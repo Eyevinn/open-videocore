@@ -129,6 +129,15 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    if (patch.technicalMetadata !== undefined) {
+      next.technicalMetadata = patch.technicalMetadata;
+      if (patch.technicalMetadata !== null) {
+        next.technicalMetadataError = undefined;
+      }
+    }
+    if (patch.technicalMetadataError !== undefined) {
+      next.technicalMetadataError = patch.technicalMetadataError;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -173,6 +182,8 @@ function toDoc(asset: Asset): Record<string, unknown> {
     parentId: asset.parentId,
     objectKey: asset.objectKey,
     statusHistory: asset.statusHistory,
+    technicalMetadata: asset.technicalMetadata ?? null,
+    technicalMetadataError: asset.technicalMetadataError,
     createdAt: asset.createdAt,
     updatedAt: asset.updatedAt
   };
@@ -188,6 +199,8 @@ function fromDoc(doc: StoredDoc): Asset {
     parentId: doc['parentId'] as string | undefined,
     objectKey: doc['objectKey'] as string | undefined,
     statusHistory: (doc['statusHistory'] as Asset['statusHistory']) ?? [],
+    technicalMetadata: (doc['technicalMetadata'] as Asset['technicalMetadata']) ?? null,
+    technicalMetadataError: doc['technicalMetadataError'] as string | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

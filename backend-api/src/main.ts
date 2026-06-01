@@ -9,9 +9,24 @@ import {
 import { provisionRouter } from './routes/provision.js';
 import { registerAuth } from './auth/middleware.js';
 import { assetsRouter } from './routes/assets.js';
+import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
+import { jobsRouter } from './routes/jobs.js';
 import { couchServer, WorkspaceCouch } from './data/couchdb.js';
 import { CouchAssetRepository } from './data/couch-asset-repo.js';
+import { CouchJobRepository } from './data/couch-job-repo.js';
 import { InMemoryAssetRepository, type AssetRepository } from './data/asset-repo.js';
+import { InMemoryJobRepository, type JobRepository } from './data/job-repo.js';
+import { WorkspaceStorage } from './data/storage.js';
+import { makeS3Reader } from './pipeline/source.js';
+import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
+import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
+import {
+  createJob,
+  getLogsForInstance,
+  removeJob,
+  waitForJobToComplete
+} from '@osaas/client-core';
+import { Client as MinioClient } from 'minio';
 
 const app = Fastify({ logger: true });
 
@@ -50,11 +65,94 @@ function buildAssetRepository(): AssetRepository {
   return new CouchAssetRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
 }
 
+// Object storage factory for direct client-side uploads (issue #4). MinIO
+// connection details come from the environment per 12-factor. When MINIO_URL
+// is unset the upload routes are not registered, so the rest of the API still
+// boots in a bare local run.
+function buildStorage(): { storageFor: StorageFactory; client: MinioClient } | undefined {
+  const minioUrl = process.env['MINIO_URL'];
+  const accessKey = process.env['MINIO_ACCESS_KEY'];
+  const secretKey = process.env['MINIO_SECRET_KEY'];
+  if (!minioUrl || !accessKey || !secretKey) {
+    app.log.warn('MINIO_URL/credentials not set — upload + URL-pull routes disabled');
+    return undefined;
+  }
+  const url = new URL(minioUrl);
+  const useSSL = url.protocol === 'https:';
+  const client = new MinioClient({
+    endPoint: url.hostname,
+    port: url.port ? Number(url.port) : useSSL ? 443 : 80,
+    useSSL,
+    accessKey,
+    secretKey
+  });
+  const bucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
+  return { storageFor: (workspaceId: string) => new WorkspaceStorage(workspaceId, client, bucket), client };
+}
+
+// Ingest job persistence (issue #5). CouchDB-backed when configured, otherwise
+// in-memory so the API still boots in a bare local run.
+function buildJobRepository(): JobRepository {
+  const couchUrl = process.env['COUCHDB_URL'];
+  if (!couchUrl) {
+    app.log.warn('COUCHDB_URL not set — using in-memory job repository (non-durable)');
+    return new InMemoryJobRepository();
+  }
+  const dbName = process.env['COUCHDB_JOBS_DB'] ?? process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
+  const server = couchServer(couchUrl);
+  return new CouchJobRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
+}
+
 // Workspace-scoped resource routers. All resources are namespaced by the
 // workspaceId derived from the caller's OSC token (issue #20).
-await app.register(assetsRouter, { prefix: '/api/v1/assets', repository: buildAssetRepository() });
+const assetRepository = buildAssetRepository();
+const jobRepository = buildJobRepository();
+const storage = buildStorage();
+
+// Technical metadata extraction (issue #6) runs on the OSC eyevinn-ffmpeg-s3
+// ephemeral ffprobe job. It needs both an OSC context (to dispatch the job) and
+// object storage (to mint the presigned source URL). When either is missing the
+// probe runner is undefined and extraction is disabled (routes respond 501).
+const probe: ProbeRunner | undefined = storage
+  ? makeOscProbeRunner({
+      context: oscContext,
+      createJob,
+      waitForJobToComplete,
+      getLogsForInstance,
+      removeJob
+    })
+  : undefined;
+
+// Assets router also owns POST /ingest-url (issue #5). It shares the same job
+// repository instance as the jobs router so a job created here is readable
+// there. S3 sources are read via the same MinIO client (S3-compatible).
+await app.register(assetsRouter, {
+  prefix: '/api/v1/assets',
+  repository: assetRepository,
+  jobRepository,
+  storageFor: storage?.storageFor,
+  pullDeps: storage ? { openS3: makeS3Reader(storage.client) } : undefined,
+  probe
+});
+
+await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository });
+
+if (storage) {
+  await app.register(assetUploadRouter, {
+    prefix: '/api/v1/assets',
+    repository: assetRepository,
+    storageFor: storage.storageFor,
+    // On upload completion, fire-and-forget ffprobe extraction (issue #6).
+    onObjectStored: probe
+      ? (workspaceId, assetId, objectKey) =>
+          void extractTechnicalMetadata(
+            { workspaceId, assetId, objectKey },
+            { assets: assetRepository, storage: storage.storageFor(workspaceId), probe }
+          )
+      : undefined
+  });
+}
 // TODO: register further routers here as surfaces are implemented, passing oscContext
-// await app.register(jobsRouter,      { prefix: '/api/v1/jobs' });
 // await app.register(searchRouter,    { prefix: '/api/v1/search' });
 
 const port = parseInt(process.env['PORT'] ?? '3000', 10);
