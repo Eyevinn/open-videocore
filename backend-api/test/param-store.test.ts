@@ -51,22 +51,23 @@ describe('makeHttpParamStore', () => {
     const fetch = vi.fn(async () => new Response(null, { status: 200 }));
     const store = makeHttpParamStore({
       baseUrl: 'https://config.example.osaas.io/',
+      getOscToken: async () => 'test-sat',
       apiKey: 'key123',
       fetch: fetch as unknown as typeof globalThis.fetch
     });
 
     await store.storeStackConfig('workspace-a', 'mystack', sampleConfig);
 
+    // Confirmed contract (smoke test 2026-06-01): create is POST /api/v1/config { key, value }
     expect(fetch).toHaveBeenCalledOnce();
     const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
-    expect(url).toContain(
-      encodeURIComponent('openvideocore/workspace-a/mystack')
-    );
-    expect(init.method).toBe('PUT');
-    expect((init.headers as Record<string, string>)['authorization']).toBe(
-      'Bearer key123'
-    );
-    const body = JSON.parse(init.body as string) as { value: string };
+    expect(url).toContain('/api/v1/config');
+    expect(init.method).toBe('POST');
+    const h = init.headers as Record<string, string>;
+    expect(h['authorization']).toBe('Bearer test-sat');
+    expect(h['x-api-key']).toBe('key123');
+    const body = JSON.parse(init.body as string) as { key: string; value: string };
+    expect(body.key).toBe('openvideocore/workspace-a/mystack');
     expect(JSON.parse(body.value)).toEqual(sampleConfig);
   });
 
@@ -74,6 +75,7 @@ describe('makeHttpParamStore', () => {
     const fetch = vi.fn();
     const store = makeHttpParamStore({
       baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
       apiKey: 'key123',
       fetch: fetch as unknown as typeof globalThis.fetch
     });
@@ -97,6 +99,7 @@ describe('makeHttpParamStore', () => {
     );
     const store = makeHttpParamStore({
       baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
       apiKey: 'key123',
       fetch: fetch as unknown as typeof globalThis.fetch
     });
@@ -109,6 +112,7 @@ describe('makeHttpParamStore', () => {
     const fetch = vi.fn(async () => new Response(null, { status: 404 }));
     const store = makeHttpParamStore({
       baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
       apiKey: 'key123',
       fetch: fetch as unknown as typeof globalThis.fetch
     });
@@ -120,6 +124,7 @@ describe('makeHttpParamStore', () => {
     const fetch = vi.fn(async () => new Response('boom', { status: 500 }));
     const store = makeHttpParamStore({
       baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
       apiKey: 'key123',
       fetch: fetch as unknown as typeof globalThis.fetch
     });

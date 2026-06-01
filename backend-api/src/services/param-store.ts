@@ -113,8 +113,11 @@ function assertNoCredentials(config: StackConfig): void {
 export type HttpParamStoreConfig = {
   // Base URL of the eyevinn-app-config-svc instance (PARAMETER_STORE_URL).
   baseUrl: string;
-  // API key guarding the store (PARAMETER_STORE_API_KEY).
+  // ConfigApiKey set on the eyevinn-app-config-svc instance (PARAMETER_STORE_API_KEY).
   apiKey: string;
+  // OSC service access token for the eyevinn-app-config-svc service. Required
+  // by OSC's reverse proxy (Authorization: Bearer). Refreshed by the caller.
+  getOscToken: () => Promise<string>;
   // Injectable fetch for tests; defaults to global fetch.
   fetch?: typeof globalThis.fetch;
   // Per-request timeout in milliseconds. All external OSC calls must be bounded.
@@ -123,20 +126,27 @@ export type HttpParamStoreConfig = {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
-// HTTP-backed parameter store. The store exposes a simple key/value REST API:
-//   PUT  /api/v1/parameter/:key   { value: <string> }
-//   GET  /api/v1/parameter/:key   -> { key, value }
-// guarded by `Authorization: Bearer <apiKey>`. The stack config is serialised
-// to a single JSON value under stackConfigKey so a read/write is one round-trip.
+// HTTP-backed parameter store client for eyevinn-app-config-svc.
+//
+// SMOKE TEST CONFIRMED (2026-06-01) — real API contract:
+//   POST   /api/v1/config          { key, value }  → 200 { key, value }  (create or overwrite)
+//   GET    /api/v1/config/{key}    →  200 { key, value } | 404 { reason }
+//   PUT    /api/v1/config/{key}    { value }        → 200 { key, value } | 404
+//   DELETE /api/v1/config/{key}    → 200 { message } | 404 { reason }
+//
+// Auth: OSC SAT in `Authorization: Bearer <sat>` (reverse proxy) +
+//       `x-api-key: <ConfigApiKey>` (app layer).
+//
+// Keys containing `/` are encoded with encodeURIComponent so the
+// `openvideocore/<workspaceId>/<name>` namespace survives as a single segment.
 export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   const doFetch = config.fetch ?? globalThis.fetch;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const base = config.baseUrl.replace(/\/$/, '');
 
-  function paramUrl(key: string): string {
-    // Encode the key so the `/`-containing namespace survives as a single
-    // path segment.
-    return `${base}/api/v1/parameter/${encodeURIComponent(key)}`;
+  function configUrl(key?: string): string {
+    const path = key ? `/${encodeURIComponent(key)}` : '';
+    return `${base}/api/v1/config${path}`;
   }
 
   async function withTimeout<T>(
@@ -151,83 +161,78 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
     }
   }
 
-  const authHeader = { authorization: `Bearer ${config.apiKey}` };
+  async function buildHeaders(): Promise<Record<string, string>> {
+    const sat = await config.getOscToken();
+    return {
+      'content-type': 'application/json',
+      authorization: `Bearer ${sat}`,
+      'x-api-key': config.apiKey
+    };
+  }
 
   return {
     async storeStackConfig(workspaceId, name, stackConfig) {
       assertNoCredentials(stackConfig);
       const key = stackConfigKey(workspaceId, name);
+      const value = JSON.stringify(stackConfig);
+      // POST creates or overwrites — confirmed idempotent in smoke test.
+      const h = await buildHeaders();
       const res = await withTimeout((signal) =>
-        doFetch(paramUrl(key), {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json', ...authHeader },
-          body: JSON.stringify({ value: JSON.stringify(stackConfig) }),
+        doFetch(configUrl(), {
+          method: 'POST',
+          headers: h,
+          body: JSON.stringify({ key, value }),
           signal
         })
       );
       if (!res.ok) {
         const text = await res.text().catch(() => '');
-        throw new Error(
-          `parameter store write failed: ${res.status} ${text}`.trim()
-        );
+        throw new Error(`parameter store write failed: ${res.status} ${text}`.trim());
       }
     },
 
     async loadStackConfig(workspaceId, name) {
       const key = stackConfigKey(workspaceId, name);
+      const h = await buildHeaders();
       const res = await withTimeout((signal) =>
-        doFetch(paramUrl(key), { method: 'GET', headers: authHeader, signal })
+        doFetch(configUrl(key), { method: 'GET', headers: h, signal })
       );
-      if (res.status === 404) {
-        return undefined;
-      }
+      if (res.status === 404) return undefined;
       if (!res.ok) {
         const text = await res.text().catch(() => '');
-        throw new Error(
-          `parameter store read failed: ${res.status} ${text}`.trim()
-        );
+        throw new Error(`parameter store read failed: ${res.status} ${text}`.trim());
       }
       const body = (await res.json().catch(() => ({}))) as { value?: string };
-      if (typeof body.value !== 'string' || body.value.length === 0) {
-        return undefined;
-      }
+      if (typeof body.value !== 'string' || body.value.length === 0) return undefined;
       try {
         return JSON.parse(body.value) as StackConfig;
       } catch {
-        throw new Error(
-          `parameter store value for "${key}" is not valid JSON`
-        );
+        throw new Error(`parameter store value for "${key}" is not valid JSON`);
       }
     },
 
     async deleteStackConfig(workspaceId, name) {
       const key = stackConfigKey(workspaceId, name);
+      const h = await buildHeaders();
       const res = await withTimeout((signal) =>
-        doFetch(paramUrl(key), { method: 'DELETE', headers: authHeader, signal })
+        doFetch(configUrl(key), { method: 'DELETE', headers: h, signal })
       );
-      // 404 is success from an idempotency standpoint: the entry is already
-      // gone, which is exactly the desired end state.
-      if (res.status === 404 || res.ok) {
-        return;
-      }
+      // 404 = already gone — idempotent success.
+      if (res.status === 404 || res.ok) return;
       const text = await res.text().catch(() => '');
-      throw new Error(
-        `parameter store delete failed: ${res.status} ${text}`.trim()
-      );
+      throw new Error(`parameter store delete failed: ${res.status} ${text}`.trim());
     }
   };
 }
 
-// Build a ParamStore from the environment, or return undefined when the store
-// is not configured. PARAMETER_STORE_URL + PARAMETER_STORE_API_KEY must both be
-// present; PARAMETER_STORE_NAME is the human-facing store name (logged, not
-// required to construct the client). When undefined, the provision route must
-// fail with a clear error rather than silently skipping persistence.
-export function paramStoreFromEnv(): ParamStore | undefined {
+// Build a ParamStore from the environment. Requires PARAMETER_STORE_URL +
+// PARAMETER_STORE_API_KEY. Returns undefined when unconfigured (provision
+// route will surface a 501).
+export function paramStoreFromEnv(
+  getOscToken: () => Promise<string>
+): ParamStore | undefined {
   const baseUrl = process.env['PARAMETER_STORE_URL'];
   const apiKey = process.env['PARAMETER_STORE_API_KEY'];
-  if (!baseUrl || !apiKey) {
-    return undefined;
-  }
-  return makeHttpParamStore({ baseUrl, apiKey });
+  if (!baseUrl || !apiKey) return undefined;
+  return makeHttpParamStore({ baseUrl, apiKey, getOscToken });
 }
