@@ -8,10 +8,21 @@ import {
   createInstance,
   getInstance,
   getPortsForInstance,
+  listSubscriptions,
+  saveSecret,
   waitForInstanceReady
 } from '@osaas/client-core';
 import { Client as MinioClient } from 'minio';
-import { deprovisionStack } from '../services/deprovision.js';
+import {
+  deprovisionStack,
+  deprovisionStackFromConfig
+} from '../services/deprovision.js';
+import {
+  type ParamStore,
+  type StackConfig,
+  stripCredentials
+} from '../services/param-store.js';
+import { STACK_SERVICES } from '../services/stack.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
 // referenced by Encore (input/source) and eyevinn-encore-packager
@@ -19,13 +30,16 @@ import { deprovisionStack } from '../services/deprovision.js';
 const SOURCE_BUCKET = 'openvideocore-source';
 const PACKAGED_BUCKET = 'openvideocore-packaged';
 
+// Sensitive credentials are supplied by the operator as environment variables
+// (ADR-002, 12-factor config) — never in the request body. During provisioning
+// each value is registered as a per-service OSC secret and referenced via
+// {{secrets.<name>}}; the literal value never reaches a createInstance body.
 const requestSchema = z.object({
   name: z
     .string()
     .min(1)
     .max(63)
-    .regex(/^[a-z0-9]+$/, 'name must be lowercase alphanumeric'),
-  adminPassword: z.string().min(8)
+    .regex(/^[a-z0-9]+$/, 'name must be lowercase alphanumeric')
 });
 
 const responseSchema = z.object({
@@ -76,7 +90,31 @@ const teardownResponseSchema = z.object({
 
 type ProvisionRouterOptions = {
   osc: Context;
+  // OSC parameter store (issue #31). When provided, a successful provision
+  // persists the stack's non-secret coordinates here and GET /:name reads them
+  // back. When undefined the store is not configured: provision still succeeds
+  // but skips persistence (logged), and GET /:name responds 501.
+  paramStore?: ParamStore;
 };
+
+// Stored-config view returned by GET /:name. Mirrors StackConfig but is
+// declared as a schema for response validation.
+const storedConfigSchema = z.object({
+  minioEndpoint: z.string(),
+  couchdbUrl: z.string(),
+  databaseUrl: z.string(),
+  redisUrl: z.string(),
+  encoreUrl: z.string(),
+  encoreCallbackUrl: z.string(),
+  sourceBucket: z.string(),
+  packagedBucket: z.string(),
+  services: z.array(
+    z.object({ serviceId: z.string(), instanceName: z.string() })
+  )
+});
+
+const notFoundSchema = z.object({ error: z.string() });
+const notConfiguredSchema = z.object({ error: z.string() });
 
 type Instance = { url?: string } & Record<string, unknown>;
 
@@ -159,12 +197,57 @@ async function redisUrlFrom(
   return `redis://${clusterHost}:6379`;
 }
 
+// Derive the deployment's own workspace (tenant) id from the OSC Context.
+// These routes are not caller-authenticated: the middleware authenticates to
+// OSC with its own OSC_ACCESS_TOKEN, so there is no per-caller bearer token to
+// resolve a workspace from. The deployment's tenant IS the workspace used to
+// scope the parameter store. All subscriptions for a single token belong to the
+// same tenant, so the tenantId of any one of them is the deployment's workspace.
+async function deriveWorkspaceId(osc: Context): Promise<string> {
+  const subscriptions = await listSubscriptions(osc);
+  const tenantId = subscriptions.find(
+    (s) => typeof s.tenantId === 'string' && s.tenantId.length > 0
+  )?.tenantId;
+  if (!tenantId) {
+    throw new Error('OSC context is not associated with a workspace (tenant)');
+  }
+  return tenantId;
+}
+
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
   fastify,
   opts
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { osc } = opts;
+  const { osc, paramStore } = opts;
+
+  // Operator-supplied credentials (ADR-002). Read once at registration time so
+  // a misconfigured deployment fails fast at startup rather than mid-provision.
+  // These are the only places these literals live in process memory — they are
+  // written to OSC as per-service secrets and never echoed in a response.
+  const minioRootPassword = process.env['MINIO_ROOT_PASSWORD'];
+  const couchdbAdminPassword = process.env['COUCHDB_ADMIN_PASSWORD'];
+  if (!minioRootPassword) {
+    throw new Error('MINIO_ROOT_PASSWORD environment variable is required');
+  }
+  if (!couchdbAdminPassword) {
+    throw new Error('COUCHDB_ADMIN_PASSWORD environment variable is required');
+  }
+
+  // Secret naming convention (ADR-002): <stackName>.<purpose>. Secrets are
+  // per-service-scoped (a secret saved for one serviceId cannot be referenced
+  // from another) and write-once / never-read-back. PostgreSQL reuses the MinIO
+  // root password as its DB password; Encore and the packager reuse it as their
+  // S3 secret. Each consuming service still needs its own saveSecret call.
+  const ROOTPASSWORD = 'rootpassword';
+  const ADMINPASSWORD = 'adminpassword';
+  const PGPASSWORD = 'pgpassword';
+
+  // Provision/deprovision/lookup are stack-lifecycle operations performed by
+  // the deployment itself. They are NOT caller-authenticated: the OSC SDK
+  // middleware authenticates to OSC using this deployment's own OSC_ACCESS_TOKEN
+  // (ADR-002), and there is no per-caller token for these routes. Parameter
+  // store scoping uses the deployment's own tenant id (deriveWorkspaceId).
 
   app.post(
     '/',
@@ -178,7 +261,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       }
     },
     async (request, reply) => {
-      const { name, adminPassword } = request.body;
+      const { name } = request.body;
+
+      // secretRef registers a value as an OSC secret scoped to a specific
+      // serviceId and returns the {{secrets.<name>}} reference to embed in the
+      // createInstance body. Secrets are per-service: the same logical value
+      // (e.g. the MinIO root password reused as Encore's S3 secret) must be
+      // saved separately under each consuming serviceId.
+      const secretRef = async (
+        serviceId: string,
+        purpose: string,
+        value: string
+      ): Promise<string> => {
+        const secretName = `${name}.${purpose}`;
+        await saveSecret(serviceId, secretName, value, osc);
+        return `{{secrets.${secretName}}}`;
+      };
 
       // Track what has been provisioned so a failure mid-stack can report
       // partial state to the operator for manual cleanup. Each entry carries
@@ -204,9 +302,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       try {
         // 1. MinIO — S3-compatible object storage.
         currentService = 'minio-minio';
+        const minioRootPasswordRef = await secretRef(
+          'minio-minio',
+          ROOTPASSWORD,
+          minioRootPassword
+        );
         const minio = await provision('minio-minio', {
           RootUser: 'admin',
-          RootPassword: adminPassword
+          RootPassword: minioRootPasswordRef
         });
         await waitForInstanceReady('minio-minio', name, osc);
         const minioEndpoint = instanceUrl(minio);
@@ -225,7 +328,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               : 80,
           useSSL: minioUrl.protocol === 'https:',
           accessKey: 'admin',
-          secretKey: adminPassword
+          // The admin S3 client connects with the real credential — OSC resolves
+          // the {{secrets.*}} reference on its side, but our client speaks S3
+          // directly to the live instance and needs the literal password.
+          secretKey: minioRootPassword
         });
         const delay = (ms: number) =>
           new Promise((resolve) => setTimeout(resolve, ms));
@@ -248,23 +354,38 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
         // 2. CouchDB — document store for asset metadata.
         currentService = 'apache-couchdb';
+        const couchdbAdminPasswordRef = await secretRef(
+          'apache-couchdb',
+          ADMINPASSWORD,
+          couchdbAdminPassword
+        );
         const couchdb = await provision('apache-couchdb', {
-          AdminPassword: adminPassword
+          AdminPassword: couchdbAdminPasswordRef
         });
         await waitForInstanceReady('apache-couchdb', name, osc);
         const couchdbUrl = instanceUrl(couchdb);
 
         // 3. PostgreSQL — relational store and full-text search index.
         currentService = 'birme-osc-postgresql';
+        // PostgreSQL reuses the MinIO root password as its DB password, but the
+        // secret is scoped to its own serviceId under a distinct purpose.
+        const postgresPasswordRef = await secretRef(
+          'birme-osc-postgresql',
+          PGPASSWORD,
+          minioRootPassword
+        );
         const postgres = await provision('birme-osc-postgresql', {
           PostgresUser: 'openvideocore',
-          PostgresPassword: adminPassword,
+          PostgresPassword: postgresPasswordRef,
           PostgresDb: 'openvideocore'
         });
         await waitForInstanceReady('birme-osc-postgresql', name, osc);
+        // The connection URL we hand back to the operator embeds the literal
+        // password — it is a direct client connection string, not an OSC
+        // service config field, so it cannot use a {{secrets.*}} reference.
         const databaseUrl = databaseUrlFrom(postgres, {
           user: 'openvideocore',
-          password: adminPassword,
+          password: minioRootPassword,
           db: 'openvideocore'
         });
 
@@ -278,9 +399,16 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // Slowest service to become ready (Essential tier); wait before
         // configuring the callback listener with its URL.
         currentService = 'encore';
+        // Encore's S3 secret is the MinIO root password, scoped to the encore
+        // serviceId under the rootpassword purpose.
+        const encoreS3SecretRef = await secretRef(
+          'encore',
+          ROOTPASSWORD,
+          minioRootPassword
+        );
         const encore = await provision('encore', {
           s3AccessKeyId: 'admin',
-          s3SecretAccessKey: adminPassword,
+          s3SecretAccessKey: encoreS3SecretRef,
           s3Endpoint: minioEndpoint
         });
         await waitForInstanceReady('encore', name, osc);
@@ -305,15 +433,62 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         if (!pat) {
           throw new Error('OSC_ACCESS_TOKEN is not configured');
         }
+        // The packager's AWS S3 secret is the MinIO root password, scoped to
+        // the eyevinn-encore-packager serviceId under the rootpassword purpose.
+        const packagerS3SecretRef = await secretRef(
+          'eyevinn-encore-packager',
+          ROOTPASSWORD,
+          minioRootPassword
+        );
         await provision('eyevinn-encore-packager', {
           RedisUrl: redisUrl,
           OutputFolder: `s3://${PACKAGED_BUCKET}`,
           PersonalAccessToken: pat,
           AwsAccessKeyId: 'admin',
-          AwsSecretAccessKey: adminPassword,
+          AwsSecretAccessKey: packagerS3SecretRef,
           S3EndpointUrl: minioEndpoint
         });
         await waitForInstanceReady('eyevinn-encore-packager', name, osc);
+
+        // Persist the stack's non-secret connection coordinates to the OSC
+        // parameter store (issue #31, ADR-002) so the API — and deprovision
+        // (#29) — can rediscover this stack at runtime without the caller
+        // re-supplying every endpoint. Credentials are stripped from any
+        // URL-shaped value before storage; param-store.ts asserts none remain.
+        //
+        // Persistence failure is logged but does NOT fail the provision: the
+        // stack is already live and the response below still hands the operator
+        // every coordinate. The stored copy is a convenience cache, not the
+        // source of truth, so a write error must not strand a healthy stack.
+        if (paramStore) {
+          const stackConfig: StackConfig = {
+            minioEndpoint,
+            couchdbUrl: stripCredentials(couchdbUrl),
+            databaseUrl: stripCredentials(databaseUrl),
+            redisUrl,
+            encoreUrl,
+            encoreCallbackUrl,
+            sourceBucket: SOURCE_BUCKET,
+            packagedBucket: PACKAGED_BUCKET,
+            services: STACK_SERVICES.map((s) => ({
+              serviceId: s.serviceId,
+              instanceName: name
+            }))
+          };
+          try {
+            const workspaceId = await deriveWorkspaceId(osc);
+            await paramStore.storeStackConfig(workspaceId, name, stackConfig);
+          } catch (err) {
+            request.log.error(
+              { err, name },
+              'failed to persist stack config to parameter store'
+            );
+          }
+        } else {
+          request.log.warn(
+            'parameter store not configured — stack coordinates not persisted'
+          );
+        }
 
         return reply.code(200).send({
           name,
@@ -336,6 +511,44 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           provisioned
         });
       }
+    }
+  );
+
+  // GET /api/v1/provision/:name — return the stored connection coordinates for
+  // a named stack, scoped to the caller's workspace (issue #31). The values are
+  // those persisted by a prior successful POST (non-secret endpoints + bucket
+  // names + the service list). Behaviour:
+  //   - 200  stored coordinates returned
+  //   - 404  no coordinates stored for this workspace + name
+  //   - 501  parameter store not configured on this deployment
+  app.get(
+    '/:name',
+    {
+      schema: {
+        params: nameParamSchema,
+        response: {
+          200: storedConfigSchema,
+          404: notFoundSchema,
+          501: notConfiguredSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const { name } = request.params;
+
+      if (!paramStore) {
+        return reply.code(501).send({
+          error:
+            'parameter store not configured (set PARAMETER_STORE_URL and PARAMETER_STORE_API_KEY)'
+        });
+      }
+
+      const workspaceId = await deriveWorkspaceId(osc);
+      const config = await paramStore.loadStackConfig(workspaceId, name);
+      if (!config) {
+        return reply.code(404).send({ error: `no stored config for stack "${name}"` });
+      }
+      return reply.code(200).send(config);
     }
   );
 
@@ -363,19 +576,64 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     async (request, reply) => {
       const { name } = request.params;
 
-      const result = await deprovisionStack(osc, name);
+      // Without a parameter store there is no per-workspace ownership record to
+      // consult, so fall back to the legacy hardcoded-list teardown. This keeps
+      // store-less deployments working; ownership scoping (#29) requires the
+      // store and is exercised on the path below.
+      if (!paramStore) {
+        const result = await deprovisionStack(osc, name);
+        if (result.status === 'failed') {
+          request.log.error({ result }, 'stack teardown reported failures');
+          return reply.code(502).send(result);
+        }
+        if (result.status === 'not_found') {
+          return reply.code(404).send(result);
+        }
+        return reply.code(200).send(result);
+      }
+
+      // Discovery: the stored config is namespaced by the deployment's own
+      // workspace (tenant). A miss means the stack never existed under this
+      // deployment, or was already deprovisioned.
+      const workspaceId = await deriveWorkspaceId(osc);
+      const config = await paramStore.loadStackConfig(workspaceId, name);
+      if (!config) {
+        // Idempotent: a retry after a successful teardown (entry already gone)
+        // lands here. Report not_found rather than erroring.
+        return reply.code(404).send({ name, status: 'not_found', services: [] });
+      }
+
+      // Teardown order and the instance set come from what was actually
+      // provisioned (the stored services[]), not the static STACK_SERVICES list.
+      const result = await deprovisionStackFromConfig(
+        osc,
+        name,
+        config.services
+      );
 
       if (result.status === 'failed') {
         request.log.error({ result }, 'stack teardown reported failures');
         // 502 Bad Gateway: the failure originates in a downstream OSC service.
+        // The parameter-store entry is intentionally NOT removed so a retry can
+        // re-read the services[] and finish the teardown.
         return reply.code(502).send(result);
       }
 
-      if (result.status === 'not_found') {
-        return reply.code(404).send(result);
+      // removed | partial | not_found — every instance is gone (or was already
+      // gone). The stack is fully torn down, so remove the stored coordinates.
+      // deleteStackConfig is idempotent, so a retry that re-finds a stale entry
+      // still converges. A delete failure is logged but does not fail the call:
+      // the OSC instances are already removed and a stale config entry is a
+      // recoverable inconsistency, not a stranded stack.
+      try {
+        await paramStore.deleteStackConfig(workspaceId, name);
+      } catch (err) {
+        request.log.error(
+          { err, name },
+          'stack torn down but failed to remove parameter store entry'
+        );
       }
 
-      // removed | partial
       return reply.code(200).send(result);
     }
   );

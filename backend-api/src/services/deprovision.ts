@@ -3,7 +3,13 @@ import {
   getInstance,
   removeInstance
 } from '@osaas/client-core';
-import { TEARDOWN_ORDER, type StackService } from './stack.js';
+import { STACK_SERVICES, TEARDOWN_ORDER, type StackService } from './stack.js';
+
+// A stored service entry as persisted in the parameter store (StackConfig
+// .services[]). Carries the serviceId and the instance name actually
+// provisioned, but not the descriptive role — that is resolved from
+// STACK_SERVICES so teardown ordering and reporting stay consistent.
+export type StoredService = { serviceId: string; instanceName: string };
 
 // Per-service outcome of a teardown attempt.
 //   removed    — instance existed and was removed this call
@@ -62,23 +68,42 @@ async function teardownService(
   }
 }
 
-// Tear down an entire stack in dependency-safe order. Failures do not abort the
-// run: every service is attempted so a single transient error does not strand
-// the rest of the stack. Partial failures are accumulated and reported, and the
-// whole operation is safe to retry (idempotent) because each step probes for
-// existence first and treats a missing instance as success.
-export async function deprovisionStack(
-  osc: Context,
-  name: string
-): Promise<StackTeardownResult> {
-  const services: ServiceTeardownResult[] = [];
+// Order the stored service list into dependency-safe teardown order. The stored
+// list (StackConfig.services[]) records what was actually provisioned but in
+// provision order and without a role. We sort it by each serviceId's position
+// in TEARDOWN_ORDER (consumers first) and resolve its role from STACK_SERVICES.
+// Any serviceId not recognised in STACK_SERVICES is placed first (torn down
+// before known producers) with role 'unknown', so an evolving stack still tears
+// down cleanly rather than silently skipping an instance.
+function orderStoredServices(
+  stored: readonly StoredService[]
+): { service: StackService; instanceName: string }[] {
+  const teardownIndex = new Map<string, number>();
+  TEARDOWN_ORDER.forEach((s, i) => teardownIndex.set(s.serviceId, i));
+  const roleFor = new Map<string, string>(
+    STACK_SERVICES.map((s) => [s.serviceId, s.role])
+  );
 
-  // Sequential teardown: respecting dependency order requires that a consumer
-  // is fully removed before the producer it depends on, so we do not parallelise.
-  for (const service of TEARDOWN_ORDER) {
-    services.push(await teardownService(osc, service, name));
-  }
+  return [...stored]
+    .sort(
+      (a, b) =>
+        (teardownIndex.get(a.serviceId) ?? -1) -
+        (teardownIndex.get(b.serviceId) ?? -1)
+    )
+    .map((entry) => ({
+      service: {
+        serviceId: entry.serviceId,
+        role: roleFor.get(entry.serviceId) ?? 'unknown'
+      } as StackService,
+      instanceName: entry.instanceName
+    }));
+}
 
+// Aggregate a list of per-service results into a stack-level status.
+function aggregate(
+  name: string,
+  services: ServiceTeardownResult[]
+): StackTeardownResult {
   const anyFailed = services.some((s) => s.status === 'failed');
   const anyRemoved = services.some((s) => s.status === 'removed');
 
@@ -94,4 +119,43 @@ export async function deprovisionStack(
   }
 
   return { name, status, services };
+}
+
+// Tear down an entire stack in dependency-safe order using the hardcoded
+// STACK_SERVICES list (legacy / fallback path). Failures do not abort the run:
+// every service is attempted so a single transient error does not strand the
+// rest of the stack. The whole operation is safe to retry (idempotent) because
+// each step probes for existence first and treats a missing instance as success.
+export async function deprovisionStack(
+  osc: Context,
+  name: string
+): Promise<StackTeardownResult> {
+  const services: ServiceTeardownResult[] = [];
+
+  // Sequential teardown: respecting dependency order requires that a consumer
+  // is fully removed before the producer it depends on, so we do not parallelise.
+  for (const service of TEARDOWN_ORDER) {
+    services.push(await teardownService(osc, service, name));
+  }
+
+  return aggregate(name, services);
+}
+
+// Tear down a stack using the service list recorded in the parameter store
+// (issue #29). The stored list is the source of truth for what was actually
+// provisioned, so teardown removes exactly those instances — even if
+// STACK_SERVICES has since changed. Each entry carries its own instanceName.
+// Same idempotency and partial-failure semantics as deprovisionStack.
+export async function deprovisionStackFromConfig(
+  osc: Context,
+  name: string,
+  stored: readonly StoredService[]
+): Promise<StackTeardownResult> {
+  const services: ServiceTeardownResult[] = [];
+
+  for (const { service, instanceName } of orderStoredServices(stored)) {
+    services.push(await teardownService(osc, service, instanceName));
+  }
+
+  return aggregate(name, services);
 }
