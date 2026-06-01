@@ -134,12 +134,12 @@ OSC My Apps run the customer's own git repo on open-source `web-runner-{node,pyt
 
 ## Open questions for the customer
 
-1. **Runtime language:** The API layer runtime is not yet decided. Node.js is the OSC-default for My Apps and has the best OSC Web Runner support. Python is viable. Go is not currently supported by OSC Web Runner. Which runtime does the consultant prefer?
-2. **Authentication model for v1:** Open (no auth, developer convenience), API keys (simple, stateless), or OAuth2/OIDC (full multi-tenant)? This affects the first-run bootstrap story ("zero prior knowledge" success metric).
-3. **Search scope for v1:** PostgreSQL full-text search covers title/description/transcript fields. Is this sufficient for v1, or does the consultant want a dedicated search cluster (which would require a new OSC catalog entry or an external service)?
-4. **CDN / delivery URLs:** For v1, open-videocore returns origin URLs pointing at MinIO. Does the consultant want CDN integration (token-signed delivery URLs, edge caching) in v1 scope, or is that a post-v1 delivery ADR?
-5. **Open source license:** Apache 2.0, MIT, or other? Affects the OSC catalog submission requirements.
-6. **AI/ML pipeline stages:** `eyevinn-auto-subtitles` requires an OpenAI API key (uses Whisper via OpenAI). Is this in v1 scope? If so, the operator provisioning open-videocore must supply an OpenAI API key. Scene detection and keyframe extraction will be handled via `eyevinn-ffmpeg-s3` jobs instead.
+1. **Runtime language:** ~~Undecided~~ **RESOLVED 2026-06-01** — Node 22 + Fastify + Zod + pnpm, aligned with open-live org pattern.
+2. **Authentication model for v1:** ~~Open (no auth), API keys, or OIDC?~~ **RESOLVED 2026-06-01** — Gated behind OSC login-wall. `OSC_ACCESS_TOKEN` is the operator's credential; open-videocore calls OSC APIs on their behalf. No additional API key layer needed for v1.
+3. **Search scope for v1:** ~~Dedicated search cluster or PostgreSQL FTS?~~ **RESOLVED 2026-06-01** — PostgreSQL FTS is sufficient for v1. Dedicated search deferred to ADR-004.
+4. **CDN / delivery URLs:** ~~v1 scope or post-v1?~~ **RESOLVED 2026-06-01** — CDN deferred to post-v1 delivery ADR (ADR-003).
+5. **Open source license:** ~~Apache 2.0, MIT, or other?~~ **RESOLVED 2026-06-01** — Apache 2.0.
+6. **AI/ML pipeline stages:** ~~`eyevinn-auto-subtitles` in v1 scope?~~ **RESOLVED 2026-06-01** — Not in v1 scope. `eyevinn-ffmpeg-s3` handles probing, thumbnails, and remux. Subtitle generation deferred to post-v1.
 
 ---
 
