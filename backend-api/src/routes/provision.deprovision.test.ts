@@ -8,21 +8,9 @@ import {
 const getInstance = vi.fn();
 const removeInstance = vi.fn();
 
-// Mock the workspace resolver so a known bearer token maps to a workspace and
-// anything else is rejected (mirrors the assets-router test harness).
-vi.mock('../auth/workspace.js', async () => {
-  const actual = await vi.importActual<typeof import('../auth/workspace.js')>(
-    '../auth/workspace.js'
-  );
-  return {
-    ...actual,
-    resolveWorkspaceId: vi.fn(async (token?: string) => {
-      if (token === 'token-a') return 'workspace-a';
-      throw new actual.AuthError('invalid token');
-    })
-  };
-});
-
+// These routes are not caller-authenticated: the OSC SDK authenticates to OSC
+// with the deployment's own OSC_ACCESS_TOKEN, and the parameter store is scoped
+// by the deployment's own tenant id, derived via listSubscriptions.
 vi.mock('@osaas/client-core', () => ({
   // createInstance/waitForInstanceReady are imported by provision.ts but the
   // DELETE path under test does not invoke them.
@@ -30,6 +18,9 @@ vi.mock('@osaas/client-core', () => ({
   getInstance: (...args: unknown[]) => getInstance(...args),
   removeInstance: (...args: unknown[]) => removeInstance(...args),
   getPortsForInstance: vi.fn(),
+  listSubscriptions: vi.fn(async () => [
+    { serviceId: 'minio-minio', tenantId: 'workspace-a' }
+  ]),
   waitForInstanceReady: vi.fn(),
   saveSecret: vi.fn(),
   Context: class {}
@@ -40,21 +31,16 @@ vi.mock('@osaas/client-core', () => ({
 process.env['MINIO_ROOT_PASSWORD'] = 'test-minio-password';
 process.env['COUCHDB_ADMIN_PASSWORD'] = 'test-couchdb-password';
 
-import { registerAuth } from '../auth/middleware.js';
 import { provisionRouter } from './provision.js';
 import type { ParamStore } from '../services/param-store.js';
 
 const getServiceAccessToken = vi.fn(async () => 'test-sat');
 const osc = { getServiceAccessToken } as never;
 
-// Valid bearer header for the authenticated paths (issue #28).
-const AUTH = { authorization: 'Bearer token-a' };
-
 async function buildApp(paramStore?: ParamStore) {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
-  registerAuth(app);
   await app.register(provisionRouter, {
     prefix: '/api/v1/provision',
     osc,
@@ -112,8 +98,7 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     const app = await buildApp(paramStore);
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/mystack',
-      headers: AUTH
+      url: '/api/v1/provision/mystack'
     });
 
     expect(res.statusCode).toBe(200);
@@ -138,8 +123,7 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     const app = await buildApp(paramStore);
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/notmine',
-      headers: AUTH
+      url: '/api/v1/provision/notmine'
     });
 
     expect(res.statusCode).toBe(404);
@@ -155,8 +139,7 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     const app = await buildApp(paramStore);
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/mystack',
-      headers: AUTH
+      url: '/api/v1/provision/mystack'
     });
     expect(res.statusCode).toBe(404);
     expect(res.json().status).toBe('not_found');
@@ -173,8 +156,7 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     const app = await buildApp(paramStore);
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/mystack',
-      headers: AUTH
+      url: '/api/v1/provision/mystack'
     });
 
     expect(res.statusCode).toBe(502);
@@ -192,8 +174,7 @@ describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
     const app = await buildApp();
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/mystack',
-      headers: AUTH
+      url: '/api/v1/provision/mystack'
     });
 
     expect(res.statusCode).toBe(200);
@@ -206,8 +187,7 @@ describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
     const app = await buildApp();
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/ghoststack',
-      headers: AUTH
+      url: '/api/v1/provision/ghoststack'
     });
 
     expect(res.statusCode).toBe(404);
@@ -224,8 +204,7 @@ describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
     const app = await buildApp();
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/mystack',
-      headers: AUTH
+      url: '/api/v1/provision/mystack'
     });
 
     expect(res.statusCode).toBe(502);
@@ -241,58 +220,9 @@ describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
     const app = await buildApp();
     const res = await app.inject({
       method: 'DELETE',
-      url: '/api/v1/provision/Invalid_Name',
-      headers: AUTH
+      url: '/api/v1/provision/Invalid_Name'
     });
     expect(res.statusCode).toBe(400);
-  });
-});
-
-describe('provision/deprovision authentication (issue #28)', () => {
-  it('rejects DELETE without a token (401 + WWW-Authenticate: Bearer)', async () => {
-    const app = await buildApp();
-    const res = await app.inject({
-      method: 'DELETE',
-      url: '/api/v1/provision/mystack'
-    });
-    expect(res.statusCode).toBe(401);
-    expect(res.headers['www-authenticate']).toBe('Bearer');
-    expect(getInstance).not.toHaveBeenCalled();
-  });
-
-  it('rejects DELETE with an invalid token (401)', async () => {
-    const app = await buildApp();
-    const res = await app.inject({
-      method: 'DELETE',
-      url: '/api/v1/provision/mystack',
-      headers: { authorization: 'Bearer nope' }
-    });
-    expect(res.statusCode).toBe(401);
-    expect(res.headers['www-authenticate']).toBe('Bearer');
-    expect(getInstance).not.toHaveBeenCalled();
-  });
-
-  it('rejects POST without a token (401) before provisioning anything', async () => {
-    const app = await buildApp();
-    const res = await app.inject({
-      method: 'POST',
-      url: '/api/v1/provision',
-      payload: { name: 'mystack' }
-    });
-    expect(res.statusCode).toBe(401);
-    expect(res.headers['www-authenticate']).toBe('Bearer');
-    expect(getServiceAccessToken).not.toHaveBeenCalled();
-  });
-
-  it('rejects POST with an invalid token (401)', async () => {
-    const app = await buildApp();
-    const res = await app.inject({
-      method: 'POST',
-      url: '/api/v1/provision',
-      headers: { authorization: 'Bearer nope' },
-      payload: { name: 'mystack', adminPassword: 'supersecret' }
-    });
-    expect(res.statusCode).toBe(401);
   });
 });
 
@@ -319,8 +249,7 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
     const app = await buildApp(paramStore);
     const res = await app.inject({
       method: 'GET',
-      url: '/api/v1/provision/mystack',
-      headers: AUTH
+      url: '/api/v1/provision/mystack'
     });
 
     expect(res.statusCode).toBe(200);
@@ -337,8 +266,7 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
     const app = await buildApp(paramStore);
     const res = await app.inject({
       method: 'GET',
-      url: '/api/v1/provision/ghoststack',
-      headers: AUTH
+      url: '/api/v1/provision/ghoststack'
     });
 
     expect(res.statusCode).toBe(404);
@@ -348,23 +276,9 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
     const app = await buildApp(undefined);
     const res = await app.inject({
       method: 'GET',
-      url: '/api/v1/provision/mystack',
-      headers: AUTH
+      url: '/api/v1/provision/mystack'
     });
 
     expect(res.statusCode).toBe(501);
-  });
-
-  it('rejects GET without a token (401)', async () => {
-    const paramStore = {
-      storeStackConfig: vi.fn(),
-      loadStackConfig: vi.fn()
-    } as unknown as ParamStore;
-    const app = await buildApp(paramStore);
-    const res = await app.inject({
-      method: 'GET',
-      url: '/api/v1/provision/mystack'
-    });
-    expect(res.statusCode).toBe(401);
   });
 });

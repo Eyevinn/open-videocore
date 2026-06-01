@@ -22,7 +22,7 @@ import {
   type Context
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
-import type { FfprobeResult, ProbeRunner } from './metadata-extractor.js';
+import type { FfprobeResult, FfprobeStream, ProbeRunner } from './metadata-extractor.js';
 
 // Subset of the OSC SDK surface this runner needs. Declared structurally so the
 // real SDK functions satisfy it and tests can pass lightweight fakes.

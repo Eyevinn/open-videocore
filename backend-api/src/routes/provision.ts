@@ -8,6 +8,7 @@ import {
   createInstance,
   getInstance,
   getPortsForInstance,
+  listSubscriptions,
   saveSecret,
   waitForInstanceReady
 } from '@osaas/client-core';
@@ -196,6 +197,23 @@ async function redisUrlFrom(
   return `redis://${clusterHost}:6379`;
 }
 
+// Derive the deployment's own workspace (tenant) id from the OSC Context.
+// These routes are not caller-authenticated: the middleware authenticates to
+// OSC with its own OSC_ACCESS_TOKEN, so there is no per-caller bearer token to
+// resolve a workspace from. The deployment's tenant IS the workspace used to
+// scope the parameter store. All subscriptions for a single token belong to the
+// same tenant, so the tenantId of any one of them is the deployment's workspace.
+async function deriveWorkspaceId(osc: Context): Promise<string> {
+  const subscriptions = await listSubscriptions(osc);
+  const tenantId = subscriptions.find(
+    (s) => typeof s.tenantId === 'string' && s.tenantId.length > 0
+  )?.tenantId;
+  if (!tenantId) {
+    throw new Error('OSC context is not associated with a workspace (tenant)');
+  }
+  return tenantId;
+}
+
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
   fastify,
   opts
@@ -225,17 +243,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   const ADMINPASSWORD = 'adminpassword';
   const PGPASSWORD = 'pgpassword';
 
-  // Provision/deprovision are privileged stack-lifecycle operations and must
-  // run with a validated caller identity (issue #28, prerequisite for ADR-002).
-  // The `authenticate` preHandler resolves the OSC bearer token to
-  // request.workspaceId and rejects unauthenticated callers with 401 +
-  // WWW-Authenticate: Bearer before the handler runs.
-  const guarded = { onRequest: app.authenticate };
+  // Provision/deprovision/lookup are stack-lifecycle operations performed by
+  // the deployment itself. They are NOT caller-authenticated: the OSC SDK
+  // middleware authenticates to OSC using this deployment's own OSC_ACCESS_TOKEN
+  // (ADR-002), and there is no per-caller token for these routes. Parameter
+  // store scoping uses the deployment's own tenant id (deriveWorkspaceId).
 
   app.post(
     '/',
     {
-      ...guarded,
       schema: {
         body: requestSchema,
         response: {
@@ -460,14 +476,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             }))
           };
           try {
-            await paramStore.storeStackConfig(
-              request.workspaceId,
-              name,
-              stackConfig
-            );
+            const workspaceId = await deriveWorkspaceId(osc);
+            await paramStore.storeStackConfig(workspaceId, name, stackConfig);
           } catch (err) {
             request.log.error(
-              { err, name, workspaceId: request.workspaceId },
+              { err, name },
               'failed to persist stack config to parameter store'
             );
           }
@@ -511,7 +524,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   app.get(
     '/:name',
     {
-      ...guarded,
       schema: {
         params: nameParamSchema,
         response: {
@@ -531,10 +543,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         });
       }
 
-      const config = await paramStore.loadStackConfig(
-        request.workspaceId,
-        name
-      );
+      const workspaceId = await deriveWorkspaceId(osc);
+      const config = await paramStore.loadStackConfig(workspaceId, name);
       if (!config) {
         return reply.code(404).send({ error: `no stored config for stack "${name}"` });
       }
@@ -554,7 +564,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   app.delete(
     '/:name',
     {
-      ...guarded,
       schema: {
         params: nameParamSchema,
         response: {
@@ -583,14 +592,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         return reply.code(200).send(result);
       }
 
-      // Ownership + discovery: the stored config is namespaced by workspace, so
-      // a caller can only ever load (and therefore tear down) a stack their own
-      // workspace provisioned. A miss means the stack is not owned by this
-      // workspace — or never existed, or was already deprovisioned.
-      const config = await paramStore.loadStackConfig(
-        request.workspaceId,
-        name
-      );
+      // Discovery: the stored config is namespaced by the deployment's own
+      // workspace (tenant). A miss means the stack never existed under this
+      // deployment, or was already deprovisioned.
+      const workspaceId = await deriveWorkspaceId(osc);
+      const config = await paramStore.loadStackConfig(workspaceId, name);
       if (!config) {
         // Idempotent: a retry after a successful teardown (entry already gone)
         // lands here. Report not_found rather than erroring.
@@ -620,10 +626,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // the OSC instances are already removed and a stale config entry is a
       // recoverable inconsistency, not a stranded stack.
       try {
-        await paramStore.deleteStackConfig(request.workspaceId, name);
+        await paramStore.deleteStackConfig(workspaceId, name);
       } catch (err) {
         request.log.error(
-          { err, name, workspaceId: request.workspaceId },
+          { err, name },
           'stack torn down but failed to remove parameter store entry'
         );
       }
