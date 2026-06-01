@@ -20,6 +20,11 @@ import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
+import { internalRouter } from './routes/internal.js';
+import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
+import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
+import { makeHttpEncoreClient, type EncoreClient } from './pipeline/encore-client.js';
+import { Redis as IORedis } from 'ioredis';
 import {
   createJob,
   getLogsForInstance,
@@ -123,19 +128,78 @@ const probe: ProbeRunner | undefined = storage
     })
   : undefined;
 
-// Assets router also owns POST /ingest-url (issue #5). It shares the same job
-// repository instance as the jobs router so a job created here is readable
-// there. S3 sources are read via the same MinIO client (S3-compatible).
+// ABR transcoding (issue #8). Encore is a long-lived OSC instance; we submit
+// jobs to its REST API and receive completion via the encore-callback listener.
+// Enabled only when ENCORE_URL is set; otherwise POST /:id/transcode responds
+// 501. The service access token for Encore is resolved per-submit from the OSC
+// context.
+function buildEncore(): EncoreClient | undefined {
+  const baseUrl = process.env['ENCORE_URL'];
+  if (!baseUrl) {
+    app.log.warn('ENCORE_URL not set — ABR transcoding disabled');
+    return undefined;
+  }
+  return makeHttpEncoreClient({
+    baseUrl,
+    getToken: () => oscContext.getServiceAccessToken('encore')
+  });
+}
+
+const encore = buildEncore();
+const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
+const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
+
+// Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
+// (issue #8). It shares the same job repository instance as the jobs router so a
+// job created here is readable there. S3 sources are read via the same MinIO
+// client (S3-compatible).
 await app.register(assetsRouter, {
   prefix: '/api/v1/assets',
   repository: assetRepository,
   jobRepository,
   storageFor: storage?.storageFor,
   pullDeps: storage ? { openS3: makeS3Reader(storage.client) } : undefined,
-  probe
+  probe,
+  encore,
+  sourceBucket,
+  outputBucket
 });
 
 await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository });
+
+// HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
+// queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs and
+// receive a completion callback. Wiring is enabled only when REDIS_URL is set
+// (the Valkey queue is the load-bearing dependency); otherwise the packaging
+// trigger and the packager-callback route respond as not-configured. The
+// PackagingService is exposed to issue #8's Encore callback handler via the
+// PackagingTrigger interface so the two features stay decoupled.
+function buildPackaging(): PackagingService | undefined {
+  const redisUrl = process.env['REDIS_URL'];
+  if (!redisUrl) {
+    app.log.warn('REDIS_URL not set — HLS/DASH packaging disabled');
+    return undefined;
+  }
+  const redis = new IORedis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
+  return new PackagingService({
+    assets: assetRepository,
+    queue: makeOscPackagerQueue(redis),
+    publicBaseUrl: packagingPublicBaseUrl()
+  });
+}
+
+const packaging = buildPackaging();
+
+// Internal OSC callbacks. Unauthenticated by design — see routes/internal.ts.
+// Hosts both the issue #9 packager-callback and the issue #8 encore-callback
+// (transcode completion), which resolves its workspace + job from the embedded
+// encoreJobId and creates ready child assets for each rendition.
+await app.register(internalRouter, {
+  prefix: '/api/v1/internal',
+  packaging,
+  jobRepository,
+  repository: assetRepository
+});
 
 if (storage) {
   await app.register(assetUploadRouter, {

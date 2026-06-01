@@ -138,6 +138,16 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.technicalMetadataError !== undefined) {
       next.technicalMetadataError = patch.technicalMetadataError;
     }
+    if (patch.manifestUrls !== undefined) {
+      next.manifestUrls = patch.manifestUrls;
+      next.packagingError = undefined;
+    }
+    if (patch.packagingError !== undefined) {
+      next.packagingError = patch.packagingError;
+    }
+    if (patch.renditions !== undefined) {
+      next.renditions = patch.renditions;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -184,6 +194,9 @@ function toDoc(asset: Asset): Record<string, unknown> {
     statusHistory: asset.statusHistory,
     technicalMetadata: asset.technicalMetadata ?? null,
     technicalMetadataError: asset.technicalMetadataError,
+    manifestUrls: asset.manifestUrls ?? null,
+    packagingError: asset.packagingError,
+    renditions: asset.renditions ?? null,
     createdAt: asset.createdAt,
     updatedAt: asset.updatedAt
   };
@@ -201,6 +214,9 @@ function fromDoc(doc: StoredDoc): Asset {
     statusHistory: (doc['statusHistory'] as Asset['statusHistory']) ?? [],
     technicalMetadata: (doc['technicalMetadata'] as Asset['technicalMetadata']) ?? null,
     technicalMetadataError: doc['technicalMetadataError'] as string | undefined,
+    manifestUrls: (doc['manifestUrls'] as Asset['manifestUrls']) ?? undefined,
+    packagingError: doc['packagingError'] as string | undefined,
+    renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

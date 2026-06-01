@@ -8,8 +8,9 @@
 
 import {
   applyJobPatch,
+  decodeEncoreJobId,
   type CreateJobInput,
-  type IngestJob,
+  type Job,
   type JobRepository,
   type JobStatus,
   type JobType,
@@ -24,20 +25,22 @@ export type CouchFactory = (workspaceId: string) => WorkspaceCouch;
 export class CouchJobRepository implements JobRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
-  async create(workspaceId: string, input: CreateJobInput): Promise<IngestJob> {
+  async create(workspaceId: string, input: CreateJobInput): Promise<Job> {
     const couch = this.couchFor(workspaceId);
     const now = new Date().toISOString();
     const localId = `job-${cryptoId()}`;
-    const job: IngestJob = {
+    const job: Job = {
       id: localId,
       workspaceId,
       type: input.type,
       status: 'pending',
       assetId: input.assetId,
-      sourceUrl: input.sourceUrl,
+      sourceUrl: input.sourceUrl ?? '',
       progress: 0,
       bytesTransferred: 0,
       attempts: 0,
+      encoreJobId: input.encoreJobId,
+      profile: input.profile,
       createdAt: now,
       updatedAt: now
     };
@@ -45,7 +48,7 @@ export class CouchJobRepository implements JobRepository {
     return job;
   }
 
-  async get(workspaceId: string, id: string): Promise<IngestJob | undefined> {
+  async get(workspaceId: string, id: string): Promise<Job | undefined> {
     const couch = this.couchFor(workspaceId);
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
@@ -54,11 +57,34 @@ export class CouchJobRepository implements JobRepository {
     return fromDoc(doc);
   }
 
+  // The internal Encore callback is unauthenticated and carries no workspace.
+  // We encode the workspaceId into the encoreJobId at submit time (see
+  // job-repo.encodeEncoreJobId), so we can decode it here and resolve the job
+  // through the normal workspace-scoped path — no cross-partition scan.
+  async findByEncoreJobId(
+    encoreJobId: string
+  ): Promise<{ workspaceId: string; job: Job } | undefined> {
+    const decoded = decodeEncoreJobId(encoreJobId);
+    if (!decoded) {
+      return undefined;
+    }
+    const couch = this.couchFor(decoded.workspaceId);
+    const doc = await couch.get(decoded.jobLocalId);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const job = fromDoc(doc);
+    if (job.encoreJobId !== encoreJobId) {
+      return undefined;
+    }
+    return { workspaceId: decoded.workspaceId, job };
+  }
+
   async update(
     workspaceId: string,
     id: string,
     patch: UpdateJobInput
-  ): Promise<IngestJob | undefined> {
+  ): Promise<Job | undefined> {
     const couch = this.couchFor(workspaceId);
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
@@ -71,7 +97,7 @@ export class CouchJobRepository implements JobRepository {
   }
 }
 
-function toDoc(job: IngestJob): Record<string, unknown> {
+function toDoc(job: Job): Record<string, unknown> {
   return {
     resourceType: RESOURCE_TYPE,
     localId: job.id,
@@ -84,12 +110,15 @@ function toDoc(job: IngestJob): Record<string, unknown> {
     totalBytes: job.totalBytes,
     attempts: job.attempts,
     error: job.error,
+    encoreJobId: job.encoreJobId,
+    profile: job.profile,
+    renditionAssetIds: job.renditionAssetIds,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
   };
 }
 
-function fromDoc(doc: StoredDoc): IngestJob {
+function fromDoc(doc: StoredDoc): Job {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
     workspaceId: doc.workspaceId,
@@ -102,6 +131,9 @@ function fromDoc(doc: StoredDoc): IngestJob {
     totalBytes: doc['totalBytes'] as number | undefined,
     attempts: Number(doc['attempts'] ?? 0),
     error: doc['error'] as string | undefined,
+    encoreJobId: doc['encoreJobId'] as string | undefined,
+    profile: doc['profile'] as string | undefined,
+    renditionAssetIds: doc['renditionAssetIds'] as string[] | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

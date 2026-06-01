@@ -31,8 +31,41 @@ import {
   type ExtractDeps,
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
+import { submitTranscode } from '../pipeline/transcode.js';
+import type { EncoreClient } from '../pipeline/encore-client.js';
+import { PRESET_NAMES, type EncoreProfile } from '../pipeline/encode-presets.js';
 
 const statusSchema = z.enum(ASSET_STATUSES);
+
+// A custom Encore profile a caller may supply instead of a named preset. Kept
+// permissive (forwarded to Encore) but bounded so it cannot be abused.
+const encoreOutputSchema = z.object({
+  label: z.string().min(1).max(64),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  videoBitrateBps: z.number().int().positive(),
+  audioBitrateBps: z.number().int().positive(),
+  format: z.string().min(1).max(32)
+});
+
+const customProfileSchema = z.object({
+  name: z.string().min(1).max(128),
+  outputs: z.array(encoreOutputSchema).min(1).max(16)
+});
+
+const transcodeBodySchema = z
+  .object({
+    profile: z.enum(PRESET_NAMES).optional(),
+    customProfile: customProfileSchema.optional()
+  })
+  .refine((b) => !(b.profile && b.customProfile), {
+    message: 'specify either profile or customProfile, not both'
+  });
+
+const transcodeAcceptedSchema = z.object({
+  jobId: z.string(),
+  encoreJobId: z.string()
+});
 
 const createSchema = z.object({
   name: z.string().min(1).max(256),
@@ -85,6 +118,19 @@ const technicalMetadataSchema = z.object({
   extractedAt: z.string()
 });
 
+const manifestUrlsSchema = z.object({
+  hls: z.string().optional(),
+  dash: z.string().optional()
+});
+
+const renditionSchema = z.object({
+  assetId: z.string(),
+  label: z.string(),
+  width: z.number(),
+  height: z.number(),
+  objectKey: z.string()
+});
+
 const assetSchema = z.object({
   id: z.string(),
   workspaceId: z.string(),
@@ -98,6 +144,13 @@ const assetSchema = z.object({
   // (or after a failed one); `technicalMetadataError` carries the last failure.
   technicalMetadata: technicalMetadataSchema.nullish(),
   technicalMetadataError: z.string().optional(),
+  // Streaming manifest URLs from the packaging pipeline (issue #9). Absent until
+  // packaging completes; `packagingError` carries the last packaging failure.
+  manifestUrls: manifestUrlsSchema.optional(),
+  packagingError: z.string().optional(),
+  // ABR renditions produced by transcoding (issue #8). Absent until a transcode
+  // job completes; each entry links to a child asset via its assetId.
+  renditions: z.array(renditionSchema).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -133,6 +186,12 @@ type AssetsRouterOptions = {
   // Defaults to the real fire-and-forget extractor.
   extract?: typeof extractTechnicalMetadata;
   extractDeps?: Partial<ExtractDeps>;
+  // Encore transcode client (issue #8). When absent, POST /:id/transcode
+  // responds 501 (Encore not configured on this deployment).
+  encore?: EncoreClient;
+  // S3 bucket names Encore reads the source from / writes renditions to.
+  sourceBucket?: string;
+  outputBucket?: string;
 };
 
 const ingestUrlSchema = z.object({
@@ -356,6 +415,70 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       triggerExtraction(request.workspaceId, asset.id, asset.objectKey);
       return reply.code(202).send({ assetId: asset.id, status: 'extracting' });
+    }
+  );
+
+  // Submit an ABR transcoding job to Encore (issue #8). Workspace-scoped and
+  // behind `authenticate`. Resolves a preset (default 1080p) or a custom
+  // profile, creates a TranscodeJob, advances the source asset to `processing`,
+  // and submits to Encore. Returns the job id + Encore job id immediately; the
+  // caller polls GET /api/v1/jobs/:id and the Encore callback finishes the work.
+  //   202 — accepted, transcode submitted
+  //   404 — unknown/foreign source asset (existence not leaked)
+  //   409 — the source asset has no stored object to transcode
+  //   501 — transcoding is not configured on this deployment
+  //   502 — Encore rejected the submission
+  app.post(
+    '/:id/transcode',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: transcodeBodySchema,
+        response: {
+          202: transcodeAcceptedSchema,
+          404: errorSchema,
+          409: errorSchema,
+          501: errorSchema,
+          502: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      if (!asset.objectKey) {
+        return reply.code(409).send({
+          error: 'no_object',
+          message: 'asset has no stored object to transcode'
+        });
+      }
+      if (!opts.encore || !opts.sourceBucket || !opts.outputBucket) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'transcoding is not configured'
+        });
+      }
+      try {
+        const result = await submitTranscode(
+          {
+            workspaceId: request.workspaceId,
+            sourceAssetId: asset.id,
+            sourceObjectKey: asset.objectKey,
+            preset: request.body.profile,
+            customProfile: request.body.customProfile as EncoreProfile | undefined,
+            sourceBucket: opts.sourceBucket,
+            outputBucket: opts.outputBucket
+          },
+          { jobs, assets: repo, encore: opts.encore }
+        );
+        return reply.code(202).send(result);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(502).send({ error: 'encore_submit_failed', message });
+      }
     }
   );
 

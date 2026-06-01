@@ -24,6 +24,10 @@ const jobSchema = z.object({
   totalBytes: z.number().optional(),
   attempts: z.number(),
   error: z.string().optional(),
+  // Transcode-job fields (issue #8). Present only when type === 'transcode'.
+  encoreJobId: z.string().optional(),
+  profile: z.string().optional(),
+  renditionAssetIds: z.array(z.string()).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });

@@ -76,6 +76,32 @@ export type TechnicalMetadata = {
   extractedAt: string; // ISO timestamp of when extraction completed
 };
 
+// Streaming manifest URLs produced by the HLS/DASH packaging pipeline (issue
+// #9). Populated asynchronously after transcoding completes and the
+// eyevinn-encore-packager finishes packaging. Both are MinIO-hosted manifest
+// URLs (CMAF: HLS and DASH share the same underlying media segments). Either
+// field may be absent if only one format was produced; `packagingError`
+// carries the reason when the last packaging attempt failed.
+export type ManifestUrls = {
+  hls?: string;
+  dash?: string;
+};
+
+// One ABR rendition produced by a transcode job (issue #8). Recorded on the
+// SOURCE asset so a client can discover the produced renditions and their child
+// asset ids in a single read. Each entry mirrors a child asset created with
+// parentId = the source asset id.
+export type Rendition = {
+  // The child asset id holding this rendition's stored object.
+  assetId: string;
+  // Rung label from the encode profile (e.g. "1080p", "720p").
+  label: string;
+  width: number;
+  height: number;
+  // MinIO object key (workspace-local) of the produced file.
+  objectKey: string;
+};
+
 export type Asset = {
   id: string;
   workspaceId: string;
@@ -94,6 +120,15 @@ export type Asset = {
   // Extraction never blocks the asset record, so both fields are optional.
   technicalMetadata?: TechnicalMetadata | null;
   technicalMetadataError?: string;
+  // Streaming manifest URLs from the packaging pipeline (issue #9). Undefined
+  // until packaging completes successfully; `packagingError` is set instead
+  // when the last packaging attempt failed. Packaging never changes the
+  // asset's lifecycle status — it only annotates the record.
+  manifestUrls?: ManifestUrls;
+  packagingError?: string;
+  // ABR renditions produced by transcoding (issue #8). Populated on the SOURCE
+  // asset when a transcode job completes; undefined until then.
+  renditions?: Rendition[];
   createdAt: string;
   updatedAt: string;
 };
@@ -118,6 +153,14 @@ export type UpdateAssetInput = {
   // for `technicalMetadata` (distinct from "not provided").
   technicalMetadata?: TechnicalMetadata | null;
   technicalMetadataError?: string;
+  // Set by the packaging pipeline (issue #9). Writing `manifestUrls` clears any
+  // prior `packagingError`; writing `packagingError` records a failure and
+  // leaves `manifestUrls` untouched. Neither field changes `status`.
+  manifestUrls?: ManifestUrls;
+  packagingError?: string;
+  // Set by the transcode pipeline (issue #8) on the source asset when a
+  // transcode job completes. Does not change `status`.
+  renditions?: Rendition[];
 };
 
 export type ListOptions = {
@@ -309,6 +352,17 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.technicalMetadataError !== undefined) {
       next.technicalMetadataError = patch.technicalMetadataError;
+    }
+    if (patch.manifestUrls !== undefined) {
+      next.manifestUrls = patch.manifestUrls;
+      // A successful packaging result clears any stale error.
+      next.packagingError = undefined;
+    }
+    if (patch.packagingError !== undefined) {
+      next.packagingError = patch.packagingError;
+    }
+    if (patch.renditions !== undefined) {
+      next.renditions = patch.renditions;
     }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
