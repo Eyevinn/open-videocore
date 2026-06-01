@@ -31,6 +31,13 @@ export const STACK_SERVICES = [
 
 export type StackService = (typeof STACK_SERVICES)[number];
 
+// eyevinn-ffmpeg-s3: the ephemeral ffprobe/ffmpeg runner used by the technical
+// metadata extraction pipeline (issue #6). It is NOT part of the long-lived
+// provisioned stack above — it is invoked per-extraction as an ephemeral job
+// against a presigned MinIO object URL — so it is exported separately rather
+// than added to STACK_SERVICES.
+export const FFPROBE_SERVICE_ID = 'eyevinn-ffmpeg-s3' as const;
+
 // Teardown order is the reverse of provision order: consumers are removed
 // before the producers they depend on (packager -> callback listener -> encore
 // -> queue -> databases -> storage). This avoids tearing a producer out from

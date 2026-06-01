@@ -21,16 +21,20 @@ import { assertOwned, assertValidWorkspaceId, namespacedId } from './guard.js';
 // MinIO), advances to `processing` once a transcode/analysis job is running,
 // `ready` when it can be served, and `archived` as a terminal soft-deleted /
 // retired state.
-export const ASSET_STATUSES = ['uploading', 'processing', 'ready', 'archived'] as const;
+// `failed` is a non-terminal error state for an asset whose ingest could not
+// complete (issue #5 URL-pull). From `failed` a caller may retry (back to
+// `uploading`/`processing`) or archive it.
+export const ASSET_STATUSES = ['uploading', 'processing', 'ready', 'failed', 'archived'] as const;
 export type AssetStatus = (typeof ASSET_STATUSES)[number];
 
 // Allowed forward transitions. Anything not listed is rejected with 422.
 // `archived` is terminal. We allow `ready -> processing` so a ready asset can
 // be re-processed (e.g. a new rendition pass) before going back to ready.
 const ALLOWED_TRANSITIONS: Record<AssetStatus, readonly AssetStatus[]> = {
-  uploading: ['processing', 'archived'],
-  processing: ['ready', 'archived'],
+  uploading: ['processing', 'failed', 'archived'],
+  processing: ['ready', 'failed', 'archived'],
   ready: ['processing', 'archived'],
+  failed: ['uploading', 'processing', 'archived'],
   archived: []
 };
 
@@ -47,6 +51,31 @@ export type StatusTransition = {
   to: AssetStatus;
 };
 
+// One audio track within a container, as reported by ffprobe (issue #6). A
+// container can carry multiple audio tracks (e.g. multi-language), so this is
+// surfaced as an array on TechnicalMetadata.
+export type AudioTrack = {
+  index: number;
+  codec: string;
+  channels: number;
+  sampleRateHz: number;
+};
+
+// Technical metadata extracted from the stored object by an ephemeral ffprobe
+// job (issue #6). Populated asynchronously after ingest; null until the first
+// successful extraction (or after a failed extraction — see
+// `technicalMetadataError`).
+export type TechnicalMetadata = {
+  codec: string;
+  width: number;
+  height: number;
+  durationSeconds: number;
+  bitrateBps: number;
+  containerFormat: string;
+  audioTracks: AudioTrack[];
+  extractedAt: string; // ISO timestamp of when extraction completed
+};
+
 export type Asset = {
   id: string;
   workspaceId: string;
@@ -59,6 +88,12 @@ export type Asset = {
   objectKey?: string;
   // Append-only audit trail of every status change (issue #3 deliverable 5).
   statusHistory: StatusTransition[];
+  // Technical metadata from the ffprobe extraction pipeline (issue #6).
+  // `null` means extraction has not yet succeeded; an accompanying
+  // `technicalMetadataError` carries the reason when the last attempt failed.
+  // Extraction never blocks the asset record, so both fields are optional.
+  technicalMetadata?: TechnicalMetadata | null;
+  technicalMetadataError?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -77,6 +112,12 @@ export type UpdateAssetInput = {
   description?: string;
   objectKey?: string;
   status?: AssetStatus;
+  // Set by the metadata extractor (issue #6). Writing `technicalMetadata` to a
+  // value clears any prior error; writing `technicalMetadataError` records a
+  // failure and leaves `technicalMetadata` null. `null` is an accepted value
+  // for `technicalMetadata` (distinct from "not provided").
+  technicalMetadata?: TechnicalMetadata | null;
+  technicalMetadataError?: string;
 };
 
 export type ListOptions = {
@@ -259,6 +300,16 @@ export class InMemoryAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    if (patch.technicalMetadata !== undefined) {
+      next.technicalMetadata = patch.technicalMetadata;
+      // A successful extraction clears any stale error.
+      if (patch.technicalMetadata !== null) {
+        next.technicalMetadataError = undefined;
+      }
+    }
+    if (patch.technicalMetadataError !== undefined) {
+      next.technicalMetadataError = patch.technicalMetadataError;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
