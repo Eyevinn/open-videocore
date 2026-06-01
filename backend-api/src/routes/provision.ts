@@ -448,7 +448,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           AwsSecretAccessKey: packagerS3SecretRef,
           S3EndpointUrl: minioEndpoint
         });
-        await waitForInstanceReady('eyevinn-encore-packager', name, osc);
+        // The packager is a background queue-consumer — it does not expose a
+        // synchronous health endpoint. waitForInstanceReady is skipped; the
+        // instance starts asynchronously and picks up jobs from the Valkey queue.
 
         // Persist the stack's non-secret connection coordinates to the OSC
         // parameter store (issue #31, ADR-002) so the API — and deprovision
@@ -505,6 +507,30 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           { err, failedService: currentService, provisioned },
           'provisioning failed'
         );
+        // Even on failure, persist whatever was provisioned so the deprovision
+        // route can clean up via the API. Without this, partially-provisioned
+        // stacks leave orphaned OSC instances that must be removed manually.
+        if (paramStore && provisioned.length > 0) {
+          try {
+            const workspaceId = await deriveWorkspaceId(osc);
+            await paramStore.storeStackConfig(workspaceId, name, {
+              minioEndpoint: '',
+              couchdbUrl: '',
+              databaseUrl: '',
+              redisUrl: '',
+              encoreUrl: '',
+              encoreCallbackUrl: '',
+              sourceBucket: SOURCE_BUCKET,
+              packagedBucket: PACKAGED_BUCKET,
+              services: provisioned.map((p) => ({
+                serviceId: p.serviceId,
+                instanceName: p.name
+              }))
+            });
+          } catch (storeErr) {
+            request.log.error({ storeErr }, 'failed to persist partial stack config');
+          }
+        }
         return reply.code(500).send({
           error: `provisioning failed at ${currentService}: ${message}`,
           failedService: currentService,
