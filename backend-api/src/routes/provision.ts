@@ -6,6 +6,7 @@ import { z } from 'zod';
 import {
   Context,
   createInstance,
+  getInstance,
   getPortsForInstance,
   waitForInstanceReady
 } from '@osaas/client-core';
@@ -103,11 +104,12 @@ function databaseUrlFrom(
   return `postgresql://${opts.user}:${encodeURIComponent(opts.password)}@${host}:5432/${opts.db}`;
 }
 
-// Valkey (Redis-compatible) connection string. Valkey is reached over a raw TCP
-// port, not the HTTP .url field. OSC routes extra TCP ports via the ports API,
-// so we resolve the externally routed port for this instance.
-// FLAGGED FOR SMOKE-TEST VERIFICATION: confirm the routed port/host shape
-// against a live valkey-io-valkey instance.
+// Valkey (Redis-compatible) connection string.
+// OSC Valkey instances use internal-only cluster DNS (publicAccess=false).
+// The internal DNS follows the pattern:
+//   oscaidev-<name>.valkey-io-valkey.svc.cluster.local:6379
+// This is only reachable from within the OSC cluster — correct for
+// open-videocore running as an OSC service.
 async function redisUrlFrom(
   osc: Context,
   serviceId: string,
@@ -115,11 +117,22 @@ async function redisUrlFrom(
 ): Promise<string> {
   const sat = await osc.getServiceAccessToken(serviceId);
   const ports = await getPortsForInstance(osc, serviceId, name, sat);
-  if (!ports || ports.length === 0) {
-    throw new Error('valkey instance did not expose a routed TCP port');
+  if (ports && ports.length > 0) {
+    // Public TCP endpoint available (non-default config)
+    const { externalIp, externalPort } = ports[0];
+    return `redis://${externalIp}:${externalPort}`;
   }
-  const { externalIp, externalPort } = ports[0];
-  return `redis://${externalIp}:${externalPort}`;
+  // Internal-only: the instance URL is
+  //   https://oscaidev-<name>.valkey-io-valkey.auto.prod.osaas.io
+  // Strip to the cluster-DNS form:
+  //   oscaidev-<name>.valkey-io-valkey.svc.cluster.local:6379
+  const instance = await getInstance(osc, serviceId, name, sat);
+  const instanceHostname = new URL(instance.url as string).hostname;
+  const clusterHost = instanceHostname.replace(
+    /\.auto\.prod\.osaas\.io$/,
+    '.svc.cluster.local'
+  );
+  return `redis://${clusterHost}:6379`;
 }
 
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
@@ -174,9 +187,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         await waitForInstanceReady('minio-minio', name, osc);
         const minioEndpoint = instanceUrl(minio);
 
-        // 1b. Create the source and packaged buckets on the live MinIO instance
-        // before any downstream service references them. Done synchronously so
-        // Encore (input) and the packager (OutputFolder) can rely on them.
+        // 1b. Create the source and packaged buckets on the live MinIO instance.
+        // waitForInstanceReady passes when the container health check is green,
+        // but the MinIO S3 API may still be initialising. Retry with backoff
+        // until S3 is actually accepting connections.
         const minioUrl = new URL(minioEndpoint);
         const minioClient = new MinioClient({
           endPoint: minioUrl.hostname,
@@ -189,10 +203,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           accessKey: 'admin',
           secretKey: adminPassword
         });
+        const delay = (ms: number) =>
+          new Promise((resolve) => setTimeout(resolve, ms));
         for (const bucket of [SOURCE_BUCKET, PACKAGED_BUCKET]) {
-          const exists = await minioClient.bucketExists(bucket);
-          if (!exists) {
-            await minioClient.makeBucket(bucket);
+          let attempts = 0;
+          while (true) {
+            try {
+              const exists = await minioClient.bucketExists(bucket);
+              if (!exists) {
+                await minioClient.makeBucket(bucket);
+              }
+              break;
+            } catch (err) {
+              attempts++;
+              if (attempts >= 20) throw err;
+              await delay(5000);
+            }
           }
         }
 
