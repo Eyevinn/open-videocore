@@ -237,20 +237,10 @@ export function paramStoreFromEnv(
   return makeHttpParamStore({ baseUrl, apiKey, getOscToken });
 }
 
-// The OSC service that backs the parameter store (eyevinn-app-config-svc). The
-// store is an OSC service instance, so "creating the store" means creating the
-// instance and seeding its ConfigApiKey.
 export const PARAM_STORE_SERVICE_ID = 'eyevinn-app-config-svc' as const;
 
-// Default OSC instance name for the auto-bootstrapped parameter store. The
-// operator may override it with PARAMETER_STORE_INSTANCE_NAME (must match the
-// instance PARAMETER_STORE_URL points at when both are pre-provisioned).
-const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'openvideocore-config';
-
-// The slice of the @osaas/client-core SDK ensureParameterStore needs. Declared
-// as a narrow interface so the bootstrap can be unit-tested without a live OSC
-// API or a real Context. Shapes mirror createInstance/getInstance in client-core.
-export interface OscInstanceApi {
+// OSC instance name must be alphanumeric-only (OSC constraint).
+const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig';export interface OscInstanceApi {
   getServiceAccessToken(serviceId: string): Promise<string>;
   getInstance(
     serviceId: string,
@@ -265,21 +255,12 @@ export interface OscInstanceApi {
 }
 
 export type EnsureParameterStoreOptions = {
-  // OSC SDK surface (production: an adapter over the client-core functions).
   osc: OscInstanceApi;
-  // Structured logger; only warn is used. Matches Fastify's app.log.
   log: { info: (msg: string) => void; warn: (msg: string) => void };
 };
 
-// Idempotently ensure the parameter store backing instance exists on first
-// startup (issue #35). When PARAMETER_STORE_URL + PARAMETER_STORE_API_KEY are
-// set but the named eyevinn-app-config-svc instance has not been created yet,
-// create it and seed its ConfigApiKey from PARAMETER_STORE_API_KEY.
-//
-// Graceful degradation: any OSC failure is logged as a warning and swallowed —
-// startup continues, and the provision route will surface a 501/connect error
-// later if the store is genuinely unavailable. Returns true when the store is
-// known to exist (already present or freshly created), false otherwise.
+// Idempotently ensure the eyevinn-app-config-svc instance exists on first
+// startup (issue #35). Any OSC failure is logged as a warning and swallowed.
 export async function ensureParameterStore(
   opts: EnsureParameterStoreOptions
 ): Promise<boolean> {
