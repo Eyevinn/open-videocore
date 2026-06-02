@@ -14,7 +14,6 @@
 // Roles (for documentation / friction logging):
 //   storage    — MinIO (S3-compatible object storage)
 //   database   — CouchDB (document metadata store)
-//   database   — PostgreSQL (relational store + full-text index)
 //   queue      — Valkey (Redis-compatible coordination backbone)
 //   transcode  — Encore (transcoding engine; depends on storage)
 //   transcode  — Encore callback listener (bridges Encore -> queue)
@@ -22,7 +21,6 @@
 export const STACK_SERVICES = [
   { serviceId: 'minio-minio', role: 'storage' },
   { serviceId: 'apache-couchdb', role: 'database' },
-  { serviceId: 'birme-osc-postgresql', role: 'database' },
   { serviceId: 'valkey-io-valkey', role: 'queue' },
   { serviceId: 'encore', role: 'transcode' },
   { serviceId: 'eyevinn-encore-callback-listener', role: 'transcode' },
@@ -40,6 +38,6 @@ export const FFPROBE_SERVICE_ID = 'eyevinn-ffmpeg-s3' as const;
 
 // Teardown order is the reverse of provision order: consumers are removed
 // before the producers they depend on (packager -> callback listener -> encore
-// -> queue -> databases -> storage). This avoids tearing a producer out from
+// -> queue -> database -> storage). This avoids tearing a producer out from
 // under a still-running consumer.
 export const TEARDOWN_ORDER: readonly StackService[] = [...STACK_SERVICES].reverse();

@@ -46,7 +46,6 @@ const responseSchema = z.object({
   name: z.string(),
   minioEndpoint: z.string(),
   couchdbUrl: z.string(),
-  databaseUrl: z.string(),
   redisUrl: z.string(),
   encoreUrl: z.string(),
   encoreCallbackUrl: z.string()
@@ -108,7 +107,6 @@ type ProvisionRouterOptions = {
 const storedConfigSchema = z.object({
   minioEndpoint: z.string(),
   couchdbUrl: z.string(),
-  databaseUrl: z.string(),
   redisUrl: z.string(),
   encoreUrl: z.string(),
   encoreCallbackUrl: z.string(),
@@ -126,50 +124,13 @@ type Instance = { url?: string } & Record<string, unknown>;
 
 // Resolve the public HTTP service URL from a freshly created instance object.
 // Suitable for services accessed over HTTP (MinIO console/S3 endpoint, CouchDB,
-// Encore, callback listener). NOT suitable for raw TCP database/cache
-// connections (PostgreSQL, Valkey) — see databaseUrlFrom / redisUrlFrom.
+// Encore, callback listener). NOT suitable for raw TCP cache
+// connections (Valkey) — see redisUrlFrom.
 function instanceUrl(instance: Instance): string {
   if (typeof instance.url === 'string' && instance.url.length > 0) {
     return instance.url;
   }
   throw new Error('instance did not return a usable url');
-}
-
-// Read a string field from an instance object if present and non-empty.
-function instanceField(instance: Instance, key: string): string | undefined {
-  const value = instance[key];
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
-// PostgreSQL connection string. The birme-osc-postgresql instance exposes a
-// ready-to-use connection URL on a service-specific field. Field name not yet
-// confirmed against a live instance; we probe the known candidates and fall
-// back to reconstructing from the supplied credentials + instance host.
-// FLAGGED FOR SMOKE-TEST VERIFICATION: confirm the exact field name against a
-// live birme-osc-postgresql instance and drop the fallback once known.
-function databaseUrlFrom(
-  instance: Instance,
-  opts: { user: string; password: string; db: string }
-): string {
-  const candidates = [
-    'PostgresUrl',
-    'postgresUrl',
-    'connectionUrl',
-    'ConnectionUrl',
-    'databaseUrl',
-    'DatabaseUrl'
-  ];
-  for (const key of candidates) {
-    const value = instanceField(instance, key);
-    if (value) {
-      return value;
-    }
-  }
-  // Fallback: reconstruct from the HTTP service URL host. The .url field is the
-  // HTTP service URL; we extract its host and assume the standard Postgres port.
-  const httpUrl = instanceUrl(instance);
-  const host = new URL(httpUrl).hostname;
-  return `postgresql://${opts.user}:${encodeURIComponent(opts.password)}@${host}:5432/${opts.db}`;
 }
 
 // Valkey (Redis-compatible) connection string.
@@ -242,12 +203,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
   // Secret naming convention (ADR-002): <stackName>.<purpose>. Secrets are
   // per-service-scoped (a secret saved for one serviceId cannot be referenced
-  // from another) and write-once / never-read-back. PostgreSQL reuses the MinIO
-  // root password as its DB password; Encore and the packager reuse it as their
-  // S3 secret. Each consuming service still needs its own saveSecret call.
+  // from another) and write-once / never-read-back. Encore and the packager
+  // reuse the MinIO root password as their S3 secret. Each consuming service
+  // still needs its own saveSecret call.
   const ROOTPASSWORD = 'rootpassword';
   const ADMINPASSWORD = 'adminpassword';
-  const PGPASSWORD = 'pgpassword';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -371,37 +331,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         await waitForInstanceReady('apache-couchdb', name, osc);
         const couchdbUrl = instanceUrl(couchdb);
 
-        // 3. PostgreSQL — relational store and full-text search index.
-        currentService = 'birme-osc-postgresql';
-        // PostgreSQL reuses the MinIO root password as its DB password, but the
-        // secret is scoped to its own serviceId under a distinct purpose.
-        const postgresPasswordRef = await secretRef(
-          'birme-osc-postgresql',
-          PGPASSWORD,
-          minioRootPassword
-        );
-        const postgres = await provision('birme-osc-postgresql', {
-          PostgresUser: 'openvideocore',
-          PostgresPassword: postgresPasswordRef,
-          PostgresDb: 'openvideocore'
-        });
-        await waitForInstanceReady('birme-osc-postgresql', name, osc);
-        // The connection URL we hand back to the operator embeds the literal
-        // password — it is a direct client connection string, not an OSC
-        // service config field, so it cannot use a {{secrets.*}} reference.
-        const databaseUrl = databaseUrlFrom(postgres, {
-          user: 'openvideocore',
-          password: minioRootPassword,
-          db: 'openvideocore'
-        });
-
-        // 4. Valkey — queue / coordination backbone.
+        // 3. Valkey — queue / coordination backbone.
         currentService = 'valkey-io-valkey';
         await provision('valkey-io-valkey', {});
         await waitForInstanceReady('valkey-io-valkey', name, osc);
         const redisUrl = await redisUrlFrom(osc, 'valkey-io-valkey', name);
 
-        // 5. Encore — transcoding engine. Uses MinIO as its S3 backend.
+        // 4. Encore — transcoding engine. Uses MinIO as its S3 backend.
         // Slowest service to become ready (Essential tier); wait before
         // configuring the callback listener with its URL.
         currentService = 'encore';
@@ -420,7 +356,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         await waitForInstanceReady('encore', name, osc);
         const encoreUrl = instanceUrl(encore);
 
-        // 6. Encore callback listener — bridges Encore completion to the queue.
+        // 5. Encore callback listener — bridges Encore completion to the queue.
         currentService = 'eyevinn-encore-callback-listener';
         const callback = await provision('eyevinn-encore-callback-listener', {
           RedisUrl: redisUrl,
@@ -433,7 +369,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         );
         const encoreCallbackUrl = instanceUrl(callback);
 
-        // 7. Encore packager — consumes the queue and produces streaming output.
+        // 6. Encore packager — consumes the queue and produces streaming output.
         currentService = 'eyevinn-encore-packager';
         const pat = osc.getPersonalAccessToken();
         if (!pat) {
@@ -472,7 +408,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const stackConfig: StackConfig = {
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
-            databaseUrl: stripCredentials(databaseUrl),
             redisUrl,
             encoreUrl,
             encoreCallbackUrl,
@@ -505,7 +440,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           name,
           minioEndpoint,
           couchdbUrl,
-          databaseUrl,
           redisUrl,
           encoreUrl,
           encoreCallbackUrl
@@ -525,7 +459,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             await paramStore.storeStackConfig(workspaceId, name, {
               minioEndpoint: '',
               couchdbUrl: '',
-              databaseUrl: '',
               redisUrl: '',
               encoreUrl: '',
               encoreCallbackUrl: '',

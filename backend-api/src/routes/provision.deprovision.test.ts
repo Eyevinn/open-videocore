@@ -61,7 +61,6 @@ beforeEach(() => {
 const STORED_CONFIG = {
   minioEndpoint: 'https://minio.example.osaas.io',
   couchdbUrl: 'https://couch.example.osaas.io',
-  databaseUrl: 'postgresql://host.example.osaas.io:5432/openvideocore',
   redisUrl: 'redis://valkey.svc.cluster.local:6379',
   encoreUrl: 'https://encore.example.osaas.io',
   encoreCallbackUrl: 'https://callback.example.osaas.io',
@@ -70,7 +69,6 @@ const STORED_CONFIG = {
   services: [
     { serviceId: 'minio-minio', instanceName: 'mystack' },
     { serviceId: 'apache-couchdb', instanceName: 'mystack' },
-    { serviceId: 'birme-osc-postgresql', instanceName: 'mystack' },
     { serviceId: 'valkey-io-valkey', instanceName: 'mystack' },
     { serviceId: 'encore', instanceName: 'mystack' },
     { serviceId: 'eyevinn-encore-callback-listener', instanceName: 'mystack' },
@@ -230,7 +228,6 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
   const storedConfig = {
     minioEndpoint: 'https://minio.example.osaas.io',
     couchdbUrl: 'https://couch.example.osaas.io',
-    databaseUrl: 'postgresql://host.example.osaas.io:5432/openvideocore',
     redisUrl: 'redis://valkey.svc.cluster.local:6379',
     encoreUrl: 'https://encore.example.osaas.io',
     encoreCallbackUrl: 'https://callback.example.osaas.io',
