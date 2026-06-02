@@ -1,13 +1,16 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
-import { Context } from '@osaas/client-core';
+import { Context, createInstance, getInstance } from '@osaas/client-core';
 import {
   serializerCompiler,
   validatorCompiler
 } from 'fastify-type-provider-zod';
 import { provisionRouter } from './routes/provision.js';
-import { paramStoreFromEnv } from './services/param-store.js';
+import {
+  ensureParameterStore,
+  paramStoreFromEnv
+} from './services/param-store.js';
 import { registerAuth } from './auth/middleware.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
@@ -65,6 +68,18 @@ if (!paramStore) {
   app.log.warn(
     'PARAMETER_STORE_URL/API_KEY not set — provisioned stack coordinates will not be persisted'
   );
+} else {
+  // First-startup bootstrap (issue #35): create the eyevinn-app-config-svc
+  // instance if it does not exist yet. Idempotent and non-fatal — a failure is
+  // logged and startup continues.
+  await ensureParameterStore({
+    osc: {
+      getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
+      getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat),
+      createInstance: (serviceId, sat, body) => createInstance(oscContext, serviceId, sat, body)
+    },
+    log: app.log
+  });
 }
 
 await app.register(provisionRouter, {
