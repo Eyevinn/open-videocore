@@ -31,6 +31,8 @@ import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
+import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
+import type { RewrapRunner } from './pipeline/rewrap.js';
 import { internalRouter } from './routes/internal.js';
 import { adminRouter } from './routes/admin.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
@@ -221,6 +223,21 @@ const thumbnailExtractor: FrameExtractor | undefined = storage
     })
   : undefined;
 
+// Export / re-wrap (issue #19) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to
+// remux a stored object into a different container with `-c copy` (no
+// re-encode), writing the new child asset back to MinIO via a presigned PUT
+// URL. Like the thumbnail runner it needs both an OSC context and object
+// storage; when either is missing POST /:id/export responds 501.
+const rewrapRunner: RewrapRunner | undefined = storage
+  ? makeOscRewrapRunner({
+      context: oscContext,
+      createJob,
+      waitForJobToComplete,
+      getLogsForInstance,
+      removeJob
+    })
+  : undefined;
+
 // ABR transcoding (issue #8). Encore is a long-lived OSC instance; we submit
 // jobs to its REST API and receive completion via the encore-callback listener.
 // Enabled only when ENCORE_URL is set; otherwise POST /:id/transcode responds
@@ -257,7 +274,8 @@ await app.register(assetsRouter, {
   sourceBucket,
   outputBucket,
   thumbnailExtractor,
-  thumbnailPublicBaseUrl: process.env['THUMBNAIL_PUBLIC_BASE_URL']
+  thumbnailPublicBaseUrl: process.env['THUMBNAIL_PUBLIC_BASE_URL'],
+  rewrapRunner
 });
 
 await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository });

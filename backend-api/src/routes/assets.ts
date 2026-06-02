@@ -47,6 +47,13 @@ import {
 } from '../pipeline/thumbnail.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { PRESET_NAMES, type EncoreProfile } from '../pipeline/encode-presets.js';
+import {
+  rewrap,
+  REWRAP_FORMATS,
+  UnsupportedFormatError,
+  type RewrapDeps,
+  type RewrapRunner
+} from '../pipeline/rewrap.js';
 
 const statusSchema = z.enum(ASSET_STATUSES);
 
@@ -140,6 +147,14 @@ const thumbnailsBodySchema = z.object({
 const thumbnailsResultSchema = z.object({
   assetId: z.string(),
   thumbnails: z.array(z.string())
+});
+
+// Export / re-wrap request (issue #19): the target container format and an
+// optional name for the new child asset. The supported formats are validated
+// with a Zod enum so an unsupported container is a 400 at the boundary.
+const exportBodySchema = z.object({
+  targetFormat: z.enum(REWRAP_FORMATS),
+  outputName: z.string().min(1).max(256).optional()
 });
 
 const transitionSchema = z.object({
@@ -306,6 +321,14 @@ type AssetsRouterOptions = {
   // Public base URL for building thumbnail URLs in GET responses. When unset,
   // GET returns workspace-local object keys instead of absolute URLs.
   thumbnailPublicBaseUrl?: string;
+  // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
+  // job (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
+  // object storage), POST /:id/export responds 501.
+  rewrapRunner?: RewrapRunner;
+  // Injectable rewrap orchestrator + extra deps (tests stub the runner/TTL).
+  // Defaults to the real awaited rewrap pipeline.
+  rewrap?: typeof rewrap;
+  rewrapDeps?: Partial<RewrapDeps>;
 };
 
 const ingestUrlSchema = z.object({
@@ -326,6 +349,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const runner = opts.runPull ?? runPull;
   const extractRunner = opts.extract ?? extractTechnicalMetadata;
   const thumbnailRunner = opts.extractThumbnails ?? extractThumbnails;
+  const rewrapRunner = opts.rewrap ?? rewrap;
   const storageFor = opts.storageFor;
 
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
@@ -367,6 +391,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     if (err instanceof SourceTooLargeError) {
       return reply.code(413).send({ error: 'source_too_large', message: err.message });
+    }
+    if (err instanceof UnsupportedFormatError) {
+      return reply.code(400).send({ error: 'unsupported_format', message: err.message });
     }
     throw err;
   });
@@ -718,6 +745,75 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'thumbnail_extraction_failed', message });
+      }
+    }
+  );
+
+  // Export / re-wrap (remux) an asset into a different container (issue #19).
+  // Workspace-scoped and behind `authenticate`. Copies every stream verbatim
+  // (`-c copy`) into a new container chosen by `targetFormat`, producing a NEW
+  // child asset (parentId = source). Like thumbnails this is AWAITED: the caller
+  // gets back the new child asset synchronously (201). The source is unchanged.
+  //   201 — re-wrapped, the new child asset returned
+  //   400 — unsupported target format (validated by the enum / pipeline guard)
+  //   404 — unknown/foreign source asset (existence not leaked)
+  //   409 — the source asset has no stored object to re-wrap
+  //   501 — export / re-wrap is not configured on this deployment
+  //   502 — the OSC ffmpeg job failed
+  app.post(
+    '/:id/export',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: exportBodySchema,
+        response: {
+          201: assetSchema,
+          400: errorSchema,
+          404: errorSchema,
+          409: errorSchema,
+          501: errorSchema,
+          502: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      if (!asset.objectKey) {
+        return reply.code(409).send({
+          error: 'no_object',
+          message: 'asset has no stored object to re-wrap'
+        });
+      }
+      if (!opts.rewrapRunner || !storageFor) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'export / re-wrap is not configured'
+        });
+      }
+      try {
+        const child = await rewrapRunner(
+          {
+            workspaceId: request.workspaceId,
+            sourceAssetId: asset.id,
+            objectKey: asset.objectKey,
+            targetFormat: request.body.targetFormat,
+            outputName: request.body.outputName
+          },
+          {
+            assets: repo,
+            storage: storageFor(request.workspaceId),
+            runner: opts.rewrapRunner,
+            ...opts.rewrapDeps
+          }
+        );
+        return reply.code(201).send(child);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(502).send({ error: 'rewrap_failed', message });
       }
     }
   );
