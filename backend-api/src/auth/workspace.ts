@@ -40,6 +40,11 @@ function environment(): string {
 // with a tenant. All external calls are timeout-bounded and error-handled per
 // the project code standards.
 export async function resolveWorkspaceId(token: string | undefined): Promise<string> {
+  // Local dev bypass: set DEV_WORKSPACE_ID to skip OSC token validation.
+  // Never set this in production — the OSC login wall provides the real token.
+  const devWorkspace = process.env['DEV_WORKSPACE_ID'];
+  if (devWorkspace) return devWorkspace;
+
   if (!token || token.trim().length === 0) {
     throw new AuthError('missing access token');
   }
