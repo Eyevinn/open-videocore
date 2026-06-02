@@ -26,10 +26,11 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
-import type { PackagingService } from '../pipeline/packaging.js';
+import { parsePackagingId, type PackagingService } from '../pipeline/packaging.js';
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
+import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 
 const packagerCallbackSchema = z.object({
   packagingId: z.string().min(1),
@@ -87,6 +88,11 @@ type InternalRouterOptions = {
   // encore-callback endpoint responds 501.
   jobRepository?: JobRepository;
   repository?: AssetRepository;
+  // Webhook event dispatcher (issue #13). When set, asset/job lifecycle events
+  // surfaced by these callbacks are delivered to the workspace's registered
+  // webhooks. Fire-and-forget: a delivery failure never affects the callback
+  // response. Absent on deployments with webhooks disabled.
+  webhookDispatcher?: WebhookDispatcher;
 };
 
 function normaliseRenditions(
@@ -131,6 +137,20 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       const applied = await opts.packaging.handleCallback(request.body);
       if (!applied) {
         return reply.code(404).send({ error: 'not_found' });
+      }
+      // Notify subscribers (issue #13). Fire-and-forget; the parsed packagingId
+      // is the same workspace+asset the callback just applied. A delivery
+      // failure never affects this 200 response.
+      const parsed = parsePackagingId(request.body.packagingId);
+      if (parsed && opts.webhookDispatcher) {
+        const failed = request.body.status === 'failed';
+        void opts.webhookDispatcher.dispatch(parsed.workspaceId, {
+          type: failed ? 'package.failed' : 'package.complete',
+          payload: {
+            assetId: parsed.assetId,
+            error: failed ? (request.body.error ?? 'packaging failed') : undefined
+          }
+        });
       }
       return reply.code(200).send({ ok: true });
     }
@@ -177,6 +197,36 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         },
         { jobs: jobRepository, assets: repository }
       );
+
+      // Notify subscribers (issue #13). Fire-and-forget; only emitted when the
+      // callback actually applied (not a duplicate/late no-op) so a redelivered
+      // Encore callback never double-fires events. A delivery failure never
+      // affects this 200 response.
+      if (result.applied && opts.webhookDispatcher) {
+        const { workspaceId } = found;
+        const assetId = found.job.assetId;
+        if (success) {
+          void opts.webhookDispatcher.dispatch(workspaceId, {
+            type: 'transcode.complete',
+            payload: { assetId, renditionAssetIds: result.renditionAssetIds }
+          });
+          // The source asset returns to `ready` once its renditions exist.
+          void opts.webhookDispatcher.dispatch(workspaceId, {
+            type: 'asset.ready',
+            payload: { assetId }
+          });
+        } else {
+          const error = message ?? `encore status: ${status}`;
+          void opts.webhookDispatcher.dispatch(workspaceId, {
+            type: 'transcode.failed',
+            payload: { assetId, error }
+          });
+          void opts.webhookDispatcher.dispatch(workspaceId, {
+            type: 'asset.failed',
+            payload: { assetId, error }
+          });
+        }
+      }
 
       return reply.code(200).send(result);
     }
