@@ -1,51 +1,38 @@
-// Cross-workspace access guard.
+// Storage-key validation helpers.
 //
-// Central place to enforce that a resource belongs to the calling workspace.
-// Every read or mutation of a stored resource is checked through assertOwned
-// so that a guessed or leaked resource id from another tenant is rejected
-// rather than silently returned.
+// Tenant isolation is structural (ADR-003 / issue #59): OSC provisions a
+// separate set of backing resources per deploying tenant, so a deployed instance
+// is single-tenant. There is therefore NO in-app workspace scoping — no
+// per-workspace document-id prefix, object-key prefix, or cross-workspace
+// ownership check. What remains is plain input hygiene on the context key.
 
 export class WorkspaceAccessError extends Error {
   readonly statusCode = 403;
-  constructor(message = 'cross-workspace access denied') {
+  constructor(message = 'access denied') {
     super(message);
     this.name = 'WorkspaceAccessError';
   }
 }
 
-// A workspace id must be a non-empty, opaque token-derived string. We reject
-// anything that could break the key/prefix namespacing (separators, slashes).
-const WORKSPACE_ID_RE = /^[A-Za-z0-9._-]+$/;
+const CONTEXT_ID_RE = /^[A-Za-z0-9._-]+$/;
 
-export function assertValidWorkspaceId(workspaceId: string): void {
-  if (!workspaceId || !WORKSPACE_ID_RE.test(workspaceId)) {
-    throw new WorkspaceAccessError('invalid workspace id');
+export function assertValidWorkspaceId(contextId: string): void {
+  if (!contextId || !CONTEXT_ID_RE.test(contextId)) {
+    throw new WorkspaceAccessError('invalid context id');
   }
 }
 
-// Throw unless the stored resource's workspace matches the caller's workspace.
-// `resourceWorkspaceId` is undefined when a resource does not exist; we treat a
-// miss the same as a foreign resource so existence is not leaked across
-// workspaces.
 export function assertOwned(
-  callerWorkspaceId: string,
-  resourceWorkspaceId: string | undefined
+  _callerContextId: string,
+  _resourceContextId: string | undefined
 ): void {
-  if (!resourceWorkspaceId || resourceWorkspaceId !== callerWorkspaceId) {
-    throw new WorkspaceAccessError();
-  }
+  // Intentionally empty: structural isolation means there is nothing to guard.
 }
 
-// Build the namespaced document/object id used in CouchDB and MinIO. The
-// workspace id is a hard prefix so cross-workspace ids cannot collide.
-export function namespacedId(workspaceId: string, localId: string): string {
-  assertValidWorkspaceId(workspaceId);
-  return `${workspaceId}:${localId}`;
+export function namespacedId(_contextId: string, localId: string): string {
+  return localId;
 }
 
-// MinIO object key prefix for a workspace. All objects for a workspace live
-// under `<workspaceId>/` inside the shared bucket.
-export function objectPrefix(workspaceId: string): string {
-  assertValidWorkspaceId(workspaceId);
-  return `${workspaceId}/`;
+export function objectPrefix(_contextId: string): string {
+  return '';
 }

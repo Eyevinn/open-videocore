@@ -1,17 +1,20 @@
-// Workspace identity resolution.
+// Request authentication gate.
 //
-// open-videocore is gated behind the OSC login-wall (ADR-001, open question 2):
-// every caller authenticates with an OSC access token. That token resolves to
-// an OSC tenant, and the tenant id IS the workspace id. All resources are
-// namespaced by this workspace id so that tenants sharing a single deployment
-// never see each other's data.
+// open-videocore is gated behind the OSC platform auth wall (ADR-003): every
+// inbound request reaches the process only after the platform has authenticated
+// the caller. The auth wall is treated as a PURE GATE — open-videocore does not
+// read a per-request workspace/tenant identifier, because tenant isolation is
+// structural: OSC provisions a separate set of backing resources (CouchDB,
+// PostgreSQL, MinIO, Encore) per deploying tenant, so a deployed instance IS the
+// tenant's workspace. There is no shared backing store across tenants and thus
+// no in-app workspace scoping to perform.
 //
-// We resolve a token to its tenant by calling the OSC `mysubscriptions`
-// endpoint with the token as the `x-pat-jwt` bearer. A token that OSC accepts
-// and that maps to a tenant is, by definition, valid for this deployment. The
-// resolution is cached briefly to avoid a round-trip to OSC on every request.
-
-import { createFetch } from '@osaas/client-core';
+// Previously this module called the OSC `mysubscriptions` endpoint to resolve a
+// token to a tenant id used as a per-request workspace scope. That resolution is
+// REMOVED (ADR-003 / issue #59): there is no tenant to resolve and nothing to
+// scope. We only require a bearer token to be present so a deployment
+// accidentally exposed without the wall (or an off-OSC deployment behind an
+// equivalent proxy) rejects anonymous traffic rather than serving it.
 
 export class AuthError extends Error {
   constructor(message: string) {
@@ -20,78 +23,30 @@ export class AuthError extends Error {
   }
 }
 
-type Subscription = { serviceId: string; tenantId: string };
+// The single, deployment-wide resource context. A deployed instance is one
+// tenant's workspace (ADR-003), so all data lives in one context. This constant
+// is the stable key handed to the backing-stack resolver and repositories; it is
+// NOT a tenant identifier derived from the request.
+export const DEPLOYMENT_CONTEXT = 'default';
 
-type CacheEntry = { workspaceId: string; expiresAt: number };
-
-// Short TTL: a token that is revoked on OSC should stop working quickly, but we
-// still want to avoid a network call on every single request in a burst.
-const CACHE_TTL_MS = 60_000;
-const RESOLVE_TIMEOUT_MS = 5_000;
-
-const cache = new Map<string, CacheEntry>();
-
-function environment(): string {
-  return process.env['OSC_ENVIRONMENT'] ?? 'prod';
-}
-
-// Resolve an OSC access token to the workspace (tenant) id it belongs to.
-// Throws AuthError if the token is missing, rejected by OSC, or not associated
-// with a tenant. All external calls are timeout-bounded and error-handled per
-// the project code standards.
+// Gate an inbound request. Returns the fixed deployment context when a bearer
+// token is present (the OSC auth wall has already authenticated it upstream);
+// throws AuthError when no token is present so anonymous traffic is rejected.
+//
+// Retains the historical name `resolveWorkspaceId` for callers and test doubles,
+// but it no longer resolves a tenant — it is a pure presence gate. The token is
+// intentionally not inspected for identity.
 export async function resolveWorkspaceId(token: string | undefined): Promise<string> {
-  // Local dev bypass: set DEV_WORKSPACE_ID to skip OSC token validation.
-  // Never set this in production — the OSC login wall provides the real token.
-  const devWorkspace = process.env['DEV_WORKSPACE_ID'];
-  if (devWorkspace) return devWorkspace;
-
+  if (process.env['DEV_WORKSPACE_ID']) {
+    return process.env['DEV_WORKSPACE_ID'] as string;
+  }
   if (!token || token.trim().length === 0) {
     throw new AuthError('missing access token');
   }
-
-  const cached = cache.get(token);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.workspaceId;
-  }
-
-  const url = new URL(`https://catalog.svc.${environment()}.osaas.io/mysubscriptions`);
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RESOLVE_TIMEOUT_MS);
-
-  let subscriptions: Subscription[];
-  try {
-    subscriptions = (await createFetch<Subscription[]>(url, {
-      method: 'GET',
-      headers: {
-        'x-pat-jwt': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      signal: controller.signal
-    })) as Subscription[];
-  } catch (err) {
-    // Any failure to validate the token against OSC is treated as an auth
-    // failure, not a server error: we cannot establish who the caller is.
-    const message = err instanceof Error ? err.message : String(err);
-    throw new AuthError(`token validation failed: ${message}`);
-  } finally {
-    clearTimeout(timer);
-  }
-
-  const tenantId = Array.isArray(subscriptions)
-    ? subscriptions.find((s) => typeof s.tenantId === 'string' && s.tenantId.length > 0)
-        ?.tenantId
-    : undefined;
-
-  if (!tenantId) {
-    throw new AuthError('token is not associated with a workspace');
-  }
-
-  cache.set(token, { workspaceId: tenantId, expiresAt: Date.now() + CACHE_TTL_MS });
-  return tenantId;
+  return DEPLOYMENT_CONTEXT;
 }
 
-// Test-only: clear the resolution cache between cases.
+// Test-only no-op retained for source compatibility (no resolution cache exists).
 export function _clearWorkspaceCache(): void {
-  cache.clear();
+  // nothing to clear: no tenant resolution / cache exists.
 }

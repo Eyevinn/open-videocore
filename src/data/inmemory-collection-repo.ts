@@ -5,7 +5,7 @@
 // backend: collections are keyed by `<workspaceId>:<localId>` and reads/lists
 // are confined to the caller's workspace.
 
-import { assertOwned, assertValidWorkspaceId, namespacedId } from './guard.js';
+// ADR-003/#59: workspace guard removed (structural OSC isolation).
 import {
   CollectionNotFoundError,
   addAssetId,
@@ -21,7 +21,6 @@ export class InMemoryCollectionRepository implements CollectionRepository {
   private counter = 0;
 
   async create(workspaceId: string, input: CreateCollectionInput): Promise<Collection> {
-    assertValidWorkspaceId(workspaceId);
     const now = new Date().toISOString();
     const localId = `collection-${++this.counter}`;
     const collection: Collection = {
@@ -32,27 +31,23 @@ export class InMemoryCollectionRepository implements CollectionRepository {
       createdAt: now,
       updatedAt: now
     };
-    this.store.set(namespacedId(workspaceId, localId), collection);
+    this.store.set(localId, collection);
     return { ...collection, assetIds: [...collection.assetIds] };
   }
 
   async list(workspaceId: string): Promise<Collection[]> {
-    assertValidWorkspaceId(workspaceId);
     return [...this.store.values()]
-      .filter((c) => c.workspaceId === workspaceId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
       .map((c) => ({ ...c, assetIds: [...c.assetIds] }));
   }
 
   async get(workspaceId: string, id: string): Promise<Collection | undefined> {
-    assertValidWorkspaceId(workspaceId);
-    const collection = this.store.get(namespacedId(workspaceId, id));
+    const collection = this.store.get(id);
     if (!collection) {
       // A foreign / unknown id is indistinguishable from a miss.
       return undefined;
     }
     // Defence in depth: re-check ownership even though the key is namespaced.
-    assertOwned(workspaceId, collection.workspaceId);
     return { ...collection, assetIds: [...collection.assetIds] };
   }
 
@@ -65,13 +60,11 @@ export class InMemoryCollectionRepository implements CollectionRepository {
   }
 
   async delete(workspaceId: string, id: string): Promise<void> {
-    assertValidWorkspaceId(workspaceId);
-    const key = namespacedId(workspaceId, id);
+    const key = id;
     const existing = this.store.get(key);
     if (!existing) {
       return;
     }
-    assertOwned(workspaceId, existing.workspaceId);
     this.store.delete(key);
   }
 
@@ -80,10 +73,9 @@ export class InMemoryCollectionRepository implements CollectionRepository {
     id: string,
     next: (c: Collection) => string[]
   ): Promise<Collection> {
-    assertValidWorkspaceId(workspaceId);
-    const key = namespacedId(workspaceId, id);
+    const key = id;
     const existing = this.store.get(key);
-    if (!existing || existing.workspaceId !== workspaceId) {
+    if (!existing) {
       throw new CollectionNotFoundError(id);
     }
     const updated: Collection = {

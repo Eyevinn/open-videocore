@@ -17,6 +17,7 @@ import {
   type UpdateJobInput
 } from './job-repo.js';
 import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
+import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
 
 const RESOURCE_TYPE = 'job';
 
@@ -132,7 +133,7 @@ function toDoc(job: Job): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): Job {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: doc.workspaceId,
+    workspaceId: DEPLOYMENT_CONTEXT,
     type: doc['type'] as JobType,
     status: doc['status'] as JobStatus,
     assetId: String(doc['assetId'] ?? ''),

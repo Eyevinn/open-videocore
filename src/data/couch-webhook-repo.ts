@@ -7,6 +7,7 @@
 // (existence is not leaked) and is never read or deleted cross-workspace.
 
 import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
+import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
 import type {
   CreateWebhookInput,
   WebhookRegistration,
@@ -68,7 +69,7 @@ function toDoc(registration: WebhookRegistration): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): WebhookRegistration {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: doc.workspaceId,
+    workspaceId: DEPLOYMENT_CONTEXT,
     url: String(doc['url'] ?? ''),
     events: (doc['events'] as string[] | undefined) ?? [],
     secret: doc['secret'] as string | undefined,

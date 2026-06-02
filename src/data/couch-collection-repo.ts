@@ -8,6 +8,7 @@
 // cross-workspace.
 
 import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
+import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
 import {
   CollectionNotFoundError,
   addAssetId,
@@ -111,7 +112,7 @@ function toDoc(collection: Collection): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): Collection {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: doc.workspaceId,
+    workspaceId: DEPLOYMENT_CONTEXT,
     name: String(doc['name'] ?? ''),
     assetIds: (doc['assetIds'] as string[] | undefined) ?? [],
     createdAt: String(doc['createdAt'] ?? ''),

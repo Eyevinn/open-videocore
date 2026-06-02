@@ -124,7 +124,7 @@ describe('webhook registration CRUD (issue #13)', () => {
   });
 
   describe('workspace isolation', () => {
-    it('does not list another workspace registrations', async () => {
+    it.skip('does not list another workspace registrations', async () => {
       const { app } = await buildApp();
       await register(app, A, { url: 'https://a.example/hook', events: ['asset.ready'] });
 
@@ -132,7 +132,7 @@ describe('webhook registration CRUD (issue #13)', () => {
       expect(listB.json().webhooks).toHaveLength(0);
     });
 
-    it('cannot delete another workspace registration (no-op, no leak)', async () => {
+    it.skip('cannot delete another workspace registration (no-op, no leak)', async () => {
       const { app } = await buildApp();
       const created = await register(app, A, {
         url: 'https://a.example/hook',
@@ -169,7 +169,10 @@ describe('WebhookDispatcher (issue #13)', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('https://hit.example');
   });
 
-  it('does not deliver to other workspaces', async () => {
+  // ADR-003 / issue #59: in-app workspace scoping is removed (structural OSC
+  // tenant isolation). A single deployment is one tenant, so there is no
+  // cross-workspace delivery boundary to enforce in the dispatcher.
+  it.skip('does not deliver to other workspaces', async () => {
     const repo = new InMemoryWebhookRepository();
     await repo.create('workspace-b', { url: 'https://b.example', events: ['asset.ready'] });
 

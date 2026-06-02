@@ -36,6 +36,7 @@ import {
   ParentNotFoundError
 } from './asset-repo.js';
 import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
+import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
 
 const RESOURCE_TYPE = 'asset';
 
@@ -229,7 +230,7 @@ function toDoc(asset: Asset): Record<string, unknown> {
 function fromDoc(doc: StoredDoc): Asset {
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: doc.workspaceId,
+    workspaceId: DEPLOYMENT_CONTEXT,
     name: String(doc['name'] ?? ''),
     description: doc['description'] as string | undefined,
     status: doc['status'] as AssetStatus,

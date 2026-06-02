@@ -7,31 +7,22 @@ import {
   WorkspaceAccessError
 } from '../src/data/guard.js';
 
-describe('workspace guard primitives', () => {
-  it('namespaces ids with the workspace as a hard prefix', () => {
-    expect(namespacedId('ws1', 'asset-9')).toBe('ws1:asset-9');
+// ADR-003 / issue #59: in-app workspace scoping is removed (OSC provides
+// structural tenant isolation — a deployed instance is one tenant's workspace).
+describe('storage-key guard primitives (post issue #59)', () => {
+  it('does not namespace ids — the local id is the document id', () => {
+    expect(namespacedId('ctx', 'asset-9')).toBe('asset-9');
   });
-
-  it('builds a per-workspace object prefix', () => {
-    expect(objectPrefix('ws1')).toBe('ws1/');
+  it('uses no object-key prefix', () => {
+    expect(objectPrefix('ctx')).toBe('');
   });
-
-  it('rejects invalid workspace ids that could break namespacing', () => {
+  it('still validates a context id for input hygiene', () => {
     expect(() => assertValidWorkspaceId('')).toThrow(WorkspaceAccessError);
     expect(() => assertValidWorkspaceId('a/b')).toThrow(WorkspaceAccessError);
-    expect(() => assertValidWorkspaceId('a:b')).toThrow(WorkspaceAccessError);
     expect(() => assertValidWorkspaceId('ok-id_1.2')).not.toThrow();
   });
-
-  it('allows a resource owned by the caller', () => {
-    expect(() => assertOwned('ws1', 'ws1')).not.toThrow();
-  });
-
-  it('rejects a resource owned by another workspace', () => {
-    expect(() => assertOwned('ws1', 'ws2')).toThrow(WorkspaceAccessError);
-  });
-
-  it('rejects a missing resource (no existence leak)', () => {
-    expect(() => assertOwned('ws1', undefined)).toThrow(WorkspaceAccessError);
+  it('no longer rejects on ownership — single tenant per deployment', () => {
+    expect(() => assertOwned('ctx', 'other')).not.toThrow();
+    expect(() => assertOwned('ctx', undefined)).not.toThrow();
   });
 });

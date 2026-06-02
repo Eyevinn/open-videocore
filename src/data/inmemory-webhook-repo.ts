@@ -5,7 +5,7 @@
 // backend: registrations are keyed by `<workspaceId>:<localId>` and reads/lists
 // are confined to the caller's workspace.
 
-import { assertOwned, assertValidWorkspaceId, namespacedId } from './guard.js';
+// ADR-003/#59: workspace guard removed (structural OSC isolation).
 import type {
   CreateWebhookInput,
   WebhookRegistration,
@@ -18,7 +18,6 @@ export class InMemoryWebhookRepository implements WebhookRepository {
   private counter = 0;
 
   async create(workspaceId: string, input: CreateWebhookInput): Promise<WebhookRegistration> {
-    assertValidWorkspaceId(workspaceId);
     const now = new Date().toISOString();
     const localId = `webhook-${++this.counter}`;
     const registration: WebhookRegistration = {
@@ -29,21 +28,18 @@ export class InMemoryWebhookRepository implements WebhookRepository {
       secret: input.secret,
       createdAt: now
     };
-    this.store.set(namespacedId(workspaceId, localId), registration);
+    this.store.set(localId, registration);
     return { ...registration };
   }
 
   async list(workspaceId: string): Promise<WebhookRegistration[]> {
-    assertValidWorkspaceId(workspaceId);
     return [...this.store.values()]
-      .filter((w) => w.workspaceId === workspaceId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
       .map((w) => ({ ...w }));
   }
 
   async delete(workspaceId: string, id: string): Promise<void> {
-    assertValidWorkspaceId(workspaceId);
-    const key = namespacedId(workspaceId, id);
+    const key = id;
     const existing = this.store.get(key);
     if (!existing) {
       // A foreign / unknown id is indistinguishable from a miss: existence is
@@ -51,7 +47,6 @@ export class InMemoryWebhookRepository implements WebhookRepository {
       return;
     }
     // Defence in depth: re-check ownership even though the key is namespaced.
-    assertOwned(workspaceId, existing.workspaceId);
     this.store.delete(key);
   }
 }
