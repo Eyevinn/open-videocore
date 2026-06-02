@@ -106,7 +106,7 @@ export type WatchFolderOptions = {
 
 export class WatchFolderService {
   private readonly client: MinioClient;
-  private readonly bucket: string;
+  private bucket: string;
   private readonly repo: AssetRepository;
   private readonly log: WatchFolderLogger;
   private readonly onObjectStored?: (
@@ -143,6 +143,27 @@ export class WatchFolderService {
 
   processedCount(): number {
     return this.processed.size;
+  }
+
+  // The bucket currently being watched. Callers (e.g. the storage router's
+  // per-bucket toggle) read this to decide whether the watch-folder is active
+  // on a given bucket.
+  currentBucket(): string {
+    return this.bucket;
+  }
+
+  // Repoint the watcher at a different source bucket. Stops the current watcher
+  // (detaching any notification listener + poll timer), swaps the bucket, and
+  // restarts if it was running so the change takes effect immediately. A no-op
+  // when the bucket is unchanged. The processed-key set is cleared so the new
+  // bucket is scanned from scratch (its keys are independent of the old one).
+  setBucket(bucket: string): void {
+    if (bucket === this.bucket) return;
+    const wasRunning = this.running;
+    if (wasRunning) this.stop();
+    this.bucket = bucket;
+    this.processed.clear();
+    if (wasRunning) this.start();
   }
 
   // Begin watching. Tries to attach a bucket-notification listener; if that is

@@ -1102,6 +1102,22 @@ async function renderStorageTab(container) {
   title.textContent = 'Storage';
   container.appendChild(title);
 
+  // Create-bucket form
+  const createSection = document.createElement('div');
+  createSection.className = 'section';
+  createSection.innerHTML = [
+    '<div class="section-title">Create bucket</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="bucket-name">Bucket name</label>',
+    '    <input type="text" id="bucket-name" placeholder="my-bucket (3-63 chars, a-z 0-9 -)" />',
+    '  </div>',
+    '  <button id="bucket-create-btn">Create</button>',
+    '</div>',
+    '<div id="bucket-create-msg"></div>',
+  ].join('');
+  container.appendChild(createSection);
+
   // Bucket list section
   const bucketsSection = document.createElement('div');
   bucketsSection.className = 'section';
@@ -1115,43 +1131,99 @@ async function renderStorageTab(container) {
   container.appendChild(browser);
 
   const bucketsWrap = bucketsSection.querySelector('#buckets-wrap');
-  const loader = loadingEl();
-  bucketsWrap.appendChild(loader);
 
-  let buckets = [];
-  try {
-    buckets = await apiFetch('/storage/buckets');
-  } catch (err) {
+  async function loadBuckets() {
+    bucketsWrap.innerHTML = '';
+    const loader = loadingEl();
+    bucketsWrap.appendChild(loader);
+
+    let buckets = [];
+    try {
+      buckets = await apiFetch('/storage/buckets');
+    } catch (err) {
+      loader.remove();
+      showMsg(bucketsWrap, 'Failed to load buckets: ' + err.message, 'error');
+      return;
+    }
     loader.remove();
-    showMsg(bucketsWrap, 'Failed to load buckets: ' + err.message, 'error');
-    return;
-  }
-  loader.remove();
 
-  if (!buckets || buckets.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    empty.textContent = 'No buckets configured.';
-    bucketsWrap.appendChild(empty);
-    return;
-  }
+    if (!buckets || buckets.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No buckets configured.';
+      bucketsWrap.appendChild(empty);
+      return;
+    }
 
-  const cards = document.createElement('div');
-  cards.className = 'bucket-cards';
-  buckets.forEach(function(b) {
-    const card = document.createElement('div');
-    card.className = 'bucket-card';
-    card.innerHTML =
-      '<div class="bucket-card-name">📦 ' + escHtml(b.name) + '</div>' +
-      '<span class="badge ' + (b.role === 'source' ? 'badge-pending' : 'badge-ready') + '">' + escHtml(b.role) + '</span>';
-    card.addEventListener('click', function() {
-      cards.querySelectorAll('.bucket-card').forEach(function(c) { c.classList.remove('active'); });
-      card.classList.add('active');
-      openBucketBrowser(browser, b.name, '');
+    const cards = document.createElement('div');
+    cards.className = 'bucket-cards';
+    buckets.forEach(function(b) {
+      const card = document.createElement('div');
+      card.className = 'bucket-card';
+      const badgeCls = b.role === 'source' ? 'badge-pending' : (b.role === 'packaged' ? 'badge-ready' : 'badge-unknown');
+      card.innerHTML =
+        '<div class="bucket-card-name">📦 ' + escHtml(b.name) + '</div>' +
+        '<span class="badge ' + badgeCls + '">' + escHtml(b.role) + '</span>';
+      card.addEventListener('click', function() {
+        cards.querySelectorAll('.bucket-card').forEach(function(c) { c.classList.remove('active'); });
+        card.classList.add('active');
+        openBucketBrowser(browser, b.name, '');
+      });
+      cards.appendChild(card);
     });
-    cards.appendChild(card);
+    bucketsWrap.appendChild(cards);
+  }
+
+  createSection.querySelector('#bucket-create-btn').addEventListener('click', async function() {
+    const input = createSection.querySelector('#bucket-name');
+    const name = input.value.trim();
+    const msgEl = createSection.querySelector('#bucket-create-msg');
+    msgEl.innerHTML = '';
+    if (!name) { showMsg(msgEl, 'Bucket name is required.', 'error'); return; }
+    if (!/^[a-zA-Z0-9-]{3,63}$/.test(name)) {
+      showMsg(msgEl, 'Name must be 3-63 alphanumeric characters and hyphens.', 'error');
+      return;
+    }
+    try {
+      await apiFetch('/storage/buckets', { method: 'POST', body: JSON.stringify({ name: name }) });
+      showMsg(msgEl, 'Bucket "' + name + '" created.', 'success');
+      input.value = '';
+      await loadBuckets();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
   });
-  bucketsWrap.appendChild(cards);
+
+  await loadBuckets();
+}
+
+async function renderWatchFolderToggle(wfEl, bucket) {
+  wfEl.innerHTML = '';
+  let status;
+  try {
+    status = await apiFetch('/storage/buckets/' + encodeURIComponent(bucket) + '/watch-folder');
+  } catch (err) {
+    // Watch-folder not configured (501) or other error — surface nothing
+    // intrusive; the feature is optional.
+    showMsg(wfEl, 'Watch folder unavailable: ' + err.message, 'info');
+    return;
+  }
+
+  const btn = document.createElement('button');
+  btn.className = 'btn-sm';
+  const active = status.enabled && status.running;
+  btn.textContent = active ? '⏹ Disable watch folder' : '▶ Enable watch folder';
+  btn.addEventListener('click', async function() {
+    btn.disabled = true;
+    try {
+      await apiFetch('/storage/buckets/' + encodeURIComponent(bucket) + '/watch-folder/toggle', { method: 'POST' });
+      await renderWatchFolderToggle(wfEl, bucket);
+    } catch (err) {
+      showMsg(wfEl, 'Error: ' + err.message, 'error');
+      btn.disabled = false;
+    }
+  });
+  wfEl.appendChild(btn);
 }
 
 async function openBucketBrowser(browser, bucket, prefix) {
@@ -1159,9 +1231,14 @@ async function openBucketBrowser(browser, bucket, prefix) {
   browser.className = 'section';
   browser.innerHTML = [
     '<div class="section-title">Bucket: ' + escHtml(bucket) + '</div>',
+    '<div id="storage-watch-folder" class="mt8"></div>',
     '<div id="storage-breadcrumb" class="breadcrumb"></div>',
     '<div id="storage-objects"></div>',
   ].join('');
+
+  // Watch-folder toggle for this bucket.
+  const wfEl = browser.querySelector('#storage-watch-folder');
+  renderWatchFolderToggle(wfEl, bucket);
 
   // Breadcrumb trail — each segment clickable, narrows the prefix.
   const crumb = browser.querySelector('#storage-breadcrumb');

@@ -23,6 +23,7 @@ import type { BucketItem } from 'minio';
 import { z } from 'zod';
 import { objectPrefix } from '../data/guard.js';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
+import type { WatchFolderService } from '../pipeline/watch-folder.js';
 
 // Hard cap on objects returned by a single listing call. Bounds the response
 // size regardless of how many objects a prefix holds.
@@ -30,6 +31,10 @@ const MAX_OBJECTS = 200;
 
 export type StorageRouterOptions = {
   stackResolver: WorkspaceStackResolver;
+  // The global watch-folder service, when configured + enabled. Absent when
+  // MinIO is not configured or WATCH_FOLDER_ENABLED is not 'true'; the
+  // per-bucket watch-folder routes then report enabled:false / respond 501.
+  watchFolder?: WatchFolderService;
 };
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -40,6 +45,31 @@ const bucketSchema = z.object({
 });
 
 const bucketsSchema = z.array(bucketSchema);
+
+// Create-bucket request + response. Bucket names follow the S3/MinIO naming
+// rules the route enforces: 3-63 chars, lowercase-friendly alphanumeric plus
+// hyphens. Created buckets carry the `custom` role (not the workspace's
+// stack-managed source/packaged buckets).
+const createBucketSchema = z.object({
+  name: z
+    .string()
+    .min(3)
+    .max(63)
+    .regex(/^[a-zA-Z0-9-]+$/, 'name must be alphanumeric characters and hyphens only')
+});
+
+const createdBucketSchema = z.object({
+  name: z.string(),
+  role: z.literal('custom')
+});
+
+// Per-bucket watch-folder status. `enabled` is true only when the watch-folder
+// service is configured AND currently pointed at this bucket.
+const watchFolderBucketSchema = z.object({
+  enabled: z.boolean(),
+  running: z.boolean(),
+  bucket: z.string()
+});
 
 const objectSchema = z.object({
   key: z.string(),
@@ -61,7 +91,7 @@ const listQuerySchema = z.object({
 
 export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { stackResolver } = opts;
+  const { stackResolver, watchFolder } = opts;
 
   const guarded = { onRequest: app.authenticate };
 
@@ -82,6 +112,104 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
         { name: conns.sourceBucket, role: 'source' as const },
         { name: conns.packagedBucket, role: 'packaged' as const }
       ]);
+    }
+  );
+
+  // Create a new bucket on the workspace's object-storage backend.
+  //   201 — { name, role: 'custom' }
+  //   409 — a bucket with that name already exists
+  //   501 — object storage not configured
+  app.post(
+    '/buckets',
+    {
+      ...guarded,
+      schema: {
+        body: createBucketSchema,
+        response: { 201: createdBucketSchema, 409: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const conns = request.connections;
+      if (!conns?.storageClient) {
+        return reply
+          .code(501)
+          .send({ error: 'not_configured', message: 'object storage is not configured' });
+      }
+      const { name } = request.body;
+      try {
+        await conns.storageClient.makeBucket(name, '');
+      } catch (err) {
+        // MinIO signals an existing bucket via BucketAlreadyOwnedByYou /
+        // BucketAlreadyExists. Map both to 409 rather than a 500.
+        if (isBucketExistsError(err)) {
+          return reply
+            .code(409)
+            .send({ error: 'conflict', message: 'a bucket with that name already exists' });
+        }
+        throw err;
+      }
+      return reply.code(201).send({ name, role: 'custom' as const });
+    }
+  );
+
+  // Read whether the watch-folder service is active on a given bucket.
+  //   200 — { enabled, running, bucket }
+  // `enabled` is true only when the watch-folder is configured AND currently
+  // pointed at this bucket; `running` reflects the live service state.
+  app.get(
+    '/buckets/:bucket/watch-folder',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ bucket: z.string().min(1).max(256) }),
+        response: { 200: watchFolderBucketSchema }
+      }
+    },
+    async (request, reply) => {
+      const { bucket } = request.params;
+      const onThisBucket = watchFolder !== undefined && watchFolder.currentBucket() === bucket;
+      return reply.code(200).send({
+        enabled: onThisBucket,
+        running: onThisBucket && watchFolder.isRunning(),
+        bucket
+      });
+    }
+  );
+
+  // Toggle the watch-folder on a bucket.
+  //   - running on this bucket  -> stop it
+  //   - not running on this bucket -> point it at this bucket and start it
+  //   200 — { enabled, running, bucket }
+  //   501 — watch-folder service not configured
+  app.post(
+    '/buckets/:bucket/watch-folder/toggle',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ bucket: z.string().min(1).max(256) }),
+        response: { 200: watchFolderBucketSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      if (!watchFolder) {
+        return reply
+          .code(501)
+          .send({ error: 'not_configured', message: 'watch-folder service is not configured' });
+      }
+      const { bucket } = request.params;
+      const runningHere = watchFolder.currentBucket() === bucket && watchFolder.isRunning();
+      if (runningHere) {
+        watchFolder.stop();
+      } else {
+        watchFolder.setBucket(bucket);
+        watchFolder.start();
+      }
+      const onThisBucket = watchFolder.currentBucket() === bucket;
+      return reply.code(200).send({
+        enabled: onThisBucket,
+        running: onThisBucket && watchFolder.isRunning(),
+        bucket
+      });
     }
   );
 
@@ -175,6 +303,14 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
     }
   );
 };
+
+// Whether a thrown error from makeBucket indicates the bucket already exists.
+// MinIO surfaces this as a `code` of BucketAlreadyOwnedByYou (owned by the
+// caller) or BucketAlreadyExists (owned globally); match either.
+function isBucketExistsError(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code;
+  return code === 'BucketAlreadyOwnedByYou' || code === 'BucketAlreadyExists';
+}
 
 // List up to `limit` objects under `scopedPrefix` non-recursively, returning
 // workspace-local keys (the `wsPrefix` namespace stripped). CommonPrefixes are
