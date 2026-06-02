@@ -18,6 +18,11 @@ import { CouchSearchRepository } from './data/couch-search-repo.js';
 import { InMemorySearchRepository } from './data/inmemory-search-repo.js';
 import type { SearchRepository } from './data/search-repo.js';
 import { searchRouter } from './routes/search.js';
+import { CouchWebhookRepository } from './data/couch-webhook-repo.js';
+import { InMemoryWebhookRepository } from './data/inmemory-webhook-repo.js';
+import type { WebhookRepository } from './data/webhook-repo.js';
+import { WebhookDispatcher } from './services/webhook-dispatcher.js';
+import { webhooksRouter } from './routes/webhooks.js';
 import { InMemoryAssetRepository, type AssetRepository } from './data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from './data/job-repo.js';
 import { WorkspaceStorage } from './data/storage.js';
@@ -155,12 +160,35 @@ function buildSearchRepository(assets: AssetRepository): SearchRepository {
   return new CouchSearchRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
 }
 
+// Webhook registration persistence (issue #13). CouchDB-backed when configured,
+// otherwise in-memory so the API still boots in a bare local run. Registrations
+// share the same workspace partition + ownership guards as assets and jobs.
+function buildWebhookRepository(): WebhookRepository {
+  const couchUrl = process.env['COUCHDB_URL'];
+  if (!couchUrl) {
+    app.log.warn('COUCHDB_URL not set — using in-memory webhook repository (non-durable)');
+    return new InMemoryWebhookRepository();
+  }
+  const dbName = process.env['COUCHDB_WEBHOOKS_DB'] ?? process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
+  const server = couchServer(couchUrl);
+  return new CouchWebhookRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
+}
+
 // Workspace-scoped resource routers. All resources are namespaced by the
 // workspaceId derived from the caller's OSC token (issue #20).
 const assetRepository = buildAssetRepository();
 const jobRepository = buildJobRepository();
 const searchRepository = buildSearchRepository(assetRepository);
+const webhookRepository = buildWebhookRepository();
 const storage = buildStorage();
+
+// Webhook event dispatcher (issue #13). Fired from the internal OSC callbacks
+// when assets/jobs reach a terminal state so integrators are notified without
+// polling. Delivery is best-effort and fire-and-forget; failures are logged.
+const webhookDispatcher = new WebhookDispatcher({
+  repository: webhookRepository,
+  log: app.log
+});
 
 // Technical metadata extraction (issue #6) runs on the OSC eyevinn-ffmpeg-s3
 // ephemeral ffprobe job. It needs both an OSC context (to dispatch the job) and
@@ -263,7 +291,8 @@ await app.register(internalRouter, {
   prefix: '/api/v1/internal',
   packaging,
   jobRepository,
-  repository: assetRepository
+  repository: assetRepository,
+  webhookDispatcher
 });
 
 if (storage) {
@@ -283,6 +312,9 @@ if (storage) {
 }
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
+
+// Webhook registrations (issue #13). Workspace-scoped; behind `authenticate`.
+await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: webhookRepository });
 
 const port = parseInt(process.env['PORT'] ?? '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
