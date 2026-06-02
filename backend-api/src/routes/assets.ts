@@ -929,9 +929,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const keys = asset.thumbnails ?? [];
       const base = opts.thumbnailPublicBaseUrl;
-      const thumbnails = base
-        ? keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`)
-        : keys;
+      let thumbnails: string[];
+      if (base) {
+        thumbnails = keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`);
+      } else if (storageFor && keys.length > 0) {
+        const storage = storageFor(request.workspaceId);
+        thumbnails = await Promise.all(keys.map((k) => storage.presignedGet(k, 3600)));
+      } else {
+        thumbnails = keys;
+      }
       return reply.code(200).send({ assetId: asset.id, thumbnails });
     }
   );
