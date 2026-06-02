@@ -265,7 +265,7 @@ async function loadAssets(listSection, detailPanel) {
   // Build table using escaped values
   const rows = assets.map(function(a) {
     var thumb = a.thumbnails && a.thumbnails.length
-      ? '<img src="' + escHtml(a.thumbnails[0]) + '" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+      ? '<img src="/api/v1/assets/' + escHtml(a.id) + '/thumbnails/0" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
       : '<div class="thumb-xs thumb-placeholder"></div>';
     return '<tr data-id="' + escHtml(a.id) + '">' +
       '<td style="width:52px;padding:4px 6px">' + thumb + '</td>' +
