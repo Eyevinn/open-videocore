@@ -46,19 +46,96 @@ See [docs/architecture/ADR-001-osc-stack.md](docs/architecture/ADR-001-osc-stack
 
 ## Quick start (OSC operator)
 
-1. Provision the required OSC services (see `infra/provision-dev.sh`).
-2. Set the required environment variables (see `backend-api/.env.example`).
-3. Deploy this repo as an OSC catalog entry or run it locally:
+### Prerequisites
+
+Before running open-videocore you need two pieces of OSC infrastructure in place. These are **deployment-level** resources — created once per installation, not per workspace.
+
+> **Note:** OSC instance names must be **alphanumeric only** (no hyphens or underscores). Set `OSC_ACCESS_TOKEN` in your environment before running `osc` commands, or export it: `export OSC_ACCESS_TOKEN=<your-pat>`.
+
+**1. A Valkey instance (backing store for the parameter store)**
+
+```bash
+osc create valkey-io-valkey ovcparamstore
+```
+
+Then get the connection URL:
+
+```bash
+osc describe valkey-io-valkey ovcparamstore
+# Output includes:  172.232.x.x:YYYY => 6379
+# Redis URL is:     redis://172.232.x.x:YYYY
+```
+
+**2. A parameter store (`eyevinn-app-config-svc`)**
+
+The parameter store persists provisioned stack endpoints so the API can rediscover them at runtime and deprovision cleanly. Pick a strong `ConfigApiKey` — this becomes `PARAMETER_STORE_API_KEY`.
+
+```bash
+osc create eyevinn-app-config-svc ovcconfig \
+  -o RedisUrl=redis://172.232.x.x:YYYY \
+  -o ConfigApiKey=<your-chosen-key>
+```
+
+The `url` field in the output is your `PARAMETER_STORE_URL` (e.g. `https://<tenant>-ovcconfig.eyevinn-app-config-svc.auto.prod.osaas.io`).
+
+> **Why pre-create?** The parameter store is infrastructure for the middleware itself, not for the media stacks it provisions. Auto-bootstrapping on startup is a planned improvement ([#35](https://github.com/Eyevinn/open-videocore/issues/35)).
+
+### Set environment variables
+
+Copy `backend-api/.env.example` to `backend-api/.env` and fill in the values (see [Environment variables](#environment-variables) below).
+
+### Run locally
 
 ```bash
 cd backend-api
-npm install
-npm start
+pnpm install
+pnpm dev
+```
+
+### Provision a media stack
+
+Once the API is running, create a full stack (MinIO, CouchDB, PostgreSQL, Valkey, Encore, callback listener, packager) with a single call:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/provision \
+  -H "Content-Type: application/json" \
+  -d '{"name": "myworkspace"}'
+```
+
+The response contains the connection endpoints for the provisioned stack. The API also stores them internally so you can retrieve them later:
+
+```bash
+curl http://localhost:3000/api/v1/provision/myworkspace
+```
+
+To tear down the stack:
+
+```bash
+curl -X DELETE http://localhost:3000/api/v1/provision/myworkspace
 ```
 
 ## Environment variables
 
-All connection strings are read from environment at startup. See `backend-api/.env.example` for the full list. When running on OSC, bind to the `openvideocore` parameter store — all keys are pre-populated by the Day-1 deploy plan.
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OSC_ACCESS_TOKEN` | **Yes** | OSC Personal Access Token. Get yours from [app.osaas.io/settings](https://app.osaas.io/settings). On OSC this is injected automatically at deploy time. |
+| `MINIO_ROOT_PASSWORD` | **Yes** | Admin password for provisioned MinIO instances. Also reused as the PostgreSQL DB password and the Encore/packager S3 secret. Never sent in plaintext — registered as an OSC service secret and referenced via `{{secrets.<name>}}` at provision time. |
+| `COUCHDB_ADMIN_PASSWORD` | **Yes** | Admin password for provisioned CouchDB instances. Same OSC secrets treatment as above. |
+| `PARAMETER_STORE_URL` | **Yes** | Base URL of your pre-created `eyevinn-app-config-svc` instance. Required for `GET /api/v1/provision/:name` and `DELETE /api/v1/provision/:name` to work. Without it provisioning still succeeds but stack coordinates are not persisted. |
+| `PARAMETER_STORE_API_KEY` | **Yes** | The `ConfigApiKey` you chose when creating the `eyevinn-app-config-svc` instance. |
+| `PORT` | No | HTTP port (default `3000`). |
+| `OSC_ENVIRONMENT` | No | OSC environment for token validation (default `prod`). |
+| `PARAMETER_STORE_NAME` | No | Human-readable name for the store (default `openvideocore`). Used in logs only. |
+| `COUCHDB_URL` | No | CouchDB connection URL for the asset/job document store. When unset the API uses an in-memory store (non-durable, suitable for development only). |
+| `MINIO_URL` | No | MinIO S3 endpoint for the upload and URL-pull ingest routes. |
+| `MINIO_ACCESS_KEY` | No | MinIO access key (default `admin`). |
+| `MINIO_SECRET_KEY` | No | MinIO secret key. When unset, upload and ingest routes respond `501`. |
+| `MINIO_SOURCE_BUCKET` | No | Source object bucket name (default `openvideocore-source`). |
+| `ENCORE_URL` | No | Encore instance URL for ABR transcoding. When unset, the transcode route responds `501`. |
+| `REDIS_URL` | No | Valkey/Redis connection URL for the packaging queue. When unset, HLS/DASH packaging responds `501`. |
+| `UPLOAD_URL_TTL_SECONDS` | No | TTL for presigned upload URLs (default `900` — 15 min). |
+| `INGEST_MAX_SOURCE_BYTES` | No | Maximum source file size for URL-pull ingest (default `53687091200` — 50 GB). |
+| `PROBE_URL_TTL_SECONDS` | No | TTL for presigned URLs handed to the FFmpeg metadata probe job (default `600` — 10 min). |
 
 ## Contributing
 
