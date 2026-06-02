@@ -50,25 +50,33 @@ See [docs/architecture/ADR-001-osc-stack.md](docs/architecture/ADR-001-osc-stack
 
 Before running open-videocore you need two pieces of OSC infrastructure in place. These are **deployment-level** resources — created once per installation, not per workspace.
 
+> **Note:** OSC instance names must be **alphanumeric only** (no hyphens or underscores). Set `OSC_ACCESS_TOKEN` in your environment before running `osc` commands, or export it: `export OSC_ACCESS_TOKEN=<your-pat>`.
+
 **1. A Valkey instance (backing store for the parameter store)**
 
 ```bash
-osc create valkey-io-valkey openvideocore
+osc create valkey-io-valkey ovcparamstore
 ```
 
-Note the connection URL from the output (e.g. `redis://<ip>:<port>`).
+Then get the connection URL:
+
+```bash
+osc describe valkey-io-valkey ovcparamstore
+# Output includes:  172.232.x.x:YYYY => 6379
+# Redis URL is:     redis://172.232.x.x:YYYY
+```
 
 **2. A parameter store (`eyevinn-app-config-svc`)**
 
 The parameter store persists provisioned stack endpoints so the API can rediscover them at runtime and deprovision cleanly. Pick a strong `ConfigApiKey` — this becomes `PARAMETER_STORE_API_KEY`.
 
 ```bash
-osc create eyevinn-app-config-svc openvideocore \
-  --RedisUrl redis://<ip>:<port> \
-  --ConfigApiKey <your-chosen-key>
+osc create eyevinn-app-config-svc ovcconfig \
+  -o RedisUrl=redis://172.232.x.x:YYYY \
+  -o ConfigApiKey=<your-chosen-key>
 ```
 
-Note the instance URL from the output (e.g. `https://<tenant>-openvideocore.eyevinn-app-config-svc.auto.prod.osaas.io`).
+The `url` field in the output is your `PARAMETER_STORE_URL` (e.g. `https://<tenant>-ovcconfig.eyevinn-app-config-svc.auto.prod.osaas.io`).
 
 > **Why pre-create?** The parameter store is infrastructure for the middleware itself, not for the media stacks it provisions. Auto-bootstrapping on startup is a planned improvement ([#35](https://github.com/Eyevinn/open-videocore/issues/35)).
 
@@ -91,19 +99,19 @@ Once the API is running, create a full stack (MinIO, CouchDB, PostgreSQL, Valkey
 ```bash
 curl -X POST http://localhost:3000/api/v1/provision \
   -H "Content-Type: application/json" \
-  -d '{"name": "my-workspace"}'
+  -d '{"name": "myworkspace"}'
 ```
 
 The response contains the connection endpoints for the provisioned stack. The API also stores them internally so you can retrieve them later:
 
 ```bash
-curl http://localhost:3000/api/v1/provision/my-workspace
+curl http://localhost:3000/api/v1/provision/myworkspace
 ```
 
 To tear down the stack:
 
 ```bash
-curl -X DELETE http://localhost:3000/api/v1/provision/my-workspace
+curl -X DELETE http://localhost:3000/api/v1/provision/myworkspace
 ```
 
 ## Environment variables
