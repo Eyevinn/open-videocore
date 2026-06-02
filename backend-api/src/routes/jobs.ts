@@ -60,6 +60,28 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
     }
   );
 
+  // Cancel / mark a job as failed. Useful for orphaned jobs (e.g. Encore jobs
+  // lost when a stack was reprovisioned).
+  app.delete(
+    '/:id',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: jobSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const job = await repo.get(request.workspaceId, request.params.id);
+      if (!job) return reply.code(404).send({ error: 'not_found' });
+      const updated = await repo.update(request.workspaceId, request.params.id, {
+        status: 'failed',
+        error: 'cancelled by operator'
+      });
+      return reply.code(200).send(updated ?? job);
+    }
+  );
+
   app.get(
     '/:id',
     {

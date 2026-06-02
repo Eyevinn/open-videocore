@@ -494,19 +494,38 @@ async function renderJobsTab(container) {
       listContent.innerHTML = '<p class="text-muted">No jobs yet.</p>';
       return;
     }
-    var rows = data.items.map(function(j) {
-      return '<tr>' +
+    var tbody = document.createElement('tbody');
+    data.items.forEach(function(j) {
+      var tr = document.createElement('tr');
+      tr.innerHTML =
         '<td class="cell-id">' + escHtml(j.id) + '</td>' +
         '<td>' + escHtml(j.type) + '</td>' +
         '<td>' + renderBadge(j.status) + '</td>' +
         '<td class="cell-id">' + escHtml(j.assetId || '—') + '</td>' +
         '<td>' + (j.progress != null ? j.progress + '%' : '—') + '</td>' +
         '<td>' + escHtml(fmtDate(j.createdAt)) + '</td>' +
-        '</tr>';
-    }).join('');
-    listContent.innerHTML = '<table><thead><tr>' +
-      '<th>ID</th><th>Type</th><th>Status</th><th>Asset</th><th>Progress</th><th>Created</th>' +
-      '</tr></thead><tbody>' + rows + '</tbody></table>';
+        '<td></td>';
+      if (j.status === 'running' || j.status === 'pending') {
+        var cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn-danger';
+        cancelBtn.style.cssText = 'font-size:12px;padding:3px 8px';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', function() {
+          cancelBtn.disabled = true;
+          apiFetch('/jobs/' + encodeURIComponent(j.id), { method: 'DELETE' })
+            .then(function() { renderJobsTab(container.parentElement ? container : document.getElementById('content')); })
+            .catch(function(err) { cancelBtn.disabled = false; alert(err.message); });
+        });
+        tr.lastElementChild.appendChild(cancelBtn);
+      }
+      tbody.appendChild(tr);
+    });
+    var table = document.createElement('table');
+    table.innerHTML = '<thead><tr>' +
+      '<th>ID</th><th>Type</th><th>Status</th><th>Asset</th><th>Progress</th><th>Created</th><th></th>' +
+      '</tr></thead>';
+    table.appendChild(tbody);
+    listContent.appendChild(table);
   }).catch(function(err) {
     listContent.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
   });
