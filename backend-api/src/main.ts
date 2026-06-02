@@ -18,6 +18,10 @@ import { jobsRouter } from './routes/jobs.js';
 import { couchServer, WorkspaceCouch } from './data/couchdb.js';
 import { CouchAssetRepository } from './data/couch-asset-repo.js';
 import { CouchJobRepository } from './data/couch-job-repo.js';
+import { CouchSearchRepository } from './data/couch-search-repo.js';
+import { InMemorySearchRepository } from './data/inmemory-search-repo.js';
+import type { SearchRepository } from './data/search-repo.js';
+import { searchRouter } from './routes/search.js';
 import { InMemoryAssetRepository, type AssetRepository } from './data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from './data/job-repo.js';
 import { WorkspaceStorage } from './data/storage.js';
@@ -141,10 +145,26 @@ function buildJobRepository(): JobRepository {
   return new CouchJobRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
 }
 
+// Full-text + metadata search (issue #10). CouchDB-backed (Mango /_find,
+// partitioned per workspace) when configured; otherwise filters the in-memory
+// asset repository so search still works in a bare local run. Free-text degrades
+// to substring matching when no CouchDB text index is available.
+function buildSearchRepository(assets: AssetRepository): SearchRepository {
+  const couchUrl = process.env['COUCHDB_URL'];
+  if (!couchUrl) {
+    app.log.warn('COUCHDB_URL not set — using in-memory search repository');
+    return new InMemorySearchRepository(assets);
+  }
+  const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
+  const server = couchServer(couchUrl);
+  return new CouchSearchRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
+}
+
 // Workspace-scoped resource routers. All resources are namespaced by the
 // workspaceId derived from the caller's OSC token (issue #20).
 const assetRepository = buildAssetRepository();
 const jobRepository = buildJobRepository();
+const searchRepository = buildSearchRepository(assetRepository);
 const storage = buildStorage();
 
 // Technical metadata extraction (issue #6) runs on the OSC eyevinn-ffmpeg-s3
@@ -249,8 +269,8 @@ if (storage) {
       : undefined
   });
 }
-// TODO: register further routers here as surfaces are implemented, passing oscContext
-// await app.register(searchRouter,    { prefix: '/api/v1/search' });
+// Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
+await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
 
 const port = parseInt(process.env['PORT'] ?? '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
