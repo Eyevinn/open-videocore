@@ -49,7 +49,7 @@ export type SubmitTranscodeResult = {
 // after marking the job failed and reverting the source asset.
 export async function submitTranscode(
   params: SubmitTranscodeParams,
-  deps: { jobs: JobRepository; assets: AssetRepository; encore: EncoreClient }
+  deps: { jobs: JobRepository; assets: AssetRepository; encore: EncoreClient; encoreCallbackUrl?: string }
 ): Promise<SubmitTranscodeResult> {
   const profile = resolveProfile(params.preset, params.customProfile);
 
@@ -61,8 +61,10 @@ export async function submitTranscode(
   });
 
   const encoreJobId = encodeEncoreJobId(params.workspaceId, job.id);
-  const inputUri = `s3://${params.sourceBucket}/${params.sourceObjectKey}`;
-  const outputUri = `s3://${params.outputBucket}/${PACKAGED_OUTPUT_PREFIX}/${params.sourceAssetId}/${job.id}`;
+  // Object keys are workspace-local; prefix the workspaceId so Encore reads/writes
+  // from the right path in the shared bucket (matches WorkspaceStorage behaviour).
+  const inputUri = `s3://${params.sourceBucket}/${params.workspaceId}/${params.sourceObjectKey}`;
+  const outputUri = `s3://${params.outputBucket}/${params.workspaceId}/${PACKAGED_OUTPUT_PREFIX}/${params.sourceAssetId}/${job.id}`;
 
   // Record the encore job id and advance the job to running + the source asset
   // to processing before we submit, so a callback that races back finds a
@@ -72,7 +74,11 @@ export async function submitTranscode(
 
   let encoreInternalJobId: string | undefined;
   try {
-    const progressCallbackUri = process.env['ENCORE_CALLBACK_URL'];
+    // Use the stack's encore-callback-listener URL so Encore POSTs completions
+    // to the listener, which then puts the result on the Redis queue our API reads.
+    const progressCallbackUri = deps.encoreCallbackUrl
+      ? `${deps.encoreCallbackUrl.replace(/\/$/, '')}/encoreCallback`
+      : undefined;
     const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile, progressCallbackUri });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {

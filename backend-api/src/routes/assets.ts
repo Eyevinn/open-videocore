@@ -703,7 +703,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
-          { jobs, assets: repo, encore: opts.encore }
+          { jobs, assets: repo, encore: opts.encore, encoreCallbackUrl: request.connections?.encoreCallbackUrl }
         );
         return reply.code(202).send(result);
       } catch (err) {
