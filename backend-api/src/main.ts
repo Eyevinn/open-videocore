@@ -1,6 +1,9 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import fastifyStatic from '@fastify/static';
+import { fileURLToPath } from 'url';
+import { join, dirname } from 'path';
 import { Context, createInstance, getInstance } from '@osaas/client-core';
 import {
   serializerCompiler,
@@ -401,6 +404,17 @@ await app.register(collectionsRouter, {
   repository: collectionRepository,
   assetRepository
 });
+
+// Static file serving for the web UI (issue #frontend). Files are served from
+// the public/ directory at the /ui/ prefix. The directory is intentionally
+// empty until the frontend build populates it; the plugin boots without error
+// when no files are present.
+await app.register(fastifyStatic, {
+  root: join(dirname(fileURLToPath(import.meta.url)), '../public'),
+  prefix: '/ui/',
+  decorateReply: false
+});
+app.get('/ui', async (_req, reply) => reply.redirect('/ui/index.html'));
 
 const port = parseInt(process.env['PORT'] ?? '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });

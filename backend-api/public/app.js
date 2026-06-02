@@ -1,0 +1,1104 @@
+/**
+ * open-videocore ops dashboard — app.js
+ *
+ * Security note: All dynamic values from the API or user input are passed through
+ * escHtml() before being interpolated into HTML template literals. escHtml() encodes
+ * &, <, >, and " characters. No raw external strings are inserted into innerHTML.
+ * DOM APIs (textContent, createElement) are used where possible; innerHTML is used
+ * only with fully-escaped, controlled template strings.
+ */
+
+// ─── Token helpers ───────────────────────────────────────────────────────────
+
+const TOKEN_KEY = 'ovc_token';
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY) || '';
+}
+
+function setToken(value) {
+  if (value) {
+    localStorage.setItem(TOKEN_KEY, value);
+  } else {
+    localStorage.removeItem(TOKEN_KEY);
+  }
+}
+
+// ─── Escape helper (XSS prevention) ─────────────────────────────────────────
+
+function escHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ─── API fetch helper ────────────────────────────────────────────────────────
+
+const API_BASE = window.location.origin + '/api/v1';
+
+async function apiFetch(path, options = {}) {
+  const token = getToken();
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(options.headers || {}),
+  };
+  if (token) {
+    headers['Authorization'] = 'Bearer ' + token;
+  }
+  const res = await fetch(API_BASE + path, { ...options, headers });
+  if (!res.ok) {
+    let msg = 'HTTP ' + res.status;
+    try {
+      const body = await res.json();
+      msg = body.error || body.message || msg;
+    } catch (_) { /* ignore */ }
+    throw new Error(msg);
+  }
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) {
+    return res.json();
+  }
+  return null;
+}
+
+// ─── Utility helpers ─────────────────────────────────────────────────────────
+
+function fmtDate(val) {
+  if (!val) return '—';
+  try {
+    return new Date(val).toLocaleString();
+  } catch (_) {
+    return String(val);
+  }
+}
+
+function badgeClass(status) {
+  if (!status) return 'badge-unknown';
+  const s = status.toLowerCase();
+  if (['ready', 'active', 'done', 'completed'].includes(s)) return 'badge-ready';
+  if (['pending', 'ingesting', 'transcoding', 'processing', 'running'].includes(s)) return 'badge-pending';
+  if (['failed', 'error', 'archived'].includes(s)) return 'badge-failed';
+  return 'badge-unknown';
+}
+
+function renderBadge(status) {
+  // status is escaped before insertion
+  return '<span class="badge ' + badgeClass(status) + '">' + escHtml(status || 'unknown') + '</span>';
+}
+
+function renderTags(tags) {
+  if (!tags || tags.length === 0) return '<span class="text-muted">—</span>';
+  // each tag is escaped individually
+  return tags.map(function(t) { return '<span class="tag">' + escHtml(t) + '</span>'; }).join(' ');
+}
+
+function showMsg(container, text, type) {
+  type = type || 'info';
+  const el = document.createElement('div');
+  el.className = 'msg msg-' + type;
+  el.textContent = text;
+  container.appendChild(el);
+  setTimeout(function() { el.remove(); }, 6000);
+}
+
+function loadingEl() {
+  const el = document.createElement('div');
+  el.className = 'loading';
+  el.innerHTML = '<span class="spinner"></span>';
+  const txt = document.createTextNode(' Loading…');
+  el.appendChild(txt);
+  return el;
+}
+
+// ─── Token bar setup ─────────────────────────────────────────────────────────
+
+function setupTokenBar() {
+  const input = document.getElementById('token-input');
+  const btn = document.getElementById('token-save');
+  const status = document.getElementById('token-status');
+
+  const stored = getToken();
+  if (stored) {
+    input.value = stored;
+    status.textContent = 'Token set';
+  }
+
+  btn.addEventListener('click', function() {
+    const val = input.value.trim();
+    setToken(val);
+    status.textContent = val ? 'Saved.' : 'Cleared.';
+    setTimeout(function() { status.textContent = val ? 'Token set' : ''; }, 2000);
+  });
+}
+
+// ─── Tab switching ────────────────────────────────────────────────────────────
+
+const TABS = ['assets', 'jobs', 'collections', 'search', 'webhooks', 'provision'];
+const TAB_RENDERERS = {};
+
+function switchTab(name) {
+  if (!TABS.includes(name)) return;
+  document.querySelectorAll('.tab-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.tab === name);
+  });
+  const content = document.getElementById('content');
+  content.innerHTML = '';
+  TAB_RENDERERS[name](content);
+}
+
+function setupTabs() {
+  document.querySelectorAll('.tab-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { switchTab(btn.dataset.tab); });
+  });
+}
+
+// ─── ASSETS TAB ──────────────────────────────────────────────────────────────
+
+async function renderAssetsTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Assets';
+  container.appendChild(title);
+
+  // Ingest URL section
+  const ingestSection = document.createElement('div');
+  ingestSection.className = 'section';
+  // Only static HTML here — no user data
+  ingestSection.innerHTML = [
+    '<div class="section-title">Ingest from URL</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="ingest-url">Source URL</label>',
+    '    <input type="url" id="ingest-url" placeholder="https://example.com/video.mp4" />',
+    '  </div>',
+    '  <div class="form-field">',
+    '    <label for="ingest-title">Title (optional)</label>',
+    '    <input type="text" id="ingest-title" placeholder="My asset" />',
+    '  </div>',
+    '  <button id="ingest-btn">Ingest</button>',
+    '</div>',
+    '<div id="ingest-msg"></div>',
+  ].join('');
+  container.appendChild(ingestSection);
+
+  // Asset list section
+  const listSection = document.createElement('div');
+  listSection.className = 'section';
+  listSection.innerHTML = [
+    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
+    '  <span>Asset list</span>',
+    '  <button id="assets-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
+    '</div>',
+    '<div id="assets-table-wrap"></div>',
+  ].join('');
+  container.appendChild(listSection);
+
+  // Detail panel placeholder
+  const detailPanel = document.createElement('div');
+  detailPanel.id = 'asset-detail';
+  detailPanel.style.display = 'none';
+  container.appendChild(detailPanel);
+
+  ingestSection.querySelector('#ingest-btn').addEventListener('click', async function() {
+    const url = ingestSection.querySelector('#ingest-url').value.trim();
+    const titleVal = ingestSection.querySelector('#ingest-title').value.trim();
+    const msgEl = ingestSection.querySelector('#ingest-msg');
+    msgEl.innerHTML = '';
+    if (!url) { showMsg(msgEl, 'Source URL is required.', 'error'); return; }
+    try {
+      const body = { sourceUrl: url };
+      if (titleVal) body.title = titleVal;
+      const result = await apiFetch('/assets/ingest-url', { method: 'POST', body: JSON.stringify(body) });
+      showMsg(msgEl, 'Ingest job started. Job ID: ' + (result && (result.jobId || result.id) ? (result.jobId || result.id) : JSON.stringify(result)), 'success');
+      await loadAssets(listSection, detailPanel);
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  listSection.querySelector('#assets-refresh').addEventListener('click', function() {
+    loadAssets(listSection, detailPanel);
+  });
+
+  await loadAssets(listSection, detailPanel);
+}
+
+async function loadAssets(listSection, detailPanel) {
+  const wrap = listSection.querySelector('#assets-table-wrap');
+  wrap.innerHTML = '';
+  const loader = loadingEl();
+  wrap.appendChild(loader);
+
+  let assets = [];
+  try {
+    const res = await apiFetch('/assets');
+    assets = Array.isArray(res) ? res : (res && (res.items || res.assets) ? (res.items || res.assets) : []);
+  } catch (err) {
+    wrap.innerHTML = '';
+    showMsg(wrap, 'Failed to load assets: ' + err.message, 'error');
+    return;
+  }
+  loader.remove();
+
+  if (assets.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No assets found.';
+    wrap.appendChild(empty);
+    return;
+  }
+
+  const tableWrap = document.createElement('div');
+  tableWrap.className = 'table-wrap';
+
+  // Build table using escaped values
+  const rows = assets.map(function(a) {
+    return '<tr data-id="' + escHtml(a.id) + '">' +
+      '<td class="cell-id">' + escHtml(a.id) + '</td>' +
+      '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
+      '<td>' + renderBadge(a.status) + '</td>' +
+      '<td>' + renderTags(a.tags) + '</td>' +
+      '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
+      '<td>' +
+        '<button class="btn-ghost asset-detail-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Detail</button>' +
+        '<button class="btn-danger asset-delete-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Archive</button>' +
+      '</td>' +
+      '</tr>';
+  }).join('');
+
+  tableWrap.innerHTML = '<table>' +
+    '<thead><tr><th>ID</th><th>Name / Title</th><th>Status</th><th>Tags</th><th>Created</th><th>Actions</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody>' +
+    '</table>';
+  wrap.appendChild(tableWrap);
+
+  tableWrap.querySelectorAll('.asset-detail-btn').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      showAssetDetail(btn.dataset.id, detailPanel);
+    });
+  });
+
+  tableWrap.querySelectorAll('.asset-delete-btn').forEach(function(btn) {
+    btn.addEventListener('click', async function(e) {
+      e.stopPropagation();
+      if (!confirm('Archive asset ' + btn.dataset.id + '?')) return;
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
+        await loadAssets(listSection, detailPanel);
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    });
+  });
+}
+
+async function showAssetDetail(id, detailPanel) {
+  detailPanel.style.display = 'block';
+  detailPanel.className = 'detail-panel';
+  // Static structural HTML only
+  detailPanel.innerHTML = [
+    '<div class="detail-panel-header">',
+    '  <h3>Asset Detail</h3>',
+    '  <button id="close-detail" class="btn-ghost" style="font-size:12px;padding:3px 8px;">Close</button>',
+    '</div>',
+    '<div class="detail-panel-body" id="detail-body"></div>',
+  ].join('');
+
+  detailPanel.querySelector('#close-detail').addEventListener('click', function() {
+    detailPanel.style.display = 'none';
+    detailPanel.innerHTML = '';
+  });
+
+  const body = detailPanel.querySelector('#detail-body');
+  const loader = loadingEl();
+  body.appendChild(loader);
+
+  try {
+    const asset = await apiFetch('/assets/' + encodeURIComponent(id));
+    let deliveryUrl = null;
+    try { deliveryUrl = await apiFetch('/assets/' + encodeURIComponent(id) + '/delivery-url'); } catch (_) {}
+
+    loader.remove();
+
+    // Build KV grid with escaped values
+    const kvRows = [
+      ['ID', '<span class="text-mono">' + escHtml(asset.id) + '</span>'],
+      ['Title', escHtml(asset.title || asset.name || '—')],
+      ['Status', renderBadge(asset.status)],
+      ['MIME type', escHtml(asset.mimeType || '—')],
+      ['Tags', renderTags(asset.tags)],
+      ['Created', escHtml(fmtDate(asset.createdAt))],
+      ['Updated', escHtml(fmtDate(asset.updatedAt))],
+    ];
+    if (deliveryUrl && deliveryUrl.url) {
+      kvRows.push(['Delivery URL', '<a href="' + escHtml(deliveryUrl.url) + '" target="_blank" rel="noopener" style="color:var(--accent)">Open</a>']);
+    }
+
+    const kvHtml = kvRows.map(function(r) {
+      return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+    }).join('');
+
+    const kvDiv = document.createElement('div');
+    kvDiv.className = 'kv-grid';
+    kvDiv.innerHTML = kvHtml;
+    body.appendChild(kvDiv);
+
+    if (asset.metadata) {
+      const metaDiv = document.createElement('div');
+      metaDiv.className = 'mt12';
+      const metaTitle = document.createElement('div');
+      metaTitle.className = 'section-title';
+      metaTitle.textContent = 'Metadata';
+      const pre = document.createElement('pre');
+      pre.className = 'code-block';
+      pre.textContent = JSON.stringify(asset.metadata, null, 2);
+      metaDiv.appendChild(metaTitle);
+      metaDiv.appendChild(pre);
+      body.appendChild(metaDiv);
+    }
+
+    // Action buttons — static labels, no dynamic content
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'mt12 flex-gap';
+    actionsDiv.innerHTML = [
+      '<button id="btn-transcode" class="btn-ghost">Transcode (ABR)</button>',
+      '<button id="btn-extract-meta" class="btn-ghost">Extract Metadata</button>',
+      '<button id="btn-thumbnails" class="btn-ghost">Thumbnails</button>',
+    ].join('');
+    body.appendChild(actionsDiv);
+
+    const actionMsg = document.createElement('div');
+    actionMsg.id = 'action-msg';
+    actionMsg.className = 'mt8';
+    body.appendChild(actionMsg);
+
+    const thumbArea = document.createElement('div');
+    thumbArea.id = 'thumbnails-area';
+    body.appendChild(thumbArea);
+
+    body.querySelector('#btn-transcode').addEventListener('click', async function() {
+      actionMsg.innerHTML = '';
+      try {
+        const r = await apiFetch('/assets/' + encodeURIComponent(id) + '/transcode', { method: 'POST', body: JSON.stringify({}) });
+        showMsg(actionMsg, 'Transcode job submitted. ID: ' + (r && (r.jobId || r.id) ? (r.jobId || r.id) : JSON.stringify(r)), 'success');
+      } catch (err) {
+        showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      }
+    });
+
+    body.querySelector('#btn-extract-meta').addEventListener('click', async function() {
+      actionMsg.innerHTML = '';
+      try {
+        const r = await apiFetch('/assets/' + encodeURIComponent(id) + '/extract-metadata', { method: 'POST', body: JSON.stringify({}) });
+        const pre = document.createElement('pre');
+        pre.className = 'code-block mt8';
+        pre.textContent = JSON.stringify(r, null, 2);
+        showMsg(actionMsg, 'Metadata extraction complete.', 'success');
+        actionMsg.appendChild(pre);
+      } catch (err) {
+        showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      }
+    });
+
+    body.querySelector('#btn-thumbnails').addEventListener('click', async function() {
+      actionMsg.innerHTML = '';
+      thumbArea.innerHTML = '';
+      try {
+        const r = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails', { method: 'POST', body: JSON.stringify({}) });
+        const urls = r && (r.urls || r.thumbnails) ? (r.urls || r.thumbnails) : (Array.isArray(r) ? r : []);
+        if (urls.length) {
+          const titleEl = document.createElement('div');
+          titleEl.className = 'section-title mt12';
+          titleEl.textContent = 'Thumbnails';
+          thumbArea.appendChild(titleEl);
+          const strip = document.createElement('div');
+          strip.className = 'thumbnails';
+          urls.forEach(function(u) {
+            const img = document.createElement('img');
+            img.src = u;
+            img.alt = 'thumbnail';
+            strip.appendChild(img);
+          });
+          thumbArea.appendChild(strip);
+        } else {
+          showMsg(actionMsg, 'Thumbnails job submitted.', 'success');
+        }
+      } catch (err) {
+        showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      }
+    });
+
+  } catch (err) {
+    body.innerHTML = '';
+    showMsg(body, 'Failed to load asset: ' + err.message, 'error');
+  }
+}
+
+// ─── JOBS TAB ────────────────────────────────────────────────────────────────
+
+async function renderJobsTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Jobs';
+  container.appendChild(title);
+
+  // Job lookup
+  const section = document.createElement('div');
+  section.className = 'section';
+  section.innerHTML = [
+    '<div class="section-title">Look up job by ID</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="job-id-input">Job ID</label>',
+    '    <input type="text" id="job-id-input" placeholder="job_abc123" />',
+    '  </div>',
+    '  <button id="job-lookup-btn">Lookup</button>',
+    '</div>',
+    '<div id="job-result" class="mt8"></div>',
+  ].join('');
+  container.appendChild(section);
+
+  section.querySelector('#job-lookup-btn').addEventListener('click', async function() {
+    const jobId = section.querySelector('#job-id-input').value.trim();
+    const resultEl = section.querySelector('#job-result');
+    resultEl.innerHTML = '';
+    if (!jobId) { showMsg(resultEl, 'Enter a Job ID.', 'error'); return; }
+    const loader = loadingEl();
+    resultEl.appendChild(loader);
+    try {
+      const job = await apiFetch('/jobs/' + encodeURIComponent(jobId));
+      loader.remove();
+
+      const kvRows = [
+        ['ID', '<span class="text-mono">' + escHtml(job.id) + '</span>'],
+        ['Asset ID', '<span class="text-mono">' + escHtml(job.assetId || '—') + '</span>'],
+        ['Type', escHtml(job.type || '—')],
+        ['Status', renderBadge(job.status)],
+        ['Created', escHtml(fmtDate(job.createdAt))],
+        ['Updated', escHtml(fmtDate(job.updatedAt))],
+      ];
+      const kvDiv = document.createElement('div');
+      kvDiv.className = 'kv-grid mt8';
+      kvDiv.innerHTML = kvRows.map(function(r) {
+        return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+      }).join('');
+      resultEl.appendChild(kvDiv);
+
+      if (job.error) {
+        const errEl = document.createElement('div');
+        errEl.className = 'msg msg-error mt8';
+        errEl.textContent = job.error;
+        resultEl.appendChild(errEl);
+      }
+
+      const pre = document.createElement('pre');
+      pre.className = 'code-block mt12';
+      pre.textContent = JSON.stringify(job, null, 2);
+      resultEl.appendChild(pre);
+    } catch (err) {
+      loader.remove();
+      showMsg(resultEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  // Admin status
+  const statusSection = document.createElement('div');
+  statusSection.className = 'section';
+  const sTitle = document.createElement('div');
+  sTitle.className = 'section-title';
+  sTitle.textContent = 'Background service status';
+  statusSection.appendChild(sTitle);
+  const adminWrap = document.createElement('div');
+  const adminLoader = loadingEl();
+  adminWrap.appendChild(adminLoader);
+  statusSection.appendChild(adminWrap);
+  container.appendChild(statusSection);
+
+  try {
+    const status = await apiFetch('/admin/status');
+    adminLoader.remove();
+    const pre = document.createElement('pre');
+    pre.className = 'code-block';
+    pre.textContent = JSON.stringify(status, null, 2);
+    adminWrap.appendChild(pre);
+  } catch (err) {
+    adminLoader.remove();
+    showMsg(adminWrap, 'Failed: ' + err.message, 'error');
+  }
+}
+
+// ─── COLLECTIONS TAB ─────────────────────────────────────────────────────────
+
+async function renderCollectionsTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Collections';
+  container.appendChild(title);
+
+  // Create form
+  const createSection = document.createElement('div');
+  createSection.className = 'section';
+  createSection.innerHTML = [
+    '<div class="section-title">Create collection</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="coll-name">Name</label>',
+    '    <input type="text" id="coll-name" placeholder="My collection" />',
+    '  </div>',
+    '  <button id="coll-create-btn">Create</button>',
+    '</div>',
+    '<div id="coll-create-msg"></div>',
+  ].join('');
+  container.appendChild(createSection);
+
+  // List section
+  const listSection = document.createElement('div');
+  listSection.className = 'section';
+  listSection.innerHTML = [
+    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
+    '  <span>Collections</span>',
+    '  <button id="coll-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
+    '</div>',
+    '<div id="coll-list-wrap"></div>',
+  ].join('');
+  container.appendChild(listSection);
+
+  const detailPanel = document.createElement('div');
+  detailPanel.id = 'coll-detail';
+  detailPanel.style.display = 'none';
+  container.appendChild(detailPanel);
+
+  async function loadCollections() {
+    const wrap = listSection.querySelector('#coll-list-wrap');
+    wrap.innerHTML = '';
+    const loader = loadingEl();
+    wrap.appendChild(loader);
+    let collections = [];
+    try {
+      const res = await apiFetch('/collections');
+      collections = Array.isArray(res) ? res : (res && (res.items || res.collections) ? (res.items || res.collections) : []);
+    } catch (err) {
+      loader.remove();
+      showMsg(wrap, 'Failed: ' + err.message, 'error');
+      return;
+    }
+    loader.remove();
+    if (collections.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No collections.';
+      wrap.appendChild(empty);
+      return;
+    }
+
+    const rows = collections.map(function(c) {
+      const assetCount = c.assets ? c.assets.length : (c.assetCount != null ? c.assetCount : '—');
+      return '<tr data-id="' + escHtml(c.id) + '">' +
+        '<td class="cell-id">' + escHtml(c.id) + '</td>' +
+        '<td>' + escHtml(c.name || '—') + '</td>' +
+        '<td>' + escHtml(String(assetCount)) + '</td>' +
+        '<td>' + escHtml(fmtDate(c.createdAt)) + '</td>' +
+        '<td>' +
+          '<button class="btn-ghost coll-view-btn" data-id="' + escHtml(c.id) + '" style="font-size:12px;padding:3px 8px;">View</button>' +
+          '<button class="btn-danger coll-delete-btn" data-id="' + escHtml(c.id) + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Delete</button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-wrap';
+    tableWrap.innerHTML = '<table>' +
+      '<thead><tr><th>ID</th><th>Name</th><th>Asset count</th><th>Created</th><th>Actions</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+      '</table>';
+    wrap.appendChild(tableWrap);
+
+    tableWrap.querySelectorAll('.coll-view-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() { showCollectionDetail(btn.dataset.id, detailPanel, loadCollections); });
+    });
+    tableWrap.querySelectorAll('.coll-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        if (!confirm('Delete collection ' + btn.dataset.id + '?')) return;
+        try {
+          await apiFetch('/collections/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
+          loadCollections();
+        } catch (err) {
+          alert('Error: ' + err.message);
+        }
+      });
+    });
+  }
+
+  createSection.querySelector('#coll-create-btn').addEventListener('click', async function() {
+    const name = createSection.querySelector('#coll-name').value.trim();
+    const msgEl = createSection.querySelector('#coll-create-msg');
+    msgEl.innerHTML = '';
+    if (!name) { showMsg(msgEl, 'Name is required.', 'error'); return; }
+    try {
+      await apiFetch('/collections', { method: 'POST', body: JSON.stringify({ name: name }) });
+      showMsg(msgEl, 'Collection created.', 'success');
+      createSection.querySelector('#coll-name').value = '';
+      loadCollections();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  listSection.querySelector('#coll-refresh').addEventListener('click', loadCollections);
+  await loadCollections();
+}
+
+async function showCollectionDetail(id, detailPanel, onRefresh) {
+  detailPanel.style.display = 'block';
+  detailPanel.className = 'detail-panel';
+  detailPanel.innerHTML = [
+    '<div class="detail-panel-header">',
+    '  <h3>Collection</h3>',
+    '  <button id="close-coll-detail" class="btn-ghost" style="font-size:12px;padding:3px 8px;">Close</button>',
+    '</div>',
+    '<div class="detail-panel-body" id="coll-detail-body"></div>',
+  ].join('');
+
+  detailPanel.querySelector('#close-coll-detail').addEventListener('click', function() {
+    detailPanel.style.display = 'none';
+    detailPanel.innerHTML = '';
+  });
+
+  const body = detailPanel.querySelector('#coll-detail-body');
+  const loader = loadingEl();
+  body.appendChild(loader);
+
+  try {
+    const coll = await apiFetch('/collections/' + encodeURIComponent(id));
+    loader.remove();
+    const assets = coll.assets || [];
+
+    const kvDiv = document.createElement('div');
+    kvDiv.className = 'kv-grid';
+    kvDiv.innerHTML = [
+      '<span class="kv-key">ID</span><span class="kv-val text-mono">' + escHtml(coll.id) + '</span>',
+      '<span class="kv-key">Name</span><span class="kv-val">' + escHtml(coll.name || '—') + '</span>',
+      '<span class="kv-key">Created</span><span class="kv-val">' + escHtml(fmtDate(coll.createdAt)) + '</span>',
+    ].join('');
+    body.appendChild(kvDiv);
+
+    // Add asset form
+    const addDiv = document.createElement('div');
+    addDiv.className = 'mt12';
+    addDiv.innerHTML = [
+      '<div class="section-title">Add asset to collection</div>',
+      '<div class="form-row mt8">',
+      '  <div class="form-field grow">',
+      '    <input type="text" id="add-asset-id" placeholder="Asset ID" />',
+      '  </div>',
+      '  <button id="add-asset-btn">Add</button>',
+      '</div>',
+      '<div id="add-asset-msg"></div>',
+    ].join('');
+    body.appendChild(addDiv);
+
+    addDiv.querySelector('#add-asset-btn').addEventListener('click', async function() {
+      const assetId = addDiv.querySelector('#add-asset-id').value.trim();
+      const msgEl = addDiv.querySelector('#add-asset-msg');
+      msgEl.innerHTML = '';
+      if (!assetId) { showMsg(msgEl, 'Asset ID required.', 'error'); return; }
+      try {
+        await apiFetch('/collections/' + encodeURIComponent(id) + '/assets/' + encodeURIComponent(assetId), { method: 'PUT', body: JSON.stringify({}) });
+        showMsg(msgEl, 'Asset added.', 'success');
+        showCollectionDetail(id, detailPanel, onRefresh);
+      } catch (err) {
+        showMsg(msgEl, 'Error: ' + err.message, 'error');
+      }
+    });
+
+    // Asset list
+    const assetsDiv = document.createElement('div');
+    assetsDiv.className = 'mt12';
+    const assetsTitle = document.createElement('div');
+    assetsTitle.className = 'section-title';
+    assetsTitle.textContent = 'Assets (' + assets.length + ')';
+    assetsDiv.appendChild(assetsTitle);
+
+    if (assets.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No assets in this collection.';
+      assetsDiv.appendChild(empty);
+    } else {
+      const rows = assets.map(function(a) {
+        return '<tr>' +
+          '<td class="cell-id">' + escHtml(a.id) + '</td>' +
+          '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
+          '<td>' + renderBadge(a.status) + '</td>' +
+          '<td><button class="btn-danger remove-asset-btn" data-asset-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Remove</button></td>' +
+          '</tr>';
+      }).join('');
+      const tableWrap = document.createElement('div');
+      tableWrap.className = 'table-wrap';
+      tableWrap.innerHTML = '<table>' +
+        '<thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Actions</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody>' +
+        '</table>';
+      assetsDiv.appendChild(tableWrap);
+
+      tableWrap.querySelectorAll('.remove-asset-btn').forEach(function(btn) {
+        btn.addEventListener('click', async function() {
+          try {
+            await apiFetch('/collections/' + encodeURIComponent(id) + '/assets/' + encodeURIComponent(btn.dataset.assetId), { method: 'DELETE' });
+            showCollectionDetail(id, detailPanel, onRefresh);
+          } catch (err) {
+            alert('Error: ' + err.message);
+          }
+        });
+      });
+    }
+    body.appendChild(assetsDiv);
+
+  } catch (err) {
+    body.innerHTML = '';
+    showMsg(body, 'Failed: ' + err.message, 'error');
+  }
+}
+
+// ─── SEARCH TAB ──────────────────────────────────────────────────────────────
+
+async function renderSearchTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Search';
+  container.appendChild(title);
+
+  const section = document.createElement('div');
+  section.className = 'section';
+  section.innerHTML = [
+    '<div class="section-title">Search assets</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="search-q">Query</label>',
+    '    <input type="text" id="search-q" placeholder="Full-text search…" />',
+    '  </div>',
+    '  <div class="form-field">',
+    '    <label for="search-tags">Tags (comma-separated)</label>',
+    '    <input type="text" id="search-tags" placeholder="news,sports" />',
+    '  </div>',
+    '  <div class="form-field">',
+    '    <label for="search-mime">MIME type</label>',
+    '    <input type="text" id="search-mime" placeholder="video/mp4" />',
+    '  </div>',
+    '  <button id="search-btn">Search</button>',
+    '</div>',
+    '<div id="search-results" class="mt8"></div>',
+  ].join('');
+  container.appendChild(section);
+
+  section.querySelector('#search-btn').addEventListener('click', async function() {
+    const q = section.querySelector('#search-q').value.trim();
+    const tags = section.querySelector('#search-tags').value.trim();
+    const mime = section.querySelector('#search-mime').value.trim();
+    const resultsEl = section.querySelector('#search-results');
+    resultsEl.innerHTML = '';
+    const loader = loadingEl();
+    resultsEl.appendChild(loader);
+
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (tags) params.set('tags', tags);
+    if (mime) params.set('mimeType', mime);
+
+    try {
+      const res = await apiFetch('/search?' + params.toString());
+      const assets = Array.isArray(res) ? res :
+        (res && (res.items || res.results || res.assets) ? (res.items || res.results || res.assets) : []);
+      loader.remove();
+      if (assets.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No results.';
+        resultsEl.appendChild(empty);
+        return;
+      }
+      const rows = assets.map(function(a) {
+        return '<tr>' +
+          '<td class="cell-id">' + escHtml(a.id) + '</td>' +
+          '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
+          '<td>' + renderBadge(a.status) + '</td>' +
+          '<td>' + renderTags(a.tags) + '</td>' +
+          '<td>' + escHtml(a.mimeType || '—') + '</td>' +
+          '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
+          '</tr>';
+      }).join('');
+      const tableWrap = document.createElement('div');
+      tableWrap.className = 'table-wrap';
+      tableWrap.innerHTML = '<table>' +
+        '<thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>MIME type</th><th>Created</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody>' +
+        '</table>';
+      resultsEl.appendChild(tableWrap);
+    } catch (err) {
+      loader.remove();
+      showMsg(resultsEl, 'Error: ' + err.message, 'error');
+    }
+  });
+}
+
+// ─── WEBHOOKS TAB ────────────────────────────────────────────────────────────
+
+const WEBHOOK_EVENTS = ['asset.ready', 'transcode.complete', 'package.complete', 'asset.failed'];
+
+async function renderWebhooksTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Webhooks';
+  container.appendChild(title);
+
+  // Register form
+  const registerSection = document.createElement('div');
+  registerSection.className = 'section';
+  // All labels are static strings — no dynamic content
+  const checkboxes = WEBHOOK_EVENTS.map(function(ev) {
+    return '<label class="checkbox-label">' +
+      '<input type="checkbox" name="wh-event" value="' + escHtml(ev) + '" checked />' +
+      ' ' + escHtml(ev) +
+      '</label>';
+  }).join('');
+
+  registerSection.innerHTML = [
+    '<div class="section-title">Register webhook</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="wh-url">Endpoint URL</label>',
+    '    <input type="url" id="wh-url" placeholder="https://example.com/webhook" />',
+    '  </div>',
+    '</div>',
+    '<div class="form-field mt8">',
+    '  <label>Events</label>',
+    '  <div class="checkbox-group">' + checkboxes + '</div>',
+    '</div>',
+    '<button id="wh-register-btn" class="mt8">Register</button>',
+    '<div id="wh-register-msg"></div>',
+  ].join('');
+  container.appendChild(registerSection);
+
+  // List
+  const listSection = document.createElement('div');
+  listSection.className = 'section';
+  listSection.innerHTML = [
+    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
+    '  <span>Registered webhooks</span>',
+    '  <button id="wh-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
+    '</div>',
+    '<div id="wh-list-wrap"></div>',
+  ].join('');
+  container.appendChild(listSection);
+
+  async function loadWebhooks() {
+    const wrap = listSection.querySelector('#wh-list-wrap');
+    wrap.innerHTML = '';
+    const loader = loadingEl();
+    wrap.appendChild(loader);
+    let webhooks = [];
+    try {
+      const res = await apiFetch('/webhooks');
+      webhooks = Array.isArray(res) ? res : (res && (res.items || res.webhooks) ? (res.items || res.webhooks) : []);
+    } catch (err) {
+      loader.remove();
+      showMsg(wrap, 'Failed: ' + err.message, 'error');
+      return;
+    }
+    loader.remove();
+    if (webhooks.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No webhooks registered.';
+      wrap.appendChild(empty);
+      return;
+    }
+    const rows = webhooks.map(function(wh) {
+      const evTags = (wh.events || []).map(function(e) { return '<span class="tag">' + escHtml(e) + '</span>'; }).join(' ');
+      return '<tr>' +
+        '<td class="cell-id">' + escHtml(wh.id) + '</td>' +
+        '<td style="word-break:break-all;">' + escHtml(wh.url || wh.endpoint || '—') + '</td>' +
+        '<td>' + evTags + '</td>' +
+        '<td>' + escHtml(fmtDate(wh.createdAt)) + '</td>' +
+        '<td><button class="btn-danger wh-delete-btn" data-id="' + escHtml(wh.id) + '" style="font-size:12px;padding:3px 8px;">Delete</button></td>' +
+        '</tr>';
+    }).join('');
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-wrap';
+    tableWrap.innerHTML = '<table>' +
+      '<thead><tr><th>ID</th><th>URL</th><th>Events</th><th>Created</th><th>Actions</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+      '</table>';
+    wrap.appendChild(tableWrap);
+
+    tableWrap.querySelectorAll('.wh-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        if (!confirm('Delete webhook ' + btn.dataset.id + '?')) return;
+        try {
+          await apiFetch('/webhooks/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
+          loadWebhooks();
+        } catch (err) {
+          alert('Error: ' + err.message);
+        }
+      });
+    });
+  }
+
+  registerSection.querySelector('#wh-register-btn').addEventListener('click', async function() {
+    const url = registerSection.querySelector('#wh-url').value.trim();
+    const events = Array.from(registerSection.querySelectorAll('input[name="wh-event"]:checked')).map(function(cb) { return cb.value; });
+    const msgEl = registerSection.querySelector('#wh-register-msg');
+    msgEl.innerHTML = '';
+    if (!url) { showMsg(msgEl, 'URL is required.', 'error'); return; }
+    if (events.length === 0) { showMsg(msgEl, 'Select at least one event.', 'error'); return; }
+    try {
+      await apiFetch('/webhooks', { method: 'POST', body: JSON.stringify({ url: url, events: events }) });
+      showMsg(msgEl, 'Webhook registered.', 'success');
+      registerSection.querySelector('#wh-url').value = '';
+      loadWebhooks();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  listSection.querySelector('#wh-refresh').addEventListener('click', loadWebhooks);
+  await loadWebhooks();
+}
+
+// ─── PROVISION TAB ───────────────────────────────────────────────────────────
+
+async function renderProvisionTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Provision OSC Stack';
+  container.appendChild(title);
+
+  // Provision form
+  const section = document.createElement('div');
+  section.className = 'section';
+  section.innerHTML = [
+    '<div class="section-title">Provision a new stack</div>',
+    '<p class="text-muted" style="font-size:13px;margin-bottom:12px;">Creates and configures OSC services for a named workspace.</p>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="prov-name">Stack name</label>',
+    '    <input type="text" id="prov-name" placeholder="my-workspace" />',
+    '  </div>',
+    '  <button id="prov-btn">Provision Stack</button>',
+    '</div>',
+    '<div id="prov-msg"></div>',
+  ].join('');
+  container.appendChild(section);
+
+  // Status lookup
+  const statusSection = document.createElement('div');
+  statusSection.className = 'section';
+  statusSection.innerHTML = [
+    '<div class="section-title">Check stack coordinates</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="prov-status-name">Stack name</label>',
+    '    <input type="text" id="prov-status-name" placeholder="my-workspace" />',
+    '  </div>',
+    '  <button id="prov-status-btn" class="btn-ghost">Get Status</button>',
+    '</div>',
+    '<div id="prov-status-result" class="mt8"></div>',
+  ].join('');
+  container.appendChild(statusSection);
+
+  section.querySelector('#prov-btn').addEventListener('click', async function() {
+    const name = section.querySelector('#prov-name').value.trim();
+    const msgEl = section.querySelector('#prov-msg');
+    msgEl.innerHTML = '';
+    if (!name) { showMsg(msgEl, 'Stack name is required.', 'error'); return; }
+    const btn = section.querySelector('#prov-btn');
+    btn.disabled = true;
+    btn.textContent = 'Provisioning…';
+    try {
+      const result = await apiFetch('/provision', { method: 'POST', body: JSON.stringify({ name: name }) });
+      showMsg(msgEl, 'Provisioning started for "' + name + '".', 'success');
+      if (result) {
+        const pre = document.createElement('pre');
+        pre.className = 'code-block mt8';
+        pre.textContent = JSON.stringify(result, null, 2);
+        msgEl.appendChild(pre);
+      }
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Provision Stack';
+    }
+  });
+
+  statusSection.querySelector('#prov-status-btn').addEventListener('click', async function() {
+    const name = statusSection.querySelector('#prov-status-name').value.trim();
+    const resultEl = statusSection.querySelector('#prov-status-result');
+    resultEl.innerHTML = '';
+    if (!name) { showMsg(resultEl, 'Stack name is required.', 'error'); return; }
+    const loader = loadingEl();
+    resultEl.appendChild(loader);
+    try {
+      const data = await apiFetch('/provision/' + encodeURIComponent(name));
+      loader.remove();
+
+      const kvRows = [
+        ['Name', escHtml(data && data.name ? data.name : name)],
+        ['Status', renderBadge(data && data.status ? data.status : null)],
+        ['Created', escHtml(fmtDate(data && data.createdAt ? data.createdAt : null))],
+      ];
+
+      const kvDiv = document.createElement('div');
+      kvDiv.className = 'kv-grid';
+      kvDiv.innerHTML = kvRows.map(function(r) {
+        return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+      }).join('');
+      resultEl.appendChild(kvDiv);
+
+      const endpoints = (data && (data.endpoints || data.services)) ? (data.endpoints || data.services) : {};
+      if (Object.keys(endpoints).length > 0) {
+        const epTitle = document.createElement('div');
+        epTitle.className = 'mt12 section-title';
+        epTitle.textContent = 'Endpoints';
+        resultEl.appendChild(epTitle);
+
+        const epGrid = document.createElement('div');
+        epGrid.className = 'kv-grid mt8';
+        epGrid.innerHTML = Object.entries(endpoints).map(function(pair) {
+          const k = pair[0], v = pair[1];
+          return '<span class="kv-key">' + escHtml(k) + '</span>' +
+            '<span class="kv-val text-mono">' + escHtml(typeof v === 'string' ? v : JSON.stringify(v)) + '</span>';
+        }).join('');
+        resultEl.appendChild(epGrid);
+      }
+
+      const pre = document.createElement('pre');
+      pre.className = 'code-block mt12';
+      pre.textContent = JSON.stringify(data, null, 2);
+      resultEl.appendChild(pre);
+
+    } catch (err) {
+      loader.remove();
+      showMsg(resultEl, 'Error: ' + err.message, 'error');
+    }
+  });
+}
+
+// ─── Tab renderer registry ───────────────────────────────────────────────────
+
+TAB_RENDERERS['assets'] = renderAssetsTab;
+TAB_RENDERERS['jobs'] = renderJobsTab;
+TAB_RENDERERS['collections'] = renderCollectionsTab;
+TAB_RENDERERS['search'] = renderSearchTab;
+TAB_RENDERERS['webhooks'] = renderWebhooksTab;
+TAB_RENDERERS['provision'] = renderProvisionTab;
+
+// ─── Boot ────────────────────────────────────────────────────────────────────
+
+setupTokenBar();
+setupTabs();
+switchTab('assets');
