@@ -938,11 +938,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const keys = asset.thumbnails ?? [];
       const base = opts.thumbnailPublicBaseUrl;
-      // Return proxy URLs through the API — OSC MinIO blocks anonymous presigned
-      // URL access so we serve thumbnails via GET /:id/thumbnails/:index instead.
+      // With a public base URL, return absolute URLs; otherwise return the
+      // stored object keys as-is (callers can fetch them via the proxy route).
       const thumbnails = base
         ? keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`)
-        : keys.map((_, i) => `/api/v1/assets/${asset.id}/thumbnails/${i}`);
+        : keys;
       return reply.code(200).send({ assetId: asset.id, thumbnails });
     }
   );

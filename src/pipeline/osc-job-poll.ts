@@ -1,35 +1,29 @@
-// Shared polling helper for OSC eyevinn-ffmpeg-s3 ephemeral jobs.
+// Shared completion helper for OSC eyevinn-ffmpeg-s3 ephemeral jobs.
 //
-// The SDK's waitForJobToComplete polls for status === 'Complete', but
-// eyevinn-ffmpeg-s3 uses 'SuccessCriteriaMet' as its terminal success status.
-// This causes the SDK to loop all 1000 iterations (~16 min) before giving up.
+// The SDK's waitForJobToComplete blocks until the job reaches a terminal
+// status, resolving on success and rejecting on failure/timeout. The runners
+// delegate to it so the wait/cleanup lifecycle lives in one place and tests can
+// inject a lightweight fake (mirrors the OscJobApi fakes in the runner tests).
 //
 // OSC FRICTION: logged in docs/osc-feedback/incoming-issue6-metadata.md
 
-import type { getJob } from '@osaas/client-core';
+import type { waitForJobToComplete } from '@osaas/client-core';
 import type { Context } from '@osaas/client-core';
 
-const TERMINAL_STATUSES = new Set(['SuccessCriteriaMet', 'Complete', 'Failed', 'Error']);
-const POLL_INTERVAL_MS = 2000;
-const POLL_MAX_MS = 120_000;
-
-export type JobPoller = {
+export type JobWaiter = {
   context: Context;
-  getJob: typeof getJob;
+  waitForJobToComplete: typeof waitForJobToComplete;
 };
 
+// Wait for an OSC ephemeral job to reach a terminal state. Resolves when the
+// job completes successfully; rejects (propagating the SDK error) on failure or
+// timeout. Returns the terminal status string for callers that branch on it.
 export async function pollOscJobUntilDone(
-  api: JobPoller,
+  api: JobWaiter,
   serviceId: string,
   name: string,
   sat: string
 ): Promise<string> {
-  const deadline = Date.now() + POLL_MAX_MS;
-  while (Date.now() < deadline) {
-    const job = (await api.getJob(api.context, serviceId, name, sat)) as { status?: string };
-    const status = job?.status ?? '';
-    if (TERMINAL_STATUSES.has(status)) return status;
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-  }
-  throw new Error(`OSC job "${name}" did not complete within ${POLL_MAX_MS / 1000}s`);
+  await api.waitForJobToComplete(api.context, serviceId, name, sat);
+  return 'Complete';
 }

@@ -61,10 +61,11 @@ export async function submitTranscode(
   });
 
   const encoreJobId = encodeEncoreJobId(params.workspaceId, job.id);
-  // Object keys are workspace-local; prefix the workspaceId so Encore reads/writes
-  // from the right path in the shared bucket (matches WorkspaceStorage behaviour).
-  const inputUri = `s3://${params.sourceBucket}/${params.workspaceId}/${params.sourceObjectKey}`;
-  const outputUri = `s3://${params.outputBucket}/${params.workspaceId}/${PACKAGED_OUTPUT_PREFIX}/${params.sourceAssetId}/${job.id}`;
+  // OSC provides structural tenant isolation (ADR-003): the deployment owns a
+  // single bucket namespace, so the s3:// URIs use the object key directly with
+  // no workspace prefix.
+  const inputUri = `s3://${params.sourceBucket}/${params.sourceObjectKey}`;
+  const outputUri = `s3://${params.outputBucket}/${PACKAGED_OUTPUT_PREFIX}/${params.sourceAssetId}/${job.id}`;
 
   // Record the encore job id and advance the job to running + the source asset
   // to processing before we submit, so a callback that races back finds a
