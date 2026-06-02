@@ -12,7 +12,6 @@ import {
 const sampleConfig: StackConfig = {
   minioEndpoint: 'https://minio.example.osaas.io',
   couchdbUrl: 'https://couch.example.osaas.io',
-  databaseUrl: 'postgresql://host.example.osaas.io:5432/openvideocore',
   redisUrl: 'redis://valkey.svc.cluster.local:6379',
   encoreUrl: 'https://encore.example.osaas.io',
   encoreCallbackUrl: 'https://callback.example.osaas.io',
@@ -86,7 +85,7 @@ describe('makeHttpParamStore', () => {
     await expect(
       store.storeStackConfig('workspace-a', 'mystack', {
         ...sampleConfig,
-        databaseUrl: 'postgresql://user:secret@host:5432/db'
+        couchdbUrl: 'https://user:secret@couch.example.osaas.io'
       })
     ).rejects.toThrow(/refusing to store credential-bearing/);
     expect(fetch).not.toHaveBeenCalled();

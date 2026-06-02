@@ -25,8 +25,6 @@ export type StackConfig = {
   minioEndpoint: string;
   // CouchDB host/URL only — no embedded password.
   couchdbUrl: string;
-  // PostgreSQL host/port/db only — credentials stripped.
-  databaseUrl: string;
   redisUrl: string;
   encoreUrl: string;
   encoreCallbackUrl: string;
@@ -98,7 +96,6 @@ export function hasCredentials(connectionString: string): boolean {
 function assertNoCredentials(config: StackConfig): void {
   for (const key of [
     'couchdbUrl',
-    'databaseUrl',
     'redisUrl',
     'minioEndpoint',
     'encoreUrl',
