@@ -12,6 +12,7 @@
 // so both backends share one definition (issue #3).
 
 // ADR-003/#59: workspace guard removed (structural OSC isolation).
+import { ulid } from 'ulid';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -50,6 +51,22 @@ export type StatusTransition = {
   from: AssetStatus | null; // null for the initial creation entry
   to: AssetStatus;
 };
+
+// Provenance log entry (ADR-005, issue #53). Append-only audit of who/what
+// mutated which namespace.
+export const PROVENANCE_ACTORS = ['user', 'system', 'ai'] as const;
+export type ProvenanceActor = (typeof PROVENANCE_ACTORS)[number];
+
+export type ProvenanceEntry = {
+  at: string;
+  by: ProvenanceActor;
+  op: string;
+  detail?: string;
+};
+
+// How an asset entered the system (ADR-005 administrative.source.method).
+export const ASSET_SOURCE_METHODS = ['upload', 'url-pull', 'watch-folder'] as const;
+export type AssetSourceMethod = (typeof ASSET_SOURCE_METHODS)[number];
 
 // One audio track within a container, as reported by ffprobe (issue #6). A
 // container can carry multiple audio tracks (e.g. multi-language), so this is
@@ -184,6 +201,14 @@ export type Asset = {
   // dedicated /:id/subtitle-tracks routes. Undefined until the first track is
   // added.
   subtitleTracks?: SubtitleTrack[];
+  // How the asset entered the system (ADR-005 administrative.source.method).
+  sourceMethod?: AssetSourceMethod;
+  // Origin URI for url-pull / watch-folder ingest.
+  originUri?: string;
+  // Append-only provenance log (ADR-005 / issue #53).
+  provenance?: ProvenanceEntry[];
+  // Collection memberships projected onto the asset (ADR-005 structural).
+  collections?: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -197,6 +222,9 @@ export type CreateAssetInput = {
   metadata?: Record<string, unknown>;
   // Optional first-class tags supplied at creation time (issue #11).
   tags?: string[];
+  // How the asset is entering the system (ADR-005). Defaults to 'upload'.
+  sourceMethod?: AssetSourceMethod;
+  originUri?: string;
 };
 
 // Mutable fields accepted by PATCH. `status` is validated against the state
@@ -311,6 +339,42 @@ export function initialHistory(now: string): StatusTransition[] {
   return [{ at: now, from: null, to: 'uploading' }];
 }
 
+// Build the initial provenance log for a freshly created asset (issue #53).
+export function initialProvenance(now: string, method: AssetSourceMethod): ProvenanceEntry[] {
+  return [{ at: now, by: 'user', op: 'create', detail: `source=${method}` }];
+}
+
+// Derive the provenance entries a given patch produces (issue #53).
+export function provenanceForPatch(patch: UpdateAssetInput, now: string): ProvenanceEntry[] {
+  const entries: ProvenanceEntry[] = [];
+  if (patch.status !== undefined) {
+    entries.push({ at: now, by: 'system', op: 'state', detail: patch.status });
+  }
+  if (patch.technicalMetadata !== undefined || patch.technicalMetadataError !== undefined) {
+    entries.push({ at: now, by: 'system', op: 'technical' });
+  }
+  if (patch.renditions !== undefined) {
+    entries.push({ at: now, by: 'system', op: 'rendition' });
+  }
+  if (patch.manifestUrls !== undefined || patch.packagingError !== undefined) {
+    entries.push({ at: now, by: 'system', op: 'manifest' });
+  }
+  if (patch.thumbnails !== undefined) {
+    entries.push({ at: now, by: 'system', op: 'thumbnail' });
+  }
+  if (
+    patch.name !== undefined ||
+    patch.description !== undefined ||
+    patch.metadata !== undefined ||
+    patch.tags !== undefined ||
+    patch.audioTracks !== undefined ||
+    patch.subtitleTracks !== undefined
+  ) {
+    entries.push({ at: now, by: 'user', op: 'descriptive' });
+  }
+  return entries;
+}
+
 // Apply a status change, validating the transition and appending to history.
 // Mutates and returns the passed-in arrays/values via a new object the caller
 // can persist. Throws InvalidStateTransitionError on an illegal move.
@@ -367,7 +431,6 @@ export function normalizeTags(tags: readonly string[]): string[] {
 export class InMemoryAssetRepository implements AssetRepository {
   // Keyed by fully namespaced id `<workspaceId>:<localId>`.
   private readonly store = new Map<string, Asset>();
-  private counter = 0;
 
   async create(workspaceId: string, input: CreateAssetInput): Promise<Asset> {
     if (input.parentId) {
@@ -377,7 +440,9 @@ export class InMemoryAssetRepository implements AssetRepository {
       }
     }
     const now = new Date().toISOString();
-    const localId = `asset-${++this.counter}`;
+    // ULID local id (ADR-005 / issue #53): time-sortable + URL-safe.
+    const localId = ulid();
+    const method = input.sourceMethod ?? 'upload';
     const asset: Asset = {
       id: localId,
       workspaceId,
@@ -389,6 +454,9 @@ export class InMemoryAssetRepository implements AssetRepository {
       statusHistory: initialHistory(now),
       metadata: input.metadata,
       tags: input.tags ? normalizeTags(input.tags) : undefined,
+      sourceMethod: method,
+      originUri: input.originUri,
+      provenance: initialProvenance(now, method),
       createdAt: now,
       updatedAt: now
     };
@@ -486,6 +554,10 @@ export class InMemoryAssetRepository implements AssetRepository {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
       next.statusHistory = applied.statusHistory;
+    }
+    const entries = provenanceForPatch(patch, now);
+    if (entries.length > 0) {
+      next.provenance = [...(existing.provenance ?? []), ...entries];
     }
     this.store.set(key, next);
     return { ...next };

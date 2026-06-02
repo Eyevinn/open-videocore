@@ -32,13 +32,14 @@ export function thumbnailUrlTtlSeconds(): number {
 }
 
 // One frame to extract: the source timecode (seconds) and the destination it
-// must be written to, expressed both as a presigned PUT URL (for the runner)
-// and as a workspace-local object key (for recording on the asset).
+// must be written to, expressed both as a presigned PUT URL (for the runner to
+// write to) and as the object key (for recording on the asset).
 export type FrameTarget = {
   timecodeSeconds: number;
-  // Workspace-local object key (without workspace prefix). Used by the
-  // FrameExtractor to construct the S3 output path.
+  // Object key recorded on the asset document.
   objectKey: string;
+  // Presigned PUT URL the FrameExtractor writes the JPEG to.
+  putUrl: string;
 };
 
 // Calls the OSC ffmpeg runner: seek to each frame's timecode in the source and
@@ -96,23 +97,23 @@ export async function extractThumbnails(
 
   const sourceUrl = await deps.storage.presignedGet(objectKey, ttl);
 
-  // Workspace-local keys stored on the asset (no workspace prefix).
-  const localKeys = unique.map((t) => thumbnailObjectKey(assetId, t));
+  // Object keys recorded on the asset. No workspace prefix: OSC provides
+  // structural tenant isolation (ADR-003), so the deployment owns a single
+  // bucket namespace.
+  const keys = unique.map((t) => thumbnailObjectKey(assetId, t));
 
-  // S3 object keys include the workspace prefix so the extractor writes to
-  // the right path in the shared bucket.
-  const frames: FrameTarget[] = unique.map((timecodeSeconds, i) => ({
-    timecodeSeconds,
-    objectKey: `${workspaceId}/${localKeys[i]}`
-  }));
+  // Each frame carries a presigned PUT URL the extractor writes the JPEG to.
+  const frames: FrameTarget[] = await Promise.all(
+    unique.map(async (timecodeSeconds, i) => ({
+      timecodeSeconds,
+      objectKey: keys[i],
+      putUrl: await deps.storage.presignedPut(keys[i], ttl)
+    }))
+  );
 
-  // Run one job per frame — the eyevinn-ffmpeg-s3 service only reliably
-  // processes one S3 output file per job invocation.
-  for (const frame of frames) {
-    await deps.extractor(sourceUrl, [frame]);
-  }
+  // One extraction call covers every requested frame.
+  await deps.extractor(sourceUrl, frames);
 
-  const thumbnails = localKeys;
-  await deps.assets.update(workspaceId, assetId, { thumbnails });
-  return thumbnails;
+  await deps.assets.update(workspaceId, assetId, { thumbnails: keys });
+  return keys;
 }

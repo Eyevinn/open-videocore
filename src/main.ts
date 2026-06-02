@@ -253,18 +253,16 @@ const probe: ProbeRunner | undefined = storageAvailable
 // unwraps it if s3Config is available, otherwise falls back to a direct call
 // which uses env-var credentials (local dev / env-override path).
 const thumbnailExtractor = storageAvailable
-  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): FrameExtractor =>
+  ? (_s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): FrameExtractor =>
+      // Output goes to the presigned PUT URL on each FrameTarget, so the runner
+      // no longer needs standing S3 credentials in the job body.
       makeOscThumbnailExtractor({
         context: oscContext,
         createJob,
         getJob,
         waitForJobToComplete,
         getLogsForInstance,
-        removeJob,
-        s3Endpoint: s3.endpoint,
-        s3AccessKey: s3.accessKey,
-        s3SecretKey: s3.secretKey,
-        s3Bucket: s3.bucket
+        removeJob
       })
   : undefined;
 

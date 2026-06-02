@@ -19,6 +19,7 @@
 //   WorkspaceStorage.removeObject) is intentionally NOT wired here; see the
 //   open questions in the issue report and the OSC friction log.
 
+import { ulid } from 'ulid';
 import {
   type Asset,
   type AssetRepository,
@@ -31,10 +32,18 @@ import {
   applyStatus,
   clampLimit,
   initialHistory,
+  initialProvenance,
   normalizeTags,
+  provenanceForPatch,
   MAX_LIMIT,
   ParentNotFoundError
 } from './asset-repo.js';
+import {
+  AssetDocumentSchema,
+  fromAssetDocument,
+  toAssetDocument,
+  type AssetDocument
+} from './asset-document.js';
 import type { StoredDoc, WorkspaceCouch } from './couchdb.js';
 import { DEPLOYMENT_CONTEXT } from "../auth/workspace.js";
 
@@ -57,7 +66,9 @@ export class CouchAssetRepository implements AssetRepository {
       }
     }
     const now = new Date().toISOString();
-    const localId = `asset-${cryptoId()}`;
+    // ULID local id (ADR-005 / issue #53): time-sortable + URL-safe.
+    const localId = ulid();
+    const method = input.sourceMethod ?? 'upload';
     const asset: Asset = {
       id: localId,
       workspaceId,
@@ -69,6 +80,9 @@ export class CouchAssetRepository implements AssetRepository {
       statusHistory: initialHistory(now),
       metadata: input.metadata,
       tags: input.tags ? normalizeTags(input.tags) : undefined,
+      sourceMethod: method,
+      originUri: input.originUri,
+      provenance: initialProvenance(now, method),
       createdAt: now,
       updatedAt: now
     };
@@ -173,6 +187,11 @@ export class CouchAssetRepository implements AssetRepository {
       next.status = applied.status;
       next.statusHistory = applied.statusHistory;
     }
+    // Append provenance for whichever namespaces this patch touched (issue #53).
+    const entries = provenanceForPatch(patch, now);
+    if (entries.length > 0) {
+      next.provenance = [...(existing.provenance ?? []), ...entries];
+    }
     // Carry _rev so CouchDB accepts the update; put() forces the partition.
     await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;
@@ -180,7 +199,7 @@ export class CouchAssetRepository implements AssetRepository {
 
   async countChildren(workspaceId: string, id: string): Promise<number> {
     const couch = this.couchFor(workspaceId);
-    return couch.count({ resourceType: RESOURCE_TYPE, parentId: id });
+    return couch.count({ resourceType: RESOURCE_TYPE, derivedFrom: id });
   }
 
   async remove(workspaceId: string, id: string): Promise<Asset | undefined> {
@@ -192,73 +211,49 @@ export class CouchAssetRepository implements AssetRepository {
 function buildSelector(opts: ListOptions): Record<string, unknown> {
   const selector: Record<string, unknown> = { resourceType: RESOURCE_TYPE };
   if (opts.status) {
-    selector['status'] = opts.status as AssetStatus;
+    // Mirror of `state` for indexable Mango filtering (ADR-005).
+    selector['state'] = opts.status as AssetStatus;
   }
   if (opts.parentId !== undefined) {
-    selector['parentId'] = opts.parentId;
+    // Mirror of structural.derivedFrom for indexable Mango filtering.
+    selector['derivedFrom'] = opts.parentId;
   }
   return selector;
 }
 
-// Map an Asset to the persisted document body (excluding CouchDB-managed
-// fields _id/_rev/workspaceId which WorkspaceCouch.put owns).
+// Map an Asset to the persisted four-namespace document body (ADR-005). The
+// CouchDB-managed envelope fields (_id/_rev/workspaceId) are owned by
+// WorkspaceCouch.put; here we emit the namespaced model plus a small set of
+// top-level mirrors (`resourceType`, `state`, `derivedFrom`) so Mango selectors
+// stay simple and indexable. Validated against AssetDocumentSchema before write.
 function toDoc(asset: Asset): Record<string, unknown> {
+  const document: AssetDocument = toAssetDocument(asset);
+  const validated = AssetDocumentSchema.parse(document);
+  const { _id: _ignoredId, _rev: _ignoredRev, ...body } = validated;
   return {
+    ...body,
     resourceType: RESOURCE_TYPE,
     localId: asset.id,
-    name: asset.name,
-    description: asset.description,
-    status: asset.status,
-    parentId: asset.parentId,
-    objectKey: asset.objectKey,
-    statusHistory: asset.statusHistory,
-    technicalMetadata: asset.technicalMetadata ?? null,
-    technicalMetadataError: asset.technicalMetadataError,
-    manifestUrls: asset.manifestUrls ?? null,
-    packagingError: asset.packagingError,
-    renditions: asset.renditions ?? null,
-    thumbnails: asset.thumbnails ?? null,
-    metadata: asset.metadata ?? null,
-    tags: asset.tags ?? null,
-    audioTracks: asset.audioTracks ?? null,
-    subtitleTracks: asset.subtitleTracks ?? null,
-    createdAt: asset.createdAt,
-    updatedAt: asset.updatedAt
+    state: asset.status,
+    derivedFrom: asset.parentId ?? null
   };
 }
 
 function fromDoc(doc: StoredDoc): Asset {
-  return {
-    id: String(doc['localId'] ?? stripPartition(doc._id)),
-    workspaceId: DEPLOYMENT_CONTEXT,
-    name: String(doc['name'] ?? ''),
-    description: doc['description'] as string | undefined,
-    status: doc['status'] as AssetStatus,
-    parentId: doc['parentId'] as string | undefined,
-    objectKey: doc['objectKey'] as string | undefined,
-    statusHistory: (doc['statusHistory'] as Asset['statusHistory']) ?? [],
-    technicalMetadata: (doc['technicalMetadata'] as Asset['technicalMetadata']) ?? null,
-    technicalMetadataError: doc['technicalMetadataError'] as string | undefined,
-    manifestUrls: (doc['manifestUrls'] as Asset['manifestUrls']) ?? undefined,
-    packagingError: doc['packagingError'] as string | undefined,
-    renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
-    thumbnails: (doc['thumbnails'] as Asset['thumbnails']) ?? undefined,
-    metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
-    tags: (doc['tags'] as Asset['tags']) ?? undefined,
-    audioTracks: (doc['audioTracks'] as Asset['audioTracks']) ?? undefined,
-    subtitleTracks: (doc['subtitleTracks'] as Asset['subtitleTracks']) ?? undefined,
-    createdAt: String(doc['createdAt'] ?? ''),
-    updatedAt: String(doc['updatedAt'] ?? '')
-  };
+  const localId = String(doc['localId'] ?? stripPartition(doc._id));
+  const document = AssetDocumentSchema.parse({
+    ...doc,
+    _id: localId,
+    type: 'asset',
+    schemaVersion: 1
+  });
+  // #64: workspace scoping removed — the synthesized workspaceId on the model
+  // is the fixed deployment context (OSC provides structural tenant isolation).
+  return fromAssetDocument(document, DEPLOYMENT_CONTEXT);
 }
 
 // `<workspaceId>:<localId>` -> `<localId>`.
 function stripPartition(id: string): string {
   const idx = id.indexOf(':');
   return idx >= 0 ? id.slice(idx + 1) : id;
-}
-
-// Short, collision-resistant local id without pulling in a dependency.
-function cryptoId(): string {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 }

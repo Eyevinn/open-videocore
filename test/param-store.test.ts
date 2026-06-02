@@ -176,7 +176,9 @@ describe('ensureParameterStore', () => {
     expect(osc.createInstance).toHaveBeenCalledWith(
       PARAM_STORE_SERVICE_ID,
       'sat',
-      { name: 'openvideocore-config', ConfigApiKey: 'key123' }
+      // OSC instance names must be alphanumeric-only (no hyphens) — smoke-test
+      // finding, mirrored by DEFAULT_PARAM_STORE_INSTANCE_NAME in param-store.ts.
+      { name: 'ovcconfig', ConfigApiKey: 'key123' }
     );
   });
 
