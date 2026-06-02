@@ -156,6 +156,12 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.metadata !== undefined) {
       next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
     }
+    if (patch.audioTracks !== undefined) {
+      next.audioTracks = patch.audioTracks;
+    }
+    if (patch.subtitleTracks !== undefined) {
+      next.subtitleTracks = patch.subtitleTracks;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -207,6 +213,8 @@ function toDoc(asset: Asset): Record<string, unknown> {
     renditions: asset.renditions ?? null,
     thumbnails: asset.thumbnails ?? null,
     metadata: asset.metadata ?? null,
+    audioTracks: asset.audioTracks ?? null,
+    subtitleTracks: asset.subtitleTracks ?? null,
     createdAt: asset.createdAt,
     updatedAt: asset.updatedAt
   };
@@ -229,6 +237,8 @@ function fromDoc(doc: StoredDoc): Asset {
     renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
     thumbnails: (doc['thumbnails'] as Asset['thumbnails']) ?? undefined,
     metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
+    audioTracks: (doc['audioTracks'] as Asset['audioTracks']) ?? undefined,
+    subtitleTracks: (doc['subtitleTracks'] as Asset['subtitleTracks']) ?? undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

@@ -102,6 +102,40 @@ export type Rendition = {
   objectKey: string;
 };
 
+// Multi-language audio and subtitle tracks (issue #18). These are EDITORIAL /
+// metadata-level track descriptors managed directly via the API — distinct from
+// the machine-extracted `TechnicalMetadata.audioTracks` (ffprobe-derived stream
+// info on the container). An asset carries zero or more of each as structured
+// arrays; track ids are generated server-side and used to address single tracks
+// for removal. `language` is a free-form BCP-47 string (e.g. "en", "sv",
+// "pt-BR"); no strict enum is enforced.
+//
+// NOTE on naming: the ffprobe stream type above is also called `AudioTrack`, so
+// the editorial descriptor is named `AssetAudioTrack` to avoid a clash while the
+// asset field is `audioTracks` per the issue spec.
+export type AssetAudioTrack = {
+  id: string;
+  language: string;
+  codec?: string;
+  channels?: number;
+  label?: string;
+  default?: boolean;
+};
+
+export const SUBTITLE_FORMATS = ['vtt', 'srt', 'ttml'] as const;
+export type SubtitleFormat = (typeof SUBTITLE_FORMATS)[number];
+
+export type SubtitleTrack = {
+  id: string;
+  language: string;
+  format: SubtitleFormat;
+  // Workspace-local MinIO object key of the subtitle file. Undefined until the
+  // file is uploaded (the add route mints a presigned PUT URL the client uses).
+  objectKey?: string;
+  label?: string;
+  default?: boolean;
+};
+
 export type Asset = {
   id: string;
   workspaceId: string;
@@ -139,6 +173,14 @@ export type Asset = {
   // `technicalMetadata` (machine-extracted) — this is editorial/business data
   // such as genre, rightsHolder, or language.
   metadata?: Record<string, unknown>;
+  // Multi-language audio tracks (issue #18). Editorial descriptors managed via
+  // the dedicated /:id/audio-tracks routes. Undefined until the first track is
+  // added.
+  audioTracks?: AssetAudioTrack[];
+  // Multi-language subtitle / caption tracks (issue #18). Managed via the
+  // dedicated /:id/subtitle-tracks routes. Undefined until the first track is
+  // added.
+  subtitleTracks?: SubtitleTrack[];
   createdAt: string;
   updatedAt: string;
 };
@@ -184,6 +226,11 @@ export type UpdateAssetInput = {
   // When true, `metadata` replaces the existing object wholesale instead of
   // being shallow-merged. Used by PUT /:id/metadata; PATCH leaves it false.
   replaceMetadata?: boolean;
+  // Multi-language tracks (issue #18). On update these REPLACE the asset's
+  // respective track list wholesale; the add/remove-one semantics live behind
+  // the dedicated /:id/audio-tracks and /:id/subtitle-tracks routes.
+  audioTracks?: AssetAudioTrack[];
+  subtitleTracks?: SubtitleTrack[];
 };
 
 export type ListOptions = {
@@ -408,6 +455,12 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.metadata !== undefined) {
       next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
+    }
+    if (patch.audioTracks !== undefined) {
+      next.audioTracks = patch.audioTracks;
+    }
+    if (patch.subtitleTracks !== undefined) {
+      next.subtitleTracks = patch.subtitleTracks;
     }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);

@@ -13,13 +13,17 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import {
   ASSET_STATUSES,
   HasChildrenError,
   InMemoryAssetRepository,
   InvalidStateTransitionError,
   ParentNotFoundError,
-  type AssetRepository
+  SUBTITLE_FORMATS,
+  type AssetAudioTrack,
+  type AssetRepository,
+  type SubtitleTrack
 } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -175,6 +179,51 @@ const renditionSchema = z.object({
   objectKey: z.string()
 });
 
+// Multi-language audio/subtitle tracks (issue #18). `language` is a free-form
+// BCP-47 string (non-empty, no strict enum); subtitle `format` is constrained
+// to the formats we know how to package. Track `id` is server-generated.
+const audioTrackOutSchema = z.object({
+  id: z.string(),
+  language: z.string(),
+  codec: z.string().optional(),
+  channels: z.number().optional(),
+  label: z.string().optional(),
+  default: z.boolean().optional()
+});
+
+const subtitleFormatSchema = z.enum(SUBTITLE_FORMATS);
+
+const subtitleTrackOutSchema = z.object({
+  id: z.string(),
+  language: z.string(),
+  format: subtitleFormatSchema,
+  objectKey: z.string().optional(),
+  label: z.string().optional(),
+  default: z.boolean().optional()
+});
+
+// Request bodies for adding tracks. The server assigns the id, so it is not
+// accepted from the client.
+const addAudioTrackSchema = z.object({
+  language: z.string().min(1).max(64),
+  codec: z.string().min(1).max(64).optional(),
+  channels: z.number().int().min(1).max(64).optional(),
+  label: z.string().min(1).max(128).optional(),
+  default: z.boolean().optional()
+});
+
+const addSubtitleTrackSchema = z.object({
+  language: z.string().min(1).max(64),
+  format: subtitleFormatSchema,
+  label: z.string().min(1).max(128).optional(),
+  default: z.boolean().optional()
+});
+
+const tracksSchema = z.object({
+  audioTracks: z.array(audioTrackOutSchema),
+  subtitleTracks: z.array(subtitleTrackOutSchema)
+});
+
 const assetSchema = z.object({
   id: z.string(),
   workspaceId: z.string(),
@@ -201,6 +250,10 @@ const assetSchema = z.object({
   // Free-form operator metadata (issue #12). Absent until the operator sets any
   // metadata; a JSON object of JSON-serializable values.
   metadata: metadataSchema.optional(),
+  // Multi-language audio/subtitle tracks (issue #18). Absent until the first
+  // track of the respective kind is added.
+  audioTracks: z.array(audioTrackOutSchema).optional(),
+  subtitleTracks: z.array(subtitleTrackOutSchema).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -724,6 +777,188 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send(updated);
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Multi-language audio & subtitle tracks (issue #18).
+  //
+  // Tracks are EDITORIAL metadata stored as structured arrays on the asset, not
+  // a processing-pipeline feature. All routes are workspace-scoped and behind
+  // `authenticate`; a foreign/unknown asset resolves to 404 (existence is not
+  // leaked). Track ids are server-generated (randomUUID) and used to address a
+  // single track for removal. `language` is a free-form BCP-47 string.
+  //
+  // Subtitle files live in object storage at
+  //   {workspaceId}/subtitles/{assetId}/{trackId}.{format}
+  // When MinIO is configured, adding a subtitle track returns a short-lived
+  // presigned PUT URL the client uploads the subtitle file to; the object key is
+  // recorded on the track immediately so a later upload resolves to it. When
+  // storage is not configured the track is still created but `uploadUrl` is
+  // omitted from the response.
+  // -------------------------------------------------------------------------
+
+  // List an asset's audio + subtitle tracks.
+  //   200 — { audioTracks, subtitleTracks } (each possibly empty)
+  //   404 — unknown/foreign asset
+  app.get(
+    '/:id/tracks',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: tracksSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send({
+        audioTracks: asset.audioTracks ?? [],
+        subtitleTracks: asset.subtitleTracks ?? []
+      });
+    }
+  );
+
+  // Add an audio track. Returns the updated full audio track list.
+  //   201 — track added, updated list returned
+  //   404 — unknown/foreign asset
+  app.post(
+    '/:id/audio-tracks',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: addAudioTrackSchema,
+        response: {
+          201: z.object({ audioTracks: z.array(audioTrackOutSchema) }),
+          404: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const track: AssetAudioTrack = {
+        id: randomUUID(),
+        language: request.body.language,
+        codec: request.body.codec,
+        channels: request.body.channels,
+        label: request.body.label,
+        default: request.body.default
+      };
+      const audioTracks = [...(asset.audioTracks ?? []), track];
+      await repo.update(request.workspaceId, asset.id, { audioTracks });
+      return reply.code(201).send({ audioTracks });
+    }
+  );
+
+  // Remove an audio track by id.
+  //   204 — removed
+  //   404 — unknown/foreign asset, or no track with that id
+  app.delete(
+    '/:id/audio-tracks/:trackId',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string(), trackId: z.string() }),
+        response: { 204: z.null(), 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const existing = asset.audioTracks ?? [];
+      const audioTracks = existing.filter((t) => t.id !== request.params.trackId);
+      if (audioTracks.length === existing.length) {
+        return reply.code(404).send({ error: 'not_found', message: 'audio track not found' });
+      }
+      await repo.update(request.workspaceId, asset.id, { audioTracks });
+      return reply.code(204).send(null);
+    }
+  );
+
+  // Add a subtitle track. When object storage is configured the response also
+  // carries a presigned PUT `uploadUrl` for the subtitle file at
+  // {workspaceId}/subtitles/{assetId}/{trackId}.{format}; the object key is
+  // recorded on the track immediately.
+  //   201 — track added; { track, uploadUrl? }
+  //   404 — unknown/foreign asset
+  app.post(
+    '/:id/subtitle-tracks',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: addSubtitleTrackSchema,
+        response: {
+          201: z.object({ track: subtitleTrackOutSchema, uploadUrl: z.string().optional() }),
+          404: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const trackId = randomUUID();
+      // Workspace-local object key (the storage layer namespaces by workspace,
+      // so we do NOT prefix the workspaceId here — it is added on signing).
+      const objectKey = `subtitles/${asset.id}/${trackId}.${request.body.format}`;
+
+      let uploadUrl: string | undefined;
+      if (storageFor) {
+        uploadUrl = await storageFor(request.workspaceId).presignedPut(objectKey);
+      }
+
+      const track: SubtitleTrack = {
+        id: trackId,
+        language: request.body.language,
+        format: request.body.format,
+        // Record the key even before upload so a GET resolves it; the key is
+        // only meaningful once the client PUTs the file to `uploadUrl`.
+        objectKey: storageFor ? objectKey : undefined,
+        label: request.body.label,
+        default: request.body.default
+      };
+      const subtitleTracks = [...(asset.subtitleTracks ?? []), track];
+      await repo.update(request.workspaceId, asset.id, { subtitleTracks });
+      return reply.code(201).send(uploadUrl ? { track, uploadUrl } : { track });
+    }
+  );
+
+  // Remove a subtitle track by id. Leaves the subtitle object (if any) in
+  // storage; storage reclamation is a separate lifecycle concern.
+  //   204 — removed
+  //   404 — unknown/foreign asset, or no track with that id
+  app.delete(
+    '/:id/subtitle-tracks/:trackId',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string(), trackId: z.string() }),
+        response: { 204: z.null(), 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const existing = asset.subtitleTracks ?? [];
+      const subtitleTracks = existing.filter((t) => t.id !== request.params.trackId);
+      if (subtitleTracks.length === existing.length) {
+        return reply.code(404).send({ error: 'not_found', message: 'subtitle track not found' });
+      }
+      await repo.update(request.workspaceId, asset.id, { subtitleTracks });
+      return reply.code(204).send(null);
     }
   );
 
