@@ -20,6 +20,7 @@ import {
   InMemoryAssetRepository,
   InvalidStateTransitionError,
   ParentNotFoundError,
+  normalizeTags,
   SUBTITLE_FORMATS,
   type AssetAudioTrack,
   type AssetRepository,
@@ -92,12 +93,18 @@ const transcodeAcceptedSchema = z.object({
 // JSON-serializable; the object is otherwise opaque to the API.
 const metadataSchema = z.record(z.unknown());
 
+// First-class tags (issue #11). Each tag is a non-empty, bounded string; the
+// repository deduplicates the list (first-seen order preserved).
+const tagSchema = z.string().min(1).max(128);
+const tagsSchema = z.array(tagSchema).max(128);
+
 const createSchema = z.object({
   name: z.string().min(1).max(256),
   description: z.string().max(2048).optional(),
   parentId: z.string().min(1).optional(),
   objectKey: z.string().min(1).max(1024).optional(),
-  metadata: metadataSchema.optional()
+  metadata: metadataSchema.optional(),
+  tags: tagsSchema.optional()
 });
 
 // PATCH: all fields optional; at least one is required. `status` is checked
@@ -110,7 +117,9 @@ const updateSchema = z
     description: z.string().max(2048).optional(),
     objectKey: z.string().min(1).max(1024).optional(),
     status: statusSchema.optional(),
-    metadata: metadataSchema.optional()
+    metadata: metadataSchema.optional(),
+    // First-class tags (issue #11). On PATCH this REPLACES the tag list wholesale.
+    tags: tagsSchema.optional()
   })
   .refine((b) => Object.keys(b).length > 0, { message: 'no updatable fields provided' });
 
@@ -282,6 +291,8 @@ const assetSchema = z.object({
   // track of the respective kind is added.
   audioTracks: z.array(audioTrackOutSchema).optional(),
   subtitleTracks: z.array(subtitleTrackOutSchema).optional(),
+  // First-class tags (issue #11). Absent until the first tag is set.
+  tags: z.array(z.string()).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -1132,6 +1143,61 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       await repo.update(request.workspaceId, asset.id, { subtitleTracks });
       return reply.code(204).send(null);
+    }
+  );
+
+  // Append one or more tags to an asset (issue #11). Existing tags are kept and
+  // the resulting list is deduplicated (first-seen order). Idempotent.
+  //   200 — full asset with the updated tag list; 404 — unknown/foreign asset
+  app.post(
+    '/:id/tags',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: z.object({ tags: z.array(tagSchema).min(1).max(128) }),
+        response: { 200: assetSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const merged = normalizeTags([...(asset.tags ?? []), ...request.body.tags]);
+      const updated = await repo.update(request.workspaceId, request.params.id, { tags: merged });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
+    }
+  );
+
+  // Remove a single tag from an asset (issue #11). Removing an absent tag is a
+  // no-op (still 200).
+  //   200 — full asset with the updated tag list; 404 — unknown/foreign asset
+  app.delete(
+    '/:id/tags/:tag',
+    {
+      ...guarded,
+      schema: {
+        params: z.object({ id: z.string(), tag: z.string().min(1) }),
+        response: { 200: assetSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const remaining = (asset.tags ?? []).filter((t) => t !== request.params.tag);
+      const updated = await repo.update(request.workspaceId, request.params.id, {
+        tags: remaining
+      });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
     }
   );
 

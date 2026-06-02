@@ -31,6 +31,7 @@ import {
   applyStatus,
   clampLimit,
   initialHistory,
+  normalizeTags,
   MAX_LIMIT,
   ParentNotFoundError
 } from './asset-repo.js';
@@ -66,6 +67,7 @@ export class CouchAssetRepository implements AssetRepository {
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
       metadata: input.metadata,
+      tags: input.tags ? normalizeTags(input.tags) : undefined,
       createdAt: now,
       updatedAt: now
     };
@@ -156,6 +158,9 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.metadata !== undefined) {
       next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
     }
+    if (patch.tags !== undefined) {
+      next.tags = normalizeTags(patch.tags);
+    }
     if (patch.audioTracks !== undefined) {
       next.audioTracks = patch.audioTracks;
     }
@@ -213,6 +218,7 @@ function toDoc(asset: Asset): Record<string, unknown> {
     renditions: asset.renditions ?? null,
     thumbnails: asset.thumbnails ?? null,
     metadata: asset.metadata ?? null,
+    tags: asset.tags ?? null,
     audioTracks: asset.audioTracks ?? null,
     subtitleTracks: asset.subtitleTracks ?? null,
     createdAt: asset.createdAt,
@@ -237,6 +243,7 @@ function fromDoc(doc: StoredDoc): Asset {
     renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
     thumbnails: (doc['thumbnails'] as Asset['thumbnails']) ?? undefined,
     metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
+    tags: (doc['tags'] as Asset['tags']) ?? undefined,
     audioTracks: (doc['audioTracks'] as Asset['audioTracks']) ?? undefined,
     subtitleTracks: (doc['subtitleTracks'] as Asset['subtitleTracks']) ?? undefined,
     createdAt: String(doc['createdAt'] ?? ''),

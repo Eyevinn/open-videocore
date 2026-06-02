@@ -173,6 +173,9 @@ export type Asset = {
   // `technicalMetadata` (machine-extracted) — this is editorial/business data
   // such as genre, rightsHolder, or language.
   metadata?: Record<string, unknown>;
+  // First-class, free-form string labels (issue #11). Deduplicated, order
+  // preserved. Matched by SearchQuery.tags. Undefined until the first tag is set.
+  tags?: string[];
   // Multi-language audio tracks (issue #18). Editorial descriptors managed via
   // the dedicated /:id/audio-tracks routes. Undefined until the first track is
   // added.
@@ -192,6 +195,8 @@ export type CreateAssetInput = {
   objectKey?: string;
   // Optional free-form metadata supplied at creation time (issue #12).
   metadata?: Record<string, unknown>;
+  // Optional first-class tags supplied at creation time (issue #11).
+  tags?: string[];
 };
 
 // Mutable fields accepted by PATCH. `status` is validated against the state
@@ -226,6 +231,9 @@ export type UpdateAssetInput = {
   // When true, `metadata` replaces the existing object wholesale instead of
   // being shallow-merged. Used by PUT /:id/metadata; PATCH leaves it false.
   replaceMetadata?: boolean;
+  // First-class tags (issue #11). On PATCH this REPLACES the asset's tag list
+  // wholesale (deduplicated). Append/remove-one live behind POST/DELETE /:id/tags.
+  tags?: string[];
   // Multi-language tracks (issue #18). On update these REPLACE the asset's
   // respective track list wholesale; the add/remove-one semantics live behind
   // the dedicated /:id/audio-tracks and /:id/subtitle-tracks routes.
@@ -339,6 +347,19 @@ export function applyMetadata(
   return { ...(existing ?? {}), ...patch };
 }
 
+// Deduplicate a tag list while preserving first-seen order (issue #11).
+export function normalizeTags(tags: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of tags) {
+    if (!seen.has(t)) {
+      seen.add(t);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // In-memory implementation
 // ---------------------------------------------------------------------------
@@ -368,6 +389,7 @@ export class InMemoryAssetRepository implements AssetRepository {
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
       metadata: input.metadata,
+      tags: input.tags ? normalizeTags(input.tags) : undefined,
       createdAt: now,
       updatedAt: now
     };
@@ -455,6 +477,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.metadata !== undefined) {
       next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
+    }
+    if (patch.tags !== undefined) {
+      next.tags = normalizeTags(patch.tags);
     }
     if (patch.audioTracks !== undefined) {
       next.audioTracks = patch.audioTracks;

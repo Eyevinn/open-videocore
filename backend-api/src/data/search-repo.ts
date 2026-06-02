@@ -39,7 +39,7 @@ export interface SearchRepository {
 // Tags are stored as an optional, loosely-typed field on the asset document.
 // They are not part of the core Asset lifecycle, so we read them defensively.
 export function assetTags(asset: Asset): string[] {
-  const tags = (asset as { tags?: unknown }).tags;
+  const tags = asset.tags;
   return Array.isArray(tags) ? tags.filter((t): t is string => typeof t === 'string') : [];
 }
 

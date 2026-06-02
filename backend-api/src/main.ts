@@ -23,6 +23,10 @@ import { InMemoryWebhookRepository } from './data/inmemory-webhook-repo.js';
 import type { WebhookRepository } from './data/webhook-repo.js';
 import { WebhookDispatcher } from './services/webhook-dispatcher.js';
 import { webhooksRouter } from './routes/webhooks.js';
+import { CouchCollectionRepository } from './data/couch-collection-repo.js';
+import { InMemoryCollectionRepository } from './data/inmemory-collection-repo.js';
+import type { CollectionRepository } from './data/collection-repo.js';
+import { collectionsRouter } from './routes/collections.js';
 import { InMemoryAssetRepository, type AssetRepository } from './data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from './data/job-repo.js';
 import { WorkspaceStorage } from './data/storage.js';
@@ -180,12 +184,27 @@ function buildWebhookRepository(): WebhookRepository {
   return new CouchWebhookRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
 }
 
+// Collection persistence (issue #11). CouchDB-backed when configured, otherwise
+// in-memory so the API still boots in a bare local run. Collections share the
+// same workspace partition + ownership guards as assets and webhooks.
+function buildCollectionRepository(): CollectionRepository {
+  const couchUrl = process.env['COUCHDB_URL'];
+  if (!couchUrl) {
+    app.log.warn('COUCHDB_URL not set — using in-memory collection repository (non-durable)');
+    return new InMemoryCollectionRepository();
+  }
+  const dbName = process.env['COUCHDB_COLLECTIONS_DB'] ?? process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
+  const server = couchServer(couchUrl);
+  return new CouchCollectionRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
+}
+
 // Workspace-scoped resource routers. All resources are namespaced by the
 // workspaceId derived from the caller's OSC token (issue #20).
 const assetRepository = buildAssetRepository();
 const jobRepository = buildJobRepository();
 const searchRepository = buildSearchRepository(assetRepository);
 const webhookRepository = buildWebhookRepository();
+const collectionRepository = buildCollectionRepository();
 const storage = buildStorage();
 
 // Webhook event dispatcher (issue #13). Fired from the internal OSC callbacks
@@ -374,6 +393,14 @@ await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchR
 
 // Webhook registrations (issue #13). Workspace-scoped; behind `authenticate`.
 await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: webhookRepository });
+
+// Collections (issue #11). Workspace-scoped; behind `authenticate`. Shares the
+// asset repository to validate membership and resolve assets on GET /:id.
+await app.register(collectionsRouter, {
+  prefix: '/api/v1/collections',
+  repository: collectionRepository,
+  assetRepository
+});
 
 const port = parseInt(process.env['PORT'] ?? '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
