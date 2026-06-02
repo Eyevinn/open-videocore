@@ -1,8 +1,11 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
+  ensureParameterStore,
   makeHttpParamStore,
+  PARAM_STORE_SERVICE_ID,
   stackConfigKey,
   stripCredentials,
+  type OscInstanceApi,
   type StackConfig
 } from '../src/services/param-store.js';
 
@@ -132,5 +135,78 @@ describe('makeHttpParamStore', () => {
     await expect(
       store.loadStackConfig('workspace-a', 'mystack')
     ).rejects.toThrow(/parameter store read failed: 500/);
+  });
+});
+
+describe('ensureParameterStore', () => {
+  const log = { info: vi.fn(), warn: vi.fn() };
+
+  function makeOsc(overrides: Partial<OscInstanceApi> = {}): OscInstanceApi {
+    return {
+      getServiceAccessToken: vi.fn(async () => 'sat'),
+      getInstance: vi.fn(async () => undefined),
+      createInstance: vi.fn(async () => ({ name: 'openvideocore-config' })),
+      ...overrides
+    };
+  }
+
+  beforeEach(() => {
+    process.env['PARAMETER_STORE_URL'] = 'https://config.example.osaas.io';
+    process.env['PARAMETER_STORE_API_KEY'] = 'key123';
+    delete process.env['PARAMETER_STORE_INSTANCE_NAME'];
+    log.info.mockReset();
+    log.warn.mockReset();
+  });
+
+  afterEach(() => {
+    delete process.env['PARAMETER_STORE_URL'];
+    delete process.env['PARAMETER_STORE_API_KEY'];
+    delete process.env['PARAMETER_STORE_INSTANCE_NAME'];
+  });
+
+  it('returns false and does nothing when unconfigured', async () => {
+    delete process.env['PARAMETER_STORE_URL'];
+    const osc = makeOsc();
+    expect(await ensureParameterStore({ osc, log })).toBe(false);
+    expect(osc.getInstance).not.toHaveBeenCalled();
+  });
+
+  it('creates the instance with the ConfigApiKey when it does not exist', async () => {
+    const osc = makeOsc();
+    expect(await ensureParameterStore({ osc, log })).toBe(true);
+    expect(osc.createInstance).toHaveBeenCalledWith(
+      PARAM_STORE_SERVICE_ID,
+      'sat',
+      { name: 'openvideocore-config', ConfigApiKey: 'key123' }
+    );
+  });
+
+  it('is idempotent: does not create when the instance already exists', async () => {
+    const osc = makeOsc({ getInstance: vi.fn(async () => ({ name: 'openvideocore-config' })) });
+    expect(await ensureParameterStore({ osc, log })).toBe(true);
+    expect(osc.createInstance).not.toHaveBeenCalled();
+  });
+
+  it('honours PARAMETER_STORE_INSTANCE_NAME', async () => {
+    process.env['PARAMETER_STORE_INSTANCE_NAME'] = 'my-config';
+    const osc = makeOsc();
+    await ensureParameterStore({ osc, log });
+    expect(osc.getInstance).toHaveBeenCalledWith(PARAM_STORE_SERVICE_ID, 'my-config', 'sat');
+    expect(osc.createInstance).toHaveBeenCalledWith(
+      PARAM_STORE_SERVICE_ID,
+      'sat',
+      { name: 'my-config', ConfigApiKey: 'key123' }
+    );
+  });
+
+  it('degrades gracefully: warns and returns false on OSC failure', async () => {
+    const osc = makeOsc({
+      getInstance: vi.fn(async () => {
+        throw new Error('osc down');
+      })
+    });
+    expect(await ensureParameterStore({ osc, log })).toBe(false);
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(osc.createInstance).not.toHaveBeenCalled();
   });
 });

@@ -236,3 +236,76 @@ export function paramStoreFromEnv(
   if (!baseUrl || !apiKey) return undefined;
   return makeHttpParamStore({ baseUrl, apiKey, getOscToken });
 }
+
+// The OSC service that backs the parameter store (eyevinn-app-config-svc). The
+// store is an OSC service instance, so "creating the store" means creating the
+// instance and seeding its ConfigApiKey.
+export const PARAM_STORE_SERVICE_ID = 'eyevinn-app-config-svc' as const;
+
+// Default OSC instance name for the auto-bootstrapped parameter store. The
+// operator may override it with PARAMETER_STORE_INSTANCE_NAME (must match the
+// instance PARAMETER_STORE_URL points at when both are pre-provisioned).
+const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'openvideocore-config';
+
+// The slice of the @osaas/client-core SDK ensureParameterStore needs. Declared
+// as a narrow interface so the bootstrap can be unit-tested without a live OSC
+// API or a real Context. Shapes mirror createInstance/getInstance in client-core.
+export interface OscInstanceApi {
+  getServiceAccessToken(serviceId: string): Promise<string>;
+  getInstance(
+    serviceId: string,
+    name: string,
+    sat: string
+  ): Promise<{ name?: string } | undefined>;
+  createInstance(
+    serviceId: string,
+    sat: string,
+    body: Record<string, unknown>
+  ): Promise<{ name?: string }>;
+}
+
+export type EnsureParameterStoreOptions = {
+  // OSC SDK surface (production: an adapter over the client-core functions).
+  osc: OscInstanceApi;
+  // Structured logger; only warn is used. Matches Fastify's app.log.
+  log: { info: (msg: string) => void; warn: (msg: string) => void };
+};
+
+// Idempotently ensure the parameter store backing instance exists on first
+// startup (issue #35). When PARAMETER_STORE_URL + PARAMETER_STORE_API_KEY are
+// set but the named eyevinn-app-config-svc instance has not been created yet,
+// create it and seed its ConfigApiKey from PARAMETER_STORE_API_KEY.
+//
+// Graceful degradation: any OSC failure is logged as a warning and swallowed —
+// startup continues, and the provision route will surface a 501/connect error
+// later if the store is genuinely unavailable. Returns true when the store is
+// known to exist (already present or freshly created), false otherwise.
+export async function ensureParameterStore(
+  opts: EnsureParameterStoreOptions
+): Promise<boolean> {
+  const apiKey = process.env['PARAMETER_STORE_API_KEY'];
+  if (!process.env['PARAMETER_STORE_URL'] || !apiKey) return false;
+
+  const name =
+    process.env['PARAMETER_STORE_INSTANCE_NAME'] ??
+    DEFAULT_PARAM_STORE_INSTANCE_NAME;
+
+  try {
+    const sat = await opts.osc.getServiceAccessToken(PARAM_STORE_SERVICE_ID);
+    const existing = await opts.osc.getInstance(PARAM_STORE_SERVICE_ID, name, sat);
+    if (existing) return true;
+    await opts.osc.createInstance(PARAM_STORE_SERVICE_ID, sat, {
+      name,
+      ConfigApiKey: apiKey
+    });
+    opts.log.info(`parameter store instance "${name}" created`);
+    return true;
+  } catch (err) {
+    opts.log.warn(
+      `parameter store auto-bootstrap skipped: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    return false;
+  }
+}
