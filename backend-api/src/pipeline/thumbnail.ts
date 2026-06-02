@@ -36,8 +36,9 @@ export function thumbnailUrlTtlSeconds(): number {
 // and as a workspace-local object key (for recording on the asset).
 export type FrameTarget = {
   timecodeSeconds: number;
+  // Workspace-local object key (without workspace prefix). Used by the
+  // FrameExtractor to construct the S3 output path.
   objectKey: string;
-  putUrl: string;
 };
 
 // Calls the OSC ffmpeg runner: seek to each frame's timecode in the source and
@@ -95,17 +96,23 @@ export async function extractThumbnails(
 
   const sourceUrl = await deps.storage.presignedGet(objectKey, ttl);
 
-  const frames: FrameTarget[] = await Promise.all(
-    unique.map(async (timecodeSeconds) => {
-      const key = thumbnailObjectKey(assetId, timecodeSeconds);
-      const putUrl = await deps.storage.presignedPut(key, ttl);
-      return { timecodeSeconds, objectKey: key, putUrl };
-    })
-  );
+  // Workspace-local keys stored on the asset (no workspace prefix).
+  const localKeys = unique.map((t) => thumbnailObjectKey(assetId, t));
 
-  await deps.extractor(sourceUrl, frames);
+  // S3 object keys include the workspace prefix so the extractor writes to
+  // the right path in the shared bucket.
+  const frames: FrameTarget[] = unique.map((timecodeSeconds, i) => ({
+    timecodeSeconds,
+    objectKey: `${workspaceId}/${localKeys[i]}`
+  }));
 
-  const thumbnails = frames.map((f) => f.objectKey);
+  // Run one job per frame — the eyevinn-ffmpeg-s3 service only reliably
+  // processes one S3 output file per job invocation.
+  for (const frame of frames) {
+    await deps.extractor(sourceUrl, [frame]);
+  }
+
+  const thumbnails = localKeys;
   await deps.assets.update(workspaceId, assetId, { thumbnails });
   return thumbnails;
 }

@@ -334,10 +334,10 @@ type AssetsRouterOptions = {
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
-  // Thumbnail / poster-frame extraction (issue #7). `thumbnailExtractor` runs
-  // the OSC ffmpeg job (eyevinn-ffmpeg-s3 in production, a stub in tests). When
-  // absent (or no object storage), the thumbnail routes respond 501.
-  thumbnailExtractor?: FrameExtractor;
+  // Thumbnail / poster-frame extraction (issue #7). Factory receives the
+  // workspace's s3Config so the OSC ffmpeg job can write directly to the right
+  // MinIO bucket. When absent (or no object storage), the thumbnail routes respond 501.
+  thumbnailExtractor?: FrameExtractor | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor);
   // Injectable extractor runner + extra deps (tests stub the extractor/TTL).
   // Defaults to the real awaited extractor.
   extractThumbnails?: typeof extractThumbnails;
@@ -755,6 +755,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'thumbnail extraction is not configured'
         });
       }
+      // Resolve the extractor: if it's a factory, call it with the workspace's
+      // s3Config so the ffmpeg job can write to the right MinIO bucket.
+      const s3Cfg = request.connections?.s3Config;
+      const resolvedExtractor = typeof opts.thumbnailExtractor === 'function' && s3Cfg
+        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
+            ...s3Cfg,
+            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
+          })
+        : opts.thumbnailExtractor as FrameExtractor;
       try {
         const thumbnails = await thumbnailRunner(
           {
@@ -766,7 +775,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             assets: repo,
             storage: storageFor(request.workspaceId),
-            extractor: opts.thumbnailExtractor,
+            extractor: resolvedExtractor,
             ...opts.thumbnailDeps
           }
         );
@@ -929,16 +938,42 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const keys = asset.thumbnails ?? [];
       const base = opts.thumbnailPublicBaseUrl;
-      let thumbnails: string[];
-      if (base) {
-        thumbnails = keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`);
-      } else if (storageFor && keys.length > 0) {
-        const storage = storageFor(request.workspaceId);
-        thumbnails = await Promise.all(keys.map((k) => storage.presignedGet(k, 3600)));
-      } else {
-        thumbnails = keys;
-      }
+      // Return proxy URLs through the API — OSC MinIO blocks anonymous presigned
+      // URL access so we serve thumbnails via GET /:id/thumbnails/:index instead.
+      const thumbnails = base
+        ? keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`)
+        : keys.map((_, i) => `/api/v1/assets/${asset.id}/thumbnails/${i}`);
       return reply.code(200).send({ assetId: asset.id, thumbnails });
+    }
+  );
+
+  // Proxy a single thumbnail image through the API. OSC MinIO blocks anonymous
+  // presigned URL access, so the browser cannot load MinIO URLs directly.
+  // This endpoint fetches the object using admin credentials and streams it.
+  //   200 — image/jpeg stream
+  //   404 — unknown asset or out-of-range index
+  //   501 — storage not configured
+  app.get(
+    '/:id/thumbnails/:index',
+    {
+      ...guarded,
+      schema: { params: z.object({ id: z.string(), index: z.string() }) }
+    },
+    async (request, reply) => {
+      if (!storageFor) return reply.code(501).send({ error: 'not_configured' });
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) return reply.code(404).send({ error: 'not_found' });
+      const keys = asset.thumbnails ?? [];
+      const idx = parseInt(request.params.index, 10);
+      if (isNaN(idx) || idx < 0 || idx >= keys.length) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const storage = storageFor(request.workspaceId);
+      const stream = await storage.getObject(keys[idx]);
+      return reply
+        .header('Content-Type', 'image/jpeg')
+        .header('Cache-Control', 'public, max-age=86400')
+        .send(stream);
     }
   );
 

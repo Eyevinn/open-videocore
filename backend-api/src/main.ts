@@ -246,15 +246,24 @@ const probe: ProbeRunner | undefined = storageAvailable
 // to MinIO via a presigned PUT URL. Like the probe runner it needs both an OSC
 // context and object storage; when either is missing the thumbnail routes
 // respond 501.
-const thumbnailExtractor: FrameExtractor | undefined = storageAvailable
-  ? makeOscThumbnailExtractor({
-      context: oscContext,
-      createJob,
-      getJob,
-      waitForJobToComplete,
-      getLogsForInstance,
-      removeJob
-    })
+// Thumbnail extractor: a factory so the route can supply the workspace's MinIO
+// credentials (resolved from the stack config) at request time. The route
+// unwraps it if s3Config is available, otherwise falls back to a direct call
+// which uses env-var credentials (local dev / env-override path).
+const thumbnailExtractor = storageAvailable
+  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): FrameExtractor =>
+      makeOscThumbnailExtractor({
+        context: oscContext,
+        createJob,
+        getJob,
+        waitForJobToComplete,
+        getLogsForInstance,
+        removeJob,
+        s3Endpoint: s3.endpoint,
+        s3AccessKey: s3.accessKey,
+        s3SecretKey: s3.secretKey,
+        s3Bucket: s3.bucket
+      })
   : undefined;
 
 // Export / re-wrap (issue #19) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to

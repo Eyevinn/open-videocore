@@ -119,6 +119,12 @@ export class WorkspaceStorage {
     await this.client.removeObject(this.bucket, this.scopedKey(localKey));
   }
 
+  // Stream an object directly — bypasses presigned URLs for environments where
+  // they are blocked (e.g. OSC MinIO reverse proxy).
+  async getObject(localKey: string): Promise<import('stream').Readable> {
+    return this.client.getObject(this.bucket, this.scopedKey(localKey));
+  }
+
   // -------------------------------------------------------------------------
   // Multipart / chunked upload (issue #4).
   //
