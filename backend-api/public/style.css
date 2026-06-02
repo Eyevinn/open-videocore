@@ -53,6 +53,25 @@ header {
   white-space: nowrap;
 }
 
+.header-nav {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.header-link {
+  font-size: 13px;
+  color: var(--text-muted);
+  text-decoration: none;
+  opacity: 0.8;
+}
+
+.header-link:hover {
+  color: var(--accent);
+  opacity: 1;
+}
+
 /* Tab bar */
 .tab-bar {
   display: flex;

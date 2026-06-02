@@ -2,10 +2,13 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import fastifyStatic from '@fastify/static';
+import fastifySwagger from '@fastify/swagger';
+import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
 import { Context, createInstance, getInstance } from '@osaas/client-core';
 import {
+  jsonSchemaTransform,
   serializerCompiler,
   validatorCompiler
 } from 'fastify-type-provider-zod';
@@ -62,6 +65,38 @@ const app = Fastify({ logger: true });
 
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
+
+await app.register(fastifySwagger, {
+  openapi: {
+    info: {
+      title: 'open-videocore API',
+      description: 'OSC-native media asset management — ingest, transcode, package, search, and deliver video assets.',
+      version: '1.0.0'
+    },
+    tags: [
+      { name: 'assets', description: 'Asset lifecycle, metadata, tracks, thumbnails, clip, export' },
+      { name: 'jobs', description: 'Background job status' },
+      { name: 'search', description: 'Full-text and metadata search' },
+      { name: 'collections', description: 'Named asset groups' },
+      { name: 'webhooks', description: 'Event notification registrations' },
+      { name: 'provision', description: 'OSC stack provisioning and teardown' },
+      { name: 'admin', description: 'Operational status and background service control' },
+    ],
+    components: {
+      securitySchemes: {
+        bearerAuth: { type: 'http', scheme: 'bearer', description: 'OSC access token (injected by the OSC login wall in production)' }
+      }
+    },
+    security: [{ bearerAuth: [] }]
+  },
+  transform: jsonSchemaTransform
+});
+
+await app.register(fastifySwaggerUi, {
+  routePrefix: '/api-docs',
+  uiConfig: { docExpansion: 'list', deepLinking: true },
+  staticCSP: false
+});
 
 await app.register(cors);
 await app.register(helmet, {
