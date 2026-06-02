@@ -72,6 +72,28 @@ header {
   opacity: 1;
 }
 
+.header-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.header-select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  min-width: 80px;
+}
+
+.header-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 /* Tab bar */
 .tab-bar {
   display: flex;

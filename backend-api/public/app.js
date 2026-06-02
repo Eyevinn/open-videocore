@@ -19,13 +19,62 @@ function escHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
+// ─── Stack selector ──────────────────────────────────────────────────────────
+
+const STACK_KEY = 'ovc_stack';
+
+function getActiveStack() {
+  return localStorage.getItem(STACK_KEY) || '';
+}
+
+function setActiveStack(name) {
+  if (name) localStorage.setItem(STACK_KEY, name);
+  else localStorage.removeItem(STACK_KEY);
+}
+
+async function initStackSelector() {
+  const sel = document.getElementById('stack-select');
+  if (!sel) return;
+  try {
+    const names = await apiFetch('/provision');
+    sel.innerHTML = '';
+    if (!names || !names.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '— no stacks —';
+      sel.appendChild(opt);
+      return;
+    }
+    const stored = getActiveStack();
+    names.forEach(function(name) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      if (name === stored) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    // If nothing stored yet, default to first stack
+    if (!stored && names.length) setActiveStack(names[0]);
+    sel.addEventListener('change', function() {
+      setActiveStack(sel.value);
+      // Reload current tab with new stack
+      const active = document.querySelector('.tab-btn.active');
+      if (active) active.click();
+    });
+  } catch (_) {
+    sel.innerHTML = '<option value="">— unavailable —</option>';
+  }
+}
+
 // ─── API fetch helper ────────────────────────────────────────────────────────
 
 const API_BASE = window.location.origin + '/api/v1';
 
 async function apiFetch(path, options = {}) {
+  const stack = getActiveStack();
   const headers = {
     'Content-Type': 'application/json',
+    ...(stack ? { 'X-Stack-Name': stack } : {}),
     ...(options.headers || {}),
   };
   const res = await fetch(API_BASE + path, { ...options, headers });
@@ -1174,3 +1223,4 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 
 setupTabs();
 switchTab('assets');
+initStackSelector();
