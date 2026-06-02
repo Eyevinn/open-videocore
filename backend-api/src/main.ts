@@ -33,6 +33,8 @@ import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
+import { makeOscClipRunner } from './pipeline/osc-clip.js';
+import type { ClipRunner } from './pipeline/clip.js';
 import { internalRouter } from './routes/internal.js';
 import { adminRouter } from './routes/admin.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
@@ -238,6 +240,16 @@ const rewrapRunner: RewrapRunner | undefined = storage
     })
   : undefined;
 
+const clipRunner: ClipRunner | undefined = storage
+  ? makeOscClipRunner({
+      context: oscContext,
+      createJob,
+      waitForJobToComplete,
+      getLogsForInstance,
+      removeJob
+    })
+  : undefined;
+
 // ABR transcoding (issue #8). Encore is a long-lived OSC instance; we submit
 // jobs to its REST API and receive completion via the encore-callback listener.
 // Enabled only when ENCORE_URL is set; otherwise POST /:id/transcode responds
@@ -275,7 +287,8 @@ await app.register(assetsRouter, {
   outputBucket,
   thumbnailExtractor,
   thumbnailPublicBaseUrl: process.env['THUMBNAIL_PUBLIC_BASE_URL'],
-  rewrapRunner
+  rewrapRunner,
+  clipRunner
 });
 
 await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository });

@@ -45,6 +45,7 @@ import {
   type ExtractThumbnailsDeps,
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
+import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { PRESET_NAMES, type EncoreProfile } from '../pipeline/encode-presets.js';
 import {
@@ -156,6 +157,18 @@ const exportBodySchema = z.object({
   targetFormat: z.enum(REWRAP_FORMATS),
   outputName: z.string().min(1).max(256).optional()
 });
+// Clip / trim request (issue #17): a time window in seconds. `endSeconds` must
+// be strictly greater than `startSeconds`. Optional `outputName` names the new
+// child asset.
+const clipBodySchema = z
+  .object({
+    startSeconds: z.number().min(0),
+    endSeconds: z.number().positive(),
+    outputName: z.string().min(1).max(256).optional()
+  })
+  .refine((b) => b.endSeconds > b.startSeconds, {
+    message: 'endSeconds must be greater than startSeconds'
+  });
 
 const transitionSchema = z.object({
   at: z.string(),
@@ -325,10 +338,14 @@ type AssetsRouterOptions = {
   // job (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
   // object storage), POST /:id/export responds 501.
   rewrapRunner?: RewrapRunner;
-  // Injectable rewrap orchestrator + extra deps (tests stub the runner/TTL).
-  // Defaults to the real awaited rewrap pipeline.
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
+  // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
+  // (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
+  // object storage), POST /:id/clip responds 501.
+  clipRunner?: ClipRunner;
+  clip?: typeof runClip;
+  clipDeps?: Partial<ClipDeps>;
 };
 
 const ingestUrlSchema = z.object({
@@ -350,6 +367,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const extractRunner = opts.extract ?? extractTechnicalMetadata;
   const thumbnailRunner = opts.extractThumbnails ?? extractThumbnails;
   const rewrapRunner = opts.rewrap ?? rewrap;
+  const clipRunnerOrchestrator = opts.clip ?? runClip;
   const storageFor = opts.storageFor;
 
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
@@ -749,7 +767,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // Export / re-wrap (remux) an asset into a different container (issue #19).
+// Export / re-wrap (remux) an asset into a different container (issue #19).
   // Workspace-scoped and behind `authenticate`. Copies every stream verbatim
   // (`-c copy`) into a new container chosen by `targetFormat`, producing a NEW
   // child asset (parentId = source). Like thumbnails this is AWAITED: the caller
@@ -814,6 +832,65 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'rewrap_failed', message });
+      }
+    }
+  );
+
+  app.post(
+    '/:id/clip',
+    {
+      onRequest: app.authenticate,
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: clipBodySchema,
+        response: {
+          201: assetSchema,
+          400: errorSchema,
+          404: errorSchema,
+          409: errorSchema,
+          501: errorSchema,
+          502: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.workspaceId, request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      if (!asset.objectKey) {
+        return reply.code(409).send({
+          error: 'no_object',
+          message: 'asset has no stored object to clip'
+        });
+      }
+      if (!opts.clipRunner || !storageFor) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'clip extraction is not configured'
+        });
+      }
+      try {
+        const child = await clipRunnerOrchestrator(
+          {
+            workspaceId: request.workspaceId,
+            sourceAssetId: asset.id,
+            objectKey: asset.objectKey,
+            startSeconds: request.body.startSeconds,
+            endSeconds: request.body.endSeconds,
+            outputName: request.body.outputName
+          },
+          {
+            assets: repo,
+            storage: storageFor(request.workspaceId),
+            runner: opts.clipRunner,
+            ...opts.clipDeps
+          }
+        );
+        return reply.code(201).send(child);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.code(502).send({ error: 'clip_failed', message });
       }
     }
   );
