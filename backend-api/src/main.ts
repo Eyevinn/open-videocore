@@ -6,7 +6,7 @@ import fastifySwagger from '@fastify/swagger';
 import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
-import { Context, createInstance, getInstance, listSubscriptions } from '@osaas/client-core';
+import { Context, createInstance, getInstance } from '@osaas/client-core';
 import {
   jsonSchemaTransform,
   serializerCompiler,
@@ -17,26 +17,21 @@ import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
-import { couchServer, WorkspaceCouch } from './data/couchdb.js';
-import { CouchAssetRepository } from './data/couch-asset-repo.js';
-import { CouchJobRepository } from './data/couch-job-repo.js';
-import { CouchSearchRepository } from './data/couch-search-repo.js';
-import { InMemorySearchRepository } from './data/inmemory-search-repo.js';
-import type { SearchRepository } from './data/search-repo.js';
 import { searchRouter } from './routes/search.js';
-import { CouchWebhookRepository } from './data/couch-webhook-repo.js';
-import { InMemoryWebhookRepository } from './data/inmemory-webhook-repo.js';
-import type { WebhookRepository } from './data/webhook-repo.js';
 import { WebhookDispatcher } from './services/webhook-dispatcher.js';
 import { webhooksRouter } from './routes/webhooks.js';
-import { CouchCollectionRepository } from './data/couch-collection-repo.js';
-import { InMemoryCollectionRepository } from './data/inmemory-collection-repo.js';
-import type { CollectionRepository } from './data/collection-repo.js';
 import { collectionsRouter } from './routes/collections.js';
-import { InMemoryAssetRepository, type AssetRepository } from './data/asset-repo.js';
-import { InMemoryJobRepository, type JobRepository } from './data/job-repo.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
+import { WorkspaceStackResolver, type WorkspaceConnections } from './services/workspace-stack.js';
+import {
+  PerWorkspaceAssetRepository,
+  PerWorkspaceJobRepository,
+  PerWorkspaceSearchRepository,
+  PerWorkspaceWebhookRepository,
+  PerWorkspaceCollectionRepository,
+  PerWorkspaceEncoreClient
+} from './data/per-workspace-repos.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
@@ -50,7 +45,7 @@ import { adminRouter } from './routes/admin.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
-import { makeHttpEncoreClient, type EncoreClient } from './pipeline/encore-client.js';
+import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import {
   createJob,
@@ -59,7 +54,14 @@ import {
   removeJob,
   waitForJobToComplete
 } from '@osaas/client-core';
-import { Client as MinioClient } from 'minio';
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    // Backing-service connections for this request's workspace, resolved by the
+    // global preHandler hook. Null on unauthenticated routes (no workspaceId).
+    connections: WorkspaceConnections | null;
+  }
+}
 
 const app = Fastify({ logger: true });
 
@@ -144,155 +146,77 @@ if (!paramStore) {
     },
     log: app.log
   });
-
-  // Self-configuration: if OVC_STACK_NAME is set, load the provisioned stack
-  // coordinates from the parameter store and inject them into the process
-  // environment so all downstream builders (CouchDB, MinIO, Redis, Encore) pick
-  // them up without requiring manual env var configuration.
-  const stackName = process.env['OVC_STACK_NAME'];
-  if (stackName) {
-    try {
-      const oscSubscriptions = await listSubscriptions(oscContext);
-      const workspaceId = oscSubscriptions.find(
-        (s: { tenantId?: string }) => typeof s.tenantId === 'string' && s.tenantId.length > 0
-      )?.tenantId;
-      const stackConfig = workspaceId
-        ? await paramStore.loadStackConfig(workspaceId, stackName)
-        : undefined;
-      if (stackConfig) {
-        const pw = process.env['MINIO_ROOT_PASSWORD'] ?? '';
-        const couchPw = process.env['COUCHDB_ADMIN_PASSWORD'] ?? '';
-        process.env['MINIO_URL'] ??= stackConfig.minioEndpoint;
-        process.env['MINIO_ACCESS_KEY'] ??= 'admin';
-        process.env['MINIO_SECRET_KEY'] ??= pw;
-        process.env['MINIO_SOURCE_BUCKET'] ??= stackConfig.sourceBucket;
-        process.env['MINIO_PACKAGED_BUCKET'] ??= stackConfig.packagedBucket;
-        process.env['COUCHDB_URL'] ??= `${stackConfig.couchdbUrl.replace(/\/$/, '')}`.replace(
-          /^(https?:\/\/)/, `$1admin:${couchPw}@`
-        );
-        process.env['REDIS_URL'] ??= stackConfig.redisUrl;
-        process.env['ENCORE_URL'] ??= stackConfig.encoreUrl;
-        app.log.info(`stack "${stackName}" loaded from parameter store — connection env vars auto-configured`);
-      } else {
-        app.log.warn(`OVC_STACK_NAME="${stackName}" set but no stack config found in parameter store`);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      app.log.warn(`stack self-configuration failed: ${msg} — falling back to explicit env vars`);
-    }
-  }
 }
+
+// Per-workspace backing-service resolver (replaces the global singleton
+// connection config). Each request's connections are resolved at request time
+// from the parameter store (or an explicit env-var override for local dev),
+// keyed by the caller's workspace and an optional X-Stack-Name header. The
+// resolver caches results and is invalidated after a provision/teardown.
+const stackResolver = new WorkspaceStackResolver({
+  paramStore,
+  oscContext,
+  minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
+  couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? ''
+});
+
+// Resolve per-request connections AFTER authentication. The auth preHandler
+// (attached per-router via { onRequest: app.authenticate }) sets
+// request.workspaceId; this global preHandler then warms the resolver cache and
+// attaches the resolved connections so handlers (and the sync StorageFactory
+// below) can read them synchronously.
+app.decorateRequest('connections', null);
+app.addHook('preHandler', async (request) => {
+  if (request.workspaceId) {
+    const stackHeader = request.headers['x-stack-name'];
+    const stackName = typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
+    request.connections = await stackResolver.resolve(request.workspaceId, stackName);
+  }
+});
 
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
   osc: oscContext,
-  paramStore
+  paramStore,
+  // Invalidate the resolver cache after a successful provision/teardown so the
+  // new (or removed) stack is picked up on the next request without a restart.
+  onStackChange: (workspaceId: string) => stackResolver.invalidate(workspaceId)
 });
 
-// Asset persistence. In a live OSC deployment assets are stored in CouchDB
-// (partitioned by workspace, issue #20 + #3). Connection details come from the
-// environment per 12-factor. If COUCHDB_URL is unset (e.g. a bare local run)
-// we fall back to the in-memory repository so the API still boots.
-function buildAssetRepository(): AssetRepository {
-  const couchUrl = process.env['COUCHDB_URL'];
-  if (!couchUrl) {
-    app.log.warn('COUCHDB_URL not set — using in-memory asset repository (non-durable)');
-    return new InMemoryAssetRepository();
-  }
-  const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
-  const server = couchServer(couchUrl);
-  return new CouchAssetRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
-}
+// Workspace-scoped resource repositories. These hold NO connection of their
+// own: each delegates to the concrete repository in the stack resolved for the
+// request's workspace (CouchDB-backed when a stack is provisioned, in-memory
+// otherwise — WorkspaceStackResolver decides). The router option interfaces and
+// route handlers are unchanged; only the backing connection is now resolved
+// lazily per workspace at request time instead of as a startup singleton.
+const assetRepository = new PerWorkspaceAssetRepository(stackResolver);
+const jobRepository = new PerWorkspaceJobRepository(stackResolver);
+const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
+const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
+const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver);
 
-// Object storage factory for direct client-side uploads (issue #4). MinIO
-// connection details come from the environment per 12-factor. When MINIO_URL
-// is unset the upload routes are not registered, so the rest of the API still
-// boots in a bare local run.
-function buildStorage(): { storageFor: StorageFactory; client: MinioClient } | undefined {
-  const minioUrl = process.env['MINIO_URL'];
-  const accessKey = process.env['MINIO_ACCESS_KEY'];
-  const secretKey = process.env['MINIO_SECRET_KEY'];
-  if (!minioUrl || !accessKey || !secretKey) {
-    app.log.warn('MINIO_URL/credentials not set — upload + URL-pull routes disabled');
-    return undefined;
+// Synchronous, per-workspace object-storage factory (issue #4). Reads the
+// connections already warmed into the resolver cache by the global preHandler
+// hook, so it can stay the sync StorageFactory the asset routers expect. When
+// the resolved stack has no object storage (in-memory fallback) it throws — the
+// routes only call this when the asset has an objectKey, and upload routes are
+// gated by `storageAvailable` below.
+const storageFor: StorageFactory = (workspaceId: string): WorkspaceStorage => {
+  const conns = stackResolver.resolveCached(workspaceId);
+  if (!conns?.storageFor) {
+    throw new Error('object storage is not configured for this workspace');
   }
-  const url = new URL(minioUrl);
-  const useSSL = url.protocol === 'https:';
-  const client = new MinioClient({
-    endPoint: url.hostname,
-    port: url.port ? Number(url.port) : useSSL ? 443 : 80,
-    useSSL,
-    accessKey,
-    secretKey
-  });
-  const bucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
-  return { storageFor: (workspaceId: string) => new WorkspaceStorage(workspaceId, client, bucket), client };
-}
+  return conns.storageFor(workspaceId);
+};
 
-// Ingest job persistence (issue #5). CouchDB-backed when configured, otherwise
-// in-memory so the API still boots in a bare local run.
-function buildJobRepository(): JobRepository {
-  const couchUrl = process.env['COUCHDB_URL'];
-  if (!couchUrl) {
-    app.log.warn('COUCHDB_URL not set — using in-memory job repository (non-durable)');
-    return new InMemoryJobRepository();
-  }
-  const dbName = process.env['COUCHDB_JOBS_DB'] ?? process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
-  const server = couchServer(couchUrl);
-  return new CouchJobRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
+// Whether any object storage is reachable at all (explicit env override OR a
+// provisioned stack). Upload/URL-pull routes and the watch-folder are only
+// wired when true. A bare local run with no COUCHDB_URL/MINIO_URL leaves this
+// false and those routes degrade to 501 / are skipped.
+const storageAvailable = Boolean(process.env['MINIO_URL']) || Boolean(paramStore);
+if (!storageAvailable) {
+  app.log.warn('no MINIO_URL and no parameter store — upload + URL-pull routes disabled');
 }
-
-// Full-text + metadata search (issue #10). CouchDB-backed (Mango /_find,
-// partitioned per workspace) when configured; otherwise filters the in-memory
-// asset repository so search still works in a bare local run. Free-text degrades
-// to substring matching when no CouchDB text index is available.
-function buildSearchRepository(assets: AssetRepository): SearchRepository {
-  const couchUrl = process.env['COUCHDB_URL'];
-  if (!couchUrl) {
-    app.log.warn('COUCHDB_URL not set — using in-memory search repository');
-    return new InMemorySearchRepository(assets);
-  }
-  const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
-  const server = couchServer(couchUrl);
-  return new CouchSearchRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
-}
-
-// Webhook registration persistence (issue #13). CouchDB-backed when configured,
-// otherwise in-memory so the API still boots in a bare local run. Registrations
-// share the same workspace partition + ownership guards as assets and jobs.
-function buildWebhookRepository(): WebhookRepository {
-  const couchUrl = process.env['COUCHDB_URL'];
-  if (!couchUrl) {
-    app.log.warn('COUCHDB_URL not set — using in-memory webhook repository (non-durable)');
-    return new InMemoryWebhookRepository();
-  }
-  const dbName = process.env['COUCHDB_WEBHOOKS_DB'] ?? process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
-  const server = couchServer(couchUrl);
-  return new CouchWebhookRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
-}
-
-// Collection persistence (issue #11). CouchDB-backed when configured, otherwise
-// in-memory so the API still boots in a bare local run. Collections share the
-// same workspace partition + ownership guards as assets and webhooks.
-function buildCollectionRepository(): CollectionRepository {
-  const couchUrl = process.env['COUCHDB_URL'];
-  if (!couchUrl) {
-    app.log.warn('COUCHDB_URL not set — using in-memory collection repository (non-durable)');
-    return new InMemoryCollectionRepository();
-  }
-  const dbName = process.env['COUCHDB_COLLECTIONS_DB'] ?? process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
-  const server = couchServer(couchUrl);
-  return new CouchCollectionRepository((workspaceId) => new WorkspaceCouch(workspaceId, server, dbName));
-}
-
-// Workspace-scoped resource routers. All resources are namespaced by the
-// workspaceId derived from the caller's OSC token (issue #20).
-const assetRepository = buildAssetRepository();
-const jobRepository = buildJobRepository();
-const searchRepository = buildSearchRepository(assetRepository);
-const webhookRepository = buildWebhookRepository();
-const collectionRepository = buildCollectionRepository();
-const storage = buildStorage();
 
 // Webhook event dispatcher (issue #13). Fired from the internal OSC callbacks
 // when assets/jobs reach a terminal state so integrators are notified without
@@ -306,7 +230,7 @@ const webhookDispatcher = new WebhookDispatcher({
 // ephemeral ffprobe job. It needs both an OSC context (to dispatch the job) and
 // object storage (to mint the presigned source URL). When either is missing the
 // probe runner is undefined and extraction is disabled (routes respond 501).
-const probe: ProbeRunner | undefined = storage
+const probe: ProbeRunner | undefined = storageAvailable
   ? makeOscProbeRunner({
       context: oscContext,
       createJob,
@@ -322,7 +246,7 @@ const probe: ProbeRunner | undefined = storage
 // to MinIO via a presigned PUT URL. Like the probe runner it needs both an OSC
 // context and object storage; when either is missing the thumbnail routes
 // respond 501.
-const thumbnailExtractor: FrameExtractor | undefined = storage
+const thumbnailExtractor: FrameExtractor | undefined = storageAvailable
   ? makeOscThumbnailExtractor({
       context: oscContext,
       createJob,
@@ -338,7 +262,7 @@ const thumbnailExtractor: FrameExtractor | undefined = storage
 // re-encode), writing the new child asset back to MinIO via a presigned PUT
 // URL. Like the thumbnail runner it needs both an OSC context and object
 // storage; when either is missing POST /:id/export responds 501.
-const rewrapRunner: RewrapRunner | undefined = storage
+const rewrapRunner: RewrapRunner | undefined = storageAvailable
   ? makeOscRewrapRunner({
       context: oscContext,
       createJob,
@@ -349,7 +273,7 @@ const rewrapRunner: RewrapRunner | undefined = storage
     })
   : undefined;
 
-const clipRunner: ClipRunner | undefined = storage
+const clipRunner: ClipRunner | undefined = storageAvailable
   ? makeOscClipRunner({
       context: oscContext,
       createJob,
@@ -360,37 +284,41 @@ const clipRunner: ClipRunner | undefined = storage
     })
   : undefined;
 
-// ABR transcoding (issue #8). Encore is a long-lived OSC instance; we submit
-// jobs to its REST API and receive completion via the encore-callback listener.
-// Enabled only when ENCORE_URL is set; otherwise POST /:id/transcode responds
-// 501. The service access token for Encore is resolved per-submit from the OSC
-// context.
-function buildEncore(): EncoreClient | undefined {
-  const baseUrl = process.env['ENCORE_URL'];
-  if (!baseUrl) {
-    app.log.warn('ENCORE_URL not set — ABR transcoding disabled');
-    return undefined;
-  }
-  return makeHttpEncoreClient({
-    baseUrl,
-    getToken: () => oscContext.getServiceAccessToken('encore')
-  });
-}
+// ABR transcoding (issue #8). Encore is a long-lived OSC instance provisioned
+// per workspace as part of the stack. The per-workspace client resolves the
+// right Encore from the request's stack (decoding the workspace from the job's
+// externalId at submit time). Enabled whenever object storage is reachable;
+// otherwise POST /:id/transcode responds 501 / 502.
+const encore: EncoreClient | undefined = storageAvailable
+  ? new PerWorkspaceEncoreClient(stackResolver)
+  : undefined;
 
-const encore = buildEncore();
+// Bucket names are stack-invariant (created at provision time, see provision.ts)
+// so a static default is correct for every workspace.
 const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
 const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
 
+// S3 reader for URL-pull ingest of s3:// sources (issue #5). This reads the
+// source object via a MinIO client. With per-workspace stacks the worker runs
+// detached and the global pullDeps cannot carry a per-request workspace, so we
+// bind it only for the explicit env-override (single global MinIO) path. In the
+// provisioned multi-stack case s3:// pull is unsupported (http/https pull still
+// works); this is tracked for follow-up route plumbing.
+const envMinioClient = process.env['MINIO_URL']
+  ? (await stackResolver.resolve('__env_probe__')).storageClient
+  : undefined;
+const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : undefined;
+
 // Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
-// (issue #8). It shares the same job repository instance as the jobs router so a
-// job created here is readable there. S3 sources are read via the same MinIO
-// client (S3-compatible).
+// (issue #8). It shares the same job repository so a job created here is
+// readable by the jobs router. The per-workspace storage factory + S3 reader
+// resolve the caller's stack at request time.
 await app.register(assetsRouter, {
   prefix: '/api/v1/assets',
   repository: assetRepository,
   jobRepository,
-  storageFor: storage?.storageFor,
-  pullDeps: storage ? { openS3: makeS3Reader(storage.client) } : undefined,
+  storageFor: storageAvailable ? storageFor : undefined,
+  pullDeps,
   probe,
   encore,
   sourceBucket,
@@ -442,33 +370,36 @@ await app.register(internalRouter, {
 // ffprobe extraction (issue #6). Shared by the upload route and the
 // watch-folder service so a direct-bucket drop gets the same treatment as an
 // API upload. Undefined when no probe runner is configured.
+// The upload route resolves the caller's workspace before invoking this, so the
+// resolver cache is warm and the sync storageFor() can read it.
 const onObjectStored =
-  storage && probe
+  storageAvailable && probe
     ? (workspaceId: string, assetId: string, objectKey: string) =>
         void extractTechnicalMetadata(
           { workspaceId, assetId, objectKey },
-          { assets: assetRepository, storage: storage.storageFor(workspaceId), probe }
+          { assets: assetRepository, storage: storageFor(workspaceId), probe }
         )
     : undefined;
 
-if (storage) {
+if (storageAvailable) {
   await app.register(assetUploadRouter, {
     prefix: '/api/v1/assets',
     repository: assetRepository,
-    storageFor: storage.storageFor,
+    storageFor,
     onObjectStored
   });
 }
 
-// Watch-folder ingest (issue #16). Opt-in via WATCH_FOLDER_ENABLED=true and
-// only when MinIO is configured (graceful degradation: silently skipped
-// otherwise). Detects objects written directly to the source bucket — bypassing
-// the API upload route — and creates asset records for them. Started after all
-// routers are registered (see app.listen below).
+// Watch-folder ingest (issue #16). Opt-in via WATCH_FOLDER_ENABLED=true. It is
+// a global background service watching a single source bucket, so it needs a
+// concrete MinIO client up front — only available via the explicit env override
+// (single global MinIO). In the provisioned multi-stack model there is no single
+// bucket to watch, so the watch-folder is skipped (the API upload + URL-pull
+// paths still cover ingest).
 const watchFolder =
-  storage && watchFolderEnabled()
+  envMinioClient && watchFolderEnabled()
     ? new WatchFolderService({
-        client: storage.client,
+        client: envMinioClient,
         bucket: sourceBucket,
         repository: assetRepository,
         log: app.log,

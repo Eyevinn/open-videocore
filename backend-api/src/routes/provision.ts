@@ -95,6 +95,12 @@ type ProvisionRouterOptions = {
   // back. When undefined the store is not configured: provision still succeeds
   // but skips persistence (logged), and GET /:name responds 501.
   paramStore?: ParamStore;
+  // Invoked after a stack is provisioned or torn down so the caller can drop any
+  // cached per-workspace connections for that workspace (see
+  // WorkspaceStackResolver.invalidate). The workspaceId passed is the
+  // deployment's own tenant (deriveWorkspaceId). Optional: when omitted no cache
+  // invalidation is signalled.
+  onStackChange?: (workspaceId: string) => void;
 };
 
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
@@ -219,7 +225,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   opts
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { osc, paramStore } = opts;
+  const { osc, paramStore, onStackChange } = opts;
 
   // Operator-supplied credentials (ADR-002). Read once at registration time so
   // a misconfigured deployment fails fast at startup rather than mid-provision.
@@ -480,6 +486,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           try {
             const workspaceId = await deriveWorkspaceId(osc);
             await paramStore.storeStackConfig(workspaceId, name, stackConfig);
+            // The new stack is now discoverable: drop any cached connections so
+            // the next request resolves it immediately.
+            onStackChange?.(workspaceId);
           } catch (err) {
             request.log.error(
               { err, name },
@@ -682,6 +691,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           'stack torn down but failed to remove parameter store entry'
         );
       }
+
+      // Drop cached connections for this workspace so the removed stack is not
+      // served from cache after teardown.
+      onStackChange?.(workspaceId);
 
       return reply.code(200).send(result);
     }
