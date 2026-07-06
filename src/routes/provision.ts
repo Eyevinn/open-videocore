@@ -23,6 +23,7 @@ import {
   stripCredentials
 } from '../services/param-store.js';
 import { STACK_SERVICES } from '../services/stack.js';
+import type { OperationStore } from '../services/operation-store.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
 // referenced by Encore (input/source) and eyevinn-encore-packager
@@ -100,7 +101,30 @@ type ProvisionRouterOptions = {
   // deployment's own tenant (deriveWorkspaceId). Optional: when omitted no cache
   // invalidation is signalled.
   onStackChange?: (workspaceId: string) => void;
+  // In-memory store for async provision/deprovision operations. POST / and
+  // DELETE /:name return 202 immediately with an operationId; the caller polls
+  // GET /operations/:id for completion.
+  operationStore: OperationStore;
 };
+
+// Async operation view returned by GET /operations and GET /operations/:id.
+const operationSchema = z.object({
+  id: z.string(),
+  type: z.enum(['provision', 'deprovision']),
+  name: z.string(),
+  status: z.enum(['pending', 'running', 'done', 'failed']),
+  startedAt: z.number(),
+  completedAt: z.number().optional(),
+  result: z.unknown().optional(),
+  error: z.string().optional()
+});
+
+// 202 Accepted payload for POST / and DELETE /:name.
+const acceptedSchema = z.object({
+  operationId: z.string(),
+  name: z.string(),
+  status: z.literal('pending')
+});
 
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
 // declared as a schema for response validation.
@@ -186,7 +210,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   opts
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { osc, paramStore, onStackChange } = opts;
+  const { osc, paramStore, onStackChange, operationStore: ops } = opts;
 
   // Operator-supplied credentials (ADR-002). Read once at registration time so
   // a misconfigured deployment fails fast at startup rather than mid-provision.
@@ -221,13 +245,21 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       schema: {
         body: requestSchema,
         response: {
-          200: responseSchema,
-          500: errorSchema
+          202: acceptedSchema
         }
       }
     },
     async (request, reply) => {
       const { name } = request.body;
+
+      // Create the async operation and return 202 immediately. The full
+      // provisioning logic runs in the background closure below; the caller
+      // polls GET /operations/:id for progress and the final stack coordinates.
+      const op = ops.create('provision', name);
+      reply.code(202).send({ operationId: op.id, name, status: 'pending' });
+
+      setImmediate(async () => {
+        ops.update(op.id, { status: 'running' });
 
       // secretRef registers a value as an OSC secret scoped to a specific
       // serviceId and returns the {{secrets.<name>}} reference to embed in the
@@ -443,49 +475,54 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           );
         }
 
-        return reply.code(200).send({
-          name,
-          minioEndpoint,
-          couchdbUrl,
-          redisUrl,
-          encoreUrl,
-          encoreCallbackUrl
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        request.log.error(
-          { err, failedService: currentService, provisioned },
-          'provisioning failed'
-        );
-        // Even on failure, persist whatever was provisioned so the deprovision
-        // route can clean up via the API. Without this, partially-provisioned
-        // stacks leave orphaned OSC instances that must be removed manually.
-        if (paramStore && provisioned.length > 0) {
-          try {
-            const workspaceId = await deriveWorkspaceId(osc);
-            await paramStore.storeStackConfig(workspaceId, name, {
-              minioEndpoint: '',
-              couchdbUrl: '',
-              redisUrl: '',
-              encoreUrl: '',
-              encoreCallbackUrl: '',
-              sourceBucket: SOURCE_BUCKET,
-              packagedBucket: PACKAGED_BUCKET,
-              services: provisioned.map((p) => ({
-                serviceId: p.serviceId,
-                instanceName: p.name
-              }))
-            });
-          } catch (storeErr) {
-            request.log.error({ storeErr }, 'failed to persist partial stack config');
+          ops.update(op.id, {
+            status: 'done',
+            completedAt: Date.now(),
+            result: {
+              name,
+              minioEndpoint,
+              couchdbUrl,
+              redisUrl,
+              encoreUrl,
+              encoreCallbackUrl
+            }
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          app.log.error(
+            { err, failedService: currentService, provisioned },
+            'provisioning failed'
+          );
+          // Even on failure, persist whatever was provisioned so the deprovision
+          // route can clean up via the API. Without this, partially-provisioned
+          // stacks leave orphaned OSC instances that must be removed manually.
+          if (paramStore && provisioned.length > 0) {
+            try {
+              const workspaceId = await deriveWorkspaceId(osc);
+              await paramStore.storeStackConfig(workspaceId, name, {
+                minioEndpoint: '',
+                couchdbUrl: '',
+                redisUrl: '',
+                encoreUrl: '',
+                encoreCallbackUrl: '',
+                sourceBucket: SOURCE_BUCKET,
+                packagedBucket: PACKAGED_BUCKET,
+                services: provisioned.map((p) => ({
+                  serviceId: p.serviceId,
+                  instanceName: p.name
+                }))
+              });
+            } catch (storeErr) {
+              app.log.error({ storeErr }, 'failed to persist partial stack config');
+            }
           }
+          ops.update(op.id, {
+            status: 'failed',
+            completedAt: Date.now(),
+            error: `provisioning failed at ${currentService}: ${message}`
+          });
         }
-        return reply.code(500).send({
-          error: `provisioning failed at ${currentService}: ${message}`,
-          failedService: currentService,
-          provisioned
-        });
-      }
+      });
     }
   );
 
@@ -565,78 +602,138 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       schema: {
         params: nameParamSchema,
         response: {
-          200: teardownResponseSchema,
-          404: teardownResponseSchema,
-          502: teardownResponseSchema
+          202: acceptedSchema
         }
       }
     },
     async (request, reply) => {
       const { name } = request.params;
 
-      // Without a parameter store there is no per-workspace ownership record to
-      // consult, so fall back to the legacy hardcoded-list teardown. This keeps
-      // store-less deployments working; ownership scoping (#29) requires the
-      // store and is exercised on the path below.
-      if (!paramStore) {
-        const result = await deprovisionStack(osc, name);
-        if (result.status === 'failed') {
-          request.log.error({ result }, 'stack teardown reported failures');
-          return reply.code(502).send(result);
+      // Create the async operation and return 202 immediately. The teardown
+      // runs in the background closure below; the caller polls GET
+      // /operations/:id for the final teardown result.
+      const op = ops.create('deprovision', name);
+      reply.code(202).send({ operationId: op.id, name, status: 'pending' });
+
+      setImmediate(async () => {
+        try {
+          ops.update(op.id, { status: 'running' });
+
+          // Without a parameter store there is no per-workspace ownership record
+          // to consult, so fall back to the legacy hardcoded-list teardown. This
+          // keeps store-less deployments working; ownership scoping (#29)
+          // requires the store and is exercised on the path below.
+          if (!paramStore) {
+            const result = await deprovisionStack(osc, name);
+            if (result.status === 'failed') {
+              app.log.error({ result }, 'stack teardown reported failures');
+            }
+            ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+            return;
+          }
+
+          // Discovery: the stored config is namespaced by the deployment's own
+          // workspace (tenant). A miss means the stack never existed under this
+          // deployment, or was already deprovisioned.
+          const workspaceId = await deriveWorkspaceId(osc);
+          const config = await paramStore.loadStackConfig(workspaceId, name);
+          if (!config) {
+            // Idempotent: a retry after a successful teardown (entry already
+            // gone) lands here. Report not_found rather than erroring.
+            ops.update(op.id, {
+              status: 'done',
+              completedAt: Date.now(),
+              result: { name, status: 'not_found', services: [] }
+            });
+            return;
+          }
+
+          // Teardown order and the instance set come from what was actually
+          // provisioned (the stored services[]), not the static STACK_SERVICES.
+          const result = await deprovisionStackFromConfig(
+            osc,
+            name,
+            config.services
+          );
+
+          if (result.status === 'failed') {
+            app.log.error({ result }, 'stack teardown reported failures');
+            // The parameter-store entry is intentionally NOT removed so a retry
+            // can re-read the services[] and finish the teardown.
+            ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+            return;
+          }
+
+          // removed | partial | not_found — every instance is gone (or was
+          // already gone). The stack is fully torn down, so remove the stored
+          // coordinates. deleteStackConfig is idempotent, so a retry that
+          // re-finds a stale entry still converges. A delete failure is logged
+          // but does not fail the call: the OSC instances are already removed
+          // and a stale config entry is a recoverable inconsistency.
+          try {
+            await paramStore.deleteStackConfig(workspaceId, name);
+          } catch (err) {
+            app.log.error(
+              { err, name },
+              'stack torn down but failed to remove parameter store entry'
+            );
+          }
+
+          // Drop cached connections for this workspace so the removed stack is
+          // not served from cache after teardown.
+          onStackChange?.(workspaceId);
+
+          ops.update(op.id, { status: 'done', completedAt: Date.now(), result });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          app.log.error({ err, name }, 'deprovisioning failed');
+          ops.update(op.id, {
+            status: 'failed',
+            completedAt: Date.now(),
+            error: `deprovisioning failed: ${message}`
+          });
         }
-        if (result.status === 'not_found') {
-          return reply.code(404).send(result);
+      });
+    }
+  );
+
+  // GET /api/v1/provision/operations — list all async provision/deprovision
+  // operations, newest first. Unauthenticated (same as the other provision
+  // routes).
+  app.get(
+    '/operations',
+    {
+      schema: {
+        response: {
+          200: z.array(operationSchema)
         }
-        return reply.code(200).send(result);
       }
+    },
+    async (_request, reply) => {
+      return reply.code(200).send(ops.list());
+    }
+  );
 
-      // Discovery: the stored config is namespaced by the deployment's own
-      // workspace (tenant). A miss means the stack never existed under this
-      // deployment, or was already deprovisioned.
-      const workspaceId = await deriveWorkspaceId(osc);
-      const config = await paramStore.loadStackConfig(workspaceId, name);
-      if (!config) {
-        // Idempotent: a retry after a successful teardown (entry already gone)
-        // lands here. Report not_found rather than erroring.
-        return reply.code(404).send({ name, status: 'not_found', services: [] });
+  // GET /api/v1/provision/operations/:id — fetch one operation by id. When
+  // status === 'done', `result` holds the full stack coordinates (provision) or
+  // the teardown result (deprovision). Unauthenticated.
+  app.get(
+    '/operations/:id',
+    {
+      schema: {
+        params: z.object({ id: z.string().uuid() }),
+        response: {
+          200: operationSchema,
+          404: notFoundSchema
+        }
       }
-
-      // Teardown order and the instance set come from what was actually
-      // provisioned (the stored services[]), not the static STACK_SERVICES list.
-      const result = await deprovisionStackFromConfig(
-        osc,
-        name,
-        config.services
-      );
-
-      if (result.status === 'failed') {
-        request.log.error({ result }, 'stack teardown reported failures');
-        // 502 Bad Gateway: the failure originates in a downstream OSC service.
-        // The parameter-store entry is intentionally NOT removed so a retry can
-        // re-read the services[] and finish the teardown.
-        return reply.code(502).send(result);
+    },
+    async (request, reply) => {
+      const op = ops.get(request.params.id);
+      if (!op) {
+        return reply.code(404).send({ error: `no operation with id "${request.params.id}"` });
       }
-
-      // removed | partial | not_found — every instance is gone (or was already
-      // gone). The stack is fully torn down, so remove the stored coordinates.
-      // deleteStackConfig is idempotent, so a retry that re-finds a stale entry
-      // still converges. A delete failure is logged but does not fail the call:
-      // the OSC instances are already removed and a stale config entry is a
-      // recoverable inconsistency, not a stranded stack.
-      try {
-        await paramStore.deleteStackConfig(workspaceId, name);
-      } catch (err) {
-        request.log.error(
-          { err, name },
-          'stack torn down but failed to remove parameter store entry'
-        );
-      }
-
-      // Drop cached connections for this workspace so the removed stack is not
-      // served from cache after teardown.
-      onStackChange?.(workspaceId);
-
-      return reply.code(200).send(result);
+      return reply.code(200).send(op);
     }
   );
 };

@@ -13,6 +13,7 @@ import {
   validatorCompiler
 } from 'fastify-type-provider-zod';
 import { provisionRouter } from './routes/provision.js';
+import { OperationStore } from './services/operation-store.js';
 import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';import { registerAuth } from './auth/middleware.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
@@ -176,10 +177,13 @@ app.addHook('preHandler', async (request) => {
   }
 });
 
+const operationStore = new OperationStore();
+
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
   osc: oscContext,
   paramStore,
+  operationStore,
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   onStackChange: (workspaceId: string) => stackResolver.invalidate(workspaceId)
