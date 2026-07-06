@@ -376,6 +376,45 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
         }
 
+        // 1c. Set CORS on both buckets so browsers can PUT presigned URLs
+        // directly from the ops UI without cross-origin errors.
+        // MinIO supports the S3 PutBucketCors API; we call it via the MinIO
+        // client's makeRequestAsync (which handles AWS Signature V4 signing)
+        // because the minio JS SDK does not expose a setBucketCors helper.
+        const corsXml = [
+          '<?xml version="1.0" encoding="UTF-8"?>',
+          '<CORSConfiguration>',
+          '<CORSRule>',
+          '<AllowedOrigin>*</AllowedOrigin>',
+          '<AllowedMethod>GET</AllowedMethod>',
+          '<AllowedMethod>PUT</AllowedMethod>',
+          '<AllowedMethod>HEAD</AllowedMethod>',
+          '<AllowedHeader>*</AllowedHeader>',
+          '<ExposeHeader>ETag</ExposeHeader>',
+          '<MaxAgeSeconds>3600</MaxAgeSeconds>',
+          '</CORSRule>',
+          '</CORSConfiguration>'
+        ].join('');
+        const corsPayload = Buffer.from(corsXml, 'utf-8');
+        for (const bucket of [SOURCE_BUCKET, PACKAGED_BUCKET]) {
+          let attempts = 0;
+          while (true) {
+            try {
+              await (minioClient as unknown as { makeRequestAsync(opts: object, payload: Buffer, codes: number[]): Promise<unknown> })
+                .makeRequestAsync(
+                  { method: 'PUT', bucketName: bucket, query: 'cors', headers: { 'content-type': 'application/xml' } },
+                  corsPayload,
+                  [200]
+                );
+              break;
+            } catch {
+              attempts++;
+              if (attempts >= 5) break; // CORS is best-effort — don't block provision
+              await delay(3000);
+            }
+          }
+        }
+
         // 2. CouchDB — document store for asset metadata.
         currentService = 'apache-couchdb';
         const couchdbAdminPasswordRef = await secretRef(
