@@ -73,7 +73,7 @@ const API_BASE = window.location.origin + '/api/v1';
 async function apiFetch(path, options = {}) {
   const stack = getActiveStack();
   const headers = {
-    'Content-Type': 'application/json',
+    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
     ...(options.headers || {}),
   };
