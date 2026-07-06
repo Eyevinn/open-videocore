@@ -1410,6 +1410,10 @@ async function renderProvisionTab(container) {
           setTimeout(tick, 3000);
         } else {
           activeOpIds.delete(op.id);
+          // Hide the section once no active ops remain.
+          const row = opsContent.querySelector('#op-' + op.id);
+          if (row) row.remove();
+          if (!activeOpIds.size) opsSection.style.display = 'none';
         }
       }).catch(function() {
         setTimeout(tick, 5000);
@@ -1418,21 +1422,20 @@ async function renderProvisionTab(container) {
     setTimeout(tick, 3000);
   }
 
-  apiFetch('/provision/operations').then(function(ops) {
-    if (!ops || !ops.length) {
-      const p = document.createElement('p');
-      p.className = 'text-muted';
-      p.style.fontSize = '13px';
-      p.textContent = 'No operations yet.';
-      opsContent.appendChild(p);
-      return;
-    }
-    // Show most-recent first; resume polling active ones.
-    ops.slice().reverse().forEach(function(op) {
-      upsertOpRow(op);
-      if (op.status === 'pending' || op.status === 'running') pollOp(op);
-    });
-  }).catch(function() {});
+  function refreshOpsSection() {
+    apiFetch('/provision/operations').then(function(ops) {
+      const active = (ops || []).filter(function(op) {
+        return op.status === 'pending' || op.status === 'running';
+      });
+      opsSection.style.display = active.length ? '' : 'none';
+      active.forEach(function(op) {
+        upsertOpRow(op);
+        pollOp(op);
+      });
+    }).catch(function() {});
+  }
+  opsSection.style.display = 'none';
+  refreshOpsSection();
 
   // Stack list
   const listSection = document.createElement('div');
