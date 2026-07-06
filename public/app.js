@@ -381,7 +381,8 @@ async function renderAssetsTab(container) {
         headers: {
           'Content-Type': file.type || 'application/octet-stream',
           'Content-Length': String(file.size),
-          'X-Stack-Name': getActiveStack()
+          'X-Stack-Name': getActiveStack(),
+          ...(_devToken ? { 'Authorization': 'Bearer ' + _devToken } : {})
         }
       });
       if (!uploadRes.ok) {
