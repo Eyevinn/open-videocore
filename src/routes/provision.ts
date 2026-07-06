@@ -250,16 +250,23 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       const provisioned: ProvisionedEntry[] = [];
 
       // Helper: provision one service with its own short-lived service access
-      // token, then mark it as provisioned.
+      // token, then mark it as provisioned. Idempotent: if the named instance
+      // already exists (OSC returns "Name is already taken") we fetch and
+      // return the existing instance rather than failing.
       const provision = async (
         serviceId: string,
         body: Record<string, unknown>
       ): Promise<Instance> => {
         const sat = await osc.getServiceAccessToken(serviceId);
-        const instance = await createInstance(osc, serviceId, sat, {
-          name,
-          ...body
-        });
+        let instance: Instance;
+        try {
+          instance = await createInstance(osc, serviceId, sat, { name, ...body });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('already taken') && !msg.includes('already exists')) throw err;
+          // Instance already exists — fetch and reuse it.
+          instance = (await getInstance(osc, serviceId, name, sat)) as Instance;
+        }
         provisioned.push({ serviceId, name });
         return instance;
       };

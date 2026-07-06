@@ -70,20 +70,39 @@ export async function updateInstance(
 
 // Spawn a fresh Encore OSC instance and register it in the pool. The instance
 // name is unique per spawn so concurrent scale-ups never collide.
+// Retries up to 3 times on transient 5xx OSC infrastructure errors (e.g.
+// ingress-nginx admission webhook timeouts that appear under cluster load).
 export async function spawnInstance(
-  config: EncoreScalerConfig
+  config: EncoreScalerConfig,
+  maxAttempts = 3
 ): Promise<EncoreInstanceRecord> {
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
   // Lowercase-alphanumeric, matching OSC's instance-name rules
   // (isValidInstanceName) and the provision route's own naming constraints.
   const name = `scaler${config.workspaceId.replace(/[^a-z0-9]/gi, '').toLowerCase()}${Date.now().toString(36)}`;
 
-  const instance = (await createInstance(
-    config.oscContext,
-    ENCORE_SERVICE_ID,
-    sat,
-    { name }
-  )) as OscInstance;
+  let lastErr: unknown;
+  let instance: OscInstance | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      instance = (await createInstance(
+        config.oscContext,
+        ENCORE_SERVICE_ID,
+        sat,
+        { name }
+      )) as OscInstance;
+      break;
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      // Only retry on transient 5xx / network errors, not on 4xx (bad request).
+      const isTransient = msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
+      if (!isTransient || attempt === maxAttempts) throw err;
+      // Exponential back-off: 5s, 10s.
+      await new Promise((r) => setTimeout(r, attempt * 5_000));
+    }
+  }
+  if (!instance) throw lastErr;
 
   const instanceId = instanceName(instance);
   await waitForInstanceReady(ENCORE_SERVICE_ID, instanceId, config.oscContext);

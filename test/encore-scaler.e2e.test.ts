@@ -111,11 +111,15 @@ describe.skipIf(SKIP)('Encore auto-scaler e2e (OSC + Redis)', () => {
   }
 
   afterEach(async () => {
+    // Capture the current connection locally so a deferred cleanup can't close
+    // a connection that belongs to the next test (redis is reassigned by beforeEach).
+    const conn = redis;
+    const snapshot = configsToClean.slice();
     // Destroy any instances the test left behind so we never leak OSC compute.
     // Cleanup must be resilient: a test may already have destroyed instances.
     try {
-      for (const config of configsToClean) {
-        const records = await listInstances(redis, config.workspaceId);
+      for (const config of snapshot) {
+        const records = await listInstances(conn, config.workspaceId);
         for (const record of records) {
           try {
             await destroyInstance(record.instanceId, config);
@@ -123,18 +127,15 @@ describe.skipIf(SKIP)('Encore auto-scaler e2e (OSC + Redis)', () => {
             // An already-gone instance is fine; keep cleaning the rest.
           }
         }
-        await flushWorkspace(redis, config.workspaceId);
+        await flushWorkspace(conn, config.workspaceId);
       }
     } catch {
       // Never let cleanup fail the test result.
     } finally {
-      await redis.quit().catch(() => undefined);
+      await conn.quit().catch(() => undefined);
     }
-  });
-
-  afterAll(() => {
-    // beforeEach owns the connection lifecycle; nothing global to tear down.
-  });
+  // OSC removeInstance takes ~10–30s per instance; allow up to 180s for cleanup.
+  }, 180_000);
 
   it.skipIf(SKIP)(
     'scale-up: spawns one Encore instance when a job is queued',
@@ -265,20 +266,26 @@ describe.skipIf(SKIP)('Encore auto-scaler e2e (OSC + Redis)', () => {
       records = await listInstances(redis, workspaceId);
       expect(records).toHaveLength(0);
 
-      // 7. The instance is gone from OSC too: getInstance throws or yields
-      //    a falsy value once the instance has been removed.
+      // 7. The instance is eventually gone from OSC. OSC propagates the deletion
+      //    asynchronously so we poll for up to 30s rather than asserting instantly.
       const token = await oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
       let stillPresent = true;
-      try {
-        const instance = await oscGetInstance(
-          oscContext,
-          ENCORE_SERVICE_ID,
-          instanceId,
-          token
-        );
-        stillPresent = Boolean(instance);
-      } catch {
-        stillPresent = false;
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        try {
+          const instance = await oscGetInstance(
+            oscContext,
+            ENCORE_SERVICE_ID,
+            instanceId,
+            token
+          );
+          stillPresent = Boolean(instance);
+          if (!stillPresent) break;
+        } catch {
+          stillPresent = false;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 3_000));
       }
       expect(stillPresent).toBe(false);
     },
