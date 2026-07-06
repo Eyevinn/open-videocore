@@ -41,7 +41,11 @@ export type AssetUploadRouterOptions = {
   // upload-complete kicks off an ffprobe extraction against the freshly stored
   // object. Detached and non-blocking; never throws. Absent in deployments
   // without an ffprobe runner, in which case upload-complete behaves as before.
-  onObjectStored?: (workspaceId: string, assetId: string, objectKey: string) => void;
+  // The storage instance is passed so the callback uses the already-resolved
+  // workspace storage (which carries the correct stack) rather than trying to
+  // re-resolve it from the cache, which may not have a bare-workspaceId entry
+  // when the request came in with an X-Stack-Name header.
+  onObjectStored?: (workspaceId: string, assetId: string, objectKey: string, storage?: WorkspaceStorage) => void;
 };
 
 // Deterministic object key for an asset's source payload. Workspace scoping is
@@ -161,7 +165,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       }
 
       await repo.update(request.workspaceId, asset.id, { objectKey, status: 'processing' });
-      opts.onObjectStored?.(request.workspaceId, asset.id, objectKey);
+      opts.onObjectStored?.(request.workspaceId, asset.id, objectKey, storage);
       return reply.code(200).send({ id: asset.id, status: 'processing' });
     }
   );
@@ -305,7 +309,8 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       // Trigger technical metadata extraction against the stored object
       // (issue #6). Fire-and-forget; does not affect this response.
       const objectKey = existing.objectKey ?? sourceObjectKey(updated.id);
-      opts.onObjectStored?.(request.workspaceId, updated.id, objectKey);
+      const storage = storageFor(request.workspaceId);
+      opts.onObjectStored?.(request.workspaceId, updated.id, objectKey, storage);
       return reply.code(200).send({ id: updated.id, status: updated.status });
     }
   );

@@ -418,10 +418,10 @@ await app.register(internalRouter, {
 // resolver cache is warm and the sync storageFor() can read it.
 const onObjectStored =
   storageAvailable && probe
-    ? (workspaceId: string, assetId: string, objectKey: string) =>
+    ? (workspaceId: string, assetId: string, objectKey: string, storage?: WorkspaceStorage) =>
         void extractTechnicalMetadata(
           { workspaceId, assetId, objectKey },
-          { assets: assetRepository, storage: storageFor(workspaceId), probe }
+          { assets: assetRepository, storage: storage ?? storageFor(workspaceId), probe }
         )
     : undefined;
 
