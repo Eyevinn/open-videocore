@@ -1449,16 +1449,80 @@ async function renderProvisionTab(container) {
     btn.textContent = 'Provisioning…';
     try {
       const result = await apiFetch('/provision', { method: 'POST', body: JSON.stringify({ name: name }) });
-      showMsg(msgEl, 'Provisioning started for "' + name + '".', 'success');
-      if (result) {
-        const pre = document.createElement('pre');
-        pre.className = 'code-block mt8';
-        pre.textContent = JSON.stringify(result, null, 2);
-        msgEl.appendChild(pre);
+      const opId = result && result.operationId;
+
+      // Show a live status bar that polls until done/failed.
+      const statusBar = document.createElement('div');
+      statusBar.className = 'mt8';
+      msgEl.appendChild(statusBar);
+
+      const updateBar = function(op) {
+        const isDone = op.status === 'done';
+        const isFailed = op.status === 'failed';
+        const icon = isDone ? '✓' : isFailed ? '✗' : '…';
+        const cls = isDone ? 'success' : isFailed ? 'error' : 'info';
+
+        statusBar.textContent = '';
+        const wrap = document.createElement('div');
+        wrap.className = 'msg msg-' + cls;
+        wrap.style.cssText = 'display:flex;align-items:center;gap:8px;';
+
+        const iconEl = document.createElement('span');
+        iconEl.style.fontSize = '16px';
+        iconEl.textContent = icon;
+        wrap.appendChild(iconEl);
+
+        const body = document.createElement('div');
+        const strong = document.createElement('strong');
+        strong.textContent = op.status;
+        body.appendChild(strong);
+        body.appendChild(document.createTextNode(' — ' + op.name));
+        if (op.error) {
+          const errEl = document.createElement('span');
+          errEl.style.cssText = 'display:block;font-size:12px;opacity:.8;';
+          errEl.textContent = op.error;
+          body.appendChild(errEl);
+        }
+        wrap.appendChild(body);
+        statusBar.appendChild(wrap);
+        if (isDone) {
+          // Show stack coordinates inline once provisioning succeeds.
+          apiFetch('/provision/' + encodeURIComponent(op.name)).then(function(coords) {
+            const pre = document.createElement('pre');
+            pre.className = 'code-block mt8';
+            pre.textContent = JSON.stringify(coords, null, 2);
+            msgEl.appendChild(pre);
+          }).catch(function() {});
+        }
+      };
+
+      if (opId) {
+        // Poll until terminal.
+        const poll = async function() {
+          try {
+            const op = await apiFetch('/provision/operations/' + encodeURIComponent(opId));
+            updateBar(op);
+            if (op.status !== 'done' && op.status !== 'failed') {
+              setTimeout(poll, 3000);
+            } else {
+              btn.disabled = false;
+              btn.textContent = 'Provision Stack';
+            }
+          } catch (e) {
+            // Keep polling on transient fetch errors.
+            setTimeout(poll, 5000);
+          }
+        };
+        updateBar({ status: 'pending', name: name });
+        poll();
+      } else {
+        // Fallback: no operationId, show raw response.
+        showMsg(msgEl, 'Provisioning started for "' + name + '".', 'success');
+        btn.disabled = false;
+        btn.textContent = 'Provision Stack';
       }
     } catch (err) {
       showMsg(msgEl, 'Error: ' + err.message, 'error');
-    } finally {
       btn.disabled = false;
       btn.textContent = 'Provision Stack';
     }
