@@ -13,6 +13,7 @@ import {
   waitForInstanceReady
 } from '@osaas/client-core';
 import { Client as MinioClient } from 'minio';
+import nano from 'nano';
 import {
   deprovisionStack,
   deprovisionStackFromConfig
@@ -387,6 +388,33 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         });
         await waitForInstanceReady('apache-couchdb', name, osc);
         const couchdbUrl = instanceUrl(couchdb);
+
+        // 2b. Create the required CouchDB databases. waitForInstanceReady
+        // passes when the container is healthy but the HTTP API may still be
+        // starting up — retry with backoff the same way we do for MinIO.
+        const couchAdminUrl = couchdbUrl
+          .replace(/\/$/, '')
+          .replace(/^(https?:\/\/)/, `$1admin:${couchdbAdminPassword}@`);
+        const couchServer = nano(couchAdminUrl);
+        const couchDbs = process.env['COUCHDB_ASSETS_DB']
+          ? [process.env['COUCHDB_ASSETS_DB']]
+          : ['assets', 'jobs', 'collections', 'webhooks'];
+        for (const db of couchDbs) {
+          let attempts = 0;
+          while (true) {
+            try {
+              await couchServer.db.create(db);
+              break;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              // Ignore "already exists" — idempotent re-provision.
+              if (msg.includes('already exists') || msg.includes('file_exists')) break;
+              attempts++;
+              if (attempts >= 20) throw err;
+              await delay(5000);
+            }
+          }
+        }
 
         // 3. Valkey — queue / coordination backbone.
         currentService = 'valkey-io-valkey';
