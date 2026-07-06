@@ -6,7 +6,7 @@ import fastifySwagger from '@fastify/swagger';
 import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
-import { Context, createInstance, getInstance } from '@osaas/client-core';
+import { Context, createInstance, getInstance, waitForInstanceReady, getPortsForInstance } from '@osaas/client-core';
 import {
   jsonSchemaTransform,
   serializerCompiler,
@@ -145,7 +145,9 @@ if (!paramStore) {
     osc: {
       getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
       getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat),
-      createInstance: (serviceId, sat, body) => createInstance(oscContext, serviceId, sat, body)
+      createInstance: (serviceId, sat, body) => createInstance(oscContext, serviceId, sat, body),
+      waitForInstanceReady: (serviceId, name) => waitForInstanceReady(serviceId, name, oscContext),
+      getPortsForInstance: (serviceId, name, sat) => getPortsForInstance(oscContext, serviceId, name, sat)
     },
     log: app.log
   });
