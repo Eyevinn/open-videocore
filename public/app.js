@@ -202,6 +202,78 @@ async function renderAssetsTab(container) {
   ].join('');
   container.appendChild(ingestSection);
 
+  // Upload file section
+  const uploadSection = document.createElement('div');
+  uploadSection.className = 'section';
+  const uploadTitle = document.createElement('div');
+  uploadTitle.className = 'section-title';
+  uploadTitle.textContent = 'Upload file';
+  uploadSection.appendChild(uploadTitle);
+  const uploadForm = document.createElement('div');
+  uploadForm.className = 'form-row';
+  const fileField = document.createElement('div');
+  fileField.className = 'form-field grow';
+  const fileLabel = document.createElement('label');
+  fileLabel.htmlFor = 'upload-file';
+  fileLabel.textContent = 'File';
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.id = 'upload-file';
+  fileInput.accept = 'video/*,audio/*';
+  fileField.appendChild(fileLabel);
+  fileField.appendChild(fileInput);
+  const uploadBtn = document.createElement('button');
+  uploadBtn.id = 'upload-btn';
+  uploadBtn.textContent = 'Upload';
+  uploadForm.appendChild(fileField);
+  uploadForm.appendChild(uploadBtn);
+  uploadSection.appendChild(uploadForm);
+  const uploadProgress = document.createElement('div');
+  uploadSection.appendChild(uploadProgress);
+  container.appendChild(uploadSection);
+
+  uploadBtn.addEventListener('click', async function() {
+    const file = fileInput.files && fileInput.files[0];
+    uploadProgress.textContent = '';
+    if (!file) { showMsg(uploadProgress, 'Select a file first.', 'error'); return; }
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = 'Uploading…';
+    try {
+      // 1. Create the asset record.
+      const asset = await apiFetch('/assets', {
+        method: 'POST',
+        body: JSON.stringify({ name: file.name })
+      });
+      const assetId = asset.id;
+      showMsg(uploadProgress, 'Asset created (' + assetId + '), getting upload URL…', 'info');
+
+      // 2. Get a presigned PUT URL.
+      const { url: presignedUrl } = await apiFetch('/assets/' + encodeURIComponent(assetId) + '/upload-url');
+
+      showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
+
+      // 3. PUT the file directly to MinIO.
+      const putRes = await fetch(presignedUrl, {
+        method: 'PUT',
+        body: file,
+        headers: { 'Content-Type': file.type || 'application/octet-stream' }
+      });
+      if (!putRes.ok) throw new Error('Upload to storage failed: HTTP ' + putRes.status);
+
+      // 4. Notify the API the upload is complete.
+      await apiFetch('/assets/' + encodeURIComponent(assetId) + '/upload-complete', { method: 'POST' });
+
+      showMsg(uploadProgress, 'Upload complete — asset "' + file.name + '" is ready.', 'success');
+      fileInput.value = '';
+      await loadAssets(listSection, detailPanel);
+    } catch (err) {
+      showMsg(uploadProgress, 'Error: ' + err.message, 'error');
+    } finally {
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = 'Upload';
+    }
+  });
+
   // Asset list section
   const listSection = document.createElement('div');
   listSection.className = 'section';
