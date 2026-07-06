@@ -285,20 +285,38 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // token, then mark it as provisioned. Idempotent: if the named instance
       // already exists (OSC returns "Name is already taken") we fetch and
       // return the existing instance rather than failing.
+      // Retries up to 3 times on transient 5xx OSC infrastructure errors
+      // (ingress-nginx admission webhook timeouts under cluster load).
       const provision = async (
         serviceId: string,
-        body: Record<string, unknown>
+        body: Record<string, unknown>,
+        maxAttempts = 3
       ): Promise<Instance> => {
         const sat = await osc.getServiceAccessToken(serviceId);
-        let instance: Instance;
-        try {
-          instance = await createInstance(osc, serviceId, sat, { name, ...body });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!msg.includes('already taken') && !msg.includes('already exists')) throw err;
-          // Instance already exists — fetch and reuse it.
-          instance = (await getInstance(osc, serviceId, name, sat)) as Instance;
+        let instance: Instance | undefined;
+        let lastErr: unknown;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            instance = await createInstance(osc, serviceId, sat, { name, ...body });
+            break;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('already taken') || msg.includes('already exists')) {
+              instance = (await getInstance(osc, serviceId, name, sat)) as Instance;
+              break;
+            }
+            lastErr = err;
+            const isTransient =
+              msg.includes('500') ||
+              msg.includes('502') ||
+              msg.includes('503') ||
+              msg.includes('ECONNRESET') ||
+              msg.includes('context deadline exceeded');
+            if (!isTransient || attempt === maxAttempts) throw err;
+            await new Promise((r) => setTimeout(r, attempt * 5_000));
+          }
         }
+        if (!instance) throw lastErr;
         provisioned.push({ serviceId, name });
         return instance;
       };
