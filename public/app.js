@@ -356,25 +356,24 @@ async function renderAssetsTab(container) {
         body: JSON.stringify({ name: file.name })
       });
       const assetId = asset.id;
-      showMsg(uploadProgress, 'Asset created (' + assetId + '), getting upload URL…', 'info');
-
-      // 2. Get a presigned PUT URL.
-      const { url: presignedUrl } = await apiFetch('/assets/' + encodeURIComponent(assetId) + '/upload-url');
-
       showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
 
-      // 3. PUT the file directly to MinIO.
-      const putRes = await fetch(presignedUrl, {
+      // 2. Stream the file through the API (avoids CORS on MinIO presigned URLs).
+      const uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
         method: 'PUT',
         body: file,
-        headers: { 'Content-Type': file.type || 'application/octet-stream' }
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream',
+          'Content-Length': String(file.size),
+          'X-Stack-Name': getActiveStack()
+        }
       });
-      if (!putRes.ok) throw new Error('Upload to storage failed: HTTP ' + putRes.status);
+      if (!uploadRes.ok) {
+        const err = await uploadRes.json().catch(() => ({}));
+        throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
+      }
 
-      // 4. Notify the API the upload is complete.
-      await apiFetch('/assets/' + encodeURIComponent(assetId) + '/upload-complete', { method: 'POST' });
-
-      showMsg(uploadProgress, 'Upload complete — asset "' + file.name + '" is ready.', 'success');
+      showMsg(uploadProgress, 'Upload complete — asset "' + file.name + '" is processing.', 'success');
       fileInput.value = '';
       await loadAssets(listSection, detailPanel);
     } catch (err) {
