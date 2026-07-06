@@ -73,7 +73,7 @@ const API_BASE = window.location.origin + '/api/v1';
 async function apiFetch(path, options = {}) {
   const stack = getActiveStack();
   const headers = {
-    'Content-Type': 'application/json',
+    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
     ...(options.headers || {}),
   };
@@ -1362,48 +1362,135 @@ async function renderProvisionTab(container) {
   listSection.appendChild(detailSection);
 
   function showStackDetail(name) {
-    detailSection.innerHTML = '<div class="section-title">Stack: ' + escHtml(name) + '</div>' + loadingEl().outerHTML;
+    detailSection.textContent = '';
+    const title = document.createElement('div');
+    title.className = 'section-title';
+    title.textContent = 'Stack: ' + name;
+    detailSection.appendChild(title);
+    detailSection.appendChild(loadingEl());
     detailSection.style.display = 'block';
     apiFetch('/provision/' + encodeURIComponent(name)).then(function(data) {
-      const rows = Object.entries(data)
+      detailSection.textContent = '';
+      const t2 = document.createElement('div');
+      t2.className = 'section-title';
+      t2.textContent = 'Stack: ' + name;
+      detailSection.appendChild(t2);
+      const table = document.createElement('table');
+      Object.entries(data)
         .filter(function(e) { return e[0] !== 'services'; })
-        .map(function(e) {
-          return '<tr><td style="color:var(--text-muted);white-space:nowrap;padding-right:16px">' + escHtml(e[0]) + '</td>' +
-            '<td style="word-break:break-all;font-family:monospace;font-size:12px">' + escHtml(String(e[1])) + '</td></tr>';
-        }).join('');
-      detailSection.innerHTML = '<div class="section-title">Stack: ' + escHtml(name) + '</div><table>' + rows + '</table>';
+        .forEach(function(e) {
+          const tr = document.createElement('tr');
+          const kd = document.createElement('td');
+          kd.style.cssText = 'color:var(--text-muted);white-space:nowrap;padding-right:16px';
+          kd.textContent = e[0];
+          const vd = document.createElement('td');
+          vd.style.cssText = 'word-break:break-all;font-family:monospace;font-size:12px';
+          vd.textContent = String(e[1]);
+          tr.appendChild(kd);
+          tr.appendChild(vd);
+          table.appendChild(tr);
+        });
+      detailSection.appendChild(table);
     }).catch(function(err) {
-      detailSection.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
+      detailSection.textContent = '';
+      const p = document.createElement('p');
+      p.className = 'text-muted';
+      p.textContent = err.message;
+      detailSection.appendChild(p);
+    });
+  }
+
+  function pollDeprovisionOp(opId, statusEl, rowEl) {
+    apiFetch('/provision/operations/' + encodeURIComponent(opId)).then(function(op) {
+      if (op.status === 'done') {
+        statusEl.textContent = '✓ removed';
+        statusEl.style.color = 'var(--color-success, #4caf50)';
+        if (rowEl) rowEl.remove();
+      } else if (op.status === 'failed') {
+        statusEl.textContent = '✗ ' + (op.error || 'failed');
+        statusEl.style.color = 'var(--color-danger, #f44)';
+      } else {
+        statusEl.textContent = op.status + '…';
+        setTimeout(function() { pollDeprovisionOp(opId, statusEl, rowEl); }, 3000);
+      }
+    }).catch(function() {
+      setTimeout(function() { pollDeprovisionOp(opId, statusEl, rowEl); }, 5000);
     });
   }
 
   apiFetch('/provision').then(function(names) {
-    listContent.innerHTML = '';
+    listContent.textContent = '';
     if (!names.length) {
-      listContent.innerHTML = '<p class="text-muted">No stacks provisioned yet.</p>';
+      const p = document.createElement('p');
+      p.className = 'text-muted';
+      p.textContent = 'No stacks provisioned yet.';
+      listContent.appendChild(p);
       return;
     }
     const table = document.createElement('table');
-    table.innerHTML = '<thead><tr><th>Name</th><th></th></tr></thead>';
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['Name', '', ''].forEach(function(h) {
+      const th = document.createElement('th');
+      th.textContent = h;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
     const tbody = document.createElement('tbody');
     names.forEach(function(name) {
       const tr = document.createElement('tr');
+
       const tdName = document.createElement('td');
       tdName.textContent = name;
+
       const tdBtn = document.createElement('td');
-      const btn = document.createElement('button');
-      btn.className = 'btn-sm';
-      btn.textContent = 'Details';
-      btn.addEventListener('click', function() { showStackDetail(name); });
-      tdBtn.appendChild(btn);
+      const detailBtn = document.createElement('button');
+      detailBtn.className = 'btn-sm';
+      detailBtn.textContent = 'Details';
+      detailBtn.addEventListener('click', function() { showStackDetail(name); });
+      tdBtn.appendChild(detailBtn);
+
+      const tdRemove = document.createElement('td');
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'btn-sm btn-danger';
+      removeBtn.textContent = 'Remove';
+      const statusSpan = document.createElement('span');
+      statusSpan.style.cssText = 'margin-left:8px;font-size:12px;';
+      removeBtn.addEventListener('click', function() {
+        if (!confirm('Remove stack "' + name + '"? This will destroy all OSC services in the stack.')) return;
+        removeBtn.disabled = true;
+        statusSpan.textContent = 'removing…';
+        apiFetch('/provision/' + encodeURIComponent(name), { method: 'DELETE' }).then(function(res) {
+          const opId = res && res.operationId;
+          if (opId) {
+            statusSpan.textContent = 'pending…';
+            pollDeprovisionOp(opId, statusSpan, tr);
+          } else {
+            statusSpan.textContent = '✓ removed';
+            tr.remove();
+          }
+        }).catch(function(err) {
+          statusSpan.textContent = '✗ ' + err.message;
+          removeBtn.disabled = false;
+        });
+      });
+      tdRemove.appendChild(removeBtn);
+      tdRemove.appendChild(statusSpan);
+
       tr.appendChild(tdName);
       tr.appendChild(tdBtn);
+      tr.appendChild(tdRemove);
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
     listContent.appendChild(table);
   }).catch(function(err) {
-    listContent.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
+    listContent.textContent = '';
+    const p = document.createElement('p');
+    p.className = 'text-muted';
+    p.textContent = err.message;
+    listContent.appendChild(p);
   });
 
   // Provision form
