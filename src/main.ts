@@ -55,7 +55,6 @@ import {
   getJob,
   getLogsForInstance,
   removeJob,
-  waitForJobToComplete
 } from '@osaas/client-core';
 
 declare module 'fastify' {
@@ -250,7 +249,6 @@ const probe: ProbeRunner | undefined = storageAvailable
       context: oscContext,
       createJob,
       getJob,
-      waitForJobToComplete,
       getLogsForInstance,
       removeJob
     })
@@ -273,7 +271,6 @@ const thumbnailExtractor = storageAvailable
         context: oscContext,
         createJob,
         getJob,
-        waitForJobToComplete,
         getLogsForInstance,
         removeJob
       })
@@ -289,7 +286,6 @@ const rewrapRunner: RewrapRunner | undefined = storageAvailable
       context: oscContext,
       createJob,
       getJob,
-      waitForJobToComplete,
       getLogsForInstance,
       removeJob
     })
@@ -300,7 +296,6 @@ const clipRunner: ClipRunner | undefined = storageAvailable
       context: oscContext,
       createJob,
       getJob,
-      waitForJobToComplete,
       getLogsForInstance,
       removeJob
     })

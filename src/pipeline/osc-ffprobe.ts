@@ -19,7 +19,6 @@ import {
   getJob,
   getLogsForInstance,
   removeJob,
-  waitForJobToComplete,
   type Context
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
@@ -31,7 +30,6 @@ export type OscJobApi = {
   context: Context;
   createJob: typeof createJob;
   getJob: typeof getJob;
-  waitForJobToComplete: typeof waitForJobToComplete;
   getLogsForInstance: typeof getLogsForInstance;
   removeJob: typeof removeJob;
 };

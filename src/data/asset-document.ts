@@ -255,9 +255,9 @@ export function toAssetDocument(
   if (opts.rev) {
     doc._rev = opts.rev;
   }
-  if (asset.objectKey && opts.storageBucket) {
+  if (asset.objectKey) {
     doc.administrative.storage = {
-      bucket: opts.storageBucket,
+      bucket: opts.storageBucket ?? '',
       key: asset.objectKey,
       sizeBytes: opts.storageSizeBytes ?? 0
     };
