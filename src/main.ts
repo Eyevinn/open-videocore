@@ -30,8 +30,7 @@ import {
   PerWorkspaceJobRepository,
   PerWorkspaceSearchRepository,
   PerWorkspaceWebhookRepository,
-  PerWorkspaceCollectionRepository,
-  PerWorkspaceEncoreClient
+  PerWorkspaceCollectionRepository
 } from './data/per-workspace-repos.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
@@ -48,6 +47,7 @@ import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.j
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
+import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import {
   createJob,
   getJob,
@@ -293,14 +293,29 @@ const clipRunner: ClipRunner | undefined = storageAvailable
     })
   : undefined;
 
-// ABR transcoding (issue #8). Encore is a long-lived OSC instance provisioned
-// per workspace as part of the stack. The per-workspace client resolves the
-// right Encore from the request's stack (decoding the workspace from the job's
-// externalId at submit time). Enabled whenever object storage is reachable;
-// otherwise POST /:id/transcode responds 501 / 502.
-const encore: EncoreClient | undefined = storageAvailable
-  ? new PerWorkspaceEncoreClient(stackResolver)
-  : undefined;
+// ABR transcoding via auto-scaling Encore pool (ADR-006). The scaler exposes
+// the same EncoreClient interface as the old static client but manages a
+// per-workspace pool of Encore OSC instances. Set ENCORE_MAX_INSTANCES=1 to
+// cap the pool at a single instance (equivalent to the previous static behaviour).
+// Requires REDIS_URL (same Valkey used for HLS/DASH packaging). When Redis is
+// unavailable transcoding degrades to 501.
+const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] ?? '3', 10);
+const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] ?? String(5 * 60 * 1000), 10);
+
+let encore: EncoreClient | undefined;
+let sharedRedis: IORedis | undefined;
+
+if (storageAvailable && process.env['REDIS_URL']) {
+  sharedRedis = new IORedis(process.env['REDIS_URL'], { lazyConnect: true, maxRetriesPerRequest: null });
+  encore = new WorkspaceEncoreScalerRegistry({
+    redis: sharedRedis,
+    oscContext,
+    maxInstances: encoreMaxInstances,
+    idleTimeoutMs: encoreIdleTimeoutMs
+  });
+} else if (storageAvailable) {
+  app.log.warn('REDIS_URL not set — Encore auto-scaler disabled, transcoding unavailable');
+}
 
 // Bucket names are stack-invariant (created at provision time, see provision.ts)
 // so a static default is correct for every workspace.
@@ -348,15 +363,13 @@ await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobReposito
 // PackagingService is exposed to issue #8's Encore callback handler via the
 // PackagingTrigger interface so the two features stay decoupled.
 function buildPackaging(): PackagingService | undefined {
-  const redisUrl = process.env['REDIS_URL'];
-  if (!redisUrl) {
+  if (!sharedRedis) {
     app.log.warn('REDIS_URL not set — HLS/DASH packaging disabled');
     return undefined;
   }
-  const redis = new IORedis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
   return new PackagingService({
     assets: assetRepository,
-    queue: makeOscPackagerQueue(redis),
+    queue: makeOscPackagerQueue(sharedRedis),
     publicBaseUrl: packagingPublicBaseUrl()
   });
 }
