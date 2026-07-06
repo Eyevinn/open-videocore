@@ -1344,6 +1344,96 @@ async function renderProvisionTab(container) {
   title.textContent = 'Provision OSC Stack';
   container.appendChild(title);
 
+  // Active operations — shown on load so in-progress ops survive tab switches / reloads.
+  const opsSection = document.createElement('div');
+  opsSection.className = 'section';
+  const opsSectionTitle = document.createElement('div');
+  opsSectionTitle.className = 'section-title';
+  opsSectionTitle.textContent = 'Active operations';
+  opsSection.appendChild(opsSectionTitle);
+  const opsContent = document.createElement('div');
+  opsSection.appendChild(opsContent);
+  container.appendChild(opsSection);
+
+  const activeOpIds = new Set();
+
+  function renderOpRow(op) {
+    const isDone = op.status === 'done';
+    const isFailed = op.status === 'failed';
+    const row = document.createElement('div');
+    row.id = 'op-' + op.id;
+    row.style.cssText = 'display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border,#333);font-size:13px;';
+
+    const icon = document.createElement('span');
+    icon.style.cssText = 'min-width:16px;margin-top:1px;';
+    icon.textContent = isDone ? '✓' : isFailed ? '✗' : '⟳';
+
+    const body = document.createElement('div');
+    const label = document.createElement('span');
+    label.style.fontWeight = 'bold';
+    label.textContent = op.type + ' ';
+    const nameSpan = document.createElement('span');
+    nameSpan.style.fontFamily = 'monospace';
+    nameSpan.textContent = op.name;
+    const statusSpan = document.createElement('span');
+    statusSpan.style.cssText = 'margin-left:8px;opacity:.7;';
+    statusSpan.textContent = op.status;
+    body.appendChild(label);
+    body.appendChild(nameSpan);
+    body.appendChild(statusSpan);
+    if (op.error) {
+      const errEl = document.createElement('div');
+      errEl.style.cssText = 'font-size:11px;opacity:.7;margin-top:2px;color:var(--color-danger,#f66);';
+      errEl.textContent = op.error;
+      body.appendChild(errEl);
+    }
+
+    row.appendChild(icon);
+    row.appendChild(body);
+    return row;
+  }
+
+  function upsertOpRow(op) {
+    const existing = opsContent.querySelector('#op-' + op.id);
+    const row = renderOpRow(op);
+    if (existing) existing.replaceWith(row);
+    else opsContent.prepend(row);
+  }
+
+  function pollOp(op) {
+    if (activeOpIds.has(op.id)) return;
+    activeOpIds.add(op.id);
+    const tick = function() {
+      apiFetch('/provision/operations/' + encodeURIComponent(op.id)).then(function(updated) {
+        upsertOpRow(updated);
+        if (updated.status !== 'done' && updated.status !== 'failed') {
+          setTimeout(tick, 3000);
+        } else {
+          activeOpIds.delete(op.id);
+        }
+      }).catch(function() {
+        setTimeout(tick, 5000);
+      });
+    };
+    setTimeout(tick, 3000);
+  }
+
+  apiFetch('/provision/operations').then(function(ops) {
+    if (!ops || !ops.length) {
+      const p = document.createElement('p');
+      p.className = 'text-muted';
+      p.style.fontSize = '13px';
+      p.textContent = 'No operations yet.';
+      opsContent.appendChild(p);
+      return;
+    }
+    // Show most-recent first; resume polling active ones.
+    ops.slice().reverse().forEach(function(op) {
+      upsertOpRow(op);
+      if (op.status === 'pending' || op.status === 'running') pollOp(op);
+    });
+  }).catch(function() {});
+
   // Stack list
   const listSection = document.createElement('div');
   listSection.className = 'section';
@@ -1465,6 +1555,9 @@ async function renderProvisionTab(container) {
           const opId = res && res.operationId;
           if (opId) {
             statusSpan.textContent = 'pending…';
+            // Mirror into Active Operations so it survives tab switches.
+            upsertOpRow({ id: opId, type: 'deprovision', name: name, status: 'pending' });
+            pollOp({ id: opId, type: 'deprovision', name: name, status: 'pending' });
             pollDeprovisionOp(opId, statusSpan, tr);
           } else {
             statusSpan.textContent = '✓ removed';
@@ -1584,7 +1677,10 @@ async function renderProvisionTab(container) {
       };
 
       if (opId) {
-        // Poll until terminal.
+        // Mirror into the Active Operations section so it survives tab switches.
+        upsertOpRow({ id: opId, type: 'provision', name: name, status: 'pending' });
+        pollOp({ id: opId, type: 'provision', name: name, status: 'pending' });
+        // Poll until terminal (also updates the inline status bar).
         const poll = async function() {
           try {
             const op = await apiFetch('/provision/operations/' + encodeURIComponent(opId));
