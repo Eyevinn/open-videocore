@@ -145,6 +145,14 @@ registerAuth(app);
 app.get('/health', async () => ({ status: 'ok', service: 'open-videocore-api' }));
 app.get('/healthz', async () => ({ status: 'ok' }));
 
+// Dev config: expose the local OSC token so the UI can authenticate against the
+// local server without requiring the OSC auth wall. Only returned when
+// OSC_ACCESS_TOKEN is set (i.e. local dev). In production the auth wall is in
+// front of this process and this endpoint is irrelevant.
+app.get('/api/v1/dev-config', async () => ({
+  token: process.env['OSC_ACCESS_TOKEN'] ?? ''
+}));
+
 // OSC parameter store (issue #31, ADR-002). Persists provisioned stack
 // coordinates so the API can rediscover a named stack at runtime. Configured
 // via PARAMETER_STORE_URL + PARAMETER_STORE_API_KEY; when unset the provision
