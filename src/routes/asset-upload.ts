@@ -23,6 +23,7 @@
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
+import type { Readable } from 'node:stream';
 import { z } from 'zod';
 import { InvalidStateTransitionError, type AssetRepository } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
@@ -97,6 +98,8 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   fastify,
   opts
 ) => {
+  // Pass any non-JSON body through as a stream so PUT /:id/upload can pipe it
+  // to MinIO. Scoped to this plugin — does not affect other routers.
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const { repository: repo, storageFor } = opts;
 
@@ -146,7 +149,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
 
       const maxBytes = 10 * 1024 * 1024 * 1024; // 10 GiB cap
       try {
-        await storage.putStream(objectKey, request.raw, {
+        await storage.putStream(objectKey, request.body as Readable, {
           maxBytes,
           totalBytes: contentLength
         });

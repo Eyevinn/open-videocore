@@ -71,6 +71,21 @@ const app = Fastify({ logger: true });
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
 
+// Pass binary/media upload bodies through as a stream for PUT /:id/upload.
+// Registered before plugins so child scopes inherit these parsers.
+// The route handler reads request.body as a Readable and pipes it to MinIO.
+for (const ct of [
+  'application/octet-stream',
+  'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
+  'video/webm', 'video/mpeg', 'video/ogg', 'video/3gpp',
+  'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/flac',
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+]) {
+  app.addContentTypeParser(ct, (_req, payload, done) => {
+    done(null, payload);
+  });
+}
+
 await app.register(fastifySwagger, {
   openapi: {
     info: {
