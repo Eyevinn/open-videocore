@@ -258,7 +258,11 @@ export function paramStoreFromEnv(
 export const PARAM_STORE_SERVICE_ID = 'eyevinn-app-config-svc' as const;
 
 // OSC instance name must be alphanumeric-only (OSC constraint).
-const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig';export interface OscInstanceApi {
+const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig';
+
+const VALKEY_SERVICE_ID = 'valkey-io-valkey';
+
+export interface OscInstanceApi {
   getServiceAccessToken(serviceId: string): Promise<string>;
   getInstance(
     serviceId: string,
@@ -270,6 +274,12 @@ const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig';export interface OscInstan
     sat: string,
     body: Record<string, unknown>
   ): Promise<{ name?: string }>;
+  waitForInstanceReady(serviceId: string, name: string): Promise<void>;
+  getPortsForInstance(
+    serviceId: string,
+    name: string,
+    sat: string
+  ): Promise<Array<{ externalIp: string; externalPort: number; internalPort: number }>>;
 }
 
 export type EnsureParameterStoreOptions = {
@@ -293,11 +303,33 @@ export async function ensureParameterStore(
     const sat = await opts.osc.getServiceAccessToken(PARAM_STORE_SERVICE_ID);
     const existing = await opts.osc.getInstance(PARAM_STORE_SERVICE_ID, name, sat);
     if (existing) return true;
+
+    // Provision a dedicated Valkey for the config service so it is never
+    // shared with the pipeline queue. Named "${name}redis" (alphanumeric only).
+    const valkeyName = `${name}redis`;
+    const valkeySat = await opts.osc.getServiceAccessToken(VALKEY_SERVICE_ID);
+    let valkeyPorts: Array<{ externalIp: string; externalPort: number; internalPort: number }>;
+    const existingValkey = await opts.osc.getInstance(VALKEY_SERVICE_ID, valkeyName, valkeySat);
+    if (existingValkey) {
+      opts.log.info(`config Valkey "${valkeyName}" already exists`);
+      valkeyPorts = await opts.osc.getPortsForInstance(VALKEY_SERVICE_ID, valkeyName, valkeySat);
+    } else {
+      await opts.osc.createInstance(VALKEY_SERVICE_ID, valkeySat, { name: valkeyName });
+      opts.log.info(`config Valkey "${valkeyName}" created, waiting for ready…`);
+      await opts.osc.waitForInstanceReady(VALKEY_SERVICE_ID, valkeyName);
+      valkeyPorts = await opts.osc.getPortsForInstance(VALKEY_SERVICE_ID, valkeyName, valkeySat);
+    }
+
+    const port = valkeyPorts.find((p) => p.internalPort === 6379) ?? valkeyPorts[0];
+    if (!port) throw new Error(`no ports returned for Valkey instance "${valkeyName}"`);
+    const redisUrl = `redis://${port.externalIp}:${port.externalPort}`;
+
     await opts.osc.createInstance(PARAM_STORE_SERVICE_ID, sat, {
       name,
-      ConfigApiKey: apiKey
+      ConfigApiKey: apiKey,
+      RedisUrl: redisUrl
     });
-    opts.log.info(`parameter store instance "${name}" created`);
+    opts.log.info(`parameter store instance "${name}" created with dedicated Valkey`);
     return true;
   } catch (err) {
     opts.log.warn(
