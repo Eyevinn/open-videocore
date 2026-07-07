@@ -368,7 +368,7 @@ function loadingEl() {
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
 
-const TABS = ['assets', 'jobs', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+const TABS = ['assets', 'jobs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -2715,10 +2715,148 @@ function renderPipelinesTab(container) {
   container.appendChild(wrap);
 }
 
+// ─── TRANSCODERS TAB ───────────────────────────────────────────────────────────
+
+// Human-readable relative time for a lastIdleAt epoch-ms value ("X minutes ago").
+function relativeTime(epochMs) {
+  if (epochMs == null || isNaN(epochMs)) return '—';
+  const diffMs = Date.now() - Number(epochMs);
+  if (diffMs < 0) return 'just now';
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's') + ' ago';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's') + ' ago';
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return hr + ' hour' + (hr === 1 ? '' : 's') + ' ago';
+  const day = Math.floor(hr / 24);
+  return day + ' day' + (day === 1 ? '' : 's') + ' ago';
+}
+
+// Derive per-instance job capacity from the pool records rather than hardcoding.
+// The scaler treats an instance as "busy" at JOBS_PER_INSTANCE (=1) but that
+// constant is not on the wire; instead we infer capacity as the highest
+// activeJobs observed across the pool, floored at 1 so a fully-idle pool still
+// reports a sane capacity of 1.
+function deriveInstanceCapacity(instances) {
+  let cap = 1;
+  (instances || []).forEach(function(inst) {
+    const a = Number(inst.activeJobs) || 0;
+    if (a > cap) cap = a;
+  });
+  return cap;
+}
+
+// Green (idle) / amber (partial) / red (at capacity) load class for an instance.
+function loadClass(activeJobs, capacity) {
+  const a = Number(activeJobs) || 0;
+  if (a <= 0) return 'load-idle';
+  if (a >= capacity) return 'load-full';
+  return 'load-partial';
+}
+
+async function renderTranscodersTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Transcoders';
+  container.appendChild(title);
+
+  const section = document.createElement('div');
+  section.className = 'section';
+  section.innerHTML = [
+    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
+    '  <span id="tc-summary">Encore scaler pool</span>',
+    '  <button id="tc-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
+    '</div>',
+    '<div id="tc-wrap"></div>',
+  ].join('');
+  container.appendChild(section);
+
+  const summaryEl = section.querySelector('#tc-summary');
+  const wrap = section.querySelector('#tc-wrap');
+
+  async function load() {
+    wrap.innerHTML = '';
+    const loader = loadingEl();
+    wrap.appendChild(loader);
+
+    let status;
+    try {
+      status = await apiFetch('/scaler/status');
+    } catch (err) {
+      loader.remove();
+      showMsg(wrap, 'Failed to load scaler status: ' + err.message, 'error');
+      summaryEl.textContent = 'Encore scaler pool';
+      return;
+    }
+    loader.remove();
+
+    const workspaces = (status && status.workspaces) || [];
+    const maxInstances = status && typeof status.maxInstances === 'number' ? status.maxInstances : 0;
+    const scalerActive = !!(status && status.scalerActive);
+
+    // Flatten every instance across returned workspaces into one grid, keeping a
+    // reference to its owning workspaceId for context.
+    const flatInstances = [];
+    workspaces.forEach(function(ws) {
+      (ws.instances || []).forEach(function(inst) {
+        flatInstances.push({ inst: inst, workspaceId: ws.workspaceId });
+      });
+    });
+
+    // Pool-capacity context using maxInstances from the response.
+    summaryEl.textContent = flatInstances.length + ' of ' + maxInstances +
+      ' instance' + (maxInstances === 1 ? '' : 's') + ' active';
+
+    if (!scalerActive || flatInstances.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No active transcoder instances.';
+      wrap.appendChild(empty);
+      return;
+    }
+
+    const capacity = deriveInstanceCapacity(flatInstances.map(function(f) { return f.inst; }));
+
+    const grid = document.createElement('div');
+    grid.className = 'tc-grid';
+    grid.innerHTML = flatInstances.map(function(f) {
+      const inst = f.inst;
+      const active = Number(inst.activeJobs) || 0;
+      const cls = loadClass(active, capacity);
+      const label = active <= 0 ? 'idle' : (active >= capacity ? 'at capacity' : 'partial');
+      return [
+        '<div class="tc-card">',
+        '  <div class="tc-card-head">',
+        '    <span class="tc-id text-mono">' + escHtml(inst.instanceId) + '</span>',
+        '    <span class="tc-load ' + cls + '" title="' + escHtml(label) + '">',
+        '      <span class="tc-dot"></span>' + escHtml(String(active)) + ' / ' + escHtml(String(capacity)),
+        '    </span>',
+        '  </div>',
+        '  <div class="tc-row">',
+        '    <a href="' + escHtml(inst.url) + '" target="_blank" rel="noopener" class="text-mono tc-url">' + escHtml(inst.url) + '</a>',
+        '  </div>',
+        '  <div class="tc-meta">',
+        '    <span class="text-muted">Workspace</span> <span class="text-mono">' + escHtml(f.workspaceId) + '</span>',
+        '  </div>',
+        '  <div class="tc-meta">',
+        '    <span class="text-muted">Last idle</span> ' + escHtml(relativeTime(inst.lastIdleAt)),
+        '  </div>',
+        '</div>',
+      ].join('');
+    }).join('');
+    wrap.appendChild(grid);
+  }
+
+  section.querySelector('#tc-refresh').addEventListener('click', load);
+  await load();
+}
+
 // ─── Tab renderer registry ───────────────────────────────────────────────────
 
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
+TAB_RENDERERS['transcoders'] = renderTranscodersTab;
 TAB_RENDERERS['pipelines'] = renderPipelinesTab;
 TAB_RENDERERS['profiles'] = renderProfilesTab;
 TAB_RENDERERS['collections'] = renderCollectionsTab;

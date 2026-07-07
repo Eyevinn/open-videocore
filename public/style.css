@@ -500,6 +500,82 @@ button:disabled {
   font-size: 13px;
 }
 
+/* Transcoders tab — instance card grid */
+.tc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.tc-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tc-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.tc-id {
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.tc-url {
+  color: var(--accent);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.tc-meta {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.tc-load {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.tc-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.tc-load.load-idle {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+
+.tc-load.load-partial {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+}
+
+.tc-load.load-full {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
 /* Code block */
 pre.code-block {
   background: var(--bg);
