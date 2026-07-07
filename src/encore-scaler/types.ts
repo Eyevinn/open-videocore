@@ -71,5 +71,8 @@ export const keys = {
   inflight: (workspaceId: string) => `encore:inflight:${workspaceId}`,
   pool: (workspaceId: string) => `encore:pool:${workspaceId}`,
   jobInstance: (workspaceId: string) => `encore:job-instance:${workspaceId}`,
-  jobStatus: (workspaceId: string) => `encore:job-status:${workspaceId}`
+  jobStatus: (workspaceId: string) => `encore:job-status:${workspaceId}`,
+  // Encore-assigned UUID for a job (stored at dispatch time, TTL 24h).
+  // Keyed by our encoreJobId (externalId) across workspaces since it's unique.
+  jobUuid: (encoreJobId: string) => `encore:job-uuid:${encoreJobId}`
 };
