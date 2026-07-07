@@ -42,6 +42,7 @@ import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
 import { internalRouter } from './routes/internal.js';
+import { encoreCompatRouter } from './routes/encore-compat.js';
 import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
@@ -405,6 +406,20 @@ await app.register(assetsRouter, {
 });
 
 await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository, redis: sharedRedis });
+
+// Encore-compatible transcode submission (migration surface). Lets integrators
+// who POST directly to an Encore OSC instance repoint at this API with only a
+// base-URL swap — same payloads. Unauthenticated by design (matches Encore's
+// own submit API; OSC terminates auth at the edge). Shares the same deps as the
+// assets router so a job submitted here is observable everywhere else.
+await app.register(encoreCompatRouter, {
+  prefix: '/api/v1/encore',
+  repository: assetRepository,
+  jobRepository,
+  encore,
+  sourceBucket,
+  outputBucket
+});
 
 // Internal OSC callbacks. Unauthenticated by design — see routes/internal.ts.
 // Hosts both the issue #9 packager-callback and the issue #8 encore-callback
