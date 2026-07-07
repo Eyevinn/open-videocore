@@ -741,7 +741,7 @@ async function showAssetDetail(id, detailPanel) {
     // Fall back to the known-good 'program' profile if the fetch fails or is empty.
     var encodeProfiles = ['program'];
     try {
-      const profilesResp = await fetch('/profiles');
+      const profilesResp = await fetch('/api/v1/profiles');
       if (profilesResp.ok) {
         const profilesData = await profilesResp.json();
         if (profilesData && Array.isArray(profilesData.profiles) && profilesData.profiles.length > 0) {
