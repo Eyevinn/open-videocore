@@ -104,19 +104,22 @@ export type ManifestUrls = {
   dash?: string;
 };
 
-// One ABR rendition produced by a transcode job (issue #8). Recorded on the
-// SOURCE asset so a client can discover the produced renditions and their child
-// asset ids in a single read. Each entry mirrors a child asset created with
-// parentId = the source asset id.
+// One ABR rendition produced by a transcode job (issue #8, redesigned #79).
+// Renditions are EMBEDDED variants of a single asset, not separate child
+// assets. An asset represents a piece of content; all of its transcoded
+// variants live on the one asset record so a client discovers them in a single
+// read. Each entry is self-contained (no child asset id).
 export type Rendition = {
-  // The child asset id holding this rendition's stored object.
-  assetId: string;
+  // ULID — stable identifier for this variant.
+  id: string;
   // Rung label from the encode profile (e.g. "1080p", "720p").
   label: string;
   width: number;
   height: number;
   // MinIO object key (workspace-local) of the produced file.
   objectKey: string;
+  codec?: string;
+  bitrateBps?: number;
 };
 
 // Multi-language audio and subtitle tracks (issue #18). These are EDITORIAL /

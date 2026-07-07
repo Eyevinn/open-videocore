@@ -10,14 +10,16 @@
 //                       resolve them later.
 //
 //   completeTranscode — invoked from the internal Encore callback. Idempotently
-//                       marks the job done/failed; on success creates a child
-//                       asset (status=ready, parentId=source) per produced
-//                       rendition and records the renditions on the source.
+//                       marks the job done/failed; on success records the
+//                       produced renditions as EMBEDDED variants on the single
+//                       source asset (issue #79 — no child assets) and returns
+//                       the source to `ready`.
 //
 // Idempotency: the callback listener may deliver more than once. completeTranscode
-// no-ops if the job is already terminal, so duplicate callbacks never create
-// duplicate child assets.
+// no-ops if the job is already terminal, so duplicate callbacks never record
+// duplicate renditions.
 
+import { ulid } from 'ulid';
 import type { AssetRepository, Rendition } from '../data/asset-repo.js';
 import {
   encodeEncoreJobId,
@@ -105,6 +107,8 @@ export type CallbackRendition = {
   width: number;
   height: number;
   objectKey: string;
+  codec?: string;
+  bitrateBps?: number;
 };
 
 export type CompleteTranscodeParams = {
@@ -119,23 +123,25 @@ export type CompleteTranscodeParams = {
 export type CompleteTranscodeResult = {
   // false when the job was already terminal (duplicate callback) and we no-oped.
   applied: boolean;
-  renditionAssetIds: string[];
+  // Number of embedded renditions recorded on the source asset (issue #79).
+  renditionCount: number;
 };
 
-// Apply an Encore completion to the job + assets. Idempotent: a second call for
-// an already-terminal job no-ops. On success, creates one child asset per
-// rendition (status=ready, parentId=source) and records them on the source.
+// Apply an Encore completion to the job + source asset. Idempotent: a second
+// call for an already-terminal job no-ops. On success, builds one embedded
+// Rendition per produced variant (issue #79 — no child assets) and records the
+// list on the SINGLE source asset, then returns it to `ready`.
 export async function completeTranscode(
   params: CompleteTranscodeParams,
   deps: { jobs: JobRepository; assets: AssetRepository }
 ): Promise<CompleteTranscodeResult> {
   const job = await deps.jobs.get(params.jobId);
   if (!job) {
-    return { applied: false, renditionAssetIds: [] };
+    return { applied: false, renditionCount: 0 };
   }
   if (job.status === 'done' || job.status === 'failed') {
     // Duplicate / late callback: nothing to do.
-    return { applied: false, renditionAssetIds: job.renditionAssetIds ?? [] };
+    return { applied: false, renditionCount: 0 };
   }
 
   if (!params.success) {
@@ -144,34 +150,19 @@ export async function completeTranscode(
       error: params.error ?? 'transcode failed'
     });
     await deps.assets.update(params.sourceAssetId, { status: 'failed' });
-    return { applied: true, renditionAssetIds: [] };
+    return { applied: true, renditionCount: 0 };
   }
 
-  // Success: materialise each rendition as a ready child asset of the source.
-  const source = await deps.assets.get(params.sourceAssetId);
-  const baseName = source?.name ?? params.sourceAssetId;
-  const renditionAssetIds: string[] = [];
-  const renditions: Rendition[] = [];
-
-  for (const r of params.renditions) {
-    const child = await deps.assets.create({
-      name: `${baseName} [${r.label}]`,
-      parentId: params.sourceAssetId,
-      objectKey: r.objectKey
-    });
-    // A freshly created asset is `uploading`; the rendition payload already
-    // exists, so advance it straight to ready (uploading -> processing -> ready).
-    await deps.assets.update(child.id, { status: 'processing' });
-    await deps.assets.update(child.id, { status: 'ready' });
-    renditionAssetIds.push(child.id);
-    renditions.push({
-      assetId: child.id,
-      label: r.label,
-      width: r.width,
-      height: r.height,
-      objectKey: r.objectKey
-    });
-  }
+  // Success: build one self-contained embedded rendition per produced variant.
+  const renditions: Rendition[] = params.renditions.map((r) => ({
+    id: ulid(),
+    label: r.label,
+    width: r.width,
+    height: r.height,
+    objectKey: r.objectKey,
+    codec: r.codec,
+    bitrateBps: r.bitrateBps
+  }));
 
   // Record renditions on the source and finalise the job.
   await deps.assets.update(params.sourceAssetId, { renditions });
@@ -182,9 +173,8 @@ export async function completeTranscode(
   }
   await deps.jobs.update(params.jobId, {
     status: 'done',
-    progress: 100,
-    renditionAssetIds
+    progress: 100
   });
 
-  return { applied: true, renditionAssetIds };
+  return { applied: true, renditionCount: renditions.length };
 }

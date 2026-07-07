@@ -75,24 +75,14 @@ export function manifestUrlsFor(assetId: string, baseUrl: string): ManifestUrls 
   };
 }
 
-// One Encore output rendition (a transcoded ABR variant) as reported by the
-// Encore callback. Kept permissive — the callback handler (issue #8) forwards
-// whatever Encore produced; the packager consumes the segment/object locations.
-export type EncoreOutput = {
-  // The MinIO object key / URI of a transcoded rendition.
-  file: string;
-  // Optional rendition hints (bitrate, resolution) when Encore supplies them.
-  type?: string;
-};
-
-// The job enqueued onto the Valkey queue for the packager to consume.
+// The job enqueued onto the Valkey sorted-set queue for the packager to consume.
+// CONTRACT (verified from encore-packager redisListener.ts 2026-07-07):
+//   { jobId: string, url: string }
+//   - jobId: our correlation id returned verbatim in the packager callback
+//   - url:   the Encore job API URL the packager fetches output details from
 export type PackagingJob = {
-  packagingId: string;
-  assetId: string;
-  // Where the packager should write CMAF output (inside the packaged bucket).
-  outputPrefix: string;
-  // The transcoded renditions to package.
-  inputs: EncoreOutput[];
+  jobId: string;
+  url: string;
 };
 
 // The queue publisher. Default implementation is Valkey/Redis-backed
@@ -109,22 +99,25 @@ export interface PackageQueue {
 export interface PackagingTrigger {
   triggerPackaging(
     assetId: string,
-    encoreOutputs: EncoreOutput[]
+    encoreJobUrl: string
   ): Promise<void>;
 }
 
-// The shape of the packager's completion callback (POST .../packager-callback).
-// `status` distinguishes success from failure. On success the packager MAY
-// report explicit manifest object keys; when it does not we fall back to the
-// deterministic CMAF manifest names under the output prefix.
-export type PackagerCallbackPayload = {
-  packagingId: string;
-  status: 'success' | 'failed';
-  // Explicit manifest object keys (relative to the packaged bucket) when known.
-  hlsManifest?: string;
-  dashManifest?: string;
-  // Failure reason when status === 'failed'.
-  error?: string;
+// Success callback payload from the packager (POST .../packagerCallback/success).
+// CONTRACT (verified from encore-packager callbackListener.ts 2026-07-07):
+//   { url: string, jobId: string, outputPath?: string }
+//   - url:        the Encore job URL that was packaged
+//   - jobId:      echoed back from the queue message (= assetId in our usage)
+//   - outputPath: S3/local path of the packager's CMAF output directory
+export type PackagerSuccessPayload = {
+  url: string;
+  jobId: string;
+  outputPath?: string;
+};
+
+// Failure callback payload from the packager (POST .../packagerCallback/failure).
+export type PackagerFailurePayload = {
+  message: string;
 };
 
 export type PackagingDeps = {
@@ -147,21 +140,17 @@ export class PackagingService implements PackagingTrigger {
 
   // Invoked from the Encore callback handler (issue #8) when a transcode
   // succeeds. Enqueues a packaging job for the packager. NEVER throws into the
-  // caller: a queue failure is recorded as `packagingError` on the asset (which
-  // does not change the asset status) so the callback handler stays simple and
-  // a packaging hiccup cannot fail the transcode-completion path. Idempotent:
-  // the job is keyed by packagingId so a redelivered transcode callback
-  // re-enqueues the same deterministic job/output rather than forking output.
+  // caller: a queue failure is recorded as `packagingError` on the asset.
+  // The job format matches the packager's sorted-set contract: { jobId, url }.
+  // We use assetId as jobId so the callback can resolve back to the asset.
   async triggerPackaging(
     assetId: string,
-    encoreOutputs: EncoreOutput[]
+    encoreJobUrl: string
   ): Promise<void> {
     try {
       const job: PackagingJob = {
-        packagingId: packagingId(assetId),
-        assetId,
-        outputPrefix: outputPrefix(assetId),
-        inputs: encoreOutputs
+        jobId: assetId,
+        url: encoreJobUrl
       };
       await this.deps.queue.enqueue(job);
     } catch (err) {
@@ -177,45 +166,49 @@ export class PackagingService implements PackagingTrigger {
     }
   }
 
-  // Invoked by POST /api/v1/internal/packager-callback when the packager
-  // signals completion. Resolves the packagingId to a workspace+asset, then
-  // writes manifestUrls (success) or packagingError (failure). Returns whether
-  // the callback resolved to a known asset so the route can answer 200/404.
+  // Invoked by POST /api/v1/internal/packagerCallback/success when the packager
+  // signals successful completion. The jobId in the payload is the assetId we
+  // used when enqueueing. Writes manifestUrls onto the asset.
   // NEVER changes the asset's lifecycle status.
-  async handleCallback(payload: PackagerCallbackPayload): Promise<boolean> {
-    const parsed = parsePackagingId(payload.packagingId);
-    if (!parsed) {
-      return false;
-    }
-    const { assetId } = parsed;
+  async handleSuccess(payload: PackagerSuccessPayload): Promise<boolean> {
+    const assetId = payload.jobId; // we set jobId = assetId at enqueue time
     const asset = await this.deps.assets.get(assetId);
-    if (!asset) {
-      return false;
-    }
+    if (!asset) return false;
 
-    if (payload.status === 'failed') {
-      await this.deps.assets.update(assetId, {
-        packagingError: payload.error ?? 'packaging failed'
-      });
-      return true;
-    }
-
-    // Success: prefer explicit manifest paths from the packager; otherwise fall
-    // back to the deterministic CMAF manifest names under the output prefix.
     const base = this.deps.publicBaseUrl ?? packagingPublicBaseUrl();
-    const fallback = manifestUrlsFor(assetId, base);
-    const origin = base.replace(/\/+$/, '');
-    const manifestUrls: ManifestUrls = {
-      hls: payload.hlsManifest ? `${origin}/${stripLeadingSlash(payload.hlsManifest)}` : fallback.hls,
-      dash: payload.dashManifest
-        ? `${origin}/${stripLeadingSlash(payload.dashManifest)}`
-        : fallback.dash
-    };
+    // outputPath from the packager is the S3/local directory (e.g.
+    // "/rendition_x264_3100/job-abc/"). Append known shaka-packager-s3 manifest
+    // filenames to construct public URLs. Falls back to our deterministic names.
+    const manifestUrls = outputPathToManifestUrls(payload.outputPath, base, assetId);
     await this.deps.assets.update(assetId, { manifestUrls });
+    return true;
+  }
+
+  // Invoked by POST /api/v1/internal/packagerCallback/failure.
+  async handleFailure(assetId: string, message: string): Promise<boolean> {
+    const asset = await this.deps.assets.get(assetId);
+    if (!asset) return false;
+    await this.deps.assets.update(assetId, { packagingError: message });
     return true;
   }
 }
 
-function stripLeadingSlash(s: string): string {
-  return s.replace(/^\/+/, '');
+// Build manifest URLs from the packager's reported outputPath. The packager's
+// shaka-packager-s3 backend produces index.m3u8 (HLS) and manifest.mpd (DASH)
+// by default under the output directory. When outputPath is absent we fall back
+// to the deterministic names under our own outputPrefix.
+function outputPathToManifestUrls(
+  outputPath: string | undefined,
+  publicBaseUrl: string,
+  assetId: string
+): ManifestUrls {
+  const origin = publicBaseUrl.replace(/\/+$/, '');
+  if (outputPath) {
+    const dir = outputPath.replace(/\/+$/, '');
+    return {
+      hls: `${origin}${dir}/index.m3u8`,
+      dash: `${origin}${dir}/manifest.mpd`
+    };
+  }
+  return manifestUrlsFor(assetId, publicBaseUrl);
 }

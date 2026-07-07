@@ -84,7 +84,7 @@ const encoreCallbackSchema = z.object({
 
 const encoreAckSchema = z.object({
   applied: z.boolean(),
-  renditionAssetIds: z.array(z.string())
+  renditionCount: z.number()
 });
 
 type InternalRouterOptions = {
@@ -151,7 +151,8 @@ function normaliseRenditions(
       label: `rendition-${i + 1}`,
       width: stream?.width ?? 0,
       height: stream?.height ?? 0,
-      objectKey: o.file ?? `rendition-${i + 1}`
+      objectKey: o.file ?? `rendition-${i + 1}`,
+      bitrateBps: o.overallBitrate
     };
   });
 }
@@ -234,7 +235,8 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
 
   // Encore transcode completion callback (issue #8). No auth — see file header.
   // Resolves the job by the embedded workspace+job encoreJobId, then idempotently
-  // marks it done/failed and creates ready child assets for each rendition.
+  // marks it done/failed and records the produced renditions as embedded variants
+  // on the single source asset (issue #79 — no child assets).
   //   200 — callback applied (or no-op for a duplicate / already-terminal job)
   //   404 — unknown encoreJobId (existence not leaked)
   //   501 — transcoding is not configured on this deployment
@@ -334,7 +336,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         if (success) {
           void opts.webhookDispatcher.dispatch({
             type: 'transcode.complete',
-            payload: { assetId, renditionAssetIds: result.renditionAssetIds }
+            payload: { assetId, renditionCount: result.renditionCount }
           });
           // The source asset returns to `ready` once its renditions exist.
           void opts.webhookDispatcher.dispatch({

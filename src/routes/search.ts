@@ -47,11 +47,13 @@ const manifestUrlsSchema = z.object({
 });
 
 const renditionSchema = z.object({
-  assetId: z.string(),
+  id: z.string(),
   label: z.string(),
   width: z.number(),
   height: z.number(),
-  objectKey: z.string()
+  objectKey: z.string(),
+  codec: z.string().optional(),
+  bitrateBps: z.number().optional()
 });
 
 const assetSchema = z.object({

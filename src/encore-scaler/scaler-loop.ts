@@ -149,8 +149,16 @@ export class EncoreScalerLoop {
       });
       if (!res.ok) return false;
 
+      // Capture the Encore-assigned UUID so the packaging step can construct a
+      // valid encoreJobs/{uuid} URL. We store it separately (not in our Job table,
+      // which is only updated via the callback path) with a 24h TTL.
+      const body = await res.json().catch(() => ({})) as { id?: string; jobId?: string };
+      const encoreUuid = String(body.id ?? body.jobId ?? '');
       await redis.hset(keys.jobInstance(workspaceId), job.jobId, inst.instanceId);
       await redis.hset(keys.jobStatus(workspaceId), job.jobId, 'running');
+      if (encoreUuid && encoreUuid !== job.jobId) {
+        await redis.set(keys.jobUuid(job.jobId), encoreUuid, 'EX', 86_400);
+      }
       return true;
     } catch {
       return false;

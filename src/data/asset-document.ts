@@ -58,11 +58,13 @@ export const AudioTrackSchema = z.object({
 export type DocAudioTrack = z.infer<typeof AudioTrackSchema>;
 
 export const RenditionSchema = z.object({
-  assetId: z.string(),
+  id: z.string(),
   label: z.string(),
   width: z.number(),
   height: z.number(),
-  objectKey: z.string()
+  objectKey: z.string(),
+  codec: z.string().optional(),
+  bitrateBps: z.number().optional()
 });
 export type DocRendition = z.infer<typeof RenditionSchema>;
 

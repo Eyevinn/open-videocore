@@ -218,11 +218,13 @@ const manifestUrlsSchema = z.object({
 });
 
 const renditionSchema = z.object({
-  assetId: z.string(),
+  id: z.string(),
   label: z.string(),
   width: z.number(),
   height: z.number(),
-  objectKey: z.string()
+  objectKey: z.string(),
+  codec: z.string().optional(),
+  bitrateBps: z.number().optional()
 });
 
 // Multi-language audio/subtitle tracks (issue #18). `language` is a free-form
@@ -286,8 +288,9 @@ const assetSchema = z.object({
   // packaging completes; `packagingError` carries the last packaging failure.
   manifestUrls: manifestUrlsSchema.optional(),
   packagingError: z.string().optional(),
-  // ABR renditions produced by transcoding (issue #8). Absent until a transcode
-  // job completes; each entry links to a child asset via its assetId.
+  // ABR renditions produced by transcoding (issue #8, redesigned #79). Absent
+  // until a transcode job completes; each entry is an embedded variant of this
+  // single asset (no child assets).
   renditions: z.array(renditionSchema).optional(),
   // Thumbnail / poster-frame object keys (issue #7). Absent until the first
   // successful extraction; replaced wholesale by a later extraction.
