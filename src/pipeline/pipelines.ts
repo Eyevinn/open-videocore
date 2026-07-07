@@ -9,17 +9,17 @@ export const PIPELINE_STEPS = ['extract-metadata', 'thumbnail', 'transcode', 'pa
 export type PipelineStepName = (typeof PIPELINE_STEPS)[number];
 
 export const BUILT_IN_PIPELINES: Record<string, PipelineStepName[]> = {
-  transcode: ['transcode'],
+  encode: ['transcode'],
   'abr-vod': ['transcode', 'package'],
   ingest: ['extract-metadata', 'thumbnail'],
   full: ['extract-metadata', 'thumbnail', 'transcode', 'package']
 };
 
 export const PIPELINE_DESCRIPTIONS: Record<string, string> = {
-  transcode: 'Transcode source file to ABR renditions (no packaging).',
-  'abr-vod': 'Transcode to ABR renditions, then package to HLS/DASH for streaming.',
+  encode: 'Encode the source file using the selected profile. Profile is chosen at execution time.',
+  'abr-vod': 'Encode then package to HLS/DASH for streaming. Profile is chosen at execution time.',
   ingest: 'Extract technical metadata and generate thumbnail frames.',
-  full: 'Full pipeline: metadata extraction, thumbnails, ABR transcode, and HLS/DASH packaging.'
+  full: 'Full pipeline: metadata extraction, thumbnails, encode, and HLS/DASH packaging.'
 };
 
 export const PIPELINE_NAMES = Object.keys(BUILT_IN_PIPELINES) as (keyof typeof BUILT_IN_PIPELINES)[];

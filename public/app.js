@@ -733,18 +733,33 @@ async function showAssetDetail(id, detailPanel) {
     body.appendChild(execDiv);
     await renderExecutions(id, execDiv);
 
-    // Run Pipeline control: a named-pipeline select + trigger button.
+    // Run Pipeline control: pipeline select + optional profile select + trigger.
+    var ENCODE_PIPELINES = ['encode', 'abr-vod', 'full']; // pipelines with a transcode step
     const runDiv = document.createElement('div');
     runDiv.className = 'mt12 flex-gap';
     runDiv.innerHTML = [
       '<select id="pipeline-select" class="input">',
+      '  <option value="encode">encode (transcode only)</option>',
       '  <option value="abr-vod">abr-vod (transcode + package)</option>',
       '  <option value="ingest">ingest (metadata + thumbnail)</option>',
       '  <option value="full">full (all steps)</option>',
       '</select>',
+      '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
+      ENCODE_PROFILES.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
+      '</select>',
       '<button id="btn-run-pipeline" class="btn-ghost">Run Pipeline</button>',
     ].join('');
     body.appendChild(runDiv);
+
+    // Show/hide profile selector based on whether chosen pipeline has a transcode step.
+    var pipelineSel = runDiv.querySelector('#pipeline-select');
+    var profileSel = runDiv.querySelector('#profile-select');
+    function updateProfileVisibility() {
+      var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
+      profileSel.style.display = hasTranscode ? '' : 'none';
+    }
+    pipelineSel.addEventListener('change', updateProfileVisibility);
+    updateProfileVisibility();
 
     // Action buttons — static labels, no dynamic content
     const actionsDiv = document.createElement('div');
@@ -757,11 +772,14 @@ async function showAssetDetail(id, detailPanel) {
 
     runDiv.querySelector('#btn-run-pipeline').addEventListener('click', async function() {
       actionMsg.innerHTML = '';
-      var pipeline = runDiv.querySelector('#pipeline-select').value;
+      var pipeline = pipelineSel.value;
+      var hasTranscode = ENCODE_PIPELINES.indexOf(pipeline) !== -1;
+      var body2 = { pipeline: pipeline };
+      if (hasTranscode) body2.profile = profileSel.value;
       try {
         var exec = await apiFetch('/assets/' + encodeURIComponent(id) + '/execute', {
           method: 'POST',
-          body: JSON.stringify({ pipeline: pipeline })
+          body: JSON.stringify(body2)
         });
         showMsg(actionMsg, 'Pipeline "' + escHtml(exec.pipelineName) + '" started (execution ' + escHtml(exec.id) + ').', 'success');
         await renderExecutions(id, execDiv);
@@ -2395,15 +2413,15 @@ function cssEscape(value) {
 
 var PIPELINE_CATALOG = [
   {
-    name: 'transcode',
-    label: 'Transcode',
-    description: 'Transcode source file to ABR renditions (no packaging).',
+    name: 'encode',
+    label: 'Encode',
+    description: 'Encode the source file using the selected profile. Profile is chosen at execution time.',
     steps: ['transcode']
   },
   {
     name: 'abr-vod',
     label: 'ABR VOD',
-    description: 'Transcode to ABR renditions, then package to HLS/DASH for streaming.',
+    description: 'Encode then package to HLS/DASH for streaming. Profile is chosen at execution time.',
     steps: ['transcode', 'package']
   },
   {
@@ -2415,10 +2433,13 @@ var PIPELINE_CATALOG = [
   {
     name: 'full',
     label: 'Full',
-    description: 'Full pipeline: metadata extraction, thumbnails, ABR transcode, and HLS/DASH packaging.',
+    description: 'Full pipeline: metadata extraction, thumbnails, encode, and HLS/DASH packaging.',
     steps: ['extract-metadata', 'thumbnail', 'transcode', 'package']
   }
 ];
+
+// Encode profiles available for pipelines with a transcode step.
+var ENCODE_PROFILES = ['program', 'drama', 'sport', 'low-latency'];
 
 var STEP_ICONS = {
   'extract-metadata': '🔬',

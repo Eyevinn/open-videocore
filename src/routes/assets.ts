@@ -498,7 +498,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     asset: NonNullable<Awaited<ReturnType<AssetRepository['get']>>>,
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
-    reply: import('fastify').FastifyReply
+    reply: import('fastify').FastifyReply,
+    encodeOpts?: { profile?: string; customProfile?: EncoreProfile }
   ): Promise<import('../data/pipeline-repo.js').PipelineExecution | undefined> {
     const pipelineRepo = opts.pipelineRepository;
     if (!pipelineRepo) {
@@ -565,7 +566,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               sourceAssetId: asset.id,
               sourceObjectKey: asset.objectKey as string,
               sourceBucket: opts.sourceBucket as string,
-              outputBucket: opts.outputBucket as string
+              outputBucket: opts.outputBucket as string,
+              preset: encodeOpts?.profile as typeof PRESET_NAMES[number] | undefined,
+              customProfile: encodeOpts?.customProfile
             },
             { jobs, assets: repo, encore: opts.encore!, encoreCallbackUrl: request.connections?.encoreCallbackUrl }
           );
@@ -996,7 +999,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     {
       schema: {
         params: z.object({ id: z.string() }),
-        body: z.object({ pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]) }),
+        body: z.object({
+          pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
+          profile: z.enum(PRESET_NAMES).optional(),
+          customProfile: customProfileSchema.optional()
+        }),
         response: {
           202: pipelineExecutionSchema,
           404: z.object({ error: z.string() }),
@@ -1018,7 +1025,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         asset,
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
         request,
-        reply
+        reply,
+        { profile: request.body.profile, customProfile: request.body.customProfile as EncoreProfile | undefined }
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);
