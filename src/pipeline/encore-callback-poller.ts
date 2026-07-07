@@ -311,6 +311,100 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   });
 }
 
+// Sweep all scaler-managed Encore instances for SUCCESSFUL jobs whose callback
+// message was never written to the queue. This is a fallback for the missing
+// `await` bug in eyevinn-encore-callback-listener's pushMessage (the zAdd is
+// fire-and-forget, so messages can silently fail to land in Redis). The sweep
+// runs every SWEEP_INTERVAL_MS and re-synthesises the same message format the
+// callback listener would have produced, then pushes it to the main queue only
+// if the job is not already there and is not yet terminal in our DB.
+//
+// Contract: Encore /encoreJobs/search/findByStatus returns Spring HATEOAS pages:
+//   { _embedded: { encoreJobs: [{ id: "<uuid>", externalId: "...", ... }] },
+//     page: { totalElements: N } }
+// (verified from Encore source and OSC docs, 2026-07-07)
+const SWEEP_INTERVAL_MS = 30_000;
+
+// Scan `encore:pool:*` keys to find all workspaces that have an active pool,
+// then for each workspace check every Encore instance for SUCCESSFUL jobs that
+// have a UUID→externalId mapping but whose local job is not yet in a terminal
+// state. If such a job exists and is not already in the queue, push a synthetic
+// message so the regular loop picks it up.
+async function sweepCompletedJobs(deps: PollerDeps, queueKey: string): Promise<void> {
+  const { redis, oscContext, logger, jobRepository } = deps;
+
+  const poolKeys = await redis.keys('encore:pool:*');
+  if (poolKeys.length === 0) return;
+
+  let sat: string;
+  try {
+    sat = await oscContext.getServiceAccessToken('encore');
+  } catch (err) {
+    logger.warn({ msg: 'encore-callback-poller: sweep — failed to get SAT, skipping', err });
+    return;
+  }
+
+  const processingKey = `${queueKey}:processing`;
+
+  for (const poolKey of poolKeys) {
+    const poolRaw = await redis.hgetall(poolKey).catch(() => ({}));
+    for (const instanceJson of Object.values(poolRaw)) {
+      let record: EncoreInstanceRecord;
+      try { record = JSON.parse(instanceJson) as EncoreInstanceRecord; } catch { continue; }
+
+      const searchUrl =
+        `${record.url.replace(/\/+$/, '')}/encoreJobs/search/findByStatus` +
+        `?status=SUCCESSFUL&page=0&size=100`;
+      let encoreJobs: Array<{ id?: string }> = [];
+      try {
+        const res = await fetch(searchUrl, { headers: { authorization: `Bearer ${sat}` } });
+        if (!res.ok) continue;
+        const body = (await res.json()) as {
+          _embedded?: { encoreJobs?: typeof encoreJobs };
+        };
+        encoreJobs = body._embedded?.encoreJobs ?? [];
+      } catch { continue; }
+
+      for (const encoreJob of encoreJobs) {
+        const encoreUuid = encoreJob.id;
+        if (!encoreUuid) continue;
+
+        // Is this one of our jobs? (UUID→externalId written at dispatch time, TTL 24h)
+        const externalId = await redis.get(keys.uuidToExternalId(encoreUuid));
+        if (!externalId) continue;
+
+        // Skip if the local job is already terminal — avoids repeated re-queueing.
+        try {
+          const found = await jobRepository.findByEncoreJobId(externalId);
+          if (!found || found.job.status === 'done' || found.job.status === 'failed') continue;
+        } catch { continue; }
+
+        // Build the message the callback listener would have produced.
+        // (verified from eyevinn-encore-callback-listener src/api.ts onSuccess handler)
+        const message = JSON.stringify({
+          jobId: encoreUuid,
+          url: `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`
+        });
+
+        // Skip if the message is already in the main queue or processing set.
+        const [inQueue, inProcessing] = await Promise.all([
+          redis.zscore(queueKey, message),
+          redis.zscore(processingKey, message)
+        ]);
+        if (inQueue !== null || inProcessing !== null) continue;
+
+        logger.info({
+          msg: 'encore-callback-poller: sweep found missed callback — re-queuing',
+          encoreUuid,
+          externalId,
+          instanceId: record.instanceId
+        });
+        await redis.zadd(queueKey, Date.now(), message);
+      }
+    }
+  }
+}
+
 // Two-phase processing: messages move from the main queue to a processing set
 // before handleMessage runs, and are only removed from processing on success.
 // On any failure the message is returned to the main queue so it is retried on
@@ -351,6 +445,17 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   const { signal } = controller;
 
   deps.logger.info({ msg: 'encore-callback-poller: starting', queueKey, processingKey });
+
+  // Fallback sweep: periodically poll all Encore instances for SUCCESSFUL jobs
+  // that never produced a queue message (eyevinn-encore-callback-listener missing
+  // `await` on zAdd). First sweep fires after SWEEP_INTERVAL_MS, not immediately,
+  // so the normal queue-drain path gets first chance on startup.
+  const sweepTimer = setInterval(() => {
+    void sweepCompletedJobs(deps, queueKey).catch((err) => {
+      deps.logger.warn({ msg: 'encore-callback-poller: sweep error', err });
+    });
+  }, SWEEP_INTERVAL_MS);
+  sweepTimer.unref?.();
 
   const loop = async (): Promise<void> => {
     // On startup, recover any messages left in the processing set from a prior
@@ -396,5 +501,8 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
   void loop();
 
-  return () => controller.abort();
+  return () => {
+    controller.abort();
+    clearInterval(sweepTimer);
+  };
 }
