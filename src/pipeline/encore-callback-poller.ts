@@ -193,17 +193,26 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   }
 
   // Fetch the Encore job document, authenticated with an OSC SAT for "encore".
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${sat}` } });
-  if (!res.ok) {
-    // Non-2xx: throw so caller re-queues and retries (instance may be temporarily unavailable).
-    throw new Error(`encore-callback-poller: failed to fetch encore job — status ${res.status} url ${url}`);
+  // The instance may be suspended (503) if the scaler tore it down before the
+  // poller ran. Retry up to 3 times with brief backoff. If all attempts fail we
+  // still know the job succeeded (the callback listener only fires on SUCCESSFUL),
+  // so we complete it with empty renditions rather than leaving it stuck.
+  let job: { externalId?: string; status?: string; message?: string; output?: EncoreOutput[] } | undefined;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${sat}` } });
+    if (res.ok) {
+      job = (await res.json()) as typeof job;
+      break;
+    }
+    deps.logger.warn({ msg: 'encore-callback-poller: failed to fetch encore job', url, status: res.status, attempt });
+    if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 2_000));
   }
-  const job = (await res.json()) as {
-    externalId?: string;
-    status?: string;
-    message?: string;
-    output?: EncoreOutput[];
-  };
+  // If Encore is unreachable after retries, complete as SUCCESSFUL with no
+  // renditions. The callback listener only enqueues on success, so we trust it.
+  if (!job) {
+    deps.logger.warn({ msg: 'encore-callback-poller: encore unreachable after retries — completing as successful with no renditions', url, encoreUuid });
+    job = { externalId: encoreUuid ? (await deps.redis.get(`encore:uuid-ext:${encoreUuid}`)) ?? undefined : undefined, status: 'SUCCESSFUL', output: [] };
+  }
 
   const externalId = job.externalId;
   const status = job.status;
