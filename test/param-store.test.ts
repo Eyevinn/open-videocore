@@ -150,7 +150,6 @@ describe('ensureParameterStore', () => {
   }
 
   beforeEach(() => {
-    process.env['PARAMETER_STORE_URL'] = 'https://config.example.osaas.io';
     process.env['PARAMETER_STORE_API_KEY'] = 'key123';
     delete process.env['PARAMETER_STORE_INSTANCE_NAME'];
     log.info.mockReset();
@@ -158,13 +157,12 @@ describe('ensureParameterStore', () => {
   });
 
   afterEach(() => {
-    delete process.env['PARAMETER_STORE_URL'];
     delete process.env['PARAMETER_STORE_API_KEY'];
     delete process.env['PARAMETER_STORE_INSTANCE_NAME'];
   });
 
   it('returns false and does nothing when unconfigured', async () => {
-    delete process.env['PARAMETER_STORE_URL'];
+    delete process.env['PARAMETER_STORE_API_KEY'];
     const osc = makeOsc();
     expect(await ensureParameterStore({ osc, log })).toBe(false);
     expect(osc.getInstance).not.toHaveBeenCalled();

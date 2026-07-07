@@ -146,14 +146,19 @@ app.get('/healthz', async () => ({ status: 'ok' }));
 
 // OSC parameter store (issue #31, ADR-002). Persists provisioned stack
 // coordinates so the API can rediscover a named stack at runtime. Configured
-// via PARAMETER_STORE_URL + PARAMETER_STORE_API_KEY; when unset the provision
+// via PARAMETER_STORE_INSTANCE_NAME + PARAMETER_STORE_API_KEY; the instance URL
+// is resolved from the name via the OSC SDK and cached. When unset the provision
 // route still works but skips persistence and GET /:name responds 501.
-const paramStore = paramStoreFromEnv(
+const paramStore = await paramStoreFromEnv(
+  {
+    getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
+    getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat)
+  },
   () => oscContext.getServiceAccessToken('eyevinn-app-config-svc')
 );
 if (!paramStore) {
   app.log.warn(
-    'PARAMETER_STORE_URL/API_KEY not set — provisioned stack coordinates will not be persisted'
+    'PARAMETER_STORE_API_KEY not set (or config instance unresolved) — provisioned stack coordinates will not be persisted'
   );
 } else {
   await ensureParameterStore({

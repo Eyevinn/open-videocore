@@ -106,7 +106,8 @@ function assertNoCredentials(config: StackConfig): void {
 }
 
 export type HttpParamStoreConfig = {
-  // Base URL of the eyevinn-app-config-svc instance (PARAMETER_STORE_URL).
+  // Base URL of the eyevinn-app-config-svc instance, resolved at runtime from
+  // PARAMETER_STORE_INSTANCE_NAME via the OSC SDK (getInstance().url).
   baseUrl: string;
   // ConfigApiKey set on the eyevinn-app-config-svc instance (PARAMETER_STORE_API_KEY).
   apiKey: string;
@@ -239,22 +240,65 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   };
 }
 
-// Build a ParamStore from the environment. Requires PARAMETER_STORE_URL +
-// PARAMETER_STORE_API_KEY. Returns undefined when unconfigured (provision
-// route will surface a 501).
-export function paramStoreFromEnv(
-  getOscToken: () => Promise<string>
-): ParamStore | undefined {
-  const baseUrl = process.env['PARAMETER_STORE_URL'];
-  const apiKey = process.env['PARAMETER_STORE_API_KEY'];
-  if (!baseUrl || !apiKey) return undefined;
-  return makeHttpParamStore({ baseUrl, apiKey, getOscToken });
-}
-
 export const PARAM_STORE_SERVICE_ID = 'eyevinn-app-config-svc' as const;
 
 // OSC instance name must be alphanumeric-only (OSC constraint).
 const DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig';
+
+// Resolve the eyevinn-app-config-svc instance's public URL from its name via
+// the OSC SDK. Contract (node_modules/@osaas/client-core/lib/core.d.ts:56):
+//   getInstance(context, serviceId, name, token): Promise<any>  → { url }
+// This is the same pattern the provision route uses (routes/provision.ts:150,
+// instanceUrl). We never hardcode the OSC URL scheme.
+export interface ParamStoreUrlResolver {
+  getServiceAccessToken(serviceId: string): Promise<string>;
+  getInstance(
+    serviceId: string,
+    name: string,
+    sat: string
+  ): Promise<{ url?: string } | undefined>;
+}
+
+// Module-level in-memory cache of the resolved base URL, keyed by instance
+// name, so we resolve it once at startup rather than on every request.
+const resolvedBaseUrlCache = new Map<string, string>();
+
+async function resolveParamStoreBaseUrl(
+  resolver: ParamStoreUrlResolver,
+  instanceName: string
+): Promise<string | undefined> {
+  const cached = resolvedBaseUrlCache.get(instanceName);
+  if (cached) return cached;
+  const sat = await resolver.getServiceAccessToken(PARAM_STORE_SERVICE_ID);
+  const instance = await resolver.getInstance(
+    PARAM_STORE_SERVICE_ID,
+    instanceName,
+    sat
+  );
+  const url = instance?.url;
+  if (typeof url !== 'string' || url.length === 0) return undefined;
+  resolvedBaseUrlCache.set(instanceName, url);
+  return url;
+}
+
+// Build a ParamStore from the environment. Requires PARAMETER_STORE_API_KEY;
+// the base URL is resolved at runtime from PARAMETER_STORE_INSTANCE_NAME (or
+// the default) via the OSC SDK and cached in memory. Returns undefined when
+// unconfigured or when the instance URL cannot be resolved (provision route
+// will surface a 501).
+export async function paramStoreFromEnv(
+  resolver: ParamStoreUrlResolver,
+  getOscToken: () => Promise<string>
+): Promise<ParamStore | undefined> {
+  const apiKey = process.env['PARAMETER_STORE_API_KEY'];
+  if (!apiKey) return undefined;
+  const instanceName =
+    process.env['PARAMETER_STORE_INSTANCE_NAME'] ??
+    DEFAULT_PARAM_STORE_INSTANCE_NAME;
+  const baseUrl = await resolveParamStoreBaseUrl(resolver, instanceName);
+  if (!baseUrl) return undefined;
+  return makeHttpParamStore({ baseUrl, apiKey, getOscToken });
+}
 
 const VALKEY_SERVICE_ID = 'valkey-io-valkey';
 
@@ -289,7 +333,7 @@ export async function ensureParameterStore(
   opts: EnsureParameterStoreOptions
 ): Promise<boolean> {
   const apiKey = process.env['PARAMETER_STORE_API_KEY'];
-  if (!process.env['PARAMETER_STORE_URL'] || !apiKey) return false;
+  if (!apiKey) return false;
 
   const name =
     process.env['PARAMETER_STORE_INSTANCE_NAME'] ??

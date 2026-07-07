@@ -580,7 +580,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     },
     async (request, reply) => {
       if (!opts.paramStore) {
-        return reply.code(501).send({ error: 'parameter store not configured (set PARAMETER_STORE_URL and PARAMETER_STORE_API_KEY)' });
+        return reply.code(501).send({ error: 'parameter store not configured (set PARAMETER_STORE_INSTANCE_NAME and PARAMETER_STORE_API_KEY)' });
       }
       try {
         const workspaceId = await deriveWorkspaceId(osc);
@@ -621,7 +621,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       if (!paramStore) {
         return reply.code(501).send({
           error:
-            'parameter store not configured (set PARAMETER_STORE_URL and PARAMETER_STORE_API_KEY)'
+            'parameter store not configured (set PARAMETER_STORE_INSTANCE_NAME and PARAMETER_STORE_API_KEY)'
         });
       }
 
