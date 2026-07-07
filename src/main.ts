@@ -591,9 +591,11 @@ await app.register(scalerRouter, {
   redis: sharedRedis,
   maxInstances: encoreMaxInstances,
   minInstances: 0,
+  idleTimeoutMs: encoreIdleTimeoutMs,
   onConfigChange: (cfg) => {
     if (encore instanceof WorkspaceEncoreScalerRegistry) {
       encore.setMaxInstances(cfg.maxInstances);
+      encore.setIdleTimeoutMs(cfg.idleTimeoutMs);
     }
   }
 });

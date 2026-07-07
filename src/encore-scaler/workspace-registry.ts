@@ -88,6 +88,13 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     }
   }
 
+  setIdleTimeoutMs(ms: number): void {
+    this.config.idleTimeoutMs = ms;
+    for (const { loop } of this.loops.values()) {
+      loop.setIdleTimeoutMs(ms);
+    }
+  }
+
   // Scan Redis for workspaceIds that have an existing pool and start their loops
   // immediately. This repairs stale activeJobs counts left by a previous server
   // run without waiting for the first job submission to trigger getOrCreate.

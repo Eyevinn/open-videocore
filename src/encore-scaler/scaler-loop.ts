@@ -66,6 +66,10 @@ export class EncoreScalerLoop {
     this.config.maxInstances = max;
   }
 
+  setIdleTimeoutMs(ms: number): void {
+    this.config.idleTimeoutMs = ms;
+  }
+
   async tick(): Promise<void> {
     const { redis, workspaceId, maxInstances, idleTimeoutMs } = this.config;
     const minInstances = this.config.minInstances ?? 0;
