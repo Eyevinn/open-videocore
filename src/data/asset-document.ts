@@ -58,7 +58,10 @@ export const AudioTrackSchema = z.object({
 export type DocAudioTrack = z.infer<typeof AudioTrackSchema>;
 
 export const RenditionSchema = z.object({
-  id: z.string(),
+  // `id` was added in the #79 redesign; old documents lack it — default to a
+  // deterministic placeholder so they can be read without error. The next write
+  // (re-transcode) will replace these with real ULIDs.
+  id: z.string().default('legacy'),
   label: z.string(),
   width: z.number(),
   height: z.number(),
