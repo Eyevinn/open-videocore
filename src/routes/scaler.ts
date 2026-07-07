@@ -31,9 +31,17 @@ type ScalerRouterOptions = {
   maxInstances: number;
   // Minimum instances to keep warm (0 = scale to zero when idle). Default 0.
   minInstances?: number;
+  // Idle time (ms) before an idle Encore instance is torn down
+  // (ENCORE_IDLE_TIMEOUT_MS). Default 5 minutes.
+  idleTimeoutMs: number;
   // Callback to update the live scaler config at runtime.
-  onConfigChange?: (cfg: { maxInstances: number; minInstances: number }) => void;
+  onConfigChange?: (cfg: { maxInstances: number; minInstances: number; idleTimeoutMs: number }) => void;
 };
+
+// Lower bound on the runtime idle timeout. A near-zero timeout would let the
+// scaler destroy an instance almost as soon as it goes idle, thrashing the
+// spawn/destroy cycle (spawns take 60-120s). 10s is a defensible floor.
+const MIN_IDLE_TIMEOUT_MS = 10_000;
 
 const instanceSchema = z.object({
   instanceId: z.string(),
@@ -52,6 +60,7 @@ const workspaceSchema = z.object({
 const scalerStatusSchema = z.object({
   workspaces: z.array(workspaceSchema),
   maxInstances: z.number(),
+  idleTimeoutMs: z.number(),
   scalerActive: z.boolean()
 });
 
@@ -80,10 +89,12 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
   // Mutable runtime config — updated by PATCH /config.
   let liveMaxInstances = opts.maxInstances;
   let liveMinInstances = opts.minInstances ?? 0;
+  let liveIdleTimeoutMs = opts.idleTimeoutMs;
 
   const scalerConfigSchema = z.object({
     maxInstances: z.number().int().min(1).max(20),
-    minInstances: z.number().int().min(0).max(10)
+    minInstances: z.number().int().min(0).max(10),
+    idleTimeoutMs: z.number().int().min(MIN_IDLE_TIMEOUT_MS)
   });
 
   app.get(
@@ -92,7 +103,7 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     async () => {
       const redis = opts.redis;
       if (!redis) {
-        return { workspaces: [], maxInstances: 0, scalerActive: false };
+        return { workspaces: [], maxInstances: 0, idleTimeoutMs: liveIdleTimeoutMs, scalerActive: false };
       }
 
       const workspaceIds = await scanWorkspaceIds(redis);
@@ -107,7 +118,7 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         })
       );
 
-      return { workspaces, maxInstances: liveMaxInstances, scalerActive: true };
+      return { workspaces, maxInstances: liveMaxInstances, idleTimeoutMs: liveIdleTimeoutMs, scalerActive: true };
     }
   );
 
@@ -121,11 +132,20 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
       }
     },
     async (request) => {
-      const { maxInstances, minInstances } = request.body;
+      const { maxInstances, minInstances, idleTimeoutMs } = request.body;
       if (maxInstances !== undefined) liveMaxInstances = maxInstances;
       if (minInstances !== undefined) liveMinInstances = minInstances;
-      opts.onConfigChange?.({ maxInstances: liveMaxInstances, minInstances: liveMinInstances });
-      return { maxInstances: liveMaxInstances, minInstances: liveMinInstances };
+      if (idleTimeoutMs !== undefined) liveIdleTimeoutMs = idleTimeoutMs;
+      opts.onConfigChange?.({
+        maxInstances: liveMaxInstances,
+        minInstances: liveMinInstances,
+        idleTimeoutMs: liveIdleTimeoutMs
+      });
+      return {
+        maxInstances: liveMaxInstances,
+        minInstances: liveMinInstances,
+        idleTimeoutMs: liveIdleTimeoutMs
+      };
     }
   );
 
@@ -137,6 +157,10 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         response: { 200: scalerConfigSchema }
       }
     },
-    async () => ({ maxInstances: liveMaxInstances, minInstances: liveMinInstances })
+    async () => ({
+      maxInstances: liveMaxInstances,
+      minInstances: liveMinInstances,
+      idleTimeoutMs: liveIdleTimeoutMs
+    })
   );
 };
