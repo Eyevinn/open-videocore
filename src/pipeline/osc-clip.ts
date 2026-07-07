@@ -19,7 +19,7 @@ import {
   createJob,
   getLogsForInstance,
   removeJob,
-  getJob,
+  getInstanceHealth,
 
   type Context
 } from '@osaas/client-core';
@@ -33,7 +33,7 @@ import type { ClipRunner } from './clip.js';
 export type OscJobApi = {
   context: Context;
   createJob: typeof createJob;
-  getJob: typeof getJob;
+  getInstanceHealth: typeof getInstanceHealth;
 
   getLogsForInstance: typeof getLogsForInstance;
   removeJob: typeof removeJob;

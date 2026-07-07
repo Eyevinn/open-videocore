@@ -52,7 +52,7 @@ import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import {
   createJob,
-  getJob,
+  getInstanceHealth,
   getLogsForInstance,
   removeJob,
 } from '@osaas/client-core';
@@ -248,7 +248,7 @@ const probe: ProbeRunner | undefined = storageAvailable
   ? makeOscProbeRunner({
       context: oscContext,
       createJob,
-      getJob,
+      getInstanceHealth,
       getLogsForInstance,
       removeJob
     })
@@ -270,7 +270,7 @@ const thumbnailExtractor = storageAvailable
       makeOscThumbnailExtractor({
         context: oscContext,
         createJob,
-        getJob,
+        getInstanceHealth,
         getLogsForInstance,
         removeJob
       })
@@ -285,7 +285,7 @@ const rewrapRunner: RewrapRunner | undefined = storageAvailable
   ? makeOscRewrapRunner({
       context: oscContext,
       createJob,
-      getJob,
+      getInstanceHealth,
       getLogsForInstance,
       removeJob
     })
@@ -295,7 +295,7 @@ const clipRunner: ClipRunner | undefined = storageAvailable
   ? makeOscClipRunner({
       context: oscContext,
       createJob,
-      getJob,
+      getInstanceHealth,
       getLogsForInstance,
       removeJob
     })
