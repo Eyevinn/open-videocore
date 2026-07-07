@@ -1210,20 +1210,42 @@ async function showJobDetail(id, detailPanel) {
       });
     }
 
-    // Transcode pipeline visualization. For transcode jobs, fetch the source
-    // asset to resolve the Package/Ready stages (renditions live on the asset).
+    // Transcode pipeline visualization. For transcode jobs, prefer showing the
+    // PipelineExecution steps (which reflect the actual pipeline that was run).
+    // Fall back to the legacy static diagram only if no execution is found.
     if (job && job.type === 'transcode') {
       let asset = null;
+      let executions = [];
       if (job.assetId) {
         try {
           asset = await apiFetch('/assets/' + encodeURIComponent(job.assetId));
-        } catch (_) { /* asset may be gone; pipeline degrades gracefully */ }
+        } catch (_) { /* asset may be gone */ }
+        try {
+          executions = await apiFetch('/assets/' + encodeURIComponent(job.assetId) + '/executions');
+        } catch (_) { /* executions endpoint may not be available */ }
       }
+      // Find the execution whose transcode step matches this job id.
+      var matchedExec = executions.find(function(ex) {
+        return ex.steps && ex.steps.some(function(s) { return s.jobId === job.id; });
+      });
       const pipelineTitle = document.createElement('div');
       pipelineTitle.className = 'section-title mt12';
-      pipelineTitle.textContent = 'Transcode pipeline';
+      pipelineTitle.textContent = 'Pipeline';
       body.appendChild(pipelineTitle);
-      body.appendChild(renderPipeline(buildTranscodePipeline(job, asset)));
+      if (matchedExec) {
+        // Use renderExecutions-style: map PipelineExecution steps to pipeline nodes.
+        var STATUS_MAP = { pending: 'pending', running: 'running', done: 'completed', failed: 'failed' };
+        var nodes = [{ label: 'Upload', status: 'completed' }].concat(
+          matchedExec.steps.map(function(s) {
+            var detail;
+            if (s.name === 'transcode' && s.status === 'running' && job.progress != null) detail = job.progress + '%';
+            return { label: s.name, status: STATUS_MAP[s.status] || s.status, detail: detail };
+          })
+        );
+        body.appendChild(renderPipeline(nodes));
+      } else {
+        body.appendChild(renderPipeline(buildTranscodePipeline(job, asset)));
+      }
     }
 
     // Cancel button in the panel for running/pending jobs.
