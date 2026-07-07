@@ -315,8 +315,11 @@ function loadingEl() {
 const TABS = ['assets', 'jobs', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
+const TAB_KEY = 'ovc-active-tab';
+
 function switchTab(name) {
   if (!TABS.includes(name)) return;
+  localStorage.setItem(TAB_KEY, name);
   document.querySelectorAll('.tab-btn').forEach(function(b) {
     b.classList.toggle('active', b.dataset.tab === name);
   });
@@ -2244,5 +2247,5 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
 setupTabs();
-switchTab('assets');
+switchTab(localStorage.getItem(TAB_KEY) || 'assets');
 initStackSelector();
