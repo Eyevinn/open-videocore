@@ -176,6 +176,14 @@ export type Asset = {
   // asset's lifecycle status — it only annotates the record.
   manifestUrls?: ManifestUrls;
   packagingError?: string;
+  // Pipeline orchestration state (issue #9 pipeline mode). Set when
+  // POST /assets/:id/package is called without encoreJobId, triggering an
+  // auto-transcode → package workflow. Updated as the pipeline advances.
+  pipelineStatus?: 'transcoding' | 'packaging' | 'done' | 'failed';
+  // Our internal Job id for the transcode step; used by the encore-callback to
+  // find and advance the right pipeline when the job completes.
+  pipelineTranscodeJobId?: string;
+  pipelineError?: string;
   // ABR renditions produced by transcoding (issue #8). Populated on the SOURCE
   // asset when a transcode job completes; undefined until then.
   renditions?: Rendition[];
@@ -244,6 +252,10 @@ export type UpdateAssetInput = {
   // leaves `manifestUrls` untouched. Neither field changes `status`.
   manifestUrls?: ManifestUrls;
   packagingError?: string;
+  // Pipeline orchestration fields (issue #9 pipeline mode).
+  pipelineStatus?: 'transcoding' | 'packaging' | 'done' | 'failed';
+  pipelineTranscodeJobId?: string;
+  pipelineError?: string;
   // Set by the transcode pipeline (issue #8) on the source asset when a
   // transcode job completes. Does not change `status`.
   renditions?: Rendition[];
@@ -528,6 +540,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     if (patch.packagingError !== undefined) {
       next.packagingError = patch.packagingError;
     }
+    if (patch.pipelineStatus !== undefined) next.pipelineStatus = patch.pipelineStatus;
+    if (patch.pipelineTranscodeJobId !== undefined) next.pipelineTranscodeJobId = patch.pipelineTranscodeJobId;
+    if (patch.pipelineError !== undefined) next.pipelineError = patch.pipelineError;
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;
     }

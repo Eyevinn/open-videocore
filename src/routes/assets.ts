@@ -49,6 +49,8 @@ import {
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
+import { decodeEncoreJobId } from '../data/job-repo.js';
+import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { PRESET_NAMES, type EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
@@ -278,6 +280,9 @@ const assetSchema = z.object({
   // packaging completes; `packagingError` carries the last packaging failure.
   manifestUrls: manifestUrlsSchema.optional(),
   packagingError: z.string().optional(),
+  // Pipeline orchestration state (issue #9 pipeline mode).
+  pipelineStatus: z.enum(['transcoding', 'packaging', 'done', 'failed']).optional(),
+  pipelineError: z.string().optional(),
   // ABR renditions produced by transcoding (issue #8). Absent until a transcode
   // job completes; each entry links to a child asset via its assetId.
   renditions: z.array(renditionSchema).optional(),
@@ -357,6 +362,10 @@ type AssetsRouterOptions = {
   clipRunner?: ClipRunner;
   clip?: typeof runClip;
   clipDeps?: Partial<ClipDeps>;
+  // HLS/DASH packaging (issue #9). When present, POST /:id/package is enabled.
+  packaging?: import('../pipeline/packaging.js').PackagingService;
+  // Redis for resolving Encore instance URL at packaging time.
+  packagingRedis?: import('ioredis').Redis;
 };
 
 const ingestUrlSchema = z.object({
@@ -369,6 +378,31 @@ const ingestAcceptedSchema = z.object({
   assetId: z.string(),
   jobId: z.string()
 });
+
+// Resolve the Encore job URL for packaging by looking up the instance URL from
+// the Redis pool using the encoreJobId → instanceId → EncoreInstanceRecord chain.
+// Returns undefined when the instance is no longer in the pool.
+async function resolveEncoreJobUrlForPackaging(
+  encoreJobId: string,
+  redis: import('ioredis').Redis | undefined
+): Promise<string | undefined> {
+  if (!redis) return undefined;
+  const decoded = decodeEncoreJobId(encoreJobId);
+  if (!decoded) return undefined;
+  const instanceId = await redis.hget(keys.jobInstance(decoded.workspaceId), encoreJobId);
+  if (!instanceId) return undefined;
+  const [instanceJson, encoreUuid] = await Promise.all([
+    redis.hget(keys.pool(decoded.workspaceId), instanceId),
+    redis.get(keys.jobUuid(encoreJobId))
+  ]);
+  if (!instanceJson || !encoreUuid) return undefined;
+  try {
+    const record = JSON.parse(instanceJson) as EncoreInstanceRecord;
+    return `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`;
+  } catch {
+    return undefined;
+  }
+}
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
@@ -707,6 +741,108 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
       }
+    }
+  );
+
+  // HLS/DASH packaging (issue #9). Workspace-scoped and behind `authenticate`.
+  // `encoreJobId` is optional:
+  //   - Provided: enqueues that specific Encore job for CMAF packaging directly.
+  //   - Omitted: "pipeline mode" — submits an ABR transcode first, then auto-
+  //     triggers packaging when the transcode callback arrives. Pipeline state
+  //     is persisted on the asset (pipelineStatus) so a failed transcode can be
+  //     retried by calling this endpoint again.
+  //
+  //   202 — packaging enqueued (or pipeline started)
+  //   404 — unknown/foreign asset (existence not leaked)
+  //   409 — pipeline already running / job not found / instance unavailable
+  //   501 — required service not configured on this deployment
+  //   502 — Encore submission failed
+  app.post(
+    '/:id/package',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: z.object({ encoreJobId: z.string().min(1).optional() }),
+        response: {
+          202: z.object({ ok: z.literal(true), jobId: z.string().optional(), pipelineMode: z.boolean().optional() }),
+          404: z.object({ error: z.string() }),
+          409: z.object({ error: z.string(), message: z.string() }),
+          501: z.object({ error: z.string(), message: z.string() }),
+          502: z.object({ error: z.string(), message: z.string() })
+        }
+      }
+    },
+    async (request, reply) => {
+      if (!opts.packaging) {
+        return reply.code(501).send({ error: 'not_configured', message: 'packaging is not configured' });
+      }
+      const asset = await repo.get((request.params as { id: string }).id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      const { encoreJobId } = request.body;
+
+      // Pipeline mode: auto-transcode then package.
+      if (!encoreJobId) {
+        if (!opts.encore) {
+          return reply.code(501).send({ error: 'not_configured', message: 'transcode not configured — cannot start pipeline' });
+        }
+        // Reject if a pipeline step is already running (not failed/done).
+        if (asset.pipelineStatus === 'transcoding' || asset.pipelineStatus === 'packaging') {
+          return reply.code(409).send({
+            error: 'pipeline_running',
+            message: `pipeline already in '${asset.pipelineStatus}' — wait for it to complete or check its status`
+          });
+        }
+        if (!asset.objectKey) {
+          return reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to transcode' });
+        }
+        if (!opts.sourceBucket || !opts.outputBucket) {
+          return reply.code(501).send({ error: 'not_configured', message: 'transcode buckets not configured' });
+        }
+        try {
+          const result = await submitTranscode(
+            {
+              workspaceId: DEPLOYMENT_CONTEXT,
+              sourceAssetId: asset.id,
+              sourceObjectKey: asset.objectKey,
+              sourceBucket: opts.sourceBucket,
+              outputBucket: opts.outputBucket
+            },
+            {
+              jobs,
+              assets: repo,
+              encore: opts.encore,
+              encoreCallbackUrl: request.connections?.encoreCallbackUrl
+            }
+          );
+          await repo.update(asset.id, {
+            pipelineStatus: 'transcoding',
+            pipelineTranscodeJobId: result.jobId,
+            pipelineError: undefined
+          });
+          return reply.code(202).send({ ok: true, jobId: result.jobId, pipelineMode: true });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return reply.code(502).send({ error: 'encore_submit_failed', message });
+        }
+      }
+
+      // Explicit encoreJobId: enqueue for packaging immediately.
+      const found = await jobs.findByEncoreJobId(encoreJobId);
+      if (!found || found.job.assetId !== asset.id) {
+        return reply.code(409).send({ error: 'job_not_found', message: 'encoreJobId not found for this asset' });
+      }
+      // Resolve the Encore instance URL + UUID from Redis. Both must be present
+      // (stored at dispatch time). If the instance has been scaled down, packaging
+      // cannot proceed — the Encore job data is only accessible while the instance runs.
+      const encoreJobUrl = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
+      if (!encoreJobUrl) {
+        return reply.code(409).send({ error: 'instance_not_found', message: 'Encore instance no longer in pool — cannot resolve job URL for packaging' });
+      }
+      void opts.packaging.triggerPackaging(asset.id, encoreJobUrl);
+      return reply.code(202).send({ ok: true });
     }
   );
 

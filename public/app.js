@@ -654,6 +654,12 @@ async function showAssetDetail(id, detailPanel) {
     } else if (asset.technicalMetadataError) {
       kvRows.push(['Tech Metadata', '<span style="color:var(--error,#f87171)">' + escHtml(asset.technicalMetadataError) + '</span>']);
     }
+    if (asset.pipelineStatus) {
+      var pipelineColor = { transcoding: 'var(--accent,#60a5fa)', packaging: 'var(--accent,#60a5fa)', done: 'var(--success,#4ade80)', failed: 'var(--error,#f87171)' }[asset.pipelineStatus] || '';
+      var pipelineText = '<span style="color:' + pipelineColor + '">' + escHtml(asset.pipelineStatus) + '</span>';
+      if (asset.pipelineError) pipelineText += ' — ' + escHtml(asset.pipelineError);
+      kvRows.push(['Pipeline', pipelineText]);
+    }
 
     const kvHtml = kvRows.map(function(r) {
       return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
@@ -683,6 +689,7 @@ async function showAssetDetail(id, detailPanel) {
     actionsDiv.className = 'mt12 flex-gap';
     actionsDiv.innerHTML = [
       '<button id="btn-transcode" class="btn-ghost">Transcode (ABR)</button>',
+      '<button id="btn-package" class="btn-ghost">Package for VOD</button>',
       '<button id="btn-extract-meta" class="btn-ghost">Extract Metadata</button>',
       '<button id="btn-thumbnails" class="btn-ghost">Thumbnails</button>',
     ].join('');
@@ -702,6 +709,22 @@ async function showAssetDetail(id, detailPanel) {
       try {
         const r = await apiFetch('/assets/' + encodeURIComponent(id) + '/transcode', { method: 'POST', body: JSON.stringify({}) });
         showMsg(actionMsg, 'Transcode job submitted. ID: ' + (r && (r.jobId || r.id) ? (r.jobId || r.id) : JSON.stringify(r)), 'success');
+      } catch (err) {
+        showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      }
+    });
+
+    body.querySelector('#btn-package').addEventListener('click', async function() {
+      actionMsg.innerHTML = '';
+      var encoreJobId = prompt('Enter an Encore job ID to package directly, or leave blank to start a full transcode+package pipeline:');
+      var requestBody = encoreJobId && encoreJobId.trim() ? { encoreJobId: encoreJobId.trim() } : {};
+      try {
+        var r = await apiFetch('/assets/' + encodeURIComponent(id) + '/package', { method: 'POST', body: JSON.stringify(requestBody) });
+        if (r && r.pipelineMode) {
+          showMsg(actionMsg, 'Pipeline started: transcoding then packaging. Job ID: ' + r.jobId + '. Reload asset to track progress.', 'success');
+        } else {
+          showMsg(actionMsg, 'Packaging enqueued. The packager will produce HLS/DASH manifests.', 'success');
+        }
       } catch (err) {
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
       }
