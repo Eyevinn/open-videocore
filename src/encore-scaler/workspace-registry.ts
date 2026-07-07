@@ -15,6 +15,7 @@ import type { EncoreClient, EncoreSubmitInput, EncoreSubmitResult } from '../pip
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { EncoreScalerLoop } from './scaler-loop.js';
 import { makeScalingEncoreClient } from './index.js';
+import { keys } from './types.js';
 import type { EncoreScalerConfig } from './types.js';
 
 export type WorkspaceEncoreScalerConfig = {
@@ -75,6 +76,19 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     this.config.maxInstances = max;
     for (const { loop } of this.loops.values()) {
       loop.setMaxInstances(max);
+    }
+  }
+
+  // Scan Redis for workspaceIds that have an existing pool and start their loops
+  // immediately. This repairs stale activeJobs counts left by a previous server
+  // run without waiting for the first job submission to trigger getOrCreate.
+  async resumeExistingWorkspaces(): Promise<void> {
+    const poolPattern = 'encore:pool:*';
+    const existingKeys = await this.config.redis.keys(poolPattern);
+    for (const key of existingKeys) {
+      // key = "encore:pool:{workspaceId}"
+      const workspaceId = key.slice('encore:pool:'.length);
+      if (workspaceId) this.getOrCreate(workspaceId);
     }
   }
 

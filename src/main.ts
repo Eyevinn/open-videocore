@@ -354,6 +354,12 @@ if (storageAvailable && process.env['REDIS_URL']) {
   if (!encoreS3Endpoint) {
     app.log.warn('ENCORE_S3_ENDPOINT not set — Encore instances will not be able to read from MinIO; set ENCORE_S3_ENDPOINT to the MinIO URL');
   }
+  // Start loops for any workspaces that had pool entries from a previous run.
+  // This triggers reconcile() on the first tick, correcting stale activeJobs counts
+  // left by jobs that completed while the server was down.
+  void (encore as import('./encore-scaler/workspace-registry.js').WorkspaceEncoreScalerRegistry)
+    .resumeExistingWorkspaces()
+    .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
 } else if (storageAvailable) {
   app.log.warn('REDIS_URL not set — Encore auto-scaler disabled, transcoding unavailable');
 }
