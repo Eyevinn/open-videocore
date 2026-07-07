@@ -98,6 +98,12 @@ export async function spawnInstance(
         instanceBody['s3SecretAccessKey'] = config.s3Config.secretAccessKey;
         instanceBody['s3Region'] = config.s3Config.region ?? 'us-east-1';
       }
+      // Point the instance at our own public profile index so it loads the
+      // operator-managed profiles from CouchDB (issue #84). `profilesUrl` is the
+      // Encore service's own config key for the YAML profile index URL.
+      if (config.profilesUrl) {
+        instanceBody['profilesUrl'] = config.profilesUrl;
+      }
       instance = (await createInstance(
         config.oscContext,
         ENCORE_SERVICE_ID,

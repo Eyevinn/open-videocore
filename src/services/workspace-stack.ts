@@ -19,14 +19,17 @@ import { CouchJobRepository } from '../data/couch-job-repo.js';
 import { CouchSearchRepository } from '../data/couch-search-repo.js';
 import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
+import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { InMemorySearchRepository } from '../data/inmemory-search-repo.js';
 import { InMemoryWebhookRepository } from '../data/inmemory-webhook-repo.js';
 import { InMemoryCollectionRepository } from '../data/inmemory-collection-repo.js';
+import { InMemoryProfileRepository } from '../data/inmemory-profile-repo.js';
 import type { SearchRepository } from '../data/search-repo.js';
 import type { WebhookRepository } from '../data/webhook-repo.js';
 import type { CollectionRepository } from '../data/collection-repo.js';
+import type { ProfileRepository } from '../data/profile-repo.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
 import type { Context } from '@osaas/client-core';
@@ -39,6 +42,7 @@ export type WorkspaceConnections = {
   search: SearchRepository;
   webhooks: WebhookRepository;
   collections: CollectionRepository;
+  profiles: ProfileRepository;
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
@@ -77,6 +81,7 @@ function buildConnectionsFromStack(
   const search = new CouchSearchRepository(wc);
   const webhooks = new CouchWebhookRepository(wc);
   const collections = new CouchCollectionRepository(wc);
+  const profiles = new CouchProfileRepository(wc);
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -92,6 +97,7 @@ function buildConnectionsFromStack(
     search,
     webhooks,
     collections,
+    profiles,
     storageFor,
     storageClient: minioClient,
     encore,
@@ -120,6 +126,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let search: SearchRepository;
   let webhooks: WebhookRepository;
   let collections: CollectionRepository;
+  let profiles: ProfileRepository;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -130,6 +137,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     search = new CouchSearchRepository(wc);
     webhooks = new CouchWebhookRepository(wc);
     collections = new CouchCollectionRepository(wc);
+    profiles = new CouchProfileRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -137,6 +145,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     search = new InMemorySearchRepository(mem);
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
+    profiles = new InMemoryProfileRepository();
   }
 
   let storageFor: StorageFactory | undefined;
@@ -166,7 +175,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections,
+    assets, jobs, search, webhooks, collections, profiles,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined
@@ -179,8 +188,9 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const search = new InMemorySearchRepository(assets);
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
+  const profiles = new InMemoryProfileRepository();
   return {
-    assets, jobs, search, webhooks, collections,
+    assets, jobs, search, webhooks, collections, profiles,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',

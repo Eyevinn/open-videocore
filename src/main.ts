@@ -31,7 +31,8 @@ import {
   PerWorkspaceJobRepository,
   PerWorkspaceSearchRepository,
   PerWorkspaceWebhookRepository,
-  PerWorkspaceCollectionRepository
+  PerWorkspaceCollectionRepository,
+  PerWorkspaceProfileRepository
 } from './data/per-workspace-repos.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
@@ -44,6 +45,7 @@ import type { ClipRunner } from './pipeline/clip.js';
 import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
+import { bootstrapProfiles } from './services/profile-bootstrap.js';
 import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
@@ -217,6 +219,7 @@ const jobRepository = new PerWorkspaceJobRepository(stackResolver);
 const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
 const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver);
+const profileRepository = new PerWorkspaceProfileRepository(stackResolver);
 
 // Synchronous, per-workspace object-storage factory (issue #4). Reads the
 // connections already warmed into the resolver cache by the global preHandler
@@ -319,6 +322,24 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] ?? '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] ?? String(5 * 60 * 1000), 10);
 
+// The default Encore profile index used to seed the profile store on first
+// startup / on bootstrap. Same URL + default as before (issue #84).
+const encoreProfilesUrl =
+  process.env['ENCORE_PROFILES_URL'] ??
+  'https://raw.githubusercontent.com/Eyevinn/encore-test-profiles/refs/heads/main/profiles.yml';
+
+// Publicly-reachable base URL of this API, used to build the `profilesUrl` we
+// hand to each Encore instance the scaler spawns so Encore fetches profiles
+// from our own GET /api/v1/profiles/index.yml. When unset the scaler falls back
+// to the remote default index (previous behaviour), so Encore still works.
+const publicBaseUrl = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
+const encoreScalerProfilesUrl = publicBaseUrl
+  ? `${publicBaseUrl}/api/v1/profiles/index.yml`
+  : encoreProfilesUrl;
+if (!publicBaseUrl) {
+  app.log.warn('PUBLIC_BASE_URL not set — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+}
+
 let encore: EncoreClient | undefined;
 let sharedRedis: IORedis | undefined;
 
@@ -337,6 +358,9 @@ if (storageAvailable && process.env['REDIS_URL']) {
     oscContext,
     maxInstances: encoreMaxInstances,
     idleTimeoutMs: encoreIdleTimeoutMs,
+    // Point each spawned Encore instance at our own public profile index so it
+    // loads the operator-managed profiles from CouchDB (issue #84).
+    profilesUrl: encoreScalerProfilesUrl,
     s3Config: encoreS3Endpoint && encoreS3SecretKey ? {
       endpoint: encoreS3Endpoint,
       accessKeyId: encoreS3AccessKey,
@@ -437,17 +461,28 @@ if (sharedRedis) {
   });
 }
 
-// Encore transcoding profile catalogue (public metadata). Unauthenticated by
-// design — it exposes only the list of available profile names for a UI picker,
-// no workspace data. The index URL is the Encore instance's `profilesUrl`,
-// configurable via ENCORE_PROFILES_URL; defaults to the Eyevinn test profiles.
-const encoreProfilesUrl =
-  process.env['ENCORE_PROFILES_URL'] ??
-  'https://raw.githubusercontent.com/Eyevinn/encore-test-profiles/refs/heads/main/profiles.yml';
+// Encore transcoding profile catalogue + management (issue #84). Profiles are
+// persisted in CouchDB (per-tenant) and surfaced/managed through this router.
+// Unauthenticated by design: it exposes profile management + a public
+// index.yml that the Encore instances the scaler spawns fetch directly (no
+// bearer token). ENCORE_PROFILES_URL is the *bootstrap* seed source (the
+// default Encore profile index), configurable and defaulting to the Eyevinn
+// test profiles.
 await app.register(profilesRouter, {
   prefix: '/api/v1/profiles',
-  profilesUrl: encoreProfilesUrl
+  repository: profileRepository,
+  bootstrapIndexUrl: encoreProfilesUrl
 });
+
+// Seed profiles from the default Encore index on first startup. Skipped when
+// profiles already exist (survives restarts). Best-effort: a fetch failure
+// (e.g. offline local run) is logged and does not block boot; operators can
+// retry via POST /api/v1/profiles/bootstrap.
+void bootstrapProfiles({
+  repository: profileRepository,
+  indexUrl: encoreProfilesUrl,
+  log: app.log
+}).catch((err) => app.log.warn({ err }, 'profile bootstrap on startup failed'));
 
 // Assets router also owns POST /ingest-url (issue #5) and POST /:id/transcode
 // (issue #8). It shares the same job repository so a job created here is

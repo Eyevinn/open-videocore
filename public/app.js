@@ -368,7 +368,7 @@ function loadingEl() {
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
 
-const TABS = ['assets', 'jobs', 'pipelines', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+const TABS = ['assets', 'jobs', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -1606,6 +1606,175 @@ async function renderSearchTab(container) {
 
 const WEBHOOK_EVENTS = ['asset.ready', 'transcode.complete', 'package.complete', 'asset.failed'];
 
+// ─── PROFILES TAB ────────────────────────────────────────────────────────────
+
+// Encore transcoding profiles (issue #84). Profiles are persisted in CouchDB
+// and served to Encore via the public GET /api/v1/profiles/index.yml. This tab
+// lets an operator list profiles, view their YAML, create new ones, seed the
+// store from the default Encore index (bootstrap), and delete profiles.
+async function renderProfilesTab(container) {
+  const title = document.createElement('h2');
+  title.className = 'panel-title';
+  title.textContent = 'Transcoding profiles';
+  container.appendChild(title);
+
+  // Create form.
+  const createSection = document.createElement('div');
+  createSection.className = 'section';
+  createSection.innerHTML = [
+    '<div class="section-title">Add profile</div>',
+    '<div class="form-row">',
+    '  <div class="form-field grow">',
+    '    <label for="pf-name">Name</label>',
+    '    <input type="text" id="pf-name" placeholder="program" />',
+    '  </div>',
+    '</div>',
+    '<div class="form-field mt8 grow">',
+    '  <label for="pf-yaml">Profile YAML</label>',
+    '  <textarea id="pf-yaml" rows="8" placeholder="name: program&#10;description: ..." style="width:100%;font-family:monospace;"></textarea>',
+    '</div>',
+    '<button id="pf-create-btn" class="mt8">Create</button>',
+    '<div id="pf-create-msg"></div>',
+  ].join('');
+  container.appendChild(createSection);
+
+  // List + bootstrap.
+  const listSection = document.createElement('div');
+  listSection.className = 'section';
+  listSection.innerHTML = [
+    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
+    '  <span>Configured profiles</span>',
+    '  <span>',
+    '    <button id="pf-bootstrap" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Bootstrap from default index</button>',
+    '    <button id="pf-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
+    '  </span>',
+    '</div>',
+    '<div id="pf-bootstrap-msg"></div>',
+    '<div id="pf-list-wrap"></div>',
+    '<div id="pf-yaml-view"></div>',
+  ].join('');
+  container.appendChild(listSection);
+
+  async function loadProfiles() {
+    const wrap = listSection.querySelector('#pf-list-wrap');
+    wrap.innerHTML = '';
+    const loader = loadingEl();
+    wrap.appendChild(loader);
+    let items = [];
+    try {
+      const res = await apiFetch('/profiles');
+      items = res && Array.isArray(res.items) ? res.items : [];
+    } catch (err) {
+      loader.remove();
+      showMsg(wrap, 'Failed: ' + err.message, 'error');
+      return;
+    }
+    loader.remove();
+    if (items.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No profiles configured. Use Bootstrap to seed from the default Encore index.';
+      wrap.appendChild(empty);
+      return;
+    }
+    const rows = items.map(function(p) {
+      return '<tr>' +
+        '<td class="cell-id">' + escHtml(p.name) + '</td>' +
+        '<td>' + escHtml(fmtDate(p.updatedAt)) + '</td>' +
+        '<td>' +
+        '<button class="btn-ghost pf-view-btn" data-name="' + escHtml(p.name) + '" style="font-size:12px;padding:3px 8px;">View YAML</button> ' +
+        '<button class="btn-danger pf-delete-btn" data-name="' + escHtml(p.name) + '" style="font-size:12px;padding:3px 8px;">Delete</button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-wrap';
+    tableWrap.innerHTML = '<table>' +
+      '<thead><tr><th>Name</th><th>Updated</th><th>Actions</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+      '</table>';
+    wrap.appendChild(tableWrap);
+
+    tableWrap.querySelectorAll('.pf-view-btn').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        const view = listSection.querySelector('#pf-yaml-view');
+        view.innerHTML = '';
+        try {
+          const p = await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name));
+          const box = document.createElement('div');
+          box.className = 'section';
+          const pre = document.createElement('pre');
+          pre.style.whiteSpace = 'pre-wrap';
+          pre.style.fontFamily = 'monospace';
+          // textContent — never innerHTML — so YAML content cannot inject markup.
+          pre.textContent = p.yaml || '';
+          const head = document.createElement('div');
+          head.className = 'section-title';
+          head.textContent = 'YAML — ' + p.name;
+          box.appendChild(head);
+          box.appendChild(pre);
+          view.appendChild(box);
+        } catch (err) {
+          showMsg(view, 'Error: ' + err.message, 'error');
+        }
+      });
+    });
+
+    tableWrap.querySelectorAll('.pf-delete-btn').forEach(function(btn) {
+      btn.addEventListener('click', async function() {
+        if (!confirm('Delete profile ' + btn.dataset.name + '?')) return;
+        try {
+          await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name), { method: 'DELETE' });
+          listSection.querySelector('#pf-yaml-view').innerHTML = '';
+          loadProfiles();
+        } catch (err) {
+          alert('Error: ' + err.message);
+        }
+      });
+    });
+  }
+
+  createSection.querySelector('#pf-create-btn').addEventListener('click', async function() {
+    const name = createSection.querySelector('#pf-name').value.trim();
+    const yaml = createSection.querySelector('#pf-yaml').value;
+    const msgEl = createSection.querySelector('#pf-create-msg');
+    msgEl.innerHTML = '';
+    if (!name) { showMsg(msgEl, 'Name is required.', 'error'); return; }
+    if (!yaml.trim()) { showMsg(msgEl, 'YAML content is required.', 'error'); return; }
+    try {
+      await apiFetch('/profiles', { method: 'POST', body: JSON.stringify({ name: name, yaml: yaml }) });
+      showMsg(msgEl, 'Profile created.', 'success');
+      createSection.querySelector('#pf-name').value = '';
+      createSection.querySelector('#pf-yaml').value = '';
+      loadProfiles();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  listSection.querySelector('#pf-bootstrap').addEventListener('click', async function() {
+    const msgEl = listSection.querySelector('#pf-bootstrap-msg');
+    msgEl.innerHTML = '';
+    if (!confirm('Seed profiles from the default Encore profile index?')) return;
+    try {
+      const res = await apiFetch('/profiles/bootstrap', { method: 'POST' });
+      if (res && res.skipped) {
+        showMsg(msgEl, 'Profiles already exist — bootstrap skipped.', 'success');
+      } else {
+        showMsg(msgEl, 'Seeded ' + (res ? res.seeded : 0) + ' profile(s).', 'success');
+      }
+      loadProfiles();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  listSection.querySelector('#pf-refresh').addEventListener('click', loadProfiles);
+  await loadProfiles();
+}
+
+// ─── WEBHOOKS TAB ────────────────────────────────────────────────────────────
+
 async function renderWebhooksTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
@@ -2551,6 +2720,7 @@ function renderPipelinesTab(container) {
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
 TAB_RENDERERS['pipelines'] = renderPipelinesTab;
+TAB_RENDERERS['profiles'] = renderProfilesTab;
 TAB_RENDERERS['collections'] = renderCollectionsTab;
 TAB_RENDERERS['search'] = renderSearchTab;
 TAB_RENDERERS['webhooks'] = renderWebhooksTab;

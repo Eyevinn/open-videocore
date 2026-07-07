@@ -105,6 +105,8 @@ curl -X DELETE http://localhost:3000/api/v1/provision/mystack
 | `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances kept warm (default `0`). |
 | `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`). |
 | `ENCORE_S3_ENDPOINT` | No | MinIO/S3 endpoint URL passed to Encore instances so they can read source media. If unset, Encore instances cannot read from MinIO. |
+| `ENCORE_PROFILES_URL` | No | Default Encore profile index used to seed the profile store on first startup / bootstrap (default: the Eyevinn `encore-test-profiles` index). |
+| `PUBLIC_BASE_URL` | No | Publicly-reachable base URL of this API (e.g. `https://ovc.example.com`). Used to build the `profilesUrl` handed to each Encore instance the auto-scaler spawns, pointing at `GET /api/v1/profiles/index.yml` so Encore loads the operator-managed profiles from CouchDB. If unset, Encore instances fall back to `ENCORE_PROFILES_URL`. |
 
 ## API reference
 
@@ -167,9 +169,20 @@ Key endpoints:
 
 **Profiles**
 
+Transcoding profiles are persisted in CouchDB (seeded from `ENCORE_PROFILES_URL`
+on first startup) and served to Encore via the public, unauthenticated
+`index.yml` endpoint. Operators manage them through the API or the Profiles tab
+in the ops UI.
+
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/profiles` | List available transcoding profiles |
+| `GET` | `/api/v1/profiles` | List profiles (names for the picker + full items) |
+| `POST` | `/api/v1/profiles` | Create a profile (`{ name, yaml }`) |
+| `GET` | `/api/v1/profiles/:name` | Get a single profile |
+| `PUT` | `/api/v1/profiles/:name` | Replace a profile's YAML (`{ yaml }`) |
+| `DELETE` | `/api/v1/profiles/:name` | Delete a profile |
+| `POST` | `/api/v1/profiles/bootstrap` | Seed profiles from the default Encore index (`?force=true` to re-seed) |
+| `GET` | `/api/v1/profiles/index.yml` | Public Encore-format profile index (no auth) |
 
 **Search**
 

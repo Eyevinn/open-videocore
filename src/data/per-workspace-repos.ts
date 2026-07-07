@@ -37,6 +37,11 @@ import type {
   Collection
 } from './collection-repo.js';
 import type {
+  ProfileRepository,
+  CreateProfileInput,
+  Profile
+} from './profile-repo.js';
+import type {
   EncoreClient,
   EncoreSubmitInput,
   EncoreSubmitResult
@@ -136,6 +141,31 @@ export class PerWorkspaceWebhookRepository implements WebhookRepository {
   }
   async delete(id: string): Promise<void> {
     return (await this.repo()).delete(id);
+  }
+}
+
+export class PerWorkspaceProfileRepository implements ProfileRepository {
+  constructor(private readonly resolver: WorkspaceStackResolver) {}
+  private async repo(): Promise<ProfileRepository> {
+    return (await this.resolver.resolve()).profiles;
+  }
+  async create(input: CreateProfileInput): Promise<Profile> {
+    return (await this.repo()).create(input);
+  }
+  async list(): Promise<Profile[]> {
+    return (await this.repo()).list();
+  }
+  async get(name: string): Promise<Profile | undefined> {
+    return (await this.repo()).get(name);
+  }
+  async update(name: string, yaml: string): Promise<Profile | undefined> {
+    return (await this.repo()).update(name, yaml);
+  }
+  async delete(name: string): Promise<void> {
+    return (await this.repo()).delete(name);
+  }
+  async count(): Promise<number> {
+    return (await this.repo()).count();
   }
 }
 

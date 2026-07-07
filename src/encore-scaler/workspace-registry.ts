@@ -28,6 +28,9 @@ export type WorkspaceEncoreScalerConfig = {
   redisUrl: string;
   tickIntervalMs?: number;
   s3Config?: import('./types.js').EncoreS3Config;
+  // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
+  // operator-managed profiles from this API's public index (issue #84).
+  profilesUrl?: string;
   // Forwarded to every per-workspace scaler loop: invoked after a queued job is
   // dispatched to an Encore instance so the Job record can advance queued->running.
   onDispatched?: (encoreJobId: string) => Promise<void>;
@@ -52,6 +55,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       redisUrl: this.config.redisUrl,
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
       s3Config: this.config.s3Config,
+      profilesUrl: this.config.profilesUrl,
       onDispatched: this.config.onDispatched
     };
 

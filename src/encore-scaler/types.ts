@@ -51,6 +51,12 @@ export type EncoreScalerConfig = {
   // MinIO S3 credentials injected into every spawned Encore instance. Required
   // for Encore to read source files from the workspace's MinIO bucket.
   s3Config?: EncoreS3Config;
+  // Full URL of the Encore profile index each spawned instance should load its
+  // transcoding profiles from (its `profilesUrl` config). When set, points at
+  // this API's own public GET /api/v1/profiles/index.yml so Encore uses the
+  // operator-managed profiles in CouchDB (issue #84). When unset the Encore
+  // instance uses its service default.
+  profilesUrl?: string;
   // Invoked after a queued job is successfully dispatched to an Encore instance
   // (after the Redis mapping/status writes). The scaler has no job repository of
   // its own, so main.ts wires this up to advance the corresponding Job from
