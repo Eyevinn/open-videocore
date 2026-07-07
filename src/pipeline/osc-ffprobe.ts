@@ -16,7 +16,7 @@
 
 import {
   createJob,
-  getInstanceHealth,
+  getJob,
   getLogsForInstance,
   removeJob,
   type Context
@@ -29,7 +29,7 @@ import type { FfprobeResult, FfprobeStream, ProbeRunner } from './metadata-extra
 export type OscJobApi = {
   context: Context;
   createJob: typeof createJob;
-  getInstanceHealth: typeof getInstanceHealth;
+  getJob: typeof getJob;
   getLogsForInstance: typeof getLogsForInstance;
   removeJob: typeof removeJob;
 };
