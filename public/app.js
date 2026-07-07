@@ -320,9 +320,10 @@ function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(function(b) {
     b.classList.toggle('active', b.dataset.tab === name);
   });
+  if (jobsPollTimer) { clearInterval(jobsPollTimer); jobsPollTimer = null; }
   const content = document.getElementById('content');
   content.innerHTML = '';
-  content.classList.toggle('content-fullbleed', name === 'assets');
+  content.classList.toggle('content-fullbleed', name === 'assets' || name === 'jobs');
   TAB_RENDERERS[name](content);
 }
 
@@ -771,150 +772,82 @@ async function showAssetDetail(id, detailPanel) {
 
 // ─── JOBS TAB ────────────────────────────────────────────────────────────────
 
+// Jobs tab pagination + polling state.
+const JOBS_PAGE_SIZE = 20;
+const jobsState = { offset: 0, total: 0, selectedId: null };
+let jobsPollTimer = null;
+
 async function renderJobsTab(container) {
-  const title = document.createElement('h2');
-  title.className = 'panel-title';
-  title.textContent = 'Jobs';
-  container.appendChild(title);
+  jobsState.offset = 0;
+  jobsState.selectedId = null;
 
-  // Job list
-  const listSection = document.createElement('div');
-  listSection.className = 'section';
-  const listContent = document.createElement('div');
-  listContent.appendChild(loadingEl());
-  listSection.innerHTML = '<div class="section-title">Recent jobs</div>';
-  listSection.appendChild(listContent);
-  container.appendChild(listSection);
+  // Layout: full-height table on the left, detail side panel on the right (hidden initially).
+  const layout = document.createElement('div');
+  layout.className = 'assets-layout';
+  container.appendChild(layout);
 
-  apiFetch('/jobs').then(function(data) {
-    listContent.innerHTML = '';
-    if (!data.items || !data.items.length) {
-      listContent.innerHTML = '<p class="text-muted">No jobs yet.</p>';
-      return;
-    }
-    var tbody = document.createElement('tbody');
-    data.items.forEach(function(j) {
-      var tr = document.createElement('tr');
-      tr.innerHTML =
-        '<td class="cell-id">' + escHtml(j.id) + '</td>' +
-        '<td>' + escHtml(j.type) + '</td>' +
-        '<td>' + renderBadge(j.status) + '</td>' +
-        '<td class="cell-id">' + escHtml(j.assetId || '—') + '</td>' +
-        '<td>' + (j.progress != null ? j.progress + '%' : '—') + '</td>' +
-        '<td>' + escHtml(fmtDate(j.createdAt)) + '</td>' +
-        '<td></td>';
-      if (j.status === 'running' || j.status === 'pending') {
-        var cancelBtn = document.createElement('button');
-        cancelBtn.className = 'btn-danger';
-        cancelBtn.style.cssText = 'font-size:12px;padding:3px 8px';
-        cancelBtn.textContent = 'Cancel';
-        cancelBtn.addEventListener('click', function() {
-          cancelBtn.disabled = true;
-          apiFetch('/jobs/' + encodeURIComponent(j.id), { method: 'DELETE' })
-            .then(function() { renderJobsTab(container.parentElement ? container : document.getElementById('content')); })
-            .catch(function(err) { cancelBtn.disabled = false; alert(err.message); });
-        });
-        tr.lastElementChild.appendChild(cancelBtn);
-      }
-      tbody.appendChild(tr);
-    });
-    var table = document.createElement('table');
-    table.innerHTML = '<thead><tr>' +
-      '<th>ID</th><th>Type</th><th>Status</th><th>Asset</th><th>Progress</th><th>Created</th><th></th>' +
-      '</tr></thead>';
-    table.appendChild(tbody);
-    listContent.appendChild(table);
-  }).catch(function(err) {
-    listContent.innerHTML = '<p class="text-muted">' + escHtml(err.message) + '</p>';
-  });
+  // ── Main (table) column ──
+  const main = document.createElement('div');
+  main.className = 'assets-main';
+  layout.appendChild(main);
 
-  // Job lookup
-  const section = document.createElement('div');
-  section.className = 'section';
-  section.innerHTML = [
-    '<div class="section-title">Look up job by ID</div>',
-    '<div class="form-row">',
-    '  <div class="form-field grow">',
-    '    <label for="job-id-input">Job ID</label>',
-    '    <input type="text" id="job-id-input" placeholder="job_abc123" />',
-    '  </div>',
-    '  <button id="job-lookup-btn">Lookup</button>',
+  const header = document.createElement('div');
+  header.className = 'assets-main-header';
+  header.innerHTML = [
+    '<span class="section-title">Jobs</span>',
+    '<div class="flex-gap">',
+    '  <button id="jobs-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
     '</div>',
-    '<div id="job-result" class="mt8"></div>',
   ].join('');
-  container.appendChild(section);
+  main.appendChild(header);
 
-  section.querySelector('#job-lookup-btn').addEventListener('click', async function() {
-    const jobId = section.querySelector('#job-id-input').value.trim();
-    const resultEl = section.querySelector('#job-result');
-    resultEl.innerHTML = '';
-    if (!jobId) { showMsg(resultEl, 'Enter a Job ID.', 'error'); return; }
-    const loader = loadingEl();
-    resultEl.appendChild(loader);
-    try {
-      const job = await apiFetch('/jobs/' + encodeURIComponent(jobId));
-      loader.remove();
+  const tableScroll = document.createElement('div');
+  tableScroll.className = 'assets-table-scroll';
+  tableScroll.id = 'jobs-table-wrap';
+  main.appendChild(tableScroll);
 
-      // Transcode pipeline visualization. For transcode jobs, fetch the source
-      // asset to resolve the Package/Ready stages (renditions live on the asset).
-      if (job && job.type === 'transcode') {
-        let asset = null;
-        if (job.assetId) {
-          try {
-            asset = await apiFetch('/assets/' + encodeURIComponent(job.assetId));
-          } catch (_) { /* asset may be gone; pipeline degrades gracefully */ }
-        }
-        const pipelineTitle = document.createElement('div');
-        pipelineTitle.className = 'section-title';
-        pipelineTitle.textContent = 'Transcode pipeline';
-        resultEl.appendChild(pipelineTitle);
-        resultEl.appendChild(renderPipeline(buildTranscodePipeline(job, asset)));
-      }
+  const pagination = document.createElement('div');
+  pagination.className = 'pagination';
+  pagination.id = 'jobs-pagination';
+  pagination.style.display = 'none';
+  pagination.innerHTML = [
+    '<span class="page-indicator" id="jobs-page-indicator"></span>',
+    '<button id="jobs-prev" class="btn-ghost">Previous</button>',
+    '<button id="jobs-next" class="btn-ghost">Next</button>',
+  ].join('');
+  main.appendChild(pagination);
 
-      const kvRows = [
-        ['ID', '<span class="text-mono">' + escHtml(job.id) + '</span>'],
-        ['Asset ID', '<span class="text-mono">' + escHtml(job.assetId || '—') + '</span>'],
-        ['Type', escHtml(job.type || '—')],
-        ['Status', renderBadge(job.status)],
-        ['Created', escHtml(fmtDate(job.createdAt))],
-        ['Updated', escHtml(fmtDate(job.updatedAt))],
-      ];
-      const kvDiv = document.createElement('div');
-      kvDiv.className = 'kv-grid mt8';
-      kvDiv.innerHTML = kvRows.map(function(r) {
-        return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
-      }).join('');
-      resultEl.appendChild(kvDiv);
+  // ── Side detail panel (created on demand) ──
+  const detailPanel = document.createElement('div');
+  detailPanel.id = 'job-detail';
+  detailPanel.className = 'assets-side';
+  detailPanel.style.display = 'none';
+  layout.appendChild(detailPanel);
 
-      if (job.error) {
-        const errEl = document.createElement('div');
-        errEl.className = 'msg msg-error mt8';
-        errEl.textContent = job.error;
-        resultEl.appendChild(errEl);
-      }
-
-      const pre = document.createElement('pre');
-      pre.className = 'code-block mt12';
-      pre.textContent = JSON.stringify(job, null, 2);
-      resultEl.appendChild(pre);
-    } catch (err) {
-      loader.remove();
-      showMsg(resultEl, 'Error: ' + err.message, 'error');
+  header.querySelector('#jobs-refresh').addEventListener('click', function() {
+    loadJobs(detailPanel);
+  });
+  pagination.querySelector('#jobs-prev').addEventListener('click', function() {
+    if (jobsState.offset >= JOBS_PAGE_SIZE) {
+      jobsState.offset -= JOBS_PAGE_SIZE;
+      loadJobs(detailPanel);
+    }
+  });
+  pagination.querySelector('#jobs-next').addEventListener('click', function() {
+    if (jobsState.offset + JOBS_PAGE_SIZE < jobsState.total) {
+      jobsState.offset += JOBS_PAGE_SIZE;
+      loadJobs(detailPanel);
     }
   });
 
-  // Admin status
+  // ── Background service status (watch folder) — compact footer in the main column ──
   const statusSection = document.createElement('div');
-  statusSection.className = 'section';
-  const sTitle = document.createElement('div');
-  sTitle.className = 'section-title';
-  sTitle.textContent = 'Background service status';
-  statusSection.appendChild(sTitle);
+  statusSection.style.cssText = 'padding:8px 12px;border-top:1px solid var(--border,#333);font-size:13px;';
   const adminWrap = document.createElement('div');
   const adminLoader = loadingEl();
   adminWrap.appendChild(adminLoader);
   statusSection.appendChild(adminWrap);
-  container.appendChild(statusSection);
+  main.appendChild(statusSection);
 
   async function refreshWatchFolderStatus() {
     try {
@@ -956,8 +889,228 @@ async function renderJobsTab(container) {
       showMsg(adminWrap, 'Failed: ' + err.message, 'error');
     }
   }
+  refreshWatchFolderStatus();
 
-  await refreshWatchFolderStatus();
+  await loadJobs(detailPanel);
+
+  // Auto-refresh the table (only the table, not the whole tab) every 5s.
+  if (jobsPollTimer) clearInterval(jobsPollTimer);
+  jobsPollTimer = setInterval(function() {
+    if (document.getElementById('jobs-table-wrap')) {
+      loadJobs(detailPanel, true);
+    } else {
+      clearInterval(jobsPollTimer);
+      jobsPollTimer = null;
+    }
+  }, 5000);
+}
+
+async function loadJobs(detailPanel, silent) {
+  const wrap = document.getElementById('jobs-table-wrap');
+  const pagination = document.getElementById('jobs-pagination');
+  if (!wrap) return;
+  let loader = null;
+  if (!silent) {
+    wrap.innerHTML = '';
+    loader = loadingEl();
+    wrap.appendChild(loader);
+  }
+
+  let jobs = [];
+  try {
+    const qs = 'limit=' + JOBS_PAGE_SIZE + '&offset=' + jobsState.offset;
+    const res = await apiFetch('/jobs?' + qs);
+    jobs = (res && res.items) || [];
+    jobsState.total = (res && typeof res.total === 'number') ? res.total : jobs.length;
+  } catch (err) {
+    if (silent) return;
+    wrap.innerHTML = '';
+    showMsg(wrap, 'Failed to load jobs: ' + err.message, 'error');
+    if (pagination) pagination.style.display = 'none';
+    return;
+  }
+  if (loader) loader.remove();
+  wrap.innerHTML = '';
+
+  if (jobs.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = jobsState.offset > 0 ? 'No more jobs.' : 'No jobs yet.';
+    wrap.appendChild(empty);
+    if (pagination) pagination.style.display = 'none';
+    return;
+  }
+
+  const rows = jobs.map(function(j) {
+    const selected = j.id === jobsState.selectedId ? ' class="row-selected"' : '';
+    return '<tr data-id="' + escHtml(j.id) + '"' + selected + '>' +
+      '<td class="cell-id">' + escHtml(j.id) + '</td>' +
+      '<td>' + escHtml(j.type) + '</td>' +
+      '<td>' + renderBadge(j.status) + '</td>' +
+      '<td class="cell-id">' + escHtml(j.assetId || '—') + '</td>' +
+      '<td>' + (j.progress != null ? escHtml(j.progress + '%') : '—') + '</td>' +
+      '<td>' + escHtml(fmtDate(j.createdAt)) + '</td>' +
+      '<td>' +
+        ((j.status === 'running' || j.status === 'pending')
+          ? '<button class="btn-danger job-cancel-btn" data-id="' + escHtml(j.id) + '" style="font-size:12px;padding:3px 8px;">Cancel</button>'
+          : '') +
+      '</td>' +
+      '</tr>';
+  }).join('');
+
+  const table = document.createElement('table');
+  table.innerHTML = '<thead><tr>' +
+    '<th>ID</th><th>Type</th><th>Status</th><th>Asset ID</th><th>Progress</th><th>Created</th><th></th>' +
+    '</tr></thead><tbody>' + rows + '</tbody>';
+  wrap.appendChild(table);
+
+  table.querySelectorAll('tbody tr').forEach(function(tr) {
+    tr.addEventListener('click', function() {
+      table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
+      tr.classList.add('row-selected');
+      jobsState.selectedId = tr.dataset.id;
+      showJobDetail(tr.dataset.id, detailPanel);
+    });
+  });
+
+  table.querySelectorAll('.job-cancel-btn').forEach(function(btn) {
+    btn.addEventListener('click', async function(e) {
+      e.stopPropagation();
+      btn.disabled = true;
+      try {
+        await apiFetch('/jobs/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
+        await loadJobs(detailPanel);
+        if (jobsState.selectedId === btn.dataset.id) showJobDetail(btn.dataset.id, detailPanel);
+      } catch (err) {
+        btn.disabled = false;
+        alert('Error: ' + err.message);
+      }
+    });
+  });
+
+  if (pagination) {
+    const totalPages = Math.max(1, Math.ceil(jobsState.total / JOBS_PAGE_SIZE));
+    const currentPage = Math.floor(jobsState.offset / JOBS_PAGE_SIZE) + 1;
+    pagination.style.display = 'flex';
+    pagination.querySelector('#jobs-page-indicator').textContent =
+      'Page ' + currentPage + ' of ' + totalPages + ' (' + jobsState.total + ' total)';
+    pagination.querySelector('#jobs-prev').disabled = jobsState.offset === 0;
+    pagination.querySelector('#jobs-next').disabled =
+      jobsState.offset + JOBS_PAGE_SIZE >= jobsState.total;
+  }
+}
+
+async function showJobDetail(id, detailPanel) {
+  detailPanel.style.display = 'flex';
+  detailPanel.innerHTML = [
+    '<div class="detail-panel-header">',
+    '  <h3>Job Detail</h3>',
+    '  <button id="close-job-detail" class="side-close-btn" aria-label="Close">×</button>',
+    '</div>',
+    '<div class="detail-panel-body" id="job-detail-body"></div>',
+  ].join('');
+
+  detailPanel.querySelector('#close-job-detail').addEventListener('click', function() {
+    detailPanel.style.display = 'none';
+    detailPanel.innerHTML = '';
+    jobsState.selectedId = null;
+    var table = document.querySelector('#jobs-table-wrap table');
+    if (table) table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
+  });
+
+  const body = detailPanel.querySelector('#job-detail-body');
+  const loader = loadingEl();
+  body.appendChild(loader);
+
+  try {
+    const job = await apiFetch('/jobs/' + encodeURIComponent(id));
+    loader.remove();
+
+    const kvRows = [
+      ['ID', '<span class="text-mono">' + escHtml(job.id) + '</span>'],
+      ['Type', escHtml(job.type || '—')],
+      ['Status', renderBadge(job.status)],
+    ];
+    if (job.assetId) {
+      kvRows.push(['Asset ID',
+        '<a href="#" class="job-asset-link text-mono" data-asset-id="' + escHtml(job.assetId) + '" style="color:var(--accent)">' + escHtml(job.assetId) + '</a>']);
+    } else {
+      kvRows.push(['Asset ID', '<span class="text-mono">—</span>']);
+    }
+    if (job.profile) kvRows.push(['Profile', escHtml(job.profile)]);
+    if (job.progress != null) kvRows.push(['Progress', escHtml(job.progress + '%')]);
+    kvRows.push(['Created', escHtml(fmtDate(job.createdAt))]);
+    kvRows.push(['Updated', escHtml(fmtDate(job.updatedAt))]);
+    if (job.error) {
+      kvRows.push(['Error', '<span style="color:var(--error,#f87171)">' + escHtml(job.error) + '</span>']);
+    }
+
+    const kvDiv = document.createElement('div');
+    kvDiv.className = 'kv-grid';
+    kvDiv.innerHTML = kvRows.map(function(r) {
+      return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+    }).join('');
+    body.appendChild(kvDiv);
+
+    // Clicking the asset link jumps to the Assets tab and opens that asset.
+    const assetLink = body.querySelector('.job-asset-link');
+    if (assetLink) {
+      assetLink.addEventListener('click', function(e) {
+        e.preventDefault();
+        const assetId = assetLink.dataset.assetId;
+        switchTab('assets');
+        // After the assets tab loads, open the asset detail panel.
+        const panel = document.getElementById('asset-detail');
+        if (panel) showAssetDetail(assetId, panel);
+      });
+    }
+
+    // Transcode pipeline visualization. For transcode jobs, fetch the source
+    // asset to resolve the Package/Ready stages (renditions live on the asset).
+    if (job && job.type === 'transcode') {
+      let asset = null;
+      if (job.assetId) {
+        try {
+          asset = await apiFetch('/assets/' + encodeURIComponent(job.assetId));
+        } catch (_) { /* asset may be gone; pipeline degrades gracefully */ }
+      }
+      const pipelineTitle = document.createElement('div');
+      pipelineTitle.className = 'section-title mt12';
+      pipelineTitle.textContent = 'Transcode pipeline';
+      body.appendChild(pipelineTitle);
+      body.appendChild(renderPipeline(buildTranscodePipeline(job, asset)));
+    }
+
+    // Cancel button in the panel for running/pending jobs.
+    if (job.status === 'running' || job.status === 'pending') {
+      const actions = document.createElement('div');
+      actions.className = 'mt12';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'btn-danger';
+      cancelBtn.textContent = 'Cancel job';
+      cancelBtn.addEventListener('click', async function() {
+        cancelBtn.disabled = true;
+        try {
+          await apiFetch('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
+          showJobDetail(id, detailPanel);
+          await loadJobs(detailPanel);
+        } catch (err) {
+          cancelBtn.disabled = false;
+          alert('Error: ' + err.message);
+        }
+      });
+      actions.appendChild(cancelBtn);
+      body.appendChild(actions);
+    }
+
+    const pre = document.createElement('pre');
+    pre.className = 'code-block mt12';
+    pre.textContent = JSON.stringify(job, null, 2);
+    body.appendChild(pre);
+  } catch (err) {
+    body.innerHTML = '';
+    showMsg(body, 'Failed to load job: ' + err.message, 'error');
+  }
 }
 
 // ─── COLLECTIONS TAB ─────────────────────────────────────────────────────────
