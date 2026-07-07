@@ -23,6 +23,7 @@ export type WorkspaceEncoreScalerConfig = {
   maxInstances: number;
   idleTimeoutMs: number;
   tickIntervalMs?: number;
+  s3Config?: import('./types.js').EncoreS3Config;
 };
 
 export class WorkspaceEncoreScalerRegistry implements EncoreClient {
@@ -40,7 +41,8 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       idleTimeoutMs: this.config.idleTimeoutMs,
       oscContext: this.config.oscContext,
       redis: this.config.redis,
-      getToken: () => this.config.oscContext.getServiceAccessToken('encore')
+      getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
+      s3Config: this.config.s3Config
     };
 
     const loop = new EncoreScalerLoop(scalerConfig);

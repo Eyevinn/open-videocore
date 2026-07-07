@@ -315,12 +315,26 @@ let sharedRedis: IORedis | undefined;
 
 if (storageAvailable && process.env['REDIS_URL']) {
   sharedRedis = new IORedis(process.env['REDIS_URL'], { lazyConnect: true, maxRetriesPerRequest: null });
+  // ENCORE_S3_ENDPOINT et al. allow the operator to pass MinIO credentials to
+  // every Encore instance the scaler spawns. Without these Encore resolves
+  // s3:// URIs against AWS S3 and fails with 404.
+  const encoreS3Endpoint = process.env['ENCORE_S3_ENDPOINT'];
+  const encoreS3AccessKey = process.env['ENCORE_S3_ACCESS_KEY'] ?? process.env['MINIO_ACCESS_KEY'] ?? 'admin';
+  const encoreS3SecretKey = process.env['ENCORE_S3_SECRET_KEY'] ?? process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'];
   encore = new WorkspaceEncoreScalerRegistry({
     redis: sharedRedis,
     oscContext,
     maxInstances: encoreMaxInstances,
-    idleTimeoutMs: encoreIdleTimeoutMs
+    idleTimeoutMs: encoreIdleTimeoutMs,
+    s3Config: encoreS3Endpoint && encoreS3SecretKey ? {
+      endpoint: encoreS3Endpoint,
+      accessKeyId: encoreS3AccessKey,
+      secretAccessKey: encoreS3SecretKey
+    } : undefined
   });
+  if (!encoreS3Endpoint) {
+    app.log.warn('ENCORE_S3_ENDPOINT not set — Encore instances will not be able to read from MinIO; set ENCORE_S3_ENDPOINT to the MinIO URL');
+  }
 } else if (storageAvailable) {
   app.log.warn('REDIS_URL not set — Encore auto-scaler disabled, transcoding unavailable');
 }

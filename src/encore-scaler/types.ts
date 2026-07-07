@@ -18,6 +18,16 @@
 //     src/routes/provision.ts:343-355).
 //   - Encore REST payload shape: src/pipeline/encore-client.ts toEncorePayload().
 
+// S3/MinIO credentials passed to each Encore OSC instance at creation time so
+// Encore can read source files from the workspace's MinIO bucket. Without these
+// Encore resolves s3:// URIs against AWS S3 and gets a 404.
+export type EncoreS3Config = {
+  endpoint: string;     // full URL, e.g. https://oscaidev-jonas.minio-minio.auto.prod-se.osaas.io
+  accessKeyId: string;  // MinIO root user (always "admin" in OSC stacks)
+  secretAccessKey: string;
+  region?: string;      // S3 region string — MinIO ignores it but Encore requires a value
+};
+
 export type EncoreScalerConfig = {
   workspaceId: string;
   maxInstances: number;
@@ -32,6 +42,9 @@ export type EncoreScalerConfig = {
   // instance URLs returned by OSC require a bearer token exactly as the
   // existing makeHttpEncoreClient does (src/pipeline/encore-client.ts).
   getToken: () => Promise<string>;
+  // MinIO S3 credentials injected into every spawned Encore instance. Required
+  // for Encore to read source files from the workspace's MinIO bucket.
+  s3Config?: EncoreS3Config;
 };
 
 export type EncoreInstanceRecord = {

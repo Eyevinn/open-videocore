@@ -85,11 +85,18 @@ export async function spawnInstance(
   let instance: OscInstance | undefined;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      const instanceBody: Record<string, string> = { name };
+      if (config.s3Config) {
+        instanceBody['s3Endpoint'] = config.s3Config.endpoint;
+        instanceBody['s3AccessKeyId'] = config.s3Config.accessKeyId;
+        instanceBody['s3SecretAccessKey'] = config.s3Config.secretAccessKey;
+        instanceBody['s3Region'] = config.s3Config.region ?? 'us-east-1';
+      }
       instance = (await createInstance(
         config.oscContext,
         ENCORE_SERVICE_ID,
         sat,
-        { name }
+        instanceBody
       )) as OscInstance;
       break;
     } catch (err) {
