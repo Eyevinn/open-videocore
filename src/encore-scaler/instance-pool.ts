@@ -135,7 +135,7 @@ export async function spawnInstance(
     {
       name: instanceId,
       RedisUrl: config.redisUrl,
-      EncoreUrl: encoreUrl,
+      EncoreUrl: encoreUrl.replace(/\/+$/, ''),
       RedisQueue: 'packaging-queue'
     }
   )) as OscInstance;
