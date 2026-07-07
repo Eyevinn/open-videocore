@@ -456,9 +456,12 @@ if (sharedRedis) {
     jobRepository,
     assetRepository,
     pipelineRepository,
-    packaging,
     oscContext,
     queueKey: process.env['ENCORE_CALLBACK_QUEUE_KEY'],
+    // The eyevinn-encore-packager's input queue (#94). Defaults to
+    // "packaging-queue"; overridable so the poller can target a differently
+    // named packager queue without a code change.
+    packagingQueueKey: process.env['PACKAGING_QUEUE_KEY'],
     logger: app.log
   });
   app.addHook('onClose', async () => {

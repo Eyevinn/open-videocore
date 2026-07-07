@@ -33,7 +33,6 @@ import type { Context } from '@osaas/client-core';
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
-import type { PackagingService } from './packaging.js';
 import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -59,6 +58,27 @@ async function resolveUrlFromEncoreUuid(
 const DEFAULT_QUEUE_KEY = 'ovc:transcode-done';
 const BZPOPMIN_TIMEOUT_SECONDS = 5;
 
+// The eyevinn-encore-packager's INPUT queue (#94). After #93 moved our callback
+// listeners onto the dedicated "ovc:transcode-done" queue, "packaging-queue" is
+// free to be used exclusively as the packager's input queue. We push the
+// packaging job here (ZADD onto a Redis sorted set) and the packager consumes it
+// via BZPOPMIN — the OSC-native transcode->package handoff, replacing the former
+// in-process PackagingService.triggerPackaging HTTP call.
+//
+// CONTRACT (packager input message shape) — this is the SAME { jobId, url }
+// envelope the eyevinn-encore-callback-listener writes and this poller already
+// consumes (see the file header, line 8-10, and sweepCompletedJobs line 391-394,
+// "verified from eyevinn-encore-callback-listener source, 2026-07-07"). The
+// packager's redisListener reads that envelope from its queue via BZPOPMIN and
+// fetches the Encore job document from `url`. Encoded structurally in
+// src/pipeline/packaging.ts PackagingJob (osc-packager-queue.ts:9-16):
+//   { jobId: string, url: string }
+//   - jobId: our correlation id, echoed verbatim in the packager's
+//            /packagerCallback/success payload (we use the assetId so the
+//            callback resolves back to the asset — see src/routes/internal.ts).
+//   - url:   the Encore job API URL the packager fetches output details from.
+const DEFAULT_PACKAGING_QUEUE_KEY = 'packaging-queue';
+
 type Logger = {
   info(...a: any[]): void;
   warn(...a: any[]): void;
@@ -70,11 +90,44 @@ type PollerDeps = {
   jobRepository: JobRepository;
   assetRepository: AssetRepository;
   pipelineRepository?: PipelineRepository;
-  packaging?: PackagingService;
   oscContext: Context;
   queueKey?: string;
+  // The eyevinn-encore-packager's input queue key (#94). Defaults to
+  // "packaging-queue". Overridable so a deployment can point at a differently
+  // named packager queue without a code change.
+  packagingQueueKey?: string;
   logger: Logger;
 };
+
+// Push a packaging job onto the packager's input queue (#94). We ZADD the
+// { jobId, url } envelope onto the sorted set (score = Date.now() for FIFO), the
+// same producer operation the callback-listener uses; the packager consumes it
+// via BZPOPMIN. jobId = assetId so the packager's success callback resolves back
+// to the asset. Best-effort: a queue failure records packagingError on the asset
+// (mirroring the former PackagingService.triggerPackaging behaviour) and never
+// throws into the caller so pipeline advancement is not blocked.
+async function enqueuePackagingJob(
+  deps: PollerDeps,
+  assetId: string,
+  encoreJobUrl: string
+): Promise<void> {
+  const queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
+  const message = JSON.stringify({ jobId: assetId, url: encoreJobUrl });
+  try {
+    await deps.redis.zadd(queueKey, Date.now(), message);
+    deps.logger.info({ msg: 'encore-callback-poller: enqueued packaging job', queueKey, assetId, url: encoreJobUrl });
+  } catch (err) {
+    const emsg = err instanceof Error ? err.message : String(err);
+    deps.logger.error({ msg: 'encore-callback-poller: failed to enqueue packaging job', queueKey, assetId, err });
+    try {
+      await deps.assetRepository.update(assetId, {
+        packagingError: `failed to enqueue packaging job: ${emsg}`
+      });
+    } catch {
+      // Detached safety: nothing more we can do if the error write also fails.
+    }
+  }
+}
 
 // A produced Encore output entry (subset — matches the internal route schema).
 type EncoreOutput = {
@@ -284,12 +337,18 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       } else {
         steps[tIdx] = { ...steps[tIdx], status: 'done', completedAt: now };
         const nextIdx = steps.findIndex((s) => s.status === 'pending');
-        if (nextIdx >= 0 && steps[nextIdx].name === 'package' && deps.packaging) {
+        if (nextIdx >= 0 && steps[nextIdx].name === 'package') {
           const encoreJobUrl = await resolveEncoreJobUrl(externalId, deps.redis);
           if (encoreJobUrl) {
             steps[nextIdx] = { ...steps[nextIdx], status: 'running', startedAt: now };
             await deps.pipelineRepository.update(execution.id, { steps, status: 'running' });
-            void deps.packaging.triggerPackaging(found.job.assetId, encoreJobUrl);
+            // OSC-native handoff (#94): push the packaging job onto the
+            // eyevinn-encore-packager's input queue ("packaging-queue") instead
+            // of calling PackagingService.triggerPackaging in-process. The
+            // packager consumes it, performs ABR (HLS/DASH) packaging, writes to
+            // S3, and POSTs /api/v1/internal/packagerCallback/success — which
+            // advances this execution's `package` step to `done`.
+            await enqueuePackagingJob(deps, found.job.assetId, encoreJobUrl);
           } else {
             steps[nextIdx] = {
               ...steps[nextIdx],
