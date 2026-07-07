@@ -254,6 +254,53 @@ function showMsg(container, text, type) {
   setTimeout(function() { el.remove(); }, 6000);
 }
 
+// ─── Modal dialog helper ───────────────────────────────────────────────────────
+// Opens a centered modal with a backdrop. `title` is a plain string (set via
+// textContent). `buildBody(bodyEl, close)` populates the body. Returns a close fn.
+function openModal(title, buildBody) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+
+  const dialog = document.createElement('div');
+  dialog.className = 'modal-dialog';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+
+  const header = document.createElement('div');
+  header.className = 'modal-header';
+  const h = document.createElement('h3');
+  h.textContent = title;
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'modal-close-btn';
+  closeBtn.setAttribute('aria-label', 'Close');
+  closeBtn.textContent = '×';
+  header.appendChild(h);
+  header.appendChild(closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'modal-body';
+
+  dialog.appendChild(header);
+  dialog.appendChild(body);
+  backdrop.appendChild(dialog);
+
+  function close() {
+    document.removeEventListener('keydown', onKey);
+    backdrop.remove();
+  }
+  function onKey(e) { if (e.key === 'Escape') close(); }
+
+  closeBtn.addEventListener('click', close);
+  backdrop.addEventListener('click', function(e) {
+    if (e.target === backdrop) close();
+  });
+  document.addEventListener('keydown', onKey);
+
+  buildBody(body, close);
+  document.body.appendChild(backdrop);
+  return close;
+}
+
 function loadingEl() {
   const el = document.createElement('div');
   el.className = 'loading';
@@ -275,6 +322,7 @@ function switchTab(name) {
   });
   const content = document.getElementById('content');
   content.innerHTML = '';
+  content.classList.toggle('content-fullbleed', name === 'assets');
   TAB_RENDERERS[name](content);
 }
 
@@ -286,159 +334,190 @@ function setupTabs() {
 
 // ─── ASSETS TAB ──────────────────────────────────────────────────────────────
 
+// Assets tab pagination state.
+const ASSETS_PAGE_SIZE = 20;
+const assetsState = { offset: 0, total: 0 };
+
 async function renderAssetsTab(container) {
-  const title = document.createElement('h2');
-  title.className = 'panel-title';
-  title.textContent = 'Assets';
-  container.appendChild(title);
+  assetsState.offset = 0;
 
-  // Ingest URL section
-  const ingestSection = document.createElement('div');
-  ingestSection.className = 'section';
-  // Only static HTML here — no user data
-  ingestSection.innerHTML = [
-    '<div class="section-title">Ingest from URL</div>',
-    '<div class="form-row">',
-    '  <div class="form-field grow">',
-    '    <label for="ingest-url">Source URL</label>',
-    '    <input type="url" id="ingest-url" placeholder="https://example.com/video.mp4" />',
-    '  </div>',
-    '  <div class="form-field">',
-    '    <label for="ingest-title">Title (optional)</label>',
-    '    <input type="text" id="ingest-title" placeholder="My asset" />',
-    '  </div>',
-    '  <button id="ingest-btn">Ingest</button>',
+  // Layout: full-height table on the left, detail side panel on the right (hidden initially).
+  const layout = document.createElement('div');
+  layout.className = 'assets-layout';
+  container.appendChild(layout);
+
+  // ── Main (table) column ──
+  const main = document.createElement('div');
+  main.className = 'assets-main';
+  layout.appendChild(main);
+
+  const header = document.createElement('div');
+  header.className = 'assets-main-header';
+  header.innerHTML = [
+    '<span class="section-title">Assets</span>',
+    '<div class="flex-gap">',
+    '  <button id="btn-open-upload" class="header-btn">Upload File</button>',
+    '  <button id="btn-open-ingest" class="header-btn">Ingest URL</button>',
+    '  <button id="assets-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
     '</div>',
-    '<div id="ingest-msg"></div>',
   ].join('');
-  container.appendChild(ingestSection);
+  main.appendChild(header);
 
-  // Upload file section
-  const uploadSection = document.createElement('div');
-  uploadSection.className = 'section';
-  const uploadTitle = document.createElement('div');
-  uploadTitle.className = 'section-title';
-  uploadTitle.textContent = 'Upload file';
-  uploadSection.appendChild(uploadTitle);
-  const uploadForm = document.createElement('div');
-  uploadForm.className = 'form-row';
-  const fileField = document.createElement('div');
-  fileField.className = 'form-field grow';
-  const fileLabel = document.createElement('label');
-  fileLabel.htmlFor = 'upload-file';
-  fileLabel.textContent = 'File';
-  const fileInput = document.createElement('input');
-  fileInput.type = 'file';
-  fileInput.id = 'upload-file';
-  fileInput.accept = 'video/*,audio/*';
-  fileField.appendChild(fileLabel);
-  fileField.appendChild(fileInput);
-  const uploadBtn = document.createElement('button');
-  uploadBtn.id = 'upload-btn';
-  uploadBtn.textContent = 'Upload';
-  uploadForm.appendChild(fileField);
-  uploadForm.appendChild(uploadBtn);
-  uploadSection.appendChild(uploadForm);
-  const uploadProgress = document.createElement('div');
-  uploadSection.appendChild(uploadProgress);
-  container.appendChild(uploadSection);
+  const tableScroll = document.createElement('div');
+  tableScroll.className = 'assets-table-scroll';
+  tableScroll.id = 'assets-table-wrap';
+  main.appendChild(tableScroll);
 
-  uploadBtn.addEventListener('click', async function() {
-    const file = fileInput.files && fileInput.files[0];
-    uploadProgress.textContent = '';
-    if (!file) { showMsg(uploadProgress, 'Select a file first.', 'error'); return; }
-    uploadBtn.disabled = true;
-    uploadBtn.textContent = 'Uploading…';
-    try {
-      // 1. Create the asset record.
-      const asset = await apiFetch('/assets', {
-        method: 'POST',
-        body: JSON.stringify({ name: file.name })
-      });
-      const assetId = asset.id;
-      showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
-
-      // 2. Stream the file through the API (avoids CORS on MinIO presigned URLs).
-      const uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
-        method: 'PUT',
-        body: file,
-        headers: {
-          'Content-Type': file.type || 'application/octet-stream',
-          'Content-Length': String(file.size),
-          'X-Stack-Name': getActiveStack()
-        }
-      });
-      if (!uploadRes.ok) {
-        const err = await uploadRes.json().catch(() => ({}));
-        throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
-      }
-
-      showMsg(uploadProgress, 'Upload complete — asset "' + file.name + '" is processing.', 'success');
-      fileInput.value = '';
-      await loadAssets(listSection, detailPanel);
-    } catch (err) {
-      showMsg(uploadProgress, 'Error: ' + err.message, 'error');
-    } finally {
-      uploadBtn.disabled = false;
-      uploadBtn.textContent = 'Upload';
-    }
-  });
-
-  // Asset list section
-  const listSection = document.createElement('div');
-  listSection.className = 'section';
-  listSection.innerHTML = [
-    '<div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">',
-    '  <span>Asset list</span>',
-    '  <button id="assets-refresh" class="btn-ghost" style="font-size:12px;padding:4px 10px;">Refresh</button>',
-    '</div>',
-    '<div id="assets-table-wrap"></div>',
+  const pagination = document.createElement('div');
+  pagination.className = 'pagination';
+  pagination.id = 'assets-pagination';
+  pagination.style.display = 'none';
+  pagination.innerHTML = [
+    '<span class="page-indicator" id="assets-page-indicator"></span>',
+    '<button id="assets-prev" class="btn-ghost">Previous</button>',
+    '<button id="assets-next" class="btn-ghost">Next</button>',
   ].join('');
-  container.appendChild(listSection);
+  main.appendChild(pagination);
 
-  // Detail panel placeholder
+  // ── Side detail panel (created on demand) ──
   const detailPanel = document.createElement('div');
   detailPanel.id = 'asset-detail';
+  detailPanel.className = 'assets-side';
   detailPanel.style.display = 'none';
-  container.appendChild(detailPanel);
+  layout.appendChild(detailPanel);
 
-  ingestSection.querySelector('#ingest-btn').addEventListener('click', async function() {
-    const url = ingestSection.querySelector('#ingest-url').value.trim();
-    const titleVal = ingestSection.querySelector('#ingest-title').value.trim();
-    const msgEl = ingestSection.querySelector('#ingest-msg');
-    msgEl.innerHTML = '';
-    if (!url) { showMsg(msgEl, 'Source URL is required.', 'error'); return; }
-    try {
-      const body = { sourceUrl: url };
-      if (titleVal) body.title = titleVal;
-      const result = await apiFetch('/assets/ingest-url', { method: 'POST', body: JSON.stringify(body) });
-      showMsg(msgEl, 'Ingest job started. Job ID: ' + (result && (result.jobId || result.id) ? (result.jobId || result.id) : JSON.stringify(result)), 'success');
-      await loadAssets(listSection, detailPanel);
-    } catch (err) {
-      showMsg(msgEl, 'Error: ' + err.message, 'error');
+  // ── Upload modal ──
+  header.querySelector('#btn-open-upload').addEventListener('click', function() {
+    openModal('Upload File', function(body, close) {
+      body.innerHTML = [
+        '<div class="form-field grow">',
+        '  <label for="upload-file">File</label>',
+        '  <input type="file" id="upload-file" accept="video/*,audio/*" />',
+        '</div>',
+        '<div class="flex-gap mt12">',
+        '  <button id="upload-btn">Upload</button>',
+        '</div>',
+        '<div id="upload-msg"></div>',
+      ].join('');
+      const fileInput = body.querySelector('#upload-file');
+      const uploadBtn = body.querySelector('#upload-btn');
+      const uploadProgress = body.querySelector('#upload-msg');
+      uploadBtn.addEventListener('click', async function() {
+        const file = fileInput.files && fileInput.files[0];
+        uploadProgress.textContent = '';
+        if (!file) { showMsg(uploadProgress, 'Select a file first.', 'error'); return; }
+        uploadBtn.disabled = true;
+        uploadBtn.textContent = 'Uploading…';
+        try {
+          const asset = await apiFetch('/assets', {
+            method: 'POST',
+            body: JSON.stringify({ name: file.name })
+          });
+          const assetId = asset.id;
+          showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
+          // Stream the file through the API (avoids CORS on MinIO presigned URLs).
+          const uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
+            method: 'PUT',
+            body: file,
+            headers: {
+              'Content-Type': file.type || 'application/octet-stream',
+              'Content-Length': String(file.size),
+              'X-Stack-Name': getActiveStack()
+            }
+          });
+          if (!uploadRes.ok) {
+            const err = await uploadRes.json().catch(() => ({}));
+            throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
+          }
+          close();
+          await loadAssets(detailPanel);
+        } catch (err) {
+          showMsg(uploadProgress, 'Error: ' + err.message, 'error');
+          uploadBtn.disabled = false;
+          uploadBtn.textContent = 'Upload';
+        }
+      });
+    });
+  });
+
+  // ── Ingest modal ──
+  header.querySelector('#btn-open-ingest').addEventListener('click', function() {
+    openModal('Ingest from URL', function(body, close) {
+      body.innerHTML = [
+        '<div class="form-field grow">',
+        '  <label for="ingest-url">Source URL</label>',
+        '  <input type="url" id="ingest-url" placeholder="https://example.com/video.mp4" />',
+        '</div>',
+        '<div class="form-field grow mt8">',
+        '  <label for="ingest-title">Title (optional)</label>',
+        '  <input type="text" id="ingest-title" placeholder="My asset" />',
+        '</div>',
+        '<div class="flex-gap mt12">',
+        '  <button id="ingest-btn">Ingest</button>',
+        '</div>',
+        '<div id="ingest-msg"></div>',
+      ].join('');
+      body.querySelector('#ingest-btn').addEventListener('click', async function() {
+        const url = body.querySelector('#ingest-url').value.trim();
+        const titleVal = body.querySelector('#ingest-title').value.trim();
+        const msgEl = body.querySelector('#ingest-msg');
+        msgEl.innerHTML = '';
+        if (!url) { showMsg(msgEl, 'Source URL is required.', 'error'); return; }
+        try {
+          const reqBody = { sourceUrl: url };
+          if (titleVal) reqBody.title = titleVal;
+          await apiFetch('/assets/ingest-url', { method: 'POST', body: JSON.stringify(reqBody) });
+          close();
+          await loadAssets(detailPanel);
+        } catch (err) {
+          showMsg(msgEl, 'Error: ' + err.message, 'error');
+        }
+      });
+    });
+  });
+
+  header.querySelector('#assets-refresh').addEventListener('click', function() {
+    loadAssets(detailPanel);
+  });
+  pagination.querySelector('#assets-prev').addEventListener('click', function() {
+    if (assetsState.offset >= ASSETS_PAGE_SIZE) {
+      assetsState.offset -= ASSETS_PAGE_SIZE;
+      loadAssets(detailPanel);
+    }
+  });
+  pagination.querySelector('#assets-next').addEventListener('click', function() {
+    if (assetsState.offset + ASSETS_PAGE_SIZE < assetsState.total) {
+      assetsState.offset += ASSETS_PAGE_SIZE;
+      loadAssets(detailPanel);
     }
   });
 
-  listSection.querySelector('#assets-refresh').addEventListener('click', function() {
-    loadAssets(listSection, detailPanel);
-  });
-
-  await loadAssets(listSection, detailPanel);
+  await loadAssets(detailPanel);
 }
 
-async function loadAssets(listSection, detailPanel) {
-  const wrap = listSection.querySelector('#assets-table-wrap');
+async function loadAssets(detailPanel) {
+  const wrap = document.getElementById('assets-table-wrap');
+  const pagination = document.getElementById('assets-pagination');
+  if (!wrap) return;
   wrap.innerHTML = '';
   const loader = loadingEl();
   wrap.appendChild(loader);
 
   let assets = [];
   try {
-    const res = await apiFetch('/assets');
-    assets = Array.isArray(res) ? res : (res && (res.items || res.assets) ? (res.items || res.assets) : []);
+    const qs = 'limit=' + ASSETS_PAGE_SIZE + '&offset=' + assetsState.offset;
+    const res = await apiFetch('/assets?' + qs);
+    if (Array.isArray(res)) {
+      assets = res;
+      assetsState.total = res.length;
+    } else {
+      assets = (res && (res.items || res.assets)) || [];
+      assetsState.total = (res && typeof res.total === 'number') ? res.total : assets.length;
+    }
   } catch (err) {
     wrap.innerHTML = '';
     showMsg(wrap, 'Failed to load assets: ' + err.message, 'error');
+    if (pagination) pagination.style.display = 'none';
     return;
   }
   loader.remove();
@@ -446,13 +525,11 @@ async function loadAssets(listSection, detailPanel) {
   if (assets.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = 'No assets found.';
+    empty.textContent = assetsState.offset > 0 ? 'No more assets.' : 'No assets found.';
     wrap.appendChild(empty);
+    if (pagination) pagination.style.display = 'none';
     return;
   }
-
-  const tableWrap = document.createElement('div');
-  tableWrap.className = 'table-wrap';
 
   // Build table using escaped values
   const rows = assets.map(function(a) {
@@ -467,47 +544,58 @@ async function loadAssets(listSection, detailPanel) {
       '<td>' + renderTags(a.tags) + '</td>' +
       '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
       '<td>' +
-        '<button class="btn-ghost asset-detail-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Detail</button>' +
-        '<button class="btn-danger asset-delete-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Archive</button>' +
+        '<button class="btn-danger asset-delete-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Archive</button>' +
       '</td>' +
       '</tr>';
   }).join('');
 
-  tableWrap.innerHTML = '<table>' +
-    '<thead><tr><th></th><th>ID</th><th>Name / Title</th><th>Status</th><th>Tags</th><th>Created</th><th>Actions</th></tr></thead>' +
-    '<tbody>' + rows + '</tbody>' +
-    '</table>';
-  wrap.appendChild(tableWrap);
+  const table = document.createElement('table');
+  table.innerHTML = '<thead><tr><th></th><th>ID</th><th>Name / Title</th><th>Status</th><th>Tags</th><th>Created</th><th>Actions</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody>';
+  wrap.appendChild(table);
 
-  tableWrap.querySelectorAll('.asset-detail-btn').forEach(function(btn) {
-    btn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      showAssetDetail(btn.dataset.id, detailPanel);
+  // Row click opens the side detail panel; the row highlights.
+  table.querySelectorAll('tbody tr').forEach(function(tr) {
+    tr.addEventListener('click', function() {
+      table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
+      tr.classList.add('row-selected');
+      showAssetDetail(tr.dataset.id, detailPanel);
     });
   });
 
-  tableWrap.querySelectorAll('.asset-delete-btn').forEach(function(btn) {
+  table.querySelectorAll('.asset-delete-btn').forEach(function(btn) {
     btn.addEventListener('click', async function(e) {
       e.stopPropagation();
       if (!confirm('Archive asset ' + btn.dataset.id + '?')) return;
       try {
         await apiFetch('/assets/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
-        await loadAssets(listSection, detailPanel);
+        await loadAssets(detailPanel);
       } catch (err) {
         alert('Error: ' + err.message);
       }
     });
   });
+
+  // Pagination controls
+  if (pagination) {
+    const totalPages = Math.max(1, Math.ceil(assetsState.total / ASSETS_PAGE_SIZE));
+    const currentPage = Math.floor(assetsState.offset / ASSETS_PAGE_SIZE) + 1;
+    pagination.style.display = 'flex';
+    pagination.querySelector('#assets-page-indicator').textContent =
+      'Page ' + currentPage + ' of ' + totalPages + ' (' + assetsState.total + ' assets)';
+    pagination.querySelector('#assets-prev').disabled = assetsState.offset === 0;
+    pagination.querySelector('#assets-next').disabled =
+      assetsState.offset + ASSETS_PAGE_SIZE >= assetsState.total;
+  }
 }
 
 async function showAssetDetail(id, detailPanel) {
-  detailPanel.style.display = 'block';
-  detailPanel.className = 'detail-panel';
+  detailPanel.style.display = 'flex';
   // Static structural HTML only
   detailPanel.innerHTML = [
     '<div class="detail-panel-header">',
     '  <h3>Asset Detail</h3>',
-    '  <button id="close-detail" class="btn-ghost" style="font-size:12px;padding:3px 8px;">Close</button>',
+    '  <button id="close-detail" class="side-close-btn" aria-label="Close">×</button>',
     '</div>',
     '<div class="detail-panel-body" id="detail-body"></div>',
   ].join('');
@@ -515,6 +603,8 @@ async function showAssetDetail(id, detailPanel) {
   detailPanel.querySelector('#close-detail').addEventListener('click', function() {
     detailPanel.style.display = 'none';
     detailPanel.innerHTML = '';
+    var table = document.querySelector('#assets-table-wrap table');
+    if (table) table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
   });
 
   const body = detailPanel.querySelector('#detail-body');

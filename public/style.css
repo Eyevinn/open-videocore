@@ -130,11 +130,30 @@ header {
 main {
   flex: 1;
   padding: 24px 20px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 #content {
   max-width: 1200px;
   margin: 0 auto;
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* When the assets tab is active, let content fill the viewport width/height */
+#content.content-fullbleed {
+  max-width: none;
+}
+
+/* Header action buttons */
+.header-btn {
+  font-size: 13px;
+  padding: 6px 12px;
 }
 
 /* Tab panels */
@@ -676,6 +695,198 @@ pre.code-block {
 @media (max-width: 640px) {
   .pipeline-node { width: 100%; }
   .pipeline-arrow { transform: rotate(90deg); align-self: center; }
+}
+
+/* ─── Assets workspace: full-height table + side panel ──────────────────────── */
+
+.assets-layout {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 16px;
+  align-items: stretch;
+}
+
+.assets-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.assets-main-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.assets-main-header .section-title {
+  margin-bottom: 0;
+}
+
+.assets-table-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.assets-table-scroll table {
+  border-collapse: collapse;
+}
+
+.assets-table-scroll thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 1;
+}
+
+.assets-table-scroll tbody tr.row-selected {
+  background: rgba(99, 102, 241, 0.14);
+}
+
+/* Pagination bar */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.2);
+  font-size: 13px;
+}
+
+.pagination .page-indicator {
+  color: var(--text-muted);
+}
+
+.pagination button {
+  font-size: 12px;
+  padding: 5px 12px;
+}
+
+/* Side detail panel (coexists with the table) */
+.assets-side {
+  flex: 0 0 38%;
+  max-width: 38%;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  animation: side-slide-in 0.18s ease-out;
+}
+
+@keyframes side-slide-in {
+  from { transform: translateX(16px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .assets-side { animation: none; }
+}
+
+.assets-side .detail-panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.side-close-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.side-close-btn:hover {
+  background: none;
+  color: var(--text);
+}
+
+@media (max-width: 900px) {
+  .assets-layout { flex-direction: column; }
+  .assets-side { flex-basis: auto; max-width: none; min-height: 300px; }
+}
+
+/* ─── Modal dialogs ─────────────────────────────────────────────────────────── */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 20px;
+  animation: modal-fade 0.15s ease-out;
+}
+
+@keyframes modal-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop { animation: none; }
+}
+
+.modal-dialog {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 100%;
+  max-width: 560px;
+  max-height: 90vh;
+  overflow: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h3 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.modal-close-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.modal-close-btn:hover {
+  background: none;
+  color: var(--text);
+}
+
+.modal-body {
+  padding: 18px;
 }
 
 /* Utility */
