@@ -799,21 +799,43 @@ async function showAssetDetail(id, detailPanel) {
     ].join('');
     body.appendChild(actionsDiv);
 
-    runDiv.querySelector('#btn-run-pipeline').addEventListener('click', async function() {
+    var runBtn = runDiv.querySelector('#btn-run-pipeline');
+    runBtn.addEventListener('click', async function() {
       actionMsg.innerHTML = '';
       var pipeline = pipelineSel.value;
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipeline) !== -1;
       var body2 = { pipeline: pipeline };
       if (hasTranscode) body2.profile = profileSel.value;
+
+      // Loading state: disable the button (and selects) and show progress so the
+      // user gets immediate feedback that the dispatch is in flight.
+      var prevLabel = runBtn.textContent;
+      runBtn.disabled = true;
+      pipelineSel.disabled = true;
+      profileSel.disabled = true;
+      runBtn.textContent = 'Running…';
+      showMsg(actionMsg, 'Queuing pipeline…', 'info');
+
       try {
         var exec = await apiFetch('/assets/' + encodeURIComponent(id) + '/execute', {
           method: 'POST',
           body: JSON.stringify(body2)
         });
-        showMsg(actionMsg, 'Pipeline "' + escHtml(exec.pipelineName) + '" started (execution ' + escHtml(exec.id) + ').', 'success');
+        actionMsg.innerHTML = '';
+        // showMsg inserts via textContent, so pass the raw server strings (no escHtml).
+        showMsg(actionMsg, 'Pipeline "' + exec.pipelineName + '" queued (execution ' + exec.id + ').', 'success');
+        // Refresh the executions/status area so the queued job appears immediately.
         await renderExecutions(id, execDiv);
       } catch (err) {
+        actionMsg.innerHTML = '';
+        // err.message carries the API error detail (apiFetch extracts body.error/message).
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      } finally {
+        runBtn.disabled = false;
+        pipelineSel.disabled = false;
+        profileSel.disabled = false;
+        runBtn.textContent = prevLabel;
+        updateProfileVisibility();
       }
     });
 
