@@ -2,8 +2,10 @@
 //
 // The system uses eyevinn-encore-callback-listener as a cloud intermediary:
 // Encore POSTs its completion webhook there, and the listener writes a message
-// to a Redis sorted set (ZADD, score = Date.now()) on the queue key (default
-// "packaging-queue"). The message is:
+// to a Redis sorted set (ZADD, score = Date.now()) on the queue key. Our
+// scaler-paired listeners are configured with the dedicated queue
+// "ovc:transcode-done" (see DEFAULT_QUEUE_KEY below and instance-pool.ts). The
+// message is:
 //   { jobId: "<encore-internal-uuid>", url: "<encoreInstanceUrl>/encoreJobs/<uuid>" }
 //   (verified from eyevinn-encore-callback-listener source, 2026-07-07)
 //
@@ -49,7 +51,12 @@ async function resolveUrlFromEncoreUuid(
   return resolveEncoreJobUrl(externalId, redis);
 }
 
-const DEFAULT_QUEUE_KEY = 'packaging-queue';
+// Dedicated queue for our scaler-paired callback listeners. MUST match the
+// RedisQueue passed to the callback listener in
+// src/encore-scaler/instance-pool.ts spawnInstance(). Using a dedicated key
+// (not the shared "packaging-queue") stops an external eyevinn-encore-packager
+// from winning the BZPOPMIN race and consuming our completion messages (#93).
+const DEFAULT_QUEUE_KEY = 'ovc:transcode-done';
 const BZPOPMIN_TIMEOUT_SECONDS = 5;
 
 type Logger = {

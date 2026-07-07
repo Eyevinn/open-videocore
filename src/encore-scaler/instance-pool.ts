@@ -130,7 +130,11 @@ export async function spawnInstance(
   // Pair this Encore instance with a dedicated callback listener (same name)
   // configured with this exact Encore URL, so completion callbacks are routed
   // to the scaler-managed instance rather than a static one. RedisQueue is set
-  // explicitly to the packaging queue so it never defaults elsewhere.
+  // explicitly to a dedicated queue (`ovc:transcode-done`) that no external
+  // eyevinn-encore-packager consumes, so an external packager can't win the
+  // BZPOPMIN race against our poller and swallow our completion messages
+  // (issue #93). This MUST match DEFAULT_QUEUE_KEY in
+  // src/pipeline/encore-callback-poller.ts.
   const callbackSat = await config.oscContext.getServiceAccessToken(
     ENCORE_CALLBACK_LISTENER_SERVICE_ID
   );
@@ -142,7 +146,7 @@ export async function spawnInstance(
       name: instanceId,
       RedisUrl: config.redisUrl,
       EncoreUrl: encoreUrl.replace(/\/+$/, ''),
-      RedisQueue: 'packaging-queue'
+      RedisQueue: 'ovc:transcode-done'
     }
   )) as OscInstance;
   await waitForInstanceReady(
