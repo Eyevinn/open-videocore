@@ -276,15 +276,20 @@ const probe: ProbeRunner | undefined = storageAvailable
 // unwraps it if s3Config is available, otherwise falls back to a direct call
 // which uses env-var credentials (local dev / env-override path).
 const thumbnailExtractor = storageAvailable
-  ? (_s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): FrameExtractor =>
-      // Output goes to the presigned PUT URL on each FrameTarget, so the runner
-      // no longer needs standing S3 credentials in the job body.
+  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): FrameExtractor =>
+      // Output goes to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so
+      // the runner needs the MinIO credentials + bucket in the job body. A
+      // presigned PUT URL does NOT work with the image2 muxer (issue #92).
       makeOscThumbnailExtractor({
         context: oscContext,
         createJob,
         getJob,
         getLogsForInstance,
-        removeJob
+        removeJob,
+        s3Endpoint: s3.endpoint,
+        s3AccessKey: s3.accessKey,
+        s3SecretKey: s3.secretKey,
+        s3Bucket: s3.bucket
       })
   : undefined;
 

@@ -149,21 +149,24 @@ describe('extractThumbnails orchestration', () => {
 });
 
 describe('thumbnailCmdLine', () => {
-  it('emits one seek + single-frame output per frame', () => {
+  it('emits one seek + single-frame output per frame, written to s3://bucket/key', () => {
     const frames: FrameTarget[] = [
       { timecodeSeconds: 5, objectKey: 'k1', putUrl: 'https://minio/k1?sig=a' },
       { timecodeSeconds: 30, objectKey: 'k2', putUrl: 'https://minio/k2?sig=b' }
     ];
-    const cmd = thumbnailCmdLine('https://minio/src?sig=s', frames);
+    const cmd = thumbnailCmdLine('https://minio/src?sig=s', frames, 'thumbs-bucket');
     expect(cmd).toContain('-ss 5');
     expect(cmd).toContain('-ss 30');
     expect(cmd).toContain('-frames:v 1');
-    expect(cmd).toContain('"https://minio/k1?sig=a"');
-    expect(cmd).toContain('"https://minio/k2?sig=b"');
+    // Output goes to the native S3 URI, NOT the presigned PUT URL: the image2
+    // muxer cannot write to an HTTP PUT endpoint (issue #92).
+    expect(cmd).toContain('"s3://thumbs-bucket/k1"');
+    expect(cmd).toContain('"s3://thumbs-bucket/k2"');
+    expect(cmd).not.toContain('https://minio/k1?sig=a');
   });
 
   it('throws when no frames are requested', () => {
-    expect(() => thumbnailCmdLine('https://minio/src', [])).toThrow(/no frames/);
+    expect(() => thumbnailCmdLine('https://minio/src', [], 'thumbs-bucket')).toThrow(/no frames/);
   });
 });
 
@@ -175,25 +178,38 @@ describe('makeOscThumbnailExtractor', () => {
     return {
       context,
       createJob: vi.fn(async () => ({ name: 'x' })),
-      waitForJobToComplete: vi.fn(async () => undefined),
+      // The runner polls getJob (via pollOscJobUntilDone); 'SuccessCriteriaMet'
+      // is the ffmpeg-s3 terminal success status.
+      getJob: vi.fn(async () => ({ status: 'SuccessCriteriaMet' })),
       getLogsForInstance: vi.fn(async () => ''),
-      removeJob: vi.fn(async () => undefined)
+      removeJob: vi.fn(async () => undefined),
+      s3Endpoint: 'https://minio.example',
+      s3AccessKey: 'admin',
+      s3SecretKey: 'secret',
+      s3Bucket: 'thumbs-bucket'
     } as unknown as OscJobApi;
   }
 
-  it('creates a job, waits, and cleans up', async () => {
+  it('creates a job with S3 credentials, waits, and cleans up', async () => {
     const api = fakeApi();
     await makeOscThumbnailExtractor(api)('https://minio/src', [
       { timecodeSeconds: 1, objectKey: 'k', putUrl: 'https://minio/k' }
     ]);
     expect(api.createJob).toHaveBeenCalledOnce();
-    expect(api.waitForJobToComplete).toHaveBeenCalledOnce();
+    // S3 credentials + endpoint must be in the job body so ffmpeg can write
+    // s3://bucket/key natively (issue #92).
+    const body = (api.createJob as ReturnType<typeof vi.fn>).mock.calls[0][3];
+    expect(body.awsAccessKeyId).toBe('admin');
+    expect(body.awsSecretAccessKey).toBe('secret');
+    expect(body.s3EndpointUrl).toBe('https://minio.example');
+    expect(body.cmdLineArgs).toContain('"s3://thumbs-bucket/k"');
+    expect(api.getJob).toHaveBeenCalled();
     expect(api.removeJob).toHaveBeenCalledOnce();
   });
 
-  it('still cleans up the job when the wait fails', async () => {
+  it('still cleans up the job when the poll fails', async () => {
     const api = fakeApi();
-    (api.waitForJobToComplete as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
+    (api.getJob as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
     await expect(
       makeOscThumbnailExtractor(api)('https://minio/src', [
         { timecodeSeconds: 1, objectKey: 'k', putUrl: 'https://minio/k' }
