@@ -454,6 +454,17 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // callback listener bound to that exact instance (ADR-006).
 
         // 4. Encore packager — consumes the queue and produces streaming output.
+        //
+        // RedisQueue is set explicitly to 'encore-packager:jobs' so this instance
+        // only consumes jobs from our pipeline producers (poller enqueuePackagingJob
+        // and PackagingService/makeOscPackagerQueue). Both use that key via
+        // packagerQueueKey() in osc-packager-queue.ts. Not setting it (or leaving
+        // it empty) would default to 'packaging-queue', which risks consuming jobs
+        // intended for other packager instances sharing the same Valkey (#93).
+        //
+        // CallbackUrl is left unset for now — the packager create-schema field name
+        // could not be verified from the OSC catalog at the time of writing; wire it
+        // once confirmed (see docs/osc-feedback/incoming-94-packager-queue-callback-config.md).
         currentService = 'eyevinn-encore-packager';
         const pat = osc.getPersonalAccessToken();
         if (!pat) {
@@ -468,6 +479,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         );
         await provision('eyevinn-encore-packager', {
           RedisUrl: redisUrl,
+          RedisQueue: 'encore-packager:jobs',
           OutputFolder: `s3://${PACKAGED_BUCKET}`,
           PersonalAccessToken: pat,
           AwsAccessKeyId: 'admin',
