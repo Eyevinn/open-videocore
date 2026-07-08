@@ -205,7 +205,15 @@ await app.register(provisionRouter, {
   operationStore,
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
-  onStackChange: () => stackResolver.invalidate()
+  // Then reconcile the scaler/queue wiring: activate it against the freshly
+  // provisioned stack's Valkey (or tear it down on the last deprovision) so
+  // transcoding comes online immediately with no restart (#103).
+  onStackChange: () => {
+    stackResolver.invalidate();
+    void reconcileScaler().catch((err) =>
+      app.log.warn({ err }, 'encore-scaler: reconcile after stack change failed')
+    );
+  }
 });
 
 // Workspace-scoped resource repositories. These hold NO connection of their
@@ -345,39 +353,84 @@ if (!publicBaseUrl) {
   app.log.warn('PUBLIC_BASE_URL not set — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
+// Live scaler/queue wiring. These are mutable holders, not startup-time
+// constants: when the API boots with no provisioned stack there is no Valkey,
+// so the scaler, packaging service, and callback poller all start disabled.
+// The moment a stack is provisioned (POST /api/v1/provision writes its redisUrl
+// to the parameter store and fires onStackChange), reconcileScaler() activates
+// them against that stack's Valkey — no restart required (#103). On deprovision
+// the same reconcile tears them back down.
+//
+// The router option objects registered below (assetRouterOptions,
+// jobsRouterOptions, internalRouterOptions, encoreCompatRouterOptions,
+// scalerRouterOptions) hold these same connections by reference. Fastify handlers
+// read them from `opts` live on each request, so mutating the option objects here
+// after (de)activation is picked up without re-registering any plugin.
 let encore: EncoreClient | undefined;
 let sharedRedis: IORedis | undefined;
+let packaging: PackagingService | undefined;
+let scalerRegistry: WorkspaceEncoreScalerRegistry | undefined;
+let stopEncoreCallbackPoller: (() => void) | undefined;
 
-// Resolve the Redis URL from the provisioned stack config in the parameter store.
-// The REDIS_URL env var can override this for local development, but on OSC the
-// URL is self-discovered from the stack config written by POST /api/v1/provision.
-let resolvedRedisUrl = process.env['REDIS_URL'];
-if (!resolvedRedisUrl && paramStore) {
+// Bucket names are stack-invariant (created at provision time, see provision.ts)
+// so a static default is correct for every workspace.
+const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
+const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
+
+// S3 reader for URL-pull ingest of s3:// sources (issue #5). This reads the
+// source object via a MinIO client. With per-workspace stacks the worker runs
+// detached and the global pullDeps cannot carry a per-request workspace, so we
+// bind it only for the explicit env-override (single global MinIO) path. In the
+// provisioned multi-stack case s3:// pull is unsupported (http/https pull still
+// works); this is tracked for follow-up route plumbing.
+const envMinioClient = process.env['MINIO_URL']
+  ? (await stackResolver.resolve()).storageClient
+  : undefined;
+const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : undefined;
+
+// PipelineExecution tracking (PipelineExecution feature). In-memory: executions
+// are ephemeral orchestration state advanced by OSC completion callbacks. Shared
+// between the assets router (creates executions) and the internal router
+// (advances them from transcode/package callbacks). Declared up front so the
+// callback poller (started on scaler activation) can advance executions.
+const pipelineRepository = new InMemoryPipelineRepository();
+
+// Read the first provisioned stack's Valkey URL from the parameter store, or
+// undefined when no stack is provisioned yet. Self-discovered: there is no
+// REDIS_URL env var — the URL only exists once POST /api/v1/provision has run.
+async function resolveStackRedisUrl(): Promise<string | undefined> {
+  if (!paramStore) return undefined;
   try {
     const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-    if (names.length > 0) {
-      const stackCfg = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
-      if (stackCfg?.redisUrl) {
-        resolvedRedisUrl = stackCfg.redisUrl;
-        app.log.info({ redisUrl: resolvedRedisUrl }, 'encore-scaler: resolved Redis URL from parameter store');
-      }
-    }
+    if (names.length === 0) return undefined;
+    const stackCfg = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+    return stackCfg?.redisUrl && stackCfg.redisUrl.length > 0 ? stackCfg.redisUrl : undefined;
   } catch (err) {
-    app.log.warn({ err }, 'encore-scaler: failed to resolve Redis URL from parameter store — transcoding unavailable');
+    app.log.warn({ err }, 'encore-scaler: failed to resolve Redis URL from parameter store');
+    return undefined;
   }
 }
 
-if (storageAvailable && resolvedRedisUrl) {
-  sharedRedis = new IORedis(resolvedRedisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
+// Bring the scaler, packaging service, and callback poller up against a stack's
+// Valkey. Idempotent: a no-op when already active on the same URL. This is
+// invoked at startup (if a stack already exists) and from onStackChange the
+// moment a stack is first provisioned (#103).
+function activateScaler(redisUrl: string): void {
+  if (sharedRedis) return; // already active
+
   // ENCORE_S3_ENDPOINT et al. allow the operator to pass MinIO credentials to
   // every Encore instance the scaler spawns. Without these Encore resolves
   // s3:// URIs against AWS S3 and fails with 404.
   const encoreS3Endpoint = process.env['ENCORE_S3_ENDPOINT'];
   const encoreS3AccessKey = process.env['ENCORE_S3_ACCESS_KEY'] ?? process.env['MINIO_ACCESS_KEY'] ?? 'admin';
   const encoreS3SecretKey = process.env['ENCORE_S3_SECRET_KEY'] ?? process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'];
-  encore = new WorkspaceEncoreScalerRegistry({
-    redis: sharedRedis,
-    redisUrl: resolvedRedisUrl,
+
+  const redis = new IORedis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
+  sharedRedis = redis;
+
+  scalerRegistry = new WorkspaceEncoreScalerRegistry({
+    redis,
+    redisUrl,
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
@@ -435,68 +488,22 @@ if (storageAvailable && resolvedRedisUrl) {
       }
     }
   });
-  // Start loops for any workspaces that had pool entries from a previous run.
-  // This triggers reconcile() on the first tick, correcting stale activeJobs counts
-  // left by jobs that completed while the server was down.
-  void (encore as import('./encore-scaler/workspace-registry.js').WorkspaceEncoreScalerRegistry)
-    .resumeExistingWorkspaces()
-    .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
-} else if (storageAvailable) {
-  app.log.warn('Redis URL not available — provision a stack first, or set REDIS_URL for local dev. Encore auto-scaler disabled.');
-}
+  encore = scalerRegistry;
 
-// Bucket names are stack-invariant (created at provision time, see provision.ts)
-// so a static default is correct for every workspace.
-const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
-const outputBucket = process.env['MINIO_PACKAGED_BUCKET'] ?? 'openvideocore-packaged';
-
-// S3 reader for URL-pull ingest of s3:// sources (issue #5). This reads the
-// source object via a MinIO client. With per-workspace stacks the worker runs
-// detached and the global pullDeps cannot carry a per-request workspace, so we
-// bind it only for the explicit env-override (single global MinIO) path. In the
-// provisioned multi-stack case s3:// pull is unsupported (http/https pull still
-// works); this is tracked for follow-up route plumbing.
-const envMinioClient = process.env['MINIO_URL']
-  ? (await stackResolver.resolve()).storageClient
-  : undefined;
-const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : undefined;
-
-// HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
-// queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs and
-// receive a completion callback. Wiring is enabled only when a Redis connection
-// is available (resolved from the provisioned stack config); otherwise the
-// packaging trigger and the packager-callback route respond as not-configured.
-function buildPackaging(): PackagingService | undefined {
-  if (!sharedRedis) {
-    app.log.warn('Redis not available — HLS/DASH packaging disabled');
-    return undefined;
-  }
-  return new PackagingService({
+  // HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
+  // queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs
+  // and receive a completion callback.
+  packaging = new PackagingService({
     assets: assetRepository,
-    queue: makeOscPackagerQueue(sharedRedis),
+    queue: makeOscPackagerQueue(redis),
     publicBaseUrl: packagingPublicBaseUrl()
   });
-}
 
-const packaging = buildPackaging();
-
-// PipelineExecution tracking (PipelineExecution feature). In-memory: executions
-// are ephemeral orchestration state advanced by OSC completion callbacks. Shared
-// between the assets router (creates executions) and the internal router
-// (advances them from transcode/package callbacks).
-const pipelineRepository = new InMemoryPipelineRepository();
-
-// Encore completion callback poller (background). The eyevinn-encore-callback-
-// listener receives Encore's completion webhook in the cloud and writes a
-// message to a Redis sorted set; POST /api/v1/internal/encore-callback is only
-// reachable when this API is deployed publicly. This poller drains that same
-// sorted set and runs the identical completion + pipeline-advancement logic, so
-// transcode completions are applied even when the callback route is unreachable
-// (e.g. local runs). Only started when the shared Redis connection is available.
-let stopEncoreCallbackPoller: (() => void) | undefined;
-if (sharedRedis) {
+  // Encore completion callback poller (background). Drains the Valkey sorted set
+  // the callback listener writes to and applies transcode completions even when
+  // the public callback route is unreachable (e.g. local runs).
   stopEncoreCallbackPoller = startEncoreCallbackPoller({
-    redis: sharedRedis,
+    redis,
     jobRepository,
     assetRepository,
     pipelineRepository,
@@ -508,9 +515,80 @@ if (sharedRedis) {
     packagingQueueKey: process.env['PACKAGING_QUEUE_KEY'],
     logger: app.log
   });
-  app.addHook('onClose', async () => {
-    stopEncoreCallbackPoller?.();
-  });
+
+  // Publish the freshly-live connections into the router option objects so every
+  // already-registered plugin picks them up on its next request/tick (#103).
+  assetRouterOptions.encore = encore;
+  assetRouterOptions.packaging = packaging;
+  assetRouterOptions.packagingRedis = redis;
+  jobsRouterOptions.redis = redis;
+  encoreCompatRouterOptions.encore = encore;
+  internalRouterOptions.packaging = packaging;
+  internalRouterOptions.redis = redis;
+  scalerRouterOptions.redis = redis;
+
+  // Start loops for any workspaces that had pool entries from a previous run.
+  // This triggers reconcile() on the first tick, correcting stale activeJobs
+  // counts left by jobs that completed while the server was down.
+  void scalerRegistry
+    .resumeExistingWorkspaces()
+    .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
+
+  app.log.info({ redisUrl }, 'encore-scaler: activated against provisioned stack Valkey');
+}
+
+// Tear down the scaler, packaging service, and callback poller when the stack
+// they were bound to is deprovisioned: stop every scaler loop and poller, close
+// the Valkey client, and clear the live wiring from the router option objects so
+// transcoding/packaging degrade back to 501 (#103).
+async function deactivateScaler(): Promise<void> {
+  if (!sharedRedis) return; // already inactive
+
+  stopEncoreCallbackPoller?.();
+  stopEncoreCallbackPoller = undefined;
+
+  scalerRegistry?.stopAll();
+  scalerRegistry = undefined;
+
+  const redis = sharedRedis;
+  sharedRedis = undefined;
+  encore = undefined;
+  packaging = undefined;
+
+  assetRouterOptions.encore = undefined;
+  assetRouterOptions.packaging = undefined;
+  assetRouterOptions.packagingRedis = undefined;
+  jobsRouterOptions.redis = undefined;
+  encoreCompatRouterOptions.encore = undefined;
+  internalRouterOptions.packaging = undefined;
+  internalRouterOptions.redis = undefined;
+  scalerRouterOptions.redis = undefined;
+
+  try {
+    // The Valkey client is created lazyConnect, so it may never have opened a
+    // socket (no transcoding happened before teardown). quit() would reject on a
+    // never-connected client; disconnect() closes it cleanly either way and does
+    // not wait on the (empty) command queue.
+    redis.disconnect();
+  } catch (err) {
+    app.log.warn({ err }, 'encore-scaler: failed to close Valkey connection on deprovision');
+  }
+
+  app.log.info('encore-scaler: deactivated (stack deprovisioned)');
+}
+
+// Bring the scaler in line with the current set of provisioned stacks: activate
+// against the first stack's Valkey when one exists and we are not yet active;
+// deactivate when the last stack is gone. Invoked at startup and after every
+// provision/teardown via onStackChange.
+async function reconcileScaler(): Promise<void> {
+  if (!storageAvailable) return;
+  const redisUrl = await resolveStackRedisUrl();
+  if (redisUrl && !sharedRedis) {
+    activateScaler(redisUrl);
+  } else if (!redisUrl && sharedRedis) {
+    await deactivateScaler();
+  }
 }
 
 // Encore transcoding profile catalogue + management (issue #84). Profiles are
@@ -540,7 +618,14 @@ void bootstrapProfiles({
 // (issue #8). It shares the same job repository so a job created here is
 // readable by the jobs router. The per-workspace storage factory + S3 reader
 // resolve the caller's stack at request time.
-await app.register(assetsRouter, {
+// The option objects below are held by reference: activateScaler /
+// deactivateScaler mutate their `encore` / `packaging` / `redis` /
+// `packagingRedis` fields when a stack is provisioned or torn down, and the
+// Fastify handlers read those fields from `opts` live on each request. This is
+// what lets the scaler and queue services come online (or go offline) without a
+// server restart (#103). At startup these fields are undefined; reconcileScaler()
+// at the end of boot fills them in if a stack already exists.
+const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/assets',
   repository: assetRepository,
   jobRepository,
@@ -557,29 +642,36 @@ await app.register(assetsRouter, {
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository
-});
+};
+await app.register(assetsRouter, assetRouterOptions);
 
-await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobRepository, redis: sharedRedis });
+const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } = {
+  prefix: '/api/v1/jobs',
+  repository: jobRepository,
+  redis: sharedRedis
+};
+await app.register(jobsRouter, jobsRouterOptions);
 
 // Encore-compatible transcode submission (migration surface). Lets integrators
 // who POST directly to an Encore OSC instance repoint at this API with only a
 // base-URL swap — same payloads. Unauthenticated by design (matches Encore's
 // own submit API; OSC terminates auth at the edge). Shares the same deps as the
 // assets router so a job submitted here is observable everywhere else.
-await app.register(encoreCompatRouter, {
+const encoreCompatRouterOptions: Parameters<typeof encoreCompatRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/encore',
   repository: assetRepository,
   jobRepository,
   encore,
   sourceBucket,
   outputBucket
-});
+};
+await app.register(encoreCompatRouter, encoreCompatRouterOptions);
 
 // Internal OSC callbacks. Unauthenticated by design — see routes/internal.ts.
 // Hosts both the issue #9 packager-callback and the issue #8 encore-callback
 // (transcode completion), which resolves its workspace + job from the embedded
 // encoreJobId and creates ready child assets for each rendition.
-await app.register(internalRouter, {
+const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/internal',
   packaging,
   jobRepository,
@@ -587,7 +679,8 @@ await app.register(internalRouter, {
   webhookDispatcher,
   redis: sharedRedis,
   pipelineRepository
-});
+};
+await app.register(internalRouter, internalRouterOptions);
 
 // On object storage (upload-complete OR watch-folder ingest), fire-and-forget
 // ffprobe extraction (issue #6). Shared by the upload route and the
@@ -635,22 +728,25 @@ const watchFolder =
 await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
 
 // Encore auto-scaler status (ADR-006). Unauthenticated read-only introspection
-// of the per-workspace scaler pool for the ops UI. `sharedRedis` is undefined
-// when the scaler is off (no Redis connection); the endpoint then reports
-// scalerActive:false with an empty workspace list.
-await app.register(scalerRouter, {
+// of the per-workspace scaler pool for the ops UI. `redis` is undefined when the
+// scaler is off; the endpoint then reports scalerActive:false with an empty
+// workspace list. The option object is held by reference so activateScaler /
+// deactivateScaler flip `redis` on (or off) when a stack is provisioned or torn
+// down, and GET /status reports scalerActive:true immediately with no restart (#103).
+const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/scaler',
   redis: sharedRedis,
   maxInstances: encoreMaxInstances,
   minInstances: 0,
   idleTimeoutMs: encoreIdleTimeoutMs,
   onConfigChange: (cfg) => {
-    if (encore instanceof WorkspaceEncoreScalerRegistry) {
-      encore.setMaxInstances(cfg.maxInstances);
-      encore.setIdleTimeoutMs(cfg.idleTimeoutMs);
+    if (scalerRegistry) {
+      scalerRegistry.setMaxInstances(cfg.maxInstances);
+      scalerRegistry.setIdleTimeoutMs(cfg.idleTimeoutMs);
     }
   }
-});
+};
+await app.register(scalerRouter, scalerRouterOptions);
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
 
@@ -681,6 +777,19 @@ await app.register(fastifyStatic, {
   decorateReply: false
 });
 app.get('/ui', async (_req, reply) => reply.redirect('/ui/index.html'));
+
+// Bring the scaler online now if a stack was already provisioned in a previous
+// run (self-discovered from the parameter store). When no stack exists yet this
+// is a no-op and the scaler stays disabled until the first POST /api/v1/provision
+// fires onStackChange -> reconcileScaler() (#103).
+await reconcileScaler().catch((err) =>
+  app.log.warn({ err }, 'encore-scaler: initial reconcile failed')
+);
+
+// Cleanly stop the callback poller and close the Valkey connection on shutdown.
+app.addHook('onClose', async () => {
+  await deactivateScaler();
+});
 
 const port = parseInt(process.env['PORT'] || '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });

@@ -194,7 +194,7 @@ in the ops UI.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances` and `idleTimeoutMs`) |
+| `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances` and `idleTimeoutMs`). Returns `scalerActive: false` until a stack is provisioned; the auto-scaler activates against the provisioned stack's Valkey immediately after `POST /api/v1/provision` completes, with no restart. |
 | `GET` | `/api/v1/scaler/config` | Get auto-scaler configuration |
 | `PATCH` | `/api/v1/scaler/config` | Update auto-scaler configuration (`maxInstances`, `minInstances`, `idleTimeoutMs`) at runtime; `idleTimeoutMs` must be at least `10000` ms |
 

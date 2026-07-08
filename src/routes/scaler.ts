@@ -24,8 +24,10 @@ import { keys } from '../encore-scaler/types.js';
 import { listInstances } from '../encore-scaler/instance-pool.js';
 
 type ScalerRouterOptions = {
-  // The shared Valkey connection used by the scaler. Undefined when the scaler
-  // is off (no REDIS_URL); the status endpoint then reports scalerActive:false.
+  // The Valkey connection used by the scaler. Undefined when the scaler is off
+  // (no stack provisioned yet). Set live by main.ts the moment a stack is
+  // provisioned, so GET /status flips to scalerActive:true without a restart
+  // (#103); the status endpoint reports scalerActive:false while it is undefined.
   redis?: Redis;
   // Upper bound on instances per workspace pool (ENCORE_MAX_INSTANCES).
   maxInstances: number;

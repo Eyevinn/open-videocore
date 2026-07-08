@@ -3,7 +3,10 @@
 // Unlike the unit tests, this exercises the REAL scaler loop against a REAL
 // OSC environment and a REAL Redis/Valkey. It spawns and tears down actual
 // Encore OSC instances, so it is SLOW (Encore startup ~60-120s) and is
-// SKIPPED automatically unless both OSC_ACCESS_TOKEN and REDIS_URL are set.
+// SKIPPED automatically unless both OSC_ACCESS_TOKEN and TEST_REDIS_URL are set.
+// (TEST_REDIS_URL is a test-harness pointer to a live Valkey only; the app itself
+// self-discovers its Valkey from the provisioned stack config — there is no
+// REDIS_URL application env var, see #103.)
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - @osaas/client-core lib/core.d.ts:
@@ -38,7 +41,7 @@ import type { EncoreProfile } from '../src/pipeline/encode-presets.js';
 // Encore instances can take 60-120s to become ready on OSC.
 const E2E_TIMEOUT_MS = 180_000;
 
-const SKIP = !process.env['OSC_ACCESS_TOKEN'] || !process.env['REDIS_URL'];
+const SKIP = !process.env['OSC_ACCESS_TOKEN'] || !process.env['TEST_REDIS_URL'];
 
 // Minimal profile consistent with EncoreProfile (encode-presets.ts). "program"
 // is the only profile confirmed present in the OSC Encore instance.
@@ -84,8 +87,8 @@ describe.skipIf(SKIP)('Encore auto-scaler e2e (OSC + Redis)', () => {
   const configsToClean: EncoreScalerConfig[] = [];
 
   beforeEach(() => {
-    // REDIS_URL is guaranteed present here (SKIP guard covers absence).
-    redis = new IORedis(process.env['REDIS_URL'] as string, {
+    // TEST_REDIS_URL is guaranteed present here (SKIP guard covers absence).
+    redis = new IORedis(process.env['TEST_REDIS_URL'] as string, {
       maxRetriesPerRequest: null
     });
     oscContext = new Context();

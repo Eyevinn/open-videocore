@@ -44,7 +44,6 @@ type JobsRouterOptions = {
 export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryJobRepository();
-  const redis = opts.redis;
 
   app.get(
     '/',
@@ -119,6 +118,9 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
         }
       }
       // Annotate with the Encore pool instance that is (or was) running this job.
+      // Read from opts live so a stack provisioned after startup (which activates
+      // the scaler and sets opts.redis) is picked up without a restart (#103).
+      const redis = opts.redis;
       if (redis && job.encoreJobId) {
         try {
           const decoded = decodeEncoreJobId(job.encoreJobId);
