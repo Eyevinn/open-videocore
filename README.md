@@ -100,7 +100,6 @@ curl -X DELETE http://localhost:3000/api/v1/provision/mystack
 | `PARAMETER_STORE_INSTANCE_NAME` | **Yes** | Name of the `eyevinn-app-config-svc` instance (default `ovcconfig`). |
 | `MINIO_ROOT_PASSWORD` | **Yes** | Admin password used when provisioning MinIO instances. |
 | `COUCHDB_ADMIN_PASSWORD` | **Yes** | Admin password used when provisioning CouchDB instances. |
-| `REDIS_URL` | No | `redis://` connection URL for the Valkey instance used by the Encore auto-scaler. On OSC this is resolved automatically from the parameter store after provisioning — set it explicitly only for local development before a stack is provisioned. Without a Redis URL (and no provisioned stack to pull one from), transcoding is disabled. |
 | `PORT` | No | HTTP port (default `3000`). |
 | `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). |
 | `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances kept warm (default `0`). |
