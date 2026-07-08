@@ -42,54 +42,63 @@ Headless, API-first media asset management (MAM) middleware that runs entirely o
 
 ## Quick start
 
-### 1. Bootstrap the parameter store
+The easiest way to get Open Videocore running is through an AI agent connected to OSC via MCP. The agent handles provisioning through natural language — no CLI, no copy-pasting resource IDs.
 
-The parameter store persists provisioned stack coordinates. Create it once per installation:
+### 1. Connect your agent to OSC
+
+For Claude Code or Claude Desktop:
 
 ```bash
-# Create a Valkey instance to back the parameter store
-osc create valkey-io-valkey ovcparamstore
-
-# Note the redis:// URL from the output, then create the parameter store
-osc create eyevinn-app-config-svc ovcconfig \
-  -o RedisUrl=redis://<ip>:<port> \
-  -o ConfigApiKey=<choose-a-strong-key>
+claude mcp add --transport http osc https://mcp.osaas.io/mcp
 ```
 
-> OSC instance names must be alphanumeric only (no hyphens or underscores).
+For Cursor, VS Code, or other MCP-compatible tools, add `https://mcp.osaas.io/mcp` as an MCP server with your OSC Personal Access Token (from [app.osaas.io/settings](https://app.osaas.io/settings)) as the Bearer token. Full setup guides at [osaas.io/mcp](https://www.osaas.io/mcp).
 
-### 2. Configure and run
+### 2. Set up a parameter store
+
+Open Videocore uses a parameter store to track the backing services it provisions. Ask your agent:
+
+> Set up an app-config parameter store called `ovcconfig` for my Open Videocore deployment.
+
+The agent provisions Valkey and the config service, then returns a config API key.
+
+### 3. Deploy Open Videocore
+
+> Create a Personal Access Token for the Open Videocore instance, then create an Open Videocore instance called `ovctest`. Connect it to the parameter store named `ovcconfig` using the API key from the previous step. Use the Personal Access Token as the OSC access token. Generate strong passwords for `MinioRootPassword` and `CouchdbAdminPassword`.
+
+The agent provisions the instance and returns its public URL — `https://<your-instance>` in all examples below.
+
+### 4. Provision a media stack
+
+A single API call stands up the backing infrastructure for a workspace — MinIO, CouchDB, Valkey, and a packager. Encore instances are not created here; the auto-scaler spins them up on demand when the first jobs arrive.
 
 ```bash
-cp .env.example .env   # fill in the values below
-pnpm install
-pnpm dev
-```
-
-Open the ops dashboard at [http://localhost:3000/ui](http://localhost:3000/ui).
-
-### 3. Provision a media stack
-
-```bash
-curl -X POST http://localhost:3000/api/v1/provision \
+curl -X POST https://<your-instance>/api/v1/provision \
   -H "Content-Type: application/json" \
   -d '{"name": "mystack"}'
 ```
 
-This creates MinIO, CouchDB, Valkey, Encore, the callback listener, and the packager — all on OSC. The middleware connects to the provisioned stack automatically for all subsequent requests.
-
-List and inspect provisioned stacks:
+Provisioning is asynchronous. Poll the returned `operationId` until `status` reaches `"done"`:
 
 ```bash
-curl http://localhost:3000/api/v1/provision
-curl http://localhost:3000/api/v1/provision/mystack
+curl https://<your-instance>/api/v1/provision/operations/<operationId>
 ```
 
-Tear down a stack:
+List, inspect, and tear down stacks:
 
 ```bash
-curl -X DELETE http://localhost:3000/api/v1/provision/mystack
+curl https://<your-instance>/api/v1/provision
+curl https://<your-instance>/api/v1/provision/mystack
+curl -X DELETE https://<your-instance>/api/v1/provision/mystack
 ```
+
+### 5. Bootstrap transcoding profiles
+
+```bash
+curl -X POST https://<your-instance>/api/v1/profiles/bootstrap
+```
+
+Seeds the profile store from the default Encore test profiles. The ops dashboard is at `https://<your-instance>/ui`.
 
 ## Environment variables
 
@@ -259,7 +268,7 @@ in the ops UI.
 
 ## Architecture
 
-open-videocore runs as an OSC service and composes other OSC services at runtime:
+Open Videocore runs as an OSC service and composes other OSC services at runtime:
 
 | OSC Service | Role |
 |---|---|
@@ -283,7 +292,7 @@ pnpm build        # compile TypeScript
 pnpm test         # run test suite
 ```
 
-The ops UI is at `/ui` and the interactive API docs are at `/api-docs`. To regenerate `openapi.json` after adding routes, run `pnpm generate:openapi`.
+The ops UI is at `http://localhost:3000/ui` and the interactive API docs are at `http://localhost:3000/api-docs`. To regenerate `openapi.json` after adding routes, run `pnpm generate:openapi`.
 
 For local development against real OSC services, set your `OSC_ACCESS_TOKEN`, then provision a stack via the Provision tab in the ops UI.
 
