@@ -25,7 +25,7 @@ import { collectionsRouter } from './routes/collections.js';
 import { storageRouter } from './routes/storage.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
-import { WorkspaceStackResolver, type WorkspaceConnections } from './services/workspace-stack.js';
+import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
 import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
@@ -366,11 +366,40 @@ if (storageAvailable && process.env['REDIS_URL']) {
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
+    // Local-dev fallback only: ENCORE_S3_ENDPOINT is used verbatim for all
+    // workspaces when set. On OSC this is unset and resolveS3Config below
+    // resolves the MinIO endpoint per workspace from the parameter store.
     s3Config: encoreS3Endpoint && encoreS3SecretKey ? {
       endpoint: encoreS3Endpoint,
       accessKeyId: encoreS3AccessKey,
       secretAccessKey: encoreS3SecretKey
     } : undefined,
+    // Resolve each workspace's MinIO endpoint from the parameter store at loop
+    // creation time so no static ENCORE_S3_ENDPOINT env var is required on OSC.
+    // Mirrors WorkspaceStackResolver: address the stack by workspaceId, falling
+    // back to the first provisioned stack for the namespace.
+    resolveS3Config: async (workspaceId: string) => {
+      if (!paramStore || !encoreS3SecretKey) return undefined;
+      try {
+        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, workspaceId);
+        if (!config) {
+          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+          }
+        }
+        if (config?.minioEndpoint) {
+          return {
+            endpoint: config.minioEndpoint,
+            accessKeyId: 'admin',
+            secretAccessKey: encoreS3SecretKey
+          };
+        }
+      } catch (err) {
+        app.log.warn({ err, workspaceId }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
+      }
+      return undefined;
+    },
     // When the scaler dispatches a queued job to an Encore instance, advance the
     // Job record queued->running and the source asset to `processing`. The
     // scaler has no repositories of its own, so we resolve the job here by the
@@ -387,9 +416,6 @@ if (storageAvailable && process.env['REDIS_URL']) {
       }
     }
   });
-  if (!encoreS3Endpoint) {
-    app.log.warn('ENCORE_S3_ENDPOINT not set — Encore instances will not be able to read from MinIO; set ENCORE_S3_ENDPOINT to the MinIO URL');
-  }
   // Start loops for any workspaces that had pool entries from a previous run.
   // This triggers reconcile() on the first tick, correcting stale activeJobs counts
   // left by jobs that completed while the server was down.

@@ -28,6 +28,11 @@ export type WorkspaceEncoreScalerConfig = {
   redisUrl: string;
   tickIntervalMs?: number;
   s3Config?: import('./types.js').EncoreS3Config;
+  // Optional per-workspace S3 config resolver. When supplied, called once at
+  // loop creation time and preferred over the static s3Config field. Allows the
+  // MinIO endpoint to be resolved from the parameter store per workspace rather
+  // than requiring a static ENCORE_S3_ENDPOINT env var.
+  resolveS3Config?: (workspaceId: string) => Promise<import('./types.js').EncoreS3Config | undefined>;
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).
   profilesUrl?: string;
@@ -41,9 +46,14 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
 
   constructor(private readonly config: WorkspaceEncoreScalerConfig) {}
 
-  private getOrCreate(workspaceId: string): EncoreClient {
+  private async getOrCreate(workspaceId: string): Promise<EncoreClient> {
     const existing = this.loops.get(workspaceId);
     if (existing) return existing.client;
+
+    let s3Config = this.config.s3Config;
+    if (this.config.resolveS3Config) {
+      s3Config = (await this.config.resolveS3Config(workspaceId)) ?? s3Config;
+    }
 
     const scalerConfig: EncoreScalerConfig = {
       workspaceId,
@@ -54,7 +64,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       redis: this.config.redis,
       redisUrl: this.config.redisUrl,
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
-      s3Config: this.config.s3Config,
+      s3Config,
       profilesUrl: this.config.profilesUrl,
       onDispatched: this.config.onDispatched
     };
@@ -72,13 +82,13 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     if (!decoded) {
       throw new Error(`Cannot decode workspaceId from externalId: ${input.externalId}`);
     }
-    return this.getOrCreate(decoded.workspaceId).submit(input);
+    return (await this.getOrCreate(decoded.workspaceId)).submit(input);
   }
 
   async getJobStatus(encoreJobId: string): Promise<string | undefined> {
     const decoded = decodeEncoreJobId(encoreJobId);
     if (!decoded) return undefined;
-    return this.getOrCreate(decoded.workspaceId).getJobStatus(encoreJobId);
+    return (await this.getOrCreate(decoded.workspaceId)).getJobStatus(encoreJobId);
   }
 
   setMaxInstances(max: number): void {
@@ -104,7 +114,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     for (const key of existingKeys) {
       // key = "encore:pool:{workspaceId}"
       const workspaceId = key.slice('encore:pool:'.length);
-      if (workspaceId) this.getOrCreate(workspaceId);
+      if (workspaceId) await this.getOrCreate(workspaceId);
     }
   }
 
