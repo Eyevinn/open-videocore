@@ -193,7 +193,15 @@ app.decorateRequest('connections', null);
 app.addHook('preHandler', async (request) => {
   const stackHeader = request.headers['x-stack-name'];
   const stackName = typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
-  request.connections = await stackResolver.resolve(stackName);
+  try {
+    request.connections = await stackResolver.resolve(stackName);
+  } catch (err) {
+    // A bad or partially-provisioned stack config (e.g. empty couchdbUrl) must
+    // not take down every route including health probes. Degrade to no connections
+    // so workspace-scoped routes fail with 503, but infrastructure routes stay up.
+    app.log.warn({ err }, 'stack resolver failed — connections unavailable for this request');
+    request.connections = null;
+  }
 });
 
 const operationStore = new OperationStore();
