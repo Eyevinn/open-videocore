@@ -58,26 +58,20 @@ async function resolveUrlFromEncoreUuid(
 const DEFAULT_QUEUE_KEY = 'ovc:transcode-done';
 const BZPOPMIN_TIMEOUT_SECONDS = 5;
 
-// The eyevinn-encore-packager's INPUT queue (#94). After #93 moved our callback
-// listeners onto the dedicated "ovc:transcode-done" queue, "packaging-queue" is
-// free to be used exclusively as the packager's input queue. We push the
-// packaging job here (ZADD onto a Redis sorted set) and the packager consumes it
-// via BZPOPMIN — the OSC-native transcode->package handoff, replacing the former
-// in-process PackagingService.triggerPackaging HTTP call.
+// The eyevinn-encore-packager's INPUT queue (#94). Must match the RedisQueue
+// set on the provisioned packager instance (provision.ts). We use the same key
+// as PackagingService / makeOscPackagerQueue ('encore-packager:jobs') so all
+// producers target one queue and the provisioned packager need only be told that
+// one key. We push the packaging job here (ZADD onto a Redis sorted set) and the
+// packager consumes it via BZPOPMIN — the OSC-native transcode->package handoff.
 //
-// CONTRACT (packager input message shape) — this is the SAME { jobId, url }
-// envelope the eyevinn-encore-callback-listener writes and this poller already
-// consumes (see the file header, line 8-10, and sweepCompletedJobs line 391-394,
-// "verified from eyevinn-encore-callback-listener source, 2026-07-07"). The
-// packager's redisListener reads that envelope from its queue via BZPOPMIN and
-// fetches the Encore job document from `url`. Encoded structurally in
-// src/pipeline/packaging.ts PackagingJob (osc-packager-queue.ts:9-16):
+// CONTRACT (packager input message shape, verified from encore-packager
+// redisListener.ts and osc-packager-queue.ts:9-16):
 //   { jobId: string, url: string }
-//   - jobId: our correlation id, echoed verbatim in the packager's
-//            /packagerCallback/success payload (we use the assetId so the
-//            callback resolves back to the asset — see src/routes/internal.ts).
-//   - url:   the Encore job API URL the packager fetches output details from.
-const DEFAULT_PACKAGING_QUEUE_KEY = 'packaging-queue';
+//   - jobId: our correlation id (assetId) — echoed in the packager's
+//            /packagerCallback/success payload so the callback resolves the asset.
+//   - url:   Encore job API URL the packager fetches output details from.
+const DEFAULT_PACKAGING_QUEUE_KEY = 'encore-packager:jobs';
 
 type Logger = {
   info(...a: any[]): void;
