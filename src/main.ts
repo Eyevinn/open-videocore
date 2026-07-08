@@ -324,8 +324,8 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // cap the pool at a single instance (equivalent to the previous static behaviour).
 // Requires a Redis connection (resolved from the parameter store after provisioning).
 // When Redis is unavailable transcoding degrades to 501.
-const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] ?? '3', 10);
-const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] ?? String(5 * 60 * 1000), 10);
+const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -378,7 +378,7 @@ if (storageAvailable && resolvedRedisUrl) {
   encore = new WorkspaceEncoreScalerRegistry({
     redis: sharedRedis,
     redisUrl: resolvedRedisUrl,
-    minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] ?? '0', 10),
+    minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
     idleTimeoutMs: encoreIdleTimeoutMs,
@@ -682,7 +682,7 @@ await app.register(fastifyStatic, {
 });
 app.get('/ui', async (_req, reply) => reply.redirect('/ui/index.html'));
 
-const port = parseInt(process.env['PORT'] ?? '3000', 10);
+const port = parseInt(process.env['PORT'] || '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
 
 // Start watch-folder ingest only after the server is listening and every router
