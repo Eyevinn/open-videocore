@@ -322,8 +322,8 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // the same EncoreClient interface as the old static client but manages a
 // per-workspace pool of Encore OSC instances. Set ENCORE_MAX_INSTANCES=1 to
 // cap the pool at a single instance (equivalent to the previous static behaviour).
-// Requires REDIS_URL (same Valkey used for HLS/DASH packaging). When Redis is
-// unavailable transcoding degrades to 501.
+// Requires a Redis connection (resolved from the parameter store after provisioning).
+// When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] ?? '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] ?? String(5 * 60 * 1000), 10);
 
@@ -348,10 +348,9 @@ if (!publicBaseUrl) {
 let encore: EncoreClient | undefined;
 let sharedRedis: IORedis | undefined;
 
-// Resolve the Redis URL: prefer the REDIS_URL env var (local dev / explicit
-// override), then fall back to the first provisioned stack's Valkey URL stored
-// in the parameter store. This means no static REDIS_URL is required on OSC —
-// the URL is self-discovered from the stack config after provisioning.
+// Resolve the Redis URL from the provisioned stack config in the parameter store.
+// The REDIS_URL env var can override this for local development, but on OSC the
+// URL is self-discovered from the stack config written by POST /api/v1/provision.
 let resolvedRedisUrl = process.env['REDIS_URL'];
 if (!resolvedRedisUrl && paramStore) {
   try {
@@ -443,7 +442,7 @@ if (storageAvailable && resolvedRedisUrl) {
     .resumeExistingWorkspaces()
     .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
 } else if (storageAvailable) {
-  app.log.warn('REDIS_URL not set — Encore auto-scaler disabled, transcoding unavailable');
+  app.log.warn('Redis URL not available — provision a stack first, or set REDIS_URL for local dev. Encore auto-scaler disabled.');
 }
 
 // Bucket names are stack-invariant (created at provision time, see provision.ts)
@@ -464,12 +463,12 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 
 // HLS/DASH packaging (issue #9). The eyevinn-encore-packager consumes a Valkey
 // queue and writes CMAF output to the packaged MinIO bucket; we enqueue jobs and
-// receive a completion callback. Wiring is enabled only when REDIS_URL is set
-// (the Valkey queue is the load-bearing dependency); otherwise the packaging
-// trigger and the packager-callback route respond as not-configured.
+// receive a completion callback. Wiring is enabled only when a Redis connection
+// is available (resolved from the provisioned stack config); otherwise the
+// packaging trigger and the packager-callback route respond as not-configured.
 function buildPackaging(): PackagingService | undefined {
   if (!sharedRedis) {
-    app.log.warn('REDIS_URL not set — HLS/DASH packaging disabled');
+    app.log.warn('Redis not available — HLS/DASH packaging disabled');
     return undefined;
   }
   return new PackagingService({
@@ -493,8 +492,7 @@ const pipelineRepository = new InMemoryPipelineRepository();
 // reachable when this API is deployed publicly. This poller drains that same
 // sorted set and runs the identical completion + pipeline-advancement logic, so
 // transcode completions are applied even when the callback route is unreachable
-// (e.g. local runs). Only started when the shared Redis (same REDIS_URL the
-// listener writes to) is configured.
+// (e.g. local runs). Only started when the shared Redis connection is available.
 let stopEncoreCallbackPoller: (() => void) | undefined;
 if (sharedRedis) {
   stopEncoreCallbackPoller = startEncoreCallbackPoller({
@@ -638,7 +636,7 @@ await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
 
 // Encore auto-scaler status (ADR-006). Unauthenticated read-only introspection
 // of the per-workspace scaler pool for the ops UI. `sharedRedis` is undefined
-// when the scaler is off (no REDIS_URL); the endpoint then reports
+// when the scaler is off (no Redis connection); the endpoint then reports
 // scalerActive:false with an empty workspace list.
 await app.register(scalerRouter, {
   prefix: '/api/v1/scaler',
