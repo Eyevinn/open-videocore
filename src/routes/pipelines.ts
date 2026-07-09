@@ -87,8 +87,10 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
 
       const enriched = await Promise.all(
         items.map(async (exec) => {
-          const asset = await assetRepository.get(exec.assetId);
-          const steps = await enrichWithProgress([...exec.steps], jobRepository);
+          const [asset, steps] = await Promise.all([
+            assetRepository.get(exec.assetId).catch(() => undefined),
+            enrichWithProgress([...exec.steps], jobRepository)
+          ]);
           return { ...exec, assetName: asset?.name, steps };
         })
       );
@@ -116,8 +118,10 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
       if (!exec) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      const asset = await assetRepository.get(exec.assetId);
-      const steps = await enrichWithProgress([...exec.steps], jobRepository);
+      const [asset, steps] = await Promise.all([
+        assetRepository.get(exec.assetId).catch(() => undefined),
+        enrichWithProgress([...exec.steps], jobRepository)
+      ]);
       return reply.code(200).send({ ...exec, assetName: asset?.name, steps });
     }
   );
