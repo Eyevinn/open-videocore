@@ -53,12 +53,35 @@ export type WorkspaceConnections = {
 
 type CacheEntry = { connections: WorkspaceConnections; expiresAt: number };
 
+// True if the value is a non-empty, parseable absolute URL. A partially
+// provisioned stack can persist empty-string coordinates; feeding those to nano
+// (dbScope) or the MinIO client's `new URL(...)` throws an uncaught assertion,
+// which — in the global preHandler — would 500 every route including /health.
+function isValidUrl(value: string | undefined): boolean {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  try {
+    // eslint-disable-next-line no-new
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Build connections for a provisioned stack. Returns null when the stack config
+// is incomplete/invalid (empty or non-URL couchdbUrl or minioEndpoint) so the
+// resolver can fall back to no-op in-memory connections instead of throwing an
+// uncaught assertion out of the global preHandler (issue #105).
 function buildConnectionsFromStack(
   config: StackConfig,
   minioPassword: string,
   couchPassword: string,
   oscContext: Context
-): WorkspaceConnections {
+): WorkspaceConnections | null {
+  if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
+    return null;
+  }
+
   const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
   const couchUrl = config.couchdbUrl.replace(/\/$/, '').replace(
     /^(https?:\/\/)/, `$1admin:${couchPassword}@`
@@ -259,9 +282,14 @@ export class WorkspaceStackResolver {
       // Fall through to in-memory
     }
 
-    const connections = config
-      ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext)
-      : buildInMemoryConnections();
+    // A partially-provisioned stack can persist empty/invalid coordinates;
+    // buildConnectionsFromStack returns null for those rather than throwing an
+    // uncaught assertion (issue #105). Treat null the same as "no stack": fall
+    // back to no-op in-memory connections so /health and infra routes stay up.
+    const connections =
+      (config
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext)
+        : null) ?? buildInMemoryConnections();
 
     this.cache.set(cacheKey, { connections, expiresAt: Date.now() + CACHE_TTL_MS });
     return connections;
