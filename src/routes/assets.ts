@@ -167,6 +167,42 @@ const deliverySchema = z.object({
   expiresAt: z.string()
 });
 
+// Unified files view (issue #119). A DERIVED / projection read model over the
+// asset's existing storage fields — it does NOT change how assets are stored.
+// A `file` is a single downloadable object; its `url` is a presigned GET so a
+// caller can download without MinIO credentials. `objectKey` is retained so the
+// caller can correlate the presigned URL back to the underlying storage key.
+// A `fileGroup` is a multi-file streaming package (HLS/DASH) addressed by a
+// single manifest URL rather than a per-segment presigned URL.
+const assetFileSchema = z.object({
+  id: z.string(),
+  type: z.enum(['source', 'rendition', 'export']),
+  name: z.string(),
+  format: z.string(),
+  objectKey: z.string(),
+  url: z.string(),
+  sizeBytes: z.number().optional(),
+  label: z.string().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+  bitrateBps: z.number().optional(),
+  codec: z.string().optional()
+});
+
+const assetFileGroupSchema = z.object({
+  id: z.string(),
+  type: z.enum(['hls-package', 'dash-package']),
+  name: z.string(),
+  manifestUrl: z.string(),
+  segmentCount: z.number().optional(),
+  objectKeyPrefix: z.string()
+});
+
+const assetFilesSchema = z.object({
+  files: z.array(assetFileSchema),
+  fileGroups: z.array(assetFileGroupSchema)
+});
+
 // Thumbnail extraction request (issue #7): one or more timecodes in seconds.
 const thumbnailsBodySchema = z.object({
   timecodes: z.array(z.number().min(0)).min(1).max(50)
@@ -462,6 +498,50 @@ async function resolveEncoreJobUrlForPackaging(
   } catch {
     return undefined;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Files-view helpers (issue #119). Pure, derive display fields from object keys
+// and manifest URLs. None of these mutate the asset — the endpoint is a read
+// projection only.
+// ---------------------------------------------------------------------------
+
+// The last path segment of a MinIO object key, used as a human file name (e.g.
+// `sources/<id>/master.mp4` -> `master.mp4`). Falls back to the whole key.
+function fileNameFromKey(key: string): string {
+  const trimmed = key.replace(/\/+$/, '');
+  const segment = trimmed.slice(trimmed.lastIndexOf('/') + 1);
+  return segment || key;
+}
+
+// Container format inferred from an object key's file extension (e.g.
+// `.../master.mp4` -> `mp4`). Asset renditions and source keys do not carry an
+// explicit format field, so it is derived from the stored key. Returns an empty
+// string when the key has no extension (schema `format` stays a plain string).
+function formatFromKey(key: string): string {
+  const name = fileNameFromKey(key);
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0 || dot === name.length - 1) {
+    return '';
+  }
+  return name.slice(dot + 1).toLowerCase();
+}
+
+// Derive the object-key prefix backing a streaming package from its manifest
+// URL — the manifest's parent "directory" (e.g.
+// `https://minio/packaged/<id>/hls/master.m3u8` -> `packaged/<id>/hls/`). The
+// URL path is used when parseable; otherwise the raw string is treated as a
+// path. Segment objects live under this prefix.
+function objectKeyPrefixFromManifest(manifestUrl: string): string {
+  let path = manifestUrl;
+  try {
+    path = new URL(manifestUrl).pathname;
+  } catch {
+    // Not an absolute URL; treat the value itself as a path.
+  }
+  path = path.replace(/^\/+/, '');
+  const lastSlash = path.lastIndexOf('/');
+  return lastSlash >= 0 ? path.slice(0, lastSlash + 1) : '';
 }
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
@@ -866,6 +946,120 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         error: 'no_delivery',
         message: 'asset has no packaged output or stored source object to deliver'
       });
+    }
+  );
+
+  // Unified files view (issue #119). A DERIVED / additive read model that folds
+  // the asset's three separate storage fields into one shape callers can consume
+  // without reassembling it themselves:
+  //   - `objectKey`   (the stored source)      -> one `file` of type `source`
+  //   - each `renditions[]` entry (issue #8)   -> a `file` of type `rendition`
+  //   - `manifestUrls` (HLS/DASH, issue #9)    -> `fileGroups`
+  // The legacy fields on the asset are UNCHANGED — this endpoint never writes.
+  // Each `file` carries a PRESIGNED GET `url` (minted the same way as the
+  // /:id/delivery source fallback above) so a caller downloads without MinIO
+  // creds. Package manifests are already public CMAF URLs, so `fileGroups` carry
+  // the manifest URL directly (no per-segment signing).
+  //   200 — the projection (files / fileGroups may each be empty)
+  //   404 — unknown/foreign asset (existence not leaked; matches sibling routes)
+  //   501 — one or more files need presigning but object storage is not
+  //         configured here (same not_configured convention as /:id/delivery)
+  app.get(
+    '/:id/files',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetFilesSchema, 404: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      // Collect the object keys that must be presigned (source + renditions).
+      // Groups (manifests) are already-public URLs and need no signing.
+      const sourceKey = asset.objectKey;
+      const renditions = asset.renditions ?? [];
+      const needsPresign = Boolean(sourceKey) || renditions.length > 0;
+
+      // Match /:id/delivery: only 501 when we actually have a key to sign and no
+      // storage is configured to sign it. An asset with only manifests (or no
+      // files at all) still returns 200 with an empty/group-only projection.
+      if (needsPresign && !storageFor) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured'
+        });
+      }
+
+      const ttl = deliveryUrlTtlSeconds();
+      const storage = storageFor ? storageFor() : undefined;
+
+      const files: z.infer<typeof assetFileSchema>[] = [];
+
+      // Source object -> one `source` file. `id` is the fixed literal "source"
+      // (an asset has at most one source object), giving a stable, addressable id.
+      if (sourceKey) {
+        files.push({
+          id: 'source',
+          type: 'source',
+          name: fileNameFromKey(sourceKey),
+          format: formatFromKey(sourceKey),
+          objectKey: sourceKey,
+          // storage is defined here: needsPresign is true so the 501 guard above
+          // already returned if storageFor was absent.
+          url: await storage!.presignedGet(sourceKey, ttl)
+        });
+      }
+
+      // Each rendition -> a `rendition` file. The rendition already carries a
+      // stable ULID `id` (asset-repo Rendition.id), so the file id is derived
+      // deterministically as `rendition:<renditionId>` — stable across calls and
+      // unique even if two rungs share a label.
+      for (const r of renditions) {
+        files.push({
+          id: `rendition:${r.id}`,
+          type: 'rendition',
+          name: fileNameFromKey(r.objectKey),
+          format: formatFromKey(r.objectKey),
+          objectKey: r.objectKey,
+          url: await storage!.presignedGet(r.objectKey, ttl),
+          label: r.label,
+          width: r.width,
+          height: r.height,
+          bitrateBps: r.bitrateBps,
+          codec: r.codec
+        });
+      }
+
+      // manifestUrls -> streaming fileGroups. `id` is the fixed package type so
+      // each format yields at most one stable group id ("hls"/"dash"). The
+      // objectKeyPrefix is derived from the manifest's path so callers can locate
+      // the segment objects that back the package.
+      const fileGroups: z.infer<typeof assetFileGroupSchema>[] = [];
+      const manifests = asset.manifestUrls;
+      if (manifests?.hls) {
+        fileGroups.push({
+          id: 'hls',
+          type: 'hls-package',
+          name: 'HLS',
+          manifestUrl: manifests.hls,
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls)
+        });
+      }
+      if (manifests?.dash) {
+        fileGroups.push({
+          id: 'dash',
+          type: 'dash-package',
+          name: 'DASH',
+          manifestUrl: manifests.dash,
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash)
+        });
+      }
+
+      return reply.code(200).send({ files, fileGroups });
     }
   );
 
