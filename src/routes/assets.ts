@@ -60,6 +60,7 @@ import {
   type PipelineStepName
 } from '../pipeline/pipelines.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
+import { InMemoryCommentRepository, type CommentRepository } from '../data/comment-repo.js';
 import {
   extractThumbnails,
   type ExtractThumbnailsDeps,
@@ -488,6 +489,9 @@ type AssetsRouterOptions = {
   // PipelineExecution tracking (POST /:id/execute). When absent, the execute
   // route and pipeline-mode packaging respond 501.
   pipelineRepository?: PipelineRepository;
+  // Asset comments (issue #135). Injectable for tests; defaults to an in-memory
+  // repository so the comments sub-resource always works.
+  commentRepository?: CommentRepository;
 };
 
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
@@ -510,6 +514,19 @@ const pipelineExecutionSchema = z.object({
   steps: z.array(stepExecutionSchema),
   createdAt: z.string(),
   updatedAt: z.string()
+});
+
+// Asset comments (issue #135). Free-text `body` only for this iteration; the
+// naming mirrors the Comment model in src/data/comment-repo.ts. The trailing
+// trim + min(1) rejects empty / whitespace-only bodies with 400.
+const commentBodySchema = z.object({
+  body: z.string().trim().min(1).max(4096)
+});
+const commentSchema = z.object({
+  id: z.string(),
+  assetId: z.string(),
+  body: z.string(),
+  createdAt: z.string()
 });
 
 const ingestUrlSchema = z.object({
@@ -606,6 +623,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryAssetRepository();
   const jobs = opts.jobRepository ?? new InMemoryJobRepository();
+  const comments = opts.commentRepository ?? new InMemoryCommentRepository();
   const runner = opts.runPull ?? runPull;
   const extractRunner = opts.extract ?? extractTechnicalMetadata;
   const subtitleRunner = opts.generateSubtitles ?? generateSubtitles;
@@ -1491,6 +1509,56 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const executions = opts.pipelineRepository ? await opts.pipelineRepository.listByAsset(asset.id) : [];
       return reply.code(200).send(executions);
+    }
+  );
+
+  // Asset comments (issue #135). Workspace-scoped and behind `authenticate`.
+  // Free-text notes attached to an asset; frame-accurate / time-based comments
+  // are a later iteration. Matches sibling sub-resources: the parent asset is
+  // resolved first and an unknown/foreign asset returns 404 (existence not
+  // leaked).
+  //
+  // POST /:id/comments — create a comment.
+  //   201 — the created comment
+  //   400 — empty / invalid body (rejected by commentBodySchema)
+  //   404 — unknown/foreign asset
+  app.post(
+    '/:id/comments',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: commentBodySchema,
+        response: { 201: commentSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const comment = await comments.create({ assetId: asset.id, body: request.body.body });
+      return reply.code(201).send(comment);
+    }
+  );
+
+  // GET /:id/comments — list comments for an asset, oldest first.
+  //   200 — array of comments (possibly empty)
+  //   404 — unknown/foreign asset
+  app.get(
+    '/:id/comments',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: z.array(commentSchema), 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const items = await comments.listByAsset(asset.id);
+      return reply.code(200).send(items);
     }
   );
 

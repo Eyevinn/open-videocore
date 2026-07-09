@@ -53,6 +53,7 @@ import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
 import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
+import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
@@ -461,6 +462,11 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 // callback poller (started on scaler activation) can advance executions.
 const pipelineRepository = new InMemoryPipelineRepository();
 
+// Asset comments (issue #135). In-memory: comments are a simple free-text
+// sub-resource for this iteration (mirrors the ephemeral pipeline repo above).
+// Shared with the assets router, which owns POST/GET /:id/comments.
+const commentRepository = new InMemoryCommentRepository();
+
 // Read the first provisioned stack's Valkey URL from the parameter store, or
 // undefined when no stack is provisioned yet. Self-discovered: there is no
 // REDIS_URL env var — the URL only exists once POST /api/v1/provision has run.
@@ -708,7 +714,8 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   sceneDetector,
   packaging,
   packagingRedis: sharedRedis,
-  pipelineRepository
+  pipelineRepository,
+  commentRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
 
