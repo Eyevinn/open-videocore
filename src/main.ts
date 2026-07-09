@@ -41,6 +41,7 @@ import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
 import { makeOscSceneDetector } from './pipeline/osc-scene-detect.js';
 import type { SceneDetector } from './pipeline/scene-detector.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
+import { extractThumbnails } from './pipeline/thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
@@ -741,18 +742,39 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
 await app.register(internalRouter, internalRouterOptions);
 
 // On object storage (upload-complete OR watch-folder ingest), fire-and-forget
-// ffprobe extraction (issue #6). Shared by the upload route and the
-// watch-folder service so a direct-bucket drop gets the same treatment as an
-// API upload. Undefined when no probe runner is configured.
-// The upload route resolves the caller's workspace before invoking this, so the
-// resolver cache is warm and the sync storageFor() can read it.
+// ffprobe extraction (issue #6) and thumbnail extraction (issue #7). Shared by
+// the upload route and the watch-folder service. The upload route resolves the
+// caller's workspace before invoking this, so the resolver cache is warm and
+// the sync storageFor() and resolveCached() can be read synchronously.
 const onObjectStored =
-  storageAvailable && probe
-    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) =>
-        void extractTechnicalMetadata(
-          { assetId, objectKey },
-          { assets: assetRepository, storage: storage ?? storageFor(), probe }
-        )
+  storageAvailable
+    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) => {
+        const effectiveStorage = storage ?? storageFor();
+        if (probe) {
+          void extractTechnicalMetadata(
+            { assetId, objectKey },
+            { assets: assetRepository, storage: effectiveStorage, probe }
+          );
+        }
+        if (thumbnailExtractor) {
+          // Read s3Config from the already-warm resolver cache. The upload
+          // preHandler called resolve() so resolveCached() is valid here.
+          const conns = stackResolver.resolveCached();
+          const s3Cfg = conns?.s3Config;
+          const bucket = conns?.sourceBucket ?? sourceBucket;
+          const extractor = s3Cfg
+            ? (thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)(
+                { ...s3Cfg, bucket }
+              )
+            : undefined;
+          if (extractor) {
+            void extractThumbnails(
+              { assetId, objectKey, timecodes: [1] },
+              { assets: assetRepository, storage: effectiveStorage, extractor }
+            ).catch(() => { /* failures recorded on asset */ });
+          }
+        }
+      }
     : undefined;
 
 if (storageAvailable) {
