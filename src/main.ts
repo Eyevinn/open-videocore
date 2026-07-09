@@ -226,7 +226,14 @@ await app.register(provisionRouter, {
     void reconcileScaler().catch((err) =>
       app.log.warn({ err }, 'encore-scaler: reconcile after stack change failed')
     );
-  }
+  },
+  // Late-bound accessor for the scaler registry. scalerRegistry is a
+  // module-level binding created lazily by reconcileScaler() only once a stack
+  // exists (and reset to undefined on the last deprovision), which is *after*
+  // this register() call runs. This getter reads that outer binding on demand
+  // so the DELETE route can reach the current registry for teardown (#123)
+  // without depending on registration-time ordering.
+  getScalerRegistry: () => scalerRegistry
 });
 
 // Workspace-scoped resource repositories. These hold NO connection of their

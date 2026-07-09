@@ -25,6 +25,7 @@ import {
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { STACK_SERVICES } from '../services/stack.js';
 import type { OperationStore } from '../services/operation-store.js';
+import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
 // referenced by Encore (input/source) and eyevinn-encore-packager
@@ -100,6 +101,15 @@ type ProvisionRouterOptions = {
   // deployment's own tenant (deriveWorkspaceId). Optional: when omitted no cache
   // invalidation is signalled.
   onStackChange?: (workspaceId: string) => void;
+  // Late-bound accessor for the scaler registry. The registry is created lazily
+  // in main.ts *after* this router registers (only once a stack exists), so it
+  // cannot be passed by value at registration time. This getter reads the
+  // outer module-level binding, resolving the ordering: it returns the current
+  // registry when one is active and undefined otherwise. Mirrors the deferred
+  // onStackChange precedent. The DELETE route uses it to reach
+  // WorkspaceEncoreScalerRegistry.teardown(workspaceId) (#122; teardown call
+  // itself is #123). Optional: when omitted the router has no registry to reach.
+  getScalerRegistry?: () => WorkspaceEncoreScalerRegistry | undefined;
   // In-memory store for async provision/deprovision operations. POST / and
   // DELETE /:name return 202 immediately with an operationId; the caller polls
   // GET /operations/:id for completion.
