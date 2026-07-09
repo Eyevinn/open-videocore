@@ -421,6 +421,12 @@ button:disabled {
   font-weight: 600;
 }
 
+.detail-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .detail-panel-body {
   padding: 16px;
 }

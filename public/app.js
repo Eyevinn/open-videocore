@@ -32,6 +32,17 @@ function setActiveStack(name) {
   else localStorage.removeItem(STACK_KEY);
 }
 
+// Window-scoped stack override for detached windows (e.g. detail.html). Unlike
+// setActiveStack, this does NOT touch the shared localStorage key, so popping
+// out a detail for a different stack cannot switch the opener window's active
+// stack. Because each window imports app.js in its own module realm, this
+// variable is naturally isolated per window.
+let stackOverride = null;
+
+function setStackOverride(name) {
+  stackOverride = name || null;
+}
+
 async function initStackSelector() {
   const sel = document.getElementById('stack-select');
   if (!sel) return;
@@ -66,12 +77,17 @@ async function initStackSelector() {
   }
 }
 
+// ─── Shared polling interval ──────────────────────────────────────────────────
+// Single source of truth for the main-UI auto-refresh cadence. Reused by the
+// jobs-table poll and by the standalone detached detail windows (detail.js).
+const DETAIL_POLL_INTERVAL_MS = 5000;
+
 // ─── API fetch helper ────────────────────────────────────────────────────────
 
 const API_BASE = window.location.origin + '/api/v1';
 
 async function apiFetch(path, options = {}) {
-  const stack = getActiveStack();
+  const stack = stackOverride || getActiveStack();
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
@@ -84,7 +100,9 @@ async function apiFetch(path, options = {}) {
       const body = await res.json();
       msg = body.error || body.message || msg;
     } catch (_) { /* ignore */ }
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
@@ -364,6 +382,18 @@ function loadingEl() {
   const txt = document.createTextNode(' Loading…');
   el.appendChild(txt);
   return el;
+}
+
+// ─── Detached detail window ───────────────────────────────────────────────────
+// Opens a standalone detail view (asset or job) in a new browser window. The
+// detached window renders ONLY that one detail view, self-polls, and shares no
+// state with this window. The active stack is passed explicitly so the detached
+// window targets the same stack without depending on the opener's localStorage.
+function openDetailWindow(type, id) {
+  const params = 'type=' + encodeURIComponent(type) +
+    '&id=' + encodeURIComponent(id) +
+    '&stack=' + encodeURIComponent(getActiveStack());
+  window.open('detail.html?' + params, '_blank', 'width=680,height=800,noopener');
 }
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
@@ -651,11 +681,15 @@ async function loadAssets(detailPanel) {
 
 async function showAssetDetail(id, detailPanel) {
   detailPanel.style.display = 'flex';
-  // Static structural HTML only
+  // Static structural HTML only. A "pop out" affordance sits next to the close
+  // button so the user can detach this asset detail into its own window.
   detailPanel.innerHTML = [
     '<div class="detail-panel-header">',
     '  <h3>Asset Detail</h3>',
-    '  <button id="close-detail" class="side-close-btn" aria-label="Close">×</button>',
+    '  <div class="detail-panel-actions">',
+    '    <button id="popout-detail" class="side-close-btn" aria-label="Open in new window" title="Open in new window">⧉</button>',
+    '    <button id="close-detail" class="side-close-btn" aria-label="Close">×</button>',
+    '  </div>',
     '</div>',
     '<div class="detail-panel-body" id="detail-body"></div>',
   ].join('');
@@ -667,11 +701,26 @@ async function showAssetDetail(id, detailPanel) {
     if (table) table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
   });
 
+  detailPanel.querySelector('#popout-detail').addEventListener('click', function() {
+    openDetailWindow('asset', id);
+  });
+
   const body = detailPanel.querySelector('#detail-body');
+  await renderAssetDetailBody(id, body);
+}
+
+// Populate an asset detail view into `bodyEl` from a freshly-fetched asset.
+// Reusable in both the embedded side panel and the standalone detached window.
+// Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
+// the fetched asset (or throws if the fetch fails / 404s so callers can react).
+async function renderAssetDetailBody(id, bodyEl) {
+  const body = bodyEl;
+  body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
 
-  try {
+  {
+    try {
     const asset = await apiFetch('/assets/' + encodeURIComponent(id));
     let deliveryUrl = null;
     try { deliveryUrl = await apiFetch('/assets/' + encodeURIComponent(id) + '/delivery'); } catch (_) {}
@@ -908,9 +957,12 @@ async function showAssetDetail(id, detailPanel) {
       container.appendChild(strip);
     }
 
+    return asset;
   } catch (err) {
     body.innerHTML = '';
     showMsg(body, 'Failed to load asset: ' + err.message, 'error');
+    throw err;
+  }
   }
 }
 
@@ -1046,7 +1098,7 @@ async function renderJobsTab(container) {
       clearInterval(jobsPollTimer);
       jobsPollTimer = null;
     }
-  }, 5000);
+  }, DETAIL_POLL_INTERVAL_MS);
 }
 
 async function loadJobs(detailPanel, silent) {
@@ -1149,7 +1201,10 @@ async function showJobDetail(id, detailPanel) {
   detailPanel.innerHTML = [
     '<div class="detail-panel-header">',
     '  <h3>Job Detail</h3>',
-    '  <button id="close-job-detail" class="side-close-btn" aria-label="Close">×</button>',
+    '  <div class="detail-panel-actions">',
+    '    <button id="popout-job-detail" class="side-close-btn" aria-label="Open in new window" title="Open in new window">⧉</button>',
+    '    <button id="close-job-detail" class="side-close-btn" aria-label="Close">×</button>',
+    '  </div>',
     '</div>',
     '<div class="detail-panel-body" id="job-detail-body"></div>',
   ].join('');
@@ -1162,11 +1217,41 @@ async function showJobDetail(id, detailPanel) {
     if (table) table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
   });
 
+  detailPanel.querySelector('#popout-job-detail').addEventListener('click', function() {
+    openDetailWindow('job', id);
+  });
+
   const body = detailPanel.querySelector('#job-detail-body');
+  // Embedded context: wire the asset-link navigation and cancel-refresh to the
+  // main-window tab UI. In standalone mode these opts are omitted (see detail.js).
+  await renderJobDetailBody(id, body, {
+    onAssetLink: function(assetId) {
+      switchTab('assets');
+      const panel = document.getElementById('asset-detail');
+      if (panel) showAssetDetail(assetId, panel);
+    },
+    afterCancel: function() {
+      showJobDetail(id, detailPanel);
+      loadJobs(detailPanel);
+    },
+  });
+}
+
+// Populate a job detail view into `bodyEl` from a freshly-fetched job.
+// Reusable in the embedded side panel and the standalone detached window.
+// `opts.onAssetLink(assetId)` handles the asset link click (embedded only);
+// `opts.afterCancel()` runs after a successful in-panel cancel (embedded only).
+// Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
+// the fetched job (or throws if the fetch fails / 404s).
+async function renderJobDetailBody(id, bodyEl, opts) {
+  opts = opts || {};
+  const body = bodyEl;
+  body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
 
-  try {
+  {
+    try {
     const job = await apiFetch('/jobs/' + encodeURIComponent(id));
     loader.remove();
 
@@ -1228,15 +1313,13 @@ async function showJobDetail(id, detailPanel) {
     }
 
     // Clicking the asset link jumps to the Assets tab and opens that asset.
+    // Only wired when the caller supplies onAssetLink (embedded main-window
+    // context). In standalone mode the link stays inert (no tab UI to switch to).
     const assetLink = body.querySelector('.job-asset-link');
-    if (assetLink) {
+    if (assetLink && typeof opts.onAssetLink === 'function') {
       assetLink.addEventListener('click', function(e) {
         e.preventDefault();
-        const assetId = assetLink.dataset.assetId;
-        switchTab('assets');
-        // After the assets tab loads, open the asset detail panel.
-        const panel = document.getElementById('asset-detail');
-        if (panel) showAssetDetail(assetId, panel);
+        opts.onAssetLink(assetLink.dataset.assetId);
       });
     }
 
@@ -1289,8 +1372,7 @@ async function showJobDetail(id, detailPanel) {
         cancelBtn.disabled = true;
         try {
           await apiFetch('/jobs/' + encodeURIComponent(job.id), { method: 'DELETE' });
-          showJobDetail(id, detailPanel);
-          await loadJobs(detailPanel);
+          if (typeof opts.afterCancel === 'function') opts.afterCancel();
         } catch (err) {
           cancelBtn.disabled = false;
           alert('Error: ' + err.message);
@@ -1304,9 +1386,12 @@ async function showJobDetail(id, detailPanel) {
     pre.className = 'code-block mt12';
     pre.textContent = JSON.stringify(job, null, 2);
     body.appendChild(pre);
+    return job;
   } catch (err) {
     body.innerHTML = '';
     showMsg(body, 'Failed to load job: ' + err.message, 'error');
+    throw err;
+  }
   }
 }
 
@@ -2887,8 +2972,26 @@ TAB_RENDERERS['webhooks'] = renderWebhooksTab;
 TAB_RENDERERS['storage'] = renderStorageTab;
 TAB_RENDERERS['provision'] = renderProvisionTab;
 
-// ─── Boot ────────────────────────────────────────────────────────────────────
+// ─── Exports for the standalone detached detail window (detail.js) ────────────
+// These are re-used by detail.js via ES module import so the standalone page
+// shares the exact same renderer + helper logic (no duplication / divergence).
+export {
+  renderAssetDetailBody,
+  renderJobDetailBody,
+  setActiveStack,
+  setStackOverride,
+  getActiveStack,
+  DETAIL_POLL_INTERVAL_MS,
+};
 
-setupTabs();
-switchTab(localStorage.getItem(TAB_KEY) || 'assets');
-initStackSelector();
+// ─── Boot ────────────────────────────────────────────────────────────────────
+// Guard: only spin up the full tab UI on the main ops page. When detail.js
+// imports the renderers above, this module's top-level code still executes, so
+// we must NOT boot the tab UI in that context. The main page sets
+// window.__OPS_MAIN__ before importing app.js; as a defensive fallback we also
+// require the tab bar to be present in the DOM.
+if (typeof window !== 'undefined' && window.__OPS_MAIN__ === true && document.querySelector('.tab-bar')) {
+  setupTabs();
+  switchTab(localStorage.getItem(TAB_KEY) || 'assets');
+  initStackSelector();
+}
