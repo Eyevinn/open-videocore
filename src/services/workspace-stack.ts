@@ -272,6 +272,16 @@ export class WorkspaceStackResolver {
     try {
       if (stackName) {
         config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
+        // If the requested stack name isn't found, fall back to the default
+        // (first provisioned) stack rather than degrading to in-memory
+        // connections. This prevents stale UI stack selections from breaking
+        // all storage/asset operations.
+        if (!config) {
+          const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
+          }
+        }
       } else {
         const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
         if (names.length > 0) {

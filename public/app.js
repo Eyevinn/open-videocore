@@ -46,15 +46,15 @@ async function initStackSelector() {
       return;
     }
     const stored = getActiveStack();
+    const validStored = names.includes(stored) ? stored : '';
+    if (!validStored) setActiveStack(names[0]);
     names.forEach(function(name) {
       const opt = document.createElement('option');
       opt.value = name;
       opt.textContent = name;
-      if (name === stored) opt.selected = true;
+      if (name === (validStored || names[0])) opt.selected = true;
       sel.appendChild(opt);
     });
-    // If nothing stored yet, default to first stack
-    if (!stored && names.length) setActiveStack(names[0]);
     sel.addEventListener('change', function() {
       setActiveStack(sel.value);
       // Reload current tab with new stack
