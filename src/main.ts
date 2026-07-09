@@ -644,7 +644,6 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   sourceBucket,
   outputBucket,
   thumbnailExtractor,
-  thumbnailPublicBaseUrl: process.env['THUMBNAIL_PUBLIC_BASE_URL'],
   rewrapRunner,
   clipRunner,
   packaging,
