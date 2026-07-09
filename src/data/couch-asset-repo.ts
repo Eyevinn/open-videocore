@@ -84,6 +84,8 @@ export class CouchAssetRepository implements AssetRepository {
       description: input.description,
       status: 'uploading',
       parentId: input.parentId,
+      versionOfAssetId: input.versionOfAssetId,
+      versionGroupId: input.versionGroupId,
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
       metadata: input.metadata,
