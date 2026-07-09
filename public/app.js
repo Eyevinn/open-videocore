@@ -32,6 +32,17 @@ function setActiveStack(name) {
   else localStorage.removeItem(STACK_KEY);
 }
 
+// Window-scoped stack override for detached windows (e.g. detail.html). Unlike
+// setActiveStack, this does NOT touch the shared localStorage key, so popping
+// out a detail for a different stack cannot switch the opener window's active
+// stack. Because each window imports app.js in its own module realm, this
+// variable is naturally isolated per window.
+let stackOverride = null;
+
+function setStackOverride(name) {
+  stackOverride = name || null;
+}
+
 async function initStackSelector() {
   const sel = document.getElementById('stack-select');
   if (!sel) return;
@@ -76,7 +87,7 @@ const DETAIL_POLL_INTERVAL_MS = 5000;
 const API_BASE = window.location.origin + '/api/v1';
 
 async function apiFetch(path, options = {}) {
-  const stack = getActiveStack();
+  const stack = stackOverride || getActiveStack();
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
@@ -89,7 +100,9 @@ async function apiFetch(path, options = {}) {
       const body = await res.json();
       msg = body.error || body.message || msg;
     } catch (_) { /* ignore */ }
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
@@ -2966,6 +2979,7 @@ export {
   renderAssetDetailBody,
   renderJobDetailBody,
   setActiveStack,
+  setStackOverride,
   getActiveStack,
   DETAIL_POLL_INTERVAL_MS,
 };

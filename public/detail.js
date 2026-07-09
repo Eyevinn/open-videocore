@@ -21,7 +21,7 @@
 import {
   renderAssetDetailBody,
   renderJobDetailBody,
-  setActiveStack,
+  setStackOverride,
   getActiveStack,
   DETAIL_POLL_INTERVAL_MS,
 } from './app.js';
@@ -34,13 +34,14 @@ const type = getParam('type');
 const id = getParam('id');
 const stackParam = getParam('stack');
 
-// Target the same stack as the opener without depending on its localStorage:
-// prefer the explicit ?stack= param, then fall back to this window's own store.
-if (stackParam) setActiveStack(stackParam);
+// Target the same stack as the opener without depending on its localStorage.
+// Use a window-scoped override (not the shared localStorage key) so popping out
+// a detail for a different stack cannot switch the opener window's active stack.
+if (stackParam) setStackOverride(stackParam);
 
 const root = document.getElementById('detail-root');
 const stackLabel = document.getElementById('detail-stack-label');
-const activeStack = getActiveStack();
+const activeStack = stackParam || getActiveStack();
 if (stackLabel) stackLabel.textContent = activeStack ? ('Stack: ' + activeStack) : '';
 
 let pollTimer = null;
@@ -74,7 +75,7 @@ function fatal(message) {
 }
 
 function isNotFound(err) {
-  return err && typeof err.message === 'string' && /HTTP 404|not found/i.test(err.message);
+  return (err && err.status === 404) || (err && typeof err.message === 'string' && /HTTP 404|not[_ -]?found/i.test(err.message));
 }
 
 // Build the static chrome (header + body). Title text is set via textContent.
