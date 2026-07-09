@@ -66,7 +66,7 @@ async function enrichWithProgress(
 }
 
 export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async (app, opts) => {
-  const { pipelineRepository, jobRepository, assetRepository, encoreClient } = opts;
+  const { pipelineRepository, jobRepository, assetRepository } = opts;
   const server = app.withTypeProvider<ZodTypeProvider>();
 
   // List all pipeline executions across all assets, newest first.
@@ -124,6 +124,10 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
 
       // Cancel any pending Encore jobs so they are removed from the scaler
       // queue and don't keep triggering instance spawning.
+      // Read encoreClient from opts at request time — it is updated by
+      // activateScaler() after router registration, so the destructured
+      // value captured at registration would always be stale.
+      const encoreClient = opts.encoreClient;
       if (encoreClient) {
         for (const step of exec.steps) {
           if (step.encoreJobId && step.status !== 'done') {
