@@ -709,6 +709,127 @@ async function showAssetDetail(id, detailPanel) {
   await renderAssetDetailBody(id, body);
 }
 
+// Fetch and render an asset's downloadable files + streaming file groups into
+// `container` from GET /assets/:id/files. Only meaningful once an asset is
+// `ready`; callers gate on that. The response shape is verified against
+// src/routes/assets.ts (assetFileSchema / assetFileGroupSchema, ~L187-214) and
+// openapi.json:
+//   files[]:      { id, type: 'source'|'rendition'|'export', name, format,
+//                   objectKey, url, sizeBytes?, label?, width?, height?,
+//                   bitrateBps?, codec? }
+//   fileGroups[]: { id, type: 'hls-package'|'dash-package', name, manifestUrl,
+//                   segmentCount?, objectKeyPrefix }
+// Renders nothing (leaves `container` empty) when both lists are empty, so the
+// section stays hidden for assets that expose no files. All server-provided
+// text flows through escHtml before interpolation.
+async function renderAssetFiles(assetId, container) {
+  container.innerHTML = '';
+
+  var data;
+  try {
+    data = await apiFetch('/assets/' + encodeURIComponent(assetId) + '/files');
+  } catch (err) {
+    // A transient/records failure here should not blank the whole detail panel;
+    // surface it inline and leave the rest of the panel intact.
+    var e = document.createElement('div');
+    e.className = 'text-muted';
+    e.textContent = 'Could not load files: ' + err.message;
+    container.appendChild(e);
+    return;
+  }
+
+  var files = (data && data.files) || [];
+  var fileGroups = (data && data.fileGroups) || [];
+  // Per issue #157: the section is only shown when there is at least one file or
+  // group. Nothing to render -> leave the container empty (hidden).
+  if (files.length === 0 && fileGroups.length === 0) return;
+
+  // A compact "resolution/bitrate" summary for a rendition. Any of the optional
+  // fields may be absent (e.g. audio-only rendition) — the row still renders
+  // with whatever is present, and shows '—' when nothing is available.
+  var detailsFor = function(f) {
+    var parts = [];
+    if (f.width && f.height) parts.push(f.width + '×' + f.height);
+    if (f.bitrateBps) parts.push(Math.round(f.bitrateBps / 1000) + ' kbps');
+    if (f.codec) parts.push(escHtml(f.codec));
+    if (f.sizeBytes != null) parts.push(escHtml(fmtBytes(f.sizeBytes)));
+    return parts.length ? parts.join(' · ') : '<span class="text-muted">—</span>';
+  };
+
+  if (files.length > 0) {
+    var filesTitle = document.createElement('div');
+    filesTitle.className = 'section-title';
+    filesTitle.textContent = 'Files';
+    container.appendChild(filesTitle);
+
+    var fwrap = document.createElement('div');
+    fwrap.className = 'table-wrap';
+    var frows = files.map(function(f) {
+      var label = f.label ? (escHtml(f.name) + ' <span class="text-muted">(' + escHtml(f.label) + ')</span>') : escHtml(f.name);
+      return '<tr>' +
+        '<td>' + renderBadge(f.type) + '</td>' +
+        '<td>' + label + '</td>' +
+        '<td>' + escHtml(f.format || '—') + '</td>' +
+        '<td>' + detailsFor(f) + '</td>' +
+        '<td><a class="btn-ghost" href="' + escHtml(f.url) + '" target="_blank" rel="noopener" download>Download</a></td>' +
+        '</tr>';
+    }).join('');
+    fwrap.innerHTML =
+      '<table><thead><tr>' +
+      '<th>Type</th><th>Filename</th><th>Format</th><th>Details</th><th></th>' +
+      '</tr></thead><tbody>' + frows + '</tbody></table>';
+    container.appendChild(fwrap);
+  }
+
+  if (fileGroups.length > 0) {
+    var groupsTitle = document.createElement('div');
+    groupsTitle.className = 'section-title mt12';
+    groupsTitle.textContent = 'File Groups';
+    container.appendChild(groupsTitle);
+
+    var gwrap = document.createElement('div');
+    gwrap.className = 'table-wrap';
+    var grows = fileGroups.map(function(g, i) {
+      return '<tr>' +
+        '<td>' + renderBadge(g.type) + '</td>' +
+        '<td>' + escHtml(g.name) + '</td>' +
+        '<td class="cell-id" title="' + escHtml(g.manifestUrl) + '">' + escHtml(g.manifestUrl) + '</td>' +
+        '<td>' +
+          '<button type="button" class="btn-ghost file-group-copy" data-idx="' + i + '">Copy URL</button> ' +
+          '<a class="btn-ghost" href="' + escHtml(g.manifestUrl) + '" target="_blank" rel="noopener">Open</a>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    gwrap.innerHTML =
+      '<table><thead><tr>' +
+      '<th>Type</th><th>Name</th><th>Manifest URL</th><th></th>' +
+      '</tr></thead><tbody>' + grows + '</tbody></table>';
+    container.appendChild(gwrap);
+
+    // Copy-to-clipboard for each manifest URL. Bound via the untrusted URL held
+    // in JS (not re-parsed from the DOM) and reported with transient feedback.
+    gwrap.querySelectorAll('.file-group-copy').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var group = fileGroups[Number(btn.dataset.idx)];
+        if (!group) return;
+        var restore = function(text) {
+          var prev = btn.textContent;
+          btn.textContent = text;
+          setTimeout(function() { btn.textContent = prev; }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(group.manifestUrl).then(
+            function() { restore('Copied'); },
+            function() { restore('Copy failed'); }
+          );
+        } else {
+          restore('Copy unavailable');
+        }
+      });
+    });
+  }
+}
+
 // Populate an asset detail view into `bodyEl` from a freshly-fetched asset.
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
@@ -896,6 +1017,17 @@ async function renderAssetDetailBody(id, bodyEl) {
     const thumbArea = document.createElement('div');
     thumbArea.id = 'thumbnails-area';
     body.appendChild(thumbArea);
+
+    // Files + File Groups (issue #157). Only fetch/show for a ready asset; the
+    // helper itself hides the section when the response has no files or groups.
+    // 'ready' matches the ASSET_STATUSES enum (src/data/asset-repo.ts:28).
+    if (asset.status === 'ready') {
+      const filesArea = document.createElement('div');
+      filesArea.className = 'mt12';
+      filesArea.id = 'files-area';
+      body.appendChild(filesArea);
+      await renderAssetFiles(id, filesArea);
+    }
 
     body.querySelector('#btn-extract-meta').addEventListener('click', async function() {
       actionMsg.innerHTML = '';
