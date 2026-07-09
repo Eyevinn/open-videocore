@@ -50,6 +50,11 @@ import {
   type SubtitleGenerator
 } from '../pipeline/subtitle-generator.js';
 import {
+  detectScenes,
+  type DetectScenesDeps,
+  type SceneDetector
+} from '../pipeline/scene-detector.js';
+import {
   BUILT_IN_PIPELINES,
   PIPELINE_NAMES,
   type PipelineStepName
@@ -275,6 +280,20 @@ const manifestUrlsSchema = z.object({
   dash: z.string().optional()
 });
 
+// Scene/shot-detection metadata (issue #115). Boundary fields are all optional
+// because the eyevinn-function-scenes runtime wire shape is not contract-verified
+// (see pipeline/scene-detector.ts), so a boundary may carry only a subset.
+const sceneBoundarySchema = z.object({
+  startSeconds: z.number().optional(),
+  endSeconds: z.number().optional(),
+  keyframeSeconds: z.number().optional()
+});
+const sceneMetadataSchema = z.object({
+  boundaries: z.array(sceneBoundarySchema),
+  sceneCount: z.number(),
+  detectedAt: z.string()
+});
+
 const renditionSchema = z.object({
   id: z.string(),
   label: z.string(),
@@ -353,6 +372,11 @@ const assetSchema = z.object({
   // (or after a failed one); `technicalMetadataError` carries the last failure.
   technicalMetadata: technicalMetadataSchema.nullish(),
   technicalMetadataError: z.string().optional(),
+  // Scene/shot-detection metadata (issue #115). `null` until the first successful
+  // detection (or after a failed one); `sceneDetectionError` carries the last
+  // failure. Surfaced here so clip/trim clients read the cut points from GET /:id.
+  sceneMetadata: sceneMetadataSchema.nullish(),
+  sceneDetectionError: z.string().optional(),
   // Streaming manifest URLs from the packaging pipeline (issue #9). Absent until
   // packaging completes; `packagingError` carries the last packaging failure.
   manifestUrls: manifestUrlsSchema.optional(),
@@ -417,6 +441,15 @@ type AssetsRouterOptions = {
   // Defaults to the real fire-and-forget generator.
   generateSubtitles?: typeof generateSubtitles;
   subtitleDeps?: Partial<GenerateSubtitlesDeps>;
+  // Scene detection (issue #115). `sceneDetector` calls the OSC
+  // eyevinn-function-scenes media function (a stub in tests). When absent (or no
+  // object storage), the OPTIONAL `scene-detect` pipeline step skips gracefully —
+  // it is fire-and-forget and never throws into the ingest/pipeline path.
+  sceneDetector?: SceneDetector;
+  // Injectable orchestrator runner + extra deps (tests stub the detector/TTL).
+  // Defaults to the real fire-and-forget detector.
+  detectScenes?: typeof detectScenes;
+  sceneDetectDeps?: Partial<DetectScenesDeps>;
   // Encore transcode client (issue #8). When absent, POST /:id/transcode
   // responds 501 (Encore not configured on this deployment).
   encore?: EncoreClient;
@@ -460,7 +493,7 @@ type AssetsRouterOptions = {
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
 const stepStatusSchema = z.enum(['pending', 'running', 'done', 'failed']);
 const stepExecutionSchema = z.object({
-  name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'transcode', 'package']),
+  name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
   status: stepStatusSchema,
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
@@ -565,6 +598,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const runner = opts.runPull ?? runPull;
   const extractRunner = opts.extract ?? extractTechnicalMetadata;
   const subtitleRunner = opts.generateSubtitles ?? generateSubtitles;
+  const sceneDetectRunner = opts.detectScenes ?? detectScenes;
   const thumbnailRunner = opts.extractThumbnails ?? extractThumbnails;
   const rewrapRunner = opts.rewrap ?? rewrap;
   const clipRunnerOrchestrator = opts.clip ?? runClip;
@@ -607,6 +641,28 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         storage: storageFor(),
         generate: opts.subtitleGenerator,
         ...opts.subtitleDeps
+      }
+    );
+    return true;
+  }
+
+  // Fire-and-forget scene/shot detection for a pipeline step (issue #115).
+  // Detached, never blocks the caller, and the detector itself never throws
+  // (records failures on the asset as `sceneDetectionError`). No-op when the OSC
+  // eyevinn-function-scenes service or object storage is not configured —
+  // consistent with the OPTIONAL, opt-in nature of the step. Returns true when a
+  // detection was actually kicked off (false = skipped gracefully).
+  function triggerSceneDetect(assetId: string, objectKey: string): boolean {
+    if (!opts.sceneDetector || !storageFor) {
+      return false;
+    }
+    void sceneDetectRunner(
+      { assetId, objectKey },
+      {
+        assets: repo,
+        storage: storageFor(),
+        detect: opts.sceneDetector,
+        ...opts.sceneDetectDeps
       }
     );
     return true;
@@ -681,7 +737,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     }
     if (
-      (firstStep === 'extract-metadata' || firstStep === 'thumbnail' || firstStep === 'subtitles') &&
+      (firstStep === 'extract-metadata' ||
+        firstStep === 'thumbnail' ||
+        firstStep === 'subtitles' ||
+        firstStep === 'scene-detect') &&
       !asset.objectKey
     ) {
       reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
@@ -715,6 +774,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // generator records its own success/failure on the asset and never
           // throws into this loop, so the step never fails the pipeline.
           triggerSubtitles(asset.id, asset.objectKey as string);
+          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          continue;
+        }
+        if (step.name === 'scene-detect') {
+          // Fire-and-forget, exactly like extract-metadata/subtitles: kick off (or
+          // skip gracefully when unconfigured) and settle the step immediately. The
+          // detector records its own success/failure on the asset and never throws
+          // into this loop, so the step never fails the pipeline.
+          triggerSceneDetect(asset.id, asset.objectKey as string);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }

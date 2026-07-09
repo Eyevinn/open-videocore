@@ -106,6 +106,27 @@ const EditorialSubtitleTrackSchema = z.object({
   default: z.boolean().optional()
 });
 
+// Scene/shot-detection boundary (issue #115), persisted under the structural
+// namespace. All fields optional/permissive because the runtime wire shape of
+// eyevinn-function-scenes is NOT contract-verified (see pipeline/scene-detector.ts).
+const SceneBoundarySchema = z.object({
+  startSeconds: z.number().optional(),
+  endSeconds: z.number().optional(),
+  keyframeSeconds: z.number().optional()
+});
+
+// Scene-detection metadata (issue #115). Held under the structural namespace and
+// optional so documents written before #115 (field absent) still deserialize — no
+// schemaVersion bump required. The failure of the LAST attempt is carried in a
+// separate structural `sceneDetectionError` field (mirroring `packagingError` /
+// `subtitlesError`), so a failed detection records the error without a metadata
+// object, exactly like the flat domain type.
+const SceneDetectionSchema = z.object({
+  boundaries: z.array(SceneBoundarySchema).default([]),
+  sceneCount: z.number().default(0),
+  detectedAt: z.string()
+});
+
 const StatusTransitionSchema = z.object({
   at: z.string(),
   from: z.string().nullable(),
@@ -184,6 +205,11 @@ export const AssetDocumentSchema = z.object({
       // documents written before #114 (field absent) still deserialize — no
       // schemaVersion bump required.
       subtitlesError: z.string().optional(),
+      // Scene/shot-detection metadata (issue #115) and the last detection
+      // failure. Both optional so documents written before #115 (fields absent)
+      // still deserialize — no schemaVersion bump required.
+      sceneDetection: SceneDetectionSchema.optional(),
+      sceneDetectionError: z.string().optional(),
       editorialAudio: z.array(EditorialAudioTrackSchema).optional(),
       editorialSubtitles: z.array(EditorialSubtitleTrackSchema).optional()
     })
@@ -304,6 +330,16 @@ export function toAssetDocument(
   if (asset.subtitlesError) {
     doc.structural.subtitlesError = asset.subtitlesError;
   }
+  if (asset.sceneMetadata) {
+    doc.structural.sceneDetection = {
+      boundaries: asset.sceneMetadata.boundaries,
+      sceneCount: asset.sceneMetadata.sceneCount,
+      detectedAt: asset.sceneMetadata.detectedAt
+    };
+  }
+  if (asset.sceneDetectionError) {
+    doc.structural.sceneDetectionError = asset.sceneDetectionError;
+  }
   if (asset.thumbnails && asset.thumbnails.length > 0) {
     doc.structural.thumbnails = asset.thumbnails.map((objectKey) => ({ objectKey }));
   }
@@ -353,6 +389,17 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     manifestUrls,
     packagingError: doc.structural?.packagingError,
     subtitlesError: doc.structural?.subtitlesError,
+    // Scene-detection metadata (issue #115). Absent structural.sceneDetection
+    // maps to `undefined` (never detected) rather than `null`; the flat type
+    // treats both as "no metadata yet". The last failure round-trips separately.
+    sceneMetadata: doc.structural?.sceneDetection
+      ? {
+          boundaries: doc.structural.sceneDetection.boundaries,
+          sceneCount: doc.structural.sceneDetection.sceneCount,
+          detectedAt: doc.structural.sceneDetection.detectedAt
+        }
+      : undefined,
+    sceneDetectionError: doc.structural?.sceneDetectionError,
     renditions: renditions && renditions.length > 0 ? renditions : undefined,
     thumbnails: thumbnails && thumbnails.length > 0 ? thumbnails : undefined,
     metadata:

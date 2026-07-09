@@ -52,6 +52,24 @@ export const FFPROBE_SERVICE_ID = 'eyevinn-ffmpeg-s3' as const;
 // `/transcribe/s3` endpoint for S3 sources; does NOT support config updates.
 export const AUTO_SUBTITLES_SERVICE_ID = 'eyevinn-auto-subtitles' as const;
 
+// eyevinn-function-scenes ("Scene Detect Media Function"): the serverless media
+// function used by the OPTIONAL scene/shot-detection pipeline step (issue #115).
+// It produces keyframe + scene-boundary metadata for the clip/trim workflows.
+// Like eyevinn-auto-subtitles it is a resolvable instance called over HTTP at its
+// instance URL (see pipeline/osc-scene-detect.ts), NOT an ephemeral job like
+// eyevinn-ffmpeg-s3. It is NOT part of the long-lived provisioned stack above — it
+// is an opt-in consumer function, provisioned separately — so it is exported
+// separately rather than added to STACK_SERVICES (mirrors the FFPROBE_SERVICE_ID
+// and AUTO_SUBTITLES_SERVICE_ID treatment).
+//
+// Contract source: get-service-schema for `eyevinn-function-scenes`.
+// create-service-instance config: required `name` (string) ONLY — it is a
+// serverless media function. NOTE: get-service-schema exposes ONLY this
+// provisioning config, NOT the runtime endpoint's request/response wire shape;
+// that un-verified wire shape is isolated in pipeline/osc-scene-detect.ts behind
+// the injected SceneDetector interface.
+export const SCENE_DETECT_SERVICE_ID = 'eyevinn-function-scenes' as const;
+
 // Teardown order is the reverse of provision order: consumers are removed
 // before the producers they depend on (packager -> queue -> database ->
 // storage). This avoids tearing a producer out from under a still-running

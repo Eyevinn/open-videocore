@@ -38,6 +38,8 @@ import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
 import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
+import { makeOscSceneDetector } from './pipeline/osc-scene-detect.js';
+import type { SceneDetector } from './pipeline/scene-detector.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
@@ -359,6 +361,28 @@ if (storageAvailable && !autoSubtitlesInstanceName) {
   app.log.info('AUTO_SUBTITLES_INSTANCE_NAME not set — optional auto-subtitles pipeline step disabled');
 }
 
+// Scene detection (issue #115) runs on the OSC eyevinn-function-scenes media
+// FUNCTION, called over HTTP at its instance URL (NOT an ephemeral job). Like
+// auto-subtitles it is OPTIONAL and opt-in: the function is provisioned
+// separately, so the deployment supplies the instance name via
+// SCENE_DETECT_INSTANCE_NAME. When that name is unset (or object storage is
+// missing) the detector is undefined and the OPTIONAL `scene-detect` pipeline
+// step skips gracefully (never throws — fire-and-forget). SCENE_DETECT_PATH
+// overrides the (un-contract-verified) runtime endpoint path (default '/').
+const sceneDetectInstanceName = process.env['SCENE_DETECT_INSTANCE_NAME'];
+const sceneDetector: SceneDetector | undefined =
+  storageAvailable && sceneDetectInstanceName
+    ? makeOscSceneDetector({
+        context: oscContext,
+        getInstance,
+        instanceName: sceneDetectInstanceName,
+        path: process.env['SCENE_DETECT_PATH']
+      })
+    : undefined;
+if (storageAvailable && !sceneDetectInstanceName) {
+  app.log.info('SCENE_DETECT_INSTANCE_NAME not set — optional scene-detect pipeline step disabled');
+}
+
 // ABR transcoding via auto-scaling Encore pool (ADR-006). The scaler exposes
 // the same EncoreClient interface as the old static client but manages a
 // per-workspace pool of Encore OSC instances. Set ENCORE_MAX_INSTANCES=1 to
@@ -672,6 +696,7 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   rewrapRunner,
   clipRunner,
   subtitleGenerator,
+  sceneDetector,
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository

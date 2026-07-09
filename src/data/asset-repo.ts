@@ -135,6 +135,35 @@ export type TechnicalMetadata = {
   extractedAt: string; // ISO timestamp of when extraction completed
 };
 
+// One scene/shot boundary produced by the scene-detection pipeline (issue #115,
+// eyevinn-function-scenes). A scene-detection tool reports the natural cut points
+// of a video; each boundary describes one detected shot for use in the clip/trim
+// workflows. Fields are ALL optional/permissive because the runtime wire shape of
+// eyevinn-function-scenes is NOT contract-verified (see pipeline/scene-detector.ts):
+//   - startSeconds / endSeconds: the [start, end) window of the shot in seconds.
+//     `endSeconds` may be absent for the final shot (no following cut).
+//   - keyframeSeconds: a representative keyframe timecode for the shot, typically
+//     the cut point at the shot's start.
+export type SceneBoundary = {
+  startSeconds?: number;
+  endSeconds?: number;
+  keyframeSeconds?: number;
+};
+
+// Scene/shot-detection metadata extracted from the stored object by the OSC
+// eyevinn-function-scenes media function (issue #115). Populated asynchronously
+// after ingest by the OPTIONAL, fire-and-forget scene-detect step; null until the
+// first successful detection (or after a failed one — see `sceneDetectionError`).
+// It is METADATA (mirrors TechnicalMetadata), not an asset-producing output, and
+// surfaces on the asset for clip/trim workflows to consume the cut points.
+export type SceneMetadata = {
+  // Detected scene/shot boundaries, in ascending time order.
+  boundaries: SceneBoundary[];
+  // Number of detected boundaries (convenience mirror of boundaries.length).
+  sceneCount: number;
+  detectedAt: string; // ISO timestamp of when detection completed
+};
+
 // Streaming manifest URLs produced by the HLS/DASH packaging pipeline (issue
 // #9). Populated asynchronously after transcoding completes and the
 // eyevinn-encore-packager finishes packaging. Both are MinIO-hosted manifest
@@ -278,6 +307,13 @@ export type Asset = {
   // blocks the asset record or changes lifecycle status, so it is optional and
   // cleared (to undefined) on the next successful generation.
   subtitlesError?: string;
+  // Scene/shot-detection metadata from the scene-detect pipeline (issue #115).
+  // `null` means detection has not yet succeeded; an accompanying
+  // `sceneDetectionError` carries the reason when the last attempt failed.
+  // Detection never blocks the asset record or changes lifecycle status, so both
+  // fields are optional. Surfaced on GET /:id for clip/trim workflows.
+  sceneMetadata?: SceneMetadata | null;
+  sceneDetectionError?: string;
   // How the asset entered the system (ADR-005 administrative.source.method).
   sourceMethod?: AssetSourceMethod;
   // Origin URI for url-pull / watch-folder ingest.
@@ -366,6 +402,13 @@ export type UpdateAssetInput = {
   // failure; writing `null` clears any prior error after a successful attach.
   // Does not change `status`. Mirrors the technicalMetadataError semantics.
   subtitlesError?: string | null;
+  // Set by the scene-detect pipeline (issue #115). Writing `sceneMetadata` to a
+  // value clears any prior error; writing `sceneDetectionError` records a failure
+  // and leaves `sceneMetadata` null. `null` is an accepted value for
+  // `sceneMetadata` (distinct from "not provided"). Mirrors the
+  // technicalMetadata/technicalMetadataError semantics. Does not change `status`.
+  sceneMetadata?: SceneMetadata | null;
+  sceneDetectionError?: string;
 };
 
 export type ListOptions = {
@@ -475,6 +518,9 @@ export function provenanceForPatch(patch: UpdateAssetInput, now: string): Proven
   }
   if (patch.technicalMetadata !== undefined || patch.technicalMetadataError !== undefined) {
     entries.push({ at: now, by: 'system', op: 'technical' });
+  }
+  if (patch.sceneMetadata !== undefined || patch.sceneDetectionError !== undefined) {
+    entries.push({ at: now, by: 'system', op: 'scenes' });
   }
   if (patch.renditions !== undefined) {
     entries.push({ at: now, by: 'system', op: 'rendition' });
@@ -817,6 +863,16 @@ export class InMemoryAssetRepository implements AssetRepository {
     if (patch.subtitlesError !== undefined) {
       // `null` clears the error (successful attach); a string records a failure.
       next.subtitlesError = patch.subtitlesError ?? undefined;
+    }
+    if (patch.sceneMetadata !== undefined) {
+      next.sceneMetadata = patch.sceneMetadata;
+      // A successful detection clears any stale error.
+      if (patch.sceneMetadata !== null) {
+        next.sceneDetectionError = undefined;
+      }
+    }
+    if (patch.sceneDetectionError !== undefined) {
+      next.sceneDetectionError = patch.sceneDetectionError;
     }
     if (patch.versionGroupId !== undefined) {
       next.versionGroupId = patch.versionGroupId;

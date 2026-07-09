@@ -194,6 +194,16 @@ export class CouchAssetRepository implements AssetRepository {
       // `null` clears the error (successful attach); a string records a failure.
       next.subtitlesError = patch.subtitlesError ?? undefined;
     }
+    if (patch.sceneMetadata !== undefined) {
+      next.sceneMetadata = patch.sceneMetadata;
+      // A successful detection clears any stale error.
+      if (patch.sceneMetadata !== null) {
+        next.sceneDetectionError = undefined;
+      }
+    }
+    if (patch.sceneDetectionError !== undefined) {
+      next.sceneDetectionError = patch.sceneDetectionError;
+    }
     if (patch.versionGroupId !== undefined) {
       next.versionGroupId = patch.versionGroupId;
     }
