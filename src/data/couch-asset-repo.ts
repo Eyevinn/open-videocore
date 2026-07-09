@@ -31,6 +31,7 @@ import {
   applyMetadata,
   applyStatus,
   clampLimit,
+  generateUniqueSlug,
   initialHistory,
   initialProvenance,
   normalizeTags,
@@ -67,9 +68,17 @@ export class CouchAssetRepository implements AssetRepository {
     // ULID local id (ADR-005 / issue #53): time-sortable + URL-safe.
     const localId = ulid();
     const method = input.sourceMethod ?? 'upload';
+    // Human-readable slug (issue #131), unique within this stack's database.
+    // OSC provisions one CouchDB instance per tenant (ADR-003), so a slug
+    // existence check against this database is inherently workspace-scoped.
+    const slug = await generateUniqueSlug(
+      (s) => this.slugTaken(couch, s),
+      input.slug
+    );
     const asset: Asset = {
       id: localId,
       name: input.name,
+      slug,
       description: input.description,
       status: 'uploading',
       parentId: input.parentId,
@@ -192,6 +201,13 @@ export class CouchAssetRepository implements AssetRepository {
     return next;
   }
 
+  // Workspace-scoped slug existence check (issue #131). Queries the top-level
+  // `slug` mirror emitted by toDoc() so the lookup is a simple Mango selector.
+  private async slugTaken(couch: StackCouch, slug: string): Promise<boolean> {
+    const matches = await couch.find({ resourceType: RESOURCE_TYPE, slug }, { limit: 1 });
+    return matches.length > 0;
+  }
+
   async countChildren(id: string): Promise<number> {
     const couch = this.couchFor();
     // Archived children no longer block deletion — they are already soft-deleted.
@@ -231,7 +247,11 @@ function toDoc(asset: Asset): Record<string, unknown> {
     resourceType: RESOURCE_TYPE,
     localId: asset.id,
     state: asset.status,
-    derivedFrom: asset.parentId ?? null
+    derivedFrom: asset.parentId ?? null,
+    // Top-level mirror of descriptive.slug (issue #131) so the workspace-scoped
+    // uniqueness check is a simple, indexable Mango selector. Omitted for
+    // legacy/slug-less assets.
+    ...(asset.slug ? { slug: asset.slug } : {})
   };
 }
 

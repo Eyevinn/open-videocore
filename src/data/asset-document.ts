@@ -123,6 +123,9 @@ export const AssetDocumentSchema = z.object({
 
   descriptive: z.object({
     title: z.string(),
+    // Human-readable URL-safe handle (issue #131). Optional so documents written
+    // before slugs existed still deserialize (field simply absent).
+    slug: z.string().optional(),
     description: z.string().optional(),
     tags: z.array(z.string()).default([]),
     language: z.string().optional(),
@@ -236,6 +239,7 @@ export function toAssetDocument(
     state: asset.status,
     descriptive: {
       title: asset.name,
+      slug: asset.slug,
       description: asset.description,
       tags: asset.tags ?? [],
       custom: (asset.metadata as Record<string, unknown>) ?? {}
@@ -300,6 +304,7 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
   return {
     id: doc._id,
     name: doc.descriptive.title,
+    slug: doc.descriptive.slug,
     description: doc.descriptive.description,
     status: doc.state as AssetStatus,
     parentId: derivedFrom ?? undefined,

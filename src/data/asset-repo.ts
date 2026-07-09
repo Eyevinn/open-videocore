@@ -159,6 +159,12 @@ export type SubtitleTrack = {
 export type Asset = {
   id: string;
   name: string;
+  // URL-safe, human-readable handle (issue #131). Generated at create time,
+  // lowercase words joined by hyphens plus a numeric suffix (e.g.
+  // `brave-river-042`), unique within the (structurally isolated) workspace.
+  // The ULID `id` remains the internal primary key; `slug` is a friendly alias.
+  // Optional so pre-existing slug-less assets remain valid on read/validation.
+  slug?: string;
   description?: string;
   status: AssetStatus;
   // Source asset id for renditions/children; undefined for top-level sources.
@@ -217,6 +223,11 @@ export type Asset = {
 
 export type CreateAssetInput = {
   name: string;
+  // Optional caller-supplied slug (issue #131). When omitted the repository
+  // generates a unique, human-readable slug per workspace. When supplied it is
+  // normalized and, on collision within the workspace, a numeric suffix is
+  // appended to make it unique.
+  slug?: string;
   description?: string;
   parentId?: string;
   objectKey?: string;
@@ -427,6 +438,92 @@ export function normalizeTags(tags: readonly string[]): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Human-readable slug generation (issue #131)
+// ---------------------------------------------------------------------------
+
+// Small embedded word lists for friendly, URL-safe slugs (e.g. `brave-river-042`).
+// No existing generator/word list was found in the repo, so a compact list is
+// used here. All entries are lowercase [a-z] only, so the joined slug is always
+// URL-safe without further escaping.
+const SLUG_ADJECTIVES = [
+  'brave', 'calm', 'clever', 'bright', 'bold', 'gentle', 'happy', 'keen',
+  'lively', 'lucky', 'merry', 'noble', 'proud', 'quiet', 'swift', 'warm',
+  'wise', 'zesty', 'amber', 'azure', 'cosmic', 'crisp', 'daring', 'eager',
+  'fancy', 'golden', 'humble', 'jolly', 'mellow', 'nimble', 'placid', 'rapid'
+] as const;
+
+const SLUG_NOUNS = [
+  'river', 'forest', 'meadow', 'canyon', 'harbor', 'summit', 'valley', 'island',
+  'comet', 'nebula', 'falcon', 'otter', 'badger', 'lynx', 'heron', 'willow',
+  'cedar', 'maple', 'ember', 'pebble', 'ripple', 'breeze', 'boulder', 'lagoon',
+  'glacier', 'prairie', 'tundra', 'orchard', 'thicket', 'delta', 'fjord', 'reef'
+] as const;
+
+// Maximum number of generation attempts before falling back to a guaranteed
+// suffix. Bounds the collision-retry loop so create() cannot spin forever.
+export const SLUG_MAX_ATTEMPTS = 25;
+
+function pick<T>(list: readonly T[]): T {
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+// Coerce an arbitrary string into a URL-safe, lowercase, hyphen-joined slug
+// base. Non-alphanumeric runs collapse to a single hyphen; leading/trailing
+// hyphens are trimmed. Returns '' when nothing usable remains (caller then
+// falls back to a generated base).
+export function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .normalize('NFKD')
+    // Strip combining diacritical marks (U+0300-U+036F) left by NFKD so
+    // accented input folds to plain ASCII before the alnum filter below.
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+// Build one random `<adjective>-<noun>-<NNN>` slug candidate. The numeric
+// suffix is zero-padded to three digits for a stable, readable shape.
+export function randomSlug(): string {
+  const suffix = Math.floor(Math.random() * 1000)
+    .toString()
+    .padStart(3, '0');
+  return `${pick(SLUG_ADJECTIVES)}-${pick(SLUG_NOUNS)}-${suffix}`;
+}
+
+// Generate a slug that is unique within a workspace. `isTaken` performs the
+// workspace-scoped existence check (each repository supplies its own lookup,
+// so uniqueness is always scoped to that repository's isolated store).
+//
+// When `base` is provided (a caller-supplied slug) it is normalized and used as
+// the stem; collisions append an incrementing `-N` suffix. When `base` is
+// absent a fresh random `adjective-noun-NNN` candidate is drawn each attempt.
+// After SLUG_MAX_ATTEMPTS the loop appends a short unique-ish suffix so create()
+// is always bounded and never blocks.
+export async function generateUniqueSlug(
+  isTaken: (slug: string) => Promise<boolean>,
+  base?: string
+): Promise<string> {
+  const stem = base ? slugify(base) : '';
+  for (let attempt = 0; attempt < SLUG_MAX_ATTEMPTS; attempt++) {
+    let candidate: string;
+    if (stem) {
+      candidate = attempt === 0 ? stem : `${stem}-${attempt + 1}`;
+    } else {
+      candidate = randomSlug();
+    }
+    if (!(await isTaken(candidate))) {
+      return candidate;
+    }
+  }
+  // Bounded fallback: append a random 6-char base36 tail to whatever stem we
+  // have (or a fresh random slug), guaranteeing termination.
+  const tail = Math.random().toString(36).slice(2, 8);
+  const fallbackStem = stem || randomSlug();
+  return `${fallbackStem}-${tail}`;
+}
+
+// ---------------------------------------------------------------------------
 // In-memory implementation
 // ---------------------------------------------------------------------------
 
@@ -446,9 +543,13 @@ export class InMemoryAssetRepository implements AssetRepository {
     // ULID local id (ADR-005 / issue #53): time-sortable + URL-safe.
     const localId = ulid();
     const method = input.sourceMethod ?? 'upload';
+    // Human-readable slug (issue #131), unique within this repository's store
+    // (workspace-scoped uniqueness — the store is one tenant's isolated set).
+    const slug = await generateUniqueSlug((s) => this.slugTaken(s), input.slug);
     const asset: Asset = {
       id: localId,
       name: input.name,
+      slug,
       description: input.description,
       status: 'uploading',
       parentId: input.parentId,
@@ -464,6 +565,17 @@ export class InMemoryAssetRepository implements AssetRepository {
     };
     this.store.set(localId, asset);
     return { ...asset };
+  }
+
+  // Workspace-scoped slug existence check (issue #131). Scans this store, which
+  // holds exactly one tenant's assets, so uniqueness is per-workspace.
+  private async slugTaken(slug: string): Promise<boolean> {
+    for (const a of this.store.values()) {
+      if (a.slug === slug) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async get(id: string): Promise<Asset | undefined> {
