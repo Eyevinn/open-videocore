@@ -100,5 +100,10 @@ export const keys = {
   // dispatch time alongside jobUuid so the callback poller can resolve the
   // correct Encore instance URL even when the callback listener's built-in URL
   // points at the wrong (non-scaler) instance.
-  uuidToExternalId: (encoreUuid: string) => `encore:uuid-ext:${encoreUuid}`
+  uuidToExternalId: (encoreUuid: string) => `encore:uuid-ext:${encoreUuid}`,
+  // Full Encore job URL (instanceUrl/encoreJobs/uuid) stored at dispatch time
+  // with a 24h TTL. Lets the callback poller resolve the packaging URL without
+  // depending on the instance still being in the pool — the scaler may have
+  // already torn down the instance by the time the transcode callback arrives.
+  jobEncoreUrl: (encoreJobId: string) => `encore:job-url:${encoreJobId}`
 };

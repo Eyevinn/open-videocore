@@ -121,6 +121,10 @@ async function resolveEncoreJobUrl(
   redis: Redis | undefined
 ): Promise<string | undefined> {
   if (!redis) return undefined;
+  // Fast path: full URL stored at dispatch time (survives pool teardown).
+  const direct = await redis.get(keys.jobEncoreUrl(encoreJobId));
+  if (direct) return direct;
+  // Fallback: reconstruct from pool record + UUID (pre-jobEncoreUrl jobs).
   const decoded = decodeEncoreJobId(encoreJobId);
   if (!decoded) return undefined;
   const { workspaceId } = decoded;

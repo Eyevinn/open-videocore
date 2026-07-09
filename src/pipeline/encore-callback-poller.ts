@@ -155,12 +155,21 @@ function normaliseRenditions(output: EncoreOutput[] | undefined): CallbackRendit
 }
 
 // Build the Encore job API URL for packaging by looking up the instance URL +
-// Encore UUID from the scaler's Redis pool. Mirrors resolveEncoreJobUrl in
+// Resolve the full Encore job URL for a given encoreJobId (externalId).
+// Tries the direct URL key stored at dispatch time first (jobEncoreUrl), which
+// is independent of the pool and survives instance scale-down. Falls back to
+// reconstructing from the pool record + UUID key for jobs dispatched before
+// the direct-URL key was introduced. Mirrors resolveEncoreJobUrl in
 // src/routes/internal.ts.
 async function resolveEncoreJobUrl(
   encoreJobId: string,
   redis: Redis
 ): Promise<string | undefined> {
+  // Fast path: full URL stored at dispatch time (unaffected by pool teardown).
+  const direct = await redis.get(keys.jobEncoreUrl(encoreJobId));
+  if (direct) return direct;
+
+  // Fallback: reconstruct from pool record + UUID (pre-jobEncoreUrl jobs).
   const decoded = decodeEncoreJobId(encoreJobId);
   if (!decoded) return undefined;
   const { workspaceId } = decoded;

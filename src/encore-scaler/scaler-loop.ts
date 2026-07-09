@@ -263,6 +263,18 @@ export class EncoreScalerLoop {
         // UUID delivered by the callback listener (which always uses its own
         // configured Encore URL, not the scaler-managed instance URL).
         await redis.set(keys.uuidToExternalId(encoreUuid), job.jobId, 'EX', 86_400);
+        // Store the full Encore job URL at dispatch time so the packaging step
+        // can look it up without depending on the instance still being in the
+        // pool. The pool record may be gone by the time the transcode callback
+        // is processed (e.g. instance scaled down, pool wiped), leading to a
+        // misleading "Encore instance no longer available for packaging" error.
+        const encoreJobUrl = `${inst.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`;
+        await redis.set(keys.jobEncoreUrl(job.jobId), encoreJobUrl, 'EX', 86_400);
+      } else {
+        // Encore didn't return a usable UUID in the POST response body — log so
+        // this is diagnosable. The packaging step will fall back to the pool
+        // lookup, which may also fail if the UUID was not captured.
+        console.warn('[encore-scaler] dispatch: Encore POST response missing id — UUID key not stored for', job.jobId);
       }
 
       // The job has now actually left the local queue and is running on an
