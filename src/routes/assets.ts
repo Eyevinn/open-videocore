@@ -353,8 +353,10 @@ type AssetsRouterOptions = {
   // Defaults to the real awaited extractor.
   extractThumbnails?: typeof extractThumbnails;
   thumbnailDeps?: Partial<ExtractThumbnailsDeps>;
-  // Public base URL for building thumbnail URLs in GET responses. When unset,
-  // GET returns workspace-local object keys instead of absolute URLs.
+  // Deprecated (issue #113): thumbnail listing now always returns API proxy
+  // URLs (/api/v1/assets/:id/thumbnails/:index), so this option is inert and no
+  // longer read by the GET handler. Retained only so existing callers/tests
+  // that still pass it continue to type-check.
   thumbnailPublicBaseUrl?: string;
   // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
   // job (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
@@ -1273,14 +1275,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // List an asset's thumbnail URLs (issue #7). Returns absolute URLs when a
-  // public base URL is configured, otherwise the workspace-local object keys.
-  //   200 — list of thumbnail URLs (possibly empty)
+  // List an asset's thumbnail URLs (issue #7, #113). Returns API proxy URLs of
+  // the form /api/v1/assets/:id/thumbnails/:index keyed by array position. The
+  // proxy route below streams the object from MinIO using admin credentials, so
+  // these URLs work without a public/presigned MinIO URL and match how the asset
+  // list card renders thumbnails (public/app.js).
+  //   200 — list of thumbnail proxy URLs (possibly empty)
   //   404 — unknown/foreign asset (existence not leaked)
   app.get(
     '/:id/thumbnails',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: {
@@ -1295,12 +1300,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       const keys = asset.thumbnails ?? [];
-      const base = opts.thumbnailPublicBaseUrl;
-      // With a public base URL, return absolute URLs; otherwise return the
-      // stored object keys as-is (callers can fetch them via the proxy route).
-      const thumbnails = base
-        ? keys.map((k) => `${base.replace(/\/+$/, '')}/${k}`)
-        : keys;
+      const thumbnails = keys.map(
+        (_k, i) => `/api/v1/assets/${asset.id}/thumbnails/${i}`
+      );
       return reply.code(200).send({ assetId: asset.id, thumbnails });
     }
   );
