@@ -1146,21 +1146,21 @@ pre.code-block {
 }
 
 .step-running {
-  background: #fffbeb;
-  border-color: #f59e0b;
-  color: #92400e;
+  background: rgba(245, 158, 11, 0.15);
+  border-color: var(--warning);
+  color: var(--warning);
 }
 
 .step-done {
-  background: #f0fdf4;
-  border-color: #22c55e;
-  color: #166534;
+  background: rgba(34, 197, 94, 0.15);
+  border-color: var(--success);
+  color: var(--success);
 }
 
 .step-failed {
-  background: #fef2f2;
-  border-color: #ef4444;
-  color: #991b1b;
+  background: rgba(239, 68, 68, 0.15);
+  border-color: var(--danger);
+  color: var(--danger);
   cursor: help;
 }
 
