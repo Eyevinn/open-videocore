@@ -171,19 +171,29 @@ export class EncoreScalerLoop {
         if (record.activeJobs === 0) continue;
 
         const token = await getToken();
-        const url =
-          `${record.url.replace(/\/$/, '')}` +
-          `/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`;
-        const res = await fetch(url, {
-          headers: { authorization: `Bearer ${token}` }
-        });
-        if (!res.ok) continue;
+        const base = record.url.replace(/\/$/, '');
+        // Count both QUEUED and IN_PROGRESS — a freshly dispatched job sits in
+        // QUEUED until Encore picks it up, so counting only IN_PROGRESS would
+        // make the instance look idle immediately after dispatch and trigger a
+        // spurious scale-up on the next tick.
+        const [resQ, resP] = await Promise.all([
+          fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=1`, {
+            headers: { authorization: `Bearer ${token}` }
+          }),
+          fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=1`, {
+            headers: { authorization: `Bearer ${token}` }
+          })
+        ]);
+        if (!resQ.ok || !resP.ok) continue;
 
-        const body = (await res.json().catch(() => ({}))) as {
-          page?: { totalElements?: number };
-        };
-        const actualCount = body.page?.totalElements;
-        if (typeof actualCount !== 'number') continue;
+        const [bodyQ, bodyP] = await Promise.all([
+          resQ.json().catch(() => ({})) as Promise<{ page?: { totalElements?: number } }>,
+          resP.json().catch(() => ({})) as Promise<{ page?: { totalElements?: number } }>
+        ]);
+        const queuedCount = bodyQ.page?.totalElements;
+        const inProgressCount = bodyP.page?.totalElements;
+        if (typeof queuedCount !== 'number' || typeof inProgressCount !== 'number') continue;
+        const actualCount = queuedCount + inProgressCount;
 
         if (record.activeJobs !== actualCount) {
           // eslint-disable-next-line no-console

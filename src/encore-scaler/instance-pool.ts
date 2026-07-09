@@ -242,26 +242,24 @@ export async function destroyInstance(
   config: EncoreScalerConfig
 ): Promise<void> {
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+  await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
+  // Best-effort teardown of the paired callback listener (same name). It may
+  // already be gone, so any error is swallowed.
   try {
-    await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
-    // Best-effort teardown of the paired callback listener (same name). It may
-    // already be gone, so any error is swallowed.
-    try {
-      const callbackSat = await config.oscContext.getServiceAccessToken(
-        ENCORE_CALLBACK_LISTENER_SERVICE_ID
-      );
-      await removeInstance(
-        config.oscContext,
-        ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-        instanceId,
-        callbackSat
-      );
-    } catch {
-      // Listener already removed or unreachable — nothing to do.
-    }
-  } finally {
-    // Always drop the pool record so a stuck instance cannot pin the pool at
-    // maxInstances forever, even if the OSC removeInstance call errored.
-    await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+    const callbackSat = await config.oscContext.getServiceAccessToken(
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID
+    );
+    await removeInstance(
+      config.oscContext,
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+      instanceId,
+      callbackSat
+    );
+  } catch {
+    // Listener already removed or unreachable — nothing to do.
   }
+  // Only drop the pool record after OSC removal succeeds. Dropping it before
+  // or on OSC failure would cause the pool to lose track of a still-running
+  // instance, which makes the next tick think it can spawn a replacement.
+  await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
 }
