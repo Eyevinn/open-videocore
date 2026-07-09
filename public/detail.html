@@ -6,21 +6,17 @@
   <title>open-videocore ops</title>
   <link rel="stylesheet" href="style.css" />
 </head>
-<body>
+<body class="detail-standalone">
   <!--
-    Standalone (detached) detail view. Renders exactly ONE asset or job detail,
-    self-polling at the shared main-UI interval. It intentionally does NOT set
-    window.__OPS_MAIN__, so importing app.js here reuses its renderers without
-    booting the full tab UI. No shared module state with the opener window.
+    Standalone (detached) detail view — issue #128. Renders exactly ONE asset or
+    job detail with MINIMAL CHROME: no global header, no tab bar, no nav. Just a
+    thin context strip (the stack label) plus the reused detail pane. It
+    self-polls at the shared main-UI interval and intentionally does NOT boot the
+    full tab UI (importing app.js here only reuses its renderers). No shared
+    module state with the opener window.
   -->
-  <header>
-    <div class="header-brand">open-videocore ops</div>
-    <nav class="header-nav">
-      <span id="detail-stack-label" class="header-label"></span>
-    </nav>
-  </header>
-
   <main>
+    <div id="detail-stack-label" class="detail-standalone-context"></div>
     <div id="content" class="content-fullbleed">
       <div class="assets-side" id="detail-root" style="display:flex;"></div>
     </div>
