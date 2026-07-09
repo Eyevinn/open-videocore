@@ -182,7 +182,11 @@ const thumbnailsResultSchema = z.object({
 // with a Zod enum so an unsupported container is a 400 at the boundary.
 const exportBodySchema = z.object({
   targetFormat: z.enum(REWRAP_FORMATS),
-  outputName: z.string().min(1).max(256).optional()
+  outputName: z.string().min(1).max(256).optional(),
+  // Version-chain linkage (issue #118). Optional; defaults to false so existing
+  // callers get today's behavior (a disconnected parentId child). When true the
+  // export is additionally recorded as a version of the source asset.
+  asVersion: z.boolean().optional()
 });
 // Clip / trim request (issue #17): a time window in seconds. `endSeconds` must
 // be strictly greater than `startSeconds`. Optional `outputName` names the new
@@ -191,7 +195,11 @@ const clipBodySchema = z
   .object({
     startSeconds: z.number().min(0),
     endSeconds: z.number().positive(),
-    outputName: z.string().min(1).max(256).optional()
+    outputName: z.string().min(1).max(256).optional(),
+    // Version-chain linkage (issue #118). Optional; defaults to false so
+    // existing callers get today's behavior (a disconnected parentId child).
+    // When true the clip is additionally recorded as a version of the source.
+    asVersion: z.boolean().optional()
   })
   .refine((b) => b.endSeconds > b.startSeconds, {
     message: 'endSeconds must be greater than startSeconds'
@@ -293,6 +301,11 @@ const assetSchema = z.object({
   // pre-existing assets serialized before reviewState existed still validate.
   reviewState: reviewStateSchema.optional(),
   parentId: z.string().optional(),
+  // Version-chain linkage (issue #118), DISTINCT from `parentId`. Present only
+  // on outputs produced by a clip/export/rewrap run with `asVersion`. Absent on
+  // originals and on pre-existing assets serialized before #118.
+  versionOfAssetId: z.string().optional(),
+  versionGroupId: z.string().optional(),
   objectKey: z.string().optional(),
   statusHistory: z.array(transitionSchema),
   // Technical metadata (issue #6). `null` until the first successful extraction
@@ -768,6 +781,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // Enumerate every version in an asset's version chain (issue #118).
+  // Workspace-scoped and behind `authenticate`. Returns all assets sharing the
+  // target's `versionGroupId`, oldest first, so a client can "show all versions
+  // of this asset", compare, or roll back. An asset that has never participated
+  // in a clip/export/rewrap version chain returns just itself (single-member
+  // chain). DISTINCT from ?parentId= listing, which enumerates rendition/child
+  // hierarchy, not edit versions.
+  //   200 — the version chain (always includes the target); 404 — unknown asset
+  app.get(
+    '/:id/versions',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: {
+          200: z.object({ assetId: z.string(), versions: z.array(assetSchema) }),
+          404: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const versions = await repo.listVersions(request.params.id);
+      if (!versions) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send({ assetId: request.params.id, versions });
+    }
+  );
+
   // Delivery URL generation (issue #14). Closes the pipeline loop: ingest ->
   // transcode -> package -> deliver. Workspace-scoped and behind `authenticate`.
   // Resolution order:
@@ -1219,7 +1260,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceAssetId: asset.id,
             objectKey: asset.objectKey,
             targetFormat: request.body.targetFormat,
-            outputName: request.body.outputName
+            outputName: request.body.outputName,
+            asVersion: request.body.asVersion
           },
           {
             assets: repo,
@@ -1276,7 +1318,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             objectKey: asset.objectKey,
             startSeconds: request.body.startSeconds,
             endSeconds: request.body.endSeconds,
-            outputName: request.body.outputName
+            outputName: request.body.outputName,
+            asVersion: request.body.asVersion
           },
           {
             assets: repo,

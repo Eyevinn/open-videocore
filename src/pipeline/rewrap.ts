@@ -19,7 +19,7 @@
 // synchronously. The new child asset is created `uploading`, advanced to
 // `processing` while the job runs, and to `ready` once the output object lands.
 
-import type { Asset, AssetRepository } from '../data/asset-repo.js';
+import { resolveVersionLinkage, type Asset, type AssetRepository } from '../data/asset-repo.js';
 import type { WorkspaceStorage } from '../data/storage.js';
 
 // Container formats we support re-wrapping into. Each maps to a file extension
@@ -74,6 +74,11 @@ export type RewrapParams = {
   targetFormat: RewrapFormat;
   // Optional name for the child asset; defaults to `<source name> [<format>]`.
   outputName?: string;
+  // Version-chain linkage (issue #118). When true, the re-wrapped output is
+  // recorded as a VERSION of the source (versionOfAssetId + shared
+  // versionGroupId) in addition to being a parentId child. When false/undefined
+  // the behavior is UNCHANGED — a plain parentId child with no version linkage.
+  asVersion?: boolean;
 };
 
 export type RewrapDeps = {
@@ -94,7 +99,7 @@ export type RewrapDeps = {
 // is observable) and the error is re-thrown for the route to map to a 502. The
 // source asset is never mutated — an export is a pure read of the source.
 export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<Asset> {
-  const { sourceAssetId, objectKey, targetFormat, outputName } = params;
+  const { sourceAssetId, objectKey, targetFormat, outputName, asVersion } = params;
 
   if (!isRewrapFormat(targetFormat)) {
     throw new UnsupportedFormatError(targetFormat);
@@ -105,10 +110,28 @@ export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<As
   const source = await deps.assets.get(sourceAssetId);
   const baseName = source?.name ?? sourceAssetId;
 
+  // Version-chain linkage (issue #118). Opt-in only: when `asVersion` is set we
+  // resolve the source's lineage and record the export as a version of it,
+  // backfilling the source's group when it had none. Default (asVersion absent)
+  // leaves both fields undefined — today's disconnected-sibling behavior.
+  let versionLinkage: { versionOfAssetId: string; versionGroupId: string } | undefined;
+  if (asVersion && source) {
+    const resolved = resolveVersionLinkage(source);
+    versionLinkage = {
+      versionOfAssetId: resolved.versionOfAssetId,
+      versionGroupId: resolved.versionGroupId
+    };
+    if (resolved.seedSourceGroup) {
+      await deps.assets.update(source.id, { versionGroupId: resolved.versionGroupId });
+    }
+  }
+
   // Create the child asset first so its id determines the output object key.
   const child = await deps.assets.create({
     name: outputName ?? `${baseName} [${targetFormat}]`,
-    parentId: sourceAssetId
+    parentId: sourceAssetId,
+    versionOfAssetId: versionLinkage?.versionOfAssetId,
+    versionGroupId: versionLinkage?.versionGroupId
   });
 
   const outputKey = rewrapObjectKey(child.id, targetFormat);

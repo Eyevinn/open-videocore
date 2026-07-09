@@ -19,7 +19,7 @@
 // child advances to `ready`. On runner failure the child is marked `failed` and
 // the error is rethrown so the route can surface a 502.
 
-import type { AssetRepository, Asset } from '../data/asset-repo.js';
+import { resolveVersionLinkage, type AssetRepository, type Asset } from '../data/asset-repo.js';
 import type { WorkspaceStorage } from '../data/storage.js';
 
 // TTL for the presigned source GET + clip PUT URLs handed to the runner. Short
@@ -55,6 +55,12 @@ export type ClipParams = {
   startSeconds: number;
   endSeconds: number;
   outputName?: string;
+  // Version-chain linkage (issue #118). When true, the clip output is recorded
+  // as a VERSION of the source asset (versionOfAssetId + shared versionGroupId)
+  // in addition to being a parentId child. When false/undefined the behavior is
+  // UNCHANGED — a plain parentId child with no version linkage — so existing
+  // callers keep today's disconnected-sibling semantics.
+  asVersion?: boolean;
 };
 
 export type ClipDeps = {
@@ -73,13 +79,34 @@ export type ClipDeps = {
 // runner failure after marking the child `failed`, so the route maps it to a
 // 502 while the child record preserves the failure for inspection.
 export async function clip(params: ClipParams, deps: ClipDeps): Promise<Asset> {
-  const { sourceAssetId, objectKey, startSeconds, endSeconds, outputName } = params;
+  const { sourceAssetId, objectKey, startSeconds, endSeconds, outputName, asVersion } = params;
   const ttl = deps.ttlSeconds ?? clipUrlTtlSeconds();
+
+  // Version-chain linkage (issue #118). Opt-in only: when `asVersion` is set we
+  // resolve the source's lineage and record the clip as a version of it,
+  // backfilling the source's group when it had none. Default (asVersion absent)
+  // leaves both fields undefined — today's disconnected-sibling behavior.
+  let versionLinkage: { versionOfAssetId: string; versionGroupId: string } | undefined;
+  if (asVersion) {
+    const source = await deps.assets.get(sourceAssetId);
+    if (source) {
+      const resolved = resolveVersionLinkage(source);
+      versionLinkage = {
+        versionOfAssetId: resolved.versionOfAssetId,
+        versionGroupId: resolved.versionGroupId
+      };
+      if (resolved.seedSourceGroup) {
+        await deps.assets.update(source.id, { versionGroupId: resolved.versionGroupId });
+      }
+    }
+  }
 
   // Create the child asset first so its id seeds the destination object key.
   const child = await deps.assets.create({
     name: outputName ?? `clip-${startSeconds}-${endSeconds}`,
-    parentId: sourceAssetId
+    parentId: sourceAssetId,
+    versionOfAssetId: versionLinkage?.versionOfAssetId,
+    versionGroupId: versionLinkage?.versionGroupId
   });
   const destKey = clipObjectKey(child.id);
   await deps.assets.update(child.id, { objectKey: destKey, status: 'processing' });

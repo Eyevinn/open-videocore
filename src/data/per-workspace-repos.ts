@@ -76,6 +76,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   async countChildren(id: string): Promise<number> {
     return (await this.repo()).countChildren(id);
   }
+  async listVersions(id: string): Promise<Asset[] | undefined> {
+    return (await this.repo()).listVersions(id);
+  }
   async remove(id: string): Promise<Asset | undefined> {
     return (await this.repo()).remove(id);
   }

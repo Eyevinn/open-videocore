@@ -215,6 +215,23 @@ export type Asset = {
   reviewState?: AssetReviewState;
   // Source asset id for renditions/children; undefined for top-level sources.
   parentId?: string;
+  // Version-chain linkage (issue #118), DISTINCT from `parentId`. Where
+  // `parentId` models the rendition/child HIERARCHY (drives countChildren /
+  // HasChildrenError / ?parentId= listing), the version chain records that this
+  // asset is an EDIT VERSION of another asset produced by a clip/export/rewrap
+  // operation run with `asVersion`. The two are independent: a version output is
+  // NOT a parentId child, so it never blocks the source's deletion and does not
+  // appear under ?parentId=<source>.
+  //   - versionOfAssetId: the immediate source asset this output is a version
+  //     of. Undefined for originals (assets that are not a version of anything).
+  //   - versionGroupId: stable id shared by every asset in one lineage so
+  //     "show all versions of this asset" is a single indexed lookup. An
+  //     original that has never been versioned has no group; the first version
+  //     operation seeds the group to the source's own id (see the clip/export/
+  //     rewrap handlers). Both fields are optional so pre-existing assets and
+  //     documents without them remain valid (backward compatible).
+  versionOfAssetId?: string;
+  versionGroupId?: string;
   // MinIO object key (workspace-local) for the asset payload, if any.
   objectKey?: string;
   // Append-only audit trail of every status change (issue #3 deliverable 5).
@@ -276,6 +293,12 @@ export type CreateAssetInput = {
   slug?: string;
   description?: string;
   parentId?: string;
+  // Version-chain linkage (issue #118). Supplied by the clip/export/rewrap
+  // handlers when the caller opts in with `asVersion`; omitted otherwise so the
+  // default (disconnected sibling) behavior is preserved. See the Asset type for
+  // the distinction from `parentId`.
+  versionOfAssetId?: string;
+  versionGroupId?: string;
   objectKey?: string;
   // Optional free-form metadata supplied at creation time (issue #12).
   metadata?: Record<string, unknown>;
@@ -293,6 +316,13 @@ export type UpdateAssetInput = {
   description?: string;
   objectKey?: string;
   status?: AssetStatus;
+  // Version-chain linkage backfill (issue #118). Set only when a clip/export/
+  // rewrap run with `asVersion` seeds a lineage on a source asset that had no
+  // group yet, so the source joins its own chain. Not exposed on the PATCH
+  // route — the `versionGroupId` mirror is written on the source by the handler,
+  // never overwriting an existing group. `versionOfAssetId` is intentionally
+  // immutable after create (an asset's provenance parent does not change).
+  versionGroupId?: string;
   // Set by the metadata extractor (issue #6). Writing `technicalMetadata` to a
   // value clears any prior error; writing `technicalMetadataError` records a
   // failure and leaves `technicalMetadata` null. `null` is an accepted value
@@ -333,6 +363,10 @@ export type ListOptions = {
   offset?: number;
   status?: AssetStatus;
   parentId?: string;
+  // Filter to a single version lineage (issue #118). Matches assets whose
+  // `versionGroupId` equals this value — used by the versions listing surface to
+  // enumerate every version in a chain. Independent of `parentId`.
+  versionGroupId?: string;
 };
 
 export type ListResult = {
@@ -403,6 +437,11 @@ export interface AssetRepository {
   transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
   countChildren(id: string): Promise<number>;
+  // Enumerate every asset in the version lineage of `id` (issue #118), oldest
+  // first. Resolves `id`'s `versionGroupId` and returns all assets sharing it.
+  // An asset that has never participated in a version chain (no group) returns
+  // just itself. Returns undefined when `id` does not exist.
+  listVersions(id: string): Promise<Asset[] | undefined>;
   // Soft-delete: transitions the asset to `archived`. Returns the archived
   // asset, or undefined if it does not exist.
   remove(id: string): Promise<Asset | undefined>;
@@ -498,6 +537,29 @@ export function applyMetadata(
     return { ...patch };
   }
   return { ...(existing ?? {}), ...patch };
+}
+
+// Resolve version-chain linkage for an output derived from `source` (issue
+// #118). Called by the clip/export/rewrap handlers when the caller opts in with
+// `asVersion`. Returns:
+//   - versionOfAssetId: the immediate source id (the new output is a version OF
+//     the source).
+//   - versionGroupId: the source's existing lineage id when it already belongs
+//     to a chain, otherwise the source's own id (which seeds a fresh lineage).
+//   - seedSourceGroup: true when the source had no group and must be backfilled
+//     with `versionGroupId` so it appears in its own chain alongside the new
+//     version. The handler performs that backfill via repo.update.
+export function resolveVersionLinkage(source: Asset): {
+  versionOfAssetId: string;
+  versionGroupId: string;
+  seedSourceGroup: boolean;
+} {
+  const versionGroupId = source.versionGroupId ?? source.id;
+  return {
+    versionOfAssetId: source.id,
+    versionGroupId,
+    seedSourceGroup: source.versionGroupId === undefined
+  };
 }
 
 // Deduplicate a tag list while preserving first-seen order (issue #11).
@@ -629,6 +691,8 @@ export class InMemoryAssetRepository implements AssetRepository {
       description: input.description,
       status: 'uploading',
       parentId: input.parentId,
+      versionOfAssetId: input.versionOfAssetId,
+      versionGroupId: input.versionGroupId,
       objectKey: input.objectKey,
       statusHistory: initialHistory(now),
       metadata: input.metadata,
@@ -671,6 +735,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (opts.parentId !== undefined) {
       all = all.filter((a) => a.parentId === opts.parentId);
+    }
+    if (opts.versionGroupId !== undefined) {
+      all = all.filter((a) => a.versionGroupId === opts.versionGroupId);
     }
     all.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     const items = all.slice(offset, offset + limit).map((a) => ({ ...a }));
@@ -737,6 +804,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     if (patch.subtitleTracks !== undefined) {
       next.subtitleTracks = patch.subtitleTracks;
     }
+    if (patch.versionGroupId !== undefined) {
+      next.versionGroupId = patch.versionGroupId;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -767,6 +837,22 @@ export class InMemoryAssetRepository implements AssetRepository {
 
   async countChildren(id: string): Promise<number> {
     return [...this.store.values()].filter((a) => a.parentId === id && a.status !== 'archived').length;
+  }
+
+  async listVersions(id: string): Promise<Asset[] | undefined> {
+    const asset = this.store.get(id);
+    if (!asset) {
+      return undefined;
+    }
+    // No lineage yet: the asset is its own (single-member) chain.
+    if (!asset.versionGroupId) {
+      return [{ ...asset }];
+    }
+    const group = asset.versionGroupId;
+    return [...this.store.values()]
+      .filter((a) => a.versionGroupId === group)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((a) => ({ ...a }));
   }
 
   async remove(id: string): Promise<Asset | undefined> {

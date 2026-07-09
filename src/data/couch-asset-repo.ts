@@ -188,6 +188,9 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.subtitleTracks !== undefined) {
       next.subtitleTracks = patch.subtitleTracks;
     }
+    if (patch.versionGroupId !== undefined) {
+      next.versionGroupId = patch.versionGroupId;
+    }
     if (patch.status !== undefined) {
       const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
       next.status = applied.status;
@@ -234,6 +237,27 @@ export class CouchAssetRepository implements AssetRepository {
     return couch.count({ resourceType: RESOURCE_TYPE, derivedFrom: id, state: { $ne: 'archived' } });
   }
 
+  async listVersions(id: string): Promise<Asset[] | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const asset = fromDoc(doc);
+    // No lineage yet: the asset is its own (single-member) chain.
+    if (!asset.versionGroupId) {
+      return [asset];
+    }
+    const docs = await couch.find(
+      { resourceType: RESOURCE_TYPE, versionGroupId: asset.versionGroupId },
+      { limit: MAX_LIMIT }
+    );
+    return docs
+      .filter((d) => d.resourceType === RESOURCE_TYPE)
+      .map(fromDoc)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  }
+
   async remove(id: string): Promise<Asset | undefined> {
     // Soft delete (see file header): archive rather than destroy.
     return this.update(id, { status: 'archived' });
@@ -249,6 +273,10 @@ function buildSelector(opts: ListOptions): Record<string, unknown> {
   if (opts.parentId !== undefined) {
     // Mirror of structural.derivedFrom for indexable Mango filtering.
     selector['derivedFrom'] = opts.parentId;
+  }
+  if (opts.versionGroupId !== undefined) {
+    // Mirror of structural.versionGroupId for indexable Mango filtering (#118).
+    selector['versionGroupId'] = opts.versionGroupId;
   }
   return selector;
 }
@@ -268,6 +296,10 @@ function toDoc(asset: Asset): Record<string, unknown> {
     localId: asset.id,
     state: asset.status,
     derivedFrom: asset.parentId ?? null,
+    // Top-level mirror of structural.versionGroupId (issue #118) so enumerating
+    // a version lineage is a simple, indexable Mango selector. Omitted for
+    // assets not in any version chain.
+    ...(asset.versionGroupId ? { versionGroupId: asset.versionGroupId } : {}),
     // Top-level mirror of descriptive.slug (issue #131) so the workspace-scoped
     // uniqueness check is a simple, indexable Mango selector. Omitted for
     // legacy/slug-less assets.

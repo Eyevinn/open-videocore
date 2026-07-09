@@ -173,6 +173,12 @@ export const AssetDocumentSchema = z.object({
       thumbnails: z.array(ThumbnailSchema).optional(),
       collections: z.array(z.string()).default([]),
       derivedFrom: z.string().nullable().optional(),
+      // Version-chain linkage (issue #118), DISTINCT from `derivedFrom` (which
+      // persists the parentId hierarchy). Both optional so documents written
+      // before #118 (field simply absent) still deserialize — no schemaVersion
+      // bump is required, all v1 documents remain valid.
+      versionOf: z.string().nullable().optional(),
+      versionGroupId: z.string().nullable().optional(),
       packagingError: z.string().optional(),
       editorialAudio: z.array(EditorialAudioTrackSchema).optional(),
       editorialSubtitles: z.array(EditorialSubtitleTrackSchema).optional()
@@ -268,7 +274,11 @@ export function toAssetDocument(
     structural: {
       renditions: asset.renditions ?? [],
       collections: asset.collections ?? [],
-      derivedFrom: asset.parentId ?? null
+      derivedFrom: asset.parentId ?? null,
+      // Version-chain linkage (issue #118). Persisted next to derivedFrom but
+      // semantically independent of the parentId hierarchy.
+      versionOf: asset.versionOfAssetId ?? null,
+      versionGroupId: asset.versionGroupId ?? null
     }
   };
   if (opts.rev) {
@@ -310,6 +320,8 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
   const renditions = doc.structural?.renditions;
   const collections = doc.structural?.collections;
   const derivedFrom = doc.structural?.derivedFrom ?? undefined;
+  const versionOfAssetId = doc.structural?.versionOf ?? undefined;
+  const versionGroupId = doc.structural?.versionGroupId ?? undefined;
 
   return {
     id: doc._id,
@@ -321,6 +333,8 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     // `draft`, so legacy documents round-trip to `draft` rather than undefined.
     reviewState: doc.administrative.reviewState as AssetReviewState,
     parentId: derivedFrom ?? undefined,
+    versionOfAssetId,
+    versionGroupId,
     objectKey: doc.administrative.storage?.key,
     statusHistory: (doc.administrative.statusHistory ?? []).map((t) => ({
       at: t.at,
