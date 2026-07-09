@@ -109,6 +109,10 @@ const tagsSchema = z.array(tagSchema).max(128);
 
 const createSchema = z.object({
   name: z.string().min(1).max(256),
+  // Optional caller-supplied slug (issue #131). Bounded; the repository
+  // normalizes it and appends a numeric suffix on collision. When omitted a
+  // unique human-readable slug is generated server-side.
+  slug: z.string().min(1).max(256).optional(),
   description: z.string().max(2048).optional(),
   parentId: z.string().min(1).optional(),
   objectKey: z.string().min(1).max(1024).optional(),
@@ -275,6 +279,9 @@ const tracksSchema = z.object({
 const assetSchema = z.object({
   id: z.string(),
   name: z.string(),
+  // Human-readable, URL-safe slug (issue #131). Present on assets created after
+  // slugs were introduced; absent/undefined for pre-existing slug-less assets.
+  slug: z.string().optional(),
   description: z.string().optional(),
   status: statusSchema,
   parentId: z.string().optional(),
