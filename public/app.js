@@ -2978,6 +2978,7 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 export {
   renderAssetDetailBody,
   renderJobDetailBody,
+  openDetailWindow,
   setActiveStack,
   setStackOverride,
   getActiveStack,
