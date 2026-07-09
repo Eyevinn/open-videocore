@@ -11,7 +11,7 @@
 
 import nano from 'nano';
 import { Client as MinioClient } from 'minio';
-import type { ParamStore, StackConfig } from './param-store.js';
+import { isReadyStack, type ParamStore, type StackConfig } from './param-store.js';
 import { couchServer, StackCouch } from '../data/couchdb.js';
 import { WorkspaceStorage } from '../data/storage.js';
 import { CouchAssetRepository } from '../data/couch-asset-repo.js';
@@ -282,12 +282,15 @@ export class WorkspaceStackResolver {
       // Fall through to in-memory
     }
 
-    // A partially-provisioned stack can persist empty/invalid coordinates;
-    // buildConnectionsFromStack returns null for those rather than throwing an
-    // uncaught assertion (issue #105). Treat null the same as "no stack": fall
-    // back to no-op in-memory connections so /health and infra routes stay up.
+    // A partially-provisioned/failed stack must never be treated as a live,
+    // connectable stack (issue #106): only 'ready' (or legacy status-less)
+    // configs are connected. Non-ready configs still exist in the store so the
+    // deprovision route can read services[] and clean up, but the resolver skips
+    // them here. buildConnectionsFromStack also returns null for empty/invalid
+    // coordinates (issue #105 defence-in-depth). In every skip case we fall back
+    // to no-op in-memory connections so /health and infra routes stay up.
     const connections =
-      (config
+      (config && isReadyStack(config)
         ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext)
         : null) ?? buildInMemoryConnections();
 
