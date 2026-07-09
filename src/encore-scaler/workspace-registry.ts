@@ -92,6 +92,14 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     return (await this.getOrCreate(decoded.workspaceId)).getJobStatus(encoreJobId);
   }
 
+  async cancel(encoreJobId: string): Promise<void> {
+    const decoded = decodeEncoreJobId(encoreJobId);
+    // Unknown workspace: nothing to cancel — treat as an idempotent no-op,
+    // mirroring getJobStatus above.
+    if (!decoded) return;
+    return (await this.getOrCreate(decoded.workspaceId)).cancel(encoreJobId);
+  }
+
   setMaxInstances(max: number): void {
     this.config.maxInstances = max;
     for (const { loop } of this.loops.values()) {
