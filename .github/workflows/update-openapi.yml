@@ -29,6 +29,8 @@ jobs:
         run: pnpm generate:openapi
         env:
           OSC_ACCESS_TOKEN: ci-placeholder
+          MINIO_ROOT_PASSWORD: ci-placeholder
+          COUCHDB_ADMIN_PASSWORD: ci-placeholder
 
       - name: Commit if changed
         run: |
