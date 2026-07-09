@@ -499,7 +499,8 @@ const stepExecutionSchema = z.object({
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
   startedAt: z.string().optional(),
-  completedAt: z.string().optional()
+  completedAt: z.string().optional(),
+  progress: z.number().optional()
 });
 const pipelineExecutionSchema = z.object({
   id: z.string(),
@@ -1471,6 +1472,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send(execution);
+    }
+  );
+
+  // GET /:id/pipelines — alias for /:id/executions (issue #161).
+  app.get(
+    '/:id/pipelines',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: z.array(pipelineExecutionSchema), 404: z.object({ error: z.string() }) }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const executions = opts.pipelineRepository ? await opts.pipelineRepository.listByAsset(asset.id) : [];
+      return reply.code(200).send(executions);
     }
   );
 

@@ -18,6 +18,7 @@ import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
+import { pipelinesRouter } from './routes/pipelines.js';
 import { searchRouter } from './routes/search.js';
 import { WebhookDispatcher } from './services/webhook-dispatcher.js';
 import { webhooksRouter } from './routes/webhooks.js';
@@ -717,6 +718,14 @@ const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } =
   redis: sharedRedis
 };
 await app.register(jobsRouter, jobsRouterOptions);
+
+// Cross-asset pipeline execution visibility (issue #161).
+await app.register(pipelinesRouter, {
+  prefix: '/api/v1/pipelines',
+  pipelineRepository,
+  jobRepository,
+  assetRepository
+});
 
 // Encore-compatible transcode submission (migration surface). Lets integrators
 // who POST directly to an Encore OSC instance repoint at this API with only a

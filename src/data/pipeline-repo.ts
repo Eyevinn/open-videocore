@@ -24,6 +24,7 @@ export type StepExecution = {
   error?: string;
   startedAt?: string;
   completedAt?: string;
+  progress?: number; // 0-100, populated at read time from the linked job
 };
 
 export type PipelineExecution = {
@@ -48,6 +49,11 @@ export interface PipelineRepository {
     patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
   ): Promise<PipelineExecution | undefined>;
   listByAsset(assetId: string): Promise<PipelineExecution[]>;
+  listAll(opts?: {
+    status?: 'running' | 'done' | 'failed';
+    limit?: number;
+    offset?: number;
+  }): Promise<{ items: PipelineExecution[]; total: number }>;
   // Find the most recent running execution for an asset that has the given step
   // in 'running' state.
   findRunningByAssetAndStep(
@@ -107,6 +113,23 @@ export class InMemoryPipelineRepository implements PipelineRepository {
       .filter((e) => e.assetId === assetId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
       .map(clone);
+  }
+
+  async listAll(opts?: {
+    status?: 'running' | 'done' | 'failed';
+    limit?: number;
+    offset?: number;
+  }): Promise<{ items: PipelineExecution[]; total: number }> {
+    let all = [...this.store.values()].sort(
+      (a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)
+    );
+    if (opts?.status) {
+      all = all.filter((e) => e.status === opts.status);
+    }
+    const total = all.length;
+    const offset = opts?.offset ?? 0;
+    const limit = opts?.limit ?? 50;
+    return { items: all.slice(offset, offset + limit).map(clone), total };
   }
 
   async findRunningByAssetAndStep(

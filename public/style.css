@@ -1051,3 +1051,94 @@ pre.code-block {
 }
 
 .mb12 { margin-bottom: 12px; }
+.mt24 { margin-top: 24px; }
+
+/* Pipeline execution list */
+.pipeline-exec-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.pipeline-exec-row {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pipeline-exec-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.pipeline-exec-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.pipeline-exec-time {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.asset-link {
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.asset-link:hover {
+  opacity: 0.8;
+}
+
+.pipeline-exec-steps {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Per-step status chips */
+.pipeline-exec-step {
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.step-pending {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.step-running {
+  background: #fffbeb;
+  border-color: #f59e0b;
+  color: #92400e;
+}
+
+.step-done {
+  background: #f0fdf4;
+  border-color: #22c55e;
+  color: #166534;
+}
+
+.step-failed {
+  background: #fef2f2;
+  border-color: #ef4444;
+  color: #991b1b;
+  cursor: help;
+}

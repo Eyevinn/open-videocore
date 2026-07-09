@@ -2901,57 +2901,160 @@ var STEP_ICONS = {
   'extract-metadata': '🔬',
   'thumbnail': '🖼',
   'transcode': '🎞',
-  'package': '📦'
+  'package': '📦',
+  'subtitles': '💬',
+  'scene-detect': '🎬'
 };
 
-function renderPipelinesTab(container) {
+var EXEC_STATUS_CLASS = {
+  running: 'status-processing',
+  done: 'status-ready',
+  failed: 'status-failed'
+};
+
+var STEP_STATUS_CLASS = {
+  pending: 'step-pending',
+  running: 'step-running',
+  done: 'step-done',
+  failed: 'step-failed'
+};
+
+function renderStepChip(step) {
+  var icon = STEP_ICONS[step.name] || '⚙';
+  var label = icon + ' ' + step.name;
+  if (step.status === 'running' && step.progress != null) {
+    label += ' ' + step.progress + '%';
+  }
+  var cls = 'pipeline-exec-step ' + (STEP_STATUS_CLASS[step.status] || '');
+  if (step.status === 'failed' && step.error) {
+    return '<span class="' + cls + '" title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
+  }
+  return '<span class="' + cls + '">' + escHtml(label) + '</span>';
+}
+
+function renderExecutionRow(exec) {
+  var row = document.createElement('div');
+  row.className = 'pipeline-exec-row';
+
+  var meta = document.createElement('div');
+  meta.className = 'pipeline-exec-meta';
+  var statusCls = EXEC_STATUS_CLASS[exec.status] || '';
+  var assetLabel = exec.assetName ? escHtml(exec.assetName) : escHtml(exec.assetId);
+  meta.innerHTML =
+    '<span class="pipeline-exec-name">' + escHtml(exec.pipelineName) + '</span>' +
+    '<span class="asset-link" data-id="' + escHtml(exec.assetId) + '">' + assetLabel + '</span>' +
+    '<span class="status-badge ' + statusCls + '">' + escHtml(exec.status) + '</span>' +
+    '<span class="pipeline-exec-time">' + escHtml(exec.createdAt.slice(0, 16).replace('T', ' ')) + '</span>';
+  row.appendChild(meta);
+
+  var steps = document.createElement('div');
+  steps.className = 'pipeline-exec-steps';
+  steps.innerHTML = exec.steps.map(function(s, i) {
+    return (i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '') + renderStepChip(s);
+  }).join('');
+  row.appendChild(steps);
+
+  // Click on asset name navigates to asset detail.
+  meta.querySelector('.asset-link').addEventListener('click', function() {
+    switchTab('assets');
+    var detail = document.getElementById('asset-detail');
+    if (detail) showAssetDetail(exec.assetId, detail);
+  });
+
+  return row;
+}
+
+async function renderPipelinesTab(container) {
   var wrap = document.createElement('div');
   wrap.className = 'pipelines-wrap';
 
-  var header = document.createElement('div');
-  header.className = 'section-title mb12';
-  header.textContent = 'Available Pipelines';
-  wrap.appendChild(header);
+  // ── Catalog ──
+  var catalogHeader = document.createElement('div');
+  catalogHeader.className = 'section-title mb12';
+  catalogHeader.textContent = 'Available Pipelines';
+  wrap.appendChild(catalogHeader);
 
   var grid = document.createElement('div');
   grid.className = 'pipelines-grid';
-
   PIPELINE_CATALOG.forEach(function(pipeline) {
     var card = document.createElement('div');
     card.className = 'pipeline-card';
-
     var cardHeader = document.createElement('div');
     cardHeader.className = 'pipeline-card-header';
-    cardHeader.innerHTML = '<span class="pipeline-card-name">' + escHtml(pipeline.label) + '</span>' +
+    cardHeader.innerHTML =
+      '<span class="pipeline-card-name">' + escHtml(pipeline.label) + '</span>' +
       '<span class="pipeline-card-id text-mono">' + escHtml(pipeline.name) + '</span>';
     card.appendChild(cardHeader);
-
     var desc = document.createElement('p');
     desc.className = 'pipeline-card-desc';
     desc.textContent = pipeline.description;
     card.appendChild(desc);
-
-    var steps = document.createElement('div');
-    steps.className = 'pipeline-steps';
+    var stepsEl = document.createElement('div');
+    stepsEl.className = 'pipeline-steps';
     pipeline.steps.forEach(function(step, i) {
       if (i > 0) {
         var arrow = document.createElement('span');
         arrow.className = 'pipeline-step-arrow';
         arrow.textContent = '→';
-        steps.appendChild(arrow);
+        stepsEl.appendChild(arrow);
       }
       var chip = document.createElement('span');
       chip.className = 'pipeline-step-chip';
       chip.textContent = (STEP_ICONS[step] || '') + ' ' + step;
-      steps.appendChild(chip);
+      stepsEl.appendChild(chip);
     });
-    card.appendChild(steps);
-
+    card.appendChild(stepsEl);
     grid.appendChild(card);
   });
-
   wrap.appendChild(grid);
+
+  // ── Executions ──
+  var execHeader = document.createElement('div');
+  execHeader.className = 'section-title mt24 mb12';
+  execHeader.textContent = 'Pipeline Executions';
+  wrap.appendChild(execHeader);
+
+  var execList = document.createElement('div');
+  execList.className = 'pipeline-exec-list';
+  execList.textContent = 'Loading…';
+  wrap.appendChild(execList);
+
   container.appendChild(wrap);
+
+  var pollTimer = null;
+
+  async function loadExecutions() {
+    try {
+      var data = await apiFetch('/pipelines?limit=50');
+      var items = (data && data.items) ? data.items : [];
+      execList.innerHTML = '';
+      if (items.length === 0) {
+        execList.textContent = 'No pipeline executions yet.';
+      } else {
+        items.forEach(function(exec) {
+          execList.appendChild(renderExecutionRow(exec));
+        });
+      }
+      // Poll while any execution is running.
+      var anyRunning = items.some(function(e) { return e.status === 'running'; });
+      if (anyRunning) {
+        pollTimer = setTimeout(loadExecutions, 5000);
+      }
+    } catch (e) {
+      execList.textContent = 'Failed to load executions.';
+    }
+  }
+
+  await loadExecutions();
+
+  // Stop polling when the tab is replaced.
+  var observer = new MutationObserver(function() {
+    if (!document.body.contains(wrap)) {
+      if (pollTimer) clearTimeout(pollTimer);
+      observer.disconnect();
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
 // ─── TRANSCODERS TAB ───────────────────────────────────────────────────────────
