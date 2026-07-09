@@ -128,6 +128,7 @@ const acceptedSchema = z.object({
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
 // declared as a schema for response validation.
 const storedConfigSchema = z.object({
+  status: z.enum(['provisioning', 'ready', 'failed']).optional(),
   minioEndpoint: z.string(),
   couchdbUrl: z.string(),
   redisUrl: z.string(),
@@ -502,6 +503,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // source of truth, so a write error must not strand a healthy stack.
         if (paramStore) {
           const stackConfig: StackConfig = {
+            status: 'ready',
             minioEndpoint,
             couchdbUrl: stripCredentials(couchdbUrl),
             redisUrl,
@@ -553,6 +555,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             try {
               const workspaceId = await deriveWorkspaceId(osc);
               await paramStore.storeStackConfig(workspaceId, name, {
+                // Mark the partial write as failed (issue #106) so the resolver
+                // never treats this never-completed stack as live. The empty
+                // coordinates are still recorded, but the deprovision route
+                // reads services[] regardless of status to clean up.
+                status: 'failed',
                 minioEndpoint: '',
                 couchdbUrl: '',
                 redisUrl: '',

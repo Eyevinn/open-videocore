@@ -22,6 +22,13 @@
 // a host/URL/endpoint or a bucket name — NO passwords, NO credential-bearing
 // connection strings. See the storage list in issue #31.
 export type StackConfig = {
+  // Lifecycle state of the stored config (issue #106). A partial-failure write
+  // persists 'failed' (or 'provisioning') so the resolver never treats a stack
+  // that never finished provisioning as live/connectable — it only builds real
+  // connections for 'ready'. Optional for back-compat: configs written before
+  // this field existed have no `status` and MUST be read as 'ready' so already
+  // provisioned live stacks keep working (see isReadyStack).
+  status?: 'provisioning' | 'ready' | 'failed';
   minioEndpoint: string;
   // CouchDB host/URL only — no embedded password.
   couchdbUrl: string;
@@ -31,6 +38,15 @@ export type StackConfig = {
   // The OSC instances that make up the stack, for deprovision (#29).
   services: { serviceId: string; instanceName: string }[];
 };
+
+// True when a stored config represents a fully provisioned, connectable stack.
+// Back-compat: a missing `status` (config written before issue #106) is treated
+// as 'ready' so existing live stacks keep resolving. Only 'ready' (or absent)
+// stacks are connected; 'provisioning'/'failed' are skipped by the resolver but
+// remain readable for deprovision cleanup (they still carry services[]).
+export function isReadyStack(config: StackConfig): boolean {
+  return config.status === undefined || config.status === 'ready';
+}
 
 // Narrow interface so the provision/read routes can be tested without a live
 // parameter store. The HTTP implementation is makeHttpParamStore.
