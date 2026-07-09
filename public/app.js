@@ -719,9 +719,11 @@ async function showAssetDetail(id, detailPanel) {
 //                   bitrateBps?, codec? }
 //   fileGroups[]: { id, type: 'hls-package'|'dash-package', name, manifestUrl,
 //                   segmentCount?, objectKeyPrefix }
-// Renders nothing (leaves `container` empty) when both lists are empty, so the
-// section stays hidden for assets that expose no files. All server-provided
-// text flows through escHtml before interpolation.
+// Renders a "Files" table (source + renditions + exports, each with a presigned
+// download link) and "File Groups" cards (one per HLS/DASH package, with the
+// manifest URL, a copy-to-clipboard button, and the segment count). Each section
+// shows a distinct empty state when its list is empty (issue #136). All
+// server-provided text flows through escHtml before interpolation.
 async function renderAssetFiles(assetId, container) {
   container.innerHTML = '';
 
@@ -740,9 +742,6 @@ async function renderAssetFiles(assetId, container) {
 
   var files = (data && data.files) || [];
   var fileGroups = (data && data.fileGroups) || [];
-  // Per issue #157: the section is only shown when there is at least one file or
-  // group. Nothing to render -> leave the container empty (hidden).
-  if (files.length === 0 && fileGroups.length === 0) return;
 
   // A compact "resolution/bitrate" summary for a rendition. Any of the optional
   // fields may be absent (e.g. audio-only rendition) — the row still renders
@@ -756,12 +755,16 @@ async function renderAssetFiles(assetId, container) {
     return parts.length ? parts.join(' · ') : '<span class="text-muted">—</span>';
   };
 
-  if (files.length > 0) {
-    var filesTitle = document.createElement('div');
-    filesTitle.className = 'section-title';
-    filesTitle.textContent = 'Files';
-    container.appendChild(filesTitle);
+  // ── Files table (source + renditions + exports) ──────────────────────────
+  // Always render the "Files" heading so a ready asset with no downloadable
+  // files still shows an explicit empty state (issue #136), rather than the
+  // section silently disappearing.
+  var filesTitle = document.createElement('div');
+  filesTitle.className = 'section-title';
+  filesTitle.textContent = 'Files';
+  container.appendChild(filesTitle);
 
+  if (files.length > 0) {
     var fwrap = document.createElement('div');
     fwrap.className = 'table-wrap';
     var frows = files.map(function(f) {
@@ -779,36 +782,45 @@ async function renderAssetFiles(assetId, container) {
       '<th>Type</th><th>Filename</th><th>Format</th><th>Details</th><th></th>' +
       '</tr></thead><tbody>' + frows + '</tbody></table>';
     container.appendChild(fwrap);
+  } else {
+    var filesEmpty = document.createElement('div');
+    filesEmpty.className = 'empty';
+    filesEmpty.setAttribute('data-empty', 'files');
+    filesEmpty.textContent = 'No files available for this asset yet.';
+    container.appendChild(filesEmpty);
   }
 
-  if (fileGroups.length > 0) {
-    var groupsTitle = document.createElement('div');
-    groupsTitle.className = 'section-title mt12';
-    groupsTitle.textContent = 'File Groups';
-    container.appendChild(groupsTitle);
+  // ── File-group cards (HLS / DASH streaming packages) ─────────────────────
+  var groupsTitle = document.createElement('div');
+  groupsTitle.className = 'section-title mt12';
+  groupsTitle.textContent = 'File Groups';
+  container.appendChild(groupsTitle);
 
-    var gwrap = document.createElement('div');
-    gwrap.className = 'table-wrap';
-    var grows = fileGroups.map(function(g, i) {
-      return '<tr>' +
-        '<td>' + renderBadge(g.type) + '</td>' +
-        '<td>' + escHtml(g.name) + '</td>' +
-        '<td class="cell-id" title="' + escHtml(g.manifestUrl) + '">' + escHtml(g.manifestUrl) + '</td>' +
-        '<td>' +
+  if (fileGroups.length > 0) {
+    var cards = document.createElement('div');
+    cards.className = 'file-group-cards';
+    var cardHtml = fileGroups.map(function(g, i) {
+      // segmentCount is optional in the contract (assetFileGroupSchema); show it
+      // only when the server actually populated it.
+      var segLine = (g.segmentCount != null)
+        ? '<div class="file-group-meta">' + escHtml(String(g.segmentCount)) + ' segment' + (g.segmentCount === 1 ? '' : 's') + '</div>'
+        : '<div class="file-group-meta text-muted">segment count unavailable</div>';
+      return '<div class="file-group-card">' +
+        '<div class="file-group-card-head">' + renderBadge(g.type) + '<span class="file-group-name">' + escHtml(g.name) + '</span></div>' +
+        '<div class="file-group-url cell-id" title="' + escHtml(g.manifestUrl) + '">' + escHtml(g.manifestUrl) + '</div>' +
+        segLine +
+        '<div class="file-group-actions">' +
           '<button type="button" class="btn-ghost file-group-copy" data-idx="' + i + '">Copy URL</button> ' +
           '<a class="btn-ghost" href="' + escHtml(g.manifestUrl) + '" target="_blank" rel="noopener">Open</a>' +
-        '</td>' +
-        '</tr>';
+        '</div>' +
+        '</div>';
     }).join('');
-    gwrap.innerHTML =
-      '<table><thead><tr>' +
-      '<th>Type</th><th>Name</th><th>Manifest URL</th><th></th>' +
-      '</tr></thead><tbody>' + grows + '</tbody></table>';
-    container.appendChild(gwrap);
+    cards.innerHTML = cardHtml;
+    container.appendChild(cards);
 
     // Copy-to-clipboard for each manifest URL. Bound via the untrusted URL held
     // in JS (not re-parsed from the DOM) and reported with transient feedback.
-    gwrap.querySelectorAll('.file-group-copy').forEach(function(btn) {
+    cards.querySelectorAll('.file-group-copy').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var group = fileGroups[Number(btn.dataset.idx)];
         if (!group) return;
@@ -827,6 +839,12 @@ async function renderAssetFiles(assetId, container) {
         }
       });
     });
+  } else {
+    var groupsEmpty = document.createElement('div');
+    groupsEmpty.className = 'empty';
+    groupsEmpty.setAttribute('data-empty', 'file-groups');
+    groupsEmpty.textContent = 'No streaming packages (HLS/DASH) for this asset yet.';
+    container.appendChild(groupsEmpty);
   }
 }
 
@@ -3186,6 +3204,7 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 // shares the exact same renderer + helper logic (no duplication / divergence).
 export {
   renderAssetDetailBody,
+  renderAssetFiles,
   renderJobDetailBody,
   openDetailWindow,
   setActiveStack,
