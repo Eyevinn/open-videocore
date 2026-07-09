@@ -109,6 +109,21 @@ export class CouchAssetRepository implements AssetRepository {
     return fromDoc(doc);
   }
 
+  // Resolve by slug (issue #132). Queries the top-level `slug` mirror emitted by
+  // toDoc() with the same Mango selector style as slugTaken(). OSC provisions one
+  // CouchDB instance per tenant (ADR-003), so the lookup is inherently
+  // workspace-scoped. Slugs are unique within the database (generateUniqueSlug),
+  // so at most one document matches.
+  async getBySlug(slug: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const matches = await couch.find({ resourceType: RESOURCE_TYPE, slug }, { limit: 1 });
+    const doc = matches.find((d) => d.resourceType === RESOURCE_TYPE);
+    if (!doc) {
+      return undefined;
+    }
+    return fromDoc(doc);
+  }
+
   async list(opts: ListOptions = {}): Promise<ListResult> {
     const couch = this.couchFor();
     const limit = clampLimit(opts.limit);

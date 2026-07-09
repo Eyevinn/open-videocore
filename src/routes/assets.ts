@@ -22,6 +22,7 @@ import {
   InvalidReviewTransitionError,
   InvalidStateTransitionError,
   ParentNotFoundError,
+  isUlid,
   normalizeTags,
   SUBTITLE_FORMATS,
   type AssetAudioTrack,
@@ -971,17 +972,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // Resolve a path `:id` that may be either the ULID id or the human-readable
+  // slug (issue #132), scoped to the caller's workspace. A value shaped like a
+  // ULID resolves by id; otherwise (or when the id lookup misses) it falls back
+  // to a slug lookup. Both lookups go through the workspace-scoped repository, so
+  // the 404 semantics are preserved when neither matches. Slugs and ULIDs use
+  // disjoint character sets (lowercase-hyphen vs. Crockford base32), so there is
+  // no ambiguity between the two.
+  async function resolveAsset(
+    idOrSlug: string
+  ): Promise<Awaited<ReturnType<AssetRepository['get']>>> {
+    if (isUlid(idOrSlug)) {
+      return repo.get(idOrSlug);
+    }
+    return repo.getBySlug(idOrSlug);
+  }
+
   app.get(
     '/:id',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: assetSchema, 404: errorSchema }
       }
     },
     async (request, reply) => {
-      const asset = await repo.get(request.params.id);
+      const asset = await resolveAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }

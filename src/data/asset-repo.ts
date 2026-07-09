@@ -477,9 +477,27 @@ export const MAX_LIMIT = 200;
 // Repository interface
 // ---------------------------------------------------------------------------
 
+// A ULID is exactly 26 chars of Crockford base32 (issue #131/#132): the digits
+// 0-9 and the uppercase letters A-Z excluding I, L, O, and U. Asset ids are
+// minted with `ulid()` (uppercase), while slugs are lowercase hyphen-joined
+// handles, so the two character sets never overlap — a string matching this
+// pattern is treated as an id, anything else as a slug. Used by the `/:id`
+// route to decide whether to resolve by id or by slug (no new regex is minted
+// elsewhere).
+const ULID_PATTERN = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+export function isUlid(value: string): boolean {
+  return ULID_PATTERN.test(value);
+}
+
 export interface AssetRepository {
   create(input: CreateAssetInput): Promise<Asset>;
   get(id: string): Promise<Asset | undefined>;
+  // Resolve an asset by its human-readable slug (issue #131/#132), scoped to the
+  // repository's (structurally isolated) workspace. Returns undefined when no
+  // asset in this workspace carries the slug. Used by the `/:id` route to accept
+  // a slug in place of the ULID id.
+  getBySlug(slug: string): Promise<Asset | undefined>;
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
@@ -780,6 +798,19 @@ export class InMemoryAssetRepository implements AssetRepository {
       return undefined;
     }
     return { ...asset };
+  }
+
+  // Resolve by slug (issue #132). Scans this store, which holds exactly one
+  // tenant's assets, so the lookup is inherently workspace-scoped — mirroring
+  // slugTaken's isolation. Slugs are unique within the store (generateUniqueSlug),
+  // so the first match is the asset.
+  async getBySlug(slug: string): Promise<Asset | undefined> {
+    for (const a of this.store.values()) {
+      if (a.slug === slug) {
+        return { ...a };
+      }
+    }
+    return undefined;
   }
 
   async list(opts: ListOptions = {}): Promise<ListResult> {
