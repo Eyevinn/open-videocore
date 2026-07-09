@@ -15,6 +15,7 @@ import type { EncoreClient, EncoreSubmitInput, EncoreSubmitResult } from '../pip
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { EncoreScalerLoop } from './scaler-loop.js';
 import { makeScalingEncoreClient } from './index.js';
+import { destroyInstance, listInstances } from './instance-pool.js';
 import { keys } from './types.js';
 import type { EncoreScalerConfig } from './types.js';
 
@@ -115,6 +116,68 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       // key = "encore:pool:{workspaceId}"
       const workspaceId = key.slice('encore:pool:'.length);
       if (workspaceId) await this.getOrCreate(workspaceId);
+    }
+  }
+
+  // Tear down a single workspace's scaler: stop its background loop and destroy
+  // every pooled Encore OSC instance (and its paired callback listener). A clean
+  // no-op when the workspace has no active loop/pool. Sub-task of #107.
+  //
+  // Contracts verified before writing (CLAUDE.md rule 7):
+  //   - this.loops: Map<string, { client: EncoreClient; loop: EncoreScalerLoop }>
+  //     (workspace-registry.ts:45)
+  //   - EncoreScalerLoop.stop(): void (scaler-loop.ts:58)
+  //   - listInstances(redis: Redis, workspaceId: string):
+  //       Promise<EncoreInstanceRecord[]> (instance-pool.ts:52)
+  //   - destroyInstance(instanceId: string, config: EncoreScalerConfig):
+  //       Promise<void> (instance-pool.ts:171). It removes the Encore instance
+  //     AND its same-named paired callback listener
+  //     (ENCORE_CALLBACK_LISTENER_SERVICE_ID, instance-pool.ts:180-192) and is
+  //     idempotent, so a missing instance never throws.
+  //   - EncoreInstanceRecord.instanceId: string (types.ts:69)
+  async teardown(workspaceId: string): Promise<void> {
+    // 1. Stop the loop if this workspace has one, and remove it from the map so a
+    //    later submit() re-creates a fresh loop via getOrCreate().
+    const existing = this.loops.get(workspaceId);
+    if (existing) {
+      existing.loop.stop();
+      this.loops.delete(workspaceId);
+    }
+
+    // 2. Destroy every pooled instance. Reads directly from Valkey so teardown
+    //    works even for a pool that outlived its in-memory loop (e.g. resumed by
+    //    resumeExistingWorkspaces() but never re-registered). A missing/empty
+    //    pool yields an empty list — a clean no-op. If Redis itself is
+    //    unavailable the read rejects; swallow it so teardown stays a no-op
+    //    (there is nothing we can safely destroy without the pool state).
+    let instances;
+    try {
+      instances = await listInstances(this.config.redis, workspaceId);
+    } catch {
+      return;
+    }
+    if (instances.length === 0) return;
+
+    // destroyInstance() only reads oscContext, redis and workspaceId from the
+    // config (instance-pool.ts:171-198). Build a minimal correctly-typed config
+    // for this workspace; getToken is required by the type but unused on the
+    // teardown path.
+    const scalerConfig: EncoreScalerConfig = {
+      workspaceId,
+      maxInstances: this.config.maxInstances,
+      minInstances: this.config.minInstances,
+      idleTimeoutMs: this.config.idleTimeoutMs,
+      oscContext: this.config.oscContext,
+      redis: this.config.redis,
+      redisUrl: this.config.redisUrl,
+      getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
+      s3Config: this.config.s3Config,
+      profilesUrl: this.config.profilesUrl,
+      onDispatched: this.config.onDispatched
+    };
+
+    for (const inst of instances) {
+      await destroyInstance(inst.instanceId, scalerConfig);
     }
   }
 
