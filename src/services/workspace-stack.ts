@@ -20,12 +20,14 @@ import { CouchSearchRepository } from '../data/couch-search-repo.js';
 import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
+import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { InMemorySearchRepository } from '../data/inmemory-search-repo.js';
 import { InMemoryWebhookRepository } from '../data/inmemory-webhook-repo.js';
 import { InMemoryCollectionRepository } from '../data/inmemory-collection-repo.js';
 import { InMemoryProfileRepository } from '../data/inmemory-profile-repo.js';
+import { InMemoryPipelineRepository, type PipelineRepository } from '../data/pipeline-repo.js';
 import type { SearchRepository } from '../data/search-repo.js';
 import type { WebhookRepository } from '../data/webhook-repo.js';
 import type { CollectionRepository } from '../data/collection-repo.js';
@@ -43,6 +45,7 @@ export type WorkspaceConnections = {
   webhooks: WebhookRepository;
   collections: CollectionRepository;
   profiles: ProfileRepository;
+  pipelines: PipelineRepository;
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
@@ -105,6 +108,7 @@ function buildConnectionsFromStack(
   const webhooks = new CouchWebhookRepository(wc);
   const collections = new CouchCollectionRepository(wc);
   const profiles = new CouchProfileRepository(wc);
+  const pipelines = new CouchPipelineRepository(wc);
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -121,6 +125,7 @@ function buildConnectionsFromStack(
     webhooks,
     collections,
     profiles,
+    pipelines,
     storageFor,
     storageClient: minioClient,
     encore,
@@ -150,6 +155,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let webhooks: WebhookRepository;
   let collections: CollectionRepository;
   let profiles: ProfileRepository;
+  let pipelines: PipelineRepository;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -161,6 +167,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     webhooks = new CouchWebhookRepository(wc);
     collections = new CouchCollectionRepository(wc);
     profiles = new CouchProfileRepository(wc);
+    pipelines = new CouchPipelineRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -169,6 +176,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
     profiles = new InMemoryProfileRepository();
+    pipelines = new InMemoryPipelineRepository();
   }
 
   let storageFor: StorageFactory | undefined;
@@ -198,7 +206,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, profiles,
+    assets, jobs, search, webhooks, collections, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined
@@ -212,8 +220,9 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
   const profiles = new InMemoryProfileRepository();
+  const pipelines = new InMemoryPipelineRepository();
   return {
-    assets, jobs, search, webhooks, collections, profiles,
+    assets, jobs, search, webhooks, collections, profiles, pipelines,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',

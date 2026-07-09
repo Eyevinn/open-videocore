@@ -52,7 +52,7 @@ import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
-import { InMemoryPipelineRepository } from './data/pipeline-repo.js';
+import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
@@ -460,7 +460,7 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 // between the assets router (creates executions) and the internal router
 // (advances them from transcode/package callbacks). Declared up front so the
 // callback poller (started on scaler activation) can advance executions.
-const pipelineRepository = new InMemoryPipelineRepository();
+const pipelineRepository = new PerWorkspacePipelineRepository(stackResolver);
 
 // Asset comments (issue #135). In-memory: comments are a simple free-text
 // sub-resource for this iteration (mirrors the ephemeral pipeline repo above).
