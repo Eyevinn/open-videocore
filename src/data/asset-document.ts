@@ -180,6 +180,10 @@ export const AssetDocumentSchema = z.object({
       versionOf: z.string().nullable().optional(),
       versionGroupId: z.string().nullable().optional(),
       packagingError: z.string().optional(),
+      // Last auto-subtitles generation failure (issue #114). Optional so
+      // documents written before #114 (field absent) still deserialize — no
+      // schemaVersion bump required.
+      subtitlesError: z.string().optional(),
       editorialAudio: z.array(EditorialAudioTrackSchema).optional(),
       editorialSubtitles: z.array(EditorialSubtitleTrackSchema).optional()
     })
@@ -297,6 +301,9 @@ export function toAssetDocument(
   if (asset.packagingError) {
     doc.structural.packagingError = asset.packagingError;
   }
+  if (asset.subtitlesError) {
+    doc.structural.subtitlesError = asset.subtitlesError;
+  }
   if (asset.thumbnails && asset.thumbnails.length > 0) {
     doc.structural.thumbnails = asset.thumbnails.map((objectKey) => ({ objectKey }));
   }
@@ -345,6 +352,7 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     technicalMetadataError: technical.technicalMetadataError,
     manifestUrls,
     packagingError: doc.structural?.packagingError,
+    subtitlesError: doc.structural?.subtitlesError,
     renditions: renditions && renditions.length > 0 ? renditions : undefined,
     thumbnails: thumbnails && thumbnails.length > 0 ? thumbnails : undefined,
     metadata:

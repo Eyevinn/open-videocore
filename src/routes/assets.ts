@@ -45,6 +45,11 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import {
+  generateSubtitles,
+  type GenerateSubtitlesDeps,
+  type SubtitleGenerator
+} from '../pipeline/subtitle-generator.js';
+import {
   BUILT_IN_PIPELINES,
   PIPELINE_NAMES,
   type PipelineStepName
@@ -403,6 +408,15 @@ type AssetsRouterOptions = {
   // Defaults to the real fire-and-forget extractor.
   extract?: typeof extractTechnicalMetadata;
   extractDeps?: Partial<ExtractDeps>;
+  // Auto-subtitles (issue #114). `subtitleGenerator` calls the OSC
+  // eyevinn-auto-subtitles (Whisper) service (a stub in tests). When absent (or
+  // no object storage), the OPTIONAL `subtitles` pipeline step skips gracefully —
+  // it is fire-and-forget and never throws into the ingest path.
+  subtitleGenerator?: SubtitleGenerator;
+  // Injectable orchestrator runner + extra deps (tests stub the generator/TTL).
+  // Defaults to the real fire-and-forget generator.
+  generateSubtitles?: typeof generateSubtitles;
+  subtitleDeps?: Partial<GenerateSubtitlesDeps>;
   // Encore transcode client (issue #8). When absent, POST /:id/transcode
   // responds 501 (Encore not configured on this deployment).
   encore?: EncoreClient;
@@ -446,7 +460,7 @@ type AssetsRouterOptions = {
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
 const stepStatusSchema = z.enum(['pending', 'running', 'done', 'failed']);
 const stepExecutionSchema = z.object({
-  name: z.enum(['extract-metadata', 'thumbnail', 'transcode', 'package']),
+  name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'transcode', 'package']),
   status: stepStatusSchema,
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
@@ -550,6 +564,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const jobs = opts.jobRepository ?? new InMemoryJobRepository();
   const runner = opts.runPull ?? runPull;
   const extractRunner = opts.extract ?? extractTechnicalMetadata;
+  const subtitleRunner = opts.generateSubtitles ?? generateSubtitles;
   const thumbnailRunner = opts.extractThumbnails ?? extractThumbnails;
   const rewrapRunner = opts.rewrap ?? rewrap;
   const clipRunnerOrchestrator = opts.clip ?? runClip;
@@ -570,6 +585,28 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         storage: storageFor(),
         probe: opts.probe,
         ...opts.extractDeps
+      }
+    );
+    return true;
+  }
+
+  // Fire-and-forget auto-subtitle generation for a pipeline step (issue #114).
+  // Detached, never blocks the caller, and the generator itself never throws
+  // (records failures on the asset as `subtitlesError`). No-op when the OSC
+  // auto-subtitles service or object storage is not configured — consistent with
+  // the OPTIONAL, opt-in nature of the step. Returns true when a generation was
+  // actually kicked off (false = skipped gracefully).
+  function triggerSubtitles(assetId: string, objectKey: string): boolean {
+    if (!opts.subtitleGenerator || !storageFor) {
+      return false;
+    }
+    void subtitleRunner(
+      { assetId, objectKey },
+      {
+        assets: repo,
+        storage: storageFor(),
+        generate: opts.subtitleGenerator,
+        ...opts.subtitleDeps
       }
     );
     return true;
@@ -643,7 +680,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return undefined;
       }
     }
-    if ((firstStep === 'extract-metadata' || firstStep === 'thumbnail') && !asset.objectKey) {
+    if (
+      (firstStep === 'extract-metadata' || firstStep === 'thumbnail' || firstStep === 'subtitles') &&
+      !asset.objectKey
+    ) {
       reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
       return undefined;
     }
@@ -666,6 +706,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         }
         if (step.name === 'thumbnail') {
           triggerThumbnail(asset.id, asset.objectKey as string, request);
+          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          continue;
+        }
+        if (step.name === 'subtitles') {
+          // Fire-and-forget, exactly like extract-metadata: kick off (or skip
+          // gracefully when unconfigured) and settle the step immediately. The
+          // generator records its own success/failure on the asset and never
+          // throws into this loop, so the step never fails the pipeline.
+          triggerSubtitles(asset.id, asset.objectKey as string);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }

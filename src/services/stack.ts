@@ -37,6 +37,21 @@ export type StackService = (typeof STACK_SERVICES)[number];
 // than added to STACK_SERVICES.
 export const FFPROBE_SERVICE_ID = 'eyevinn-ffmpeg-s3' as const;
 
+// eyevinn-auto-subtitles ("Subtitle Generator"): the Whisper-based transcription
+// service used by the OPTIONAL auto-subtitles pipeline step (issue #114). Unlike
+// eyevinn-ffmpeg-s3 (an ephemeral job runner), this is a LONG-LIVED service
+// instance called over HTTP at its instance URL (see pipeline/osc-auto-subtitles.ts).
+// It is NOT part of the long-lived provisioned stack above — it is an opt-in
+// consumer service, provisioned/configured separately (it needs an OpenAI key) —
+// so it is exported separately rather than added to STACK_SERVICES (mirrors the
+// FFPROBE_SERVICE_ID treatment).
+//
+// Contract source: get-service-schema for `eyevinn-auto-subtitles`.
+// create-service-instance config: required `name` (^\w+$) and `openaikey`;
+// optional awsAccessKeyId/awsSecretAccessKey/awsRegion/s3Endpoint. Exposes a
+// `/transcribe/s3` endpoint for S3 sources; does NOT support config updates.
+export const AUTO_SUBTITLES_SERVICE_ID = 'eyevinn-auto-subtitles' as const;
+
 // Teardown order is the reverse of provision order: consumers are removed
 // before the producers they depend on (packager -> queue -> database ->
 // storage). This avoids tearing a producer out from under a still-running

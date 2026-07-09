@@ -270,8 +270,14 @@ export type Asset = {
   audioTracks?: AssetAudioTrack[];
   // Multi-language subtitle / caption tracks (issue #18). Managed via the
   // dedicated /:id/subtitle-tracks routes. Undefined until the first track is
-  // added.
+  // added. Also the attach target for the auto-subtitles pipeline (issue #114),
+  // which appends an auto-generated track.
   subtitleTracks?: SubtitleTrack[];
+  // Set by the auto-subtitles pipeline (issue #114) when its last generation
+  // attempt failed. Fire-and-forget like `technicalMetadataError`: it never
+  // blocks the asset record or changes lifecycle status, so it is optional and
+  // cleared (to undefined) on the next successful generation.
+  subtitlesError?: string;
   // How the asset entered the system (ADR-005 administrative.source.method).
   sourceMethod?: AssetSourceMethod;
   // Origin URI for url-pull / watch-folder ingest.
@@ -356,6 +362,10 @@ export type UpdateAssetInput = {
   // the dedicated /:id/audio-tracks and /:id/subtitle-tracks routes.
   audioTracks?: AssetAudioTrack[];
   subtitleTracks?: SubtitleTrack[];
+  // Set by the auto-subtitles pipeline (issue #114). Writing a string records a
+  // failure; writing `null` clears any prior error after a successful attach.
+  // Does not change `status`. Mirrors the technicalMetadataError semantics.
+  subtitlesError?: string | null;
 };
 
 export type ListOptions = {
@@ -803,6 +813,10 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.subtitleTracks !== undefined) {
       next.subtitleTracks = patch.subtitleTracks;
+    }
+    if (patch.subtitlesError !== undefined) {
+      // `null` clears the error (successful attach); a string records a failure.
+      next.subtitlesError = patch.subtitlesError ?? undefined;
     }
     if (patch.versionGroupId !== undefined) {
       next.versionGroupId = patch.versionGroupId;

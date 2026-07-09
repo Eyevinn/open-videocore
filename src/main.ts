@@ -36,6 +36,8 @@ import {
 } from './data/per-workspace-repos.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
+import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
+import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
@@ -333,6 +335,29 @@ const clipRunner: ClipRunner | undefined = storageAvailable
       removeJob
     })
   : undefined;
+
+// Auto-subtitles (issue #114) runs on the long-lived OSC eyevinn-auto-subtitles
+// (Whisper) SERVICE, called over HTTP at its instance URL — NOT an ephemeral job
+// like the ffprobe/thumbnail/clip runners. It is OPTIONAL and opt-in: the
+// service is provisioned separately (it needs an OpenAI key), so the deployment
+// supplies the instance name via AUTO_SUBTITLES_INSTANCE_NAME. When that name is
+// unset (or object storage is missing) the generator is undefined and the
+// `subtitles` pipeline step skips gracefully (never throws — fire-and-forget).
+// AUTO_SUBTITLES_WRITES_S3=true tells the runner the service uploads the result
+// object to S3 itself (so we skip our own upload path).
+const autoSubtitlesInstanceName = process.env['AUTO_SUBTITLES_INSTANCE_NAME'];
+const subtitleGenerator: SubtitleGenerator | undefined =
+  storageAvailable && autoSubtitlesInstanceName
+    ? makeOscSubtitleGenerator({
+        context: oscContext,
+        getInstance,
+        instanceName: autoSubtitlesInstanceName,
+        writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
+      })
+    : undefined;
+if (storageAvailable && !autoSubtitlesInstanceName) {
+  app.log.info('AUTO_SUBTITLES_INSTANCE_NAME not set — optional auto-subtitles pipeline step disabled');
+}
 
 // ABR transcoding via auto-scaling Encore pool (ADR-006). The scaler exposes
 // the same EncoreClient interface as the old static client but manages a
@@ -646,6 +671,7 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   thumbnailExtractor,
   rewrapRunner,
   clipRunner,
+  subtitleGenerator,
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository

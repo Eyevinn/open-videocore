@@ -190,6 +190,10 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.subtitleTracks !== undefined) {
       next.subtitleTracks = patch.subtitleTracks;
     }
+    if (patch.subtitlesError !== undefined) {
+      // `null` clears the error (successful attach); a string records a failure.
+      next.subtitlesError = patch.subtitlesError ?? undefined;
+    }
     if (patch.versionGroupId !== undefined) {
       next.versionGroupId = patch.versionGroupId;
     }
