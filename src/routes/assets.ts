@@ -33,8 +33,8 @@ import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import {
   SourceTooLargeError,
+  WorkspaceStorage,
   deliveryUrlTtlSeconds,
-  type WorkspaceStorage
 } from '../data/storage.js';
 import { parseSource, assertPublicHost, SourceValidationError } from '../pipeline/source.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
@@ -555,6 +555,16 @@ async function resolveEncoreJobUrlForPackaging(
 
 // The last path segment of a MinIO object key, used as a human file name (e.g.
 // `sources/<id>/master.mp4` -> `master.mp4`). Falls back to the whole key.
+// Parse an `s3://bucket/key` URI into its parts. Renditions written by Encore
+// carry this format because Encore writes to a configurable S3 output bucket
+// that may differ from the source bucket (ADR-001). Returns null for plain
+// object keys (no scheme prefix) so callers can use the source-bucket storage.
+function parseS3Uri(uri: string): { bucket: string; key: string } | null {
+  const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
+  if (!match) return null;
+  return { bucket: match[1], key: match[2] };
+}
+
 function fileNameFromKey(key: string): string {
   const trimmed = key.replace(/\/+$/, '');
   const segment = trimmed.slice(trimmed.lastIndexOf('/') + 1);
@@ -1135,14 +1145,31 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // stable ULID `id` (asset-repo Rendition.id), so the file id is derived
       // deterministically as `rendition:<renditionId>` — stable across calls and
       // unique even if two rungs share a label.
+      //
+      // Renditions from Encore store their objectKey as an S3 URI
+      // (s3://openvideocore-packaged/transcode/<id>/rendition.mp4) because Encore
+      // writes to a separate packaged bucket. Parse the URI to get the actual
+      // bucket + key and presign from the right storage.
+      const storageClient = request.connections?.storageClient;
       for (const r of renditions) {
+        const s3Uri = parseS3Uri(r.objectKey);
+        let url: string;
+        let exposedKey: string;
+        if (s3Uri && storageClient) {
+          const rendStorage = new WorkspaceStorage(storageClient, s3Uri.bucket);
+          url = await rendStorage.presignedGet(s3Uri.key, ttl);
+          exposedKey = s3Uri.key;
+        } else {
+          url = await storage!.presignedGet(r.objectKey, ttl);
+          exposedKey = r.objectKey;
+        }
         files.push({
           id: `rendition:${r.id}`,
           type: 'rendition',
-          name: fileNameFromKey(r.objectKey),
-          format: formatFromKey(r.objectKey),
-          objectKey: r.objectKey,
-          url: await storage!.presignedGet(r.objectKey, ttl),
+          name: fileNameFromKey(exposedKey),
+          format: formatFromKey(exposedKey),
+          objectKey: exposedKey,
+          url,
           label: r.label,
           width: r.width,
           height: r.height,
