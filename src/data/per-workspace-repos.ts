@@ -126,6 +126,13 @@ export class PerWorkspaceEncoreClient implements EncoreClient {
     if (!conns.encore) return undefined;
     return conns.encore.getJobStatus(encoreJobId);
   }
+  async cancel(encoreJobId: string): Promise<void> {
+    const conns = await this.resolver.resolve();
+    // No Encore configured: nothing to cancel — idempotent no-op, matching
+    // getJobStatus above.
+    if (!conns.encore) return;
+    return conns.encore.cancel(encoreJobId);
+  }
 }
 
 export class PerWorkspaceSearchRepository implements SearchRepository {

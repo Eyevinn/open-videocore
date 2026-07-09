@@ -41,6 +41,12 @@ export interface EncoreClient {
   // Poll Encore for the current status of a job by its internal Encore id.
   // Returns a normalized JobStatus string, or undefined if the job is unknown.
   getJobStatus(encoreJobId: string): Promise<string | undefined>;
+  // Request cancellation of an in-flight Encore job by its internal Encore id.
+  // Contract: POST {baseUrl}/encoreJobs/{jobId}/cancel — SVT Encore
+  // EncoreController.kt (github.com/svt/encore, encore-web/.../controller/
+  // EncoreController.kt), verified 2026-07-09. Only NEW/QUEUED/IN_PROGRESS jobs
+  // are cancellable; cancelling an already-gone/terminal job is a no-op.
+  cancel(encoreJobId: string): Promise<void>;
 }
 
 // Configuration for the HTTP-backed client. The base URL is the provisioned
@@ -117,6 +123,26 @@ export function makeHttpEncoreClient(config: HttpEncoreConfig): EncoreClient {
       }
       const body = (await res.json().catch(() => ({}))) as { id?: string; jobId?: string };
       return { encoreInternalId: String(body.id ?? body.jobId ?? '') };
+    },
+    async cancel(encoreJobId: string): Promise<void> {
+      // POST {baseUrl}/encoreJobs/{jobId}/cancel — SVT Encore
+      // EncoreController.kt (github.com/svt/encore, encore-web/.../controller/
+      // EncoreController.kt), verified 2026-07-09. No request body.
+      const token = await config.getToken();
+      const res = await doFetch(
+        `${config.baseUrl.replace(/\/$/, '')}/encoreJobs/${encoreJobId}/cancel`,
+        {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}` }
+        }
+      );
+      // Idempotent no-op: 404 = job already gone, 409 = job in a terminal /
+      // non-cancellable state. Cancelling an already-finished job must not error.
+      if (res.status === 404 || res.status === 409) return;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Encore job cancellation failed: ${res.status} ${text}`.trim());
+      }
     }
   };
 }
