@@ -15,8 +15,9 @@
 // while they wait in the Encore auto-scaler's local Redis queue (ADR-006), and
 // advance to `running` once the scaler dispatches them to an Encore instance.
 // Ingest jobs advance straight to `running` once the worker starts streaming
-// bytes. Both kinds end in either `done` or `failed`; both are terminal.
-export const JOB_STATUSES = ['pending', 'queued', 'running', 'done', 'failed'] as const;
+// bytes. Both kinds end in `done`, `failed`, or `cancelled` (operator-initiated
+// via the cancel handler, distinct from `failed`); all three are terminal.
+export const JOB_STATUSES = ['pending', 'queued', 'running', 'done', 'failed', 'cancelled'] as const;
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
 // The kind of work a job performs. URL-pull ingest (issue #5) and ABR
@@ -94,11 +95,12 @@ export type UpdateJobInput = {
 };
 
 const ALLOWED_JOB_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
-  pending: ['queued', 'running', 'failed'],
-  queued: ['running', 'failed'],
-  running: ['done', 'failed', 'running'],
+  pending: ['queued', 'running', 'failed', 'cancelled'],
+  queued: ['running', 'failed', 'cancelled'],
+  running: ['done', 'failed', 'running', 'cancelled'],
   done: [],
-  failed: []
+  failed: [],
+  cancelled: []
 };
 
 export class InvalidJobTransitionError extends Error {
