@@ -23,12 +23,14 @@ import { ulid } from 'ulid';
 import {
   type Asset,
   type AssetRepository,
+  type AssetReviewState,
   type AssetStatus,
   type CreateAssetInput,
   type ListOptions,
   type ListResult,
   type UpdateAssetInput,
   applyMetadata,
+  applyReviewState,
   applyStatus,
   clampLimit,
   generateUniqueSlug,
@@ -196,6 +198,24 @@ export class CouchAssetRepository implements AssetRepository {
     if (entries.length > 0) {
       next.provenance = [...(existing.provenance ?? []), ...entries];
     }
+    // Carry _rev so CouchDB accepts the update; put() forces the partition.
+    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
+    return next;
+  }
+
+  async transitionReviewState(
+    id: string,
+    to: AssetReviewState
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const existing = fromDoc(doc);
+    const applied = applyReviewState(existing.reviewState, to);
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, reviewState: applied.reviewState, updatedAt: now };
     // Carry _rev so CouchDB accepts the update; put() forces the partition.
     await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;

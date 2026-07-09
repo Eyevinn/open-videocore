@@ -46,6 +46,48 @@ export function isValidTransition(from: AssetStatus, to: AssetStatus): boolean {
   return ALLOWED_TRANSITIONS[from].includes(to);
 }
 
+// ---------------------------------------------------------------------------
+// Review state (issue #134, sub-task of #117)
+// ---------------------------------------------------------------------------
+
+// Editorial review state, DISTINCT from the lifecycle `status` above. Where
+// `status` tracks the technical/ingest lifecycle (uploading -> ... -> archived),
+// `reviewState` tracks a human approval workflow layered on top of it. The two
+// are INDEPENDENT: a `ready` asset can be `draft`, `in-review`, `approved`, or
+// `rejected`, and moving one never moves the other.
+//
+// An asset starts in `draft`. Absent/legacy assets and documents are treated as
+// `draft` (see asset-document.ts) so backward compatibility is preserved.
+export const ASSET_REVIEW_STATES = ['draft', 'in-review', 'approved', 'rejected'] as const;
+export type AssetReviewState = (typeof ASSET_REVIEW_STATES)[number];
+
+// Allowed forward transitions for the review workflow. Anything not listed is
+// rejected with 422 (same mapping as the lifecycle machine).
+//   draft      -> in-review                submit for review
+//   in-review  -> approved | rejected      reviewer decision
+//   rejected   -> in-review                resubmit after changes (re-review)
+//   approved   -> in-review                re-open an approved asset for
+//                                          re-review (e.g. a later edit needs
+//                                          fresh sign-off). `approved` is NOT
+//                                          terminal so content can always be
+//                                          pulled back into review — a common
+//                                          editorial need — while still barring
+//                                          direct approved -> rejected without a
+//                                          re-review step.
+const ALLOWED_REVIEW_TRANSITIONS: Record<AssetReviewState, readonly AssetReviewState[]> = {
+  draft: ['in-review'],
+  'in-review': ['approved', 'rejected'],
+  approved: ['in-review'],
+  rejected: ['in-review']
+};
+
+export function isValidReviewTransition(from: AssetReviewState, to: AssetReviewState): boolean {
+  if (from === to) {
+    return true; // idempotent no-op transitions are allowed
+  }
+  return ALLOWED_REVIEW_TRANSITIONS[from].includes(to);
+}
+
 export type StatusTransition = {
   at: string; // ISO timestamp
   from: AssetStatus | null; // null for the initial creation entry
@@ -167,6 +209,10 @@ export type Asset = {
   slug?: string;
   description?: string;
   status: AssetStatus;
+  // Editorial review state (issue #134), INDEPENDENT of `status`. Optional so
+  // pre-existing assets/documents without it remain valid; absent is treated as
+  // the initial state `draft` throughout (get/list/document round-trip).
+  reviewState?: AssetReviewState;
   // Source asset id for renditions/children; undefined for top-level sources.
   parentId?: string;
   // MinIO object key (workspace-local) for the asset payload, if any.
@@ -309,6 +355,16 @@ export class InvalidStateTransitionError extends Error {
   }
 }
 
+// Raised when a review-state change violates the review state machine -> 422.
+// Mirrors InvalidStateTransitionError so routes map both to the same 422.
+export class InvalidReviewTransitionError extends Error {
+  readonly statusCode = 422;
+  constructor(from: AssetReviewState, to: AssetReviewState) {
+    super(`invalid review-state transition: ${from} -> ${to}`);
+    this.name = 'InvalidReviewTransitionError';
+  }
+}
+
 // Raised when a referenced parent asset does not exist in the workspace -> 422.
 export class ParentNotFoundError extends Error {
   readonly statusCode = 422;
@@ -340,6 +396,11 @@ export interface AssetRepository {
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
+  // Transition the asset's editorial review state (issue #134). Validates the
+  // move against the review state machine (throws InvalidReviewTransitionError
+  // on an illegal move) and persists the new state. Returns the updated asset,
+  // or undefined if the asset does not exist. INDEPENDENT of `status`.
+  transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
   countChildren(id: string): Promise<number>;
   // Soft-delete: transitions the asset to `archived`. Returns the archived
@@ -407,6 +468,21 @@ export function applyStatus(
     status: next,
     statusHistory: [...history, { at: now, from: current, to: next }]
   };
+}
+
+// Apply a review-state change (issue #134), validating the transition against
+// the review state machine. `current` defaults to `draft` for assets that have
+// no reviewState yet (backward compat). Throws InvalidReviewTransitionError on
+// an illegal move. Returns the resolved next state.
+export function applyReviewState(
+  current: AssetReviewState | undefined,
+  next: AssetReviewState
+): { reviewState: AssetReviewState } {
+  const from = current ?? 'draft';
+  if (!isValidReviewTransition(from, next)) {
+    throw new InvalidReviewTransitionError(from, next);
+  }
+  return { reviewState: next };
 }
 
 // Apply a metadata patch to an asset's existing metadata (issue #12). When
@@ -671,6 +747,21 @@ export class InMemoryAssetRepository implements AssetRepository {
       next.provenance = [...(existing.provenance ?? []), ...entries];
     }
     this.store.set(key, next);
+    return { ...next };
+  }
+
+  async transitionReviewState(
+    id: string,
+    to: AssetReviewState
+  ): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const applied = applyReviewState(existing.reviewState, to);
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, reviewState: applied.reviewState, updatedAt: now };
+    this.store.set(id, next);
     return { ...next };
   }
 

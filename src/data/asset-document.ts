@@ -24,10 +24,12 @@
 
 import { z } from 'zod';
 import {
+  ASSET_REVIEW_STATES,
   ASSET_SOURCE_METHODS,
   PROVENANCE_ACTORS,
   SUBTITLE_FORMATS,
   type Asset,
+  type AssetReviewState,
   type AssetSourceMethod,
   type AssetStatus,
   type ProvenanceEntry
@@ -156,7 +158,12 @@ export const AssetDocumentSchema = z.object({
       .object({ license: z.string().optional(), expiresAt: z.string().nullable().optional() })
       .optional(),
     provenance: z.array(ProvenanceEntrySchema).default([]),
-    statusHistory: z.array(StatusTransitionSchema).default([])
+    statusHistory: z.array(StatusTransitionSchema).default([]),
+    // Editorial review state (issue #134), DISTINCT from lifecycle `state`.
+    // `.default('draft')` means documents written before reviewState existed
+    // (the field simply absent) deserialize as `draft` — no schemaVersion bump
+    // is required, so all v1 documents remain valid.
+    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft')
   }),
 
   structural: z
@@ -253,7 +260,10 @@ export function toAssetDocument(
         originUri: asset.originUri
       },
       provenance: asset.provenance ?? [],
-      statusHistory: asset.statusHistory
+      statusHistory: asset.statusHistory,
+      // Editorial review state (issue #134). Absent on the flat asset means the
+      // asset has never been moved out of draft; persist the default explicitly.
+      reviewState: asset.reviewState ?? 'draft'
     },
     structural: {
       renditions: asset.renditions ?? [],
@@ -307,6 +317,9 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     slug: doc.descriptive.slug,
     description: doc.descriptive.description,
     status: doc.state as AssetStatus,
+    // Editorial review state (issue #134). The schema defaults absent values to
+    // `draft`, so legacy documents round-trip to `draft` rather than undefined.
+    reviewState: doc.administrative.reviewState as AssetReviewState,
     parentId: derivedFrom ?? undefined,
     objectKey: doc.administrative.storage?.key,
     statusHistory: (doc.administrative.statusHistory ?? []).map((t) => ({

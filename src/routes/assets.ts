@@ -15,9 +15,11 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import {
+  ASSET_REVIEW_STATES,
   ASSET_STATUSES,
   HasChildrenError,
   InMemoryAssetRepository,
+  InvalidReviewTransitionError,
   InvalidStateTransitionError,
   ParentNotFoundError,
   normalizeTags,
@@ -67,6 +69,9 @@ import {
 } from '../pipeline/rewrap.js';
 
 const statusSchema = z.enum(ASSET_STATUSES);
+
+// Editorial review state (issue #134), distinct from lifecycle `status`.
+const reviewStateSchema = z.enum(ASSET_REVIEW_STATES);
 
 // A custom Encore profile a caller may supply instead of a named preset. Kept
 // permissive (forwarded to Encore) but bounded so it cannot be abused.
@@ -284,6 +289,9 @@ const assetSchema = z.object({
   slug: z.string().optional(),
   description: z.string().optional(),
   status: statusSchema,
+  // Editorial review state (issue #134), INDEPENDENT of `status`. Optional so
+  // pre-existing assets serialized before reviewState existed still validate.
+  reviewState: reviewStateSchema.optional(),
   parentId: z.string().optional(),
   objectKey: z.string().optional(),
   statusHistory: z.array(transitionSchema),
@@ -622,6 +630,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     if (err instanceof InvalidStateTransitionError) {
       return reply.code(422).send({ error: 'invalid_state_transition', message: err.message });
+    }
+    if (err instanceof InvalidReviewTransitionError) {
+      return reply.code(422).send({ error: 'invalid_review_transition', message: err.message });
     }
     if (err instanceof ParentNotFoundError) {
       return reply.code(422).send({ error: 'parent_not_found', message: err.message });
@@ -1609,10 +1620,36 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // Transition an asset's editorial review state (issue #134, sub-task of #117).
+  // DISTINCT from the lifecycle `status`: this drives a human approval workflow
+  // (draft -> in-review -> approved | rejected, with re-review paths) and never
+  // touches `status`. Forward-only transitions are validated by the review state
+  // machine; an illegal move returns 422 (same mapping as the status machine).
+  //   200 — review state transitioned, full asset returned
+  //   404 — unknown/foreign asset (existence not leaked)
+  //   422 — invalid review-state transition
+  app.post(
+    '/:id/review-state',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: z.object({ reviewState: reviewStateSchema }),
+        response: { 200: assetSchema, 404: errorSchema, 422: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.transitionReviewState(request.params.id, request.body.reviewState);
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
+    }
+  );
+
   app.patch(
     '/:id',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         body: updateSchema,
