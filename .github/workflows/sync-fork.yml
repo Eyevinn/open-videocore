@@ -1,6 +1,8 @@
 name: Sync OSC Fork
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       environment:
@@ -15,13 +17,13 @@ on:
 
 jobs:
   sync-fork:
-    name: Sync fork (${{ inputs.environment }})
+    name: Sync fork (${{ inputs.environment || 'prod' }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Validate environment
         env:
-          ENV: ${{ inputs.environment }}
+          ENV: ${{ inputs.environment || 'prod' }}
         run: |
           case "$ENV" in
             prod|dev|stage) ;;
@@ -35,5 +37,5 @@ jobs:
         env:
           OSC_ACCESS_TOKEN: unused
           OSC_API_KEY: ${{ secrets.OSC_API_KEY }}
-          ENV: ${{ inputs.environment }}
+          ENV: ${{ inputs.environment || 'prod' }}
         run: osc --env "$ENV" admin sync-fork eyevinn-open-videocore
