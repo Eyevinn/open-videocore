@@ -48,6 +48,76 @@
                     "minLength": 1,
                     "maxLength": 63,
                     "pattern": "^[a-z0-9]+$"
+                  },
+                  "sourceStorage": {
+                    "type": "object",
+                    "properties": {
+                      "bucket": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "accessKeyId": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "secretAccessKey": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "region": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "endpointUrl": {
+                        "type": "string",
+                        "format": "uri"
+                      },
+                      "sessionToken": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "bucket",
+                      "accessKeyId",
+                      "secretAccessKey"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "packagedStorage": {
+                    "type": "object",
+                    "properties": {
+                      "bucket": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "accessKeyId": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "secretAccessKey": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "region": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "endpointUrl": {
+                        "type": "string",
+                        "format": "uri"
+                      },
+                      "sessionToken": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "bucket",
+                      "accessKeyId",
+                      "secretAccessKey"
+                    ],
+                    "additionalProperties": false
                   }
                 },
                 "required": [
@@ -173,6 +243,68 @@
                     },
                     "packagedBucket": {
                       "type": "string"
+                    },
+                    "storage": {
+                      "type": "object",
+                      "properties": {
+                        "source": {
+                          "type": "object",
+                          "properties": {
+                            "backend": {
+                              "type": "string",
+                              "enum": [
+                                "minio",
+                                "external"
+                              ]
+                            },
+                            "bucket": {
+                              "type": "string"
+                            },
+                            "endpointUrl": {
+                              "type": "string"
+                            },
+                            "region": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "backend",
+                            "bucket"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "packaged": {
+                          "type": "object",
+                          "properties": {
+                            "backend": {
+                              "type": "string",
+                              "enum": [
+                                "minio",
+                                "external"
+                              ]
+                            },
+                            "bucket": {
+                              "type": "string"
+                            },
+                            "endpointUrl": {
+                              "type": "string"
+                            },
+                            "region": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "backend",
+                            "bucket"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "source",
+                        "packaged"
+                      ],
+                      "additionalProperties": false
                     },
                     "services": {
                       "type": "array",

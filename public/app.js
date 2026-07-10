@@ -1553,6 +1553,102 @@ async function renderJobDetailBody(id, bodyEl, opts) {
   }
 }
 
+// ─── PIPELINE EXECUTION DETAIL ────────────────────────────────────────────────
+// Fetch and render a single PipelineExecution (issue #193) into `bodyEl`.
+// Contract: GET /api/v1/pipelines/:executionId — response `pipelineExecutionSchema`
+// in src/routes/pipelines.ts (id, assetId, assetName?, pipelineName, status
+// [running|done|failed], steps[], createdAt, updatedAt). Each step (per
+// stepExecutionSchema): name, status [pending|running|done|failed], jobId?,
+// encoreJobId?, error?, startedAt?, completedAt?, progress?.
+//
+// All server-provided text is inserted via escHtml before interpolation. Returns
+// the fetched execution so callers (detail.js) can derive the window title and
+// decide whether to keep polling.
+async function renderPipelineDetailBody(id, bodyEl) {
+  const body = bodyEl;
+  body.innerHTML = '';
+  const loader = loadingEl();
+  body.appendChild(loader);
+
+  try {
+    const exec = await apiFetch('/pipelines/' + encodeURIComponent(id));
+    loader.remove();
+
+    // Colour helper mirroring renderExecutions()'s per-status colouring.
+    const stepColor = function(status) {
+      return { running: 'var(--accent,#60a5fa)', pending: 'var(--text-muted,#9ca3af)', done: 'var(--success,#4ade80)', failed: 'var(--error,#f87171)' }[status] || '';
+    };
+
+    const kvRows = [
+      ['ID', '<span class="text-mono">' + escHtml(exec.id) + '</span>'],
+      ['Pipeline', escHtml(exec.pipelineName || '—')],
+      ['Status', renderBadge(exec.status)],
+    ];
+    if (exec.assetId) {
+      kvRows.push(['Asset', '<span class="text-mono">' + escHtml(exec.assetName || exec.assetId) + '</span>']);
+    }
+    kvRows.push(['Created', escHtml(fmtDate(exec.createdAt))]);
+    kvRows.push(['Updated', escHtml(fmtDate(exec.updatedAt))]);
+
+    const kvDiv = document.createElement('div');
+    kvDiv.className = 'kv-grid';
+    kvDiv.innerHTML = kvRows.map(function(r) {
+      return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+    }).join('');
+    body.appendChild(kvDiv);
+
+    // Per-step list: status, progress, timestamps, and the FULL error text for
+    // failed steps (inline, not tooltip-only). All fields escaped via escHtml.
+    const stepsTitle = document.createElement('div');
+    stepsTitle.className = 'section-title mt12';
+    stepsTitle.textContent = 'Steps';
+    body.appendChild(stepsTitle);
+
+    const steps = Array.isArray(exec.steps) ? exec.steps : [];
+    if (steps.length === 0) {
+      const none = document.createElement('div');
+      none.className = 'text-muted';
+      none.textContent = 'No steps.';
+      body.appendChild(none);
+    } else {
+      const rows = steps.map(function(s) {
+        const cells = [];
+        cells.push('<td>' + escHtml(s.name) + '</td>');
+        cells.push('<td><span style="color:' + stepColor(s.status) + '">' + escHtml(s.status) + '</span></td>');
+        cells.push('<td>' + (s.progress != null ? escHtml(s.progress + '%') : '—') + '</td>');
+        cells.push('<td>' + (s.jobId ? '<span class="text-mono">' + escHtml(s.jobId) + '</span>' : '—') + '</td>');
+        cells.push('<td>' + escHtml(fmtDate(s.startedAt)) + '</td>');
+        cells.push('<td>' + escHtml(fmtDate(s.completedAt)) + '</td>');
+        var row = '<tr>' + cells.join('') + '</tr>';
+        // Full error text on its own spanning row so long strings wrap and are
+        // fully visible (acceptance criterion: not tooltip-only).
+        if (s.error) {
+          row += '<tr class="step-error-row"><td colspan="6" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
+        }
+        return row;
+      }).join('');
+
+      const table = document.createElement('table');
+      table.className = 'mini-table';
+      table.innerHTML =
+        '<thead><tr>' +
+        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Started</th><th>Completed</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody>';
+      body.appendChild(table);
+    }
+
+    const pre = document.createElement('pre');
+    pre.className = 'code-block mt12';
+    pre.textContent = JSON.stringify(exec, null, 2);
+    body.appendChild(pre);
+    return exec;
+  } catch (err) {
+    body.innerHTML = '';
+    showMsg(body, 'Failed to load pipeline execution: ' + err.message, 'error');
+    throw err;
+  }
+}
+
 // ─── COLLECTIONS TAB ─────────────────────────────────────────────────────────
 
 async function renderCollectionsTab(container) {
@@ -2945,7 +3041,7 @@ var STEP_STATUS_CLASS = {
   failed: 'step-failed'
 };
 
-function renderStepChip(step) {
+function renderStepChip(step, errorLineId) {
   var icon = STEP_ICONS[step.name] || '⚙';
   var label = icon + ' ' + step.name;
   if (step.status === 'running' && step.progress != null) {
@@ -2953,7 +3049,16 @@ function renderStepChip(step) {
   }
   var cls = 'pipeline-exec-step ' + (STEP_STATUS_CLASS[step.status] || '');
   if (step.status === 'failed' && step.error) {
-    return '<span class="' + cls + '" title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
+    // Accessible failure: the chip is a focusable button that assistive tech
+    // announces via aria-label, and it toggles a visible inline error line
+    // (aria-controls) so the reason is reachable by keyboard/touch — not just
+    // the hover-only title tooltip (kept as an additional affordance).
+    return '<span class="' + cls + '"' +
+      ' role="button" tabindex="0"' +
+      ' aria-expanded="false"' +
+      (errorLineId ? ' aria-controls="' + escHtml(errorLineId) + '"' : '') +
+      ' aria-label="' + escHtml(step.name + ' step failed: ' + step.error) + '"' +
+      ' title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
   }
   return '<span class="' + cls + '">' + escHtml(label) + '</span>';
 }
@@ -2975,10 +3080,54 @@ function renderExecutionRow(exec) {
 
   var steps = document.createElement('div');
   steps.className = 'pipeline-exec-steps';
+  // Unique-ish id prefix so aria-controls references stay unique per row.
+  var rowKey = 'pxerr-' + (exec.id || Math.random().toString(36).slice(2));
+  var errorLines = [];
   steps.innerHTML = exec.steps.map(function(s, i) {
-    return (i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '') + renderStepChip(s);
+    var arrow = i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '';
+    var errId = null;
+    if (s.status === 'failed' && s.error) {
+      errId = rowKey + '-' + i;
+      errorLines.push({ id: errId, name: s.name, error: s.error });
+    }
+    return arrow + renderStepChip(s, errId);
   }).join('');
   row.appendChild(steps);
+
+  // Inline, always-rendered failure reasons under the chip row. These are
+  // visible without hover (touch-safe) and announced by screen readers via a
+  // role="alert" live region; the failed chip toggles the .is-open state.
+  if (errorLines.length > 0) {
+    var errWrap = document.createElement('div');
+    errWrap.className = 'pipeline-exec-errors';
+    errWrap.innerHTML = errorLines.map(function(e) {
+      return '<div class="pipeline-exec-error" id="' + escHtml(e.id) + '" role="alert">' +
+        '<span class="pipeline-exec-error-step">' + escHtml(e.name) + '</span>' +
+        '<span class="pipeline-exec-error-msg">' + escHtml(e.error) + '</span>' +
+        '</div>';
+    }).join('');
+    row.appendChild(errWrap);
+
+    // Wire each failed chip to expand/collapse its inline error line and to be
+    // operable by keyboard (Enter/Space) as an accessible toggle button.
+    var chips = steps.querySelectorAll('.pipeline-exec-step[aria-controls]');
+    chips.forEach(function(chip) {
+      var targetId = chip.getAttribute('aria-controls');
+      var target = targetId ? errWrap.querySelector('#' + CSS.escape(targetId)) : null;
+      var toggle = function() {
+        if (!target) return;
+        var open = target.classList.toggle('is-open');
+        chip.setAttribute('aria-expanded', open ? 'true' : 'false');
+      };
+      chip.addEventListener('click', toggle);
+      chip.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+    });
+  }
 
   // Click on asset name navigates to asset detail.
   meta.querySelector('.asset-link').addEventListener('click', function() {
@@ -3214,6 +3363,7 @@ export {
   renderAssetDetailBody,
   renderAssetFiles,
   renderJobDetailBody,
+  renderPipelineDetailBody,
   openDetailWindow,
   setActiveStack,
   setStackOverride,

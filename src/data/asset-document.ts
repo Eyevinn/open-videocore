@@ -134,6 +134,67 @@ const StatusTransitionSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// TAMS addressing (issue #165, sub-task of the #116 TAMS bridge epic).
+//
+// flowId + timerange are the pipeline/machine-derived addressing of an asset's
+// media into a Time-addressable Media Store (TAMS). They are NOT editorial, so
+// they live under the machine-owned `structural` namespace (next to renditions,
+// manifests, derivedFrom, versionOf) — never under user-writable `descriptive`.
+// Both are optional and additive: documents written before #165 (fields absent)
+// still deserialize, so no schemaVersion bump is required.
+//
+// Grammar is pinned 1:1 to ADR-008 "Time-addressing model"
+// (docs/architecture/ADR-008-tams-gateway-contract.md, lines 100-114): a TAMS
+// timerange is `[<seconds>:<nanoseconds>_<seconds>:<nanoseconds>)` on the TAI
+// timescale (e.g. `[0:0_10:0)`), where `[`/`]` are inclusive and `(`/`)` are
+// exclusive bounds, and open-ended ranges are permitted. flowId is a TAMS flow
+// UUID; a source can carry many flows (ADR-008 line 114), so the field is
+// modelled as an OPTIONAL ARRAY of UUIDs (many-per-source cardinality).
+
+// A single TAI point: `<seconds>:<nanoseconds>` (both non-negative integers).
+const TAI_POINT = String.raw`\d+:\d+`;
+
+// TAMS timerange grammar (ADR-008). Accepted forms; bracketing must be BALANCED
+// (both an inclusive `[`/`]` or exclusive `(`/`)` bound, or neither):
+//   - bounded closed range:   `[start_end)`  e.g. `[0:0_10:0)`
+//   - open-start range:       `[_end)`       (all time up to `end`)
+//   - open-end range:         `[start_)`     (from `start` onwards)
+//   - fully open range:       `[_)` / `_`    (all time)
+//   - single instant:         `[start]`      (a single TAI point)
+// Bare (unbracketed) `start_end` / `start` are also accepted; the gateway
+// echoes the canonical bracketed form back. This is a syntactic guard, not a
+// semantic one (it does not assert start <= end).
+export const TAMS_TIMERANGE_REGEX = new RegExp(
+  '^' +
+    '(?:' +
+    // bracketed forms: an open bound `[`/`(`, the body, then a close `]`/`)`.
+    `[\\[(](?:(?:${TAI_POINT})?_(?:${TAI_POINT})?|${TAI_POINT})[\\])]` +
+    // bare (unbracketed) forms: a range body or a lone point.
+    `|(?:${TAI_POINT})?_(?:${TAI_POINT})?` +
+    `|${TAI_POINT}` +
+    ')' +
+    '$'
+);
+
+export const TamsTimerangeSchema = z
+  .string()
+  .regex(TAMS_TIMERANGE_REGEX, 'must be a TAMS TAI timerange, e.g. [0:0_10:0) (ADR-008)');
+export type TamsTimerange = z.infer<typeof TamsTimerangeSchema>;
+
+// TAMS flow ids are UUIDs. A source can carry many flows, so this is an array.
+export const TamsFlowIdSchema = z.string().uuid();
+
+// The structural TAMS addressing block. Both fields optional/additive.
+export const TamsAddressingSchema = z.object({
+  // Many-per-source: an asset's media may be represented by multiple TAMS flows
+  // (ADR-008 line 114). Optional array of flow UUIDs.
+  flowIds: z.array(TamsFlowIdSchema).optional(),
+  // Canonical timerange of the asset's media in TAMS (validated grammar).
+  timerange: TamsTimerangeSchema.optional()
+});
+export type TamsAddressing = z.infer<typeof TamsAddressingSchema>;
+
+// ---------------------------------------------------------------------------
 // Asset document (the four-namespace aggregate root)
 // ---------------------------------------------------------------------------
 
@@ -211,7 +272,12 @@ export const AssetDocumentSchema = z.object({
       sceneDetection: SceneDetectionSchema.optional(),
       sceneDetectionError: z.string().optional(),
       editorialAudio: z.array(EditorialAudioTrackSchema).optional(),
-      editorialSubtitles: z.array(EditorialSubtitleTrackSchema).optional()
+      editorialSubtitles: z.array(EditorialSubtitleTrackSchema).optional(),
+      // TAMS time-addressable bridge addressing (issue #165). Machine/pipeline
+      // -derived (flow UUIDs + validated TAI timerange grammar, ADR-008), so it
+      // lives here under `structural` — NOT under user-writable `descriptive`.
+      // Optional so documents written before #165 (field absent) still parse.
+      tams: TamsAddressingSchema.optional()
     })
     .default({ renditions: [], collections: [] })
 });
@@ -349,6 +415,19 @@ export function toAssetDocument(
   if (asset.subtitleTracks && asset.subtitleTracks.length > 0) {
     doc.structural.editorialSubtitles = asset.subtitleTracks;
   }
+  // TAMS addressing (issue #165). Only persist the block when the asset actually
+  // carries flow ids and/or a timerange, so pre-#165 assets round-trip with the
+  // field absent (back-compat).
+  const hasTamsFlowIds = asset.tamsFlowIds && asset.tamsFlowIds.length > 0;
+  if (hasTamsFlowIds || asset.tamsTimerange) {
+    doc.structural.tams = {};
+    if (hasTamsFlowIds) {
+      doc.structural.tams.flowIds = asset.tamsFlowIds;
+    }
+    if (asset.tamsTimerange) {
+      doc.structural.tams.timerange = asset.tamsTimerange;
+    }
+  }
   return doc;
 }
 
@@ -409,6 +488,13 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     tags: doc.descriptive.tags && doc.descriptive.tags.length > 0 ? doc.descriptive.tags : undefined,
     audioTracks: doc.structural?.editorialAudio,
     subtitleTracks: doc.structural?.editorialSubtitles,
+    // TAMS addressing (issue #165). Absent block / empty arrays map back to
+    // undefined so the flat type stays clean for pre-#165 assets.
+    tamsFlowIds:
+      doc.structural?.tams?.flowIds && doc.structural.tams.flowIds.length > 0
+        ? doc.structural.tams.flowIds
+        : undefined,
+    tamsTimerange: doc.structural?.tams?.timerange,
     sourceMethod: doc.administrative.source.method,
     originUri: doc.administrative.source.originUri,
     provenance: doc.administrative.provenance ?? [],

@@ -20,6 +20,7 @@ import {
 import {
   type ParamStore,
   type StackConfig,
+  type StorageBackendConfig,
   stripCredentials
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
@@ -37,12 +38,33 @@ const PACKAGED_BUCKET = 'openvideocore-packaged';
 // (ADR-002, 12-factor config) — never in the request body. During provisioning
 // each value is registered as a per-service OSC secret and referenced via
 // {{secrets.<name>}}; the literal value never reaches a createInstance body.
+// Optional external S3-compatible storage block (issue #211). When supplied for
+// a role (source or packaged), the stack uses this operator-provided bucket
+// instead of the per-stack MinIO default. `secretAccessKey`/`sessionToken` are
+// secrets: they are validated here but NEVER echoed in a response and NEVER
+// written to the parameter store (only the non-secret coordinates are). Actual
+// credential injection into services is the follow-up sub-issue (#212).
+const externalStorageSchema = z.object({
+  bucket: z.string().min(1),
+  accessKeyId: z.string().min(1),
+  secretAccessKey: z.string().min(1),
+  region: z.string().min(1).optional(),
+  endpointUrl: z.string().url().optional(),
+  sessionToken: z.string().min(1).optional()
+});
+
+type ExternalStorage = z.infer<typeof externalStorageSchema>;
+
 const requestSchema = z.object({
   name: z
     .string()
     .min(1)
     .max(63)
-    .regex(/^[a-z0-9]+$/, 'name must be lowercase alphanumeric')
+    .regex(/^[a-z0-9]+$/, 'name must be lowercase alphanumeric'),
+  // Optional external source bucket. Omit for the zero-config MinIO default.
+  sourceStorage: externalStorageSchema.optional(),
+  // Optional external packaged-output bucket. Omit for the MinIO default.
+  packagedStorage: externalStorageSchema.optional()
 });
 
 const responseSchema = z.object({
@@ -140,6 +162,15 @@ const acceptedSchema = z.object({
   status: z.literal('pending')
 });
 
+// Non-secret storage backend metadata for one role, mirrors
+// StorageBackendConfig in param-store.ts. NO secret fields (issue #211).
+const storageBackendSchema = z.object({
+  backend: z.enum(['minio', 'external']),
+  bucket: z.string(),
+  endpointUrl: z.string().optional(),
+  region: z.string().optional()
+});
+
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
 // declared as a schema for response validation.
 const storedConfigSchema = z.object({
@@ -154,6 +185,11 @@ const storedConfigSchema = z.object({
   // validate. Mirrors StackConfig.autoSubtitlesInstanceName/sceneDetectInstanceName.
   autoSubtitlesInstanceName: z.string().optional(),
   sceneDetectInstanceName: z.string().optional(),
+  // Optional per-role storage backend metadata (issue #211). Absent for configs
+  // written before this field existed (both roles then default to MinIO).
+  storage: z
+    .object({ source: storageBackendSchema, packaged: storageBackendSchema })
+    .optional(),
   services: z.array(
     z.object({ serviceId: z.string(), instanceName: z.string() })
   )
@@ -262,7 +298,31 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       }
     },
     async (request, reply) => {
-      const { name } = request.body;
+      const { name, sourceStorage, packagedStorage } = request.body;
+
+      // Build the NON-SECRET storage backend metadata (issue #211) for each
+      // role from the validated request. When a block is omitted the role uses
+      // the per-stack MinIO default (zero-config). Only bucket/endpointUrl/region
+      // are captured here; accessKeyId/secretAccessKey/sessionToken are secrets
+      // and are deliberately NOT read into this object — they never reach the
+      // param store or the response. Credential wiring into services is #212.
+      const storageBackendFor = (
+        block: ExternalStorage | undefined,
+        defaultBucket: string
+      ): StorageBackendConfig =>
+        block
+          ? {
+              backend: 'external',
+              bucket: block.bucket,
+              ...(block.endpointUrl ? { endpointUrl: block.endpointUrl } : {}),
+              ...(block.region ? { region: block.region } : {})
+            }
+          : { backend: 'minio', bucket: defaultBucket };
+
+      const storageMetadata = {
+        source: storageBackendFor(sourceStorage, SOURCE_BUCKET),
+        packaged: storageBackendFor(packagedStorage, PACKAGED_BUCKET)
+      };
 
       // Create the async operation and return 202 immediately. The full
       // provisioning logic runs in the background closure below; the caller
@@ -544,6 +604,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             redisUrl,
             sourceBucket: SOURCE_BUCKET,
             packagedBucket: PACKAGED_BUCKET,
+            // Non-secret storage backend metadata (issue #211). Secrets are
+            // never included — only bucket/endpointUrl/region + backend type.
+            storage: storageMetadata,
             services: STACK_SERVICES.map((s) => ({
               serviceId: s.serviceId,
               instanceName: name
@@ -600,6 +663,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 redisUrl: '',
                 sourceBucket: SOURCE_BUCKET,
                 packagedBucket: PACKAGED_BUCKET,
+                // Preserve the requested storage backend metadata on the partial
+                // write so deprovision/downstream can still resolve it (#211).
+                storage: storageMetadata,
                 services: provisioned.map((p) => ({
                   serviceId: p.serviceId,
                   instanceName: p.name
