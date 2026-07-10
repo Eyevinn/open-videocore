@@ -54,6 +54,13 @@ export type StackConfig = {
   redisUrl: string;
   sourceBucket: string;
   packagedBucket: string;
+  // Optional pipeline services activated by provisioning rather than env vars
+  // (issue #215, data-model foundation for #216/#217/#218). These are opt-in
+  // consumers and deliberately NOT part of STACK_SERVICES. Optional for
+  // back-compat, mirroring `status?`/isReadyStack: configs written before these
+  // fields existed have no value here and MUST still load without error.
+  autoSubtitlesInstanceName?: string;
+  sceneDetectInstanceName?: string;
   // Per-role storage backend metadata (issue #211). Optional for back-compat:
   // configs written before this field existed have no `storage`, in which case
   // both roles are the default per-stack MinIO backend (sourceBucket /
