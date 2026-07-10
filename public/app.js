@@ -628,7 +628,7 @@ async function loadAssets(detailPanel) {
       : '<div class="thumb-xs thumb-placeholder"></div>';
     return '<tr data-id="' + escHtml(a.id) + '">' +
       '<td style="width:52px;padding:4px 6px">' + thumb + '</td>' +
-      '<td class="cell-id">' + escHtml(a.id) + '</td>' +
+      '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
       '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
       '<td>' + renderBadge(a.status) + '</td>' +
       '<td>' + renderTags(a.tags) + '</td>' +
@@ -868,14 +868,22 @@ async function renderAssetDetailBody(id, bodyEl) {
 
     // Build KV grid with escaped values
     const kvRows = [
-      ['ID', '<span class="text-mono">' + escHtml(asset.id) + '</span>'],
+      ['ID', '<span class="text-mono">' + escHtml(asset.slug || asset.id) + '</span>'],
+    ];
+    // When a human-friendly slug is present, keep the raw ULID visible too so it
+    // stays discoverable in the detail pane. If there is no slug, the "ID" row
+    // above already shows the ULID — avoid a duplicate/empty row.
+    if (asset.slug) {
+      kvRows.push(['ULID', '<span class="text-mono text-muted">' + escHtml(asset.id) + '</span>']);
+    }
+    kvRows.push(
       ['Title', escHtml(asset.title || asset.name || '—')],
       ['Status', renderBadge(asset.status)],
       ['MIME type', escHtml(asset.mimeType || '—')],
       ['Tags', renderTags(asset.tags)],
       ['Created', escHtml(fmtDate(asset.createdAt))],
-      ['Updated', escHtml(fmtDate(asset.updatedAt))],
-    ];
+      ['Updated', escHtml(fmtDate(asset.updatedAt))]
+    );
     if (deliveryUrl && deliveryUrl.urls) {
       var du = deliveryUrl.urls;
       if (du.hls) kvRows.push(['HLS', '<a href="' + escHtml(du.hls) + '" target="_blank" rel="noopener" style="color:var(--accent)">Open</a>']);
@@ -1745,7 +1753,7 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
     } else {
       const rows = assets.map(function(a) {
         return '<tr>' +
-          '<td class="cell-id">' + escHtml(a.id) + '</td>' +
+          '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
           '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
           '<td>' + renderBadge(a.status) + '</td>' +
           '<td><button class="btn-danger remove-asset-btn" data-asset-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Remove</button></td>' +
@@ -1837,7 +1845,7 @@ async function renderSearchTab(container) {
       }
       const rows = assets.map(function(a) {
         return '<tr>' +
-          '<td class="cell-id">' + escHtml(a.id) + '</td>' +
+          '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
           '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
           '<td>' + renderBadge(a.status) + '</td>' +
           '<td>' + renderTags(a.tags) + '</td>' +
