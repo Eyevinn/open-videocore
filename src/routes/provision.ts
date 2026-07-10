@@ -238,6 +238,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // still needs its own saveSecret call.
   const ROOTPASSWORD = 'rootpassword';
   const ADMINPASSWORD = 'adminpassword';
+  const PAT = 'pat';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -491,6 +492,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           ROOTPASSWORD,
           minioRootPassword
         );
+        // The OSC personal access token is registered as a per-service secret
+        // (scoped to eyevinn-encore-packager under the pat purpose) so it is
+        // never exposed as plain text via describe-service-instance (#185).
+        const packagerPatRef = await secretRef(
+          'eyevinn-encore-packager',
+          PAT,
+          pat
+        );
         // CallbackUrl: the packager POSTs to {CallbackUrl}/packagerCallback/success
         // and .../failure. The internal route is mounted at /api/v1/internal
         // (internal.ts), so the base is publicBaseUrl/api/v1/internal.
@@ -502,7 +511,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           RedisUrl: redisUrl,
           RedisQueue: 'encore-packager:jobs',
           OutputFolder: `s3://${PACKAGED_BUCKET.replace(/\/+$/, '')}/`,
-          PersonalAccessToken: pat,
+          PersonalAccessToken: packagerPatRef,
           AwsAccessKeyId: 'admin',
           AwsSecretAccessKey: packagerS3SecretRef,
           S3EndpointUrl: minioEndpoint,
