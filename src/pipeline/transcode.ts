@@ -144,8 +144,11 @@ export async function completeTranscode(
   if (!job) {
     return { applied: false, renditionCount: 0 };
   }
-  if (job.status === 'done' || job.status === 'failed') {
-    // Duplicate / late callback: nothing to do.
+  if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
+    // Duplicate / late callback, or the job was cancelled by an operator: nothing
+    // to do. `cancelled` is terminal (src/data/job-repo.ts:103), so short-circuit
+    // here to keep a late Encore callback idempotent — attempting an update would
+    // otherwise throw InvalidJobTransitionError (issue #126).
     return { applied: false, renditionCount: 0 };
   }
 
