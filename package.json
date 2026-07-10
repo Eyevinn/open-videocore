@@ -1,6 +1,6 @@
 {
   "name": "open-videocore-api",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "OSC-native media asset management REST API",
   "type": "module",
   "private": true,
