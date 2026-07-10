@@ -35,6 +35,13 @@ export type StackConfig = {
   redisUrl: string;
   sourceBucket: string;
   packagedBucket: string;
+  // Optional pipeline services activated by provisioning rather than env vars
+  // (issue #215, data-model foundation for #216/#217/#218). These are opt-in
+  // consumers and deliberately NOT part of STACK_SERVICES. Optional for
+  // back-compat, mirroring `status?`/isReadyStack: configs written before these
+  // fields existed have no value here and MUST still load without error.
+  autoSubtitlesInstanceName?: string;
+  sceneDetectInstanceName?: string;
   // The OSC instances that make up the stack, for deprovision (#29).
   services: { serviceId: string; instanceName: string }[];
 };

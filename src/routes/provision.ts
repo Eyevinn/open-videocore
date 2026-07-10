@@ -149,6 +149,11 @@ const storedConfigSchema = z.object({
   redisUrl: z.string(),
   sourceBucket: z.string(),
   packagedBucket: z.string(),
+  // Optional pipeline service instance names (issue #215). Optional/back-compat:
+  // stored configs written before these fields existed omit them and still
+  // validate. Mirrors StackConfig.autoSubtitlesInstanceName/sceneDetectInstanceName.
+  autoSubtitlesInstanceName: z.string().optional(),
+  sceneDetectInstanceName: z.string().optional(),
   services: z.array(
     z.object({ serviceId: z.string(), instanceName: z.string() })
   )
