@@ -244,6 +244,12 @@
                     "packagedBucket": {
                       "type": "string"
                     },
+                    "autoSubtitlesInstanceName": {
+                      "type": "string"
+                    },
+                    "sceneDetectInstanceName": {
+                      "type": "string"
+                    },
                     "storage": {
                       "type": "object",
                       "properties": {
