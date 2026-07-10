@@ -1164,6 +1164,54 @@ pre.code-block {
   cursor: help;
 }
 
+/* Failed chip acting as an accessible toggle button (issue #192). */
+.step-failed[role='button'] {
+  cursor: pointer;
+}
+
+.step-failed[role='button']:focus-visible {
+  outline: 2px solid var(--danger);
+  outline-offset: 2px;
+}
+
+.step-failed[aria-expanded='true'] {
+  background: rgba(239, 68, 68, 0.25);
+}
+
+/* Inline, non-hover failure reason lines under the chip row (issue #192).
+   Reachable by keyboard/touch; announced by screen readers via role="alert". */
+.pipeline-exec-errors {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.pipeline-exec-error {
+  display: none;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+.pipeline-exec-error.is-open {
+  display: flex;
+}
+
+.pipeline-exec-error-step {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pipeline-exec-error-msg {
+  word-break: break-word;
+}
+
 /* ── Detached (standalone) detail window — issue #128 ─────────────────────────
    Minimal chrome: no global header / tab bar / nav. The pane fills the window
    and a thin context strip shows which stack the detached view is targeting. */
