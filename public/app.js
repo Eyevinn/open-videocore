@@ -2945,7 +2945,7 @@ var STEP_STATUS_CLASS = {
   failed: 'step-failed'
 };
 
-function renderStepChip(step) {
+function renderStepChip(step, errorLineId) {
   var icon = STEP_ICONS[step.name] || '⚙';
   var label = icon + ' ' + step.name;
   if (step.status === 'running' && step.progress != null) {
@@ -2953,7 +2953,16 @@ function renderStepChip(step) {
   }
   var cls = 'pipeline-exec-step ' + (STEP_STATUS_CLASS[step.status] || '');
   if (step.status === 'failed' && step.error) {
-    return '<span class="' + cls + '" title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
+    // Accessible failure: the chip is a focusable button that assistive tech
+    // announces via aria-label, and it toggles a visible inline error line
+    // (aria-controls) so the reason is reachable by keyboard/touch — not just
+    // the hover-only title tooltip (kept as an additional affordance).
+    return '<span class="' + cls + '"' +
+      ' role="button" tabindex="0"' +
+      ' aria-expanded="false"' +
+      (errorLineId ? ' aria-controls="' + escHtml(errorLineId) + '"' : '') +
+      ' aria-label="' + escHtml(step.name + ' step failed: ' + step.error) + '"' +
+      ' title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
   }
   return '<span class="' + cls + '">' + escHtml(label) + '</span>';
 }
@@ -2975,10 +2984,54 @@ function renderExecutionRow(exec) {
 
   var steps = document.createElement('div');
   steps.className = 'pipeline-exec-steps';
+  // Unique-ish id prefix so aria-controls references stay unique per row.
+  var rowKey = 'pxerr-' + (exec.id || Math.random().toString(36).slice(2));
+  var errorLines = [];
   steps.innerHTML = exec.steps.map(function(s, i) {
-    return (i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '') + renderStepChip(s);
+    var arrow = i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '';
+    var errId = null;
+    if (s.status === 'failed' && s.error) {
+      errId = rowKey + '-' + i;
+      errorLines.push({ id: errId, name: s.name, error: s.error });
+    }
+    return arrow + renderStepChip(s, errId);
   }).join('');
   row.appendChild(steps);
+
+  // Inline, always-rendered failure reasons under the chip row. These are
+  // visible without hover (touch-safe) and announced by screen readers via a
+  // role="alert" live region; the failed chip toggles the .is-open state.
+  if (errorLines.length > 0) {
+    var errWrap = document.createElement('div');
+    errWrap.className = 'pipeline-exec-errors';
+    errWrap.innerHTML = errorLines.map(function(e) {
+      return '<div class="pipeline-exec-error" id="' + escHtml(e.id) + '" role="alert">' +
+        '<span class="pipeline-exec-error-step">' + escHtml(e.name) + '</span>' +
+        '<span class="pipeline-exec-error-msg">' + escHtml(e.error) + '</span>' +
+        '</div>';
+    }).join('');
+    row.appendChild(errWrap);
+
+    // Wire each failed chip to expand/collapse its inline error line and to be
+    // operable by keyboard (Enter/Space) as an accessible toggle button.
+    var chips = steps.querySelectorAll('.pipeline-exec-step[aria-controls]');
+    chips.forEach(function(chip) {
+      var targetId = chip.getAttribute('aria-controls');
+      var target = targetId ? errWrap.querySelector('#' + CSS.escape(targetId)) : null;
+      var toggle = function() {
+        if (!target) return;
+        var open = target.classList.toggle('is-open');
+        chip.setAttribute('aria-expanded', open ? 'true' : 'false');
+      };
+      chip.addEventListener('click', toggle);
+      chip.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+    });
+  }
 
   // Click on asset name navigates to asset detail.
   meta.querySelector('.asset-link').addEventListener('click', function() {
