@@ -1553,6 +1553,102 @@ async function renderJobDetailBody(id, bodyEl, opts) {
   }
 }
 
+// ─── PIPELINE EXECUTION DETAIL ────────────────────────────────────────────────
+// Fetch and render a single PipelineExecution (issue #193) into `bodyEl`.
+// Contract: GET /api/v1/pipelines/:executionId — response `pipelineExecutionSchema`
+// in src/routes/pipelines.ts (id, assetId, assetName?, pipelineName, status
+// [running|done|failed], steps[], createdAt, updatedAt). Each step (per
+// stepExecutionSchema): name, status [pending|running|done|failed], jobId?,
+// encoreJobId?, error?, startedAt?, completedAt?, progress?.
+//
+// All server-provided text is inserted via escHtml before interpolation. Returns
+// the fetched execution so callers (detail.js) can derive the window title and
+// decide whether to keep polling.
+async function renderPipelineDetailBody(id, bodyEl) {
+  const body = bodyEl;
+  body.innerHTML = '';
+  const loader = loadingEl();
+  body.appendChild(loader);
+
+  try {
+    const exec = await apiFetch('/pipelines/' + encodeURIComponent(id));
+    loader.remove();
+
+    // Colour helper mirroring renderExecutions()'s per-status colouring.
+    const stepColor = function(status) {
+      return { running: 'var(--accent,#60a5fa)', pending: 'var(--text-muted,#9ca3af)', done: 'var(--success,#4ade80)', failed: 'var(--error,#f87171)' }[status] || '';
+    };
+
+    const kvRows = [
+      ['ID', '<span class="text-mono">' + escHtml(exec.id) + '</span>'],
+      ['Pipeline', escHtml(exec.pipelineName || '—')],
+      ['Status', renderBadge(exec.status)],
+    ];
+    if (exec.assetId) {
+      kvRows.push(['Asset', '<span class="text-mono">' + escHtml(exec.assetName || exec.assetId) + '</span>']);
+    }
+    kvRows.push(['Created', escHtml(fmtDate(exec.createdAt))]);
+    kvRows.push(['Updated', escHtml(fmtDate(exec.updatedAt))]);
+
+    const kvDiv = document.createElement('div');
+    kvDiv.className = 'kv-grid';
+    kvDiv.innerHTML = kvRows.map(function(r) {
+      return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+    }).join('');
+    body.appendChild(kvDiv);
+
+    // Per-step list: status, progress, timestamps, and the FULL error text for
+    // failed steps (inline, not tooltip-only). All fields escaped via escHtml.
+    const stepsTitle = document.createElement('div');
+    stepsTitle.className = 'section-title mt12';
+    stepsTitle.textContent = 'Steps';
+    body.appendChild(stepsTitle);
+
+    const steps = Array.isArray(exec.steps) ? exec.steps : [];
+    if (steps.length === 0) {
+      const none = document.createElement('div');
+      none.className = 'text-muted';
+      none.textContent = 'No steps.';
+      body.appendChild(none);
+    } else {
+      const rows = steps.map(function(s) {
+        const cells = [];
+        cells.push('<td>' + escHtml(s.name) + '</td>');
+        cells.push('<td><span style="color:' + stepColor(s.status) + '">' + escHtml(s.status) + '</span></td>');
+        cells.push('<td>' + (s.progress != null ? escHtml(s.progress + '%') : '—') + '</td>');
+        cells.push('<td>' + (s.jobId ? '<span class="text-mono">' + escHtml(s.jobId) + '</span>' : '—') + '</td>');
+        cells.push('<td>' + escHtml(fmtDate(s.startedAt)) + '</td>');
+        cells.push('<td>' + escHtml(fmtDate(s.completedAt)) + '</td>');
+        var row = '<tr>' + cells.join('') + '</tr>';
+        // Full error text on its own spanning row so long strings wrap and are
+        // fully visible (acceptance criterion: not tooltip-only).
+        if (s.error) {
+          row += '<tr class="step-error-row"><td colspan="6" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
+        }
+        return row;
+      }).join('');
+
+      const table = document.createElement('table');
+      table.className = 'mini-table';
+      table.innerHTML =
+        '<thead><tr>' +
+        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Started</th><th>Completed</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody>';
+      body.appendChild(table);
+    }
+
+    const pre = document.createElement('pre');
+    pre.className = 'code-block mt12';
+    pre.textContent = JSON.stringify(exec, null, 2);
+    body.appendChild(pre);
+    return exec;
+  } catch (err) {
+    body.innerHTML = '';
+    showMsg(body, 'Failed to load pipeline execution: ' + err.message, 'error');
+    throw err;
+  }
+}
+
 // ─── COLLECTIONS TAB ─────────────────────────────────────────────────────────
 
 async function renderCollectionsTab(container) {
@@ -3267,6 +3363,7 @@ export {
   renderAssetDetailBody,
   renderAssetFiles,
   renderJobDetailBody,
+  renderPipelineDetailBody,
   openDetailWindow,
   setActiveStack,
   setStackOverride,
