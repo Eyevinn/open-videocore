@@ -10,6 +10,7 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import type { Redis } from 'ioredis';
 import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository, type JobStatus } from '../data/job-repo.js';
+import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 
@@ -39,6 +40,7 @@ const jobSchema = z.object({
 type JobsRouterOptions = {
   repository?: JobRepository;
   redis?: Redis; // for Encore instance lookup
+  pipelineRepository?: PipelineRepository; // to release the running pipeline lock on cancel
 };
 
 export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify, opts) => {
@@ -64,12 +66,15 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
     }
   );
 
-  // Cancel / mark a job as failed. Useful for orphaned jobs (e.g. Encore jobs
-  // lost when a stack was reprovisioned).
+  // Cancel a job. Requests Encore cancellation (best-effort) and sets the job's
+  // status to `cancelled` synchronously, distinct from `failed`. When the job
+  // belongs to a running transcode PipelineExecution, its running `transcode`
+  // step is marked failed so the asset's pipeline no longer shows RUNNING and a
+  // new transcode can be submitted immediately (issue #126).
   app.delete(
     '/:id',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: { 200: jobSchema, 404: errorSchema }
@@ -78,10 +83,55 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
     async (request, reply) => {
       const job = await repo.get(request.params.id);
       if (!job) return reply.code(404).send({ error: 'not_found' });
+
+      // Already terminal: repeated cancels are idempotent — return as-is without
+      // re-cancelling (avoids a terminal→terminal transition, which would throw).
+      if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
+        return reply.code(200).send(job);
+      }
+
+      // Best-effort Encore cancellation. Must never block the synchronous status
+      // update: Encore may be unreachable and cancelling a gone/terminal job is a
+      // safe no-op per EncoreClient.cancel's contract (src/pipeline/encore-client.ts:44).
+      if (job.encoreInternalJobId) {
+        const encore = request.connections?.encore;
+        if (encore) {
+          try {
+            await encore.cancel(job.encoreInternalJobId);
+          } catch {
+            // Encore unreachable or job already gone — proceed with local cancel.
+          }
+        }
+      }
+
+      // Synchronous local state: mark the job cancelled.
       const updated = await repo.update(request.params.id, {
-        status: 'failed',
+        status: 'cancelled',
         error: 'cancelled by operator'
       });
+
+      // Release the running pipeline lock: mark the running transcode step failed
+      // so the asset's pipeline is no longer RUNNING. No-op when no running
+      // execution is found (e.g. non-transcode/ingest jobs).
+      const pipelineRepo = opts.pipelineRepository;
+      if (pipelineRepo) {
+        const execution = await pipelineRepo.findRunningByAssetAndStep(job.assetId, 'transcode');
+        if (execution) {
+          const now = new Date().toISOString();
+          const steps: StepExecution[] = execution.steps.map((s) => ({ ...s }));
+          const tIdx = steps.findIndex((s) => s.name === 'transcode');
+          if (tIdx >= 0) {
+            steps[tIdx] = {
+              ...steps[tIdx],
+              status: 'failed',
+              error: 'cancelled by operator',
+              completedAt: now
+            };
+            await pipelineRepo.update(execution.id, { steps, status: 'failed' });
+          }
+        }
+      }
+
       return reply.code(200).send(updated ?? job);
     }
   );

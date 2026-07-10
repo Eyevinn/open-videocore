@@ -734,7 +734,8 @@ await app.register(assetsRouter, assetRouterOptions);
 const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/jobs',
   repository: jobRepository,
-  redis: sharedRedis
+  redis: sharedRedis,
+  pipelineRepository
 };
 await app.register(jobsRouter, jobsRouterOptions);
 
