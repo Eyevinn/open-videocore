@@ -938,7 +938,9 @@ async function renderAssetDetailBody(id, bodyEl) {
     await renderExecutions(id, execDiv);
 
     // Run Pipeline control: pipeline select + optional profile select + trigger.
-    var ENCODE_PIPELINES = ['transcode', 'abr-vod', 'full']; // pipelines with a transcode step
+    // Pipeline options + the transcode gate (ENCODE_PIPELINES) are both derived
+    // from the module-level PIPELINE_CATALOG, so new built-in pipelines show up
+    // here automatically without editing this dialog.
 
     // Load available Encore profiles from the public GET /profiles endpoint.
     // No auth header needed, so use a plain fetch rather than apiFetch.
@@ -960,14 +962,20 @@ async function renderAssetDetailBody(id, bodyEl) {
       console.warn('GET /profiles request failed; falling back to default ["program"]', e);
     }
 
+    // Build the pipeline options from the shared catalog so future built-in
+    // pipelines appear automatically. Each option label shows the pipeline id
+    // plus its ordered step list, e.g. "subtitles (subtitles)".
+    var pipelineOptions = PIPELINE_CATALOG.map(function(p) {
+      var stepSummary = p.steps.join(' + ');
+      return '<option value="' + escHtml(p.name) + '">' +
+        escHtml(p.name + ' (' + stepSummary + ')') + '</option>';
+    }).join('');
+
     const runDiv = document.createElement('div');
     runDiv.className = 'mt12 flex-gap';
     runDiv.innerHTML = [
       '<select id="pipeline-select" class="input">',
-      '  <option value="transcode">transcode (transcode only)</option>',
-      '  <option value="abr-vod">abr-vod (transcode + package)</option>',
-      '  <option value="ingest">ingest (metadata + thumbnail)</option>',
-      '  <option value="full">full (all steps)</option>',
+      pipelineOptions,
       '</select>',
       '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
       encodeProfiles.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
@@ -2992,6 +3000,11 @@ function cssEscape(value) {
 
 // ─── PIPELINES TAB ───────────────────────────────────────────────────────────
 
+// Single source of truth for the built-in pipeline metadata shown in the UI
+// (pipelines tab catalog bar + the execute dialog's pipeline selector). Kept in
+// sync with the backend BUILT_IN_PIPELINES / PIPELINE_DESCRIPTIONS in
+// src/pipeline/pipelines.ts. Adding a new entry here surfaces it automatically
+// in the execute dialog, so there is no separate hardcoded option list to touch.
 var PIPELINE_CATALOG = [
   {
     name: 'transcode',
@@ -3012,12 +3025,31 @@ var PIPELINE_CATALOG = [
     steps: ['extract-metadata', 'thumbnail']
   },
   {
+    name: 'subtitles',
+    label: 'Subtitles',
+    description: 'Auto-generate a subtitle track from the audio using Whisper transcription and attach it to the asset.',
+    steps: ['subtitles']
+  },
+  {
+    name: 'scene-detect',
+    label: 'Scene Detect',
+    description: 'Detect scene/shot boundaries and keyframes and attach them to the asset for clip and trim workflows.',
+    steps: ['scene-detect']
+  },
+  {
     name: 'full',
     label: 'Full',
-    description: 'Full pipeline: metadata extraction, thumbnails, transcode, and HLS/DASH packaging.',
-    steps: ['extract-metadata', 'thumbnail', 'transcode', 'package']
+    description: 'Full pipeline: metadata extraction, thumbnails, auto-subtitles, scene detection, transcode, and HLS/DASH packaging.',
+    steps: ['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']
   }
 ];
+
+// Pipelines whose steps include a transcode step, and therefore need the encode
+// profile selector. Derived from PIPELINE_CATALOG so it stays correct as new
+// pipelines are added (rather than a second hardcoded list to keep in sync).
+var ENCODE_PIPELINES = PIPELINE_CATALOG
+  .filter(function(p) { return p.steps.indexOf('transcode') !== -1; })
+  .map(function(p) { return p.name; });
 
 var STEP_ICONS = {
   'extract-metadata': '🔬',
