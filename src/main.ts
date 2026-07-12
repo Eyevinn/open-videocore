@@ -35,6 +35,8 @@ import {
   PerWorkspaceCollectionRepository,
   PerWorkspaceProfileRepository
 } from './data/per-workspace-repos.js';
+import type { AssetRepository } from './data/asset-repo.js';
+import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
@@ -245,7 +247,33 @@ await app.register(provisionRouter, {
 // otherwise — WorkspaceStackResolver decides). The router option interfaces and
 // route handlers are unchanged; only the backing connection is now resolved
 // lazily per workspace at request time instead of as a startup singleton.
-const assetRepository = new PerWorkspaceAssetRepository(stackResolver);
+// Base asset repository. Wrapped below by the TAMS "ready" indexing decorator
+// so no other wiring changes are needed.
+const baseAssetRepository = new PerWorkspaceAssetRepository(stackResolver);
+
+// TAMS "ready"-transition indexing trigger (issue #172, epic #116). SINGLE
+// chokepoint: `withTamsReadyIndexing` decorates the asset repository so every
+// `update()` that transitions an asset INTO `ready` fires the injected indexer
+// once — covering all four pipeline call sites (metadata-extractor, transcode,
+// clip, rewrap) without editing any of them (see src/tams/tams-ready-hook.ts
+// for the trigger-mechanism justification: an inline transition hook, since the
+// ADR-005 CouchDB `_changes` projector does not exist — issue #168).
+//
+// Decoupling: the concrete single-asset index-write path (#170) and the shared
+// config gate (#171) are not yet on main, so we import NEITHER here. The indexer
+// is INJECTED. Until #170 lands there is no concrete indexer to inject, so
+// `tamsIndexer` is undefined and the repository is left unwrapped (indexing is a
+// no-op). When #170 provides `(asset) => Promise<void>`, assign it here and the
+// decorator activates. The config gate is the inline ADR-009 `TAMS_STORE_URL`
+// check inside the hook; #171 will supply the shared gate.
+const tamsIndexer: AssetIndexer | undefined = undefined;
+const assetRepository: AssetRepository = tamsIndexer
+  ? withTamsReadyIndexing(baseAssetRepository, { indexer: tamsIndexer, log: app.log })
+  : baseAssetRepository;
+if (tamsIndexer && !isTamsConfigured()) {
+  app.log.info('TAMS_STORE_URL not set — TAMS ready-transition indexing disabled (config-gated)');
+}
+
 const jobRepository = new PerWorkspaceJobRepository(stackResolver);
 const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
