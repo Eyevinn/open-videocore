@@ -57,6 +57,18 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   if (query.tags && query.tags.length > 0) {
     selector['tags'] = { $all: query.tags };
   }
+  // TAMS addressing lookup (issue #168). Push the flow-id membership and the
+  // exact timerange match down into Mango so CouchDB filters within the
+  // workspace partition. `$elemMatch` on tamsFlowIds finds the requested UUID
+  // among the projected array; timerange is an exact string match. Field names
+  // mirror the flat projected doc shape read by fromDoc (asset.tamsFlowIds /
+  // asset.tamsTimerange).
+  if (query.tamsFlowId) {
+    selector['tamsFlowIds'] = { $elemMatch: { $eq: query.tamsFlowId } };
+  }
+  if (query.tamsTimerange) {
+    selector['tamsTimerange'] = { $eq: query.tamsTimerange };
+  }
   // Metadata filters push down as `metadata.<key>: { $eq: value }` so CouchDB
   // matches exact top-level metadata values within the workspace partition
   // (issue #12). Dotted keys address nested document fields in Mango.
@@ -83,6 +95,10 @@ function fromDoc(doc: StoredDoc): Asset {
     packagingError: doc['packagingError'] as string | undefined,
     renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
     metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
+    // TAMS addressing (issue #168). Projected verbatim from the stored doc so an
+    // asset can be looked up by its TAMS address; absent on pre-#165 assets.
+    tamsFlowIds: (doc['tamsFlowIds'] as string[] | undefined) ?? undefined,
+    tamsTimerange: (doc['tamsTimerange'] as string | undefined) ?? undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

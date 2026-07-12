@@ -22,6 +22,16 @@ export interface SearchQuery {
   // key/value pair given here, its `metadata` carries that exact value
   // (strict equality on top-level keys).
   metadata?: Record<string, unknown>;
+  // TAMS addressing lookup (issue #168, sub-task of the #116 TAMS bridge epic).
+  // These project the machine-derived TAMS fields (asset.tamsFlowIds /
+  // asset.tamsTimerange, ADR-005 `structural.tams`) into the search index so an
+  // asset can be found by its TAMS address. `tamsFlowId` matches when the asset
+  // carries that flow UUID among its `tamsFlowIds`; `tamsTimerange` is an exact
+  // (canonical-string) match against `asset.tamsTimerange`. Sibling issue #175
+  // consumes these on the assets API. Both are pure derivations of the asset
+  // record, so re-projection is idempotent (no state added).
+  tamsFlowId?: string;
+  tamsTimerange?: string;
   page?: number;
   pageSize?: number;
 }
@@ -47,6 +57,21 @@ export function assetTags(asset: Asset): string[] {
 // extracted containerFormat (issue #6) so callers can filter by, e.g., "mp4".
 export function assetMimeType(asset: Asset): string | undefined {
   return asset.technicalMetadata?.containerFormat;
+}
+
+// TAMS flow ids projected for lookup (issue #168). Read defensively: the field
+// is optional/additive (assets written before #165 lack it entirely), and only
+// string UUIDs are kept so a malformed legacy value cannot break projection.
+export function assetTamsFlowIds(asset: Asset): string[] {
+  const ids = asset.tamsFlowIds;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
+}
+
+// TAMS timerange projected for lookup (issue #168). Optional/additive; absent on
+// pre-#165 assets. Returned verbatim so the exact canonical TAI string is what
+// #175's lookup compares against.
+export function assetTamsTimerange(asset: Asset): string | undefined {
+  return typeof asset.tamsTimerange === 'string' ? asset.tamsTimerange : undefined;
 }
 
 export function clampPage(page?: number): number {
@@ -92,6 +117,20 @@ export function matchesQuery(asset: Asset, query: SearchQuery): boolean {
       if (md[key] !== value) {
         return false;
       }
+    }
+  }
+  // TAMS addressing lookup (issue #168). An asset matches when it carries the
+  // requested flow UUID among its projected flow ids, and/or its timerange
+  // equals the requested canonical string exactly. Pure over the asset, so the
+  // predicate is idempotent under re-projection from sequence 0.
+  if (query.tamsFlowId) {
+    if (!assetTamsFlowIds(asset).includes(query.tamsFlowId)) {
+      return false;
+    }
+  }
+  if (query.tamsTimerange) {
+    if (assetTamsTimerange(asset) !== query.tamsTimerange) {
+      return false;
     }
   }
   return true;

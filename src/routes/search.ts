@@ -100,6 +100,10 @@ const searchQuerySchema = z
     q: z.string().min(1).max(512).optional(),
     tags: tagsSchema,
     mimeType: z.string().min(1).max(128).optional(),
+    // TAMS addressing lookup (issue #168). Optional filters so an asset can be
+    // found by its TAMS address (flow UUID / canonical TAI timerange string).
+    tamsFlowId: z.string().min(1).max(128).optional(),
+    tamsTimerange: z.string().min(1).max(128).optional(),
     page: z.coerce.number().int().min(1).optional(),
     pageSize: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).optional()
   })
@@ -150,9 +154,9 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
       }
     },
     async (request) => {
-      const { q, tags, mimeType, page, pageSize } = request.query;
+      const { q, tags, mimeType, tamsFlowId, tamsTimerange, page, pageSize } = request.query;
       const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
-      return repo.search({ q, tags, mimeType, metadata, page, pageSize });
+      return repo.search({ q, tags, mimeType, tamsFlowId, tamsTimerange, metadata, page, pageSize });
     }
   );
 };
