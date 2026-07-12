@@ -13,6 +13,7 @@ import {
   validatorCompiler
 } from 'fastify-type-provider-zod';
 import { provisionRouter } from './routes/provision.js';
+import { optionalServicesRouter } from './routes/optional-services.js';
 import { OperationStore } from './services/operation-store.js';
 import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';
 import { assetsRouter } from './routes/assets.js';
@@ -112,6 +113,7 @@ await app.register(fastifySwagger, {
       { name: 'collections', description: 'Named asset groups' },
       { name: 'webhooks', description: 'Event notification registrations' },
       { name: 'provision', description: 'OSC stack provisioning and teardown' },
+      { name: 'optional-services', description: 'Per-optional-service (auto-subtitles, scene-detect) provision, deprovision, and status' },
       { name: 'storage', description: 'Bucket and object-storage management' },
       { name: 'admin', description: 'Operational status and background service control' },
     ],
@@ -237,6 +239,19 @@ await app.register(provisionRouter, {
   // so the DELETE route can reach the current registry for teardown (#123)
   // without depending on registration-time ordering.
   getScalerRegistry: () => scalerRegistry
+});
+
+// Per-optional-service provision/deprovision/status endpoints (issue #195).
+// Shared contract for the #187 (auto-subtitles) and #188 (scene-detect)
+// provision cards. Reuses the SAME OperationStore as the whole-stack provision
+// route so 202 operations poll the same GET /api/v1/provision/operations/:id.
+// Status reports the AUTO_SUBTITLES_INSTANCE_NAME / SCENE_DETECT_INSTANCE_NAME
+// env vars (the same source this file reads to wire the pipeline steps above),
+// so a card never disagrees with what the runtime actually discovered.
+await app.register(optionalServicesRouter, {
+  prefix: '/api/v1/optional-services',
+  osc: oscContext,
+  operationStore
 });
 
 // Workspace-scoped resource repositories. These hold NO connection of their
