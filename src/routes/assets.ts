@@ -177,8 +177,15 @@ const listQuerySchema = z.object({
 // A malformed value fails validation at the boundary and Fastify returns 400,
 // which satisfies the contract's "malformed param -> 400" case.
 const tamsLookupQuerySchema = z.object({
-  tamsFlowId: TamsFlowIdSchema,
-  tamsTimerange: TamsTimerangeSchema.optional()
+  tamsFlowId: TamsFlowIdSchema.describe(
+    'TAMS flow id (UUID) to resolve. Addressing mode (1): supplying only ' +
+      'tamsFlowId resolves the ready asset carrying this flow. Required.'
+  ),
+  tamsTimerange: TamsTimerangeSchema.optional().describe(
+    'TAMS TAI timerange (ADR-008 grammar, e.g. [0:0_10:0)). Addressing mode ' +
+      '(2): supplying tamsFlowId + tamsTimerange additionally requires an exact ' +
+      'stored-timerange match. Optional.'
+  )
 });
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });

@@ -2389,6 +2389,475 @@
         }
       }
     },
+    "/api/v1/assets/by-tams-address": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "query",
+            "name": "tamsFlowId",
+            "required": true,
+            "description": "TAMS flow id (UUID) to resolve. Addressing mode (1): supplying only tamsFlowId resolves the ready asset carrying this flow. Required."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[\\[(](?:(?:\\d+:\\d+)?_(?:\\d+:\\d+)?|\\d+:\\d+)[\\])]|(?:\\d+:\\d+)?_(?:\\d+:\\d+)?|\\d+:\\d+)$"
+            },
+            "in": "query",
+            "name": "tamsTimerange",
+            "required": false,
+            "description": "TAMS TAI timerange (ADR-008 grammar, e.g. [0:0_10:0)). Addressing mode (2): supplying tamsFlowId + tamsTimerange additionally requires an exact stored-timerange match. Optional."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "slug": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ]
+                          },
+                          "reviewState": {
+                            "type": "string",
+                            "enum": [
+                              "draft",
+                              "in-review",
+                              "approved",
+                              "rejected"
+                            ]
+                          },
+                          "parentId": {
+                            "type": "string"
+                          },
+                          "versionOfAssetId": {
+                            "type": "string"
+                          },
+                          "versionGroupId": {
+                            "type": "string"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "statusHistory": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "at": {
+                                  "type": "string"
+                                },
+                                "from": {
+                                  "type": "string",
+                                  "enum": [
+                                    "uploading",
+                                    "processing",
+                                    "ready",
+                                    "failed",
+                                    "archived"
+                                  ],
+                                  "nullable": true
+                                },
+                                "to": {
+                                  "type": "string",
+                                  "enum": [
+                                    "uploading",
+                                    "processing",
+                                    "ready",
+                                    "failed",
+                                    "archived"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "at",
+                                "from",
+                                "to"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "technicalMetadata": {
+                            "type": "object",
+                            "properties": {
+                              "codec": {
+                                "type": "string"
+                              },
+                              "width": {
+                                "type": "number"
+                              },
+                              "height": {
+                                "type": "number"
+                              },
+                              "durationSeconds": {
+                                "type": "number"
+                              },
+                              "bitrateBps": {
+                                "type": "number"
+                              },
+                              "containerFormat": {
+                                "type": "string"
+                              },
+                              "audioTracks": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "index": {
+                                      "type": "number"
+                                    },
+                                    "codec": {
+                                      "type": "string"
+                                    },
+                                    "channels": {
+                                      "type": "number"
+                                    },
+                                    "sampleRateHz": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "required": [
+                                    "index",
+                                    "codec",
+                                    "channels",
+                                    "sampleRateHz"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              },
+                              "extractedAt": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "codec",
+                              "width",
+                              "height",
+                              "durationSeconds",
+                              "bitrateBps",
+                              "containerFormat",
+                              "audioTracks",
+                              "extractedAt"
+                            ],
+                            "additionalProperties": false,
+                            "nullable": true
+                          },
+                          "technicalMetadataError": {
+                            "type": "string"
+                          },
+                          "sceneMetadata": {
+                            "type": "object",
+                            "properties": {
+                              "boundaries": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "startSeconds": {
+                                      "type": "number"
+                                    },
+                                    "endSeconds": {
+                                      "type": "number"
+                                    },
+                                    "keyframeSeconds": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "additionalProperties": false
+                                }
+                              },
+                              "sceneCount": {
+                                "type": "number"
+                              },
+                              "detectedAt": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "boundaries",
+                              "sceneCount",
+                              "detectedAt"
+                            ],
+                            "additionalProperties": false,
+                            "nullable": true
+                          },
+                          "sceneDetectionError": {
+                            "type": "string"
+                          },
+                          "manifestUrls": {
+                            "type": "object",
+                            "properties": {
+                              "hls": {
+                                "type": "string"
+                              },
+                              "dash": {
+                                "type": "string"
+                              }
+                            },
+                            "additionalProperties": false
+                          },
+                          "packagingError": {
+                            "type": "string"
+                          },
+                          "renditions": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "type": "string"
+                                },
+                                "width": {
+                                  "type": "number"
+                                },
+                                "height": {
+                                  "type": "number"
+                                },
+                                "objectKey": {
+                                  "type": "string"
+                                },
+                                "codec": {
+                                  "type": "string"
+                                },
+                                "bitrateBps": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "label",
+                                "width",
+                                "height",
+                                "objectKey"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "thumbnails": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "metadata": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          },
+                          "audioTracks": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "language": {
+                                  "type": "string"
+                                },
+                                "codec": {
+                                  "type": "string"
+                                },
+                                "channels": {
+                                  "type": "number"
+                                },
+                                "label": {
+                                  "type": "string"
+                                },
+                                "default": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "language"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "subtitleTracks": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "language": {
+                                  "type": "string"
+                                },
+                                "format": {
+                                  "type": "string",
+                                  "enum": [
+                                    "vtt",
+                                    "srt",
+                                    "ttml"
+                                  ]
+                                },
+                                "objectKey": {
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "type": "string"
+                                },
+                                "default": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "language",
+                                "format"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "tags": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "createdAt": {
+                            "type": "string"
+                          },
+                          "updatedAt": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "status",
+                          "statusHistory",
+                          "createdAt",
+                          "updatedAt"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "limit": {
+                      "type": "number"
+                    },
+                    "offset": {
+                      "type": "number"
+                    },
+                    "total": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "limit",
+                    "offset",
+                    "total"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/assets/{id}": {
       "get": {
         "parameters": [
