@@ -62,6 +62,10 @@ import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
+import {
+  ensurePackagerProvisioned,
+  packagerOscApiFromContext
+} from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
@@ -615,6 +619,75 @@ function activateScaler(redisUrl: string): void {
     publicBaseUrl: packagingPublicBaseUrl()
   });
 
+  // On-demand packager provisioning (epic #226, issue #244). The packager is no
+  // longer provisioned at stack-provision time (issue #243): this closure is
+  // invoked the first time a pipeline reaches a `package` step (assets router
+  // `ensurePackaging`). It resolves the stack's coordinates from the parameter
+  // store, then provisions + wires the packager to THIS activated stack Valkey
+  // (`redisUrl`) and packaged-output storage if absent, waiting for readiness
+  // before returning so the packaging job is only enqueued once the packager is
+  // live. It is idempotent (reconciles against OSC ground truth via getInstance)
+  // and reuses the running instance on subsequent executions. Issue #245 wraps
+  // this in a per-stack single-flight guard for concurrent first executions.
+  //
+  // Requires the MinIO root password (packager S3 secret) and the OSC PAT
+  // (packager fetches Encore job data). When either is missing this is a no-op
+  // (undefined), so packaging degrades to the pre-#244 behaviour rather than
+  // failing the pipeline.
+  const packagerMinioPassword = process.env['MINIO_ROOT_PASSWORD'];
+  const packagerPat = oscContext.getPersonalAccessToken();
+  if (packagerMinioPassword && packagerPat) {
+    const packagerApi = packagerOscApiFromContext(oscContext);
+    assetRouterOptions.ensurePackaging = async () => {
+      // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
+      // this activation is bound to. Mirrors resolveStackRedisUrl: the first
+      // provisioned stack for the namespace is the default.
+      let stackName: string | undefined;
+      let minioEndpoint: string | undefined;
+      let packagedBucket = outputBucket;
+      if (paramStore) {
+        try {
+          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            stackName = names[0];
+            const cfg = await paramStore.loadStackConfig(
+              STACK_CONFIG_NAMESPACE,
+              names[0]!
+            );
+            if (cfg?.minioEndpoint) minioEndpoint = cfg.minioEndpoint;
+            if (cfg?.packagedBucket) packagedBucket = cfg.packagedBucket;
+          }
+        } catch (err) {
+          app.log.warn({ err }, 'on-demand packager: failed to resolve stack coordinates');
+        }
+      }
+      if (!stackName || !minioEndpoint) {
+        // No resolvable stack coordinates — cannot provision the packager. Do
+        // not throw: packaging enqueues onto the shared queue regardless, and a
+        // manually/previously provisioned packager may still consume it.
+        app.log.warn('on-demand packager: stack coordinates unavailable, skipping ensure');
+        return;
+      }
+      const result = await ensurePackagerProvisioned({
+        osc: packagerApi,
+        coords: {
+          stackName,
+          redisUrl,
+          minioEndpoint,
+          packagedBucket,
+          publicBaseUrl
+        },
+        secrets: {
+          minioRootPassword: packagerMinioPassword,
+          oscPersonalAccessToken: packagerPat
+        }
+      });
+      if (result.status === 'created') {
+        app.log.info({ stackName }, 'on-demand packager provisioned');
+      }
+    };
+  }
+
   // Encore completion callback poller (background). Drains the Valkey sorted set
   // the callback listener writes to and applies transcode completions even when
   // the public callback route is unreachable (e.g. local runs).
@@ -684,6 +757,7 @@ async function deactivateScaler(): Promise<void> {
   assetRouterOptions.encore = undefined;
   assetRouterOptions.packaging = undefined;
   assetRouterOptions.packagingRedis = undefined;
+  assetRouterOptions.ensurePackaging = undefined;
   jobsRouterOptions.redis = undefined;
   encoreCompatRouterOptions.encore = undefined;
   pipelinesRouterOptions.encoreClient = undefined;
