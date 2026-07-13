@@ -5333,6 +5333,11 @@
                       "outputs"
                     ],
                     "additionalProperties": false
+                  },
+                  "destinationBucket": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
                   }
                 },
                 "required": [
@@ -5428,6 +5433,9 @@
                         ],
                         "additionalProperties": false
                       }
+                    },
+                    "destinationBucket": {
+                      "type": "string"
                     },
                     "createdAt": {
                       "type": "string"
@@ -5628,6 +5636,9 @@
                           "additionalProperties": false
                         }
                       },
+                      "destinationBucket": {
+                        "type": "string"
+                      },
                       "createdAt": {
                         "type": "string"
                       },
@@ -5768,6 +5779,9 @@
                         "additionalProperties": false
                       }
                     },
+                    "destinationBucket": {
+                      "type": "string"
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -5900,6 +5914,9 @@
                           ],
                           "additionalProperties": false
                         }
+                      },
+                      "destinationBucket": {
+                        "type": "string"
                       },
                       "createdAt": {
                         "type": "string"
