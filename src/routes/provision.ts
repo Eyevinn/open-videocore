@@ -486,6 +486,44 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
         }
 
+        // 1d. Apply an anonymous (public) read-only bucket policy to the
+        // PACKAGED bucket ONLY (issue #199) so HLS/DASH players can GET
+        // manifests/segments without a bearer token. The SOURCE bucket MUST
+        // stay private, so this loop deliberately targets PACKAGED_BUCKET
+        // alone (unlike the bucket/CORS loops above, which iterate both).
+        //
+        // Policy: allow only s3:GetObject for principal '*' on the packaged
+        // object prefix (arn:aws:s3:::<packaged>/*). No ListBucket, no write —
+        // objects are readable by exact key but the bucket is not browsable.
+        // setBucketPolicy(bucketName, policyJSON) is idempotent (it overwrites
+        // any existing policy), so re-provision converges. Best-effort with the
+        // same retry/backoff shape as the CORS loop: a policy failure must not
+        // fail a re-provision of an otherwise-healthy stack.
+        const packagedPolicy = JSON.stringify({
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Effect: 'Allow',
+              Principal: { AWS: ['*'] },
+              Action: ['s3:GetObject'],
+              Resource: [`arn:aws:s3:::${PACKAGED_BUCKET}/*`]
+            }
+          ]
+        });
+        {
+          let attempts = 0;
+          while (true) {
+            try {
+              await minioClient.setBucketPolicy(PACKAGED_BUCKET, packagedPolicy);
+              break;
+            } catch {
+              attempts++;
+              if (attempts >= 5) break; // best-effort — don't block provision
+              await delay(3000);
+            }
+          }
+        }
+
         // 2. CouchDB — document store for asset metadata.
         currentService = 'apache-couchdb';
         const couchdbAdminPasswordRef = await secretRef(
