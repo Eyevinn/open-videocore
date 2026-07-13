@@ -66,7 +66,12 @@ export class CouchPipelineRepository implements PipelineRepository {
 
   async update(
     id: string,
-    patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
+    patch: Partial<
+      Pick<
+        PipelineExecution,
+        'status' | 'steps' | 'resolvedOutputLocation' | 'relocatedPackagingIds'
+      >
+    >
   ): Promise<PipelineExecution | undefined> {
     const couch = this.couchFor();
     const doc = await couch.get(id);
@@ -78,6 +83,12 @@ export class CouchPipelineRepository implements PipelineRepository {
       ...existing,
       ...(patch.status !== undefined ? { status: patch.status } : {}),
       ...(patch.steps !== undefined ? { steps: patch.steps } : {}),
+      ...(patch.resolvedOutputLocation !== undefined
+        ? { resolvedOutputLocation: patch.resolvedOutputLocation }
+        : {}),
+      ...(patch.relocatedPackagingIds !== undefined
+        ? { relocatedPackagingIds: patch.relocatedPackagingIds }
+        : {}),
       updatedAt: new Date().toISOString()
     };
     await couch.put(id, { ...toDoc(next), _rev: doc._rev });
@@ -143,6 +154,12 @@ function toDoc(execution: PipelineExecution): Record<string, unknown> {
     ...(execution.destinationBucket !== undefined
       ? { destinationBucket: execution.destinationBucket }
       : {}),
+    ...(execution.resolvedOutputLocation !== undefined
+      ? { resolvedOutputLocation: execution.resolvedOutputLocation }
+      : {}),
+    ...(execution.relocatedPackagingIds !== undefined
+      ? { relocatedPackagingIds: execution.relocatedPackagingIds }
+      : {}),
     createdAt: execution.createdAt,
     updatedAt: execution.updatedAt
   };
@@ -172,6 +189,16 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
     ...(typeof doc['destinationBucket'] === 'string'
       ? { destinationBucket: doc['destinationBucket'] }
       : {}),
+    ...(isResolvedLocation(doc['resolvedOutputLocation'])
+      ? { resolvedOutputLocation: doc['resolvedOutputLocation'] }
+      : {}),
+    ...(Array.isArray(doc['relocatedPackagingIds'])
+      ? {
+          relocatedPackagingIds: (doc['relocatedPackagingIds'] as unknown[]).map(
+            (v) => String(v)
+          )
+        }
+      : {}),
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };
@@ -180,4 +207,18 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
 function stripPartition(id: string): string {
   const idx = id.indexOf(':');
   return idx >= 0 ? id.slice(idx + 1) : id;
+}
+
+// Narrow a stored value to the { bucket, prefix } resolved-location shape
+// (issue #208). Guards against malformed/legacy documents so a bad field never
+// yields a partially-typed PipelineExecution.
+function isResolvedLocation(
+  value: unknown
+): value is { bucket: string; prefix: string } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { bucket?: unknown }).bucket === 'string' &&
+    typeof (value as { prefix?: unknown }).prefix === 'string'
+  );
 }

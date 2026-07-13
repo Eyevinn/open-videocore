@@ -818,7 +818,19 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
   repository: assetRepository,
   webhookDispatcher,
   redis: sharedRedis,
-  pipelineRepository
+  pipelineRepository,
+  // Post-package relocation (issue #208, ADR-011). Resolve the stack's MinIO
+  // client + packaged/staging bucket at callback time so a packaging success can
+  // server-side-copy this execution's output to a per-execution
+  // `destinationBucket` override. Reuses the resolver-built MinioClient
+  // (workspace-stack.ts) — no new client construction here. Returns undefined
+  // when the resolved stack has no storage configured (no override relocation is
+  // then possible; executions without an override are unaffected regardless).
+  resolveRelocation: async () => {
+    const conns = await stackResolver.resolve();
+    if (!conns.storageClient) return undefined;
+    return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
+  }
 };
 await app.register(internalRouter, internalRouterOptions);
 
