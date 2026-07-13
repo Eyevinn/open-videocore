@@ -673,7 +673,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // CallbackUrl: the packager POSTs to {CallbackUrl}/packagerCallback/success
         // and .../failure. The internal route is mounted at /api/v1/internal
         // (internal.ts), so the base is publicBaseUrl/api/v1/internal.
-        // Omitted when PUBLIC_BASE_URL is unset (local dev without a tunnel).
+        // publicBaseUrl comes from the single resolvePublicBaseUrl() seam
+        // (issue #219). Omitted when unresolved (local dev without a tunnel),
+        // exactly as when PUBLIC_BASE_URL was read directly.
         const packagerCallbackUrl = publicBaseUrl
           ? `${publicBaseUrl}/api/v1/internal`
           : undefined;

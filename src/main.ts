@@ -63,6 +63,7 @@ import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
+import { resolvePublicBaseUrl } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
@@ -252,7 +253,7 @@ await app.register(provisionRouter, {
   osc: oscContext,
   paramStore,
   operationStore,
-  publicBaseUrl: process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, ''),
+  publicBaseUrl: resolvePublicBaseUrl(),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
@@ -452,14 +453,17 @@ const encoreProfilesUrl =
 
 // Publicly-reachable base URL of this API, used to build the `profilesUrl` we
 // hand to each Encore instance the scaler spawns so Encore fetches profiles
-// from our own GET /api/v1/profiles/index.yml. When unset the scaler falls back
-// to the remote default index (previous behaviour), so Encore still works.
-const publicBaseUrl = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
+// from our own GET /api/v1/profiles/index.yml. Resolved via the single
+// resolvePublicBaseUrl() seam (issue #219): explicit PUBLIC_BASE_URL override →
+// OSC-derived app URL (none available today) → unset. When unset the scaler
+// falls back to the remote default index (previous behaviour), so Encore still
+// works.
+const publicBaseUrl = resolvePublicBaseUrl();
 const encoreScalerProfilesUrl = publicBaseUrl
   ? `${publicBaseUrl}/api/v1/profiles/index.yml`
   : encoreProfilesUrl;
 if (!publicBaseUrl) {
-  app.log.warn('PUBLIC_BASE_URL not set — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+  app.log.warn('public base URL unresolved (PUBLIC_BASE_URL not set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time
