@@ -63,7 +63,7 @@ import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
-  ensurePackagerProvisioned,
+  PackagerEnsureSingleFlight,
   packagerOscApiFromContext
 } from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
@@ -638,6 +638,14 @@ function activateScaler(redisUrl: string): void {
   const packagerPat = oscContext.getPersonalAccessToken();
   if (packagerMinioPassword && packagerPat) {
     const packagerApi = packagerOscApiFromContext(oscContext);
+    // Per-stack single-flight guard (issue #245): N concurrent first-execution
+    // requests collapse onto one ensure run per stack, so exactly one packager
+    // is provisioned. Combined with the ground-truth reconciliation inside
+    // ensurePackagerProvisioned (getInstance check + "already taken" tolerance),
+    // a restart mid-provision self-heals without orphaning/duplicating. One
+    // guard per activation; cleared implicitly when the scaler deactivates and
+    // the ensurePackaging closure is dropped.
+    const packagerEnsureGuard = new PackagerEnsureSingleFlight();
     assetRouterOptions.ensurePackaging = async () => {
       // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
       // this activation is bound to. Mirrors resolveStackRedisUrl: the first
@@ -668,7 +676,7 @@ function activateScaler(redisUrl: string): void {
         app.log.warn('on-demand packager: stack coordinates unavailable, skipping ensure');
         return;
       }
-      const result = await ensurePackagerProvisioned({
+      const result = await packagerEnsureGuard.run({
         osc: packagerApi,
         coords: {
           stackName,
