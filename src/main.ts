@@ -63,6 +63,7 @@ import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
+import { resolvePublicBaseUrl } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
@@ -191,11 +192,41 @@ if (!paramStore) {
 // from the parameter store (or an explicit env-var override for local dev),
 // keyed by the caller's workspace and an optional X-Stack-Name header. The
 // resolver caches results and is invalidated after a provision/teardown.
+// OPTIONAL, opt-in pipeline steps are activated from the STACK RECORD, not
+// boot-time env vars (issue #217). The resolver reads the ACTIVE stack's
+// StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName at resolve
+// time and, when present, builds the corresponding generator via these
+// builders — so a freshly provisioned optional service is picked up on the next
+// pipeline run with NO API restart. When object storage is unavailable the
+// builders are omitted and the steps stay disabled (graceful skip). The
+// runner-tuning knobs (AUTO_SUBTITLES_WRITES_S3, SCENE_DETECT_PATH) are NOT
+// activation switches and remain here.
+const storageBackedForOptionalSteps = Boolean(process.env['MINIO_URL']) || Boolean(paramStore);
+const optionalStepBuilders = storageBackedForOptionalSteps
+  ? {
+      subtitleGenerator: (instanceName: string): SubtitleGenerator =>
+        makeOscSubtitleGenerator({
+          context: oscContext,
+          getInstance,
+          instanceName,
+          writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
+        }),
+      sceneDetector: (instanceName: string): SceneDetector =>
+        makeOscSceneDetector({
+          context: oscContext,
+          getInstance,
+          instanceName,
+          path: process.env['SCENE_DETECT_PATH']
+        })
+    }
+  : {};
+
 const stackResolver = new WorkspaceStackResolver({
   paramStore,
   oscContext,
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
-  couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? ''
+  couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
+  optionalSteps: optionalStepBuilders
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
@@ -222,7 +253,7 @@ await app.register(provisionRouter, {
   osc: oscContext,
   paramStore,
   operationStore,
-  publicBaseUrl: process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, ''),
+  publicBaseUrl: resolvePublicBaseUrl(),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
@@ -248,8 +279,11 @@ await app.register(provisionRouter, {
 // provision cards. Reuses the SAME OperationStore as the whole-stack provision
 // route so 202 operations poll the same GET /api/v1/provision/operations/:id.
 // Status reports the AUTO_SUBTITLES_INSTANCE_NAME / SCENE_DETECT_INSTANCE_NAME
-// env vars (the same source this file reads to wire the pipeline steps above),
-// so a card never disagrees with what the runtime actually discovered.
+// env vars via the optional-services registry. NOTE: as of issue #217 the
+// PIPELINE steps are activated from the stack record (StackConfig), not these
+// env vars — so the card's env-var view reflects the deployment's intended
+// configuration, while the runtime step activation follows what was actually
+// provisioned into the active stack.
 await app.register(optionalServicesRouter, {
   prefix: '/api/v1/optional-services',
   osc: oscContext,
@@ -392,50 +426,15 @@ const clipRunner: ClipRunner | undefined = storageAvailable
     })
   : undefined;
 
-// Auto-subtitles (issue #114) runs on the long-lived OSC eyevinn-auto-subtitles
-// (Whisper) SERVICE, called over HTTP at its instance URL — NOT an ephemeral job
-// like the ffprobe/thumbnail/clip runners. It is OPTIONAL and opt-in: the
-// service is provisioned separately (it needs an OpenAI key), so the deployment
-// supplies the instance name via AUTO_SUBTITLES_INSTANCE_NAME. When that name is
-// unset (or object storage is missing) the generator is undefined and the
-// `subtitles` pipeline step skips gracefully (never throws — fire-and-forget).
-// AUTO_SUBTITLES_WRITES_S3=true tells the runner the service uploads the result
-// object to S3 itself (so we skip our own upload path).
-const autoSubtitlesInstanceName = process.env['AUTO_SUBTITLES_INSTANCE_NAME'];
-const subtitleGenerator: SubtitleGenerator | undefined =
-  storageAvailable && autoSubtitlesInstanceName
-    ? makeOscSubtitleGenerator({
-        context: oscContext,
-        getInstance,
-        instanceName: autoSubtitlesInstanceName,
-        writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
-      })
-    : undefined;
-if (storageAvailable && !autoSubtitlesInstanceName) {
-  app.log.info('AUTO_SUBTITLES_INSTANCE_NAME not set — optional auto-subtitles pipeline step disabled');
-}
-
-// Scene detection (issue #115) runs on the OSC eyevinn-function-scenes media
-// FUNCTION, called over HTTP at its instance URL (NOT an ephemeral job). Like
-// auto-subtitles it is OPTIONAL and opt-in: the function is provisioned
-// separately, so the deployment supplies the instance name via
-// SCENE_DETECT_INSTANCE_NAME. When that name is unset (or object storage is
-// missing) the detector is undefined and the OPTIONAL `scene-detect` pipeline
-// step skips gracefully (never throws — fire-and-forget). SCENE_DETECT_PATH
-// overrides the (un-contract-verified) runtime endpoint path (default '/').
-const sceneDetectInstanceName = process.env['SCENE_DETECT_INSTANCE_NAME'];
-const sceneDetector: SceneDetector | undefined =
-  storageAvailable && sceneDetectInstanceName
-    ? makeOscSceneDetector({
-        context: oscContext,
-        getInstance,
-        instanceName: sceneDetectInstanceName,
-        path: process.env['SCENE_DETECT_PATH']
-      })
-    : undefined;
-if (storageAvailable && !sceneDetectInstanceName) {
-  app.log.info('SCENE_DETECT_INSTANCE_NAME not set — optional scene-detect pipeline step disabled');
-}
+// Auto-subtitles (issue #114) and scene detection (issue #115) are OPTIONAL,
+// opt-in pipeline steps. As of issue #217 their activation is derived from the
+// STACK RECORD (StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName)
+// rather than boot-time env vars: the stack resolver builds the per-stack
+// generator (via optionalStepBuilders above) at resolve time and exposes it on
+// request.connections, so the assets router reads it live per pipeline run. A
+// freshly provisioned optional service is therefore picked up on the next run
+// with NO restart; when the record carries no instance name the step stays
+// disabled and skips gracefully (fire-and-forget, never throws).
 
 // ABR transcoding via auto-scaling Encore pool (ADR-006). The scaler exposes
 // the same EncoreClient interface as the old static client but manages a
@@ -454,14 +453,17 @@ const encoreProfilesUrl =
 
 // Publicly-reachable base URL of this API, used to build the `profilesUrl` we
 // hand to each Encore instance the scaler spawns so Encore fetches profiles
-// from our own GET /api/v1/profiles/index.yml. When unset the scaler falls back
-// to the remote default index (previous behaviour), so Encore still works.
-const publicBaseUrl = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
+// from our own GET /api/v1/profiles/index.yml. Resolved via the single
+// resolvePublicBaseUrl() seam (issue #219): explicit PUBLIC_BASE_URL override →
+// OSC-derived app URL (none available today) → unset. When unset the scaler
+// falls back to the remote default index (previous behaviour), so Encore still
+// works.
+const publicBaseUrl = resolvePublicBaseUrl();
 const encoreScalerProfilesUrl = publicBaseUrl
   ? `${publicBaseUrl}/api/v1/profiles/index.yml`
   : encoreProfilesUrl;
 if (!publicBaseUrl) {
-  app.log.warn('PUBLIC_BASE_URL not set — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+  app.log.warn('public base URL unresolved (PUBLIC_BASE_URL not set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time
@@ -765,8 +767,6 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   thumbnailExtractor,
   rewrapRunner,
   clipRunner,
-  subtitleGenerator,
-  sceneDetector,
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository,

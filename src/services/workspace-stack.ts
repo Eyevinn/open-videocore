@@ -11,7 +11,12 @@
 
 import nano from 'nano';
 import { Client as MinioClient } from 'minio';
-import { isReadyStack, type ParamStore, type StackConfig } from './param-store.js';
+import {
+  isReadyStack,
+  type ParamStore,
+  type StackConfig,
+  type StorageBackendConfig
+} from './param-store.js';
 import { couchServer, StackCouch } from '../data/couchdb.js';
 import { WorkspaceStorage } from '../data/storage.js';
 import { CouchAssetRepository } from '../data/couch-asset-repo.js';
@@ -34,7 +39,22 @@ import type { CollectionRepository } from '../data/collection-repo.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
+import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
+import type { SceneDetector } from '../pipeline/scene-detector.js';
 import type { Context } from '@osaas/client-core';
+
+// Builders that turn a stored optional-service instance name (from the stack
+// record) into the corresponding pipeline-step generator (issue #217). main.ts
+// owns the OSC/env-tuning wiring and supplies these; the resolver invokes one
+// only when the ACTIVE stack's StackConfig carries the instance name, so a
+// freshly provisioned optional service is activated on the next pipeline run
+// with NO API restart. When a builder is absent (no object storage) or the name
+// is missing from the record, the corresponding generator is left undefined and
+// the OPTIONAL step skips gracefully — identical to the previous env-var path.
+export type OptionalStepBuilders = {
+  subtitleGenerator?: (instanceName: string) => SubtitleGenerator;
+  sceneDetector?: (instanceName: string) => SceneDetector;
+};
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
 
@@ -52,6 +72,22 @@ export type WorkspaceConnections = {
   sourceBucket: string;
   packagedBucket: string;
   s3Config: { endpoint: string; accessKey: string; secretKey: string } | undefined;
+  // Per-role storage backend metadata for the resolved stack (issue #211/#213).
+  // Carried through so the delivery route can emit backend-appropriate URLs
+  // (proxied for 'minio', public/derived object URLs for 'external') without a
+  // second parameter-store read per request. Undefined when the stack predates
+  // issue #211 (both roles then default to the per-stack MinIO backend) or for
+  // the env-override / in-memory connection paths.
+  storage:
+    | { source: StorageBackendConfig; packaged: StorageBackendConfig }
+    | undefined;
+  // OPTIONAL, opt-in pipeline-step generators activated from the stack record
+  // (issue #217), not boot-time env vars. Present only when the ACTIVE stack's
+  // StackConfig carries the instance name AND a builder was supplied (object
+  // storage available). Absent (undefined) => the OPTIONAL `subtitles` /
+  // `scene-detect` step skips gracefully — fire-and-forget, never throws.
+  subtitleGenerator: SubtitleGenerator | undefined;
+  sceneDetector: SceneDetector | undefined;
 };
 
 type CacheEntry = { connections: WorkspaceConnections; expiresAt: number };
@@ -79,7 +115,8 @@ function buildConnectionsFromStack(
   config: StackConfig,
   minioPassword: string,
   couchPassword: string,
-  oscContext: Context
+  oscContext: Context,
+  optionalSteps: OptionalStepBuilders
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -118,6 +155,21 @@ function buildConnectionsFromStack(
   // scaler-backed EncoreClient; the per-stack resolver leaves encore unset.
   const encore = undefined;
 
+  // Activate the OPTIONAL pipeline steps from the stack record (issue #217),
+  // NOT from boot-time env vars. When the ACTIVE stack was provisioned with the
+  // instance name AND a builder is available (object storage present), construct
+  // the generator for this stack; otherwise leave it undefined so the step skips
+  // gracefully. Because this runs at resolve time, a freshly provisioned
+  // optional service is picked up on the next pipeline run without a restart.
+  const subtitleGenerator =
+    config.autoSubtitlesInstanceName && optionalSteps.subtitleGenerator
+      ? optionalSteps.subtitleGenerator(config.autoSubtitlesInstanceName)
+      : undefined;
+  const sceneDetector =
+    config.sceneDetectInstanceName && optionalSteps.sceneDetector
+      ? optionalSteps.sceneDetector(config.sceneDetectInstanceName)
+      : undefined;
+
   return {
     assets,
     jobs,
@@ -131,7 +183,12 @@ function buildConnectionsFromStack(
     encore,
     sourceBucket: config.sourceBucket,
     packagedBucket: config.packagedBucket,
-    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword }
+    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword },
+    // Carry the per-role storage backend metadata (issue #211) so the delivery
+    // route can branch on backend type without re-reading the parameter store.
+    storage: config.storage,
+    subtitleGenerator,
+    sceneDetector
   };
 }
 
@@ -209,7 +266,16 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     assets, jobs, search, webhooks, collections, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
-    s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined
+    s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
+    // The env-override path has no parameter-store record, so no per-role
+    // backend metadata: delivery keeps its default (proxied) behaviour.
+    storage: undefined,
+    // The env-override path bypasses the parameter store, so there is no stack
+    // record to source optional-step instance names from (issue #217): the
+    // OPTIONAL subtitles/scene-detect steps stay disabled here and skip
+    // gracefully, exactly as when the name is absent from a record.
+    subtitleGenerator: undefined,
+    sceneDetector: undefined
   };
 }
 
@@ -227,7 +293,10 @@ function buildInMemoryConnections(): WorkspaceConnections {
     encore: undefined,
     sourceBucket: 'openvideocore-source',
     packagedBucket: 'openvideocore-packaged',
-    s3Config: undefined
+    s3Config: undefined,
+    storage: undefined,
+    subtitleGenerator: undefined,
+    sceneDetector: undefined
   };
 }
 
@@ -239,17 +308,23 @@ export class WorkspaceStackResolver {
   private oscContext: Context;
   private minioPassword: string;
   private couchPassword: string;
+  private optionalSteps: OptionalStepBuilders;
 
   constructor(opts: {
     paramStore: ParamStore | undefined;
     oscContext: Context;
     minioPassword: string;
     couchPassword: string;
+    // Builders that activate the OPTIONAL subtitles/scene-detect steps from the
+    // stack record (issue #217). Optional so callers/tests that don't wire the
+    // optional services get the graceful-skip behaviour (steps disabled).
+    optionalSteps?: OptionalStepBuilders;
   }) {
     this.paramStore = opts.paramStore;
     this.oscContext = opts.oscContext;
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
+    this.optionalSteps = opts.optionalSteps ?? {};
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -310,7 +385,7 @@ export class WorkspaceStackResolver {
     // to no-op in-memory connections so /health and infra routes stay up.
     const connections =
       (config && isReadyStack(config)
-        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext)
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
         : null) ?? buildInMemoryConnections();
 
     this.cache.set(cacheKey, { connections, expiresAt: Date.now() + CACHE_TTL_MS });

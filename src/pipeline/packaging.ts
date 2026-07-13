@@ -29,6 +29,7 @@
 // the OSC catalog — see docs/osc-feedback/incoming-issue9-packaging.md.
 
 import type { AssetRepository, ManifestUrls } from '../data/asset-repo.js';
+import type { StorageBackendConfig } from '../services/param-store.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
 // in routes/provision.ts and the packager's OutputFolder).
@@ -110,7 +111,11 @@ export function manifestUrlsForLocation(
 // strip the trailing default-bucket segment so the override bucket can be
 // substituted. When unset the default base is `/<packagedBucket>`, whose origin
 // is empty (a root-relative reference), matching the default case.
-export function packagedPublicOrigin(): string {
+//
+// NOTE: distinct from `packagedPublicOrigin` (issue #200) which returns the raw
+// configured origin or undefined; this one strips the default-bucket segment so
+// a relocation override bucket can be substituted, and always returns a string.
+export function packagedRelocationOrigin(): string {
   const base = packagingPublicBaseUrl().replace(/\/+$/, '');
   const bucketSuffix = `/${packagedBucket()}`;
   if (base.endsWith(bucketSuffix)) {
@@ -120,6 +125,41 @@ export function packagedPublicOrigin(): string {
     return '';
   }
   return base;
+}
+
+// Derive the public base origin (scheme://host[:port][/prefix]) for objects in
+// an EXTERNAL S3-compatible storage backend (issue #213). Precedence:
+//   1. `publicBaseUrl` (an operator-supplied CDN/public origin fronting the
+//      bucket) wins verbatim when set — the operator controls the emitted host.
+//   2. Otherwise the URL is derived from `endpointUrl` + `bucket` using a
+//      path-style address (`<endpointUrl>/<bucket>`), which every S3-compatible
+//      store supports without DNS/vhost setup. `region` is not embedded in the
+//      host here: a supplied `endpointUrl` is already the regional endpoint, and
+//      path-style addressing keeps the derivation deterministic and
+//      credential-free.
+// Returns undefined when the backend is not external or lacks the coordinates
+// needed to build a public URL (no publicBaseUrl and no endpointUrl) — the
+// caller then falls back to the proxied path. NEVER embeds credentials.
+export function externalPublicBaseUrl(
+  backend: StorageBackendConfig | undefined
+): string | undefined {
+  if (!backend || backend.backend !== 'external') return undefined;
+  if (backend.publicBaseUrl) {
+    return backend.publicBaseUrl.replace(/\/+$/, '');
+  }
+  if (backend.endpointUrl) {
+    const endpoint = backend.endpointUrl.replace(/\/+$/, '');
+    return `${endpoint}/${backend.bucket.replace(/^\/+|\/+$/g, '')}`;
+  }
+  return undefined;
+}
+
+// Build a public object URL for a single stored object key against an external
+// backend's public base (see externalPublicBaseUrl). The object key is appended
+// as a path segment; the deterministic manifest names (index.m3u8 / manifest.mpd)
+// are preserved by the caller. NEVER embeds credentials or signed query params.
+export function externalObjectUrl(base: string, objectKey: string): string {
+  return `${base.replace(/\/+$/, '')}/${objectKey.replace(/^\/+/, '')}`;
 }
 
 // The job enqueued onto the Valkey sorted-set queue for the packager to consume.
@@ -180,6 +220,150 @@ export type PackagingDeps = {
 
 export function packagingPublicBaseUrl(): string {
   return process.env['PACKAGED_PUBLIC_BASE_URL'] ?? `/${packagedBucket()}`;
+}
+
+// Delivery mode selects HOW packaged output is exposed to players (issue #201).
+//   - 'public': the packaged bucket is anonymously readable and delivery
+//     advertises the already-public CMAF manifest URLs (default; the existing
+//     behaviour).
+//   - 'proxy':  the packaged bucket stays private and packaged objects are
+//     streamed back through an authorized API route. Delivery advertises those
+//     proxy URLs instead, so no anonymous bucket read is required (useful for
+//     multi-tenant deployments).
+// The two modes are mutually selectable — never both active — because they have
+// deliberately different security postures. Config via env (12-factor), mirrors
+// how packagingPublicBaseUrl() reads PACKAGED_PUBLIC_BASE_URL above.
+export const DELIVERY_MODES = ['public', 'proxy'] as const;
+export type DeliveryMode = (typeof DELIVERY_MODES)[number];
+
+export function deliveryMode(): DeliveryMode {
+  const raw = process.env['DELIVERY_MODE']?.trim().toLowerCase();
+  if (raw === 'proxy') {
+    return 'proxy';
+  }
+  // Anything unset/unrecognised falls back to the safe, backwards-compatible
+  // default so an existing public-bucket deployment is unaffected.
+  return 'public';
+}
+
+// The URL prefix (relative to the assets router) under which packaged objects
+// are streamed back through the proxy route. Segment/manifest relative
+// references resolve under this prefix because the manifest is itself served
+// from `<prefix>/index.m3u8`.
+export function proxyStreamPrefix(assetId: string): string {
+  return `${assetId}/stream`;
+}
+
+// Build the proxy manifest URLs for an asset's packaged output (issue #201).
+// `apiBaseUrl` is the publicly reachable origin of THIS API (config via env,
+// PUBLIC_BASE_URL) up to and including the assets-router mount point, e.g.
+// `https://api.example/api/v1/assets`. When absent we fall back to a relative
+// path so a same-origin player still resolves the manifest and its (relative)
+// segment references back through the proxy.
+export function proxyManifestUrlsFor(assetId: string, apiBaseUrl: string): ManifestUrls {
+  const base = `${apiBaseUrl.replace(/\/+$/, '')}/${proxyStreamPrefix(assetId)}`;
+  return {
+    hls: `${base}/index.m3u8`,
+    dash: `${base}/manifest.mpd`
+  };
+}
+
+// Raised by `resolvePublicManifestUrl` when a stored manifest URL is not already
+// public and `PACKAGED_PUBLIC_BASE_URL` is unset/invalid, so we cannot resolve
+// it to a public-facing origin. The delivery endpoint surfaces this as a clear
+// 501 not_configured rather than silently handing back a relative/internal path.
+export class PublicManifestBaseUrlError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PublicManifestBaseUrlError';
+  }
+}
+
+// The configured public-facing origin for the packaged bucket (MinIO/CDN), or
+// undefined when `PACKAGED_PUBLIC_BASE_URL` is unset. Unlike
+// `packagingPublicBaseUrl()` this does NOT fall back to a relative bucket path:
+// callers that require a genuinely public origin (the delivery endpoint) must be
+// able to distinguish "configured" from "unset".
+export function packagedPublicOrigin(): string | undefined {
+  const raw = process.env['PACKAGED_PUBLIC_BASE_URL'];
+  if (!raw || raw.trim().length === 0) {
+    return undefined;
+  }
+  return raw;
+}
+
+// Resolve a stored manifest URL to a public-facing URL at read time (issue #200).
+//
+// `manifestUrls` are written at packaging time from `packagingPublicBaseUrl()`,
+// which falls back to a RELATIVE `/<bucket>` path when `PACKAGED_PUBLIC_BASE_URL`
+// is unset. A relative or internal-host URL is not fetchable by an external
+// client, so we normalise here against the configured public origin:
+//   - Already absolute AND same host as the public origin -> returned as-is.
+//   - Relative (or an unparseable/relative-looking value)  -> resolved against
+//     the public origin, preserving the stored path + query.
+//   - Absolute with a DIFFERENT (internal) host            -> host + scheme
+//     rewritten to the public origin, path + query preserved.
+// When the URL is not already absolute-public and no public origin is configured
+// we throw `PublicManifestBaseUrlError` so the miswiring is surfaced explicitly.
+export function resolvePublicManifestUrl(
+  stored: string,
+  publicOrigin: string | undefined = packagedPublicOrigin()
+): string {
+  const parsedStored = tryParseUrl(stored);
+
+  // No configured public origin: only safe if the stored URL is already
+  // absolute (has a host). We cannot know it is the public host, but rewriting
+  // is impossible without a target, so we surface the misconfiguration.
+  if (!publicOrigin) {
+    if (parsedStored) {
+      return stored;
+    }
+    throw new PublicManifestBaseUrlError(
+      'PACKAGED_PUBLIC_BASE_URL is not configured; cannot resolve a public-facing ' +
+        'manifest URL from a relative packaged path. Set PACKAGED_PUBLIC_BASE_URL ' +
+        'to the public MinIO/CDN origin for the packaged bucket.'
+    );
+  }
+
+  const parsedOrigin = tryParseUrl(publicOrigin);
+  if (!parsedOrigin) {
+    // Configured origin is itself not an absolute URL (e.g. a relative path).
+    // It is not a usable public origin, so treat it like "unset".
+    if (parsedStored) {
+      return stored;
+    }
+    throw new PublicManifestBaseUrlError(
+      `PACKAGED_PUBLIC_BASE_URL ("${publicOrigin}") is not an absolute URL and ` +
+        'cannot be used to build a public-facing manifest URL. Set it to an ' +
+        'absolute origin such as https://cdn.example.com/openvideocore-packaged.'
+    );
+  }
+
+  // Relative stored value: join the public base and the stored path.
+  if (!parsedStored) {
+    const base = publicOrigin.replace(/\/+$/, '');
+    const path = stored.startsWith('/') ? stored : `/${stored}`;
+    return `${base}${path}`;
+  }
+
+  // Already absolute and pointing at the public host: nothing to rewrite.
+  if (parsedStored.host === parsedOrigin.host) {
+    return stored;
+  }
+
+  // Absolute but internal host: rewrite scheme + host to the public origin,
+  // preserving the stored path + query + fragment.
+  parsedStored.protocol = parsedOrigin.protocol;
+  parsedStored.host = parsedOrigin.host;
+  return parsedStored.toString();
+}
+
+function tryParseUrl(value: string): URL | undefined {
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
 }
 
 export class PackagingService implements PackagingTrigger {
