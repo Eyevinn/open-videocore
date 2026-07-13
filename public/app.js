@@ -876,9 +876,17 @@ async function renderAssetDetailBody(id, bodyEl) {
     if (asset.slug) {
       kvRows.push(['ULID', '<span class="text-mono text-muted">' + escHtml(asset.id) + '</span>']);
     }
+    // Status cell; when the scene-detect pipeline recorded a failure
+    // (asset.sceneDetectionError, a plain string per src/routes/assets.ts:381),
+    // surface it as a warning right alongside the asset status. Detection never
+    // changes the asset's lifecycle status, so this is purely advisory.
+    var statusCell = renderBadge(asset.status);
+    if (asset.sceneDetectionError) {
+      statusCell += ' <span class="text-mono" style="color:var(--error,#f87171)" title="Scene detection failed">⚠ Scene detection: ' + escHtml(asset.sceneDetectionError) + '</span>';
+    }
     kvRows.push(
       ['Title', escHtml(asset.title || asset.name || '—')],
-      ['Status', renderBadge(asset.status)],
+      ['Status', statusCell],
       ['MIME type', escHtml(asset.mimeType || '—')],
       ['Tags', renderTags(asset.tags)],
       ['Created', escHtml(fmtDate(asset.createdAt))],
@@ -927,6 +935,59 @@ async function renderAssetDetailBody(id, bodyEl) {
       metaDiv.appendChild(metaTitle);
       metaDiv.appendChild(pre);
       body.appendChild(metaDiv);
+    }
+
+    // Scene/shot-detection metadata (issue #197). Shape verified against
+    // src/data/asset-repo.ts: SceneMetadata { boundaries: SceneBoundary[];
+    // sceneCount: number; detectedAt: string } (L159-165) and each
+    // SceneBoundary { startSeconds?; endSeconds?; keyframeSeconds? } (L147-151),
+    // mirrored by sceneMetadataSchema in src/routes/assets.ts:293-297. The field
+    // is `null` until the first successful detection, so only render the section
+    // when boundaries are actually present — never an empty section.
+    var sm = asset.sceneMetadata;
+    if (sm && Array.isArray(sm.boundaries) && sm.boundaries.length > 0) {
+      const sceneDiv = document.createElement('div');
+      sceneDiv.className = 'mt12';
+
+      const sceneTitle = document.createElement('div');
+      sceneTitle.className = 'section-title';
+      // sceneCount is a convenience mirror of boundaries.length; fall back to the
+      // array length if the server omitted/mismatched it.
+      var count = (typeof sm.sceneCount === 'number') ? sm.sceneCount : sm.boundaries.length;
+      sceneTitle.textContent = 'Scenes (' + count + ')';
+      sceneDiv.appendChild(sceneTitle);
+
+      if (sm.detectedAt) {
+        const detectedLine = document.createElement('div');
+        detectedLine.className = 'text-muted';
+        detectedLine.textContent = 'Detected ' + fmtDate(sm.detectedAt);
+        sceneDiv.appendChild(detectedLine);
+      }
+
+      // Format a boundary as "start → end" using whatever seconds fields are
+      // present; every field is optional in the contract, so guard each one.
+      var fmtSecs = function(v) {
+        return (typeof v === 'number') ? v.toFixed(1) + 's' : '—';
+      };
+      var rows = sm.boundaries.map(function(b, i) {
+        var window = fmtSecs(b.startSeconds) + ' → ' + fmtSecs(b.endSeconds);
+        var key = (typeof b.keyframeSeconds === 'number')
+          ? escHtml('key ' + b.keyframeSeconds.toFixed(1) + 's')
+          : '<span class="text-muted">—</span>';
+        return '<tr>' +
+          '<td>' + (i + 1) + '</td>' +
+          '<td class="text-mono">' + escHtml(window) + '</td>' +
+          '<td class="text-mono">' + key + '</td>' +
+          '</tr>';
+      }).join('');
+      var swrap = document.createElement('div');
+      swrap.className = 'table-wrap';
+      swrap.innerHTML =
+        '<table><thead><tr>' +
+        '<th>#</th><th>Window</th><th>Keyframe</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>';
+      sceneDiv.appendChild(swrap);
+      body.appendChild(sceneDiv);
     }
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
