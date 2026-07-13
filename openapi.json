@@ -250,6 +250,22 @@
                     "sceneDetectInstanceName": {
                       "type": "string"
                     },
+                    "options": {
+                      "type": "object",
+                      "properties": {
+                        "autoSubtitles": {
+                          "type": "boolean"
+                        },
+                        "sceneDetect": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "autoSubtitles",
+                        "sceneDetect"
+                      ],
+                      "additionalProperties": false
+                    },
                     "storage": {
                       "type": "object",
                       "properties": {
@@ -5335,6 +5351,11 @@
                       "outputs"
                     ],
                     "additionalProperties": false
+                  },
+                  "destinationBucket": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
                   }
                 },
                 "required": [
@@ -5430,6 +5451,9 @@
                         ],
                         "additionalProperties": false
                       }
+                    },
+                    "destinationBucket": {
+                      "type": "string"
                     },
                     "createdAt": {
                       "type": "string"
@@ -5630,6 +5654,9 @@
                           "additionalProperties": false
                         }
                       },
+                      "destinationBucket": {
+                        "type": "string"
+                      },
                       "createdAt": {
                         "type": "string"
                       },
@@ -5770,6 +5797,9 @@
                         "additionalProperties": false
                       }
                     },
+                    "destinationBucket": {
+                      "type": "string"
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -5902,6 +5932,9 @@
                           ],
                           "additionalProperties": false
                         }
+                      },
+                      "destinationBucket": {
+                        "type": "string"
                       },
                       "createdAt": {
                         "type": "string"
@@ -11207,6 +11240,24 @@
             },
             "in": "query",
             "name": "mimeType",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "in": "query",
+            "name": "tamsFlowId",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:[\\[(](?:(?:\\d+:\\d+)?_(?:\\d+:\\d+)?|\\d+:\\d+)[\\])]|(?:\\d+:\\d+)?_(?:\\d+:\\d+)?|\\d+:\\d+)$"
+            },
+            "in": "query",
+            "name": "tamsTimerange",
             "required": false
           },
           {
