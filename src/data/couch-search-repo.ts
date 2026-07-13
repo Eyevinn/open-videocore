@@ -8,7 +8,8 @@
 // on every deployment, so we degrade gracefully to substring matching rather
 // than failing the request when no text index is available.
 
-import { type Asset, type AssetStatus, MAX_LIMIT } from './asset-repo.js';
+import { type Asset, MAX_LIMIT } from './asset-repo.js';
+import { AssetDocumentSchema, fromAssetDocument } from './asset-document.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 import {
   clampPage,
@@ -83,54 +84,21 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   return selector;
 }
 
+// Rebuild the Asset from the persisted four-namespace document by parsing it
+// through AssetDocumentSchema and delegating to fromAssetDocument — the same
+// path couch-asset-repo.ts uses (issue #168). This populates every projected
+// field (including the flat tamsFlowIds / tamsTimerange derived from the
+// `structural.tams` block) from one authoritative mapping, so search and read
+// stay in lockstep rather than maintaining a second, divergent projection.
 function fromDoc(doc: StoredDoc): Asset {
-  return {
-    id: String(doc['localId'] ?? stripPartition(doc._id)),
-    name: String(doc['name'] ?? ''),
-    description: doc['description'] as string | undefined,
-    status: doc['status'] as AssetStatus,
-    parentId: doc['parentId'] as string | undefined,
-    objectKey: doc['objectKey'] as string | undefined,
-    statusHistory: (doc['statusHistory'] as Asset['statusHistory']) ?? [],
-    technicalMetadata: (doc['technicalMetadata'] as Asset['technicalMetadata']) ?? null,
-    technicalMetadataError: doc['technicalMetadataError'] as string | undefined,
-    manifestUrls: (doc['manifestUrls'] as Asset['manifestUrls']) ?? undefined,
-    packagingError: doc['packagingError'] as string | undefined,
-    renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
-    metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
-    // TAMS addressing (issue #168) is persisted under the four-namespace
-    // `structural.tams` block (asset-document.ts: structural.tams.flowIds[] /
-    // .timerange). Project it flat onto the Asset so the shared matchesQuery
-    // pass can re-check a tamsFlowId / tamsTimerange lookup. Read defensively —
-    // the block is optional/additive and absent on non-bridged assets.
-    tamsFlowIds: tamsFlowIdsFromDoc(doc),
-    tamsTimerange: tamsAddressingFromDoc(doc)?.timerange as string | undefined,
-    createdAt: String(doc['createdAt'] ?? ''),
-    updatedAt: String(doc['updatedAt'] ?? '')
-  };
-}
-
-// Read the optional `structural.tams` addressing block from the persisted
-// four-namespace document, guarding every hop (any level may be absent).
-function tamsAddressingFromDoc(doc: StoredDoc): Record<string, unknown> | undefined {
-  const structural = doc['structural'];
-  if (typeof structural !== 'object' || structural === null) {
-    return undefined;
-  }
-  const tams = (structural as Record<string, unknown>)['tams'];
-  if (typeof tams !== 'object' || tams === null) {
-    return undefined;
-  }
-  return tams as Record<string, unknown>;
-}
-
-function tamsFlowIdsFromDoc(doc: StoredDoc): string[] | undefined {
-  const flowIds = tamsAddressingFromDoc(doc)?.['flowIds'];
-  if (!Array.isArray(flowIds)) {
-    return undefined;
-  }
-  const ids = flowIds.filter((id): id is string => typeof id === 'string');
-  return ids.length > 0 ? ids : undefined;
+  const localId = String(doc['localId'] ?? stripPartition(doc._id));
+  const document = AssetDocumentSchema.parse({
+    ...doc,
+    _id: localId,
+    type: 'asset',
+    schemaVersion: 1
+  });
+  return fromAssetDocument(document);
 }
 
 function stripPartition(id: string): string {
