@@ -24,7 +24,11 @@ import {
   stripCredentials
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
-import { STACK_SERVICES } from '../services/stack.js';
+import {
+  AUTO_SUBTITLES_SERVICE_ID,
+  SCENE_DETECT_SERVICE_ID,
+  STACK_SERVICES
+} from '../services/stack.js';
 import type { OperationStore } from '../services/operation-store.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
@@ -64,7 +68,17 @@ const requestSchema = z.object({
   // Optional external source bucket. Omit for the zero-config MinIO default.
   sourceStorage: externalStorageSchema.optional(),
   // Optional external packaged-output bucket. Omit for the MinIO default.
-  packagedStorage: externalStorageSchema.optional()
+  packagedStorage: externalStorageSchema.optional(),
+  // Optional pipeline services the operator opts into at provision time (issue
+  // #216). Both flags default false: when opted out nothing is created (zero
+  // cost). When opted in, the corresponding OSC instance is provisioned AFTER
+  // the core stack is up and its name recorded in the stored StackConfig.
+  options: z
+    .object({
+      autoSubtitles: z.boolean().default(false),
+      sceneDetect: z.boolean().default(false)
+    })
+    .optional()
 });
 
 const responseSchema = z.object({
@@ -272,6 +286,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     throw new Error('COUCHDB_ADMIN_PASSWORD environment variable is required');
   }
 
+  // OpenAI API key for eyevinn-auto-subtitles' Whisper transcription (issue
+  // #216). Unlike the passwords above this is NOT required at startup: it is
+  // only needed when a request opts into autoSubtitles. Read here (ADR-002,
+  // 12-factor) so the literal lives in one place; when opted in it is
+  // registered as a per-service OSC secret via secretRef and referenced as
+  // {{secrets.*}} in the create body — never a plaintext param, never logged.
+  // Empty/absent is enforced per-request with a fail-fast error when opted in.
+  const openaiApiKey = process.env['OPENAI_API_KEY'];
+
   // Secret naming convention (ADR-002): <stackName>.<purpose>. Secrets are
   // per-service-scoped (a secret saved for one serviceId cannot be referenced
   // from another) and write-once / never-read-back. Encore and the packager
@@ -280,6 +303,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   const ROOTPASSWORD = 'rootpassword';
   const ADMINPASSWORD = 'adminpassword';
   const PAT = 'pat';
+  // Secret purpose for the OpenAI key handed to eyevinn-auto-subtitles (#216).
+  const OPENAIKEY = 'openaikey';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -298,7 +323,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       }
     },
     async (request, reply) => {
-      const { name, sourceStorage, packagedStorage } = request.body;
+      const { name, sourceStorage, packagedStorage, options } = request.body;
+      // Which optional pipeline services this request opted into (#216). Absent
+      // `options` (or absent flags) means opted out — nothing extra is created.
+      const wantAutoSubtitles = options?.autoSubtitles ?? false;
+      const wantSceneDetect = options?.sceneDetect ?? false;
 
       // Build the NON-SECRET storage backend metadata (issue #211) for each
       // role from the validated request. When a block is omitted the role uses
@@ -392,6 +421,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         provisioned.push({ serviceId, name });
         return instance;
       };
+
+      // Names of the optional pipeline instances actually created for this
+      // stack (#216). Populated below only when opted in; folded into the
+      // stored StackConfig so the resolver/pipeline can find them by name.
+      let autoSubtitlesInstanceName: string | undefined;
+      let sceneDetectInstanceName: string | undefined;
 
       let currentService = '';
       try {
@@ -586,6 +621,52 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // synchronous health endpoint. waitForInstanceReady is skipped; the
         // instance starts asynchronously and picks up jobs from the Valkey queue.
 
+        // 5. Optional pipeline services (issue #216). The core stack is now up.
+        // Each is created ONLY when the request opted in — opted-out means zero
+        // cost (nothing is provisioned). Both flow through the same provision()
+        // helper (so they land in provisioned[] and are covered by the
+        // partial-failure cleanup below) and waitForInstanceReady, and their
+        // instance names are recorded into the StackConfig persisted below.
+
+        // 5a. eyevinn-auto-subtitles ("Subtitle Generator") — Whisper transcription.
+        // Contract (get-service-schema, verified 2026-07-13): create config
+        // requires `name` (^\w+$) AND `openaikey` (OpenAI key for Whisper).
+        // No update-service-instance support. The key comes from the operator's
+        // OPENAI_API_KEY env var, registered as a per-service OSC secret scoped
+        // to AUTO_SUBTITLES_SERVICE_ID and referenced as {{secrets.*}} — never a
+        // plaintext param, never logged. Opted in without the key is a fail-fast
+        // configuration error surfaced on the operation, not a silent skip.
+        if (wantAutoSubtitles) {
+          currentService = AUTO_SUBTITLES_SERVICE_ID;
+          if (!openaiApiKey) {
+            throw new Error(
+              'autoSubtitles was requested but OPENAI_API_KEY is not set on ' +
+                'this deployment; set OPENAI_API_KEY (the OpenAI API key used by ' +
+                'eyevinn-auto-subtitles for Whisper) and retry the provision'
+            );
+          }
+          const openaiKeyRef = await secretRef(
+            AUTO_SUBTITLES_SERVICE_ID,
+            OPENAIKEY,
+            openaiApiKey
+          );
+          await provision(AUTO_SUBTITLES_SERVICE_ID, {
+            openaikey: openaiKeyRef
+          });
+          await waitForInstanceReady(AUTO_SUBTITLES_SERVICE_ID, name, osc);
+          autoSubtitlesInstanceName = name;
+        }
+
+        // 5b. eyevinn-function-scenes ("Scene Detect Media Function").
+        // Contract (get-service-schema, verified 2026-07-13): create config
+        // requires ONLY `name` — no external key dependency.
+        if (wantSceneDetect) {
+          currentService = SCENE_DETECT_SERVICE_ID;
+          await provision(SCENE_DETECT_SERVICE_ID, {});
+          await waitForInstanceReady(SCENE_DETECT_SERVICE_ID, name, osc);
+          sceneDetectInstanceName = name;
+        }
+
         // Persist the stack's non-secret connection coordinates to the OSC
         // parameter store (issue #31, ADR-002) so the API — and deprovision
         // (#29) — can rediscover this stack at runtime without the caller
@@ -604,6 +685,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             redisUrl,
             sourceBucket: SOURCE_BUCKET,
             packagedBucket: PACKAGED_BUCKET,
+            // Optional pipeline instance names (issue #215 fields, populated by
+            // #216). Present only when the request opted in and the instance was
+            // created; omitted otherwise so opted-out stacks carry no field.
+            ...(autoSubtitlesInstanceName
+              ? { autoSubtitlesInstanceName }
+              : {}),
+            ...(sceneDetectInstanceName ? { sceneDetectInstanceName } : {}),
             // Non-secret storage backend metadata (issue #211). Secrets are
             // never included — only bucket/endpointUrl/region + backend type.
             storage: storageMetadata,
