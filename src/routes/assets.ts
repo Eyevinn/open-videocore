@@ -199,8 +199,15 @@ const listQuerySchema = z.object({
 // `tams`-prefixed names. (Unifying the two spellings would require editing either
 // this route's test or the merged #174 contract test — deferred, see PR note.)
 const tamsLookupQuerySchema = z.object({
-  tamsFlowId: TamsFlowIdSchema,
-  tamsTimerange: TamsTimerangeSchema.optional()
+  tamsFlowId: TamsFlowIdSchema.describe(
+    'TAMS flow id (UUID) to resolve. Addressing mode (1): supplying only ' +
+      'tamsFlowId resolves the ready asset carrying this flow. Required.'
+  ),
+  tamsTimerange: TamsTimerangeSchema.optional().describe(
+    'TAMS TAI timerange (ADR-008 grammar, e.g. [0:0_10:0)). Addressing mode ' +
+      '(2): supplying tamsFlowId + tamsTimerange additionally requires an exact ' +
+      'stored-timerange match. Optional.'
+  )
 });
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });

@@ -2747,7 +2747,8 @@
             },
             "in": "query",
             "name": "tamsFlowId",
-            "required": true
+            "required": true,
+            "description": "TAMS flow id (UUID) to resolve. Addressing mode (1): supplying only tamsFlowId resolves the ready asset carrying this flow. Required."
           },
           {
             "schema": {
@@ -2756,7 +2757,8 @@
             },
             "in": "query",
             "name": "tamsTimerange",
-            "required": false
+            "required": false,
+            "description": "TAMS TAI timerange (ADR-008 grammar, e.g. [0:0_10:0)). Addressing mode (2): supplying tamsFlowId + tamsTimerange additionally requires an exact stored-timerange match. Optional."
           }
         ],
         "responses": {
