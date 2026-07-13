@@ -24,17 +24,19 @@ import type { OperationStore } from '../services/operation-store.js';
 // same endpoints.
 //
 // INSTANCE-NAME DISCOVERY (why status queries OSC, not a param store):
-// The runtime (main.ts) discovers the provisioned instance from the
-// AUTO_SUBTITLES_INSTANCE_NAME / SCENE_DETECT_INSTANCE_NAME env vars. A running
-// process cannot mutate those env vars for its future self, so provisioning here
-// does NOT auto-wire the runtime. Instead:
+// This status endpoint reports the AUTO_SUBTITLES_INSTANCE_NAME /
+// SCENE_DETECT_INSTANCE_NAME env vars as the deployment's declared config for
+// the #187/#188 provision cards.
 //   - The provision request supplies the instance `name`; we create the OSC
-//     instance under it and RETURN that name so the operator can set the env var.
-//   - The status endpoint reports the env var as the source of truth (matching
-//     what the pipeline actually reads) and probes OSC (getInstance) for the
-//     configured name to report whether the instance is live (`active`).
-// This keeps the status endpoint honest: it reflects exactly what the runtime
-// wired, never a claim that provisioning silently reconfigured the process.
+//     instance under it and RETURN that name.
+//   - The status endpoint reports the env var and probes OSC (getInstance) for
+//     the configured name to report whether the instance is live (`active`).
+// NOTE (issue #217): the PIPELINE steps no longer activate from these env vars —
+// the runtime derives activation from the ACTIVE stack record
+// (StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName), so a
+// freshly provisioned optional service is picked up on the next pipeline run
+// with NO restart. This card's env-var view therefore reflects the deployment's
+// declared intent, while actual step activation follows the provisioned stack.
 
 type OptionalServicesRouterOptions = {
   osc: Context;
