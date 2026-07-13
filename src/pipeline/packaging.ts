@@ -29,6 +29,7 @@
 // the OSC catalog — see docs/osc-feedback/incoming-issue9-packaging.md.
 
 import type { AssetRepository, ManifestUrls } from '../data/asset-repo.js';
+import type { StorageBackendConfig } from '../services/param-store.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
 // in routes/provision.ts and the packager's OutputFolder).
@@ -73,6 +74,41 @@ export function manifestUrlsFor(assetId: string, baseUrl: string): ManifestUrls 
     hls: `${base}/index.m3u8`,
     dash: `${base}/manifest.mpd`
   };
+}
+
+// Derive the public base origin (scheme://host[:port][/prefix]) for objects in
+// an EXTERNAL S3-compatible storage backend (issue #213). Precedence:
+//   1. `publicBaseUrl` (an operator-supplied CDN/public origin fronting the
+//      bucket) wins verbatim when set — the operator controls the emitted host.
+//   2. Otherwise the URL is derived from `endpointUrl` + `bucket` using a
+//      path-style address (`<endpointUrl>/<bucket>`), which every S3-compatible
+//      store supports without DNS/vhost setup. `region` is not embedded in the
+//      host here: a supplied `endpointUrl` is already the regional endpoint, and
+//      path-style addressing keeps the derivation deterministic and
+//      credential-free.
+// Returns undefined when the backend is not external or lacks the coordinates
+// needed to build a public URL (no publicBaseUrl and no endpointUrl) — the
+// caller then falls back to the proxied path. NEVER embeds credentials.
+export function externalPublicBaseUrl(
+  backend: StorageBackendConfig | undefined
+): string | undefined {
+  if (!backend || backend.backend !== 'external') return undefined;
+  if (backend.publicBaseUrl) {
+    return backend.publicBaseUrl.replace(/\/+$/, '');
+  }
+  if (backend.endpointUrl) {
+    const endpoint = backend.endpointUrl.replace(/\/+$/, '');
+    return `${endpoint}/${backend.bucket.replace(/^\/+|\/+$/g, '')}`;
+  }
+  return undefined;
+}
+
+// Build a public object URL for a single stored object key against an external
+// backend's public base (see externalPublicBaseUrl). The object key is appended
+// as a path segment; the deterministic manifest names (index.m3u8 / manifest.mpd)
+// are preserved by the caller. NEVER embeds credentials or signed query params.
+export function externalObjectUrl(base: string, objectKey: string): string {
+  return `${base.replace(/\/+$/, '')}/${objectKey.replace(/^\/+/, '')}`;
 }
 
 // The job enqueued onto the Valkey sorted-set queue for the packager to consume.

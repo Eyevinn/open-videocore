@@ -103,6 +103,10 @@ import {
   type RewrapDeps,
   type RewrapRunner
 } from '../pipeline/rewrap.js';
+import {
+  externalPublicBaseUrl,
+  externalObjectUrl
+} from '../pipeline/packaging.js';
 
 const statusSchema = z.enum(ASSET_STATUSES);
 
@@ -760,6 +764,24 @@ function objectKeyPrefixFromManifest(manifestUrl: string): string {
   return lastSlash >= 0 ? path.slice(0, lastSlash + 1) : '';
 }
 
+// Derive the full object KEY (path + manifest filename, no leading slash) from a
+// stored manifest URL — e.g. `https://minio/packaged/<id>/index.m3u8` ->
+// `packaged/<id>/index.m3u8`. Used to re-host a stored (proxied/MinIO) manifest
+// URL against an external object-store / CDN origin (issue #213) while keeping
+// the deterministic manifest name. A query string, if any, is dropped: delivery
+// URLs must never carry signed/credential query params.
+function objectKeyFromManifest(manifestUrl: string): string {
+  let path = manifestUrl;
+  try {
+    path = new URL(manifestUrl).pathname;
+  } catch {
+    // Not an absolute URL; treat the value itself as a path (strip any query).
+    const q = path.indexOf('?');
+    if (q >= 0) path = path.slice(0, q);
+  }
+  return path.replace(/^\/+/, '');
+}
+
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryAssetRepository();
@@ -1365,23 +1387,49 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const ttl = deliveryUrlTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
-      // Preferred: packaged streaming manifests (issue #9 / #200 / #201).
-      //
-      // PRECEDENCE (issue #201): the delivery mode is a single mutually-exclusive
-      // config flag (DELIVERY_MODE), never both at once:
-      //   - proxy  -> advertise proxy URLs that stream packaged objects back
-      //               through the authorized `/:id/stream/*` route below. The
-      //               packaged bucket stays private (no anonymous read). We
-      //               advertise proxy URLs whenever the asset has ANY packaged
-      //               output (the presence of stored manifestUrls signals that
-      //               packaging completed); the stored public URLs are ignored.
-      //   - public -> advertise the CMAF manifest URLs recorded on the asset,
-      //               resolved to the public-facing MinIO/CDN origin at read time
-      //               (issue #200). Stored URLs may be built from a
-      //               relative/internal packaged base (see packagingPublicBaseUrl),
-      //               so a missing/invalid public origin is surfaced as an explicit
-      //               501, not a silently returned relative/internal path.
+      // Resolve the per-role storage backend metadata for this asset's stack
+      // (issue #211/#213), carried on the resolved connections so no extra
+      // parameter-store read is needed here. When absent (stack predates #211,
+      // env-override path, or in-memory) both roles behave as the default
+      // per-stack MinIO backend and delivery keeps its proxied behaviour.
+      const stackStorage = request.connections?.storage;
+      // For 'external' backends we emit URLs against the operator's public/CDN
+      // origin (publicBaseUrl) or an endpointUrl-derived object URL. For 'minio'
+      // (or unset) these resolve to undefined and the MinIO delivery-mode path
+      // (proxy/public, #200/#201) is kept unchanged — OSC MinIO blocks external
+      // presigned/public GETs.
+      const packagedBase = externalPublicBaseUrl(stackStorage?.packaged);
+      const sourceBase = externalPublicBaseUrl(stackStorage?.source);
+
+      // Preferred: packaged streaming manifests (issue #9 / #200 / #201 / #213).
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
+        // External storage backend (#213): the object store / CDN is itself the
+        // public origin, so re-host the stored manifest object-key path against
+        // it (deterministic manifest names — index.m3u8 / manifest.mpd — are
+        // preserved by reusing the stored path). This supersedes the MinIO
+        // proxy/public delivery modes below, which only apply to the per-stack
+        // MinIO backend that blocks external GETs.
+        if (packagedBase) {
+          const rehost = (manifestUrl: string | undefined): string | undefined => {
+            if (!manifestUrl) return undefined;
+            return externalObjectUrl(packagedBase, objectKeyFromManifest(manifestUrl));
+          };
+          return reply.code(200).send({
+            assetId: asset.id,
+            urls: { hls: rehost(asset.manifestUrls.hls), dash: rehost(asset.manifestUrls.dash) },
+            expiresAt
+          });
+        }
+        // Default per-stack MinIO backend — apply the delivery-mode logic (#201).
+        // PRECEDENCE (issue #201): the delivery mode is a single mutually-exclusive
+        // config flag (DELIVERY_MODE), never both at once:
+        //   - proxy  -> advertise proxy URLs that stream packaged objects back
+        //               through the authorized `/:id/stream/*` route below. The
+        //               packaged bucket stays private (no anonymous read).
+        //   - public -> advertise the CMAF manifest URLs recorded on the asset,
+        //               resolved to the public-facing MinIO/CDN origin at read
+        //               time (issue #200); a missing/invalid public origin is
+        //               surfaced as an explicit 501, not a relative/internal path.
         if (deliveryMode() === 'proxy') {
           const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
           return reply.code(200).send({
@@ -1417,8 +1465,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         }
       }
 
-      // Fallback: presigned download of the raw source object.
+      // Fallback: the raw source object. For an external source backend emit a
+      // public/derived object URL (never credential-bearing) against the source
+      // public base. For the MinIO backend keep the presigned-GET proxy path,
+      // which requires object storage to be configured.
       if (asset.objectKey) {
+        if (sourceBase) {
+          const source = externalObjectUrl(sourceBase, asset.objectKey);
+          return reply.code(200).send({ assetId: asset.id, urls: { source }, expiresAt });
+        }
         if (!storageFor) {
           return reply.code(501).send({
             error: 'not_configured',

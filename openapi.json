@@ -75,6 +75,10 @@
                       "sessionToken": {
                         "type": "string",
                         "minLength": 1
+                      },
+                      "publicBaseUrl": {
+                        "type": "string",
+                        "format": "uri"
                       }
                     },
                     "required": [
@@ -110,6 +114,10 @@
                       "sessionToken": {
                         "type": "string",
                         "minLength": 1
+                      },
+                      "publicBaseUrl": {
+                        "type": "string",
+                        "format": "uri"
                       }
                     },
                     "required": [
@@ -287,6 +295,9 @@
                             },
                             "region": {
                               "type": "string"
+                            },
+                            "publicBaseUrl": {
+                              "type": "string"
                             }
                           },
                           "required": [
@@ -312,6 +323,9 @@
                               "type": "string"
                             },
                             "region": {
+                              "type": "string"
+                            },
+                            "publicBaseUrl": {
                               "type": "string"
                             }
                           },
