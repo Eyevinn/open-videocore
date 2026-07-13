@@ -193,6 +193,16 @@ const storedConfigSchema = z.object({
   // validate. Mirrors StackConfig.autoSubtitlesInstanceName/sceneDetectInstanceName.
   autoSubtitlesInstanceName: z.string().optional(),
   sceneDetectInstanceName: z.string().optional(),
+  // Derived, read-only optional-service activation summary (issue #218). Surfaces
+  // which opt-in services a stack has activated as plain booleans so a consumer
+  // does not have to know that activation is signalled by the presence of the
+  // *InstanceName fields above. ADDITIVE + back-compat: this is NOT part of the
+  // stored StackConfig — the GET handler adds it ONLY when at least one optional
+  // service is active, so a config with no optional services serialises exactly
+  // as it was stored (existing GET /:name equality contract is preserved).
+  options: z
+    .object({ autoSubtitles: z.boolean(), sceneDetect: z.boolean() })
+    .optional(),
   // Optional per-role storage backend metadata (issue #211). Absent for configs
   // written before this field existed (both roles then default to MinIO).
   storage: z
@@ -875,7 +885,18 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       if (!config) {
         return reply.code(404).send({ error: `no stored config for stack "${name}"` });
       }
-      return reply.code(200).send(config);
+      // Surface which optional opt-in services are active (issue #218) as a
+      // derived boolean summary. Only attach `options` when at least one is
+      // active so a stack with no optional services serialises exactly as stored
+      // (preserves the GET /:name response-equality contract). The raw
+      // *InstanceName fields are already passed through verbatim above.
+      const autoSubtitles = Boolean(config.autoSubtitlesInstanceName);
+      const sceneDetect = Boolean(config.sceneDetectInstanceName);
+      const withOptions =
+        autoSubtitles || sceneDetect
+          ? { ...config, options: { autoSubtitles, sceneDetect } }
+          : config;
+      return reply.code(200).send(withOptions);
     }
   );
 
@@ -962,10 +983,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
           // Teardown order and the instance set come from what was actually
           // provisioned (the stored services[]), not the static STACK_SERVICES.
+          // Optional opt-in services (issue #218) recorded on the config are
+          // torn down too: their instance names are passed alongside services[]
+          // and deprovisionStackFromConfig merges (and dedupes) them so a stack
+          // that activated auto-subtitles or scene-detect is fully removed.
           const result = await deprovisionStackFromConfig(
             osc,
             name,
-            config.services
+            config.services,
+            {
+              ...(config.autoSubtitlesInstanceName
+                ? { autoSubtitlesInstanceName: config.autoSubtitlesInstanceName }
+                : {}),
+              ...(config.sceneDetectInstanceName
+                ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
+                : {})
+            }
           );
 
           if (result.status === 'failed') {
