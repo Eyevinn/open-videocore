@@ -21,14 +21,28 @@ import {
   InMemoryAssetRepository,
   InvalidReviewTransitionError,
   InvalidStateTransitionError,
+  MAX_LIMIT,
   ParentNotFoundError,
   isUlid,
   normalizeTags,
   SUBTITLE_FORMATS,
+  type Asset,
   type AssetAudioTrack,
   type AssetRepository,
   type SubtitleTrack
 } from '../data/asset-repo.js';
+// TAMS validation primitives (ADR-008, issue #165). Reused, NOT re-declared, so
+// the lookup query grammar stays 1:1 with the persisted asset-document grammar.
+import { TamsFlowIdSchema, TamsTimerangeSchema } from '../data/asset-document.js';
+// TAMS-address query contract (ADR-010, issue #174). #175 is the handler the
+// contract module was written for — it consumes the contract's mode resolver
+// and error taxonomy rather than re-deriving them, so ADR-010 stays the single
+// source of truth for the addressing grammar and the error->status map.
+import {
+  resolveTamsQueryMode,
+  TamsQueryError,
+  type TamsQueryAddress
+} from '../tams/tams-query-contract.js';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -38,6 +52,10 @@ import {
   deliveryUrlTtlSeconds,
 } from '../data/storage.js';
 import { parseSource, assertPublicHost, SourceValidationError } from '../pipeline/source.js';
+import {
+  resolvePublicManifestUrl,
+  PublicManifestBaseUrlError
+} from '../pipeline/packaging.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
 import {
   extractTechnicalMetadata,
@@ -164,6 +182,38 @@ const listQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).optional(),
   status: statusSchema.optional(),
   parentId: z.string().min(1).optional()
+});
+
+// TAMS-addressed lookup query params (issue #175, sub-task of #116; contract
+// ADR-010 / #174). The v1 addressing surface has exactly two modes, both keyed
+// on a TAMS flow id:
+//   (1) flowId            -> `?tamsFlowId=<uuid>`
+//   (2) flowId + timerange -> `?tamsFlowId=<uuid>&tamsTimerange=<tai>`
+// No other v1 modes (source-id / segment-ref / bare-timerange are deferred).
+// The two field schemas are REUSED from asset-document.ts (TamsFlowIdSchema is a
+// UUID; TamsTimerangeSchema is the ADR-008 TAI grammar) so this route's accepted
+// grammar is identical to the persisted grammar — no regex is re-declared here.
+// A malformed value fails validation at the boundary and Fastify returns 400,
+// which satisfies the contract's "malformed param -> 400" case.
+//
+// WIRE NAMES vs CONTRACT NAMES: the wire params are `tamsFlowId` / `tamsTimerange`
+// (the `tams`-prefixed names that match the #168 search-index fields and the
+// OpenAPI surface in #176). The ADR-010 contract (`tams-query-contract.ts`)
+// names the same values `flowId` / `timerange`. The handler maps wire -> contract
+// before calling `resolveTamsQueryMode`, so the contract stays authoritative for
+// mode selection and the error taxonomy while the public wire surface keeps its
+// `tams`-prefixed names. (Unifying the two spellings would require editing either
+// this route's test or the merged #174 contract test — deferred, see PR note.)
+const tamsLookupQuerySchema = z.object({
+  tamsFlowId: TamsFlowIdSchema.describe(
+    'TAMS flow id (UUID) to resolve. Addressing mode (1): supplying only ' +
+      'tamsFlowId resolves the ready asset carrying this flow. Required.'
+  ),
+  tamsTimerange: TamsTimerangeSchema.optional().describe(
+    'TAMS TAI timerange (ADR-008 grammar, e.g. [0:0_10:0)). Addressing mode ' +
+      '(2): supplying tamsFlowId + tamsTimerange additionally requires an exact ' +
+      'stored-timerange match. Optional.'
+  )
 });
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -519,9 +569,50 @@ const pipelineExecutionSchema = z.object({
   pipelineName: z.string(),
   status: z.enum(['running', 'done', 'failed']),
   steps: z.array(stepExecutionSchema),
+  // Per-execution destination override actually used (issue #207). Absent when
+  // the caller relied on the provisioned instance-level default.
+  destinationBucket: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
+
+// Optional per-execution destination override (issue #207).
+//
+// Accepts either an `s3://bucket/prefix/` URI or a plain `bucket/prefix/` path
+// identifier — #208 later consumes it as the packager's OutputFolder for
+// post-package relocation. The packager produces malformed S3 URIs when the
+// output folder lacks a trailing slash (OSC packager contract, finding #3), so
+// this schema NORMALIZES a trailing slash on and validates the shape at the
+// edge, rejecting malformed values with a 400 before anything is persisted.
+//
+// Rejected: empty / whitespace, values with control characters, wildcards, `..`
+// path traversal, backslashes, or a `scheme://` other than `s3://`.
+const destinationBucketSchema = z
+  .string()
+  .trim()
+  .min(1, 'destinationBucket must not be empty')
+  .max(1024, 'destinationBucket is too long')
+  .refine((v) => !/\s/.test(v), {
+    message: 'destinationBucket must not contain whitespace'
+  })
+  .refine((v) => ![...v].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f), {
+    message: 'destinationBucket must not contain control characters'
+  })
+  .refine((v) => !v.includes('\\') && !v.includes('*') && !v.includes('?'), {
+    message: 'destinationBucket must not contain backslashes or wildcards'
+  })
+  .refine((v) => !/(^|\/)\.\.(\/|$)/.test(v), {
+    message: 'destinationBucket must not contain path traversal segments'
+  })
+  .refine((v) => !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v) || v.startsWith('s3://'), {
+    message: 'destinationBucket must be a plain path or an s3:// URI'
+  })
+  .refine((v) => (v.startsWith('s3://') ? v.length > 's3://'.length : true), {
+    message: 'destinationBucket s3:// URI must include a bucket'
+  })
+  // Normalize: collapse duplicate trailing slashes to exactly one so the
+  // packager always receives a well-formed folder (never a bare object key).
+  .transform((v) => v.replace(/\/+$/, '') + '/');
 
 // Asset comments (issue #135). Free-text `body` only for this iteration; the
 // naming mirrors the Comment model in src/data/comment-repo.ts. The trailing
@@ -709,8 +800,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // auto-subtitles service or object storage is not configured — consistent with
   // the OPTIONAL, opt-in nature of the step. Returns true when a generation was
   // actually kicked off (false = skipped gracefully).
-  function triggerSubtitles(assetId: string, objectKey: string): boolean {
-    if (!opts.subtitleGenerator || !storageFor) {
+  function triggerSubtitles(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+    // Activation is derived from the ACTIVE stack record (issue #217): the
+    // resolver builds the generator from StackConfig.autoSubtitlesInstanceName
+    // and exposes it on request.connections, so a freshly provisioned service is
+    // picked up on the next run with no restart. An injected opts.subtitle
+    // Generator (tests) still wins. Absent => skip gracefully (fire-and-forget).
+    const generate = opts.subtitleGenerator ?? request.connections?.subtitleGenerator;
+    if (!generate || !storageFor) {
       return false;
     }
     void subtitleRunner(
@@ -718,7 +815,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       {
         assets: repo,
         storage: storageFor(),
-        generate: opts.subtitleGenerator,
+        generate,
         ...opts.subtitleDeps
       }
     );
@@ -731,8 +828,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // eyevinn-function-scenes service or object storage is not configured —
   // consistent with the OPTIONAL, opt-in nature of the step. Returns true when a
   // detection was actually kicked off (false = skipped gracefully).
-  function triggerSceneDetect(assetId: string, objectKey: string): boolean {
-    if (!opts.sceneDetector || !storageFor) {
+  function triggerSceneDetect(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+    // Activation is derived from the ACTIVE stack record (issue #217): the
+    // resolver builds the detector from StackConfig.sceneDetectInstanceName and
+    // exposes it on request.connections, so a freshly provisioned service is
+    // picked up on the next run with no restart. An injected opts.sceneDetector
+    // (tests) still wins. Absent => skip gracefully (fire-and-forget).
+    const detect = opts.sceneDetector ?? request.connections?.sceneDetector;
+    if (!detect || !storageFor) {
       return false;
     }
     void sceneDetectRunner(
@@ -740,7 +843,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       {
         assets: repo,
         storage: storageFor(),
-        detect: opts.sceneDetector,
+        detect,
         ...opts.sceneDetectDeps
       }
     );
@@ -781,7 +884,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
     reply: import('fastify').FastifyReply,
-    encodeOpts?: { profile?: string; customProfile?: EncoreProfile }
+    encodeOpts?: { profile?: string; customProfile?: EncoreProfile },
+    // Optional per-execution destination override (issue #207). Already
+    // validated + trailing-slash-normalized by the edge schema. Persisted on the
+    // execution record so #208 (packager relocation) and #210 (delivery) can
+    // resolve the destination actually used. When undefined, later stages fall
+    // back to the provisioned instance-level default (backwards compatible).
+    destinationBucket?: string
   ): Promise<import('../data/pipeline-repo.js').PipelineExecution | undefined> {
     const pipelineRepo = opts.pipelineRepository;
     if (!pipelineRepo) {
@@ -827,7 +936,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
 
     void firstStep; // pre-flight above used firstStep; execution drives the loop
-    const execution = await pipelineRepo.create({ assetId: asset.id, pipelineName, steps });
+    const execution = await pipelineRepo.create({
+      assetId: asset.id,
+      pipelineName,
+      steps,
+      ...(destinationBucket !== undefined ? { destinationBucket } : {})
+    });
     const now = () => new Date().toISOString();
     const stepsCopy: StepExecution[] = execution.steps.map((s) => ({ ...s }));
 
@@ -852,7 +966,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // gracefully when unconfigured) and settle the step immediately. The
           // generator records its own success/failure on the asset and never
           // throws into this loop, so the step never fails the pipeline.
-          triggerSubtitles(asset.id, asset.objectKey as string);
+          triggerSubtitles(asset.id, asset.objectKey as string, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -861,7 +975,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // skip gracefully when unconfigured) and settle the step immediately. The
           // detector records its own success/failure on the asset and never throws
           // into this loop, so the step never fails the pipeline.
-          triggerSceneDetect(asset.id, asset.objectKey as string);
+          triggerSceneDetect(asset.id, asset.objectKey as string, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -1039,6 +1153,125 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // TAMS-addressed lookup resolution (issue #175). Resolves a TAMS flow id (and,
+  // optionally, a TAI timerange) to AT MOST ONE ready asset, per the ADR-010 /
+  // #174 contract cardinality:
+  //   - flowId            -> the single asset whose `tamsFlowIds` INCLUDES it.
+  //   - flowId + timerange -> that same asset, additionally requiring its stored
+  //     `tamsTimerange` to equal the requested one (v1: exact match; overlap /
+  //     containment slicing is deferred).
+  //
+  // RESOLUTION SOURCE (temporary): the #168 TAMS search index is not on main yet,
+  // so this scans the asset REPOSITORY client-side — it pages through the READY
+  // assets via `repo.list` (limit/offset up to `total`) and selects the match.
+  // -------------------------------------------------------------------------
+  // TODO(#168): when the TAMS search index lands, replace this client-side scan
+  // with the indexed `tamsFlowId` search query for efficiency (O(1) index hit
+  // instead of a full ready-asset page walk). Do NOT widen `ListOptions` here —
+  // that field belongs to #168 and adding it now would collide.
+  // -------------------------------------------------------------------------
+  // Returns:
+  //   - the resolved asset when exactly one matches,
+  //   - undefined when none matches (unknown / not-yet-indexed / timerange miss),
+  //   - the sentinel 'ambiguous' when more than one ready asset carries the flow
+  //     (unreachable in v1 since a flow id is deterministic per asset, but the
+  //     contract reserves 409 for it, so it is mapped rather than swallowed).
+  async function resolveByTamsAddress(
+    tamsFlowId: string,
+    tamsTimerange: string | undefined
+  ): Promise<Asset | undefined | 'ambiguous'> {
+    const matches: Asset[] = [];
+    // Only READY assets are addressable (uploading/processing/failed/archived are
+    // not resolvable media). Page through them with the shared list contract.
+    let offset = 0;
+    // Guard against an unbounded loop if `total` ever misbehaves.
+    for (;;) {
+      const page = await repo.list({ status: 'ready', limit: MAX_LIMIT, offset });
+      for (const asset of page.items) {
+        if (!asset.tamsFlowIds?.includes(tamsFlowId)) {
+          continue;
+        }
+        // flowId + timerange mode: additionally require an exact stored-timerange
+        // match (v1 keeps it simple — no partial/overlap slicing yet).
+        if (tamsTimerange !== undefined && asset.tamsTimerange !== tamsTimerange) {
+          continue;
+        }
+        matches.push(asset);
+        if (matches.length > 1) {
+          return 'ambiguous';
+        }
+      }
+      offset += page.limit;
+      if (offset >= page.total || page.items.length === 0) {
+        break;
+      }
+    }
+    return matches[0];
+  }
+
+  // TAMS-addressed lookup route (issue #175, contract ADR-010 / #174).
+  //
+  // A DEDICATED route (not an overload of `GET /`), because its single-match,
+  // 404-on-unknown semantics differ from list semantics. Registered BEFORE the
+  // `/:id` param route so the static `/by-tams-address` segment is never shadowed
+  // by the param (Fastify's radix router prefers the static segment, and the
+  // registration order makes that explicit).
+  //
+  // Cardinality/pagination: returns a `ListResult`-shaped envelope
+  // (`{ items, limit, offset, total }`) for forward-compatibility even though v1
+  // resolves to at most one asset.
+  //
+  // Error -> status mapping (per contract):
+  //   - malformed `tamsFlowId` (bad UUID) / `tamsTimerange` (bad TAI) -> 400
+  //     (enforced by `tamsLookupQuerySchema` validation before the handler runs).
+  //   - unknown address (well-formed but no ready asset carries the flow) -> 404.
+  //   - not-yet-indexed -> collapses to 404 (indistinguishable from unknown here).
+  //   - ambiguous -> 409 (reserved; unreachable in v1 but mapped, not swallowed).
+  app.get(
+    '/by-tams-address',
+    {
+      schema: {
+        querystring: tamsLookupQuerySchema,
+        response: { 200: listSchema, 400: errorSchema, 404: errorSchema, 409: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { tamsFlowId, tamsTimerange } = request.query;
+      // Resolve the addressing MODE through the ADR-010 contract rather than
+      // re-deriving it here. Map the wire params onto the contract's grammar and
+      // let `resolveTamsQueryMode` narrow to a typed `flowId` / `flowIdWithTimerange`
+      // address. Fastify's querystring validation already rejects malformed input
+      // with 400 before this runs, so the catch is defensive (kept so the contract
+      // grammar stays authoritative even if the wire schema and contract drift).
+      let addr: TamsQueryAddress;
+      try {
+        addr = resolveTamsQueryMode({ flowId: tamsFlowId, timerange: tamsTimerange });
+      } catch {
+        const err = new TamsQueryError('malformed');
+        return reply.code(err.status as 400 | 404 | 409).send({ error: 'invalid_tams_address' });
+      }
+      const timerange = addr.mode === 'flowIdWithTimerange' ? addr.timerange : undefined;
+      const resolved = await resolveByTamsAddress(addr.flowId, timerange);
+      if (resolved === 'ambiguous') {
+        // Contract reserves 409 for ambiguity (unreachable in v1); status comes
+        // from the contract's error->status map via TamsQueryError.
+        const err = new TamsQueryError('ambiguous');
+        return reply.code(err.status as 400 | 404 | 409).send({
+          error: 'ambiguous_tams_address',
+          message: `TAMS flow ${addr.flowId} resolves to more than one asset`
+        });
+      }
+      if (!resolved) {
+        // unknown OR not-yet-indexed OR timerange miss all collapse to 404 per
+        // the contract taxonomy (both `unknown` and `notYetIndexed` map to 404).
+        const err = new TamsQueryError('unknown');
+        return reply.code(err.status as 400 | 404 | 409).send({ error: 'not_found' });
+      }
+      // Forward-compat paginated envelope even though v1 is single-match.
+      return reply.code(200).send({ items: [resolved], limit: MAX_LIMIT, offset: 0, total: 1 });
+    }
+  );
+
   // Resolve a path `:id` that may be either the ULID id or the human-readable
   // slug (issue #132), scoped to the caller's workspace. A value shaped like a
   // ULID resolves by id; otherwise (or when the id lookup misses) it falls back
@@ -1132,7 +1365,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const ttl = deliveryUrlTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
-      // Preferred: packaged streaming manifests (issue #9 / #201).
+      // Preferred: packaged streaming manifests (issue #9 / #200 / #201).
       //
       // PRECEDENCE (issue #201): the delivery mode is a single mutually-exclusive
       // config flag (DELIVERY_MODE), never both at once:
@@ -1142,8 +1375,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       //               advertise proxy URLs whenever the asset has ANY packaged
       //               output (the presence of stored manifestUrls signals that
       //               packaging completed); the stored public URLs are ignored.
-      //   - public -> advertise the already-public CMAF manifest URLs recorded
-      //               on the asset (the pre-existing behaviour).
+      //   - public -> advertise the CMAF manifest URLs recorded on the asset,
+      //               resolved to the public-facing MinIO/CDN origin at read time
+      //               (issue #200). Stored URLs may be built from a
+      //               relative/internal packaged base (see packagingPublicBaseUrl),
+      //               so a missing/invalid public origin is surfaced as an explicit
+      //               501, not a silently returned relative/internal path.
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
         if (deliveryMode() === 'proxy') {
           const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
@@ -1157,11 +1394,27 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             expiresAt
           });
         }
-        return reply.code(200).send({
-          assetId: asset.id,
-          urls: { hls: asset.manifestUrls.hls, dash: asset.manifestUrls.dash },
-          expiresAt
-        });
+        try {
+          const hls = asset.manifestUrls.hls
+            ? resolvePublicManifestUrl(asset.manifestUrls.hls)
+            : undefined;
+          const dash = asset.manifestUrls.dash
+            ? resolvePublicManifestUrl(asset.manifestUrls.dash)
+            : undefined;
+          return reply.code(200).send({
+            assetId: asset.id,
+            urls: { hls, dash },
+            expiresAt
+          });
+        } catch (err) {
+          if (err instanceof PublicManifestBaseUrlError) {
+            return reply.code(501).send({
+              error: 'not_configured',
+              message: err.message
+            });
+          }
+          throw err;
+        }
       }
 
       // Fallback: presigned download of the raw source object.
@@ -1577,7 +1830,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: z.object({
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
           profile: z.string().min(1).optional(),
-          customProfile: customProfileSchema.optional()
+          customProfile: customProfileSchema.optional(),
+          // Optional per-execution destination override (issue #207). Validated
+          // and trailing-slash-normalized at the edge; persisted on the
+          // execution record for #208 (packager relocation) / #210 (delivery).
+          destinationBucket: destinationBucketSchema.optional()
         }),
         response: {
           202: pipelineExecutionSchema,
@@ -1601,7 +1858,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
         request,
         reply,
-        { profile: request.body.profile, customProfile: request.body.customProfile as EncoreProfile | undefined }
+        { profile: request.body.profile, customProfile: request.body.customProfile as EncoreProfile | undefined },
+        request.body.destinationBucket
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);
