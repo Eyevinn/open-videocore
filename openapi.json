@@ -250,6 +250,22 @@
                     "sceneDetectInstanceName": {
                       "type": "string"
                     },
+                    "options": {
+                      "type": "object",
+                      "properties": {
+                        "autoSubtitles": {
+                          "type": "boolean"
+                        },
+                        "sceneDetect": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "autoSubtitles",
+                        "sceneDetect"
+                      ],
+                      "additionalProperties": false
+                    },
                     "storage": {
                       "type": "object",
                       "properties": {
