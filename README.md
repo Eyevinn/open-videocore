@@ -70,7 +70,7 @@ The agent provisions the instance and returns its public URL — `https://<your-
 
 ### 4. Provision a media stack
 
-A single API call stands up the backing infrastructure for a workspace — MinIO, CouchDB, Valkey, and a packager. Encore instances are not created here; the auto-scaler spins them up on demand when the first jobs arrive.
+A single API call stands up the backing infrastructure for a workspace — MinIO, CouchDB, and Valkey. Neither Encore nor the packager is created here; the Encore auto-scaler spins Encore instances up on demand when the first transcode jobs arrive, and the packager is provisioned on demand the first time a packaging job runs (see below).
 
 ```bash
 curl -X POST https://<your-instance>/api/v1/provision \
@@ -84,6 +84,13 @@ Provisioning is asynchronous. Poll the returned `operationId` until `status` rea
 curl https://<your-instance>/api/v1/provision/operations/<operationId>
 ```
 
+By default the stack provisions its own MinIO instance and buckets — no storage
+configuration is required. To point the source and/or packaged-output roles at
+an existing AWS-region or S3-compatible bucket instead, pass the optional
+`sourceStorage` / `packagedStorage` blocks. See
+[Provisioning with external S3-compatible storage](docs/guides/provisioning-external-storage.md)
+for every field, worked examples, and the CDN-origin pattern.
+
 List, inspect, and tear down stacks:
 
 ```bash
@@ -91,6 +98,16 @@ curl https://<your-instance>/api/v1/provision
 curl https://<your-instance>/api/v1/provision/mystack
 curl -X DELETE https://<your-instance>/api/v1/provision/mystack
 ```
+
+#### On-demand packaging provisioning
+
+The packaging service (`eyevinn-encore-packager`) is **not** provisioned when you provision a stack. It is provisioned **lazily**, on the first pipeline execution that includes a packaging step, wired to the stack's shared Valkey queue and packaged-output storage, and reused by every subsequent packaging execution. It is torn down automatically when you deprovision the stack (`DELETE /api/v1/provision/:name`).
+
+Operator-visible trade-offs:
+
+- **Lower provision-time footprint.** A freshly provisioned stack creates three OSC instances (MinIO, CouchDB, Valkey) instead of four, and mints **no** packager secrets or tokens until packaging is actually used. Stacks that never package never pay for a packager.
+- **First-run cold start.** The **first** packaging execution on a stack incurs additional latency while the packager instance is created and becomes ready (the create call plus a wait-for-ready gate — the packaging job is only enqueued once the packager reports healthy). Every subsequent packaging execution reuses the running instance and does not pay this cost.
+- **No pre-warm option.** There is currently no API or configuration flag to pre-warm the packager ahead of the first packaging job — the cold start happens on first use by design. If you need to absorb the cold start before a time-sensitive workload, run one throwaway packaging execution first to leave the packager running for the stack. (Idle teardown of the packager is a noted follow-up and is not yet implemented, so a warmed packager stays up until the stack is deprovisioned.)
 
 ### 5. Bootstrap transcoding profiles
 
@@ -274,7 +291,7 @@ Open Videocore runs as an OSC service and composes other OSC services at runtime
 |---|---|
 | `encore` | ABR transcoding. Instances are pooled and scaled on demand by the built-in Encore auto-scaler (spins up under load, tears down when idle) |
 | `eyevinn-encore-callback-listener` | Bridges Encore callbacks onto the queue — one dedicated listener is paired with each Encore instance the auto-scaler starts |
-| `eyevinn-encore-packager` | HLS/DASH packaging |
+| `eyevinn-encore-packager` | HLS/DASH packaging. Provisioned on demand on the first packaging execution (not at stack-provision time) and torn down on stack deprovision |
 | `valkey-io-valkey` | Queue and coordination backbone |
 | `minio-minio` | S3-compatible object storage |
 | `apache-couchdb` | Asset metadata document store |
