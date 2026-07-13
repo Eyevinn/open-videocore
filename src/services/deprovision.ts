@@ -3,7 +3,13 @@ import {
   getInstance,
   removeInstance
 } from '@osaas/client-core';
-import { STACK_SERVICES, TEARDOWN_ORDER, type StackService } from './stack.js';
+import {
+  AUTO_SUBTITLES_SERVICE_ID,
+  SCENE_DETECT_SERVICE_ID,
+  STACK_SERVICES,
+  TEARDOWN_ORDER,
+  type StackService
+} from './stack.js';
 
 // A stored service entry as persisted in the parameter store (StackConfig
 // .services[]). Carries the serviceId and the instance name actually
@@ -141,19 +147,87 @@ export async function deprovisionStack(
   return aggregate(name, services);
 }
 
+// The OPTIONAL, opt-in service instances a stack may have activated (issue #215
+// data model; #218 teardown/report). These are long-lived services that are NOT
+// part of STACK_SERVICES (they are provisioned on their own) but are recorded on
+// the stored config so whole-stack teardown can remove them too.
+//   autoSubtitlesInstanceName → eyevinn-auto-subtitles (AUTO_SUBTITLES_SERVICE_ID)
+//   sceneDetectInstanceName   → eyevinn-function-scenes (SCENE_DETECT_SERVICE_ID)
+export type OptionalStackInstances = {
+  autoSubtitlesInstanceName?: string;
+  sceneDetectInstanceName?: string;
+};
+
+// Map the optional instance-name fields onto StoredService entries so they can
+// be enumerated for teardown alongside the core services[]. Only fields that
+// carry a non-empty instance name yield an entry — an inactive optional service
+// contributes nothing. The serviceIds are NOT in TEARDOWN_ORDER, so
+// orderStoredServices places them first (they depend on nothing else in the
+// stack) and resolves their role to 'unknown'.
+function optionalStoredServices(
+  optional: OptionalStackInstances | undefined
+): StoredService[] {
+  if (!optional) return [];
+  const entries: StoredService[] = [];
+  if (
+    typeof optional.autoSubtitlesInstanceName === 'string' &&
+    optional.autoSubtitlesInstanceName.length > 0
+  ) {
+    entries.push({
+      serviceId: AUTO_SUBTITLES_SERVICE_ID,
+      instanceName: optional.autoSubtitlesInstanceName
+    });
+  }
+  if (
+    typeof optional.sceneDetectInstanceName === 'string' &&
+    optional.sceneDetectInstanceName.length > 0
+  ) {
+    entries.push({
+      serviceId: SCENE_DETECT_SERVICE_ID,
+      instanceName: optional.sceneDetectInstanceName
+    });
+  }
+  return entries;
+}
+
 // Tear down a stack using the service list recorded in the parameter store
 // (issue #29). The stored list is the source of truth for what was actually
 // provisioned, so teardown removes exactly those instances — even if
 // STACK_SERVICES has since changed. Each entry carries its own instanceName.
 // Same idempotency and partial-failure semantics as deprovisionStack.
+//
+// Optional opt-in services (issue #218) are merged in from `optional`: when a
+// stack activated auto-subtitles or scene-detect their instances are removed
+// alongside the core services. Entries are deduped by serviceId+instanceName so
+// an optional instance that was ALSO recorded in `stored` (a #216 provision that
+// pushed it onto services[]) is torn down exactly once. Optional services depend
+// on nothing else in the stack, so they are ordered first (unknown serviceIds
+// sort ahead of the known producers in orderStoredServices) and torn down early.
+// Idempotency is unchanged: a not-found optional instance during a retry reports
+// not_found rather than erroring, so a partial teardown converges on retry.
 export async function deprovisionStackFromConfig(
   osc: Context,
   name: string,
-  stored: readonly StoredService[]
+  stored: readonly StoredService[],
+  optional?: OptionalStackInstances
 ): Promise<StackTeardownResult> {
+  // Merge the optional instances into the stored list, deduped by
+  // serviceId+instanceName so an instance recorded in BOTH places (services[]
+  // and an optional field) is not enumerated — and thus not torn down — twice.
+  const seen = new Set(
+    stored.map((s) => `${s.serviceId} ${s.instanceName}`)
+  );
+  const merged: StoredService[] = [...stored];
+  for (const entry of optionalStoredServices(optional)) {
+    const dedupeKey = `${entry.serviceId} ${entry.instanceName}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    merged.push(entry);
+  }
+
   const services: ServiceTeardownResult[] = [];
 
-  for (const { service, instanceName } of orderStoredServices(stored)) {
+  for (const { service, instanceName } of orderStoredServices(merged)) {
     services.push(await teardownService(osc, service, instanceName));
   }
 
