@@ -13,6 +13,7 @@ import {
   validatorCompiler
 } from 'fastify-type-provider-zod';
 import { provisionRouter } from './routes/provision.js';
+import { optionalServicesRouter } from './routes/optional-services.js';
 import { OperationStore } from './services/operation-store.js';
 import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';
 import { assetsRouter } from './routes/assets.js';
@@ -35,6 +36,8 @@ import {
   PerWorkspaceCollectionRepository,
   PerWorkspaceProfileRepository
 } from './data/per-workspace-repos.js';
+import type { AssetRepository } from './data/asset-repo.js';
+import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
@@ -112,6 +115,7 @@ await app.register(fastifySwagger, {
       { name: 'collections', description: 'Named asset groups' },
       { name: 'webhooks', description: 'Event notification registrations' },
       { name: 'provision', description: 'OSC stack provisioning and teardown' },
+      { name: 'optional-services', description: 'Per-optional-service (auto-subtitles, scene-detect) provision, deprovision, and status' },
       { name: 'storage', description: 'Bucket and object-storage management' },
       { name: 'admin', description: 'Operational status and background service control' },
     ],
@@ -239,13 +243,52 @@ await app.register(provisionRouter, {
   getScalerRegistry: () => scalerRegistry
 });
 
+// Per-optional-service provision/deprovision/status endpoints (issue #195).
+// Shared contract for the #187 (auto-subtitles) and #188 (scene-detect)
+// provision cards. Reuses the SAME OperationStore as the whole-stack provision
+// route so 202 operations poll the same GET /api/v1/provision/operations/:id.
+// Status reports the AUTO_SUBTITLES_INSTANCE_NAME / SCENE_DETECT_INSTANCE_NAME
+// env vars (the same source this file reads to wire the pipeline steps above),
+// so a card never disagrees with what the runtime actually discovered.
+await app.register(optionalServicesRouter, {
+  prefix: '/api/v1/optional-services',
+  osc: oscContext,
+  operationStore
+});
+
 // Workspace-scoped resource repositories. These hold NO connection of their
 // own: each delegates to the concrete repository in the stack resolved for the
 // request's workspace (CouchDB-backed when a stack is provisioned, in-memory
 // otherwise — WorkspaceStackResolver decides). The router option interfaces and
 // route handlers are unchanged; only the backing connection is now resolved
 // lazily per workspace at request time instead of as a startup singleton.
-const assetRepository = new PerWorkspaceAssetRepository(stackResolver);
+// Base asset repository. Wrapped below by the TAMS "ready" indexing decorator
+// so no other wiring changes are needed.
+const baseAssetRepository = new PerWorkspaceAssetRepository(stackResolver);
+
+// TAMS "ready"-transition indexing trigger (issue #172, epic #116). SINGLE
+// chokepoint: `withTamsReadyIndexing` decorates the asset repository so every
+// `update()` that transitions an asset INTO `ready` fires the injected indexer
+// once — covering all four pipeline call sites (metadata-extractor, transcode,
+// clip, rewrap) without editing any of them (see src/tams/tams-ready-hook.ts
+// for the trigger-mechanism justification: an inline transition hook, since the
+// ADR-005 CouchDB `_changes` projector does not exist — issue #168).
+//
+// Decoupling: the concrete single-asset index-write path (#170) and the shared
+// config gate (#171) are not yet on main, so we import NEITHER here. The indexer
+// is INJECTED. Until #170 lands there is no concrete indexer to inject, so
+// `tamsIndexer` is undefined and the repository is left unwrapped (indexing is a
+// no-op). When #170 provides `(asset) => Promise<void>`, assign it here and the
+// decorator activates. The config gate is the inline ADR-009 `TAMS_STORE_URL`
+// check inside the hook; #171 will supply the shared gate.
+const tamsIndexer: AssetIndexer | undefined = undefined;
+const assetRepository: AssetRepository = tamsIndexer
+  ? withTamsReadyIndexing(baseAssetRepository, { indexer: tamsIndexer, log: app.log })
+  : baseAssetRepository;
+if (tamsIndexer && !isTamsConfigured()) {
+  app.log.info('TAMS_STORE_URL not set — TAMS ready-transition indexing disabled (config-gated)');
+}
+
 const jobRepository = new PerWorkspaceJobRepository(stackResolver);
 const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);

@@ -11,7 +11,8 @@
     "start": "node --env-file-if-exists=.env dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "generate:openapi": "bash scripts/generate-openapi.sh"
+    "generate:openapi": "bash scripts/generate-openapi.sh",
+    "tams:backfill": "tsx scripts/tams-backfill.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.2",
