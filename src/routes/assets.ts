@@ -68,6 +68,12 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
+import {
+  deliveryMode,
+  outputPrefix,
+  packagedBucket,
+  proxyManifestUrlsFor
+} from '../pipeline/packaging.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -584,6 +590,49 @@ function parseS3Uri(uri: string): { bucket: string; key: string } | null {
   return { bucket: match[1], key: match[2] };
 }
 
+// The publicly reachable origin of THIS API up to (and including) the assets
+// router mount point, e.g. `https://api.example/api/v1/assets`. Used to build
+// proxy delivery URLs (issue #201). Prefers the configured PUBLIC_BASE_URL
+// (12-factor, mirrors how main.ts reads it) joined to the router's own request
+// prefix; falls back to a same-origin relative path derived from the incoming
+// request when PUBLIC_BASE_URL is unset (local dev without a tunnel). In both
+// cases the returned value is the base that `<assetId>/stream/...` is appended
+// to, so a manifest's relative segment references resolve back through the proxy.
+function assetsBaseUrl(requestUrl: string): string {
+  // requestUrl is the full mounted path, e.g. `/api/v1/assets/<id>/delivery`.
+  // Strip the query and the trailing `/<id>/delivery` (or any `/<id>/...`) to
+  // recover the router prefix (`/api/v1/assets`).
+  const pathOnly = requestUrl.split('?')[0];
+  const prefix = pathOnly.replace(/\/[^/]+\/[^/]+\/?$/, '');
+  const configured = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
+  if (configured) {
+    return `${configured}${prefix}`;
+  }
+  return prefix;
+}
+
+// Content-Type for a packaged object served through the proxy route (issue
+// #201), inferred from its extension. Covers the CMAF/HLS/DASH file types the
+// packager emits; unknown types fall back to a generic binary stream so the
+// player still receives the bytes.
+function contentTypeForPackagedObject(relativePath: string): string {
+  const lower = relativePath.toLowerCase();
+  if (lower.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
+  if (lower.endsWith('.mpd')) return 'application/dash+xml';
+  if (
+    lower.endsWith('.m4s') ||
+    lower.endsWith('.mp4') ||
+    lower.endsWith('.cmfv') ||
+    lower.endsWith('.cmfa') ||
+    lower.endsWith('.cmft')
+  ) {
+    return 'video/mp4';
+  }
+  if (lower.endsWith('.ts')) return 'video/mp2t';
+  if (lower.endsWith('.vtt')) return 'text/vtt';
+  return 'application/octet-stream';
+}
+
 function fileNameFromKey(key: string): string {
   const trimmed = key.replace(/\/+$/, '');
   const segment = trimmed.slice(trimmed.lastIndexOf('/') + 1);
@@ -1083,8 +1132,31 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const ttl = deliveryUrlTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
-      // Preferred: packaged streaming manifests (issue #9). Already public URLs.
+      // Preferred: packaged streaming manifests (issue #9 / #201).
+      //
+      // PRECEDENCE (issue #201): the delivery mode is a single mutually-exclusive
+      // config flag (DELIVERY_MODE), never both at once:
+      //   - proxy  -> advertise proxy URLs that stream packaged objects back
+      //               through the authorized `/:id/stream/*` route below. The
+      //               packaged bucket stays private (no anonymous read). We
+      //               advertise proxy URLs whenever the asset has ANY packaged
+      //               output (the presence of stored manifestUrls signals that
+      //               packaging completed); the stored public URLs are ignored.
+      //   - public -> advertise the already-public CMAF manifest URLs recorded
+      //               on the asset (the pre-existing behaviour).
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
+        if (deliveryMode() === 'proxy') {
+          const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
+          return reply.code(200).send({
+            assetId: asset.id,
+            // Only advertise a proxy URL for a format the asset actually produced.
+            urls: {
+              hls: asset.manifestUrls.hls ? proxied.hls : undefined,
+              dash: asset.manifestUrls.dash ? proxied.dash : undefined
+            },
+            expiresAt
+          });
+        }
         return reply.code(200).send({
           assetId: asset.id,
           urls: { hls: asset.manifestUrls.hls, dash: asset.manifestUrls.dash },
@@ -1109,6 +1181,74 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         error: 'no_delivery',
         message: 'asset has no packaged output or stored source object to deliver'
       });
+    }
+  );
+
+  // Proxy delivery of packaged output (issue #201). The alternative to the
+  // anonymous-public bucket: instead of exposing the packaged bucket for
+  // anonymous GET, packaged objects (manifests + CMAF segments) are streamed
+  // back through THIS authorized route, so the bucket stays private (desirable
+  // for multi-tenant deployments). `GET /:id/delivery` advertises these URLs
+  // when DELIVERY_MODE=proxy; a player fetches the manifest here and, because
+  // manifest segment references are relative, resolves each segment back through
+  // this same prefix (`.../:id/stream/<relative>`).
+  //
+  // The wildcard `*` is the object path RELATIVE to the asset's packaged prefix
+  // (e.g. `index.m3u8`, `manifest.mpd`, `seg-00001.m4s`). It maps to the key
+  // `outputPrefix(assetId)/<relative>` inside the PACKAGED bucket. The SOURCE
+  // bucket is never touched here — only packaged output is proxied.
+  //   200 — object stream
+  //   404 — unknown asset, or the packaged object does not exist
+  //   501 — object storage is not configured here
+  app.get(
+    '/:id/stream/*',
+    {
+      schema: { params: z.object({ id: z.string(), '*': z.string() }) }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      const storageClient = request.connections?.storageClient;
+      if (!storageClient) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured'
+        });
+      }
+
+      // Reject empty / traversal paths early; WorkspaceStorage.scopedKey also
+      // rejects `..`, but returning a clean 404 avoids leaking a 500.
+      const relative = request.params['*'].replace(/^\/+/, '');
+      if (relative.length === 0 || relative.includes('..')) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      // Bind storage to the private PACKAGED bucket (mirrors the /:id/files
+      // rendition handling, which builds a WorkspaceStorage per target bucket).
+      const bucket = request.connections?.packagedBucket ?? packagedBucket();
+      const packagedStorage = new WorkspaceStorage(storageClient, bucket);
+      const objectKey = `${outputPrefix(asset.id)}/${relative}`;
+
+      let stream: Awaited<ReturnType<WorkspaceStorage['getObject']>>;
+      try {
+        stream = await packagedStorage.getObject(objectKey);
+      } catch (err) {
+        if ((err as { code?: string }).code === 'NoSuchKey' || (err as { code?: string }).code === 'NotFound') {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+        throw err;
+      }
+
+      return reply
+        .header('Content-Type', contentTypeForPackagedObject(relative))
+        // Manifests must not be cached long (segments may roll); segments are
+        // immutable so may be cached. Keep it conservative and let a fronting
+        // CDN/proxy override if desired.
+        .header('Cache-Control', 'no-cache')
+        .send(stream);
     }
   );
 
