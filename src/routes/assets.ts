@@ -69,6 +69,10 @@ import {
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
+import {
+  manifestUrlsForLocation,
+  packagedPublicOrigin
+} from '../pipeline/packaging.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -645,6 +649,28 @@ function formatFromKey(key: string): string {
   return name.slice(dot + 1).toLowerCase();
 }
 
+// Find the resolved output location of the most recent pipeline execution that
+// relocated this asset's packaged output to a per-execution destination override
+// (issue #208/#210). Reuses the same `listByAsset` lookup the pipeline routes
+// use (assets.ts /:id/executions), which returns executions ascending by
+// createdAt; we scan from newest to oldest and return the first
+// `resolvedOutputLocation` we find. Returns undefined when no execution
+// relocated (no override was used), in which case delivery falls back to the
+// instance-default manifest URLs (existing behaviour unchanged).
+async function latestRelocatedLocation(
+  pipelineRepository: PipelineRepository,
+  assetId: string
+): Promise<{ bucket: string; prefix: string } | undefined> {
+  const executions = await pipelineRepository.listByAsset(assetId);
+  for (let i = executions.length - 1; i >= 0; i--) {
+    const loc = executions[i].resolvedOutputLocation;
+    if (loc) {
+      return loc;
+    }
+  }
+  return undefined;
+}
+
 // Derive the object-key prefix backing a streaming package from its manifest
 // URL — the manifest's parent "directory" (e.g.
 // `https://minio/packaged/<id>/hls/master.m3u8` -> `packaged/<id>/hls/`). The
@@ -1185,6 +1211,31 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       // Preferred: packaged streaming manifests (issue #9). Already public URLs.
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
+        // Destination-aware URLs (issue #210). With a per-execution destination
+        // override (#207), the packager's output is relocated (#208) to a
+        // different bucket/prefix and the resolved location is recorded on the
+        // execution as `resolvedOutputLocation`. When present, the delivery URLs
+        // must point at THAT location, not the instance-default one baked into
+        // `asset.manifestUrls`. We reuse the same execution lookup the pipeline
+        // routes use (`listByAsset`) and pick the most recent execution that
+        // actually relocated (has a `resolvedOutputLocation`). When none did,
+        // fall back to the default manifest URLs (existing behaviour unchanged).
+        const relocated = opts.pipelineRepository
+          ? await latestRelocatedLocation(opts.pipelineRepository, asset.id)
+          : undefined;
+        if (relocated) {
+          const urls = manifestUrlsForLocation(relocated, packagedPublicOrigin());
+          return reply.code(200).send({
+            assetId: asset.id,
+            // Keep the same per-manifest presence as the default output: only
+            // advertise the manifests the packaged output actually produced.
+            urls: {
+              ...(asset.manifestUrls.hls ? { hls: urls.hls } : {}),
+              ...(asset.manifestUrls.dash ? { dash: urls.dash } : {})
+            },
+            expiresAt
+          });
+        }
         return reply.code(200).send({
           assetId: asset.id,
           urls: { hls: asset.manifestUrls.hls, dash: asset.manifestUrls.dash },

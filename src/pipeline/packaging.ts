@@ -75,6 +75,53 @@ export function manifestUrlsFor(assetId: string, baseUrl: string): ManifestUrls 
   };
 }
 
+// Build the public manifest URLs for packaged output that was RELOCATED to a
+// per-execution override destination (issue #208/#210). Unlike the default
+// `manifestUrlsFor` (which assumes the provisioned packaged bucket + the
+// deterministic `packaged/<assetId>` prefix), the location here is the resolved
+// `{ bucket, prefix }` the relocation actually copied the CMAF/HLS/DASH objects
+// to (recorded on the execution as `resolvedOutputLocation`). The deterministic
+// manifest filenames are unchanged: relocation mirrors the packaged layout
+// verbatim, so `index.m3u8` (HLS) and `manifest.mpd` (DASH) sit directly under
+// the resolved prefix. `origin` is the same public origin used for the default
+// case (see `packagingPublicBaseUrl`), with the destination bucket + prefix
+// appended so the URL points at the override bucket rather than the default one.
+export function manifestUrlsForLocation(
+  location: { bucket: string; prefix: string },
+  origin: string
+): ManifestUrls {
+  const cleanOrigin = origin.replace(/\/+$/, '');
+  const cleanPrefix = location.prefix.replace(/^\/+|\/+$/g, '');
+  const segments = [cleanOrigin, location.bucket, cleanPrefix].filter(
+    (s) => s.length > 0
+  );
+  const base = segments.join('/');
+  return {
+    hls: `${base}/index.m3u8`,
+    dash: `${base}/manifest.mpd`
+  };
+}
+
+// The public origin the packaged output is served from, WITHOUT the default
+// bucket path segment `manifestUrlsFor`/`packagingPublicBaseUrl` bake in. Used
+// to build URLs for a relocated override destination whose bucket differs from
+// the provisioned packaged bucket (issue #210). When `PACKAGED_PUBLIC_BASE_URL`
+// is set it is the full origin+bucket path (e.g. `https://cdn/packaged`); we
+// strip the trailing default-bucket segment so the override bucket can be
+// substituted. When unset the default base is `/<packagedBucket>`, whose origin
+// is empty (a root-relative reference), matching the default case.
+export function packagedPublicOrigin(): string {
+  const base = packagingPublicBaseUrl().replace(/\/+$/, '');
+  const bucketSuffix = `/${packagedBucket()}`;
+  if (base.endsWith(bucketSuffix)) {
+    return base.slice(0, base.length - bucketSuffix.length);
+  }
+  if (base === packagedBucket() || base === `/${packagedBucket()}`) {
+    return '';
+  }
+  return base;
+}
+
 // The job enqueued onto the Valkey sorted-set queue for the packager to consume.
 // CONTRACT (verified from encore-packager redisListener.ts 2026-07-07):
 //   { jobId: string, url: string }
