@@ -45,6 +45,7 @@ import {
   Context,
   createInstance,
   getInstance,
+  removeInstance,
   saveSecret,
   waitForInstanceReady
 } from '@osaas/client-core';
@@ -135,6 +136,13 @@ export interface PackagerOscApi {
   ): Promise<{ name?: string }>;
   waitForInstanceReady(serviceId: string, name: string): Promise<void>;
   saveSecret(serviceId: string, name: string, value: string): Promise<void>;
+  // removeInstance(ctx, serviceId, name, token) -> Promise<void>
+  // (@osaas/client-core lib/core.d.ts:46). Used by teardownOnDemandPackager.
+  removeInstance(
+    serviceId: string,
+    name: string,
+    token: string
+  ): Promise<void>;
 }
 
 // Adapt an @osaas/client-core Context into the narrow PackagerOscApi. Keeps the
@@ -149,7 +157,9 @@ export function packagerOscApiFromContext(osc: Context): PackagerOscApi {
     waitForInstanceReady: (serviceId, name) =>
       waitForInstanceReady(serviceId, name, osc),
     saveSecret: (serviceId, name, value) =>
-      saveSecret(serviceId, name, value, osc)
+      saveSecret(serviceId, name, value, osc),
+    removeInstance: (serviceId, name, token) =>
+      removeInstance(osc, serviceId, name, token)
   };
 }
 
@@ -301,5 +311,55 @@ export class PackagerEnsureSingleFlight {
     });
     this.inFlight.set(key, promise);
     return promise;
+  }
+}
+
+// Outcome of a teardown attempt (mirrors deprovision.ts TeardownStatus).
+//   removed    — the packager existed and was removed this call
+//   not_found  — no packager existed (never provisioned, or already gone) —
+//                a success from an idempotency standpoint
+//   failed     — the OSC call errored; the operation is safe to retry
+export type PackagerTeardownStatus = 'removed' | 'not_found' | 'failed';
+
+export type PackagerTeardownResult = {
+  serviceId: string;
+  status: PackagerTeardownStatus;
+  error?: string;
+};
+
+// Tear down the on-demand packager for a stack (issue #246).
+//
+// The packager is NOT recorded in StackConfig.services[] (it is provisioned
+// lazily, never persisted there), so the stored-config teardown in
+// deprovision.ts never removes it. This function reconciles against OSC ground
+// truth instead: the packager instance shares the stack name, so it probes
+// getInstance(PACKAGER_SERVICE_ID, stackName) and removes it if present. This is
+// safe whether or not packaging was ever executed — a stack that never packaged
+// has no packager instance and this returns 'not_found' without error. It is
+// idempotent (a retry after removal returns 'not_found') and mirrors the
+// probe-then-remove pattern in services/deprovision.ts:teardownService.
+//
+// Only the getInstance/removeInstance surface of PackagerOscApi is used, so a
+// caller can pass the same packagerOscApiFromContext(osc) adapter used for the
+// ensure path.
+export async function teardownOnDemandPackager(
+  osc: Pick<
+    PackagerOscApi,
+    'getServiceAccessToken' | 'getInstance' | 'removeInstance'
+  >,
+  stackName: string
+): Promise<PackagerTeardownResult> {
+  const serviceId = PACKAGER_SERVICE_ID;
+  try {
+    const sat = await osc.getServiceAccessToken(serviceId);
+    const existing = await osc.getInstance(serviceId, stackName, sat);
+    if (!existing) {
+      return { serviceId, status: 'not_found' };
+    }
+    await osc.removeInstance(serviceId, stackName, sat);
+    return { serviceId, status: 'removed' };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { serviceId, status: 'failed', error: message };
   }
 }

@@ -25,6 +25,10 @@ import {
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { STACK_SERVICES } from '../services/stack.js';
+import {
+  packagerOscApiFromContext,
+  teardownOnDemandPackager
+} from '../services/packager-provisioning.js';
 import type { OperationStore } from '../services/operation-store.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
@@ -748,6 +752,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // keeps store-less deployments working; ownership scoping (#29)
           // requires the store and is exercised on the path below.
           if (!paramStore) {
+            // Tear down any on-demand packager first (consumer before the queue
+            // it consumes), reconciling via introspection (issue #246). Safe
+            // whether or not packaging ever ran: not_found when no packager
+            // exists. A failure is logged but does not abort the static teardown.
+            const packagerTeardown = await teardownOnDemandPackager(
+              packagerOscApiFromContext(osc),
+              name
+            );
+            if (packagerTeardown.status === 'failed') {
+              app.log.error(
+                { packagerTeardown, name },
+                'on-demand packager teardown failed; continuing static teardown'
+              );
+            }
             const result = await deprovisionStack(osc, name);
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
@@ -790,6 +808,27 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 'scaler teardown failed before static-service deprovision; continuing'
               );
             }
+          }
+
+          // Tear down any on-demand packager for this stack (epic #226 / issue
+          // #246). The packager is provisioned lazily and is NOT recorded in
+          // config.services[], so deprovisionStackFromConfig below never removes
+          // it — we reconcile against OSC ground truth here (the packager shares
+          // the stack name). It runs BEFORE the queue teardown below so the
+          // consumer is removed before the Valkey it consumes (consumer-before-
+          // producer, mirroring TEARDOWN_ORDER). Safe whether or not packaging
+          // ever ran: not_found when no packager exists. A failure is logged but
+          // must not abort the static-service teardown that follows (same policy
+          // as the scaler teardown above).
+          const packagerTeardown = await teardownOnDemandPackager(
+            packagerOscApiFromContext(osc),
+            name
+          );
+          if (packagerTeardown.status === 'failed') {
+            app.log.error(
+              { packagerTeardown, name, workspaceId },
+              'on-demand packager teardown failed; continuing static teardown'
+            );
           }
 
           // Teardown order and the instance set come from what was actually
