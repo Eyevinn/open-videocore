@@ -39,6 +39,20 @@ export type PipelineExecution = {
   // back to the provisioned instance-level default. Persisted so the pipeline
   // and delivery endpoint can both resolve the destination actually used.
   destinationBucket?: string;
+  // The canonical location the packaged output actually landed at, resolved
+  // after post-package relocation (issue #208, ADR-011). When a per-execution
+  // `destinationBucket` override is set, PackagingService server-side-copies the
+  // produced CMAF/HLS/DASH objects there and records the resolved
+  // `{bucket, prefix}` here so delivery-URL resolution (issue #210) can read the
+  // location actually used rather than re-deriving it. Absent when no override
+  // was supplied (delivery then falls back to the provisioned default).
+  resolvedOutputLocation?: { bucket: string; prefix: string };
+  // PackagingIds whose post-package relocation has already run (issue #208). The
+  // packager success callback can fire more than once for the same packagingId
+  // (retries, at-least-once callback delivery); recording completed ids here
+  // makes the server-side copy idempotent so a repeat callback neither re-copies
+  // nor double-counts. Absent/empty when no relocation has run.
+  relocatedPackagingIds?: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -53,7 +67,12 @@ export interface PipelineRepository {
   get(id: string): Promise<PipelineExecution | undefined>;
   update(
     id: string,
-    patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
+    patch: Partial<
+      Pick<
+        PipelineExecution,
+        'status' | 'steps' | 'resolvedOutputLocation' | 'relocatedPackagingIds'
+      >
+    >
   ): Promise<PipelineExecution | undefined>;
   listByAsset(assetId: string): Promise<PipelineExecution[]>;
   listAll(opts?: {
@@ -103,7 +122,12 @@ export class InMemoryPipelineRepository implements PipelineRepository {
 
   async update(
     id: string,
-    patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
+    patch: Partial<
+      Pick<
+        PipelineExecution,
+        'status' | 'steps' | 'resolvedOutputLocation' | 'relocatedPackagingIds'
+      >
+    >
   ): Promise<PipelineExecution | undefined> {
     const existing = this.store.get(id);
     if (!existing) {
@@ -113,6 +137,12 @@ export class InMemoryPipelineRepository implements PipelineRepository {
       ...existing,
       ...(patch.status !== undefined ? { status: patch.status } : {}),
       ...(patch.steps !== undefined ? { steps: patch.steps } : {}),
+      ...(patch.resolvedOutputLocation !== undefined
+        ? { resolvedOutputLocation: patch.resolvedOutputLocation }
+        : {}),
+      ...(patch.relocatedPackagingIds !== undefined
+        ? { relocatedPackagingIds: patch.relocatedPackagingIds }
+        : {}),
       updatedAt: new Date().toISOString()
     };
     this.store.set(id, next);
@@ -163,6 +193,12 @@ export class InMemoryPipelineRepository implements PipelineRepository {
 function clone(execution: PipelineExecution): PipelineExecution {
   return {
     ...execution,
-    steps: execution.steps.map((s) => ({ ...s }))
+    steps: execution.steps.map((s) => ({ ...s })),
+    ...(execution.resolvedOutputLocation !== undefined
+      ? { resolvedOutputLocation: { ...execution.resolvedOutputLocation } }
+      : {}),
+    ...(execution.relocatedPackagingIds !== undefined
+      ? { relocatedPackagingIds: [...execution.relocatedPackagingIds] }
+      : {})
   };
 }
