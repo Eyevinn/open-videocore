@@ -68,6 +68,7 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
+import { parseDestination } from '../pipeline/output-relocation.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -825,6 +826,53 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
 
     void firstStep; // pre-flight above used firstStep; execution drives the loop
+
+    // Pre-flight the per-execution destination override against the configured
+    // storage credentials (issue #209). A caller can supply a destination whose
+    // bucket is not reachable with the configured MinIO/S3 credentials; without
+    // this check the packager (or the #208 relocation copy) fails opaquely on a
+    // callback later. We reject up front, BEFORE creating/dispatching the
+    // execution, so the caller gets a clear, synchronous error naming the
+    // unreachable bucket.
+    //
+    // Scope: only destinations that resolve to the configured storage endpoint
+    // are probed. A plain `bucket/prefix/` path names a bucket on the configured
+    // client, so `bucketExists` is authoritative. An `s3://…` URI may target an
+    // external endpoint this API holds no credentials for and cannot probe;
+    // rather than hard-fail a destination we cannot verify, we let it through —
+    // if it later fails, the packager failure callback surfaces a clear,
+    // attributable error on the execution record (see internal.ts). Executions
+    // with no override are completely unaffected (this block is skipped).
+    if (destinationBucket !== undefined) {
+      const isExternalS3Uri = destinationBucket.startsWith('s3://');
+      const storageClient = request.connections?.storageClient;
+      if (!isExternalS3Uri && storageClient) {
+        const parsed = parseDestination(destinationBucket);
+        if (parsed) {
+          let reachable = false;
+          try {
+            reachable = await storageClient.bucketExists(parsed.bucket);
+          } catch (err) {
+            // A probe failure (network/credential error) is treated as
+            // unreachable: we cannot confirm the destination is usable, so we
+            // refuse to dispatch a job that would fail opaquely later.
+            request.log.warn(
+              { err, bucket: parsed.bucket },
+              'destination bucket reachability probe failed'
+            );
+            reachable = false;
+          }
+          if (!reachable) {
+            reply.code(422).send({
+              error: 'destination_unreachable',
+              message: `destination bucket "${parsed.bucket}" is not reachable with the configured storage credentials`
+            });
+            return undefined;
+          }
+        }
+      }
+    }
+
     const execution = await pipelineRepo.create({
       assetId: asset.id,
       pipelineName,
@@ -1499,6 +1547,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           202: pipelineExecutionSchema,
           404: z.object({ error: z.string() }),
           409: errorSchema,
+          422: errorSchema,
           501: errorSchema,
           502: errorSchema
         }
