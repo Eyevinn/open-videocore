@@ -24,7 +24,18 @@ import {
   stripCredentials
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
-import { STACK_SERVICES } from '../services/stack.js';
+import {
+  AUTO_SUBTITLES_SERVICE_ID,
+  SCENE_DETECT_SERVICE_ID,
+  STACK_SERVICES
+} from '../services/stack.js';
+import {
+  EXTERNAL_STORAGE_SERVICE_IDS,
+  type ExternalStorageCredentials,
+  type ServiceCredentialMapping,
+  encoreCredentialMapping,
+  ffmpegS3CredentialMapping
+} from '../services/external-storage-credentials.js';
 import type { OperationStore } from '../services/operation-store.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
@@ -50,7 +61,13 @@ const externalStorageSchema = z.object({
   secretAccessKey: z.string().min(1),
   region: z.string().min(1).optional(),
   endpointUrl: z.string().url().optional(),
-  sessionToken: z.string().min(1).optional()
+  sessionToken: z.string().min(1).optional(),
+  // OPTIONAL public origin fronting the bucket (e.g. a CDN origin) for operators
+  // who serve the packaged/source objects through a public host rather than the
+  // raw object-store endpoint (issue #213). NON-SECRET: a plain origin URL, it
+  // OVERRIDES the derived endpointUrl-based host when delivery URLs are emitted.
+  // When unset, delivery URLs are derived from endpointUrl/region + bucket.
+  publicBaseUrl: z.string().url().optional()
 });
 
 type ExternalStorage = z.infer<typeof externalStorageSchema>;
@@ -64,7 +81,17 @@ const requestSchema = z.object({
   // Optional external source bucket. Omit for the zero-config MinIO default.
   sourceStorage: externalStorageSchema.optional(),
   // Optional external packaged-output bucket. Omit for the MinIO default.
-  packagedStorage: externalStorageSchema.optional()
+  packagedStorage: externalStorageSchema.optional(),
+  // Optional pipeline services the operator opts into at provision time (issue
+  // #216). Both flags default false: when opted out nothing is created (zero
+  // cost). When opted in, the corresponding OSC instance is provisioned AFTER
+  // the core stack is up and its name recorded in the stored StackConfig.
+  options: z
+    .object({
+      autoSubtitles: z.boolean().default(false),
+      sceneDetect: z.boolean().default(false)
+    })
+    .optional()
 });
 
 const responseSchema = z.object({
@@ -168,7 +195,10 @@ const storageBackendSchema = z.object({
   backend: z.enum(['minio', 'external']),
   bucket: z.string(),
   endpointUrl: z.string().optional(),
-  region: z.string().optional()
+  region: z.string().optional(),
+  // Optional public/CDN origin fronting the bucket (issue #213). Absent for
+  // configs written before this field existed, and for the minio backend.
+  publicBaseUrl: z.string().optional()
 });
 
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
@@ -185,6 +215,16 @@ const storedConfigSchema = z.object({
   // validate. Mirrors StackConfig.autoSubtitlesInstanceName/sceneDetectInstanceName.
   autoSubtitlesInstanceName: z.string().optional(),
   sceneDetectInstanceName: z.string().optional(),
+  // Derived, read-only optional-service activation summary (issue #218). Surfaces
+  // which opt-in services a stack has activated as plain booleans so a consumer
+  // does not have to know that activation is signalled by the presence of the
+  // *InstanceName fields above. ADDITIVE + back-compat: this is NOT part of the
+  // stored StackConfig — the GET handler adds it ONLY when at least one optional
+  // service is active, so a config with no optional services serialises exactly
+  // as it was stored (existing GET /:name equality contract is preserved).
+  options: z
+    .object({ autoSubtitles: z.boolean(), sceneDetect: z.boolean() })
+    .optional(),
   // Optional per-role storage backend metadata (issue #211). Absent for configs
   // written before this field existed (both roles then default to MinIO).
   storage: z
@@ -272,6 +312,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     throw new Error('COUCHDB_ADMIN_PASSWORD environment variable is required');
   }
 
+  // OpenAI API key for eyevinn-auto-subtitles' Whisper transcription (issue
+  // #216). Unlike the passwords above this is NOT required at startup: it is
+  // only needed when a request opts into autoSubtitles. Read here (ADR-002,
+  // 12-factor) so the literal lives in one place; when opted in it is
+  // registered as a per-service OSC secret via secretRef and referenced as
+  // {{secrets.*}} in the create body — never a plaintext param, never logged.
+  // Empty/absent is enforced per-request with a fail-fast error when opted in.
+  const openaiApiKey = process.env['OPENAI_API_KEY'];
+
   // Secret naming convention (ADR-002): <stackName>.<purpose>. Secrets are
   // per-service-scoped (a secret saved for one serviceId cannot be referenced
   // from another) and write-once / never-read-back. Each consuming service
@@ -279,6 +328,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // by the on-demand ensure step now, not here — epic #226 / issue #243.)
   const ROOTPASSWORD = 'rootpassword';
   const ADMINPASSWORD = 'adminpassword';
+  // Secret purpose for the OpenAI key handed to eyevinn-auto-subtitles (#216).
+  const OPENAIKEY = 'openaikey';
+  // Role-qualified secret purpose for external-storage SOURCE credentials (#212).
+  // The credential-mapping layer appends the field-specific suffix (e.g.
+  // `.awssecretaccesskey`) so the source secrets never collide when saved under
+  // the same serviceId. (The PACKAGED-role secrets are minted by the on-demand
+  // packager ensure step now, not here — epic #226 / issue #243.)
+  const EXT_SOURCE = 'extsource';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -297,7 +354,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       }
     },
     async (request, reply) => {
-      const { name, sourceStorage, packagedStorage } = request.body;
+      const { name, sourceStorage, packagedStorage, options } = request.body;
+      // Which optional pipeline services this request opted into (#216). Absent
+      // `options` (or absent flags) means opted out — nothing extra is created.
+      const wantAutoSubtitles = options?.autoSubtitles ?? false;
+      const wantSceneDetect = options?.sceneDetect ?? false;
 
       // Build the NON-SECRET storage backend metadata (issue #211) for each
       // role from the validated request. When a block is omitted the role uses
@@ -314,7 +375,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               backend: 'external',
               bucket: block.bucket,
               ...(block.endpointUrl ? { endpointUrl: block.endpointUrl } : {}),
-              ...(block.region ? { region: block.region } : {})
+              ...(block.region ? { region: block.region } : {}),
+              // Optional public/CDN origin fronting the bucket (issue #213).
+              // NON-SECRET: a plain origin URL. When present it overrides the
+              // endpointUrl-derived host for emitted delivery/manifest URLs.
+              ...(block.publicBaseUrl ? { publicBaseUrl: block.publicBaseUrl } : {})
             }
           : { backend: 'minio', bucket: defaultBucket };
 
@@ -345,6 +410,28 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         const secretName = `${name}.${purpose}`;
         await saveSecret(serviceId, secretName, value, osc);
         return `{{secrets.${secretName}}}`;
+      };
+
+      // applyCredentialMapping realises a per-service ServiceCredentialMapping
+      // (#212) against a concrete serviceId: it saves every secret value as an
+      // OSC secret scoped to that serviceId (via secretRef) and merges the
+      // resulting {{secrets.*}} references with the mapping's non-secret config
+      // fields. The literal secret value never leaves saveSecret — only the
+      // reference is placed in the returned config object. The result is spread
+      // straight into a createInstance / createJob body.
+      const applyCredentialMapping = async (
+        serviceId: string,
+        mapping: ServiceCredentialMapping
+      ): Promise<Record<string, string>> => {
+        const fields: Record<string, string> = { ...mapping.configFields };
+        for (const secret of mapping.secrets) {
+          fields[secret.field] = await secretRef(
+            serviceId,
+            secret.purpose,
+            secret.value
+          );
+        }
+        return fields;
       };
 
       // Track what has been provisioned so a failure mid-stack can report
@@ -391,6 +478,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         provisioned.push({ serviceId, name });
         return instance;
       };
+
+      // Names of the optional pipeline instances actually created for this
+      // stack (#216). Populated below only when opted in; folded into the
+      // stored StackConfig so the resolver/pipeline can find them by name.
+      let autoSubtitlesInstanceName: string | undefined;
+      let sceneDetectInstanceName: string | undefined;
 
       let currentService = '';
       try {
@@ -485,6 +578,44 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
         }
 
+        // 1d. Apply an anonymous (public) read-only bucket policy to the
+        // PACKAGED bucket ONLY (issue #199) so HLS/DASH players can GET
+        // manifests/segments without a bearer token. The SOURCE bucket MUST
+        // stay private, so this loop deliberately targets PACKAGED_BUCKET
+        // alone (unlike the bucket/CORS loops above, which iterate both).
+        //
+        // Policy: allow only s3:GetObject for principal '*' on the packaged
+        // object prefix (arn:aws:s3:::<packaged>/*). No ListBucket, no write —
+        // objects are readable by exact key but the bucket is not browsable.
+        // setBucketPolicy(bucketName, policyJSON) is idempotent (it overwrites
+        // any existing policy), so re-provision converges. Best-effort with the
+        // same retry/backoff shape as the CORS loop: a policy failure must not
+        // fail a re-provision of an otherwise-healthy stack.
+        const packagedPolicy = JSON.stringify({
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Effect: 'Allow',
+              Principal: { AWS: ['*'] },
+              Action: ['s3:GetObject'],
+              Resource: [`arn:aws:s3:::${PACKAGED_BUCKET}/*`]
+            }
+          ]
+        });
+        {
+          let attempts = 0;
+          while (true) {
+            try {
+              await minioClient.setBucketPolicy(PACKAGED_BUCKET, packagedPolicy);
+              break;
+            } catch {
+              attempts++;
+              if (attempts >= 5) break; // best-effort — don't block provision
+              await delay(3000);
+            }
+          }
+        }
+
         // 2. CouchDB — document store for asset metadata.
         currentService = 'apache-couchdb';
         const couchdbAdminPasswordRef = await secretRef(
@@ -543,6 +674,85 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // packaging is actually used. The shared Valkey queue (created above) is
         // the wiring the on-demand packager consumes.
 
+        // 5. Optional pipeline services (issue #216). The core stack is now up.
+        // Each is created ONLY when the request opted in — opted-out means zero
+        // cost (nothing is provisioned). Both flow through the same provision()
+        // helper (so they land in provisioned[] and are covered by the
+        // partial-failure cleanup below) and waitForInstanceReady, and their
+        // instance names are recorded into the StackConfig persisted below.
+
+        // 5a. eyevinn-auto-subtitles ("Subtitle Generator") — Whisper transcription.
+        // Contract (get-service-schema, verified 2026-07-13): create config
+        // requires `name` (^\w+$) AND `openaikey` (OpenAI key for Whisper).
+        // No update-service-instance support. The key comes from the operator's
+        // OPENAI_API_KEY env var, registered as a per-service OSC secret scoped
+        // to AUTO_SUBTITLES_SERVICE_ID and referenced as {{secrets.*}} — never a
+        // plaintext param, never logged. Opted in without the key is a fail-fast
+        // configuration error surfaced on the operation, not a silent skip.
+        if (wantAutoSubtitles) {
+          currentService = AUTO_SUBTITLES_SERVICE_ID;
+          if (!openaiApiKey) {
+            throw new Error(
+              'autoSubtitles was requested but OPENAI_API_KEY is not set on ' +
+                'this deployment; set OPENAI_API_KEY (the OpenAI API key used by ' +
+                'eyevinn-auto-subtitles for Whisper) and retry the provision'
+            );
+          }
+          const openaiKeyRef = await secretRef(
+            AUTO_SUBTITLES_SERVICE_ID,
+            OPENAIKEY,
+            openaiApiKey
+          );
+          await provision(AUTO_SUBTITLES_SERVICE_ID, {
+            openaikey: openaiKeyRef
+          });
+          await waitForInstanceReady(AUTO_SUBTITLES_SERVICE_ID, name, osc);
+          autoSubtitlesInstanceName = name;
+        }
+
+        // 5b. eyevinn-function-scenes ("Scene Detect Media Function").
+        // Contract (get-service-schema, verified 2026-07-13): create config
+        // requires ONLY `name` — no external key dependency.
+        if (wantSceneDetect) {
+          currentService = SCENE_DETECT_SERVICE_ID;
+          await provision(SCENE_DETECT_SERVICE_ID, {});
+          await waitForInstanceReady(SCENE_DETECT_SERVICE_ID, name, osc);
+          sceneDetectInstanceName = name;
+        }
+
+        // Source-reading services (#212). Encore (transcode job input) and
+        // eyevinn-ffmpeg-s3 (probe/thumbnail/remux) read from the SOURCE bucket.
+        // Both are created in a DIFFERENT lifecycle than this provision flow:
+        //   - encore instances are spawned on demand by the auto-scaler
+        //     (encore-scaler/instance-pool.ts:150 spawnInstance, ADR-006), and
+        //   - eyevinn-ffmpeg-s3 runs as a per-job ephemeral instance created via
+        //     createJob at request time (pipeline/osc-ffprobe.ts,
+        //     osc-thumbnail.ts, osc-rewrap.ts).
+        // Neither is created here, so we cannot pass their create bodies from
+        // this closure. What provisioning DOES own is the secret store: when the
+        // operator supplied an external source bucket we pre-register the source
+        // credentials as OSC secrets scoped to each of those serviceIds, so the
+        // runtime create/job paths can reference them via {{secrets.*}} without
+        // ever handling a plaintext value. The literal secret only reaches
+        // saveSecret; it is never persisted to the param store or logged. The
+        // non-secret coordinates (bucket/endpoint/region) are persisted in
+        // `storageMetadata` below and consumed by the runtime paths.
+        if (sourceStorage) {
+          const sourceCreds = sourceStorage as ExternalStorageCredentials;
+          // Save (but do not use here) the encore + ffmpeg-s3 source secrets so
+          // the reference names are established under each serviceId. applyCredentialMapping
+          // performs the saveSecret calls; the returned references are consumed
+          // by the scaler / per-job paths (they resolve the same secret name).
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.encore,
+            encoreCredentialMapping(sourceCreds, EXT_SOURCE)
+          );
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.ffmpegS3,
+            ffmpegS3CredentialMapping(sourceCreds, EXT_SOURCE)
+          );
+        }
+
         // Persist the stack's non-secret connection coordinates to the OSC
         // parameter store (issue #31, ADR-002) so the API — and deprovision
         // (#29) — can rediscover this stack at runtime without the caller
@@ -561,6 +771,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             redisUrl,
             sourceBucket: SOURCE_BUCKET,
             packagedBucket: PACKAGED_BUCKET,
+            // Optional pipeline instance names (issue #215 fields, populated by
+            // #216). Present only when the request opted in and the instance was
+            // created; omitted otherwise so opted-out stacks carry no field.
+            ...(autoSubtitlesInstanceName
+              ? { autoSubtitlesInstanceName }
+              : {}),
+            ...(sceneDetectInstanceName ? { sceneDetectInstanceName } : {}),
             // Non-secret storage backend metadata (issue #211). Secrets are
             // never included — only bucket/endpointUrl/region + backend type.
             storage: storageMetadata,
@@ -707,7 +924,18 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       if (!config) {
         return reply.code(404).send({ error: `no stored config for stack "${name}"` });
       }
-      return reply.code(200).send(config);
+      // Surface which optional opt-in services are active (issue #218) as a
+      // derived boolean summary. Only attach `options` when at least one is
+      // active so a stack with no optional services serialises exactly as stored
+      // (preserves the GET /:name response-equality contract). The raw
+      // *InstanceName fields are already passed through verbatim above.
+      const autoSubtitles = Boolean(config.autoSubtitlesInstanceName);
+      const sceneDetect = Boolean(config.sceneDetectInstanceName);
+      const withOptions =
+        autoSubtitles || sceneDetect
+          ? { ...config, options: { autoSubtitles, sceneDetect } }
+          : config;
+      return reply.code(200).send(withOptions);
     }
   );
 
@@ -794,10 +1022,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
           // Teardown order and the instance set come from what was actually
           // provisioned (the stored services[]), not the static STACK_SERVICES.
+          // Optional opt-in services (issue #218) recorded on the config are
+          // torn down too: their instance names are passed alongside services[]
+          // and deprovisionStackFromConfig merges (and dedupes) them so a stack
+          // that activated auto-subtitles or scene-detect is fully removed.
           const result = await deprovisionStackFromConfig(
             osc,
             name,
-            config.services
+            config.services,
+            {
+              ...(config.autoSubtitlesInstanceName
+                ? { autoSubtitlesInstanceName: config.autoSubtitlesInstanceName }
+                : {}),
+              ...(config.sceneDetectInstanceName
+                ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
+                : {})
+            }
           );
 
           if (result.status === 'failed') {
