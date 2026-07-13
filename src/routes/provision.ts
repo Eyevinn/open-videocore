@@ -34,15 +34,14 @@ import {
   type ExternalStorageCredentials,
   type ServiceCredentialMapping,
   encoreCredentialMapping,
-  ffmpegS3CredentialMapping,
-  packagerCredentialMapping
+  ffmpegS3CredentialMapping
 } from '../services/external-storage-credentials.js';
 import type { OperationStore } from '../services/operation-store.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
 // Buckets created on the freshly provisioned MinIO instance. These names are
-// referenced by Encore (input/source) and eyevinn-encore-packager
-// (OutputFolder) downstream.
+// referenced by Encore (input/source) and, downstream, by the on-demand Encore
+// packager (OutputFolder) when packaging is first executed (epic #226).
 const SOURCE_BUCKET = 'openvideocore-source';
 const PACKAGED_BUCKET = 'openvideocore-packaged';
 
@@ -324,20 +323,19 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
   // Secret naming convention (ADR-002): <stackName>.<purpose>. Secrets are
   // per-service-scoped (a secret saved for one serviceId cannot be referenced
-  // from another) and write-once / never-read-back. Encore and the packager
-  // reuse the MinIO root password as their S3 secret. Each consuming service
-  // still needs its own saveSecret call.
+  // from another) and write-once / never-read-back. Each consuming service
+  // still needs its own saveSecret call. (The packager's own secrets are minted
+  // by the on-demand ensure step now, not here — epic #226 / issue #243.)
   const ROOTPASSWORD = 'rootpassword';
   const ADMINPASSWORD = 'adminpassword';
-  const PAT = 'pat';
   // Secret purpose for the OpenAI key handed to eyevinn-auto-subtitles (#216).
   const OPENAIKEY = 'openaikey';
-  // Role-qualified secret purposes for external-storage credentials (#212). The
-  // credential-mapping layer appends the field-specific suffix (e.g.
-  // `.awssecretaccesskey`) so the source and packaged secrets never collide when
-  // saved under the same serviceId.
+  // Role-qualified secret purpose for external-storage SOURCE credentials (#212).
+  // The credential-mapping layer appends the field-specific suffix (e.g.
+  // `.awssecretaccesskey`) so the source secrets never collide when saved under
+  // the same serviceId. (The PACKAGED-role secrets are minted by the on-demand
+  // packager ensure step now, not here — epic #226 / issue #243.)
   const EXT_SOURCE = 'extsource';
-  const EXT_PACKAGED = 'extpackaged';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -667,76 +665,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // Encore and its paired callback listener are NOT provisioned here: the
         // auto-scaler spawns each Encore instance together with a dedicated
         // callback listener bound to that exact instance (ADR-006).
-
-        // 4. Encore packager — consumes the queue and produces streaming output.
         //
-        // RedisQueue is set explicitly to 'encore-packager:jobs' so this instance
-        // only consumes jobs from our pipeline producers (poller enqueuePackagingJob
-        // and PackagingService/makeOscPackagerQueue). Both use that key via
-        // packagerQueueKey() in osc-packager-queue.ts. Not setting it (or leaving
-        // it empty) would default to 'packaging-queue', which risks consuming jobs
-        // intended for other packager instances sharing the same Valkey (#93).
-        //
-        currentService = 'eyevinn-encore-packager';
-        const pat = osc.getPersonalAccessToken();
-        if (!pat) {
-          throw new Error('OSC_ACCESS_TOKEN is not configured');
-        }
-        // The OSC personal access token is registered as a per-service secret
-        // (scoped to eyevinn-encore-packager under the pat purpose) so it is
-        // never exposed as plain text via describe-service-instance (#185).
-        const packagerPatRef = await secretRef(
-          'eyevinn-encore-packager',
-          PAT,
-          pat
-        );
-        // Packaged-output credentials (#212). When the operator supplied an
-        // external packaged bucket, map its credentials onto the packager's
-        // Aws*/S3EndpointUrl/OutputFolder field names (the mapping enforces the
-        // `s3://<bucket>/` trailing-slash rule) and save each secret scoped to
-        // the eyevinn-encore-packager serviceId. When omitted, fall back exactly
-        // to the per-stack MinIO bucket + root-password credential (NO
-        // regression for MinIO-backed stacks).
-        const packagerStorageFields = packagedStorage
-          ? await applyCredentialMapping(
-              EXTERNAL_STORAGE_SERVICE_IDS.packager,
-              packagerCredentialMapping(
-                packagedStorage as ExternalStorageCredentials,
-                EXT_PACKAGED
-              )
-            )
-          : {
-              // MinIO fallback: the packager's AWS S3 secret is the MinIO root
-              // password, scoped to the eyevinn-encore-packager serviceId under
-              // the rootpassword purpose.
-              AwsAccessKeyId: 'admin',
-              AwsSecretAccessKey: await secretRef(
-                'eyevinn-encore-packager',
-                ROOTPASSWORD,
-                minioRootPassword
-              ),
-              S3EndpointUrl: minioEndpoint,
-              OutputFolder: `s3://${PACKAGED_BUCKET.replace(/\/+$/, '')}/`
-            };
-        // CallbackUrl: the packager POSTs to {CallbackUrl}/packagerCallback/success
-        // and .../failure. The internal route is mounted at /api/v1/internal
-        // (internal.ts), so the base is publicBaseUrl/api/v1/internal.
-        // publicBaseUrl comes from the single resolvePublicBaseUrl() seam
-        // (issue #219). Omitted when unresolved (local dev without a tunnel),
-        // exactly as when PUBLIC_BASE_URL was read directly.
-        const packagerCallbackUrl = publicBaseUrl
-          ? `${publicBaseUrl}/api/v1/internal`
-          : undefined;
-        await provision('eyevinn-encore-packager', {
-          RedisUrl: redisUrl,
-          RedisQueue: 'encore-packager:jobs',
-          PersonalAccessToken: packagerPatRef,
-          ...packagerStorageFields,
-          ...(packagerCallbackUrl ? { CallbackUrl: packagerCallbackUrl } : {})
-        });
-        // The packager is a background queue-consumer — it does not expose a
-        // synchronous health endpoint. waitForInstanceReady is skipped; the
-        // instance starts asynchronously and picks up jobs from the Valkey queue.
+        // The Encore packager is ALSO not provisioned here anymore (epic #226 /
+        // issue #243). It is provisioned LAZILY on the first pipeline execution
+        // that includes a packaging step (issue #244) and torn down on stack
+        // deprovision (issue #246). A freshly provisioned stack therefore creates
+        // no packager instance and mints no packager secrets/tokens until
+        // packaging is actually used. The shared Valkey queue (created above) is
+        // the wiring the on-demand packager consumes.
 
         // 5. Optional pipeline services (issue #216). The core stack is now up.
         // Each is created ONLY when the request opted in — opted-out means zero
