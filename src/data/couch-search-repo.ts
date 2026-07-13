@@ -57,6 +57,21 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   if (query.tags && query.tags.length > 0) {
     selector['tags'] = { $all: query.tags };
   }
+  // TAMS address lookup (issue #168, epic #116). The persisted document carries
+  // the machine-derived addressing under the four-namespace `structural.tams`
+  // block (asset-document.ts: structural.tams.flowIds[] / .timerange). Push both
+  // down as dotted Mango selectors so CouchDB filters within the workspace
+  // partition. `$elemMatch $eq` matches a single flow UUID against the flowIds
+  // array (a source carries many flows, ADR-008, but a query addresses one flow
+  // — ADR-010); the timerange is an exact-equality match. The in-process
+  // matchesQuery pass re-checks both, so behaviour is identical across backends
+  // and the projection stays disposable/replayable (derived only from the doc).
+  if (query.tamsFlowId) {
+    selector['structural.tams.flowIds'] = { $elemMatch: { $eq: query.tamsFlowId } };
+  }
+  if (query.tamsTimerange) {
+    selector['structural.tams.timerange'] = { $eq: query.tamsTimerange };
+  }
   // Metadata filters push down as `metadata.<key>: { $eq: value }` so CouchDB
   // matches exact top-level metadata values within the workspace partition
   // (issue #12). Dotted keys address nested document fields in Mango.
@@ -83,9 +98,39 @@ function fromDoc(doc: StoredDoc): Asset {
     packagingError: doc['packagingError'] as string | undefined,
     renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
     metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
+    // TAMS addressing (issue #168) is persisted under the four-namespace
+    // `structural.tams` block (asset-document.ts: structural.tams.flowIds[] /
+    // .timerange). Project it flat onto the Asset so the shared matchesQuery
+    // pass can re-check a tamsFlowId / tamsTimerange lookup. Read defensively —
+    // the block is optional/additive and absent on non-bridged assets.
+    tamsFlowIds: tamsFlowIdsFromDoc(doc),
+    tamsTimerange: tamsAddressingFromDoc(doc)?.timerange as string | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };
+}
+
+// Read the optional `structural.tams` addressing block from the persisted
+// four-namespace document, guarding every hop (any level may be absent).
+function tamsAddressingFromDoc(doc: StoredDoc): Record<string, unknown> | undefined {
+  const structural = doc['structural'];
+  if (typeof structural !== 'object' || structural === null) {
+    return undefined;
+  }
+  const tams = (structural as Record<string, unknown>)['tams'];
+  if (typeof tams !== 'object' || tams === null) {
+    return undefined;
+  }
+  return tams as Record<string, unknown>;
+}
+
+function tamsFlowIdsFromDoc(doc: StoredDoc): string[] | undefined {
+  const flowIds = tamsAddressingFromDoc(doc)?.['flowIds'];
+  if (!Array.isArray(flowIds)) {
+    return undefined;
+  }
+  const ids = flowIds.filter((id): id is string => typeof id === 'string');
+  return ids.length > 0 ? ids : undefined;
 }
 
 function stripPartition(id: string): string {
