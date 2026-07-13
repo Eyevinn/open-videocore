@@ -33,6 +33,12 @@ export type PipelineExecution = {
   pipelineName: string;
   status: 'running' | 'done' | 'failed';
   steps: StepExecution[];
+  // Optional per-execution destination override (issue #207). A normalized
+  // destination bucket/folder identifier (always trailing-slash terminated).
+  // When absent, later stages (packager relocation, delivery — #208/#210) fall
+  // back to the provisioned instance-level default. Persisted so the pipeline
+  // and delivery endpoint can both resolve the destination actually used.
+  destinationBucket?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -42,6 +48,7 @@ export interface PipelineRepository {
     assetId: string;
     pipelineName: string;
     steps: PipelineStepName[];
+    destinationBucket?: string;
   }): Promise<PipelineExecution>;
   get(id: string): Promise<PipelineExecution | undefined>;
   update(
@@ -69,6 +76,7 @@ export class InMemoryPipelineRepository implements PipelineRepository {
     assetId: string;
     pipelineName: string;
     steps: PipelineStepName[];
+    destinationBucket?: string;
   }): Promise<PipelineExecution> {
     const now = new Date().toISOString();
     const id = ulid();
@@ -78,6 +86,9 @@ export class InMemoryPipelineRepository implements PipelineRepository {
       pipelineName: input.pipelineName,
       status: 'running',
       steps: input.steps.map((name) => ({ name, status: 'pending' })),
+      ...(input.destinationBucket !== undefined
+        ? { destinationBucket: input.destinationBucket }
+        : {}),
       createdAt: now,
       updatedAt: now
     };

@@ -513,9 +513,50 @@ const pipelineExecutionSchema = z.object({
   pipelineName: z.string(),
   status: z.enum(['running', 'done', 'failed']),
   steps: z.array(stepExecutionSchema),
+  // Per-execution destination override actually used (issue #207). Absent when
+  // the caller relied on the provisioned instance-level default.
+  destinationBucket: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
+
+// Optional per-execution destination override (issue #207).
+//
+// Accepts either an `s3://bucket/prefix/` URI or a plain `bucket/prefix/` path
+// identifier — #208 later consumes it as the packager's OutputFolder for
+// post-package relocation. The packager produces malformed S3 URIs when the
+// output folder lacks a trailing slash (OSC packager contract, finding #3), so
+// this schema NORMALIZES a trailing slash on and validates the shape at the
+// edge, rejecting malformed values with a 400 before anything is persisted.
+//
+// Rejected: empty / whitespace, values with control characters, wildcards, `..`
+// path traversal, backslashes, or a `scheme://` other than `s3://`.
+const destinationBucketSchema = z
+  .string()
+  .trim()
+  .min(1, 'destinationBucket must not be empty')
+  .max(1024, 'destinationBucket is too long')
+  .refine((v) => !/\s/.test(v), {
+    message: 'destinationBucket must not contain whitespace'
+  })
+  .refine((v) => ![...v].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f), {
+    message: 'destinationBucket must not contain control characters'
+  })
+  .refine((v) => !v.includes('\\') && !v.includes('*') && !v.includes('?'), {
+    message: 'destinationBucket must not contain backslashes or wildcards'
+  })
+  .refine((v) => !/(^|\/)\.\.(\/|$)/.test(v), {
+    message: 'destinationBucket must not contain path traversal segments'
+  })
+  .refine((v) => !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v) || v.startsWith('s3://'), {
+    message: 'destinationBucket must be a plain path or an s3:// URI'
+  })
+  .refine((v) => (v.startsWith('s3://') ? v.length > 's3://'.length : true), {
+    message: 'destinationBucket s3:// URI must include a bucket'
+  })
+  // Normalize: collapse duplicate trailing slashes to exactly one so the
+  // packager always receives a well-formed folder (never a bare object key).
+  .transform((v) => v.replace(/\/+$/, '') + '/');
 
 // Asset comments (issue #135). Free-text `body` only for this iteration; the
 // naming mirrors the Comment model in src/data/comment-repo.ts. The trailing
@@ -732,7 +773,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
     reply: import('fastify').FastifyReply,
-    encodeOpts?: { profile?: string; customProfile?: EncoreProfile }
+    encodeOpts?: { profile?: string; customProfile?: EncoreProfile },
+    // Optional per-execution destination override (issue #207). Already
+    // validated + trailing-slash-normalized by the edge schema. Persisted on the
+    // execution record so #208 (packager relocation) and #210 (delivery) can
+    // resolve the destination actually used. When undefined, later stages fall
+    // back to the provisioned instance-level default (backwards compatible).
+    destinationBucket?: string
   ): Promise<import('../data/pipeline-repo.js').PipelineExecution | undefined> {
     const pipelineRepo = opts.pipelineRepository;
     if (!pipelineRepo) {
@@ -778,7 +825,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
 
     void firstStep; // pre-flight above used firstStep; execution drives the loop
-    const execution = await pipelineRepo.create({ assetId: asset.id, pipelineName, steps });
+    const execution = await pipelineRepo.create({
+      assetId: asset.id,
+      pipelineName,
+      steps,
+      ...(destinationBucket !== undefined ? { destinationBucket } : {})
+    });
     const now = () => new Date().toISOString();
     const stepsCopy: StepExecution[] = execution.steps.map((s) => ({ ...s }));
 
@@ -1437,7 +1489,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: z.object({
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
           profile: z.string().min(1).optional(),
-          customProfile: customProfileSchema.optional()
+          customProfile: customProfileSchema.optional(),
+          // Optional per-execution destination override (issue #207). Validated
+          // and trailing-slash-normalized at the edge; persisted on the
+          // execution record for #208 (packager relocation) / #210 (delivery).
+          destinationBucket: destinationBucketSchema.optional()
         }),
         response: {
           202: pipelineExecutionSchema,
@@ -1461,7 +1517,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
         request,
         reply,
-        { profile: request.body.profile, customProfile: request.body.customProfile as EncoreProfile | undefined }
+        { profile: request.body.profile, customProfile: request.body.customProfile as EncoreProfile | undefined },
+        request.body.destinationBucket
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);
