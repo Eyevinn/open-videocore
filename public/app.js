@@ -2820,6 +2820,219 @@ async function renderProvisionTab(container) {
     listContent.appendChild(p);
   });
 
+  // ── Optional services: Scene Detection card (issue #198) ──
+  // Reuses the shared per-service endpoints under /optional-services/:key and
+  // the pollOp / pollDeprovisionOp helpers defined above. The service key,
+  // status shape (state: not-configured | configured | active), instance-name
+  // env var, and the empty required-field set are all taken verbatim from the
+  // backend registry — see src/services/optional-services.ts (key 'scene-detect',
+  // fields: []) and src/routes/optional-services.ts (statusSchema). Degrades to a
+  // disabled "not configured" state when SCENE_DETECT_INSTANCE_NAME is unset.
+  const sceneSection = document.createElement('div');
+  sceneSection.className = 'section';
+  const sceneTitle = document.createElement('div');
+  sceneTitle.className = 'section-title';
+  sceneTitle.textContent = 'Scene Detection';
+  sceneSection.appendChild(sceneTitle);
+  const sceneBody = document.createElement('div');
+  sceneBody.appendChild(loadingEl());
+  sceneSection.appendChild(sceneBody);
+  container.appendChild(sceneSection);
+
+  const SCENE_DETECT_KEY = 'scene-detect';
+
+  function renderSceneCard(status) {
+    sceneBody.textContent = '';
+
+    // Map the backend `state` onto a user-facing badge + description.
+    const state = status && status.state;
+    const isActive = state === 'active';
+    const isConfigured = state === 'configured';
+    const notConfigured = !state || state === 'not-configured';
+
+    const badgeStatus = isActive
+      ? 'active'
+      : isConfigured
+        ? 'pending'
+        : 'unknown';
+
+    const kv = document.createElement('div');
+    kv.className = 'kv-grid';
+    const rows = [
+      ['Service', escHtml((status && status.displayName) || 'Scene Detect Media Function')],
+      ['Status', renderBadge(badgeStatus)],
+      ['Instance name',
+        status && status.instanceName
+          ? '<span class="text-mono">' + escHtml(status.instanceName) + '</span>'
+          : '<span class="text-muted">—</span>'],
+      ['Env var',
+        '<span class="text-mono">' +
+          escHtml((status && status.instanceNameEnvVar) || 'SCENE_DETECT_INSTANCE_NAME') +
+          '</span>'],
+    ];
+    if (isActive && status.url) {
+      rows.push(['URL', '<span class="text-mono">' + escHtml(status.url) + '</span>']);
+    }
+    kv.innerHTML = rows.map(function(r) {
+      return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+    }).join('');
+    sceneBody.appendChild(kv);
+
+    const hint = document.createElement('p');
+    hint.className = 'text-muted';
+    hint.style.cssText = 'font-size:12px;margin-top:8px;';
+    if (notConfigured) {
+      hint.textContent = 'SCENE_DETECT_INSTANCE_NAME is not set. Provision an instance below, then set that environment variable to the instance name and restart to enable the scene-detect pipeline step.';
+    } else if (isConfigured) {
+      hint.textContent = 'Configured, but no live instance was found under the configured name. Re-provision to create it.';
+    } else {
+      hint.textContent = 'A live scene-detect instance is running and wired to the pipeline.';
+    }
+    sceneBody.appendChild(hint);
+
+    // Controls: provision (when not active) and deprovision (when there is an
+    // instance name to remove). When not-configured we still allow provisioning
+    // a NEW instance (the operator sets the env var afterwards).
+    const controls = document.createElement('div');
+    controls.className = 'form-row';
+    controls.style.marginTop = '8px';
+
+    // Provision control — needs an instance name (^\w+$ per the backend schema).
+    if (!isActive) {
+      const field = document.createElement('div');
+      field.className = 'form-field grow';
+      const label = document.createElement('label');
+      const inputId = 'scene-provision-name';
+      label.setAttribute('for', inputId);
+      label.textContent = 'Instance name';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = inputId;
+      input.placeholder = 'scenedetect';
+      if (status && status.instanceName) input.value = status.instanceName;
+      field.appendChild(label);
+      field.appendChild(input);
+      controls.appendChild(field);
+
+      const provBtn = document.createElement('button');
+      provBtn.textContent = 'Provision';
+      provBtn.addEventListener('click', function() {
+        const name = input.value.trim();
+        if (!name) { showMsg(sceneMsg, 'Instance name is required.', 'error'); return; }
+        provisionScene(name, provBtn);
+      });
+      controls.appendChild(provBtn);
+    }
+
+    // Deprovision control — only when an instance name is configured (the backend
+    // removes the instance named by SCENE_DETECT_INSTANCE_NAME).
+    if (status && status.instanceName) {
+      const deprovBtn = document.createElement('button');
+      deprovBtn.className = 'btn-danger';
+      deprovBtn.textContent = 'Deprovision';
+      deprovBtn.addEventListener('click', function() {
+        if (!confirm('Deprovision the scene-detect instance "' + status.instanceName + '"?')) return;
+        deprovisionScene(deprovBtn);
+      });
+      controls.appendChild(deprovBtn);
+    }
+
+    sceneBody.appendChild(controls);
+
+    const sceneMsg = document.createElement('div');
+    sceneMsg.id = 'scene-msg';
+    sceneMsg.className = 'mt8';
+    sceneBody.appendChild(sceneMsg);
+  }
+
+  function refreshSceneCard() {
+    apiFetch('/optional-services/' + encodeURIComponent(SCENE_DETECT_KEY))
+      .then(renderSceneCard)
+      .catch(function(err) {
+        sceneBody.textContent = '';
+        const p = document.createElement('p');
+        p.className = 'text-muted';
+        // Degrade gracefully: an unknown key / unreachable endpoint shows a
+        // disabled notice rather than a hard error card.
+        p.textContent = 'Scene detection is unavailable (' + err.message + ').';
+        sceneBody.appendChild(p);
+      });
+  }
+
+  function provisionScene(name, btn) {
+    const sceneMsg = sceneBody.querySelector('#scene-msg');
+    if (sceneMsg) sceneMsg.innerHTML = '';
+    btn.disabled = true;
+    btn.textContent = 'Provisioning…';
+    apiFetch('/optional-services/' + encodeURIComponent(SCENE_DETECT_KEY) + '/provision', {
+      method: 'POST',
+      body: JSON.stringify({ name: name })
+    }).then(function(res) {
+      const opId = res && res.operationId;
+      if (opId) {
+        // Mirror into Active Operations and poll to completion, then refresh.
+        upsertOpRow({ id: opId, type: 'provision', name: name, status: 'pending' });
+        pollOp({ id: opId, type: 'provision', name: name, status: 'pending' });
+        pollSceneOp(opId, btn, 'Provision');
+      } else {
+        btn.disabled = false;
+        btn.textContent = 'Provision';
+        refreshSceneCard();
+      }
+    }).catch(function(err) {
+      if (sceneMsg) showMsg(sceneMsg, 'Error: ' + err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = 'Provision';
+    });
+  }
+
+  function deprovisionScene(btn) {
+    const sceneMsg = sceneBody.querySelector('#scene-msg');
+    if (sceneMsg) sceneMsg.innerHTML = '';
+    btn.disabled = true;
+    btn.textContent = 'Deprovisioning…';
+    apiFetch('/optional-services/' + encodeURIComponent(SCENE_DETECT_KEY), { method: 'DELETE' })
+      .then(function(res) {
+        const opId = res && res.operationId;
+        const name = (res && res.name) || '';
+        if (opId) {
+          upsertOpRow({ id: opId, type: 'deprovision', name: name, status: 'pending' });
+          pollOp({ id: opId, type: 'deprovision', name: name, status: 'pending' });
+          pollSceneOp(opId, btn, 'Deprovision');
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Deprovision';
+          refreshSceneCard();
+        }
+      }).catch(function(err) {
+        if (sceneMsg) showMsg(sceneMsg, 'Error: ' + err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Deprovision';
+      });
+  }
+
+  // Poll a scene-detect optional-service operation to a terminal state, then
+  // re-render the card so the status/badge reflects the new instance state.
+  function pollSceneOp(opId, btn, verb) {
+    apiFetch('/provision/operations/' + encodeURIComponent(opId)).then(function(op) {
+      if (op.status === 'done' || op.status === 'failed') {
+        btn.disabled = false;
+        btn.textContent = verb;
+        const sceneMsg = sceneBody.querySelector('#scene-msg');
+        if (op.status === 'failed' && sceneMsg) {
+          showMsg(sceneMsg, op.error || (verb + ' failed'), 'error');
+        }
+        refreshSceneCard();
+      } else {
+        setTimeout(function() { pollSceneOp(opId, btn, verb); }, 3000);
+      }
+    }).catch(function() {
+      setTimeout(function() { pollSceneOp(opId, btn, verb); }, 5000);
+    });
+  }
+
+  refreshSceneCard();
+
   // Provision form
   const section = document.createElement('div');
   section.className = 'section';
