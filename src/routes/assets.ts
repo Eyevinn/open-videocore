@@ -89,8 +89,10 @@ import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/cli
 import { parseDestination } from '../pipeline/output-relocation.js';
 import {
   deliveryMode,
+  manifestUrlsForLocation,
   outputPrefix,
   packagedBucket,
+  packagedRelocationOrigin,
   proxyManifestUrlsFor
 } from '../pipeline/packaging.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
@@ -746,6 +748,28 @@ function formatFromKey(key: string): string {
     return '';
   }
   return name.slice(dot + 1).toLowerCase();
+}
+
+// Find the resolved output location of the most recent pipeline execution that
+// relocated this asset's packaged output to a per-execution destination override
+// (issue #208/#210). Reuses the same `listByAsset` lookup the pipeline routes
+// use (assets.ts /:id/executions), which returns executions ascending by
+// createdAt; we scan from newest to oldest and return the first
+// `resolvedOutputLocation` we find. Returns undefined when no execution
+// relocated (no override was used), in which case delivery falls back to the
+// instance-default manifest URLs (existing behaviour unchanged).
+async function latestRelocatedLocation(
+  pipelineRepository: PipelineRepository,
+  assetId: string
+): Promise<{ bucket: string; prefix: string } | undefined> {
+  const executions = await pipelineRepository.listByAsset(assetId);
+  for (let i = executions.length - 1; i >= 0; i--) {
+    const loc = executions[i].resolvedOutputLocation;
+    if (loc) {
+      return loc;
+    }
+  }
+  return undefined;
 }
 
 // Derive the object-key prefix backing a streaming package from its manifest
@@ -1451,6 +1475,32 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       // Preferred: packaged streaming manifests (issue #9 / #200 / #201 / #213).
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
+        // Destination-aware URLs (issue #210). With a per-execution destination
+        // override (#207), the packager's output is relocated (#208) to a
+        // different bucket/prefix and the resolved location is recorded on the
+        // execution as `resolvedOutputLocation`. When present, the delivery URLs
+        // must point at THAT location, not the instance-default one baked into
+        // `asset.manifestUrls`. We reuse the same execution lookup the pipeline
+        // routes use (`listByAsset`) and pick the most recent execution that
+        // actually relocated (has a `resolvedOutputLocation`). This is the most
+        // caller-explicit signal, so it takes precedence over the backend-derived
+        // delivery paths below. When none relocated, fall through to those.
+        const relocated = opts.pipelineRepository
+          ? await latestRelocatedLocation(opts.pipelineRepository, asset.id)
+          : undefined;
+        if (relocated) {
+          const urls = manifestUrlsForLocation(relocated, packagedRelocationOrigin());
+          return reply.code(200).send({
+            assetId: asset.id,
+            // Keep the same per-manifest presence as the default output: only
+            // advertise the manifests the packaged output actually produced.
+            urls: {
+              ...(asset.manifestUrls.hls ? { hls: urls.hls } : {}),
+              ...(asset.manifestUrls.dash ? { dash: urls.dash } : {})
+            },
+            expiresAt
+          });
+        }
         // External storage backend (#213): the object store / CDN is itself the
         // public origin, so re-host the stored manifest object-key path against
         // it (deterministic manifest names — index.m3u8 / manifest.mpd — are
