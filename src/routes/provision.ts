@@ -50,7 +50,13 @@ const externalStorageSchema = z.object({
   secretAccessKey: z.string().min(1),
   region: z.string().min(1).optional(),
   endpointUrl: z.string().url().optional(),
-  sessionToken: z.string().min(1).optional()
+  sessionToken: z.string().min(1).optional(),
+  // OPTIONAL public origin fronting the bucket (e.g. a CDN origin) for operators
+  // who serve the packaged/source objects through a public host rather than the
+  // raw object-store endpoint (issue #213). NON-SECRET: a plain origin URL, it
+  // OVERRIDES the derived endpointUrl-based host when delivery URLs are emitted.
+  // When unset, delivery URLs are derived from endpointUrl/region + bucket.
+  publicBaseUrl: z.string().url().optional()
 });
 
 type ExternalStorage = z.infer<typeof externalStorageSchema>;
@@ -168,7 +174,10 @@ const storageBackendSchema = z.object({
   backend: z.enum(['minio', 'external']),
   bucket: z.string(),
   endpointUrl: z.string().optional(),
-  region: z.string().optional()
+  region: z.string().optional(),
+  // Optional public/CDN origin fronting the bucket (issue #213). Absent for
+  // configs written before this field existed, and for the minio backend.
+  publicBaseUrl: z.string().optional()
 });
 
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
@@ -315,7 +324,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               backend: 'external',
               bucket: block.bucket,
               ...(block.endpointUrl ? { endpointUrl: block.endpointUrl } : {}),
-              ...(block.region ? { region: block.region } : {})
+              ...(block.region ? { region: block.region } : {}),
+              // Optional public/CDN origin fronting the bucket (issue #213).
+              // NON-SECRET: a plain origin URL. When present it overrides the
+              // endpointUrl-derived host for emitted delivery/manifest URLs.
+              ...(block.publicBaseUrl ? { publicBaseUrl: block.publicBaseUrl } : {})
             }
           : { backend: 'minio', bucket: defaultBucket };
 

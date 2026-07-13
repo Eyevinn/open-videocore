@@ -30,11 +30,20 @@
 //   backend 'external' — an operator-supplied S3-compatible object store. bucket
 //                        is the external bucket; endpointUrl is present for
 //                        non-AWS S3-compatible stores; region is optional.
+//   publicBaseUrl      — OPTIONAL operator-supplied public origin fronting the
+//                        bucket (e.g. a CDN origin). When present it OVERRIDES
+//                        the URL derived from endpointUrl/region + bucket for the
+//                        emitted delivery/manifest host (issue #213). NON-SECRET:
+//                        a plain origin URL, never carries credentials. Only
+//                        meaningful for the 'external' backend; ignored for
+//                        'minio' (which is API-proxied and never emits a public
+//                        object URL).
 export type StorageBackendConfig = {
   backend: 'minio' | 'external';
   bucket: string;
   endpointUrl?: string;
   region?: string;
+  publicBaseUrl?: string;
 };
 
 // The connection coordinates persisted for a provisioned stack. Every value is

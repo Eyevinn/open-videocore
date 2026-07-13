@@ -11,7 +11,12 @@
 
 import nano from 'nano';
 import { Client as MinioClient } from 'minio';
-import { isReadyStack, type ParamStore, type StackConfig } from './param-store.js';
+import {
+  isReadyStack,
+  type ParamStore,
+  type StackConfig,
+  type StorageBackendConfig
+} from './param-store.js';
 import { couchServer, StackCouch } from '../data/couchdb.js';
 import { WorkspaceStorage } from '../data/storage.js';
 import { CouchAssetRepository } from '../data/couch-asset-repo.js';
@@ -52,6 +57,15 @@ export type WorkspaceConnections = {
   sourceBucket: string;
   packagedBucket: string;
   s3Config: { endpoint: string; accessKey: string; secretKey: string } | undefined;
+  // Per-role storage backend metadata for the resolved stack (issue #211/#213).
+  // Carried through so the delivery route can emit backend-appropriate URLs
+  // (proxied for 'minio', public/derived object URLs for 'external') without a
+  // second parameter-store read per request. Undefined when the stack predates
+  // issue #211 (both roles then default to the per-stack MinIO backend) or for
+  // the env-override / in-memory connection paths.
+  storage:
+    | { source: StorageBackendConfig; packaged: StorageBackendConfig }
+    | undefined;
 };
 
 type CacheEntry = { connections: WorkspaceConnections; expiresAt: number };
@@ -131,7 +145,10 @@ function buildConnectionsFromStack(
     encore,
     sourceBucket: config.sourceBucket,
     packagedBucket: config.packagedBucket,
-    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword }
+    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword },
+    // Carry the per-role storage backend metadata (issue #211) so the delivery
+    // route can branch on backend type without re-reading the parameter store.
+    storage: config.storage
   };
 }
 
@@ -209,7 +226,10 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     assets, jobs, search, webhooks, collections, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
-    s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined
+    s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
+    // The env-override path has no parameter-store record, so no per-role
+    // backend metadata: delivery keeps its default (proxied) behaviour.
+    storage: undefined
   };
 }
 
@@ -227,7 +247,8 @@ function buildInMemoryConnections(): WorkspaceConnections {
     encore: undefined,
     sourceBucket: 'openvideocore-source',
     packagedBucket: 'openvideocore-packaged',
-    s3Config: undefined
+    s3Config: undefined,
+    storage: undefined
   };
 }
 
