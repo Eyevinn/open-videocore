@@ -50,13 +50,16 @@ import type {
 // Deterministic id-derivation namespaces (ADR-009 LOCKED)
 // ---------------------------------------------------------------------------
 
-// Fixed, committed namespace UUID constants for the UUIDv5 derivation. These are
-// part of the ADR-009 contract: they MUST NOT change once assets are indexed,
-// because the derived flow/source ids (and therefore idempotency) depend on
-// them. Two distinct namespaces guarantee flowId !== sourceId for the same
-// asset ULID. Generated as random v4 UUIDs and frozen here as constants.
-export const TAMS_BRIDGE_FLOW_NAMESPACE = '6f8a1e2c-3b4d-4a5e-8c7f-1d2e3a4b5c6d';
-export const TAMS_BRIDGE_SOURCE_NAMESPACE = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+// Fixed namespace UUID constants for the UUIDv5 derivation. These are part of
+// the ADR-009 contract and are the EXACT literals it pins — copied verbatim, not
+// regenerated — because the derived flow/source ids (and therefore idempotency)
+// depend on them and MUST NOT change once any asset is indexed. Two distinct
+// namespaces guarantee flowId !== sourceId for the same asset ULID.
+//   Source: docs/architecture/ADR-009-tams-bridge.md decision 2 —
+//     `TAMS_BRIDGE_FLOW_NAMESPACE`   (ADR-009 line 167)
+//     `TAMS_BRIDGE_SOURCE_NAMESPACE` (ADR-009 line 184)
+export const TAMS_BRIDGE_FLOW_NAMESPACE = '6f8e2a1c-0b3d-5e4f-8a9b-1c2d3e4f5a6b';
+export const TAMS_BRIDGE_SOURCE_NAMESPACE = '7a9f3b2d-1c4e-5f6a-9b0c-2d3e4f5a6b7c';
 
 // ---------------------------------------------------------------------------
 // UUIDv5 (RFC 4122 sec. 4.3) — SHA-1 name-based UUID.
