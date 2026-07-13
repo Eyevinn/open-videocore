@@ -34,6 +34,15 @@ import {
 // TAMS validation primitives (ADR-008, issue #165). Reused, NOT re-declared, so
 // the lookup query grammar stays 1:1 with the persisted asset-document grammar.
 import { TamsFlowIdSchema, TamsTimerangeSchema } from '../data/asset-document.js';
+// TAMS-address query contract (ADR-010, issue #174). #175 is the handler the
+// contract module was written for — it consumes the contract's mode resolver
+// and error taxonomy rather than re-deriving them, so ADR-010 stays the single
+// source of truth for the addressing grammar and the error->status map.
+import {
+  resolveTamsQueryMode,
+  TamsQueryError,
+  type TamsQueryAddress
+} from '../tams/tams-query-contract.js';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -176,6 +185,15 @@ const listQuerySchema = z.object({
 // grammar is identical to the persisted grammar — no regex is re-declared here.
 // A malformed value fails validation at the boundary and Fastify returns 400,
 // which satisfies the contract's "malformed param -> 400" case.
+//
+// WIRE NAMES vs CONTRACT NAMES: the wire params are `tamsFlowId` / `tamsTimerange`
+// (the `tams`-prefixed names that match the #168 search-index fields and the
+// OpenAPI surface in #176). The ADR-010 contract (`tams-query-contract.ts`)
+// names the same values `flowId` / `timerange`. The handler maps wire -> contract
+// before calling `resolveTamsQueryMode`, so the contract stays authoritative for
+// mode selection and the error taxonomy while the public wire surface keeps its
+// `tams`-prefixed names. (Unifying the two spellings would require editing either
+// this route's test or the merged #174 contract test — deferred, see PR note.)
 const tamsLookupQuerySchema = z.object({
   tamsFlowId: TamsFlowIdSchema,
   tamsTimerange: TamsTimerangeSchema.optional()
@@ -1095,16 +1113,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     },
     async (request, reply) => {
       const { tamsFlowId, tamsTimerange } = request.query;
-      const resolved = await resolveByTamsAddress(tamsFlowId, tamsTimerange);
+      // Resolve the addressing MODE through the ADR-010 contract rather than
+      // re-deriving it here. Map the wire params onto the contract's grammar and
+      // let `resolveTamsQueryMode` narrow to a typed `flowId` / `flowIdWithTimerange`
+      // address. Fastify's querystring validation already rejects malformed input
+      // with 400 before this runs, so the catch is defensive (kept so the contract
+      // grammar stays authoritative even if the wire schema and contract drift).
+      let addr: TamsQueryAddress;
+      try {
+        addr = resolveTamsQueryMode({ flowId: tamsFlowId, timerange: tamsTimerange });
+      } catch {
+        const err = new TamsQueryError('malformed');
+        return reply.code(err.status as 400 | 404 | 409).send({ error: 'invalid_tams_address' });
+      }
+      const timerange = addr.mode === 'flowIdWithTimerange' ? addr.timerange : undefined;
+      const resolved = await resolveByTamsAddress(addr.flowId, timerange);
       if (resolved === 'ambiguous') {
-        return reply.code(409).send({
+        // Contract reserves 409 for ambiguity (unreachable in v1); status comes
+        // from the contract's error->status map via TamsQueryError.
+        const err = new TamsQueryError('ambiguous');
+        return reply.code(err.status as 400 | 404 | 409).send({
           error: 'ambiguous_tams_address',
-          message: `TAMS flow ${tamsFlowId} resolves to more than one asset`
+          message: `TAMS flow ${addr.flowId} resolves to more than one asset`
         });
       }
       if (!resolved) {
-        // unknown OR not-yet-indexed OR timerange miss all collapse to 404.
-        return reply.code(404).send({ error: 'not_found' });
+        // unknown OR not-yet-indexed OR timerange miss all collapse to 404 per
+        // the contract taxonomy (both `unknown` and `notYetIndexed` map to 404).
+        const err = new TamsQueryError('unknown');
+        return reply.code(err.status as 400 | 404 | 409).send({ error: 'not_found' });
       }
       // Forward-compat paginated envelope even though v1 is single-match.
       return reply.code(200).send({ items: [resolved], limit: MAX_LIMIT, offset: 0, total: 1 });
