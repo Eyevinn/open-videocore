@@ -338,6 +338,24 @@ function toDoc(asset: Asset): Record<string, unknown> {
   };
 }
 
+// schemaVersion read rule (issue #166, TAMS bridge epic #116).
+//
+// The TAMS addressing fields (structural.tams.flowIds / .timerange, issue #165)
+// are ADDITIVE within schemaVersion 1: they are `.optional()` on
+// AssetDocumentSchema, so this is NOT a schemaVersion bump — ASSET_SCHEMA_VERSION
+// stays 1 (asset-document.ts) and every pre-#165 document remains a valid v1
+// document. There is no ADR-005 file in this clone's docs/architecture/ (only
+// ADR-001/007/008); the in-code schemaVersion contract above is the source of
+// truth, and it treats new optional fields as additive with a documented default
+// of ABSENT (mapped to `undefined` by fromAssetDocument), never a back-filled
+// write.
+//
+// READ RULE: schemaVersion is INJECTED, not read from the stored body. We parse
+// with a forced `schemaVersion: 1`, so a legacy document that predates the
+// explicit field (absent, or an older integer) still deserializes — the loader
+// normalises it to the current v1 shape in memory. Because `get()` only reads
+// (this function is pure and never calls couch.put), reading a legacy document
+// does NOT mutate it, back-fill the TAMS fields, or churn its CouchDB `_rev`.
 function fromDoc(doc: StoredDoc): Asset {
   const localId = String(doc['localId'] ?? stripPartition(doc._id));
   const document = AssetDocumentSchema.parse({
