@@ -25,6 +25,14 @@ import {
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { STACK_SERVICES } from '../services/stack.js';
+import {
+  EXTERNAL_STORAGE_SERVICE_IDS,
+  type ExternalStorageCredentials,
+  type ServiceCredentialMapping,
+  encoreCredentialMapping,
+  ffmpegS3CredentialMapping,
+  packagerCredentialMapping
+} from '../services/external-storage-credentials.js';
 import type { OperationStore } from '../services/operation-store.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
@@ -280,6 +288,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   const ROOTPASSWORD = 'rootpassword';
   const ADMINPASSWORD = 'adminpassword';
   const PAT = 'pat';
+  // Role-qualified secret purposes for external-storage credentials (#212). The
+  // credential-mapping layer appends the field-specific suffix (e.g.
+  // `.awssecretaccesskey`) so the source and packaged secrets never collide when
+  // saved under the same serviceId.
+  const EXT_SOURCE = 'extsource';
+  const EXT_PACKAGED = 'extpackaged';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -346,6 +360,28 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         const secretName = `${name}.${purpose}`;
         await saveSecret(serviceId, secretName, value, osc);
         return `{{secrets.${secretName}}}`;
+      };
+
+      // applyCredentialMapping realises a per-service ServiceCredentialMapping
+      // (#212) against a concrete serviceId: it saves every secret value as an
+      // OSC secret scoped to that serviceId (via secretRef) and merges the
+      // resulting {{secrets.*}} references with the mapping's non-secret config
+      // fields. The literal secret value never leaves saveSecret — only the
+      // reference is placed in the returned config object. The result is spread
+      // straight into a createInstance / createJob body.
+      const applyCredentialMapping = async (
+        serviceId: string,
+        mapping: ServiceCredentialMapping
+      ): Promise<Record<string, string>> => {
+        const fields: Record<string, string> = { ...mapping.configFields };
+        for (const secret of mapping.secrets) {
+          fields[secret.field] = await secretRef(
+            serviceId,
+            secret.purpose,
+            secret.value
+          );
+        }
+        return fields;
       };
 
       // Track what has been provisioned so a failure mid-stack can report
@@ -588,13 +624,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         if (!pat) {
           throw new Error('OSC_ACCESS_TOKEN is not configured');
         }
-        // The packager's AWS S3 secret is the MinIO root password, scoped to
-        // the eyevinn-encore-packager serviceId under the rootpassword purpose.
-        const packagerS3SecretRef = await secretRef(
-          'eyevinn-encore-packager',
-          ROOTPASSWORD,
-          minioRootPassword
-        );
         // The OSC personal access token is registered as a per-service secret
         // (scoped to eyevinn-encore-packager under the pat purpose) so it is
         // never exposed as plain text via describe-service-instance (#185).
@@ -603,6 +632,34 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           PAT,
           pat
         );
+        // Packaged-output credentials (#212). When the operator supplied an
+        // external packaged bucket, map its credentials onto the packager's
+        // Aws*/S3EndpointUrl/OutputFolder field names (the mapping enforces the
+        // `s3://<bucket>/` trailing-slash rule) and save each secret scoped to
+        // the eyevinn-encore-packager serviceId. When omitted, fall back exactly
+        // to the per-stack MinIO bucket + root-password credential (NO
+        // regression for MinIO-backed stacks).
+        const packagerStorageFields = packagedStorage
+          ? await applyCredentialMapping(
+              EXTERNAL_STORAGE_SERVICE_IDS.packager,
+              packagerCredentialMapping(
+                packagedStorage as ExternalStorageCredentials,
+                EXT_PACKAGED
+              )
+            )
+          : {
+              // MinIO fallback: the packager's AWS S3 secret is the MinIO root
+              // password, scoped to the eyevinn-encore-packager serviceId under
+              // the rootpassword purpose.
+              AwsAccessKeyId: 'admin',
+              AwsSecretAccessKey: await secretRef(
+                'eyevinn-encore-packager',
+                ROOTPASSWORD,
+                minioRootPassword
+              ),
+              S3EndpointUrl: minioEndpoint,
+              OutputFolder: `s3://${PACKAGED_BUCKET.replace(/\/+$/, '')}/`
+            };
         // CallbackUrl: the packager POSTs to {CallbackUrl}/packagerCallback/success
         // and .../failure. The internal route is mounted at /api/v1/internal
         // (internal.ts), so the base is publicBaseUrl/api/v1/internal.
@@ -613,16 +670,46 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         await provision('eyevinn-encore-packager', {
           RedisUrl: redisUrl,
           RedisQueue: 'encore-packager:jobs',
-          OutputFolder: `s3://${PACKAGED_BUCKET.replace(/\/+$/, '')}/`,
           PersonalAccessToken: packagerPatRef,
-          AwsAccessKeyId: 'admin',
-          AwsSecretAccessKey: packagerS3SecretRef,
-          S3EndpointUrl: minioEndpoint,
+          ...packagerStorageFields,
           ...(packagerCallbackUrl ? { CallbackUrl: packagerCallbackUrl } : {})
         });
         // The packager is a background queue-consumer — it does not expose a
         // synchronous health endpoint. waitForInstanceReady is skipped; the
         // instance starts asynchronously and picks up jobs from the Valkey queue.
+
+        // Source-reading services (#212). Encore (transcode job input) and
+        // eyevinn-ffmpeg-s3 (probe/thumbnail/remux) read from the SOURCE bucket.
+        // Both are created in a DIFFERENT lifecycle than this provision flow:
+        //   - encore instances are spawned on demand by the auto-scaler
+        //     (encore-scaler/instance-pool.ts:150 spawnInstance, ADR-006), and
+        //   - eyevinn-ffmpeg-s3 runs as a per-job ephemeral instance created via
+        //     createJob at request time (pipeline/osc-ffprobe.ts,
+        //     osc-thumbnail.ts, osc-rewrap.ts).
+        // Neither is created here, so we cannot pass their create bodies from
+        // this closure. What provisioning DOES own is the secret store: when the
+        // operator supplied an external source bucket we pre-register the source
+        // credentials as OSC secrets scoped to each of those serviceIds, so the
+        // runtime create/job paths can reference them via {{secrets.*}} without
+        // ever handling a plaintext value. The literal secret only reaches
+        // saveSecret; it is never persisted to the param store or logged. The
+        // non-secret coordinates (bucket/endpoint/region) are persisted in
+        // `storageMetadata` below and consumed by the runtime paths.
+        if (sourceStorage) {
+          const sourceCreds = sourceStorage as ExternalStorageCredentials;
+          // Save (but do not use here) the encore + ffmpeg-s3 source secrets so
+          // the reference names are established under each serviceId. applyCredentialMapping
+          // performs the saveSecret calls; the returned references are consumed
+          // by the scaler / per-job paths (they resolve the same secret name).
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.encore,
+            encoreCredentialMapping(sourceCreds, EXT_SOURCE)
+          );
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.ffmpegS3,
+            ffmpegS3CredentialMapping(sourceCreds, EXT_SOURCE)
+          );
+        }
 
         // Persist the stack's non-secret connection coordinates to the OSC
         // parameter store (issue #31, ADR-002) so the API — and deprovision
