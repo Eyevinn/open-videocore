@@ -744,8 +744,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // auto-subtitles service or object storage is not configured — consistent with
   // the OPTIONAL, opt-in nature of the step. Returns true when a generation was
   // actually kicked off (false = skipped gracefully).
-  function triggerSubtitles(assetId: string, objectKey: string): boolean {
-    if (!opts.subtitleGenerator || !storageFor) {
+  function triggerSubtitles(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+    // Activation is derived from the ACTIVE stack record (issue #217): the
+    // resolver builds the generator from StackConfig.autoSubtitlesInstanceName
+    // and exposes it on request.connections, so a freshly provisioned service is
+    // picked up on the next run with no restart. An injected opts.subtitle
+    // Generator (tests) still wins. Absent => skip gracefully (fire-and-forget).
+    const generate = opts.subtitleGenerator ?? request.connections?.subtitleGenerator;
+    if (!generate || !storageFor) {
       return false;
     }
     void subtitleRunner(
@@ -753,7 +759,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       {
         assets: repo,
         storage: storageFor(),
-        generate: opts.subtitleGenerator,
+        generate,
         ...opts.subtitleDeps
       }
     );
@@ -766,8 +772,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // eyevinn-function-scenes service or object storage is not configured —
   // consistent with the OPTIONAL, opt-in nature of the step. Returns true when a
   // detection was actually kicked off (false = skipped gracefully).
-  function triggerSceneDetect(assetId: string, objectKey: string): boolean {
-    if (!opts.sceneDetector || !storageFor) {
+  function triggerSceneDetect(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+    // Activation is derived from the ACTIVE stack record (issue #217): the
+    // resolver builds the detector from StackConfig.sceneDetectInstanceName and
+    // exposes it on request.connections, so a freshly provisioned service is
+    // picked up on the next run with no restart. An injected opts.sceneDetector
+    // (tests) still wins. Absent => skip gracefully (fire-and-forget).
+    const detect = opts.sceneDetector ?? request.connections?.sceneDetector;
+    if (!detect || !storageFor) {
       return false;
     }
     void sceneDetectRunner(
@@ -775,7 +787,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       {
         assets: repo,
         storage: storageFor(),
-        detect: opts.sceneDetector,
+        detect,
         ...opts.sceneDetectDeps
       }
     );
@@ -898,7 +910,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // gracefully when unconfigured) and settle the step immediately. The
           // generator records its own success/failure on the asset and never
           // throws into this loop, so the step never fails the pipeline.
-          triggerSubtitles(asset.id, asset.objectKey as string);
+          triggerSubtitles(asset.id, asset.objectKey as string, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -907,7 +919,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // skip gracefully when unconfigured) and settle the step immediately. The
           // detector records its own success/failure on the asset and never throws
           // into this loop, so the step never fails the pipeline.
-          triggerSceneDetect(asset.id, asset.objectKey as string);
+          triggerSceneDetect(asset.id, asset.objectKey as string, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
