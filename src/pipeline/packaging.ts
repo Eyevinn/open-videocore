@@ -135,6 +135,52 @@ export function packagingPublicBaseUrl(): string {
   return process.env['PACKAGED_PUBLIC_BASE_URL'] ?? `/${packagedBucket()}`;
 }
 
+// Delivery mode selects HOW packaged output is exposed to players (issue #201).
+//   - 'public': the packaged bucket is anonymously readable and delivery
+//     advertises the already-public CMAF manifest URLs (default; the existing
+//     behaviour).
+//   - 'proxy':  the packaged bucket stays private and packaged objects are
+//     streamed back through an authorized API route. Delivery advertises those
+//     proxy URLs instead, so no anonymous bucket read is required (useful for
+//     multi-tenant deployments).
+// The two modes are mutually selectable — never both active — because they have
+// deliberately different security postures. Config via env (12-factor), mirrors
+// how packagingPublicBaseUrl() reads PACKAGED_PUBLIC_BASE_URL above.
+export const DELIVERY_MODES = ['public', 'proxy'] as const;
+export type DeliveryMode = (typeof DELIVERY_MODES)[number];
+
+export function deliveryMode(): DeliveryMode {
+  const raw = process.env['DELIVERY_MODE']?.trim().toLowerCase();
+  if (raw === 'proxy') {
+    return 'proxy';
+  }
+  // Anything unset/unrecognised falls back to the safe, backwards-compatible
+  // default so an existing public-bucket deployment is unaffected.
+  return 'public';
+}
+
+// The URL prefix (relative to the assets router) under which packaged objects
+// are streamed back through the proxy route. Segment/manifest relative
+// references resolve under this prefix because the manifest is itself served
+// from `<prefix>/index.m3u8`.
+export function proxyStreamPrefix(assetId: string): string {
+  return `${assetId}/stream`;
+}
+
+// Build the proxy manifest URLs for an asset's packaged output (issue #201).
+// `apiBaseUrl` is the publicly reachable origin of THIS API (config via env,
+// PUBLIC_BASE_URL) up to and including the assets-router mount point, e.g.
+// `https://api.example/api/v1/assets`. When absent we fall back to a relative
+// path so a same-origin player still resolves the manifest and its (relative)
+// segment references back through the proxy.
+export function proxyManifestUrlsFor(assetId: string, apiBaseUrl: string): ManifestUrls {
+  const base = `${apiBaseUrl.replace(/\/+$/, '')}/${proxyStreamPrefix(assetId)}`;
+  return {
+    hls: `${base}/index.m3u8`,
+    dash: `${base}/manifest.mpd`
+  };
+}
+
 // Raised by `resolvePublicManifestUrl` when a stored manifest URL is not already
 // public and `PACKAGED_PUBLIC_BASE_URL` is unset/invalid, so we cannot resolve
 // it to a public-facing origin. The delivery endpoint surfaces this as a clear
