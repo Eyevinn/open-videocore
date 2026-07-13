@@ -126,6 +126,20 @@
                       "secretAccessKey"
                     ],
                     "additionalProperties": false
+                  },
+                  "options": {
+                    "type": "object",
+                    "properties": {
+                      "autoSubtitles": {
+                        "type": "boolean",
+                        "default": false
+                      },
+                      "sceneDetect": {
+                        "type": "boolean",
+                        "default": false
+                      }
+                    },
+                    "additionalProperties": false
                   }
                 },
                 "required": [
