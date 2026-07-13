@@ -3,10 +3,14 @@
 // These are long-lived service instances that are NOT part of the core
 // provisioned stack (STACK_SERVICES in stack.ts). Each is provisioned on its
 // own — auto-subtitles needs an OpenAI key; scene-detect needs nothing beyond a
-// name — and the runtime discovers the live instance from a per-service
-// instance-name environment variable (see main.ts):
+// name. The optional-services STATUS route reports the declared per-service
+// instance-name env var for the provision cards:
 //   - AUTO_SUBTITLES_INSTANCE_NAME → eyevinn-auto-subtitles
 //   - SCENE_DETECT_INSTANCE_NAME   → eyevinn-function-scenes
+// NOTE (issue #217): the RUNTIME pipeline no longer activates these steps from
+// the env vars — activation is derived from the ACTIVE stack record
+// (StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName). The env var
+// on each descriptor below drives only the status card, not step activation.
 //
 // This module is the single source of truth for that mapping so the
 // optional-services route (per-service status/provision/deprovision) and #187 /
@@ -48,9 +52,10 @@ export type OptionalServiceDescriptor = {
   serviceId: string;
   // Human-readable label (matches the OSC catalog display name).
   displayName: string;
-  // The environment variable the RUNTIME (main.ts) reads to discover the
-  // provisioned instance name. The status endpoint reports the SAME source of
-  // truth so a card never disagrees with what the pipeline actually wired.
+  // The environment variable that declares the provisioned instance name for
+  // the optional-services STATUS card. As of issue #217 the pipeline activates
+  // from the stack record, not this env var; the card reports the deployment's
+  // declared config while step activation follows the provisioned stack.
   instanceNameEnvVar: string;
   // The config fields accepted by POST /:key/provision, in body order.
   fields: OptionalServiceField[];

@@ -29,6 +29,14 @@ import {
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES
 } from '../services/stack.js';
+import {
+  EXTERNAL_STORAGE_SERVICE_IDS,
+  type ExternalStorageCredentials,
+  type ServiceCredentialMapping,
+  encoreCredentialMapping,
+  ffmpegS3CredentialMapping,
+  packagerCredentialMapping
+} from '../services/external-storage-credentials.js';
 import type { OperationStore } from '../services/operation-store.js';
 import type { WorkspaceEncoreScalerRegistry } from '../encore-scaler/workspace-registry.js';
 
@@ -54,7 +62,13 @@ const externalStorageSchema = z.object({
   secretAccessKey: z.string().min(1),
   region: z.string().min(1).optional(),
   endpointUrl: z.string().url().optional(),
-  sessionToken: z.string().min(1).optional()
+  sessionToken: z.string().min(1).optional(),
+  // OPTIONAL public origin fronting the bucket (e.g. a CDN origin) for operators
+  // who serve the packaged/source objects through a public host rather than the
+  // raw object-store endpoint (issue #213). NON-SECRET: a plain origin URL, it
+  // OVERRIDES the derived endpointUrl-based host when delivery URLs are emitted.
+  // When unset, delivery URLs are derived from endpointUrl/region + bucket.
+  publicBaseUrl: z.string().url().optional()
 });
 
 type ExternalStorage = z.infer<typeof externalStorageSchema>;
@@ -182,7 +196,10 @@ const storageBackendSchema = z.object({
   backend: z.enum(['minio', 'external']),
   bucket: z.string(),
   endpointUrl: z.string().optional(),
-  region: z.string().optional()
+  region: z.string().optional(),
+  // Optional public/CDN origin fronting the bucket (issue #213). Absent for
+  // configs written before this field existed, and for the minio backend.
+  publicBaseUrl: z.string().optional()
 });
 
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
@@ -199,6 +216,16 @@ const storedConfigSchema = z.object({
   // validate. Mirrors StackConfig.autoSubtitlesInstanceName/sceneDetectInstanceName.
   autoSubtitlesInstanceName: z.string().optional(),
   sceneDetectInstanceName: z.string().optional(),
+  // Derived, read-only optional-service activation summary (issue #218). Surfaces
+  // which opt-in services a stack has activated as plain booleans so a consumer
+  // does not have to know that activation is signalled by the presence of the
+  // *InstanceName fields above. ADDITIVE + back-compat: this is NOT part of the
+  // stored StackConfig — the GET handler adds it ONLY when at least one optional
+  // service is active, so a config with no optional services serialises exactly
+  // as it was stored (existing GET /:name equality contract is preserved).
+  options: z
+    .object({ autoSubtitles: z.boolean(), sceneDetect: z.boolean() })
+    .optional(),
   // Optional per-role storage backend metadata (issue #211). Absent for configs
   // written before this field existed (both roles then default to MinIO).
   storage: z
@@ -305,6 +332,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   const PAT = 'pat';
   // Secret purpose for the OpenAI key handed to eyevinn-auto-subtitles (#216).
   const OPENAIKEY = 'openaikey';
+  // Role-qualified secret purposes for external-storage credentials (#212). The
+  // credential-mapping layer appends the field-specific suffix (e.g.
+  // `.awssecretaccesskey`) so the source and packaged secrets never collide when
+  // saved under the same serviceId.
+  const EXT_SOURCE = 'extsource';
+  const EXT_PACKAGED = 'extpackaged';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -344,7 +377,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               backend: 'external',
               bucket: block.bucket,
               ...(block.endpointUrl ? { endpointUrl: block.endpointUrl } : {}),
-              ...(block.region ? { region: block.region } : {})
+              ...(block.region ? { region: block.region } : {}),
+              // Optional public/CDN origin fronting the bucket (issue #213).
+              // NON-SECRET: a plain origin URL. When present it overrides the
+              // endpointUrl-derived host for emitted delivery/manifest URLs.
+              ...(block.publicBaseUrl ? { publicBaseUrl: block.publicBaseUrl } : {})
             }
           : { backend: 'minio', bucket: defaultBucket };
 
@@ -375,6 +412,28 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         const secretName = `${name}.${purpose}`;
         await saveSecret(serviceId, secretName, value, osc);
         return `{{secrets.${secretName}}}`;
+      };
+
+      // applyCredentialMapping realises a per-service ServiceCredentialMapping
+      // (#212) against a concrete serviceId: it saves every secret value as an
+      // OSC secret scoped to that serviceId (via secretRef) and merges the
+      // resulting {{secrets.*}} references with the mapping's non-secret config
+      // fields. The literal secret value never leaves saveSecret — only the
+      // reference is placed in the returned config object. The result is spread
+      // straight into a createInstance / createJob body.
+      const applyCredentialMapping = async (
+        serviceId: string,
+        mapping: ServiceCredentialMapping
+      ): Promise<Record<string, string>> => {
+        const fields: Record<string, string> = { ...mapping.configFields };
+        for (const secret of mapping.secrets) {
+          fields[secret.field] = await secretRef(
+            serviceId,
+            secret.purpose,
+            secret.value
+          );
+        }
+        return fields;
       };
 
       // Track what has been provisioned so a failure mid-stack can report
@@ -521,6 +580,44 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
         }
 
+        // 1d. Apply an anonymous (public) read-only bucket policy to the
+        // PACKAGED bucket ONLY (issue #199) so HLS/DASH players can GET
+        // manifests/segments without a bearer token. The SOURCE bucket MUST
+        // stay private, so this loop deliberately targets PACKAGED_BUCKET
+        // alone (unlike the bucket/CORS loops above, which iterate both).
+        //
+        // Policy: allow only s3:GetObject for principal '*' on the packaged
+        // object prefix (arn:aws:s3:::<packaged>/*). No ListBucket, no write —
+        // objects are readable by exact key but the bucket is not browsable.
+        // setBucketPolicy(bucketName, policyJSON) is idempotent (it overwrites
+        // any existing policy), so re-provision converges. Best-effort with the
+        // same retry/backoff shape as the CORS loop: a policy failure must not
+        // fail a re-provision of an otherwise-healthy stack.
+        const packagedPolicy = JSON.stringify({
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Effect: 'Allow',
+              Principal: { AWS: ['*'] },
+              Action: ['s3:GetObject'],
+              Resource: [`arn:aws:s3:::${PACKAGED_BUCKET}/*`]
+            }
+          ]
+        });
+        {
+          let attempts = 0;
+          while (true) {
+            try {
+              await minioClient.setBucketPolicy(PACKAGED_BUCKET, packagedPolicy);
+              break;
+            } catch {
+              attempts++;
+              if (attempts >= 5) break; // best-effort — don't block provision
+              await delay(3000);
+            }
+          }
+        }
+
         // 2. CouchDB — document store for asset metadata.
         currentService = 'apache-couchdb';
         const couchdbAdminPasswordRef = await secretRef(
@@ -585,13 +682,6 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         if (!pat) {
           throw new Error('OSC_ACCESS_TOKEN is not configured');
         }
-        // The packager's AWS S3 secret is the MinIO root password, scoped to
-        // the eyevinn-encore-packager serviceId under the rootpassword purpose.
-        const packagerS3SecretRef = await secretRef(
-          'eyevinn-encore-packager',
-          ROOTPASSWORD,
-          minioRootPassword
-        );
         // The OSC personal access token is registered as a per-service secret
         // (scoped to eyevinn-encore-packager under the pat purpose) so it is
         // never exposed as plain text via describe-service-instance (#185).
@@ -600,21 +690,48 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           PAT,
           pat
         );
+        // Packaged-output credentials (#212). When the operator supplied an
+        // external packaged bucket, map its credentials onto the packager's
+        // Aws*/S3EndpointUrl/OutputFolder field names (the mapping enforces the
+        // `s3://<bucket>/` trailing-slash rule) and save each secret scoped to
+        // the eyevinn-encore-packager serviceId. When omitted, fall back exactly
+        // to the per-stack MinIO bucket + root-password credential (NO
+        // regression for MinIO-backed stacks).
+        const packagerStorageFields = packagedStorage
+          ? await applyCredentialMapping(
+              EXTERNAL_STORAGE_SERVICE_IDS.packager,
+              packagerCredentialMapping(
+                packagedStorage as ExternalStorageCredentials,
+                EXT_PACKAGED
+              )
+            )
+          : {
+              // MinIO fallback: the packager's AWS S3 secret is the MinIO root
+              // password, scoped to the eyevinn-encore-packager serviceId under
+              // the rootpassword purpose.
+              AwsAccessKeyId: 'admin',
+              AwsSecretAccessKey: await secretRef(
+                'eyevinn-encore-packager',
+                ROOTPASSWORD,
+                minioRootPassword
+              ),
+              S3EndpointUrl: minioEndpoint,
+              OutputFolder: `s3://${PACKAGED_BUCKET.replace(/\/+$/, '')}/`
+            };
         // CallbackUrl: the packager POSTs to {CallbackUrl}/packagerCallback/success
         // and .../failure. The internal route is mounted at /api/v1/internal
         // (internal.ts), so the base is publicBaseUrl/api/v1/internal.
-        // Omitted when PUBLIC_BASE_URL is unset (local dev without a tunnel).
+        // publicBaseUrl comes from the single resolvePublicBaseUrl() seam
+        // (issue #219). Omitted when unresolved (local dev without a tunnel),
+        // exactly as when PUBLIC_BASE_URL was read directly.
         const packagerCallbackUrl = publicBaseUrl
           ? `${publicBaseUrl}/api/v1/internal`
           : undefined;
         await provision('eyevinn-encore-packager', {
           RedisUrl: redisUrl,
           RedisQueue: 'encore-packager:jobs',
-          OutputFolder: `s3://${PACKAGED_BUCKET.replace(/\/+$/, '')}/`,
           PersonalAccessToken: packagerPatRef,
-          AwsAccessKeyId: 'admin',
-          AwsSecretAccessKey: packagerS3SecretRef,
-          S3EndpointUrl: minioEndpoint,
+          ...packagerStorageFields,
           ...(packagerCallbackUrl ? { CallbackUrl: packagerCallbackUrl } : {})
         });
         // The packager is a background queue-consumer — it does not expose a
@@ -665,6 +782,39 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           await provision(SCENE_DETECT_SERVICE_ID, {});
           await waitForInstanceReady(SCENE_DETECT_SERVICE_ID, name, osc);
           sceneDetectInstanceName = name;
+        }
+
+        // Source-reading services (#212). Encore (transcode job input) and
+        // eyevinn-ffmpeg-s3 (probe/thumbnail/remux) read from the SOURCE bucket.
+        // Both are created in a DIFFERENT lifecycle than this provision flow:
+        //   - encore instances are spawned on demand by the auto-scaler
+        //     (encore-scaler/instance-pool.ts:150 spawnInstance, ADR-006), and
+        //   - eyevinn-ffmpeg-s3 runs as a per-job ephemeral instance created via
+        //     createJob at request time (pipeline/osc-ffprobe.ts,
+        //     osc-thumbnail.ts, osc-rewrap.ts).
+        // Neither is created here, so we cannot pass their create bodies from
+        // this closure. What provisioning DOES own is the secret store: when the
+        // operator supplied an external source bucket we pre-register the source
+        // credentials as OSC secrets scoped to each of those serviceIds, so the
+        // runtime create/job paths can reference them via {{secrets.*}} without
+        // ever handling a plaintext value. The literal secret only reaches
+        // saveSecret; it is never persisted to the param store or logged. The
+        // non-secret coordinates (bucket/endpoint/region) are persisted in
+        // `storageMetadata` below and consumed by the runtime paths.
+        if (sourceStorage) {
+          const sourceCreds = sourceStorage as ExternalStorageCredentials;
+          // Save (but do not use here) the encore + ffmpeg-s3 source secrets so
+          // the reference names are established under each serviceId. applyCredentialMapping
+          // performs the saveSecret calls; the returned references are consumed
+          // by the scaler / per-job paths (they resolve the same secret name).
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.encore,
+            encoreCredentialMapping(sourceCreds, EXT_SOURCE)
+          );
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.ffmpegS3,
+            ffmpegS3CredentialMapping(sourceCreds, EXT_SOURCE)
+          );
         }
 
         // Persist the stack's non-secret connection coordinates to the OSC
@@ -838,7 +988,18 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       if (!config) {
         return reply.code(404).send({ error: `no stored config for stack "${name}"` });
       }
-      return reply.code(200).send(config);
+      // Surface which optional opt-in services are active (issue #218) as a
+      // derived boolean summary. Only attach `options` when at least one is
+      // active so a stack with no optional services serialises exactly as stored
+      // (preserves the GET /:name response-equality contract). The raw
+      // *InstanceName fields are already passed through verbatim above.
+      const autoSubtitles = Boolean(config.autoSubtitlesInstanceName);
+      const sceneDetect = Boolean(config.sceneDetectInstanceName);
+      const withOptions =
+        autoSubtitles || sceneDetect
+          ? { ...config, options: { autoSubtitles, sceneDetect } }
+          : config;
+      return reply.code(200).send(withOptions);
     }
   );
 
@@ -925,10 +1086,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
           // Teardown order and the instance set come from what was actually
           // provisioned (the stored services[]), not the static STACK_SERVICES.
+          // Optional opt-in services (issue #218) recorded on the config are
+          // torn down too: their instance names are passed alongside services[]
+          // and deprovisionStackFromConfig merges (and dedupes) them so a stack
+          // that activated auto-subtitles or scene-detect is fully removed.
           const result = await deprovisionStackFromConfig(
             osc,
             name,
-            config.services
+            config.services,
+            {
+              ...(config.autoSubtitlesInstanceName
+                ? { autoSubtitlesInstanceName: config.autoSubtitlesInstanceName }
+                : {}),
+              ...(config.sceneDetectInstanceName
+                ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
+                : {})
+            }
           );
 
           if (result.status === 'failed') {
