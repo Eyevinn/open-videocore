@@ -1,8 +1,14 @@
 # ADR-001: OSC stack for eng-open-videocore
 
-**Status:** APPROVED 2026-06-01
+**Status:** APPROVED 2026-06-01 (amended 2026-07-13, see Amendments)
 **Date:** 2026-06-01
 **Architect agent:** claude-opus-4-8
+
+---
+
+## Amendments
+
+- **2026-07-13 — On-demand packaging provisioning (epic #226, issues #243–#246).** The packaging chain (`eyevinn-encore-packager`) is **no longer provisioned eagerly** as part of the stack. It is now provisioned lazily on the first pipeline execution that includes a packaging step, reused by subsequent executions, and torn down on stack deprovision. Rationale: a freshly provisioned stack drops from four to three OSC instances and mints no packager secrets/tokens until packaging is actually used (provision-time token savings), at the cost of a one-time cold start on the first packaging execution while the packager instance is created and becomes ready. This supersedes Day-1 step 13 and the "provisioned eagerly" framing in the Decision and Consequences sections below. Idle teardown of the on-demand packager is a noted follow-up and is not yet implemented. See README "On-demand packaging provisioning" for the operator-facing description.
 
 ---
 
@@ -90,7 +96,7 @@ OSC-first deployment is the default. The infra agent runs the following calls in
 | 10 | `mcp__osc__create-service-instance` | `encore` | dev | Encore API reachable; base URL captured | `ENCORE_URL` | infra |
 | 11 | `mcp__osc__set-parameter` | Encore base URL | dev | Parameter readable | `ENCORE_URL` | infra |
 | 12 | `mcp__osc__create-service-instance` | `eyevinn-encore-callback-listener` | dev | Callback listener running; configured with `REDIS_URL` from step 8 | `ENCORE_CALLBACK_URL` | infra |
-| 13 | `mcp__osc__create-service-instance` | `eyevinn-encore-packager` | dev | Packager running; listening on Valkey queue | n/a (reads `REDIS_URL` + `MINIO_*` from env) | infra |
+| 13 | ~~`mcp__osc__create-service-instance`~~ (superseded 2026-07-13) | `eyevinn-encore-packager` | dev | **No longer provisioned here.** Provisioned on demand on the first packaging execution (epic #226, issues #243–#246); torn down on stack deprovision | n/a (reads `REDIS_URL` + `MINIO_*` from env) | infra |
 | 14 | `mcp__osc__schedule-backup` | `apache-couchdb` instance | dev | Daily backup to MinIO bucket `openvideocore-backups` scheduled | n/a | infra |
 | 15 | `mcp__osc__schedule-backup` | `birme-osc-postgresql` instance | dev | Daily backup scheduled | n/a | infra |
 
