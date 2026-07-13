@@ -52,6 +52,10 @@ import {
   deliveryUrlTtlSeconds,
 } from '../data/storage.js';
 import { parseSource, assertPublicHost, SourceValidationError } from '../pipeline/source.js';
+import {
+  resolvePublicManifestUrl,
+  PublicManifestBaseUrlError
+} from '../pipeline/packaging.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
 import {
   extractTechnicalMetadata,
@@ -1241,13 +1245,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const ttl = deliveryUrlTtlSeconds();
       const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
-      // Preferred: packaged streaming manifests (issue #9). Already public URLs.
+      // Preferred: packaged streaming manifests (issue #9). Stored manifest URLs
+      // may be built from a relative/internal packaged base (see
+      // packagingPublicBaseUrl); resolve each to the public-facing MinIO/CDN
+      // origin at read time (issue #200) so callers get a fetchable URL. A
+      // missing/invalid public origin is surfaced as an explicit 501, not a
+      // silently returned relative/internal path.
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
-        return reply.code(200).send({
-          assetId: asset.id,
-          urls: { hls: asset.manifestUrls.hls, dash: asset.manifestUrls.dash },
-          expiresAt
-        });
+        try {
+          const hls = asset.manifestUrls.hls
+            ? resolvePublicManifestUrl(asset.manifestUrls.hls)
+            : undefined;
+          const dash = asset.manifestUrls.dash
+            ? resolvePublicManifestUrl(asset.manifestUrls.dash)
+            : undefined;
+          return reply.code(200).send({
+            assetId: asset.id,
+            urls: { hls, dash },
+            expiresAt
+          });
+        } catch (err) {
+          if (err instanceof PublicManifestBaseUrlError) {
+            return reply.code(501).send({
+              error: 'not_configured',
+              message: err.message
+            });
+          }
+          throw err;
+        }
       }
 
       // Fallback: presigned download of the raw source object.
