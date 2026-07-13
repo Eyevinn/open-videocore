@@ -84,6 +84,13 @@ Provisioning is asynchronous. Poll the returned `operationId` until `status` rea
 curl https://<your-instance>/api/v1/provision/operations/<operationId>
 ```
 
+By default the stack provisions its own MinIO instance and buckets — no storage
+configuration is required. To point the source and/or packaged-output roles at
+an existing AWS-region or S3-compatible bucket instead, pass the optional
+`sourceStorage` / `packagedStorage` blocks. See
+[Provisioning with external S3-compatible storage](docs/guides/provisioning-external-storage.md)
+for every field, worked examples, and the CDN-origin pattern.
+
 List, inspect, and tear down stacks:
 
 ```bash
