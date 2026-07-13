@@ -240,3 +240,66 @@ export async function ensurePackagerProvisioned(
   }
   return { status: 'created', instanceName: name };
 }
+
+// Per-stack single-flight guard for the ensure step (issue #245).
+//
+// Two layers make on-demand provisioning idempotent + concurrency-safe:
+//
+//   1. In-process single-flight (this class): N concurrent first-execution
+//      requests for the SAME stack name collapse onto ONE in-flight
+//      ensurePackagerProvisioned promise. The other N-1 callers await that same
+//      promise instead of each racing to createInstance. This is what stops a
+//      burst of concurrent requests within one process from creating duplicate
+//      packagers.
+//
+//   2. Ground-truth reconciliation (inside ensurePackagerProvisioned): the run
+//      first getInstance-checks OSC and treats a create "already taken" error as
+//      success. An in-process lock alone does NOT survive a process restart mid-
+//      provision — but because every run reconciles against the live OSC
+//      instance list, a restart (which empties this map) self-heals: the next
+//      run sees the running/half-created instance and returns 'exists' rather
+//      than orphaning or duplicating it.
+//
+// The in-flight promise is cleared when it settles (success OR failure) so a
+// failed ensure does not wedge the stack — the next request re-attempts. Keyed
+// by stack name so different stacks never block each other.
+//
+// Exported and dependency-injected (the runner is passed in) so it is unit-
+// testable without a live OSC: a test can fire many run() calls concurrently
+// against a fake runner and assert the runner was invoked exactly once per
+// stack. NOTE: issue #245's acceptance asks for a concurrency test; per the
+// test-file write-hook policy this agent does NOT author test files — the guard
+// is implemented as this injectable single-flight primitive and the test is
+// DEFERRED to a human/reviewer (see the PR body).
+export class PackagerEnsureSingleFlight {
+  // stackName -> the currently in-flight ensure promise for that stack.
+  private inFlight = new Map<string, Promise<EnsurePackagerResult>>();
+
+  constructor(
+    // The ensure runner to single-flight. Defaults to the real
+    // ensurePackagerProvisioned; injectable so tests can supply a counting fake.
+    private readonly runner: (
+      deps: EnsurePackagerDeps
+    ) => Promise<EnsurePackagerResult> = ensurePackagerProvisioned
+  ) {}
+
+  // Run the ensure step for deps.coords.stackName under the single-flight guard.
+  // Concurrent calls for the same stack name share one runner invocation; the
+  // resolved/rejected result is fanned out to every caller. Distinct stack names
+  // run independently.
+  async run(deps: EnsurePackagerDeps): Promise<EnsurePackagerResult> {
+    const key = deps.coords.stackName;
+    const existing = this.inFlight.get(key);
+    if (existing) return existing;
+
+    const promise = (async () => this.runner(deps))().finally(() => {
+      // Clear only if this promise is still the registered one (a later run
+      // that started after we settled must not be evicted).
+      if (this.inFlight.get(key) === promise) {
+        this.inFlight.delete(key);
+      }
+    });
+    this.inFlight.set(key, promise);
+    return promise;
+  }
+}
