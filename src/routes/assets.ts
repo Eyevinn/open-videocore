@@ -550,6 +550,15 @@ type AssetsRouterOptions = {
   packaging?: import('../pipeline/packaging.js').PackagingService;
   // Redis for resolving Encore instance URL at packaging time.
   packagingRedis?: import('ioredis').Redis;
+  // On-demand packager provisioning (epic #226, issue #244). Invoked the first
+  // time a pipeline reaches a `package` step: it provisions + wires the Encore
+  // packager to the shared queue and output storage if absent, waits for
+  // readiness, then resolves — so the packaging job is only enqueued once the
+  // packager is live. Idempotent + concurrency-safe (issue #245): subsequent
+  // executions reuse the running instance. When absent (e.g. the stack Valkey is
+  // not active, or in tests that pre-wire packaging), packaging proceeds without
+  // an ensure step. Throwing rejects the pipeline's package step with a 502.
+  ensurePackaging?: () => Promise<void>;
   // PipelineExecution tracking (POST /:id/execute). When absent, the execute
   // route and pipeline-mode packaging respond 501.
   pipelineRepository?: PipelineRepository;
@@ -1096,6 +1105,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           break; // async — advanced by encore-callback
         }
         if (step.name === 'package') {
+          // On-demand packager provisioning (epic #226, issue #244): ensure the
+          // Encore packager is provisioned + wired + ready BEFORE enqueueing the
+          // packaging job, so the job is never dropped onto a queue no consumer
+          // is reading. Idempotent/concurrency-safe (issue #245): a reused
+          // running instance returns immediately. When no ensure hook is wired
+          // (the queue stack isn't active, or a test pre-wires packaging) this is
+          // skipped and packaging proceeds as before. A provisioning failure
+          // throws into the surrounding try/catch and fails the package step.
+          if (opts.ensurePackaging) {
+            await opts.ensurePackaging();
+          }
           void opts.packaging!.triggerPackaging(asset.id, '');
           stepsCopy[i] = { ...step, status: 'running', startedAt: now() };
           break; // async — advanced by packager callback
@@ -1960,6 +1980,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const encoreJobUrl = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
       if (!encoreJobUrl) {
         return reply.code(409).send({ error: 'instance_not_found', message: 'Encore instance no longer in pool — cannot resolve job URL for packaging' });
+      }
+      // On-demand packager provisioning (epic #226, issue #244): the direct
+      // package path also ensures the packager is live before enqueueing, so a
+      // job is never dropped onto an unconsumed queue. Idempotent/concurrency-
+      // safe (#245). A provisioning failure surfaces as 502.
+      if (opts.ensurePackaging) {
+        try {
+          await opts.ensurePackaging();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return reply.code(502).send({ error: 'packager_provisioning_failed', message });
+        }
       }
       void opts.packaging.triggerPackaging(asset.id, encoreJobUrl);
       return reply.code(202).send({ ok: true });
