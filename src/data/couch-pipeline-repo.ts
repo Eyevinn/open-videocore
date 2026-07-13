@@ -34,6 +34,7 @@ export class CouchPipelineRepository implements PipelineRepository {
     assetId: string;
     pipelineName: string;
     steps: PipelineStepName[];
+    destinationBucket?: string;
   }): Promise<PipelineExecution> {
     const couch = this.couchFor();
     const now = new Date().toISOString();
@@ -44,6 +45,9 @@ export class CouchPipelineRepository implements PipelineRepository {
       pipelineName: input.pipelineName,
       status: 'running',
       steps: input.steps.map((name) => ({ name, status: 'pending' })),
+      ...(input.destinationBucket !== undefined
+        ? { destinationBucket: input.destinationBucket }
+        : {}),
       createdAt: now,
       updatedAt: now
     };
@@ -136,6 +140,9 @@ function toDoc(execution: PipelineExecution): Record<string, unknown> {
     pipelineName: execution.pipelineName,
     status: execution.status,
     steps: execution.steps,
+    ...(execution.destinationBucket !== undefined
+      ? { destinationBucket: execution.destinationBucket }
+      : {}),
     createdAt: execution.createdAt,
     updatedAt: execution.updatedAt
   };
@@ -162,6 +169,9 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
     pipelineName: String(doc['pipelineName'] ?? ''),
     status: doc['status'] as PipelineExecution['status'],
     steps,
+    ...(typeof doc['destinationBucket'] === 'string'
+      ? { destinationBucket: doc['destinationBucket'] }
+      : {}),
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };
