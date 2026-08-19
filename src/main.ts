@@ -852,7 +852,9 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository,
-  commentRepository
+  commentRepository,
+  // Profile store for per-profile profileParams key validation (issue #290).
+  profileRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
 

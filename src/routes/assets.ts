@@ -63,6 +63,8 @@ import {
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import { validateProfileParams } from '../pipeline/profile-params.js';
+import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
   type GenerateSubtitlesDeps,
@@ -577,6 +579,12 @@ type AssetsRouterOptions = {
   // Asset comments (issue #135). Injectable for tests; defaults to an in-memory
   // repository so the comments sub-resource always works.
   commentRepository?: CommentRepository;
+  // Operator-managed Encore profile store (issue #84). Used by POST
+  // /:id/transcode to validate profileParams keys against the SpEL params the
+  // chosen profile actually declares (issue #290). When absent, profileParams
+  // key validation is skipped (permissive) so the transcode route still works
+  // in deployments/tests that do not wire the profile store.
+  profileRepository?: ProfileRepository;
 };
 
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
@@ -1883,6 +1891,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: transcodeBodySchema,
         response: {
           202: transcodeAcceptedSchema,
+          400: errorSchema,
           404: errorSchema,
           409: errorSchema,
           501: errorSchema,
@@ -1906,6 +1915,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           error: 'not_configured',
           message: 'transcoding is not configured'
         });
+      }
+      // Validate profileParams keys against the SpEL params the chosen profile
+      // actually declares (issue #290). We resolve the profile YAML from the
+      // operator-managed profile store — the same profiles GET /api/v1/profiles
+      // serves and Encore loads — and reject keys that profile does not declare
+      // with a descriptive 400, so a mistyped SpEL param name is an actionable
+      // error rather than a silently-ignored value. Degrades gracefully: a
+      // custom profile (not in the store) or an unresolvable profile is treated
+      // permissively (validateProfileParams passes an undefined YAML through), so
+      // custom/operator profiles are never falsely rejected. An empty/absent map
+      // always passes.
+      if (request.body.profileParams && !request.body.customProfile) {
+        const profileName = request.body.profile ?? 'program';
+        const stored = opts.profileRepository
+          ? await opts.profileRepository.get(profileName)
+          : undefined;
+        const check = validateProfileParams({
+          profileName,
+          profileYaml: stored?.yaml,
+          profileParams: request.body.profileParams
+        });
+        if (!check.ok) {
+          return reply.code(400).send({
+            error: 'unknown_profile_params',
+            message: check.message
+          });
+        }
       }
       try {
         const result = await submitTranscode(
