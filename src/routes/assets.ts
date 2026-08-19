@@ -96,6 +96,8 @@ import {
   proxyManifestUrlsFor
 } from '../pipeline/packaging.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
+import type { ProfileRepository } from '../data/profile-repo.js';
+import { isProfileRunnable } from '../services/profile-runnability.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
@@ -565,6 +567,13 @@ type AssetsRouterOptions = {
   // Asset comments (issue #135). Injectable for tests; defaults to an in-memory
   // repository so the comments sub-resource always works.
   commentRepository?: CommentRepository;
+  // Encore transcoding profile store (issue #84). When present, a transcode that
+  // names a stored profile is validated against it before submission: a GPU-only
+  // (NVENC/CUDA) profile that cannot run on this platform tier is rejected 422
+  // rather than submitted to an Encore instance that cannot execute it (issue
+  // #286). When absent (e.g. tests that do not exercise named profiles), the
+  // check is skipped and the profile name is forwarded as before.
+  profileRepository?: ProfileRepository;
 };
 
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
@@ -830,6 +839,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const clipRunnerOrchestrator = opts.clip ?? runClip;
   const storageFor = opts.storageFor;
 
+  // Resolve whether a named transcode profile can execute on this platform tier
+  // (issue #286). Returns a human message when the profile is a stored GPU-only
+  // (NVENC/CUDA) profile that cannot run on OSC's CPU-only Encore instances, so
+  // the caller can reject with a clear 422 instead of submitting an unrunnable
+  // job. Returns undefined (allow) when: no profile store is wired; no profile
+  // name was given (preset defaults handle it); the named profile is unknown to
+  // the store (forwarded verbatim as before — Encore resolves or rejects it); or
+  // the named profile is runnable.
+  async function unrunnableProfileReason(profileName: string | undefined): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const stored = await opts.profileRepository.get(profileName);
+    if (!stored) return undefined;
+    if (isProfileRunnable(stored.yaml)) return undefined;
+    return `profile "${profileName}" requires GPU (NVENC/CUDA) hardware encoding, which is not available on this platform — choose a CPU-encoded profile`;
+  }
+
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
@@ -992,6 +1017,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
 
     void firstStep; // pre-flight above used firstStep; execution drives the loop
+
+    // Reject a named GPU-only (NVENC/CUDA) profile the platform cannot execute
+    // (issue #286) up front, when the pipeline includes a transcode step, so no
+    // dangling running execution is created for a job Encore cannot run.
+    if (steps.includes('transcode')) {
+      const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
+      if (unrunnable) {
+        reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+        return undefined;
+      }
+    }
 
     // Pre-flight the per-execution destination override against the configured
     // storage credentials (issue #209). A caller can supply a destination whose
@@ -1873,6 +1909,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           202: transcodeAcceptedSchema,
           404: errorSchema,
           409: errorSchema,
+          422: errorSchema,
           501: errorSchema,
           502: errorSchema
         }
@@ -1894,6 +1931,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           error: 'not_configured',
           message: 'transcoding is not configured'
         });
+      }
+      // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
+      // platform tier (issue #286) before submitting to Encore.
+      const unrunnable = await unrunnableProfileReason(request.body.profile);
+      if (unrunnable) {
+        return reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
       }
       try {
         const result = await submitTranscode(
