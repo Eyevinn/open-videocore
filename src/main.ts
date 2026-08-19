@@ -61,6 +61,7 @@ import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
+import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
@@ -448,6 +449,11 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
+// Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
+// transcode still non-terminal after this long whose Encore record has been
+// garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
+// than left running forever. Defaults to 30 minutes.
+const encoreStallTimeoutMs = parseInt(process.env['ENCORE_STALL_TIMEOUT_MS'] || String(30 * 60 * 1000), 10);
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -608,6 +614,30 @@ function activateScaler(redisUrl: string): void {
       if (job.assetId) {
         await assetRepository.update(job.assetId, { status: 'processing' });
       }
+    },
+    // Once per tick, reconcile transcode jobs stuck non-terminal against Encore's
+    // terminal FAILED / garbage-collected (404) outcomes (issue #273). A failed
+    // Encore job never produces a completion message (the callback listener only
+    // enqueues SUCCESSFUL jobs), so without this the VideoCore job stays
+    // `running` and its asset `processing` forever. The scaler owns no repos, so
+    // we supply the repo-driven sweep here; `scalerRegistry` is the EncoreClient
+    // whose getJobStatus() polls Encore. Best-effort: errors are swallowed inside
+    // the sweep so a reconcile failure never breaks the tick.
+    reconcileFailedTranscodes: async () => {
+      await reconcileFailedTranscodes({
+        jobs: jobRepository,
+        assets: assetRepository,
+        pipeline: pipelineRepository,
+        // scalerRegistry implements EncoreClient; getJobStatus() decodes the
+        // workspace from the encore job id and polls the right instance. It is
+        // assigned below (encore = scalerRegistry) before any tick fires.
+        encore: scalerRegistry!,
+        stallTimeoutMs: encoreStallTimeoutMs,
+        logger: {
+          info: (...a: unknown[]) => app.log.info(a),
+          warn: (...a: unknown[]) => app.log.warn(a)
+        }
+      });
     }
   });
   encore = scalerRegistry;

@@ -80,6 +80,26 @@ export class EncoreScalerLoop {
     //    in-progress job count before making any scaling/dispatch decision.
     await this.reconcile();
 
+    // 0b. Reconcile transcode jobs stuck in a non-terminal state against
+    //     Encore's terminal FAILED / garbage-collected (404) outcomes (#273).
+    //     A failed Encore job never produces a completion message (the callback
+    //     listener only enqueues SUCCESSFUL jobs), so without this sweep the
+    //     VideoCore job stays `running` and its asset `processing` forever. The
+    //     sweep is repo-driven and lives in main.ts (the scaler owns no repos),
+    //     wired via this callback. Best-effort: a sweep failure must never break
+    //     the tick's scaling/dispatch work.
+    if (this.config.reconcileFailedTranscodes) {
+      try {
+        await this.config.reconcileFailedTranscodes();
+      } catch (err) {
+        console.error(
+          '[encore-scaler] failed-transcode reconcile error (workspace=%s):',
+          this.config.workspaceId,
+          err
+        );
+      }
+    }
+
     // 1. Pending work.
     const pending = await redis.llen(keys.queue(workspaceId));
 

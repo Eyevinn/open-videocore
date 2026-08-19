@@ -63,6 +63,13 @@ export type EncoreScalerConfig = {
   // `queued` to `running`. Best-effort: failures are swallowed so a repo hiccup
   // never re-queues an already-dispatched job.
   onDispatched?: (encoreJobId: string) => Promise<void>;
+  // Invoked once per tick to reconcile transcode jobs stuck in a non-terminal
+  // state against Encore's terminal FAILED/404 outcomes (issue #273). The scaler
+  // has no job repository of its own, so main.ts wires this up to run the
+  // failed-transcode reconciliation sweep (src/pipeline/failed-transcode-
+  // reconciler.ts). Best-effort: failures are swallowed so a sweep error never
+  // breaks the tick's scaling/dispatch work.
+  reconcileFailedTranscodes?: () => Promise<void>;
 };
 
 export type EncoreInstanceRecord = {
