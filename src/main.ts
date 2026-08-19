@@ -55,6 +55,7 @@ import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
+import { checkProfilesIndexReachable } from './services/profiles-reachability.js';
 import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
@@ -1048,6 +1049,25 @@ app.addHook('onClose', async () => {
 
 const port = parseInt(process.env['PORT'] || '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
+
+// Boot-time reachability self-check for the local Encore profiles index (#284).
+// The server is now listening and every router (incl. profilesRouter) is
+// registered, so the derived profiles URL — encoreScalerProfilesUrl — is fully
+// known and serveable. When it points at THIS app's own local
+// /api/v1/profiles/index.yml (i.e. publicBaseUrl resolved), fetch it exactly as
+// Encore would: an UNAUTHENTICATED GET, no bearer token. A 401/403 (the OSC
+// login wall still gating the path) or any unreachable result is logged as a
+// HARD ERROR, so a silent fallback to the remote default index — which would
+// quietly disable operator-managed profiles — is surfaced loudly. Non-fatal:
+// it never throws and the server keeps running. This is the mechanism that
+// confirms, at boot, whether OSC's 2026-07-08 promise to make /api/v1/profiles
+// publicly accessible for the app actually took effect (this environment cannot
+// reach live OSC to confirm it ahead of time).
+void checkProfilesIndexReachable({
+  profilesIndexUrl: encoreScalerProfilesUrl,
+  usingLocalIndex: Boolean(publicBaseUrl),
+  log: app.log
+}).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router
 // is registered, so a detected object can flow through the full pipeline. The
