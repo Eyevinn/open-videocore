@@ -269,9 +269,11 @@ export function proxyManifestUrlsFor(assetId: string, apiBaseUrl: string): Manif
 }
 
 // Raised by `resolvePublicManifestUrl` when a stored manifest URL is not already
-// public and `PACKAGED_PUBLIC_BASE_URL` is unset/invalid, so we cannot resolve
-// it to a public-facing origin. The delivery endpoint surfaces this as a clear
-// 501 not_configured rather than silently handing back a relative/internal path.
+// public and `PACKAGED_PUBLIC_BASE_URL` is set but INVALID (not an absolute URL),
+// so we cannot resolve the relative path to a public-facing origin. This is an
+// explicit misconfiguration — distinct from the unset/zero-config case, which
+// returns the stored value verbatim (issue #320). The delivery endpoint surfaces
+// this as a clear 501 not_configured rather than a broken rewrite.
 export class PublicManifestBaseUrlError extends Error {
   constructor(message: string) {
     super(message);
@@ -303,26 +305,29 @@ export function packagedPublicOrigin(): string | undefined {
 //     the public origin, preserving the stored path + query.
 //   - Absolute with a DIFFERENT (internal) host            -> host + scheme
 //     rewritten to the public origin, path + query preserved.
-// When the URL is not already absolute-public and no public origin is configured
-// we throw `PublicManifestBaseUrlError` so the miswiring is surfaced explicitly.
+// When `PACKAGED_PUBLIC_BASE_URL` is genuinely UNSET (the default, zero-config
+// state) we return the stored value verbatim — the pre-#200 behaviour — so an
+// unconfigured MinIO-backed stack still serves its relative manifest reference
+// instead of 501ing (issue #320). We only throw `PublicManifestBaseUrlError`
+// when the origin is SET but not a usable absolute URL (explicit misconfig) and
+// the stored value is relative, so the miswiring is surfaced explicitly.
 export function resolvePublicManifestUrl(
   stored: string,
   publicOrigin: string | undefined = packagedPublicOrigin()
 ): string {
   const parsedStored = tryParseUrl(stored);
 
-  // No configured public origin: only safe if the stored URL is already
-  // absolute (has a host). We cannot know it is the public host, but rewriting
-  // is impossible without a target, so we surface the misconfiguration.
+  // No configured public origin (PACKAGED_PUBLIC_BASE_URL unset/empty — the
+  // default, zero-config state for a MinIO-backed stack). There is no target to
+  // rewrite against, so we hand back the stored value verbatim in BOTH cases:
+  //   - Already absolute -> returned as-is (we cannot know it is the public host
+  //     but there is nothing to rewrite to).
+  //   - Relative -> returned as-is too, restoring the pre-#200 behaviour where
+  //     delivery echoed asset.manifestUrls unchanged. This avoids regressing the
+  //     unconfigured stack into a 501 (issue #320); an operator who needs an
+  //     externally-reachable origin sets PACKAGED_PUBLIC_BASE_URL.
   if (!publicOrigin) {
-    if (parsedStored) {
-      return stored;
-    }
-    throw new PublicManifestBaseUrlError(
-      'PACKAGED_PUBLIC_BASE_URL is not configured; cannot resolve a public-facing ' +
-        'manifest URL from a relative packaged path. Set PACKAGED_PUBLIC_BASE_URL ' +
-        'to the public MinIO/CDN origin for the packaged bucket.'
-    );
+    return stored;
   }
 
   const parsedOrigin = tryParseUrl(publicOrigin);
