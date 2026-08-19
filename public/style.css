@@ -269,6 +269,35 @@ tbody td {
   color: var(--text-muted);
 }
 
+/* Wedged / "needs attention" flag (issue #282): assets stuck in `processing`
+   with a technicalMetadataError. Amber, distinct from the plain status badge. */
+.badge-attention {
+  background: rgba(245, 158, 11, 0.2);
+  color: var(--warning);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+}
+
+/* Subtle left accent on rows for wedged assets so the operator can scan for
+   them even when the status column is off-screen. */
+tr.row-wedged td:first-child {
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+
+/* "Needs attention" filter toggle in the assets header. */
+.wedged-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.wedged-filter input {
+  cursor: pointer;
+}
+
 /* Tag pills */
 .tag {
   display: inline-block;

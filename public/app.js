@@ -146,6 +146,31 @@ function renderBadge(status) {
   return '<span class="badge ' + badgeClass(status) + '">' + escHtml(status || 'unknown') + '</span>';
 }
 
+// ─── Wedged-asset detection (issue #282) ─────────────────────────────────────
+// An asset is "wedged" when it is stuck in `processing` yet carries a non-empty
+// `technicalMetadataError`: technical-metadata extraction failed, so the asset
+// never advanced `processing -> ready` and is not usable. Both the `status`
+// enum value (`processing`) and the error field name (`technicalMetadataError`)
+// are verified against the asset contract:
+//   - ASSET_STATUSES  src/data/asset-repo.ts:28  ('processing' member)
+//   - assetSchema.technicalMetadataError  src/routes/assets.ts:439 (z.string().optional())
+// The re-drive endpoint POST /api/v1/assets/:id/extract-metadata recovers such
+// an asset synchronously and returns 200 { assetId, status } (issue #281,
+// src/routes/assets.ts:1859-1906).
+function isAssetWedged(asset) {
+  return !!(asset
+    && asset.status === 'processing'
+    && typeof asset.technicalMetadataError === 'string'
+    && asset.technicalMetadataError.length > 0);
+}
+
+// Client-side filter helper: narrow a list of assets to only the wedged ones.
+// Kept pure (no DOM, no fetch) so it is directly unit-testable and reused by the
+// list renderer's "wedged only" toggle.
+function filterWedgedAssets(assets) {
+  return (Array.isArray(assets) ? assets : []).filter(isAssetWedged);
+}
+
 function renderTags(tags) {
   if (!tags || tags.length === 0) return '<span class="text-muted">—</span>';
   // each tag is escaped individually
@@ -426,10 +451,13 @@ function setupTabs() {
 
 // Assets tab pagination state.
 const ASSETS_PAGE_SIZE = 20;
-const assetsState = { offset: 0, total: 0 };
+// `wedgedOnly` (issue #282) toggles the client-side filter that shows only assets
+// stuck in `processing` with a `technicalMetadataError` set.
+const assetsState = { offset: 0, total: 0, wedgedOnly: false };
 
 async function renderAssetsTab(container) {
   assetsState.offset = 0;
+  assetsState.wedgedOnly = false;
 
   // Layout: full-height table on the left, detail side panel on the right (hidden initially).
   const layout = document.createElement('div');
@@ -446,6 +474,10 @@ async function renderAssetsTab(container) {
   header.innerHTML = [
     '<span class="section-title">Assets</span>',
     '<div class="flex-gap">',
+    '  <label class="wedged-filter" title="Show only assets stuck in processing with a metadata extraction error">',
+    '    <input type="checkbox" id="assets-wedged-only" />',
+    '    <span>Needs attention</span>',
+    '  </label>',
     '  <button id="btn-open-upload" class="header-btn">Upload File</button>',
     '  <button id="btn-open-ingest" class="header-btn">Ingest URL</button>',
     '  <button id="assets-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
@@ -569,6 +601,14 @@ async function renderAssetsTab(container) {
   header.querySelector('#assets-refresh').addEventListener('click', function() {
     loadAssets(detailPanel);
   });
+  // "Needs attention" toggle (issue #282): filter the list down to wedged
+  // assets (processing + technicalMetadataError). Reset paging so the filtered
+  // view starts at the first page.
+  header.querySelector('#assets-wedged-only').addEventListener('change', function(e) {
+    assetsState.wedgedOnly = !!e.target.checked;
+    assetsState.offset = 0;
+    loadAssets(detailPanel);
+  });
   pagination.querySelector('#assets-prev').addEventListener('click', function() {
     if (assetsState.offset >= ASSETS_PAGE_SIZE) {
       assetsState.offset -= ASSETS_PAGE_SIZE;
@@ -595,7 +635,15 @@ async function loadAssets(detailPanel) {
 
   let assets = [];
   try {
-    const qs = 'limit=' + ASSETS_PAGE_SIZE + '&offset=' + assetsState.offset;
+    // When the "Needs attention" filter is active, narrow server-side to
+    // `processing` (the only status a wedged asset can hold — ASSET_STATUSES,
+    // src/data/asset-repo.ts:28) via the list endpoint's `status` query param
+    // (listQuerySchema, src/routes/assets.ts:187-192), then keep only the rows
+    // that also carry a `technicalMetadataError`. The `technicalMetadataError`
+    // field is part of the list item shape (assetSchema in listSchema), so the
+    // client can decide wedged-ness without a second request.
+    let qs = 'limit=' + ASSETS_PAGE_SIZE + '&offset=' + assetsState.offset;
+    if (assetsState.wedgedOnly) qs += '&status=processing';
     const res = await apiFetch('/assets?' + qs);
     if (Array.isArray(res)) {
       assets = res;
@@ -603,6 +651,12 @@ async function loadAssets(detailPanel) {
     } else {
       assets = (res && (res.items || res.assets)) || [];
       assetsState.total = (res && typeof res.total === 'number') ? res.total : assets.length;
+    }
+    if (assetsState.wedgedOnly) {
+      assets = filterWedgedAssets(assets);
+      // The server total counts all `processing` assets, not just wedged ones;
+      // reflect the filtered count so paging/indicator stay honest for this page.
+      assetsState.total = assets.length;
     }
   } catch (err) {
     wrap.innerHTML = '';
@@ -615,7 +669,9 @@ async function loadAssets(detailPanel) {
   if (assets.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = assetsState.offset > 0 ? 'No more assets.' : 'No assets found.';
+    empty.textContent = assetsState.wedgedOnly
+      ? 'No assets need attention.'
+      : (assetsState.offset > 0 ? 'No more assets.' : 'No assets found.');
     wrap.appendChild(empty);
     if (pagination) pagination.style.display = 'none';
     return;
@@ -626,16 +682,30 @@ async function loadAssets(detailPanel) {
     var thumb = a.thumbnails && a.thumbnails.length
       ? '<img src="/api/v1/assets/' + escHtml(a.id) + '/thumbnails/0" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
       : '<div class="thumb-xs thumb-placeholder"></div>';
-    return '<tr data-id="' + escHtml(a.id) + '">' +
+    // Wedged assets (issue #282): stuck in `processing` with a
+    // `technicalMetadataError`. Flag them with a badge (the error text is the
+    // tooltip so the operator sees the reason on hover) and offer an inline
+    // re-drive action that hits POST /assets/:id/extract-metadata.
+    var wedged = isAssetWedged(a);
+    var statusCell = renderBadge(a.status);
+    if (wedged) {
+      statusCell += ' <span class="badge badge-attention asset-wedged-flag" data-id="' + escHtml(a.id) +
+        '" title="' + escHtml(a.technicalMetadataError) + '">Needs attention</span>';
+    }
+    var actionsCell =
+      (wedged
+        ? '<button class="btn-ghost asset-redrive-btn" data-id="' + escHtml(a.id) +
+          '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
+        : '') +
+      '<button class="btn-danger asset-delete-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Archive</button>';
+    return '<tr data-id="' + escHtml(a.id) + '"' + (wedged ? ' class="row-wedged"' : '') + '>' +
       '<td style="width:52px;padding:4px 6px">' + thumb + '</td>' +
       '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
       '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
-      '<td>' + renderBadge(a.status) + '</td>' +
+      '<td>' + statusCell + '</td>' +
       '<td>' + renderTags(a.tags) + '</td>' +
       '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
-      '<td>' +
-        '<button class="btn-danger asset-delete-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Archive</button>' +
-      '</td>' +
+      '<td>' + actionsCell + '</td>' +
       '</tr>';
   }).join('');
 
@@ -662,6 +732,29 @@ async function loadAssets(detailPanel) {
         await loadAssets(detailPanel);
       } catch (err) {
         alert('Error: ' + err.message);
+      }
+    });
+  });
+
+  // Inline re-drive (issue #282). Re-runs the extractor synchronously via the
+  // recovery path of POST /assets/:id/extract-metadata (200 { assetId, status }
+  // per issue #281). We reload the list afterwards so the resulting status
+  // change is reflected (a recovered asset drops out of the "Needs attention"
+  // view and shows `ready`; a still-failing one stays flagged).
+  table.querySelectorAll('.asset-redrive-btn').forEach(function(btn) {
+    btn.addEventListener('click', async function(e) {
+      e.stopPropagation();
+      var prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Re-driving…';
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(btn.dataset.id) + '/extract-metadata',
+          { method: 'POST', body: JSON.stringify({}) });
+        await loadAssets(detailPanel);
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = prev;
+        alert('Re-drive failed: ' + err.message);
       }
     });
   });
@@ -881,6 +974,12 @@ async function renderAssetDetailBody(id, bodyEl) {
     // surface it as a warning right alongside the asset status. Detection never
     // changes the asset's lifecycle status, so this is purely advisory.
     var statusCell = renderBadge(asset.status);
+    // Wedged flag (issue #282): stuck in `processing` with a
+    // `technicalMetadataError`. Surface it right next to the status so the
+    // operator immediately sees the asset is stalled and why.
+    if (isAssetWedged(asset)) {
+      statusCell += ' <span class="badge badge-attention" title="' + escHtml(asset.technicalMetadataError) + '">Needs attention</span>';
+    }
     if (asset.sceneDetectionError) {
       statusCell += ' <span class="text-mono" style="color:var(--error,#f87171)" title="Scene detection failed">⚠ Scene detection: ' + escHtml(asset.sceneDetectionError) + '</span>';
     }
@@ -1056,10 +1155,16 @@ async function renderAssetDetailBody(id, bodyEl) {
     updateProfileVisibility();
 
     // Action buttons — static labels, no dynamic content
+    // For a wedged asset (issue #282) the extraction action is a recovery
+    // "re-drive": POST /assets/:id/extract-metadata runs synchronously and
+    // returns the settled status (200), so label it accordingly and refresh the
+    // detail afterwards to reflect the status change.
+    var wedgedDetail = isAssetWedged(asset);
     const actionsDiv = document.createElement('div');
     actionsDiv.className = 'mt12 flex-gap';
     actionsDiv.innerHTML = [
-      '<button id="btn-extract-meta" class="btn-ghost">Extract Metadata</button>',
+      '<button id="btn-extract-meta" class="' + (wedgedDetail ? 'btn-primary' : 'btn-ghost') + '">' +
+        (wedgedDetail ? 'Re-drive extraction' : 'Extract Metadata') + '</button>',
       '<button id="btn-thumbnails" class="btn-ghost">Thumbnails</button>',
     ].join('');
     body.appendChild(actionsDiv);
@@ -1126,15 +1231,36 @@ async function renderAssetDetailBody(id, bodyEl) {
 
     body.querySelector('#btn-extract-meta').addEventListener('click', async function() {
       actionMsg.innerHTML = '';
+      var extractBtn = body.querySelector('#btn-extract-meta');
+      var prevLabel = extractBtn.textContent;
+      extractBtn.disabled = true;
+      extractBtn.textContent = wedgedDetail ? 'Re-driving…' : 'Extracting…';
       try {
         const r = await apiFetch('/assets/' + encodeURIComponent(id) + '/extract-metadata', { method: 'POST', body: JSON.stringify({}) });
         const pre = document.createElement('pre');
         pre.className = 'code-block mt8';
         pre.textContent = JSON.stringify(r, null, 2);
-        showMsg(actionMsg, 'Metadata extraction complete.', 'success');
+        // The re-drive path returns the settled status (200 { assetId, status });
+        // report it so the operator sees processing -> ready (or a persistent
+        // failure). Then re-render the detail so the status badge / wedged flag
+        // reflect the change.
+        if (wedgedDetail && r && r.status) {
+          showMsg(actionMsg, 'Re-drive complete — status is now "' + r.status + '".', r.status === 'ready' ? 'success' : 'info');
+        } else {
+          showMsg(actionMsg, 'Metadata extraction complete.', 'success');
+        }
         actionMsg.appendChild(pre);
+        if (wedgedDetail) {
+          await renderAssetDetailBody(id, bodyEl);
+          return;
+        }
       } catch (err) {
         showMsg(actionMsg, 'Error: ' + err.message, 'error');
+      } finally {
+        if (body.querySelector('#btn-extract-meta') === extractBtn) {
+          extractBtn.disabled = false;
+          extractBtn.textContent = prevLabel;
+        }
       }
     });
 
@@ -3845,6 +3971,8 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 // These are re-used by detail.js via ES module import so the standalone page
 // shares the exact same renderer + helper logic (no duplication / divergence).
 export {
+  isAssetWedged,
+  filterWedgedAssets,
   renderAssetDetailBody,
   renderAssetFiles,
   renderJobDetailBody,
