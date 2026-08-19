@@ -537,9 +537,12 @@ type AssetsRouterOptions = {
   // that still pass it continue to type-check.
   thumbnailPublicBaseUrl?: string;
   // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
-  // job (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
-  // object storage), POST /:id/export responds 501.
-  rewrapRunner?: RewrapRunner;
+  // job (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
+  // extractor it may be a factory that receives the workspace's s3Config so the
+  // OSC job can write the output directly to the right MinIO bucket via
+  // `s3://bucket/key` (a presigned PUT URL does NOT work — issue #316). When
+  // absent (or no object storage), POST /:id/export responds 501.
+  rewrapRunner?: RewrapRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner);
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
   // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
@@ -2324,6 +2327,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'export / re-wrap is not configured'
         });
       }
+      // Resolve the injected runner. In production it is a factory that needs
+      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the
+      // output to `s3://bucket/key` natively (issue #316); tests inject a plain
+      // RewrapRunner and no s3Config, so fall back to using it directly. Mirrors
+      // the thumbnail extractor resolution above.
+      const s3Cfg = request.connections?.s3Config;
+      const resolvedRewrapRunner =
+        typeof opts.rewrapRunner === 'function' && s3Cfg
+          ? (opts.rewrapRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner)({
+              ...s3Cfg,
+              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
+            })
+          : (opts.rewrapRunner as RewrapRunner);
       try {
         const child = await rewrapRunner(
           {
@@ -2336,7 +2352,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             assets: repo,
             storage: storageFor(),
-            runner: opts.rewrapRunner,
+            runner: resolvedRewrapRunner,
             ...opts.rewrapDeps
           }
         );
