@@ -47,3 +47,41 @@ export function resolvePublicBaseUrl(): string | undefined {
 
   return undefined;
 }
+
+// Path suffix (relative to the resolved public base URL) that serves this API's
+// own operator-managed profile index. Each scaler-spawned Encore instance
+// fetches its transcode profiles from here (see module comment, item 2). Kept
+// as a shared constant so main.ts and this resolver cannot drift.
+export const LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml';
+
+/**
+ * Resolve the profiles-index URL handed to every scaler-spawned Encore instance
+ * as its `profilesUrl`.
+ *
+ * As of #283 OSC exposes no runtime self-URL, so an operator's ONLY lever for
+ * pointing Encore at this deployment's local profile index is an explicit
+ * env-var. This resolver gives operators two seams, in strict precedence:
+ *
+ *   1. `ENCORE_PROFILES_URL_OVERRIDE` (if set) — a DIRECT profiles-URL override.
+ *      Always wins. Use this to point Encore at an exact index URL (e.g. this
+ *      deployment's own index behind a custom hostname, or an external index)
+ *      without having to express it as a `${base}/api/v1/profiles/index.yml`
+ *      derivation. Normalised (trailing slashes stripped).
+ *   2. Derived local index — when `PUBLIC_BASE_URL` is set (via
+ *      {@link resolvePublicBaseUrl}), returns `${base}${LOCAL_PROFILES_INDEX_PATH}`
+ *      so Encore loads the operator-managed profiles served by this API.
+ *   3. `defaultProfilesUrl` — the caller-supplied remote default (bootstrap seed
+ *      index) used when neither override above is set.
+ *
+ * @param defaultProfilesUrl the remote default index URL (from `ENCORE_PROFILES_URL`).
+ * @returns the resolved profiles-index URL Encore instances should fetch.
+ */
+export function resolveEncoreProfilesUrl(defaultProfilesUrl: string): string {
+  const directOverride = process.env['ENCORE_PROFILES_URL_OVERRIDE']?.replace(/\/+$/, '');
+  if (directOverride) return directOverride;
+
+  const base = resolvePublicBaseUrl();
+  if (base) return `${base}${LOCAL_PROFILES_INDEX_PATH}`;
+
+  return defaultProfilesUrl;
+}

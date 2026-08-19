@@ -67,7 +67,7 @@ import {
   packagerOscApiFromContext
 } from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
-import { resolvePublicBaseUrl } from './services/public-base-url.js';
+import { resolvePublicBaseUrl, resolveEncoreProfilesUrl } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
@@ -462,12 +462,15 @@ const encoreProfilesUrl =
 // OSC-derived app URL (none available today) → unset. When unset the scaler
 // falls back to the remote default index (previous behaviour), so Encore still
 // works.
+// Precedence (see resolveEncoreProfilesUrl): explicit ENCORE_PROFILES_URL_OVERRIDE
+// direct override → derived ${PUBLIC_BASE_URL}/api/v1/profiles/index.yml → remote
+// default (encoreProfilesUrl). Either operator-set env var lets an operator point
+// Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
+// so an explicit value is the only lever.
 const publicBaseUrl = resolvePublicBaseUrl();
-const encoreScalerProfilesUrl = publicBaseUrl
-  ? `${publicBaseUrl}/api/v1/profiles/index.yml`
-  : encoreProfilesUrl;
-if (!publicBaseUrl) {
-  app.log.warn('public base URL unresolved (PUBLIC_BASE_URL not set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(encoreProfilesUrl);
+if (!publicBaseUrl && !process.env['ENCORE_PROFILES_URL_OVERRIDE']) {
+  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time
