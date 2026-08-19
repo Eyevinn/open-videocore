@@ -380,13 +380,25 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   });
 }
 
-// Sweep all scaler-managed Encore instances for SUCCESSFUL jobs whose callback
-// message was never written to the queue. This is a fallback for the missing
-// `await` bug in eyevinn-encore-callback-listener's pushMessage (the zAdd is
-// fire-and-forget, so messages can silently fail to land in Redis). The sweep
-// runs every SWEEP_INTERVAL_MS and re-synthesises the same message format the
-// callback listener would have produced, then pushes it to the main queue only
-// if the job is not already there and is not yet terminal in our DB.
+// Sweep all scaler-managed Encore instances for terminal jobs (both SUCCESSFUL
+// and FAILED) whose callback message was never written to the queue. This is a
+// fallback for the missing `await` bug in eyevinn-encore-callback-listener's
+// pushMessage (the zAdd is fire-and-forget, so messages can silently fail to
+// land in Redis) AND for the case where Encore/the listener simply never calls
+// back on failure the way it does on success. The sweep runs every
+// SWEEP_INTERVAL_MS and re-synthesises the same message format the callback
+// listener would have produced, then pushes it to the main queue only if the
+// job is not already there and is not yet terminal in our DB — the downstream
+// handleMessage path re-fetches the live Encore job and derives success/failure
+// itself, so both outcomes flow through the same completion logic.
+//
+// Reconciling FAILED jobs here closes the "job looks stuck running after an
+// Encore failure" gap: if Encore fails a job outright (e.g. a ProbeResult parse
+// error on an unsupported input) and no completion message ever lands, the
+// local job, source asset, and pipeline `transcode` step would otherwise stay
+// non-terminal forever. CANCELLED is deliberately NOT swept — that status is set
+// synchronously by our own operator-initiated cancel route (src/routes/jobs.ts)
+// and does not depend on an Encore callback.
 //
 // Contract: Encore /encoreJobs/search/findByStatus returns Spring HATEOAS pages:
 //   { _embedded: { encoreJobs: [{ id: "<uuid>", externalId: "...", ... }] },
@@ -394,12 +406,20 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
 // (verified from Encore source and OSC docs, 2026-07-07)
 const SWEEP_INTERVAL_MS = 30_000;
 
+// Encore terminal statuses we reconcile in the sweep. Both are handled by the
+// SAME discovery → synthesize-message → enqueue mechanism; handleMessage derives
+// the actual success/failure from the live Encore job document it re-fetches, so
+// the only thing that differs per status is the findByStatus query below.
+const SWEEP_STATUSES = ['SUCCESSFUL', 'FAILED'] as const;
+
 // Scan `encore:pool:*` keys to find all workspaces that have an active pool,
-// then for each workspace check every Encore instance for SUCCESSFUL jobs that
-// have a UUID→externalId mapping but whose local job is not yet in a terminal
-// state. If such a job exists and is not already in the queue, push a synthetic
-// message so the regular loop picks it up.
-async function sweepCompletedJobs(deps: PollerDeps, queueKey: string): Promise<void> {
+// then for each workspace check every Encore instance for terminal jobs
+// (SUCCESSFUL or FAILED) that have a UUID→externalId mapping but whose local job
+// is not yet in a terminal state. If such a job exists and is not already in the
+// queue, push a synthetic message so the regular loop picks it up and runs the
+// shared handleMessage → completeTranscode path (which marks the job done or
+// failed based on the live Encore status).
+export async function sweepTerminalJobs(deps: PollerDeps, queueKey: string): Promise<void> {
   const { redis, oscContext, logger, jobRepository } = deps;
 
   const poolKeys = await redis.keys('encore:pool:*');
@@ -421,54 +441,60 @@ async function sweepCompletedJobs(deps: PollerDeps, queueKey: string): Promise<v
       let record: EncoreInstanceRecord;
       try { record = JSON.parse(instanceJson) as EncoreInstanceRecord; } catch { continue; }
 
-      const searchUrl =
-        `${record.url.replace(/\/+$/, '')}/encoreJobs/search/findByStatus` +
-        `?status=SUCCESSFUL&page=0&size=100`;
-      let encoreJobs: Array<{ id?: string }> = [];
-      try {
-        const res = await fetch(searchUrl, { headers: { authorization: `Bearer ${sat}` } });
-        if (!res.ok) continue;
-        const body = (await res.json()) as {
-          _embedded?: { encoreJobs?: typeof encoreJobs };
-        };
-        encoreJobs = body._embedded?.encoreJobs ?? [];
-      } catch { continue; }
-
-      for (const encoreJob of encoreJobs) {
-        const encoreUuid = encoreJob.id;
-        if (!encoreUuid) continue;
-
-        // Is this one of our jobs? (UUID→externalId written at dispatch time, TTL 24h)
-        const externalId = await redis.get(keys.uuidToExternalId(encoreUuid));
-        if (!externalId) continue;
-
-        // Skip if the local job is already terminal — avoids repeated re-queueing.
+      // Query each terminal status in turn. Both SUCCESSFUL and FAILED jobs are
+      // reconciled the same way — the only per-status difference is this query;
+      // handleMessage re-derives success/failure from the live Encore document.
+      for (const status of SWEEP_STATUSES) {
+        const searchUrl =
+          `${record.url.replace(/\/+$/, '')}/encoreJobs/search/findByStatus` +
+          `?status=${status}&page=0&size=100`;
+        let encoreJobs: Array<{ id?: string }> = [];
         try {
-          const found = await jobRepository.findByEncoreJobId(externalId);
-          if (!found || found.job.status === 'done' || found.job.status === 'failed') continue;
+          const res = await fetch(searchUrl, { headers: { authorization: `Bearer ${sat}` } });
+          if (!res.ok) continue;
+          const body = (await res.json()) as {
+            _embedded?: { encoreJobs?: typeof encoreJobs };
+          };
+          encoreJobs = body._embedded?.encoreJobs ?? [];
         } catch { continue; }
 
-        // Build the message the callback listener would have produced.
-        // (verified from eyevinn-encore-callback-listener src/api.ts onSuccess handler)
-        const message = JSON.stringify({
-          jobId: encoreUuid,
-          url: `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`
-        });
+        for (const encoreJob of encoreJobs) {
+          const encoreUuid = encoreJob.id;
+          if (!encoreUuid) continue;
 
-        // Skip if the message is already in the main queue or processing set.
-        const [inQueue, inProcessing] = await Promise.all([
-          redis.zscore(queueKey, message),
-          redis.zscore(processingKey, message)
-        ]);
-        if (inQueue !== null || inProcessing !== null) continue;
+          // Is this one of our jobs? (UUID→externalId written at dispatch time, TTL 24h)
+          const externalId = await redis.get(keys.uuidToExternalId(encoreUuid));
+          if (!externalId) continue;
 
-        logger.info({
-          msg: 'encore-callback-poller: sweep found missed callback — re-queuing',
-          encoreUuid,
-          externalId,
-          instanceId: record.instanceId
-        });
-        await redis.zadd(queueKey, Date.now(), message);
+          // Skip if the local job is already terminal — avoids repeated re-queueing.
+          try {
+            const found = await jobRepository.findByEncoreJobId(externalId);
+            if (!found || found.job.status === 'done' || found.job.status === 'failed') continue;
+          } catch { continue; }
+
+          // Build the message the callback listener would have produced.
+          // (verified from eyevinn-encore-callback-listener src/api.ts onSuccess handler)
+          const message = JSON.stringify({
+            jobId: encoreUuid,
+            url: `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`
+          });
+
+          // Skip if the message is already in the main queue or processing set.
+          const [inQueue, inProcessing] = await Promise.all([
+            redis.zscore(queueKey, message),
+            redis.zscore(processingKey, message)
+          ]);
+          if (inQueue !== null || inProcessing !== null) continue;
+
+          logger.info({
+            msg: 'encore-callback-poller: sweep found unreconciled terminal job — re-queuing',
+            encoreUuid,
+            externalId,
+            status,
+            instanceId: record.instanceId
+          });
+          await redis.zadd(queueKey, Date.now(), message);
+        }
       }
     }
   }
@@ -515,12 +541,15 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
 
   deps.logger.info({ msg: 'encore-callback-poller: starting', queueKey, processingKey });
 
-  // Fallback sweep: periodically poll all Encore instances for SUCCESSFUL jobs
-  // that never produced a queue message (eyevinn-encore-callback-listener missing
-  // `await` on zAdd). First sweep fires after SWEEP_INTERVAL_MS, not immediately,
-  // so the normal queue-drain path gets first chance on startup.
+  // Fallback sweep: periodically poll all Encore instances for terminal jobs
+  // (SUCCESSFUL and FAILED) that never produced a queue message — either because
+  // eyevinn-encore-callback-listener dropped it (missing `await` on zAdd) or
+  // because Encore never called back on failure at all. Reconciling FAILED here
+  // closes the "job looks stuck running after an Encore failure" gap. First sweep
+  // fires after SWEEP_INTERVAL_MS, not immediately, so the normal queue-drain
+  // path gets first chance on startup.
   const sweepTimer = setInterval(() => {
-    void sweepCompletedJobs(deps, queueKey).catch((err) => {
+    void sweepTerminalJobs(deps, queueKey).catch((err) => {
       deps.logger.warn({ msg: 'encore-callback-poller: sweep error', err });
     });
   }, SWEEP_INTERVAL_MS);
