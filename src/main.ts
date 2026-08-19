@@ -86,7 +86,11 @@ declare module 'fastify' {
   }
 }
 
-const app = Fastify({ logger: true });
+// maxParamLength defaults to 100 in Fastify, but object-storage multipart
+// upload IDs are longer (~132 chars), so a real uploadId path parameter would
+// otherwise fail to match the /:id/multipart/:uploadId/... routes (404). Raise
+// the cap so the part-url / complete / abort routes accept real upload IDs.
+const app = Fastify({ logger: true, maxParamLength: 500 });
 
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
