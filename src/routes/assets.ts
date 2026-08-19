@@ -850,6 +850,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return true;
   }
 
+  // Synchronous re-drive of technical metadata extraction (issue #281). Unlike
+  // triggerExtraction (fire-and-forget), this AWAITS the extractor so the caller
+  // observes the settled outcome. Used by the re-drive path of
+  // POST /:id/extract-metadata to recover an asset wedged in `processing` with a
+  // `technicalMetadataError`: on success the extractor clears the error,
+  // populates `technicalMetadata`, and advances `processing -> ready`. The
+  // extractor never throws (it records failures on the asset), so callers read
+  // back the asset to learn whether recovery succeeded. Assumes probe + storage
+  // are configured (the route checks this before calling).
+  async function runExtractionSync(assetId: string, objectKey: string): Promise<void> {
+    if (!opts.probe || !storageFor) {
+      return;
+    }
+    await extractRunner(
+      { assetId, objectKey },
+      {
+        assets: repo,
+        storage: storageFor(),
+        probe: opts.probe,
+        ...opts.extractDeps
+      }
+    );
+  }
+
   // Fire-and-forget auto-subtitle generation for a pipeline step (issue #114).
   // Detached, never blocks the caller, and the generator itself never throws
   // (records failures on the asset as `subtitlesError`). No-op when the OSC
@@ -1809,20 +1833,37 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // On-demand re-extraction of technical metadata (issue #6). Workspace-scoped
-  // and behind `authenticate`. Returns 202 Accepted immediately and runs the
-  // ffprobe extraction fire-and-forget; the caller polls GET /:id to observe
-  // `technicalMetadata` / `technicalMetadataError` once it settles.
+  // On-demand (re-)extraction of technical metadata (issues #6, #281).
+  // Workspace-scoped and behind `authenticate`. Two modes:
+  //
+  //   RE-DRIVE (issue #281): when the asset is WEDGED — stuck in `processing`
+  //   with a `technicalMetadataError` set (typically after a prior conflict or
+  //   probe failure) — this runs the extraction SYNCHRONOUSLY and reports the
+  //   settled outcome (200). On success the extractor clears
+  //   `technicalMetadataError`, populates `technicalMetadata`, and advances the
+  //   lifecycle `processing -> ready`. This gives an operator a reliable, single
+  //   call to recover a wedged asset. Idempotent: re-driving an already-`ready`
+  //   asset simply re-runs extraction and stays `ready` (safe no-op). The
+  //   extractor never throws (it records failures on the asset); the resolved
+  //   status is read back and returned so a persistent failure is observable.
+  //
+  //   FIRE-AND-FORGET (issue #6): for a non-wedged asset the extraction is kicked
+  //   off detached and the route returns 202 immediately; the caller polls
+  //   GET /:id to observe `technicalMetadata` / `technicalMetadataError`.
+  //
+  //   200 — re-drive completed synchronously; body reports the resolved status
+  //   202 — extraction accepted (fire-and-forget)
   //   404 — unknown/foreign asset (existence not leaked)
   //   409 — the asset has no stored object yet (nothing to probe)
   //   501 — extraction is not configured on this deployment
   app.post(
     '/:id/extract-metadata',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: {
+          200: z.object({ assetId: z.string(), status: z.string() }),
           202: z.object({ assetId: z.string(), status: z.string() }),
           404: errorSchema,
           409: errorSchema,
@@ -1845,6 +1886,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(501).send({
           error: 'not_configured',
           message: 'technical metadata extraction is not configured'
+        });
+      }
+      // A wedged asset (issue #281): stuck in `processing` with a recorded
+      // extraction error. Re-drive synchronously so the caller learns whether
+      // the asset recovered to `ready`.
+      const wedged = asset.status === 'processing' && asset.technicalMetadataError !== undefined;
+      if (wedged) {
+        await runExtractionSync(asset.id, asset.objectKey);
+        const settled = await repo.get(asset.id);
+        return reply.code(200).send({
+          assetId: asset.id,
+          status: settled?.status ?? asset.status
         });
       }
       triggerExtraction(asset.id, asset.objectKey);

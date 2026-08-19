@@ -134,9 +134,21 @@ export async function extractTechnicalMetadata(
     const presignedUrl = await deps.storage.presignedGet(objectKey, ttl);
     const result = await deps.probe(presignedUrl);
     const metadata = parseFfprobe(result, new Date().toISOString());
-    // Extraction annotates the asset only; it never drives the lifecycle state
-    // machine (the ingest/transcode paths own status transitions).
-    await deps.assets.update(assetId, { technicalMetadata: metadata, status: 'ready' });
+    // Re-drive recovery (issue #281): if the asset is wedged in `processing`
+    // (typically because a prior extraction recorded `technicalMetadataError`
+    // and never advanced), a successful extraction completes the lifecycle by
+    // advancing `processing -> ready`. For any other status we annotate only and
+    // never force a transition: `ready` stays `ready` (idempotent no-op) and an
+    // asset still `uploading` is left for the ingest path to advance, so the
+    // extractor never drives an illegal transition (e.g. uploading -> ready).
+    // Writing a non-null `technicalMetadata` clears any prior
+    // `technicalMetadataError` at the repository boundary (asset-repo.ts).
+    const current = await deps.assets.get(assetId);
+    const advance = current?.status === 'processing';
+    await deps.assets.update(assetId, {
+      technicalMetadata: metadata,
+      ...(advance ? { status: 'ready' as const } : {})
+    });
   } catch (err) {
     deps.onError?.(err);
     const message = err instanceof Error ? err.message : String(err);

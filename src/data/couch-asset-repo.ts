@@ -47,7 +47,7 @@ import {
   toAssetDocument,
   type AssetDocument
 } from './asset-document.js';
-import type { StoredDoc, StackCouch } from './couchdb.js';
+import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'asset';
 
@@ -161,11 +161,29 @@ export class CouchAssetRepository implements AssetRepository {
     patch: UpdateAssetInput
   ): Promise<Asset | undefined> {
     const couch = this.couchFor();
-    const doc = await couch.get(id);
-    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+    // Guard the resource type before entering the retry loop so a foreign
+    // document short-circuits to `undefined` (preserving the not-found path).
+    const head = await couch.get(id);
+    if (!head || head.resourceType !== RESOURCE_TYPE) {
       return undefined;
     }
-    const existing = fromDoc(doc);
+    // Read-modify-write through the conflict-retry wrapper (issue #278). The
+    // patch application is pure (no writes) and re-runnable, so a concurrent
+    // writer that bumps `_rev` (e.g. the re-drive path of issue #281 racing an
+    // in-flight extraction) is retried against the freshly re-read document
+    // instead of losing to a 409. `updateWithRetry` carries `_rev` forward.
+    let next: Asset | undefined;
+    await updateWithRetry(couch, id, (doc) => {
+      next = this.applyPatch(fromDoc(doc), patch);
+      return { ...toDoc(next), _rev: doc._rev };
+    });
+    return next;
+  }
+
+  // Pure patch application (issue #278/#281): given the current asset and a
+  // patch, compute the next asset. NO writes and NO side effects, so it is safe
+  // to run more than once inside updateWithRetry's retry loop.
+  private applyPatch(existing: Asset, patch: UpdateAssetInput): Asset {
     const now = new Date().toISOString();
     const next: Asset = { ...existing, updatedAt: now };
     if (patch.name !== undefined) next.name = patch.name;
@@ -232,8 +250,6 @@ export class CouchAssetRepository implements AssetRepository {
     if (entries.length > 0) {
       next.provenance = [...(existing.provenance ?? []), ...entries];
     }
-    // Carry _rev so CouchDB accepts the update; put() forces the partition.
-    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;
   }
 
