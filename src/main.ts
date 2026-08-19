@@ -890,7 +890,11 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository,
-  commentRepository
+  commentRepository,
+  // Validate a named transcode profile against the store so a GPU-only
+  // (NVENC/CUDA) profile that cannot run on this platform is rejected 422
+  // before submission (issue #286).
+  profileRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
 

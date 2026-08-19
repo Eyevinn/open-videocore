@@ -41,6 +41,7 @@ import { jobsRouter } from '../src/routes/jobs.js';
 import { internalRouter } from '../src/routes/internal.js';
 import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import { InMemoryJobRepository } from '../src/data/job-repo.js';
+import { InMemoryProfileRepository } from '../src/data/inmemory-profile-repo.js';
 import type { EncoreClient, EncoreSubmitInput } from '../src/pipeline/encore-client.js';
 
 const A = { authorization: 'Bearer token-a' };
@@ -50,6 +51,7 @@ type Harness = {
   assets: InMemoryAssetRepository;
   jobs: InMemoryJobRepository;
   submitted: EncoreSubmitInput[];
+  profiles: InMemoryProfileRepository;
 };
 
 function fakeEncore(fail?: Error): { client: EncoreClient; submitted: EncoreSubmitInput[] } {
@@ -71,6 +73,7 @@ async function buildApp(opts: { encoreFail?: Error; noEncore?: boolean } = {}): 
   registerAuth(app);
   const assets = new InMemoryAssetRepository();
   const jobs = new InMemoryJobRepository();
+  const profiles = new InMemoryProfileRepository();
   const { client, submitted } = fakeEncore(opts.encoreFail);
 
   await app.register(assetsRouter, {
@@ -79,7 +82,8 @@ async function buildApp(opts: { encoreFail?: Error; noEncore?: boolean } = {}): 
     jobRepository: jobs,
     encore: opts.noEncore ? undefined : client,
     sourceBucket: 'src-bucket',
-    outputBucket: 'out-bucket'
+    outputBucket: 'out-bucket',
+    profileRepository: profiles
   });
   await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobs });
   await app.register(internalRouter, {
@@ -88,7 +92,7 @@ async function buildApp(opts: { encoreFail?: Error; noEncore?: boolean } = {}): 
     repository: assets
   });
   await app.ready();
-  return { app, assets, jobs, submitted };
+  return { app, assets, jobs, submitted, profiles };
 }
 
 // Create a source asset already carrying a stored object (ready to transcode).
@@ -175,6 +179,58 @@ describe('transcode job management (issue #8)', () => {
       expect(res.statusCode).toBe(202);
       expect(h.submitted[0].profile.name).toBe('my-custom');
       expect(h.submitted[0].profile.outputs[0].label).toBe('square');
+    });
+
+    // Create a transcodable source using the repository's current single-scope
+    // signature (create(input) / update(id, patch)), independent of the shared
+    // makeSource helper whose (workspace, …) calls predate the repo signature
+    // change (the ~99 pre-existing workspace-scoping failures). Keeps these
+    // issue #286 tests self-contained and green.
+    async function makeTranscodableSource(h: Harness, name = 'nvenc-src'): Promise<string> {
+      const asset = await h.assets.create({ name, objectKey: `ingest/${name}` });
+      await h.assets.update(asset.id, { status: 'processing' });
+      await h.assets.update(asset.id, { status: 'ready' });
+      return asset.id;
+    }
+
+    it('rejects a transcode naming a GPU-only (NVENC/CUDA) profile with 422 (issue #286)', async () => {
+      const h = await buildApp();
+      const sourceId = await makeTranscodableSource(h);
+      // Seed a GPU-only profile the platform cannot execute.
+      await h.profiles.create({
+        name: 'nvenc-test',
+        yaml: 'name: nvenc-test\nencodes:\n  - type: VideoEncode\n    codec: hevc_nvenc\n    height: 1080\n'
+      });
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: { profile: 'nvenc-test' }
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json().error).toBe('profile_unrunnable');
+      expect(res.json().message).toMatch(/GPU|NVENC/i);
+      // Nothing was submitted to Encore — the job was rejected before submit.
+      expect(h.submitted).toHaveLength(0);
+    });
+
+    it('still submits a runnable named profile that exists in the store (issue #286)', async () => {
+      const h = await buildApp();
+      const sourceId = await makeTranscodableSource(h, 'cpu-src');
+      await h.profiles.create({
+        name: 'program',
+        yaml: 'name: program\nencodes:\n  - type: X264Encode\n    height: 1080\n'
+      });
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: { profile: 'program' }
+      });
+      expect(res.statusCode).toBe(202);
+      expect(h.submitted).toHaveLength(1);
     });
 
     it('rejects supplying both profile and customProfile', async () => {
