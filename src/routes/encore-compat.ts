@@ -16,9 +16,13 @@
 //
 // Contracts fetched before writing (CLAUDE.md rule 7):
 //   - src/pipeline/encore-client.ts — the native Encore POST /encoreJobs payload
-//     shape (externalId?, inputs[].uri, outputFolder, profile?, progressCallbackUri?).
+//     shape (externalId?, inputs[].uri, outputFolder, profile?, profileParams?,
+//     progressCallbackUri?). profileParams is a TOP-LEVEL key (sibling of
+//     profile), written by toEncorePayload (encore-client.ts:92).
 //   - src/pipeline/transcode.ts — submitTranscode(params, deps) returns
-//     { jobId, encoreJobId }; deps = { jobs, assets, encore }.
+//     { jobId, encoreJobId }; deps = { jobs, assets, encore }. params accepts an
+//     optional profileParams?: Record<string,string> (issue #287) threaded into
+//     the Encore job document.
 //   - src/data/asset-repo.ts — AssetRepository.create(CreateAssetInput):
 //     { name, sourceMethod?: 'url-pull', originUri? }.
 //   - src/data/job-repo.ts — JobRepository.findByEncoreJobId(id) returns
@@ -72,12 +76,26 @@ const encoreProfileSchema = z
   })
   .passthrough();
 
+// profileParams (issue #289): a flat string map carried at the TOP LEVEL of the
+// native Encore job document (a sibling of `profile`, NOT nested inside it) —
+// see toEncorePayload in src/pipeline/encore-client.ts:92, which writes
+// `profileParams` as a top-level key alongside `profile`. A compat client
+// mimicking the native Encore POST /encoreJobs shape therefore sends it at the
+// top level. Encore evaluates the entries as SpEL expression properties within
+// the named server-side profile. Verified shape: SVT Encore
+// `EncoreJob.profileParams: Map<String, Any?>` defaulting to `{}`
+// (github.com/svt/encore, encore-common/.../model/EncoreJob.kt). We constrain
+// our contract to string values, matching the native /:id/transcode route
+// (src/routes/assets.ts:144). Omitted -> unchanged default output.
+const encoreProfileParamsSchema = z.record(z.string(), z.string());
+
 const encoreJobSchema = z
   .object({
     externalId: z.string().optional(),
     inputs: z.array(encoreInputSchema).min(1),
     outputFolder: z.string().min(1),
     profile: encoreProfileSchema.optional(),
+    profileParams: encoreProfileParamsSchema.optional(),
     progressCallbackUri: z.string().optional()
   })
   .passthrough();
@@ -193,6 +211,15 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
             // https:// sources Encore fetches the URI directly.
             sourceObjectKey: sourceUri,
             preset,
+            // Forward the compat request's top-level profileParams verbatim
+            // (issue #289) so a parametrised profile reaches Encore's job
+            // document intact, at parity with the native /:id/transcode route.
+            // submitTranscode threads it into EncoreSubmitInput.profileParams
+            // and toEncorePayload writes the Encore job document's top-level
+            // `profileParams` object (src/pipeline/encore-client.ts:92). When
+            // the caller omits it, this is undefined and the field is dropped
+            // from the payload so Encore uses its `{}` default (unchanged).
+            profileParams: body.profileParams,
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
