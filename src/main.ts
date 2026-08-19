@@ -413,17 +413,26 @@ const thumbnailExtractor = storageAvailable
 
 // Export / re-wrap (issue #19) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to
 // remux a stored object into a different container with `-c copy` (no
-// re-encode), writing the new child asset back to MinIO via a presigned PUT
-// URL. Like the thumbnail runner it needs both an OSC context and object
-// storage; when either is missing POST /:id/export responds 501.
-const rewrapRunner: RewrapRunner | undefined = storageAvailable
-  ? makeOscRewrapRunner({
-      context: oscContext,
-      createJob,
-      getJob,
-      getLogsForInstance,
-      removeJob
-    })
+// re-encode), writing the new child asset back to MinIO. Like the thumbnail
+// extractor it is a factory so the route can supply the workspace's MinIO
+// credentials (resolved from the stack config) at request time: the output goes
+// to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so the runner needs
+// the MinIO credentials + bucket in the job body. A presigned PUT URL does NOT
+// work with ffmpeg's output muxer (issue #316). When object storage is missing
+// POST /:id/export responds 501.
+const rewrapRunner = storageAvailable
+  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): RewrapRunner =>
+      makeOscRewrapRunner({
+        context: oscContext,
+        createJob,
+        getJob,
+        getLogsForInstance,
+        removeJob,
+        s3Endpoint: s3.endpoint,
+        s3AccessKey: s3.accessKey,
+        s3SecretKey: s3.secretKey,
+        s3Bucket: s3.bucket
+      })
   : undefined;
 
 const clipRunner: ClipRunner | undefined = storageAvailable
