@@ -177,6 +177,25 @@ describe('transcode job management (issue #8)', () => {
       expect(h.submitted[0].profile.outputs[0].label).toBe('square');
     });
 
+    // Note: the 202 happy-path threading of profileParams from
+    // submitTranscode into the Encore submit input is covered as a unit test in
+    // src/pipeline/transcode.test.ts, because the full HTTP happy path in this
+    // suite currently 409s on a pre-existing workspace-scoping / repo-signature
+    // drift (unrelated to issue #287). Here we only assert schema validation,
+    // which runs before the object-key check.
+    it('rejects non-string profileParams values (flat string map contract)', async () => {
+      const h = await buildApp();
+      const sourceId = await makeSource(h);
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        // height is a number, not a string — violates Record<string,string>.
+        payload: { profile: 'x264-crf-parametrized', profileParams: { height: 720 } }
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
     it('rejects supplying both profile and customProfile', async () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);

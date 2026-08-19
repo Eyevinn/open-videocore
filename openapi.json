@@ -5038,6 +5038,12 @@
                       "outputs"
                     ],
                     "additionalProperties": false
+                  },
+                  "profileParams": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
                   }
                 },
                 "additionalProperties": false

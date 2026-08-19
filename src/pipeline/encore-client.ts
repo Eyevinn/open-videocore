@@ -28,6 +28,15 @@ export type EncoreSubmitInput = {
   outputUri: string;
   // Named profile string forwarded verbatim to Encore (server-side resolution).
   profile: string;
+  // Optional flat string map populating Encore's job-document `profileParams`
+  // object (issue #287). Encore evaluates these as SpEL expression properties
+  // within the named profile (e.g. crf/preset/height/keyframes for
+  // `x264-crf-parametrized`). Verified against SVT Encore `EncoreJob`:
+  // `val profileParams: Map<String, Any?> = Collections.emptyMap()` (default
+  // `{}`) — github.com/svt/encore, encore-common/.../model/EncoreJob.kt. When
+  // undefined we omit the field entirely so Encore uses its `{}` default and
+  // output is unchanged (backward compatible).
+  profileParams?: Record<string, string>;
 };
 
 export type EncoreSubmitResult = {
@@ -74,11 +83,17 @@ export function toEncorePayload(input: EncoreSubmitInput): Record<string, unknow
     externalId: input.externalId,
     ...(input.progressCallbackUri ? { progressCallbackUri: input.progressCallbackUri } : {}),
     profile: input.profile,
+    // Populate the Encore job document's `profileParams` object (issue #287)
+    // when supplied. Encore evaluates these as SpEL expression properties within
+    // the named server-side profile and accepts string values with no coercion.
+    // Verified shape: `EncoreJob.profileParams: Map<String, Any?>` defaulting to
+    // `{}` (github.com/svt/encore, encore-common/.../model/EncoreJob.kt). Omit
+    // the key entirely when undefined so Encore falls back to its `{}` default.
+    ...(input.profileParams ? { profileParams: input.profileParams } : {}),
     outputFolder: input.outputUri,
     baseName: 'rendition',
     inputs: [{ uri: input.inputUri, type: 'AudioVideo' }]
     // NOTE: no `outputs` field — Encore profiles are server-side only.
-    // profileParams can be added here if the profile uses SpEL expressions.
   };
 }
 

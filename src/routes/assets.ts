@@ -132,10 +132,22 @@ const customProfileSchema = z.object({
   outputs: z.array(encoreOutputSchema).min(1).max(16)
 });
 
+// profileParams (issue #287): a flat string map forwarded verbatim into the
+// Encore job document's `profileParams` object, which Encore evaluates as SpEL
+// expression properties within the named server-side profile (e.g. crf, preset,
+// height, keyframes for `x264-crf-parametrized`). Verified against the SVT
+// Encore EncoreJob model — `profileParams: Map<String, Any?>` defaulting to
+// `{}` (github.com/svt/encore, encore-common/.../model/EncoreJob.kt). We
+// constrain our contract to string values: Encore accepts them with no coercion
+// and each value lands as a single token in the ffmpeg argument list (no new
+// injection surface). Values omitted -> unchanged default output.
+const profileParamsSchema = z.record(z.string(), z.string());
+
 const transcodeBodySchema = z
   .object({
     profile: z.string().min(1).optional(),
-    customProfile: customProfileSchema.optional()
+    customProfile: customProfileSchema.optional(),
+    profileParams: profileParamsSchema.optional()
   })
   .refine((b) => !(b.profile && b.customProfile), {
     message: 'specify either profile or customProfile, not both'
@@ -1903,6 +1915,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceObjectKey: asset.objectKey,
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
+            profileParams: request.body.profileParams,
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
