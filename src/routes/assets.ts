@@ -952,7 +952,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
     reply: import('fastify').FastifyReply,
-    encodeOpts?: { profile?: string; customProfile?: EncoreProfile },
+    encodeOpts?: { profile?: string; customProfile?: EncoreProfile; profileParams?: Record<string, string> },
     // Optional per-execution destination override (issue #207). Already
     // validated + trailing-slash-normalized by the edge schema. Persisted on the
     // execution record so #208 (packager relocation) and #210 (delivery) can
@@ -1103,7 +1103,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               sourceBucket: opts.sourceBucket as string,
               outputBucket: opts.outputBucket as string,
               preset: encodeOpts?.profile,
-              customProfile: encodeOpts?.customProfile
+              customProfile: encodeOpts?.customProfile,
+              // profileParams (issue #288): forwarded verbatim into the same
+              // transcode submission path as POST /:id/transcode so SpEL-
+              // parametrised profiles work from execute too. Undefined leaves
+              // execute behaviour unchanged.
+              profileParams: encodeOpts?.profileParams
             },
             { jobs, assets: repo, encore: opts.encore! }
           );
@@ -2029,6 +2034,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
           profile: z.string().min(1).optional(),
           customProfile: customProfileSchema.optional(),
+          // profileParams (issue #288): reuses the same flat string map validated
+          // on POST /:id/transcode (profileParamsSchema, issue #287) and forwards
+          // it into the shared transcode submission path so SpEL-parametrised
+          // profiles (x264-crf-parametrized, program-kf) work from execute too.
+          // Omitted -> execute behaviour unchanged.
+          profileParams: profileParamsSchema.optional(),
           // Optional per-execution destination override (issue #207). Validated
           // and trailing-slash-normalized at the edge; persisted on the
           // execution record for #208 (packager relocation) / #210 (delivery).
@@ -2057,7 +2068,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
         request,
         reply,
-        { profile: request.body.profile, customProfile: request.body.customProfile as EncoreProfile | undefined },
+        {
+          profile: request.body.profile,
+          customProfile: request.body.customProfile as EncoreProfile | undefined,
+          profileParams: request.body.profileParams
+        },
         request.body.destinationBucket
       );
       if (!started) return reply; // error already sent
