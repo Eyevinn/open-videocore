@@ -52,12 +52,18 @@ export class CouchSearchRepository implements SearchRepository {
 
 function buildSelector(query: SearchQuery): Record<string, unknown> {
   const selector: Record<string, unknown> = { resourceType: RESOURCE_TYPE };
-  if (query.mimeType) {
-    selector['technicalMetadata'] = { containerFormat: query.mimeType };
-  }
-  if (query.tags && query.tags.length > 0) {
-    selector['tags'] = { $all: query.tags };
-  }
+  // NOTE (issue #345): `mimeType`, `tags`, and free-text `q` are NOT pushed down
+  // as Mango selectors. The persisted four-namespace document (ADR-005,
+  // asset-document.ts) stores these under `descriptive.tags` and
+  // `technical.container` — there is NO top-level `tags` / `technicalMetadata`
+  // mirror — so a top-level `{ tags: { $all } }` / `{ technicalMetadata: {...} }`
+  // selector matched zero documents and the endpoint returned empty for every
+  // tag / mimeType query (and any query combined with one). Instead we fetch the
+  // workspace-partitioned asset set and let the shared in-process `matchesQuery`
+  // filter on the RECONSTRUCTED Asset (fromDoc -> fromAssetDocument reads the
+  // `descriptive` namespace), which is exactly how couch-asset-repo.search()
+  // already resolves name/description — keeping the two search endpoints in
+  // lockstep and the projection replayable from asset state alone.
   // TAMS address lookup (issue #168, epic #116). The persisted document carries
   // the machine-derived addressing under the four-namespace `structural.tams`
   // block (asset-document.ts: structural.tams.flowIds[] / .timerange). Push both
@@ -73,14 +79,12 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   if (query.tamsTimerange) {
     selector['structural.tams.timerange'] = { $eq: query.tamsTimerange };
   }
-  // Metadata filters push down as `metadata.<key>: { $eq: value }` so CouchDB
-  // matches exact top-level metadata values within the workspace partition
-  // (issue #12). Dotted keys address nested document fields in Mango.
-  if (query.metadata) {
-    for (const [key, value] of Object.entries(query.metadata)) {
-      selector[`metadata.${key}`] = { $eq: value };
-    }
-  }
+  // Operator metadata (issue #12) is NOT pushed down either: it is persisted
+  // under `descriptive.custom.<key>` (asset-document.ts -> fromAssetDocument maps
+  // it to `asset.metadata`), so a top-level `metadata.<key>` selector matched
+  // zero documents (same root cause as tags/mimeType, issue #345). The shared
+  // `matchesQuery` re-checks `asset.metadata` in-process on the reconstructed
+  // Asset, so metadata filtering stays correct without the broken push-down.
   return selector;
 }
 
