@@ -675,7 +675,17 @@ const commentSchema = z.object({
 const ingestUrlSchema = z.object({
   sourceUrl: z.string().min(1).max(4096),
   name: z.string().min(1).max(256).optional(),
-  description: z.string().max(2048).optional()
+  // Editorial title supplied at ingest time (issue #343). Persisted to the
+  // user-writable `descriptive` namespace via the repository's `name` input
+  // (asset-document.ts maps `asset.name` -> `descriptive.title`), so it lands
+  // in the exact same place a later PUT /:id/metadata would set it. `name` is
+  // kept as an alias for backward compatibility; `title` wins when both appear.
+  title: z.string().min(1).max(256).optional(),
+  description: z.string().max(2048).optional(),
+  // First-class editorial tags supplied at ingest time (issue #343). Passed to
+  // the repository's `tags` input, which normalizes (dedupe, first-seen order)
+  // exactly like POST /:id/tags and stores them under `descriptive.tags`.
+  tags: tagsSchema.optional()
 });
 
 const ingestAcceptedSchema = z.object({
@@ -1284,7 +1294,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           .code(501)
           .send({ error: 'not_configured', message: 'object storage is not configured' });
       }
-      const { sourceUrl, name, description } = request.body;
+      const { sourceUrl, name, title, description, tags } = request.body;
 
       // Validate synchronously so a bad URL is a 400, not a background failure.
       const parsed = parseSource(sourceUrl);
@@ -1297,9 +1307,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         decodeURIComponent(parsed.url.pathname.split('/').filter(Boolean).pop() ?? '') ||
         parsed.url.hostname;
 
+      // Persist editorial title + tags to the user-writable `descriptive`
+      // namespace at creation time (issue #343). `title` (preferred) or the
+      // legacy `name` alias becomes `descriptive.title`; `tags` becomes
+      // `descriptive.tags` — the repository normalizes tags identically to
+      // POST /:id/tags, so a later GET returns the submitted values verbatim.
       const asset = await repo.create({
-        name: name ?? fallbackName,
-        description
+        name: title ?? name ?? fallbackName,
+        description,
+        tags
       });
       const objectKey = `ingest/${asset.id}`;
       await repo.update(asset.id, { objectKey });

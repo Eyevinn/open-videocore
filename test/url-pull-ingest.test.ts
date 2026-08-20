@@ -147,6 +147,94 @@ describe('URL-pull ingest (issue #5)', () => {
     });
   });
 
+  describe('descriptive metadata persistence (issue #343)', () => {
+    // Read the asset back through the public GET /:id contract (the same surface
+    // a client uses). `name` is the API projection of descriptive.title; `tags`
+    // is descriptive.tags. Reading via the endpoint (rather than the repo) keeps
+    // this assertion tied to the shipped contract.
+    async function getAsset(app: FastifyInstance, id: string): Promise<Record<string, unknown>> {
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
+      expect(res.statusCode).toBe(200);
+      return res.json();
+    }
+
+    it('persists title + tags to the descriptive namespace at ingest time', async () => {
+      const payload = Buffer.from('hello-video-bytes');
+      const fetch = vi.fn(async () =>
+        new Response(payload, { headers: { 'content-length': String(payload.length) } })
+      ) as unknown as typeof globalThis.fetch;
+
+      const { app } = await buildApp({ pullDeps: { fetch } });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/assets/ingest-url',
+        headers: A,
+        payload: {
+          sourceUrl: 'https://example.com/clip.mp4',
+          title: 'Quarterly Highlights',
+          tags: ['marketing', 'q3', 'marketing']
+        }
+      });
+      expect(res.statusCode).toBe(202);
+      const { assetId } = res.json();
+
+      // The created asset must carry the submitted descriptive values — identical
+      // to what PUT /:id/metadata and POST /:id/tags would have written. Tags are
+      // deduped (first-seen order), exactly like POST /:id/tags.
+      const asset = await getAsset(app, assetId as string);
+      expect(asset.name).toBe('Quarterly Highlights');
+      expect(asset.tags).toEqual(['marketing', 'q3']);
+    });
+
+    it('reaches the search projection so a query for the title returns the asset', async () => {
+      const payload = Buffer.from('hello-video-bytes');
+      const fetch = vi.fn(async () =>
+        new Response(payload, { headers: { 'content-length': String(payload.length) } })
+      ) as unknown as typeof globalThis.fetch;
+
+      const { app } = await buildApp({ pullDeps: { fetch } });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/assets/ingest-url',
+        headers: A,
+        payload: {
+          sourceUrl: 'https://example.com/clip.mp4',
+          title: 'Searchable Title',
+          tags: ['findme']
+        }
+      });
+      const { assetId } = res.json();
+
+      // GET /search is backed by the same descriptive projection; a title
+      // substring resolves the just-ingested asset.
+      const search = await app.inject({
+        method: 'GET',
+        url: '/api/v1/assets/search?q=Searchable',
+        headers: A
+      });
+      expect(search.statusCode).toBe(200);
+      expect(search.json().items.map((a: { id: string }) => a.id)).toContain(assetId);
+    });
+
+    it('accepts the legacy `name` alias for descriptive.title', async () => {
+      const payload = Buffer.from('hello-video-bytes');
+      const fetch = vi.fn(async () =>
+        new Response(payload, { headers: { 'content-length': String(payload.length) } })
+      ) as unknown as typeof globalThis.fetch;
+
+      const { app } = await buildApp({ pullDeps: { fetch } });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/assets/ingest-url',
+        headers: A,
+        payload: { sourceUrl: 'https://example.com/clip.mp4', name: 'Legacy Name' }
+      });
+      const { assetId } = res.json();
+      const asset = await getAsset(app, assetId as string);
+      expect(asset.name).toBe('Legacy Name');
+    });
+  });
+
   describe('S3 source', () => {
     it('pulls via the injected S3 reader', async () => {
       const payload = Buffer.from('s3-object-bytes');
