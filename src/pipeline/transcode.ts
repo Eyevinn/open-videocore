@@ -40,6 +40,13 @@ export type SubmitTranscodeParams = {
   // Profile name forwarded verbatim to Encore (server-side named profile).
   preset?: string;
   customProfile?: EncoreProfile;
+  // Flat string map forwarded verbatim into the Encore job document's
+  // `profileParams` object (issue #287). Encore evaluates these as SpEL
+  // expression properties within the named profile (e.g. crf, preset, height,
+  // keyframes for `x264-crf-parametrized`). Omitting it preserves the profile's
+  // default output. Verified shape: SVT Encore `EncoreJob.profileParams`
+  // (github.com/svt/encore, encore-common/.../model/EncoreJob.kt).
+  profileParams?: Record<string, string>;
   // S3 bucket names so we can build the s3:// URIs Encore reads/writes.
   sourceBucket: string;
   outputBucket: string;
@@ -90,7 +97,7 @@ export async function submitTranscode(
     // at the callback listener paired with the chosen Encore instance (ADR-006),
     // so it is not set here.
     const encoreProfile = params.customProfile ? params.customProfile.name : profileName;
-    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, progressCallbackUri: undefined });
+    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, profileParams: params.profileParams, progressCallbackUri: undefined });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {
       await deps.jobs.update(job.id, { encoreInternalJobId });
