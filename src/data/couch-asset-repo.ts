@@ -168,8 +168,8 @@ export class CouchAssetRepository implements AssetRepository {
     if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
       return undefined;
     }
-    // Concurrent-write safety (issue #279): route the read-modify-write through
-    // the shared conflict-retry wrapper (updateWithRetry, src/data/couchdb.ts).
+    // Concurrent-write safety (issues #278/#279/#281): route the read-modify-write
+    // through the shared conflict-retry wrapper (updateWithRetry, src/data/couchdb.ts).
     // A `Document update conflict.` (HTTP 409) from a concurrent writer racing on
     // the same _rev — e.g. a thumbnail write landing between this method's read
     // and put, or the re-drive path of issue #281 racing an in-flight
