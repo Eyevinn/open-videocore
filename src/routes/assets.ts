@@ -720,7 +720,7 @@ async function resolveEncoreJobUrlForPackaging(
 // carry this format because Encore writes to a configurable S3 output bucket
 // that may differ from the source bucket (ADR-001). Returns null for plain
 // object keys (no scheme prefix) so callers can use the source-bucket storage.
-function parseS3Uri(uri: string): { bucket: string; key: string } | null {
+export function parseS3Uri(uri: string): { bucket: string; key: string } | null {
   const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
   if (!match) return null;
   return { bucket: match[1], key: match[2] };

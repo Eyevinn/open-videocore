@@ -61,6 +61,11 @@ import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { retentionRouter, archiveRetentionMsFromEnv } from './routes/retention.js';
+import {
+  ArchivedAssetPurgeLoop,
+  archivePurgeIntervalMsFromEnv
+} from './pipeline/archived-asset-purge-loop.js';
+import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
@@ -1104,6 +1109,56 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
   }
 };
 await app.register(retentionRouter, retentionRouterOptions);
+
+// Archived-asset retention purge sweep (issue #327, part of #323). An
+// INDEPENDENT unref'd, overlap-guarded interval — NOT folded into the Encore
+// scaler tick — that purges archived assets past the retention window and
+// replaces each with a tombstone. Wired here alongside startEncoreCallbackPoller
+// (started inside activateScaler above). It reads the LIVE `archiveRetentionMs`
+// each tick, so it honours PATCH /api/v1/retention/config and is skipped
+// entirely while retention is unset (0/disabled). All sweep deps are resolved
+// per tick from the (default) stack connections so the sweep targets the same
+// concrete repo + buckets the request path uses.
+//
+// purgeToTombstone is NOT on the AssetRepository interface (it is a concrete
+// method on CouchAssetRepository / InMemoryAssetRepository), so the sweep's
+// `purge` callback resolves the concrete `.assets` repo and invokes it directly.
+const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
+  retentionMs: () => archiveRetentionMs,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    assets: assetRepository,
+    // Resolve the concrete repo and call its purgeToTombstone (doc-replace to a
+    // tombstone). Present on both concrete implementations; typed loosely here
+    // because it is not on the shared AssetRepository interface.
+    purge: async (assetId: string) => {
+      const conns = await stackResolver.resolve();
+      const concrete = conns.assets as unknown as {
+        purgeToTombstone?: (id: string) => Promise<string | undefined> | boolean;
+      };
+      if (typeof concrete.purgeToTombstone !== 'function') {
+        throw new Error('resolved asset repository does not support purgeToTombstone');
+      }
+      return concrete.purgeToTombstone(assetId);
+    },
+    // Build a WorkspaceStorage per target bucket from the resolved stack's MinIO
+    // client (mirrors GET /:id/files). Returns undefined when object storage is
+    // not configured — the sweep then records the tombstone without object
+    // removal, and a later tick reclaims stragglers once storage is available.
+    storageForBucket: (bucket: string): PurgeStorage | undefined => {
+      const conns = stackResolver.resolveCached();
+      if (!conns?.storageClient) return undefined;
+      return new WorkspaceStorage(conns.storageClient, bucket);
+    },
+    sourceBucket
+  }
+});
+archivedAssetPurgeLoop.start(archivePurgeIntervalMsFromEnv());
+
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
 
