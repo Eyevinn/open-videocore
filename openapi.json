@@ -2298,6 +2298,20 @@
                   "description": {
                     "type": "string",
                     "maxLength": 2048
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "maxItems": 128
                   }
                 },
                 "required": [

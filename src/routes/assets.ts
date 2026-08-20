@@ -672,11 +672,25 @@ const commentSchema = z.object({
   createdAt: z.string()
 });
 
-const ingestUrlSchema = z.object({
-  sourceUrl: z.string().min(1).max(4096),
-  name: z.string().min(1).max(256).optional(),
-  description: z.string().max(2048).optional()
-});
+// URL-pull ingest request body (issue #5). `.strict()` (issue #344): unknown /
+// non-actionable properties are REJECTED with a 400 rather than silently
+// accepted and discarded — a silently-dropped field previously made a
+// dropped-metadata bug expensive to discover. The accepted set is exactly the
+// fields the handler acts on today (`sourceUrl`, `name`, `description`) PLUS
+// `title` and `tags`. `title`/`tags` are accepted-but-not-yet-read here: issue
+// #343 (separate branch) wires them into the descriptive namespace, so allowing
+// them now guarantees that when #343 lands its bodies are not rejected.
+const ingestUrlSchema = z
+  .object({
+    sourceUrl: z.string().min(1).max(4096),
+    name: z.string().min(1).max(256).optional(),
+    description: z.string().max(2048).optional(),
+    // Reserved for #343 (title -> descriptive namespace); accepted here so the
+    // two changes compose without a validation regression.
+    title: z.string().min(1).max(256).optional(),
+    tags: tagsSchema.optional()
+  })
+  .strict();
 
 const ingestAcceptedSchema = z.object({
   assetId: z.string(),
