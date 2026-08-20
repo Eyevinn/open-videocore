@@ -12,6 +12,7 @@
 // workspace parameter to thread; the resolver returns the deployment's stack.
 
 import type {
+  AssetReadState,
   AssetRepository,
   AssetReviewState,
   CreateAssetInput,
@@ -65,6 +66,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   }
   async get(id: string): Promise<Asset | undefined> {
     return (await this.repo()).get(id);
+  }
+  async getState(id: string): Promise<AssetReadState> {
+    return (await this.repo()).getState(id);
   }
   async getBySlug(slug: string): Promise<Asset | undefined> {
     return (await this.repo()).getBySlug(slug);
