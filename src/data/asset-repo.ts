@@ -546,6 +546,51 @@ export interface AssetRepository {
   // Soft-delete: transitions the asset to `archived`. Returns the archived
   // asset, or undefined if it does not exist.
   remove(id: string): Promise<Asset | undefined>;
+  // Undo an archive while the asset is still within its retention window
+  // (issue #328, part of the purge epic #323). Sibling to `remove(id)`: where
+  // `remove` archives, `restore` un-archives an already-`archived` asset back to
+  // a live status. The target is the pre-archive status from statusHistory when
+  // it was `ready`, otherwise `failed` (see `restoreTargetStatus`). This is the
+  // ONE audited path that leaves `archived` — it BYPASSES isValidTransition (the
+  // state machine keeps `ALLOWED_TRANSITIONS.archived === []` so no ordinary
+  // PATCH can revive an archived asset) and appends an `archived -> <target>`
+  // statusHistory entry consistent with ADR-005 (append, never rewrite).
+  // Returns the restored asset, or undefined when the id is unknown or the asset
+  // is not currently `archived` (nothing to restore).
+  restore(id: string): Promise<Asset | undefined>;
+}
+
+// Resolve the target status a `restore` (issue #328) moves an archived asset to.
+// The rule: the pre-archive status is the `from` of the most recent transition
+// INTO `archived`; if that pre-archive status was `ready` the asset returns to
+// `ready`, otherwise it returns to `failed`. Restoring to `failed` (rather than
+// e.g. `processing`/`uploading`) gives the operator a single, well-defined live
+// state to re-drive from for every non-ready pre-archive history. Defaults to
+// `failed` when no `-> archived` transition is recorded (defensive).
+export function restoreTargetStatus(history: readonly StatusTransition[]): AssetStatus {
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    if (history[i].to === 'archived') {
+      return history[i].from === 'ready' ? 'ready' : 'failed';
+    }
+  }
+  return 'failed';
+}
+
+// Apply a restore (issue #328): move an already-`archived` asset to its resolved
+// target status and append an audited `archived -> <target>` statusHistory entry.
+// Deliberately does NOT consult isValidTransition — restore is the sanctioned
+// exception to the terminal `archived` state (ALLOWED_TRANSITIONS.archived stays
+// `[]`). The history is appended to, never rewritten (ADR-005). The caller is
+// responsible for having verified `current === 'archived'`.
+export function applyRestore(
+  history: StatusTransition[],
+  now: string
+): { status: AssetStatus; statusHistory: StatusTransition[] } {
+  const target = restoreTargetStatus(history);
+  return {
+    status: target,
+    statusHistory: [...history, { at: now, from: 'archived', to: target }]
+  };
 }
 
 // Build the initial status history entry for a freshly created asset.
@@ -1023,6 +1068,32 @@ export class InMemoryAssetRepository implements AssetRepository {
     // Soft delete: transition to `archived` (see couch-asset-repo.ts for the
     // delete-strategy rationale). The route blocks if children exist.
     return this.update(id, { status: 'archived' });
+  }
+
+  async restore(id: string): Promise<Asset | undefined> {
+    // Undo an archive (issue #328). Bypasses the state machine (archived is
+    // terminal for ordinary PATCH) and appends an audited restore entry. A
+    // tombstone (purged) id is absent from `store`, so it reads as not-found
+    // here — the route maps that to 410 Gone via getState().
+    const existing = this.store.get(id);
+    if (!existing || existing.status !== 'archived') {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const applied = applyRestore(existing.statusHistory, now);
+    const next: Asset = {
+      ...existing,
+      status: applied.status,
+      statusHistory: applied.statusHistory,
+      updatedAt: now,
+      // Audited administrative restore (ADR-005 / issue #53). Append-only.
+      provenance: [
+        ...(existing.provenance ?? []),
+        { at: now, by: 'user', op: 'restore', detail: applied.status }
+      ]
+    };
+    this.store.set(id, next);
+    return { ...next };
   }
 }
 

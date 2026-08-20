@@ -31,6 +31,7 @@ import {
   type ListResult,
   type UpdateAssetInput,
   applyMetadata,
+  applyRestore,
   applyReviewState,
   applyStatus,
   clampLimit,
@@ -347,6 +348,56 @@ export class CouchAssetRepository implements AssetRepository {
   async remove(id: string): Promise<Asset | undefined> {
     // Soft delete (see file header): archive rather than destroy.
     return this.update(id, { status: 'archived' });
+  }
+
+  // Undo an archive within the retention window (issue #328, part of #323).
+  // Sibling to remove(): moves an already-`archived` asset back to a live status
+  // (`ready` when the pre-archive status was `ready`, otherwise `failed`) and
+  // appends an audited `archived -> <target>` statusHistory entry. Deliberately
+  // BYPASSES the state machine — the ordinary PATCH path cannot leave `archived`
+  // (ALLOWED_TRANSITIONS.archived stays `[]`) so this is the one sanctioned exit,
+  // consistent with ADR-005 (append the audit entry, never rewrite history).
+  //
+  // Routed through updateWithRetry for the same conflict-retry safety the rest of
+  // the read-modify-write paths use (issues #278/#279/#281): the patchFn is pure
+  // and re-runnable per attempt. A tombstone (purged) doc carries a non-asset
+  // resourceType and so fails the preflight guard, reading as undefined here — the
+  // route maps that to 410 via getState(). Returns undefined when the id is
+  // unknown, purged, or not currently `archived` (nothing to restore).
+  async restore(id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    if (fromDoc(preflight).status !== 'archived') {
+      return undefined;
+    }
+    let restored: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      // Guard again inside the retry: a concurrent writer could have moved the
+      // asset out of `archived` between the preflight read and this attempt.
+      if (existing.status !== 'archived') {
+        restored = undefined;
+        return toDoc(existing);
+      }
+      const now = new Date().toISOString();
+      const applied = applyRestore(existing.statusHistory, now);
+      const next: Asset = {
+        ...existing,
+        status: applied.status,
+        statusHistory: applied.statusHistory,
+        updatedAt: now,
+        provenance: [
+          ...(existing.provenance ?? []),
+          { at: now, by: 'user', op: 'restore', detail: applied.status }
+        ]
+      };
+      restored = next;
+      return toDoc(next);
+    });
+    return written ? restored : undefined;
   }
 
   // Purge an archived asset by REPLACING its document in place with a tombstone
