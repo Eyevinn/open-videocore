@@ -22,6 +22,7 @@
 import { ulid } from 'ulid';
 import {
   type Asset,
+  type AssetReadState,
   type AssetRepository,
   type AssetReviewState,
   type AssetStatus,
@@ -47,6 +48,12 @@ import {
   toAssetDocument,
   type AssetDocument
 } from './asset-document.js';
+import {
+  ASSET_TOMBSTONE_TYPE,
+  AssetTombstoneSchema,
+  isTombstoneDoc,
+  toTombstoneDocument
+} from './asset-tombstone.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'asset';
@@ -104,9 +111,30 @@ export class CouchAssetRepository implements AssetRepository {
     const couch = this.couchFor();
     const doc = await couch.get(id);
     if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      // A tombstone (resourceType === ASSET_TOMBSTONE_TYPE) is NOT an asset, so
+      // it reads as `undefined` here — every non-410 caller (delivery, files,
+      // pipeline) sees a purged asset as not-found, which is the safe default.
+      // The 410-aware read path uses getState() below instead.
       return undefined;
     }
     return fromDoc(doc);
+  }
+
+  async getState(id: string): Promise<AssetReadState> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc) {
+      return { kind: 'not-found' };
+    }
+    if (isTombstoneDoc(doc)) {
+      return { kind: 'tombstone' };
+    }
+    if (doc.resourceType !== RESOURCE_TYPE) {
+      // Some other resource sharing the id space (should not happen for asset
+      // ids) — treat as not-found rather than leaking a foreign document.
+      return { kind: 'not-found' };
+    }
+    return { kind: 'asset', asset: fromDoc(doc) };
   }
 
   // Resolve by slug (issue #132). Queries the top-level `slug` mirror emitted by
@@ -319,6 +347,34 @@ export class CouchAssetRepository implements AssetRepository {
   async remove(id: string): Promise<Asset | undefined> {
     // Soft delete (see file header): archive rather than destroy.
     return this.update(id, { status: 'archived' });
+  }
+
+  // Purge an archived asset by REPLACING its document in place with a tombstone
+  // (issue #326, doc-replace per ADR-005). Exposed so the retention sweep slice
+  // (#327) constructs and writes the tombstone through this one path rather than
+  // re-deriving the shape; this slice does not call it on any request route. The
+  // asset's `_rev` is carried so CouchDB accepts the replacement and the
+  // `_changes` feed emits the tombstone body, which drops the asset from the PG
+  // search projection. Returns the tombstone's id, or undefined when the id is
+  // absent or not a live asset (already purged / never existed).
+  async purgeToTombstone(
+    id: string,
+    opts: { purgedAt?: string } = {}
+  ): Promise<string | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const asset = fromDoc(doc);
+    const tombstone = toTombstoneDocument(asset, { purgedAt: opts.purgedAt });
+    // Validate the replacement body, then strip the id/rev envelope fields the
+    // storage layer owns and carry the live `_rev` so the write is an in-place
+    // replacement (not a branch/conflict).
+    const validated = AssetTombstoneSchema.parse(tombstone);
+    const { _id: _ignoredId, _rev: _ignoredRev, ...body } = validated;
+    await couch.put(id, { ...body, resourceType: ASSET_TOMBSTONE_TYPE, _rev: doc._rev });
+    return id;
   }
 }
 

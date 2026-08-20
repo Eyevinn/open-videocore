@@ -1493,11 +1493,28 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       schema: {
         params: z.object({ id: z.string() }),
-        response: { 200: assetSchema, 404: errorSchema }
+        response: { 200: assetSchema, 404: errorSchema, 410: errorSchema }
       }
     },
     async (request, reply) => {
-      const asset = await resolveAsset(request.params.id);
+      const idOrSlug = request.params.id;
+      // Tombstone semantics (issue #326): a purged archived asset's document is
+      // replaced in place by a tombstone. A read by its former id must return
+      // 410 Gone (the resource existed and was intentionally removed), NOT 404.
+      // getState() surfaces that distinction only for the ULID id path; slugs
+      // fall through to the ordinary slug lookup (a purged asset drops out of the
+      // slug index, so a former slug resolves to 404 as before).
+      if (isUlid(idOrSlug)) {
+        const state = await repo.getState(idOrSlug);
+        if (state.kind === 'tombstone') {
+          return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
+        }
+        if (state.kind === 'asset') {
+          return reply.code(200).send(state.asset);
+        }
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const asset = await resolveAsset(idOrSlug);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
