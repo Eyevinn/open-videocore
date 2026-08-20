@@ -755,18 +755,64 @@ function contentTypeForPackagedObject(relativePath: string): string {
   const lower = relativePath.toLowerCase();
   if (lower.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
   if (lower.endsWith('.mpd')) return 'application/dash+xml';
+  // CMAF media segments (fragmented .m4s / .cmf*) use the ISO segment media type
+  // (RFC 8216 / ISO BMFF); a whole `.mp4` (e.g. a single-file init or the DASH
+  // init segment) is served as a plain MP4 container.
   if (
     lower.endsWith('.m4s') ||
-    lower.endsWith('.mp4') ||
     lower.endsWith('.cmfv') ||
     lower.endsWith('.cmfa') ||
     lower.endsWith('.cmft')
   ) {
-    return 'video/mp4';
+    return 'video/iso.segment';
   }
+  if (lower.endsWith('.mp4') || lower.endsWith('.m4v')) return 'video/mp4';
+  if (lower.endsWith('.m4a')) return 'audio/mp4';
   if (lower.endsWith('.ts')) return 'video/mp2t';
   if (lower.endsWith('.vtt')) return 'text/vtt';
   return 'application/octet-stream';
+}
+
+// Parse a single-range HTTP `Range` header of the form `bytes=<start>-<end>`
+// against a known object `size`, returning the resolved inclusive byte offsets.
+// Supports the three RFC 7233 single-range forms the players emit for CMAF
+// segment fetches:
+//   - `bytes=START-END`  -> [START, END]
+//   - `bytes=START-`     -> [START, size-1] (open-ended tail)
+//   - `bytes=-SUFFIX`    -> last SUFFIX bytes -> [size-SUFFIX, size-1]
+// Returns { unsatisfiable: true } when the range is well-formed but lies outside
+// the object (the route maps this to 416). Returns undefined when the header is
+// absent or not a single byte-range we can honor, so the caller streams the
+// whole object with 200 (a correct, if unoptimised, response).
+function parseByteRange(
+  rangeHeader: string | undefined,
+  size: number
+): { start: number; end: number } | { unsatisfiable: true } | undefined {
+  if (!rangeHeader) return undefined;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!match) return undefined;
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === '' && rawEnd === '') return undefined;
+
+  let start: number;
+  let end: number;
+  if (rawStart === '') {
+    // Suffix range: final N bytes.
+    const suffix = Number.parseInt(rawEnd, 10);
+    if (!Number.isFinite(suffix) || suffix <= 0) return undefined;
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number.parseInt(rawStart, 10);
+    end = rawEnd === '' ? size - 1 : Number.parseInt(rawEnd, 10);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return undefined;
+  }
+
+  if (start > end || start >= size) {
+    return { unsatisfiable: true };
+  }
+  // Clamp the end to the last byte so an over-long range still resolves.
+  return { start, end: Math.min(end, size - 1) };
 }
 
 function fileNameFromKey(key: string): string {
@@ -1759,24 +1805,79 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const bucket = request.connections?.packagedBucket ?? packagedBucket();
       const packagedStorage = new WorkspaceStorage(storageClient, bucket);
       const objectKey = `${outputPrefix(asset.id)}/${relative}`;
+      const contentType = contentTypeForPackagedObject(relative);
 
-      let stream: Awaited<ReturnType<WorkspaceStorage['getObject']>>;
+      // stat first so we can (a) return a clean 404 for a missing object without
+      // opening a body stream, (b) advertise Accept-Ranges + Content-Length, and
+      // (c) resolve a Range header against the real object size. statObject
+      // returns undefined for a missing key (mapped to 404 below).
+      let stat: Awaited<ReturnType<WorkspaceStorage['statObject']>>;
       try {
-        stream = await packagedStorage.getObject(objectKey);
+        stat = await packagedStorage.statObject(objectKey);
       } catch (err) {
-        if ((err as { code?: string }).code === 'NoSuchKey' || (err as { code?: string }).code === 'NotFound') {
+        if (
+          (err as { code?: string }).code === 'NoSuchKey' ||
+          (err as { code?: string }).code === 'NotFound'
+        ) {
           return reply.code(404).send({ error: 'not_found' });
         }
         throw err;
       }
+      if (!stat) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
 
-      return reply
-        .header('Content-Type', contentTypeForPackagedObject(relative))
-        // Manifests must not be cached long (segments may roll); segments are
-        // immutable so may be cached. Keep it conservative and let a fronting
-        // CDN/proxy override if desired.
+      // Honor a single HTTP Range request for segment fetches. Manifests are
+      // small and typically fetched whole, but players routinely issue ranged
+      // GETs for CMAF media segments; supporting them keeps byte-range addressed
+      // playback working through the proxy (issue #339). A malformed/multi-range
+      // header falls through to a full 200 response (a valid outcome per RFC 7233).
+      const parsed = parseByteRange(request.headers['range'], stat.size);
+      if (parsed && 'unsatisfiable' in parsed) {
+        return reply
+          .code(416)
+          .header('Content-Range', `bytes */${stat.size}`)
+          .send({ error: 'range_not_satisfiable' });
+      }
+
+      // Manifests must not be cached long (segments may roll); segments are
+      // immutable so may be cached. Keep it conservative and let a fronting
+      // CDN/proxy override if desired. Accept-Ranges advertises range support so
+      // a player knows it can issue ranged segment GETs.
+      reply
+        .header('Content-Type', contentType)
         .header('Cache-Control', 'no-cache')
-        .send(stream);
+        .header('Accept-Ranges', 'bytes');
+
+      try {
+        if (parsed) {
+          const length = parsed.end - parsed.start + 1;
+          const stream = await packagedStorage.getPartialObject(
+            objectKey,
+            parsed.start,
+            length
+          );
+          return reply
+            .code(206)
+            .header('Content-Range', `bytes ${parsed.start}-${parsed.end}/${stat.size}`)
+            .header('Content-Length', String(length))
+            .send(stream);
+        }
+        const stream = await packagedStorage.getObject(objectKey);
+        return reply
+          .header('Content-Length', String(stat.size))
+          .send(stream);
+      } catch (err) {
+        // A key that vanished between stat and read (or a backend NoSuchKey) is a
+        // 404 rather than a 500 so a racing purge does not leak an error.
+        if (
+          (err as { code?: string }).code === 'NoSuchKey' ||
+          (err as { code?: string }).code === 'NotFound'
+        ) {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+        throw err;
+      }
     }
   );
 

@@ -111,6 +111,19 @@ export class WorkspaceStorage {
     return this.client.getObject(this.bucket, this.scopedKey(localKey));
   }
 
+  // Stream a byte range of an object (partial read), backing HTTP Range requests
+  // for segment fetches through the proxy delivery route (issue #339). Maps to
+  // MinIO's getPartialObject(bucket, key, offset, length?): a `length` of
+  // undefined streams from `offset` to the end of the object. Like getObject,
+  // this uses the stack's admin credentials so the packaged bucket stays private.
+  async getPartialObject(
+    localKey: string,
+    offset: number,
+    length?: number
+  ): Promise<import('stream').Readable> {
+    return this.client.getPartialObject(this.bucket, this.scopedKey(localKey), offset, length);
+  }
+
   // -------------------------------------------------------------------------
   // Multipart / chunked upload (issue #4).
   //
