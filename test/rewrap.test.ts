@@ -1,9 +1,11 @@
-// Export / re-wrap (remux) tests (issue #19).
+// Export / re-wrap (remux) tests (issue #19, issue #316).
 //
 // Covers:
 //   - the orchestration in rewrap() (child asset creation, parentId, key
-//     naming, lifecycle, source untouched, failure handling)
-//   - the OSC ffmpeg `-c copy` cmdline builder + ephemeral-job runner lifecycle
+//     naming, lifecycle, source untouched, failure handling, and the issue #316
+//     defense-in-depth output-existence check)
+//   - the OSC ffmpeg `-c copy` cmdline builder + ephemeral-job runner lifecycle,
+//     including the s3://bucket/key native output + AWS creds contract (#316)
 //   - the assets router endpoint (POST /:id/export) with statuses 201, 400,
 //     404, 409, 501, 502
 //
@@ -45,26 +47,35 @@ import type { WorkspaceStorage } from '../src/data/storage.js';
 const auth = (token: string) => ({ authorization: `Bearer ${token}` });
 const A = auth('token-a');
 
-function fakeStorage(): WorkspaceStorage {
+// Fake storage: presignedGet mints a source URL; statObject reports whether the
+// re-wrapped OUTPUT object exists (issue #316 defense in depth). By default the
+// output is present. Pass `{ objectExists: false }` to simulate ffmpeg reporting
+// success while writing nothing (the exact #316 failure mode). presignedPut is
+// retained but MUST NOT be called by the re-wrap path anymore.
+function fakeStorage(opts: { objectExists?: boolean } = {}): WorkspaceStorage {
+  const exists = opts.objectExists ?? true;
   return {
     presignedGet: vi.fn(async (key: string) => `https://minio.example/${key}?sig=get`),
-    presignedPut: vi.fn(async (key: string) => `https://minio.example/${key}?sig=put`)
+    presignedPut: vi.fn(async (key: string) => `https://minio.example/${key}?sig=put`),
+    statObject: vi.fn(async () => (exists ? { size: 1234, etag: 'etag-1' } : undefined))
   } as unknown as WorkspaceStorage;
 }
 
 async function buildApp(opts: {
   rewrapRunner?: RewrapRunner;
   withStorage?: boolean;
+  objectExists?: boolean;
 } = {}): Promise<{ app: FastifyInstance; repo: InMemoryAssetRepository }> {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
   const repo = new InMemoryAssetRepository();
+  const storage = fakeStorage({ objectExists: opts.objectExists });
   await app.register(assetsRouter, {
     prefix: '/api/v1/assets',
     repository: repo,
-    storageFor: opts.withStorage === false ? undefined : () => fakeStorage(),
+    storageFor: opts.withStorage === false ? undefined : () => storage,
     rewrapRunner: opts.rewrapRunner
   });
   await app.ready();
@@ -79,7 +90,7 @@ async function createAssetWithObject(app: FastifyInstance, repo: InMemoryAssetRe
     payload: { name: 'master' }
   });
   const id = res.json().id as string;
-  await repo.update('workspace-a', id, { objectKey: `ingest/${id}` });
+  await repo.update(id, { objectKey: `ingest/${id}` });
   return id;
 }
 
@@ -95,16 +106,16 @@ describe('rewrap format guard + key naming', () => {
   });
 
   it('builds the documented output key shape', () => {
-    expect(rewrapObjectKey('workspace-a', 'asset-2', 'mp4')).toBe('workspace-a/exports/asset-2.mp4');
+    expect(rewrapObjectKey('asset-2', 'mp4')).toBe('exports/asset-2.mp4');
   });
 });
 
 describe('rewrap orchestration', () => {
   it('creates a ready child asset linked to the source and leaves the source untouched', async () => {
     const repo = new InMemoryAssetRepository();
-    const source = await repo.create('workspace-a', { name: 'master', objectKey: 'ingest/x' });
-    await repo.update('workspace-a', source.id, { status: 'processing' });
-    await repo.update('workspace-a', source.id, { status: 'ready' });
+    const source = await repo.create({ name: 'master', objectKey: 'ingest/x' });
+    await repo.update(source.id, { status: 'processing' });
+    await repo.update(source.id, { status: 'ready' });
 
     let seenSrc = '';
     let seenDst = '';
@@ -115,7 +126,6 @@ describe('rewrap orchestration', () => {
 
     const child = await rewrap(
       {
-        workspaceId: 'workspace-a',
         sourceAssetId: source.id,
         objectKey: 'ingest/x',
         targetFormat: 'mp4'
@@ -125,23 +135,40 @@ describe('rewrap orchestration', () => {
 
     expect(child.parentId).toBe(source.id);
     expect(child.status).toBe('ready');
-    expect(child.objectKey).toBe(rewrapObjectKey('workspace-a', child.id, 'mp4'));
+    expect(child.objectKey).toBe(rewrapObjectKey(child.id, 'mp4'));
     expect(seenSrc).toContain('ingest/x');
-    expect(seenDst).toContain(`exports/${child.id}.mp4`);
+    // The runner now receives the destination OBJECT KEY, not a presigned PUT URL.
+    expect(seenDst).toBe(rewrapObjectKey(child.id, 'mp4'));
+    expect(seenDst).not.toContain('http');
 
     // Source is unchanged by an export.
-    const refreshedSource = await repo.get('workspace-a', source.id);
+    const refreshedSource = await repo.get(source.id);
     expect(refreshedSource?.status).toBe('ready');
     expect(refreshedSource?.objectKey).toBe('ingest/x');
   });
 
+  it('does not mint a presigned PUT URL for the output (issue #316)', async () => {
+    const repo = new InMemoryAssetRepository();
+    const source = await repo.create({ name: 'master', objectKey: 'ingest/x' });
+    const storage = fakeStorage();
+    const runner: RewrapRunner = vi.fn(async () => undefined);
+    await rewrap(
+      { sourceAssetId: source.id, objectKey: 'ingest/x', targetFormat: 'mp4' },
+      { assets: repo, storage, runner }
+    );
+    // The output is written natively to s3://bucket/key by the runner; the
+    // orchestrator must never presign a PUT URL for it.
+    expect(storage.presignedPut).not.toHaveBeenCalled();
+    // It DOES verify the output object exists before flipping to ready.
+    expect(storage.statObject).toHaveBeenCalledOnce();
+  });
+
   it('uses a provided outputName for the child asset', async () => {
     const repo = new InMemoryAssetRepository();
-    const source = await repo.create('workspace-a', { name: 'master', objectKey: 'ingest/x' });
+    const source = await repo.create({ name: 'master', objectKey: 'ingest/x' });
     const runner: RewrapRunner = vi.fn(async () => undefined);
     const child = await rewrap(
       {
-        workspaceId: 'workspace-a',
         sourceAssetId: source.id,
         objectKey: 'ingest/x',
         targetFormat: 'mkv',
@@ -154,32 +181,58 @@ describe('rewrap orchestration', () => {
 
   it('marks the child failed and rethrows when the runner fails', async () => {
     const repo = new InMemoryAssetRepository();
-    const source = await repo.create('workspace-a', { name: 'master', objectKey: 'ingest/x' });
+    const source = await repo.create({ name: 'master', objectKey: 'ingest/x' });
     const runner: RewrapRunner = vi.fn(async () => {
       throw new Error('ffmpeg exited 1');
     });
 
     await expect(
       rewrap(
-        { workspaceId: 'workspace-a', sourceAssetId: source.id, objectKey: 'ingest/x', targetFormat: 'mov' },
+        { sourceAssetId: source.id, objectKey: 'ingest/x', targetFormat: 'mov' },
         { assets: repo, storage: fakeStorage(), runner }
       )
     ).rejects.toThrow('ffmpeg exited 1');
 
     // A failed child asset exists under the source.
-    const children = await repo.list('workspace-a', { parentId: source.id });
+    const children = await repo.list({ parentId: source.id });
     expect(children.items).toHaveLength(1);
     expect(children.items[0]?.status).toBe('failed');
   });
 
+  // Regression for issue #316: the runner resolves "successfully" (ffmpeg-s3
+  // reaches a terminal status the poller does not treat as a failure) but the
+  // output object was never written. The child MUST end up `failed`, NOT `ready`
+  // with an objectKey pointing at a nonexistent object.
+  it('marks the child failed when the output object is absent despite a resolving runner', async () => {
+    const repo = new InMemoryAssetRepository();
+    const source = await repo.create({ name: 'master', objectKey: 'ingest/x' });
+    const storage = fakeStorage({ objectExists: false });
+    const runner: RewrapRunner = vi.fn(async () => undefined); // resolves, writes nothing
+
+    await expect(
+      rewrap(
+        { sourceAssetId: source.id, objectKey: 'ingest/x', targetFormat: 'mp4' },
+        { assets: repo, storage, runner }
+      )
+    ).rejects.toThrow(/not found in storage/);
+
+    const children = await repo.list({ parentId: source.id });
+    expect(children.items).toHaveLength(1);
+    const child = children.items[0]!;
+    expect(child.status).toBe('failed');
+    // Never expose an objectKey for an object that does not exist.
+    expect(child.status).not.toBe('ready');
+    expect(runner).toHaveBeenCalledOnce();
+  });
+
   it('rejects an unsupported format defensively', async () => {
     const repo = new InMemoryAssetRepository();
-    const source = await repo.create('workspace-a', { name: 'master', objectKey: 'ingest/x' });
+    const source = await repo.create({ name: 'master', objectKey: 'ingest/x' });
     const runner: RewrapRunner = vi.fn(async () => undefined);
     await expect(
       rewrap(
         // Bypass the type to simulate a non-HTTP caller.
-        { workspaceId: 'workspace-a', sourceAssetId: source.id, objectKey: 'ingest/x', targetFormat: 'avi' as never },
+        { sourceAssetId: source.id, objectKey: 'ingest/x', targetFormat: 'avi' as never },
         { assets: repo, storage: fakeStorage(), runner }
       )
     ).rejects.toBeInstanceOf(UnsupportedFormatError);
@@ -188,11 +241,16 @@ describe('rewrap orchestration', () => {
 });
 
 describe('rewrapCmdLine', () => {
-  it('emits an -i input and -c copy to the destination', () => {
-    const cmd = rewrapCmdLine('https://minio/src?sig=s', 'https://minio/dst.mp4?sig=p');
+  // issue #316: output must be a native s3://bucket/key URI so ffmpeg's muxer
+  // can actually write it — NOT a presigned HTTPS PUT URL.
+  it('emits an -i input and -c copy to an s3://bucket/key destination', () => {
+    const cmd = rewrapCmdLine('https://minio/src?sig=s', 'exports/asset-2.mp4', 'source-bucket');
     expect(cmd).toContain('-i "https://minio/src?sig=s"');
     expect(cmd).toContain('-c copy');
-    expect(cmd).toContain('"https://minio/dst.mp4?sig=p"');
+    expect(cmd).toContain('"s3://source-bucket/exports/asset-2.mp4"');
+    // Must not point ffmpeg at a presigned PUT URL.
+    expect(cmd).not.toContain('sig=put');
+    expect(cmd).not.toMatch(/-c copy "https?:/);
   });
 });
 
@@ -204,25 +262,38 @@ describe('makeOscRewrapRunner', () => {
     return {
       context,
       createJob: vi.fn(async () => ({ name: 'x' })),
-      waitForJobToComplete: vi.fn(async () => undefined),
+      // The runner polls getJob (via pollOscJobUntilDone); 'SuccessCriteriaMet'
+      // is the ffmpeg-s3 terminal success status.
+      getJob: vi.fn(async () => ({ status: 'SuccessCriteriaMet' })),
       getLogsForInstance: vi.fn(async () => ''),
-      removeJob: vi.fn(async () => undefined)
+      removeJob: vi.fn(async () => undefined),
+      s3Endpoint: 'https://minio.example',
+      s3AccessKey: 'admin',
+      s3SecretKey: 'secret',
+      s3Bucket: 'source-bucket'
     } as unknown as OscJobApi;
   }
 
-  it('creates a job, waits, and cleans up', async () => {
+  it('creates a job with S3 credentials + native s3://bucket/key output, waits, and cleans up', async () => {
     const api = fakeApi();
-    await makeOscRewrapRunner(api)('https://minio/src', 'https://minio/dst.mp4');
+    await makeOscRewrapRunner(api)('https://minio/src', 'exports/child.mp4');
     expect(api.createJob).toHaveBeenCalledOnce();
-    expect(api.waitForJobToComplete).toHaveBeenCalledOnce();
+    // AWS creds + endpoint must be in the job body so ffmpeg writes s3://bucket/key
+    // natively (issue #316 — a presigned PUT URL does not work).
+    const body = (api.createJob as ReturnType<typeof vi.fn>).mock.calls[0][3];
+    expect(body.awsAccessKeyId).toBe('admin');
+    expect(body.awsSecretAccessKey).toBe('secret');
+    expect(body.s3EndpointUrl).toBe('https://minio.example');
+    expect(body.cmdLineArgs).toContain('"s3://source-bucket/exports/child.mp4"');
+    expect(api.getJob).toHaveBeenCalled();
     expect(api.removeJob).toHaveBeenCalledOnce();
   });
 
-  it('still cleans up the job when the wait fails', async () => {
+  it('still cleans up the job when the poll fails', async () => {
     const api = fakeApi();
-    (api.waitForJobToComplete as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
+    (api.getJob as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
     await expect(
-      makeOscRewrapRunner(api)('https://minio/src', 'https://minio/dst.mp4')
+      makeOscRewrapRunner(api)('https://minio/src', 'exports/child.mp4')
     ).rejects.toThrow('boom');
     expect(api.removeJob).toHaveBeenCalledOnce();
   });
@@ -244,8 +315,27 @@ describe('POST /:id/export', () => {
     const child = res.json();
     expect(child.parentId).toBe(id);
     expect(child.status).toBe('ready');
-    expect(child.objectKey).toBe(rewrapObjectKey('workspace-a', child.id, 'mp4'));
+    expect(child.objectKey).toBe(rewrapObjectKey(child.id, 'mp4'));
     expect(runner).toHaveBeenCalledOnce();
+  });
+
+  it('returns 502 when the output object never landed (issue #316)', async () => {
+    const runner: RewrapRunner = vi.fn(async () => undefined);
+    const { app, repo } = await buildApp({ rewrapRunner: runner, objectExists: false });
+    const id = await createAssetWithObject(app, repo);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/export`,
+      headers: A,
+      payload: { targetFormat: 'mp4' }
+    });
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error).toBe('rewrap_failed');
+
+    // The child under the source is failed, not ready.
+    const children = await repo.list({ parentId: id });
+    expect(children.items[0]?.status).toBe('failed');
   });
 
   it('returns 400 for an unsupported target format', async () => {
@@ -314,18 +404,6 @@ describe('POST /:id/export', () => {
       method: 'POST',
       url: '/api/v1/assets/nope/export',
       headers: A,
-      payload: { targetFormat: 'mp4' }
-    });
-    expect(res.statusCode).toBe(404);
-  });
-
-  it.skip('does not leak existence across workspaces (404)', async () => {
-    const { app, repo } = await buildApp({ rewrapRunner: vi.fn(async () => undefined) });
-    const id = await createAssetWithObject(app, repo);
-    const res = await app.inject({
-      method: 'POST',
-      url: `/api/v1/assets/${id}/export`,
-      headers: auth('token-b'),
       payload: { targetFormat: 'mp4' }
     });
     expect(res.statusCode).toBe(404);
