@@ -110,11 +110,15 @@ class FakeCouch {
   }
 }
 
-// A WorkspaceStorage stub exposing only the two methods extractThumbnails calls.
+// A WorkspaceStorage stub exposing the methods extractThumbnails calls. The
+// no-op extractor in this test "writes" every requested frame, so statObject
+// reports every key as present — mirroring a successful extraction so the writer
+// records all keys (issue #332 record-only-stored verification is satisfied).
 function fakeStorage(): WorkspaceStorage {
   return {
     presignedGet: vi.fn(async (key: string) => `https://example.invalid/get/${key}`),
-    presignedPut: vi.fn(async (key: string) => `https://example.invalid/put/${key}`)
+    presignedPut: vi.fn(async (key: string) => `https://example.invalid/put/${key}`),
+    statObject: vi.fn(async (_key: string) => ({ size: 1024, etag: 'etag' }))
   } as unknown as WorkspaceStorage;
 }
 
