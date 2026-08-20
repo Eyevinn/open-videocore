@@ -55,19 +55,21 @@ import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
+import { checkProfilesIndexReachable } from './services/profiles-reachability.js';
 import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
+import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
   packagerOscApiFromContext
 } from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
-import { resolvePublicBaseUrl } from './services/public-base-url.js';
+import { resolvePublicBaseUrl, resolveEncoreProfilesUrl } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
@@ -86,7 +88,11 @@ declare module 'fastify' {
   }
 }
 
-const app = Fastify({ logger: true });
+// maxParamLength defaults to 100 in Fastify, but object-storage multipart
+// upload IDs are longer (~132 chars), so a real uploadId path parameter would
+// otherwise fail to match the /:id/multipart/:uploadId/... routes (404). Raise
+// the cap so the part-url / complete / abort routes accept real upload IDs.
+const app = Fastify({ logger: true, maxParamLength: 500 });
 
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
@@ -407,17 +413,26 @@ const thumbnailExtractor = storageAvailable
 
 // Export / re-wrap (issue #19) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to
 // remux a stored object into a different container with `-c copy` (no
-// re-encode), writing the new child asset back to MinIO via a presigned PUT
-// URL. Like the thumbnail runner it needs both an OSC context and object
-// storage; when either is missing POST /:id/export responds 501.
-const rewrapRunner: RewrapRunner | undefined = storageAvailable
-  ? makeOscRewrapRunner({
-      context: oscContext,
-      createJob,
-      getJob,
-      getLogsForInstance,
-      removeJob
-    })
+// re-encode), writing the new child asset back to MinIO. Like the thumbnail
+// extractor it is a factory so the route can supply the workspace's MinIO
+// credentials (resolved from the stack config) at request time: the output goes
+// to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so the runner needs
+// the MinIO credentials + bucket in the job body. A presigned PUT URL does NOT
+// work with ffmpeg's output muxer (issue #316). When object storage is missing
+// POST /:id/export responds 501.
+const rewrapRunner = storageAvailable
+  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): RewrapRunner =>
+      makeOscRewrapRunner({
+        context: oscContext,
+        createJob,
+        getJob,
+        getLogsForInstance,
+        removeJob,
+        s3Endpoint: s3.endpoint,
+        s3AccessKey: s3.accessKey,
+        s3SecretKey: s3.secretKey,
+        s3Bucket: s3.bucket
+      })
   : undefined;
 
 const clipRunner: ClipRunner | undefined = storageAvailable
@@ -448,6 +463,11 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
+// Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
+// transcode still non-terminal after this long whose Encore record has been
+// garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
+// than left running forever. Defaults to 30 minutes.
+const encoreStallTimeoutMs = parseInt(process.env['ENCORE_STALL_TIMEOUT_MS'] || String(30 * 60 * 1000), 10);
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -462,12 +482,15 @@ const encoreProfilesUrl =
 // OSC-derived app URL (none available today) → unset. When unset the scaler
 // falls back to the remote default index (previous behaviour), so Encore still
 // works.
+// Precedence (see resolveEncoreProfilesUrl): explicit ENCORE_PROFILES_URL_OVERRIDE
+// direct override → derived ${PUBLIC_BASE_URL}/api/v1/profiles/index.yml → remote
+// default (encoreProfilesUrl). Either operator-set env var lets an operator point
+// Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
+// so an explicit value is the only lever.
 const publicBaseUrl = resolvePublicBaseUrl();
-const encoreScalerProfilesUrl = publicBaseUrl
-  ? `${publicBaseUrl}/api/v1/profiles/index.yml`
-  : encoreProfilesUrl;
-if (!publicBaseUrl) {
-  app.log.warn('public base URL unresolved (PUBLIC_BASE_URL not set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(encoreProfilesUrl);
+if (!publicBaseUrl && !process.env['ENCORE_PROFILES_URL_OVERRIDE']) {
+  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time
@@ -608,6 +631,30 @@ function activateScaler(redisUrl: string): void {
       if (job.assetId) {
         await assetRepository.update(job.assetId, { status: 'processing' });
       }
+    },
+    // Once per tick, reconcile transcode jobs stuck non-terminal against Encore's
+    // terminal FAILED / garbage-collected (404) outcomes (issue #273). A failed
+    // Encore job never produces a completion message (the callback listener only
+    // enqueues SUCCESSFUL jobs), so without this the VideoCore job stays
+    // `running` and its asset `processing` forever. The scaler owns no repos, so
+    // we supply the repo-driven sweep here; `scalerRegistry` is the EncoreClient
+    // whose getJobStatus() polls Encore. Best-effort: errors are swallowed inside
+    // the sweep so a reconcile failure never breaks the tick.
+    reconcileFailedTranscodes: async () => {
+      await reconcileFailedTranscodes({
+        jobs: jobRepository,
+        assets: assetRepository,
+        pipeline: pipelineRepository,
+        // scalerRegistry implements EncoreClient; getJobStatus() decodes the
+        // workspace from the encore job id and polls the right instance. It is
+        // assigned below (encore = scalerRegistry) before any tick fires.
+        encore: scalerRegistry!,
+        stallTimeoutMs: encoreStallTimeoutMs,
+        logger: {
+          info: (...a: unknown[]) => app.log.info(a),
+          warn: (...a: unknown[]) => app.log.warn(a)
+        }
+      });
     }
   });
   encore = scalerRegistry;
@@ -852,7 +899,11 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository,
-  commentRepository
+  commentRepository,
+  // Validate a named transcode profile against the store so a GPU-only
+  // (NVENC/CUDA) profile that cannot run on this platform is rejected 422
+  // before submission (issue #286).
+  profileRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -1048,6 +1099,25 @@ app.addHook('onClose', async () => {
 
 const port = parseInt(process.env['PORT'] || '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
+
+// Boot-time reachability self-check for the local Encore profiles index (#284).
+// The server is now listening and every router (incl. profilesRouter) is
+// registered, so the derived profiles URL — encoreScalerProfilesUrl — is fully
+// known and serveable. When it points at THIS app's own local
+// /api/v1/profiles/index.yml (i.e. publicBaseUrl resolved), fetch it exactly as
+// Encore would: an UNAUTHENTICATED GET, no bearer token. A 401/403 (the OSC
+// login wall still gating the path) or any unreachable result is logged as a
+// HARD ERROR, so a silent fallback to the remote default index — which would
+// quietly disable operator-managed profiles — is surfaced loudly. Non-fatal:
+// it never throws and the server keeps running. This is the mechanism that
+// confirms, at boot, whether OSC's 2026-07-08 promise to make /api/v1/profiles
+// publicly accessible for the app actually took effect (this environment cannot
+// reach live OSC to confirm it ahead of time).
+void checkProfilesIndexReachable({
+  profilesIndexUrl: encoreScalerProfilesUrl,
+  usingLocalIndex: Boolean(publicBaseUrl),
+  log: app.log
+}).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router
 // is registered, so a detected object can flow through the full pipeline. The

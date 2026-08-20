@@ -30,6 +30,7 @@ import {
   spawnInstance,
   updateInstance
 } from './instance-pool.js';
+import { recordDispatch } from './retry-store.js';
 
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
@@ -80,6 +81,26 @@ export class EncoreScalerLoop {
     //    in-progress job count before making any scaling/dispatch decision.
     await this.reconcile();
 
+    // 0b. Reconcile transcode jobs stuck in a non-terminal state against
+    //     Encore's terminal FAILED / garbage-collected (404) outcomes (#273).
+    //     A failed Encore job never produces a completion message (the callback
+    //     listener only enqueues SUCCESSFUL jobs), so without this sweep the
+    //     VideoCore job stays `running` and its asset `processing` forever. The
+    //     sweep is repo-driven and lives in main.ts (the scaler owns no repos),
+    //     wired via this callback. Best-effort: a sweep failure must never break
+    //     the tick's scaling/dispatch work.
+    if (this.config.reconcileFailedTranscodes) {
+      try {
+        await this.config.reconcileFailedTranscodes();
+      } catch (err) {
+        console.error(
+          '[encore-scaler] failed-transcode reconcile error (workspace=%s):',
+          this.config.workspaceId,
+          err
+        );
+      }
+    }
+
     // 1. Pending work.
     const pending = await redis.llen(keys.queue(workspaceId));
 
@@ -129,6 +150,17 @@ export class EncoreScalerLoop {
           // Unparseable entry: drop it from inflight and move on.
           await redis.lrem(keys.inflight(workspaceId), 1, claimed);
           continue;
+        }
+
+        // Honour a retry backoff (#295): a job re-queued after a transport-class
+        // failure carries a `notBefore` timestamp. If it is not yet due, return
+        // it to the queue untouched and stop feeding this instance this tick —
+        // the next tick will re-evaluate. This keeps the loop non-blocking while
+        // still spacing out re-dispatches.
+        if (job.notBefore && job.notBefore > Date.now()) {
+          await redis.lrem(keys.inflight(workspaceId), 1, claimed);
+          await redis.rpush(keys.queue(workspaceId), claimed);
+          break;
         }
 
         const dispatched = await this.dispatch(inst, job);
@@ -257,6 +289,19 @@ export class EncoreScalerLoop {
       const encoreUuid = String(body.id ?? body.jobId ?? '');
       await redis.hset(keys.jobInstance(workspaceId), job.jobId, inst.instanceId);
       await redis.hset(keys.jobStatus(workspaceId), job.jobId, 'running');
+
+      // Persist the payload + attempt count so a transport-class failure (#295)
+      // can re-dispatch this exact job without the caller re-submitting. A
+      // first-time submission has no `attempts` field (treated as 0), so its
+      // first dispatch is attempt 1; a re-queued retry carries the prior count.
+      // Best-effort: retry bookkeeping must never cause an already-dispatched
+      // job to be re-queued as a dispatch failure.
+      const attemptNumber = (job.attempts ?? 0) + 1;
+      try {
+        await recordDispatch(redis, job.jobId, job.payload, attemptNumber);
+      } catch {
+        // Swallowed: dispatch itself succeeded; the job just loses retry state.
+      }
       if (encoreUuid && encoreUuid !== job.jobId) {
         await redis.set(keys.jobUuid(job.jobId), encoreUuid, 'EX', 86_400);
         // Reverse: lets the callback poller resolve externalId from the Encore

@@ -69,7 +69,10 @@ const auth = (token: string) => ({ authorization: `Bearer ${token}` });
 const A = auth('token-a');
 
 async function buildApp(): Promise<{ app: FastifyInstance; storages: Map<string, FakeStorage> }> {
-  const app = Fastify();
+  // Mirror the production app config from src/main.ts. maxParamLength must be
+  // raised above Fastify's default of 100 so long multipart upload IDs match
+  // the /:id/multipart/:uploadId/... routes instead of 404-ing (see #272).
+  const app = Fastify({ maxParamLength: 500 });
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
@@ -221,6 +224,35 @@ describe('direct client-side upload (issue #4)', () => {
       // Object key was persisted on the asset.
       const read = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
       expect(read.json().objectKey).toBe(sourceObjectKey(id));
+    });
+
+    it('accepts a realistic (>100 char) object-storage upload ID for part-url (#272)', async () => {
+      const id = await createAsset(app);
+
+      // Object storage issues multipart upload IDs of ~132 chars. A short
+      // fixture like "upload-xyz" hides the bug entirely, so drive the route
+      // with a realistic long ID. Below Fastify's default maxParamLength of
+      // 100 this would 404 (Route not found) rather than reach the handler.
+      const longUploadId =
+        'ZThmYjA5N2QtNGU2Mi00YzZhLWJmMTUtOWQ3ZThlM2Y0YzFhLjJmNmU4YjljLTdkMmEtNGUxOS1hM2M0LWYwYjE2ZDljZThmYS4zYTRk';
+      expect(longUploadId.length).toBeGreaterThan(100);
+
+      const partUrl = await app.inject({
+        method: 'GET',
+        url: `/api/v1/assets/${id}/multipart/${longUploadId}/part-url?partNumber=3`,
+        headers: A
+      });
+      // The load-bearing assertion: the route must MATCH (not 404) for a long
+      // upload ID and reach the handler. A 404 here is the #272 regression.
+      expect(partUrl.statusCode).toBe(200);
+      expect(partUrl.json().partNumber).toBe(3);
+
+      // The long upload ID reached storage intact.
+      const storage = [...storages.values()].find((s) =>
+        s.calls.some((c) => c.method === 'presignedUploadPart')
+      )!;
+      const call = storage.calls.find((c) => c.method === 'presignedUploadPart')!;
+      expect(call.args[1]).toBe(longUploadId);
     });
 
     it('rejects an out-of-range part number (400)', async () => {

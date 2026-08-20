@@ -63,6 +63,13 @@ export type EncoreScalerConfig = {
   // `queued` to `running`. Best-effort: failures are swallowed so a repo hiccup
   // never re-queues an already-dispatched job.
   onDispatched?: (encoreJobId: string) => Promise<void>;
+  // Invoked once per tick to reconcile transcode jobs stuck in a non-terminal
+  // state against Encore's terminal FAILED/404 outcomes (issue #273). The scaler
+  // has no job repository of its own, so main.ts wires this up to run the
+  // failed-transcode reconciliation sweep (src/pipeline/failed-transcode-
+  // reconciler.ts). Best-effort: failures are swallowed so a sweep error never
+  // breaks the tick's scaling/dispatch work.
+  reconcileFailedTranscodes?: () => Promise<void>;
 };
 
 export type EncoreInstanceRecord = {
@@ -79,6 +86,14 @@ export type QueuedJob = {
   jobId: string; // Our correlation id (encoreJobId / externalId)
   payload: Record<string, unknown>; // The raw Encore job payload to POST
   enqueuedAt: number;
+  // Epoch ms before which this job must NOT be dispatched. Set when a job is
+  // re-queued after a transport-class failure so the backoff (#295) is honoured
+  // without the scaler loop blocking. Absent/0 => dispatch immediately.
+  notBefore?: number;
+  // How many times this job has already been dispatched to an Encore instance.
+  // Absent on a first-time submission (treated as 0); set to the current attempt
+  // count when a job is re-queued for a transport-class retry (#295).
+  attempts?: number;
 };
 
 // Per-instance job capacity. OSC Encore instances process one job at a time by
@@ -105,5 +120,14 @@ export const keys = {
   // with a 24h TTL. Lets the callback poller resolve the packaging URL without
   // depending on the instance still being in the pool — the scaler may have
   // already torn down the instance by the time the transcode callback arrives.
-  jobEncoreUrl: (encoreJobId: string) => `encore:job-url:${encoreJobId}`
+  jobEncoreUrl: (encoreJobId: string) => `encore:job-url:${encoreJobId}`,
+  // Original Encore job payload, stored at dispatch time with a 24h TTL so a
+  // transport-class failure can be re-dispatched (#295) without the caller
+  // re-submitting. Keyed by our externalId (encoreJobId), which is globally
+  // unique. Cleared once the job settles (success or exhausted retries).
+  jobPayload: (encoreJobId: string) => `encore:job-payload:${encoreJobId}`,
+  // How many times this job has been *dispatched* to an Encore instance (#295).
+  // Starts at 1 on first dispatch and increments on each transport-class
+  // re-dispatch. Bounded by MAX_ENCODE_ATTEMPTS. 24h TTL; cleared on settle.
+  jobAttempts: (encoreJobId: string) => `encore:job-attempts:${encoreJobId}`
 };
