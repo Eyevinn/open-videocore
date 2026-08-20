@@ -240,13 +240,21 @@ describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
 });
 
 describe('GET /api/v1/provision/:name (issue #31)', () => {
+  // A fully capable stack: every core STACK_SERVICES role (storage, database,
+  // queue) is present, so the on-demand packager can be provisioned and the
+  // stack CAN complete the full ingest -> transcode -> package -> deliver flow.
   const storedConfig = {
+    status: 'ready' as const,
     minioEndpoint: 'https://minio.example.osaas.io',
     couchdbUrl: 'https://couch.example.osaas.io',
     redisUrl: 'redis://valkey.svc.cluster.local:6379',
     sourceBucket: 'openvideocore-source',
     packagedBucket: 'openvideocore-packaged',
-    services: [{ serviceId: 'minio-minio', instanceName: 'mystack' }]
+    services: [
+      { serviceId: 'minio-minio', instanceName: 'mystack' },
+      { serviceId: 'apache-couchdb', instanceName: 'mystack' },
+      { serviceId: 'valkey-io-valkey', instanceName: 'mystack' }
+    ]
   };
 
   it('returns 200 with stored coordinates, scoped to the workspace', async () => {
@@ -265,6 +273,59 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual(storedConfig);
     expect(loadStackConfig).toHaveBeenCalledWith('workspace-a', 'mystack');
+  });
+
+  // Issue #338: readiness reflects packaging capability, not the raw stored
+  // status. A fully capable stack still reports ready with no reason.
+  it('reports ready (no reason) for a fully capable stack (#338)', async () => {
+    const paramStore = {
+      storeStackConfig: vi.fn(),
+      loadStackConfig: vi.fn(async () => storedConfig)
+    } as unknown as ParamStore;
+
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/provision/mystack'
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe('ready');
+    expect(body.reason).toBeUndefined();
+  });
+
+  // Issue #338: a stack whose inventory cannot package must NOT report ready.
+  // Here the queue is absent, so the on-demand packager (which consumes the
+  // shared Valkey queue) cannot be provisioned — the stack cannot package.
+  it('reports non-ready with a machine-readable reason when the stack cannot package (#338)', async () => {
+    const cannotPackage = {
+      ...storedConfig,
+      services: [
+        { serviceId: 'minio-minio', instanceName: 'mystack' },
+        { serviceId: 'apache-couchdb', instanceName: 'mystack' }
+      ]
+    };
+    const paramStore = {
+      storeStackConfig: vi.fn(),
+      loadStackConfig: vi.fn(async () => cannotPackage)
+    } as unknown as ParamStore;
+
+    const app = await buildApp(paramStore);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/provision/mystack'
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).not.toBe('ready');
+    // Machine-readable reason that names the missing capability. The queue is an
+    // on-demand packager dependency, so its absence surfaces as the packaging
+    // capability being unavailable.
+    expect(body.reason).toBeDefined();
+    expect(body.reason.code).toBe('packaging_capability_missing');
+    expect(body.reason.capability).toBe('packaging');
   });
 
   it('returns 404 when no config is stored for the stack', async () => {
