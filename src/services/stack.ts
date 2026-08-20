@@ -15,18 +15,33 @@
 //   storage    — MinIO (S3-compatible object storage)
 //   database   — CouchDB (document metadata store)
 //   queue      — Valkey (Redis-compatible coordination backbone)
-//   packaging  — Encore packager (consumes queue, writes packaged output)
 //
 // Encore and its paired callback listener are NOT part of the provisioned
 // stack: the auto-scaler spawns each Encore instance together with a dedicated
 // callback listener pointing at that exact instance, and tears both down on
 // scale-down (ADR-006).
+//
+// The Encore packager (eyevinn-encore-packager) is ALSO no longer part of the
+// provisioned stack (epic #226 / issue #243): it is provisioned LAZILY, on the
+// first pipeline execution that includes a packaging step, and torn down on
+// stack deprovision (and optionally when idle). See PACKAGER_SERVICE_ID and the
+// on-demand ensure step (issues #244–#246). Removing it from STACK_SERVICES
+// means a freshly provisioned stack creates NO packager instance and mints no
+// packager secrets/tokens until packaging is actually used — the shared queue
+// (valkey-io-valkey), database and storage are unaffected.
 export const STACK_SERVICES = [
   { serviceId: 'minio-minio', role: 'storage' },
   { serviceId: 'apache-couchdb', role: 'database' },
-  { serviceId: 'valkey-io-valkey', role: 'queue' },
-  { serviceId: 'eyevinn-encore-packager', role: 'packaging' }
+  { serviceId: 'valkey-io-valkey', role: 'queue' }
 ] as const;
+
+// The Encore packager consumes the shared Valkey queue and writes CMAF output
+// to the packaged bucket. It is NOT in STACK_SERVICES (see above): it is
+// provisioned on demand at first packaging execution (issue #244) and torn down
+// on deprovision (issue #246). Exported here as the single source of truth for
+// its serviceId so the on-demand ensure/teardown paths never hardcode the
+// string (mirrors the FFPROBE_SERVICE_ID / AUTO_SUBTITLES_SERVICE_ID pattern).
+export const PACKAGER_SERVICE_ID = 'eyevinn-encore-packager' as const;
 
 export type StackService = (typeof STACK_SERVICES)[number];
 

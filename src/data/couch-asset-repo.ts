@@ -47,7 +47,7 @@ import {
   toAssetDocument,
   type AssetDocument
 } from './asset-document.js';
-import type { StoredDoc, StackCouch } from './couchdb.js';
+import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'asset';
 
@@ -161,11 +161,40 @@ export class CouchAssetRepository implements AssetRepository {
     patch: UpdateAssetInput
   ): Promise<Asset | undefined> {
     const couch = this.couchFor();
-    const doc = await couch.get(id);
-    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+    // Not-found / wrong-resource-type guard, preserved exactly (returns
+    // undefined). Done before the retry loop so a genuinely absent (or
+    // non-asset) document never enters the read-modify-write path.
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
       return undefined;
     }
-    const existing = fromDoc(doc);
+    // Concurrent-write safety (issue #279): route the read-modify-write through
+    // the shared conflict-retry wrapper (updateWithRetry, src/data/couchdb.ts).
+    // A `Document update conflict.` (HTTP 409) from a concurrent writer racing on
+    // the same _rev — e.g. a thumbnail write landing between this method's read
+    // and put, or the re-drive path of issue #281 racing an in-flight
+    // extraction — is refetched and re-applied rather than surfacing as a
+    // terminal failure. Patch application is extracted into `applyPatch` (issue
+    // #278), which is pure (no writes) so it is safe to re-run per attempt,
+    // exactly as updateWithRetry requires.
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const next = this.applyPatch(fromDoc(current), patch);
+      // Capture the in-memory result to return; updateWithRetry carries _rev and
+      // performs the put (put() forces the partition).
+      updated = next;
+      return toDoc(next);
+    });
+    // updateWithRetry returns undefined only when the document vanished between
+    // the preflight read and the loop (a concurrent delete); patchFn never ran,
+    // so `updated` is still undefined too. Preserve the not-found contract.
+    return written ? updated : undefined;
+  }
+
+  // Pure patch application (issue #278/#281): given the current asset and a
+  // patch, compute the next asset. NO writes and NO side effects, so it is safe
+  // to run more than once inside updateWithRetry's retry loop.
+  private applyPatch(existing: Asset, patch: UpdateAssetInput): Asset {
     const now = new Date().toISOString();
     const next: Asset = { ...existing, updatedAt: now };
     if (patch.name !== undefined) next.name = patch.name;
@@ -232,8 +261,6 @@ export class CouchAssetRepository implements AssetRepository {
     if (entries.length > 0) {
       next.provenance = [...(existing.provenance ?? []), ...entries];
     }
-    // Carry _rev so CouchDB accepts the update; put() forces the partition.
-    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;
   }
 
@@ -338,6 +365,24 @@ function toDoc(asset: Asset): Record<string, unknown> {
   };
 }
 
+// schemaVersion read rule (issue #166, TAMS bridge epic #116).
+//
+// The TAMS addressing fields (structural.tams.flowIds / .timerange, issue #165)
+// are ADDITIVE within schemaVersion 1: they are `.optional()` on
+// AssetDocumentSchema, so this is NOT a schemaVersion bump — ASSET_SCHEMA_VERSION
+// stays 1 (asset-document.ts) and every pre-#165 document remains a valid v1
+// document. There is no ADR-005 file in this clone's docs/architecture/ (only
+// ADR-001/007/008); the in-code schemaVersion contract above is the source of
+// truth, and it treats new optional fields as additive with a documented default
+// of ABSENT (mapped to `undefined` by fromAssetDocument), never a back-filled
+// write.
+//
+// READ RULE: schemaVersion is INJECTED, not read from the stored body. We parse
+// with a forced `schemaVersion: 1`, so a legacy document that predates the
+// explicit field (absent, or an older integer) still deserializes — the loader
+// normalises it to the current v1 shape in memory. Because `get()` only reads
+// (this function is pure and never calls couch.put), reading a legacy document
+// does NOT mutate it, back-fill the TAMS fields, or churn its CouchDB `_rev`.
 function fromDoc(doc: StoredDoc): Asset {
   const localId = String(doc['localId'] ?? stripPartition(doc._id));
   const document = AssetDocumentSchema.parse({

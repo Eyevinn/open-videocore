@@ -8,7 +8,8 @@
 // on every deployment, so we degrade gracefully to substring matching rather
 // than failing the request when no text index is available.
 
-import { type Asset, type AssetStatus, MAX_LIMIT } from './asset-repo.js';
+import { type Asset, MAX_LIMIT } from './asset-repo.js';
+import { AssetDocumentSchema, fromAssetDocument } from './asset-document.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 import {
   clampPage,
@@ -57,6 +58,21 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   if (query.tags && query.tags.length > 0) {
     selector['tags'] = { $all: query.tags };
   }
+  // TAMS address lookup (issue #168, epic #116). The persisted document carries
+  // the machine-derived addressing under the four-namespace `structural.tams`
+  // block (asset-document.ts: structural.tams.flowIds[] / .timerange). Push both
+  // down as dotted Mango selectors so CouchDB filters within the workspace
+  // partition. `$elemMatch $eq` matches a single flow UUID against the flowIds
+  // array (a source carries many flows, ADR-008, but a query addresses one flow
+  // — ADR-010); the timerange is an exact-equality match. The in-process
+  // matchesQuery pass re-checks both, so behaviour is identical across backends
+  // and the projection stays disposable/replayable (derived only from the doc).
+  if (query.tamsFlowId) {
+    selector['structural.tams.flowIds'] = { $elemMatch: { $eq: query.tamsFlowId } };
+  }
+  if (query.tamsTimerange) {
+    selector['structural.tams.timerange'] = { $eq: query.tamsTimerange };
+  }
   // Metadata filters push down as `metadata.<key>: { $eq: value }` so CouchDB
   // matches exact top-level metadata values within the workspace partition
   // (issue #12). Dotted keys address nested document fields in Mango.
@@ -68,24 +84,21 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   return selector;
 }
 
+// Rebuild the Asset from the persisted four-namespace document by parsing it
+// through AssetDocumentSchema and delegating to fromAssetDocument — the same
+// path couch-asset-repo.ts uses (issue #168). This populates every projected
+// field (including the flat tamsFlowIds / tamsTimerange derived from the
+// `structural.tams` block) from one authoritative mapping, so search and read
+// stay in lockstep rather than maintaining a second, divergent projection.
 function fromDoc(doc: StoredDoc): Asset {
-  return {
-    id: String(doc['localId'] ?? stripPartition(doc._id)),
-    name: String(doc['name'] ?? ''),
-    description: doc['description'] as string | undefined,
-    status: doc['status'] as AssetStatus,
-    parentId: doc['parentId'] as string | undefined,
-    objectKey: doc['objectKey'] as string | undefined,
-    statusHistory: (doc['statusHistory'] as Asset['statusHistory']) ?? [],
-    technicalMetadata: (doc['technicalMetadata'] as Asset['technicalMetadata']) ?? null,
-    technicalMetadataError: doc['technicalMetadataError'] as string | undefined,
-    manifestUrls: (doc['manifestUrls'] as Asset['manifestUrls']) ?? undefined,
-    packagingError: doc['packagingError'] as string | undefined,
-    renditions: (doc['renditions'] as Asset['renditions']) ?? undefined,
-    metadata: (doc['metadata'] as Asset['metadata']) ?? undefined,
-    createdAt: String(doc['createdAt'] ?? ''),
-    updatedAt: String(doc['updatedAt'] ?? '')
-  };
+  const localId = String(doc['localId'] ?? stripPartition(doc._id));
+  const document = AssetDocumentSchema.parse({
+    ...doc,
+    _id: localId,
+    type: 'asset',
+    schemaVersion: 1
+  });
+  return fromAssetDocument(document);
 }
 
 function stripPartition(id: string): string {

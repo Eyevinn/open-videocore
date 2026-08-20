@@ -18,6 +18,34 @@
 // responsible for stripping credentials before handing values to storeStackConfig
 // (see stripCredentials).
 
+// Non-secret coordinates for one storage role (source or packaged), persisted
+// so downstream routes and deprovision can resolve which backend a stack uses
+// without re-reading the request body (issue #211). NO secret values here:
+// accessKeyId, secretAccessKey and sessionToken are NEVER stored — they belong
+// in OSC secrets and are wired into services by the follow-up sub-issue (#212).
+//   backend 'minio'    — the provisioned per-stack MinIO instance (default,
+//                        zero-config). bucket is the on-MinIO bucket name;
+//                        endpointUrl/region are omitted (the MinIO endpoint is
+//                        already recorded as minioEndpoint).
+//   backend 'external' — an operator-supplied S3-compatible object store. bucket
+//                        is the external bucket; endpointUrl is present for
+//                        non-AWS S3-compatible stores; region is optional.
+//   publicBaseUrl      — OPTIONAL operator-supplied public origin fronting the
+//                        bucket (e.g. a CDN origin). When present it OVERRIDES
+//                        the URL derived from endpointUrl/region + bucket for the
+//                        emitted delivery/manifest host (issue #213). NON-SECRET:
+//                        a plain origin URL, never carries credentials. Only
+//                        meaningful for the 'external' backend; ignored for
+//                        'minio' (which is API-proxied and never emits a public
+//                        object URL).
+export type StorageBackendConfig = {
+  backend: 'minio' | 'external';
+  bucket: string;
+  endpointUrl?: string;
+  region?: string;
+  publicBaseUrl?: string;
+};
+
 // The connection coordinates persisted for a provisioned stack. Every value is
 // a host/URL/endpoint or a bucket name — NO passwords, NO credential-bearing
 // connection strings. See the storage list in issue #31.
@@ -35,6 +63,33 @@ export type StackConfig = {
   redisUrl: string;
   sourceBucket: string;
   packagedBucket: string;
+  // Optional pipeline services activated by provisioning rather than env vars
+  // (issue #215, data-model foundation for #216/#217/#218). These are opt-in
+  // consumers and deliberately NOT part of STACK_SERVICES. Optional for
+  // back-compat, mirroring `status?`/isReadyStack: configs written before these
+  // fields existed have no value here and MUST still load without error.
+  autoSubtitlesInstanceName?: string;
+  sceneDetectInstanceName?: string;
+  // Operator-supplied FULL Encore profiles-index URL (issue #315). When set,
+  // scaler-spawned Encore instances fetch their transcode profiles from this
+  // exact URL (used DIRECTLY, never re-derived), resolved at boot via
+  // resolveEncoreProfilesUrlFromParamStore (services/public-base-url.ts). This
+  // lets custom profiles work WITHOUT adding a new OSC manifest env-var key.
+  // NON-SECRET: a plain index URL, never carries credentials. Optional for
+  // back-compat, mirroring the fields above: configs written before this field
+  // existed have no value here and MUST still load without error, and an unset
+  // value falls through to the remote default index (byte-identical to today).
+  encoreProfilesUrl?: string;
+  // Per-role storage backend metadata (issue #211). Optional for back-compat:
+  // configs written before this field existed have no `storage`, in which case
+  // both roles are the default per-stack MinIO backend (sourceBucket /
+  // packagedBucket on minioEndpoint). Present when the operator supplied an
+  // external S3-compatible store for either role. NON-SECRET coordinates only —
+  // credentials are stored as OSC secrets by #212, never here.
+  storage?: {
+    source: StorageBackendConfig;
+    packaged: StorageBackendConfig;
+  };
   // The OSC instances that make up the stack, for deprovision (#29).
   services: { serviceId: string; instanceName: string }[];
 };
@@ -117,6 +172,33 @@ function assertNoCredentials(config: StackConfig): void {
       throw new Error(
         `refusing to store credential-bearing value for "${key}" in the parameter store`
       );
+    }
+  }
+
+  // Defence-in-depth for the storage backend metadata (issue #211): the
+  // StorageBackendConfig type intentionally has no secret fields, but a
+  // regression upstream could spread a raw request block (which DOES carry
+  // accessKeyId/secretAccessKey/sessionToken) into it. Reject any such key so a
+  // credential can never reach the store, and strip userinfo from endpointUrl.
+  if (config.storage) {
+    const SECRET_KEYS = ['accessKeyId', 'secretAccessKey', 'sessionToken'];
+    for (const role of ['source', 'packaged'] as const) {
+      const block = config.storage[role] as Record<string, unknown>;
+      for (const secretKey of SECRET_KEYS) {
+        if (secretKey in block) {
+          throw new Error(
+            `refusing to store secret field "${secretKey}" for storage role "${role}" in the parameter store`
+          );
+        }
+      }
+      if (
+        typeof block['endpointUrl'] === 'string' &&
+        hasCredentials(block['endpointUrl'])
+      ) {
+        throw new Error(
+          `refusing to store credential-bearing endpointUrl for storage role "${role}" in the parameter store`
+        );
+      }
     }
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "open-videocore-api",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OSC-native media asset management REST API",
   "type": "module",
   "private": true,
@@ -11,7 +11,8 @@
     "start": "node --env-file-if-exists=.env dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "generate:openapi": "bash scripts/generate-openapi.sh"
+    "generate:openapi": "bash scripts/generate-openapi.sh",
+    "tams:backfill": "tsx scripts/tams-backfill.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.2",

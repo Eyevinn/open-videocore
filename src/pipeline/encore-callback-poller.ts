@@ -36,6 +36,7 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { decideRetry, clearRetryState } from '../encore-scaler/retry-store.js';
 
 // Resolve the correct Encore job API URL using the reverse UUID mapping stored
 // at dispatch time. The callback listener always uses its own configured Encore
@@ -298,6 +299,66 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
 
   const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
+
+  // #295: before settling a FAILED job terminal, ask the retry gate whether this
+  // is a transport-class failure (S3 pool-acquire timeout on write / severed read
+  // I/O on an intact source) that should be re-dispatched instead. Only jobs that
+  // still belong to this workspace's scaler pool are eligible; a non-scaler
+  // deployment (no jobPayload key) falls through to the normal settle path.
+  //
+  // If the gate re-dispatches, we must NOT run completeTranscode (that would
+  // settle the caller-facing job to `failed`), must NOT decrement the slot for
+  // the dead attempt (the fresh dispatch manages its own slot via its own
+  // callback), and must NOT touch the pipeline execution — the job stays
+  // `running` until the retry succeeds or the bound is exhausted. This is also
+  // the #273 coordination point: a still-`running` job is exactly what #273's
+  // reconciler leaves alone, so the two never double-settle.
+  if (!success) {
+    const decoded = decodeEncoreJobId(externalId);
+    if (decoded) {
+      const failureMessage = job.message ?? `encore status: ${status}`;
+      let decision;
+      try {
+        decision = await decideRetry(
+          deps.redis,
+          decoded.workspaceId,
+          externalId,
+          failureMessage
+        );
+      } catch (err) {
+        // If the retry gate itself errors, fall through to the normal terminal
+        // settle rather than leaving the job hung.
+        deps.logger.warn({ msg: 'encore-callback-poller: retry gate error — settling terminal', externalId, err });
+        decision = undefined;
+      }
+      if (decision?.action === 'retry') {
+        deps.logger.warn({
+          msg: 'encore-callback-poller: transport-class encode failure — re-dispatching',
+          externalId,
+          attempt: decision.attempt,
+          failureClass: decision.failureClass,
+          backoffMs: decision.backoffMs,
+          failureMessage
+        });
+        // Free the slot on the instance that ran the FAILED attempt so the
+        // scaler can dispatch the retry (and other work) — the retry re-enters
+        // the queue and will be dispatched by the loop like any other job.
+        await decrementActiveJobs(deps.redis, externalId, deps.logger);
+        return; // do not settle; the retry is pending.
+      }
+      if (decision?.action === 'settle') {
+        // Retries exhausted or non-retryable: fall through to settle terminal,
+        // then clear the retry bookkeeping.
+        deps.logger.info({
+          msg: 'encore-callback-poller: encode failure settling terminal',
+          externalId,
+          reason: decision.reason,
+          failureClass: decision.failureClass
+        });
+      }
+    }
+  }
+
   // completeTranscode touches CouchDB — let any throw propagate so the outer
   // loop re-queues and retries on transient DB errors.
   const result = await completeTranscode(
@@ -315,6 +376,9 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   // reuse its capacity. Only on a terminal completion that actually applied.
   if (result.applied) {
     await decrementActiveJobs(deps.redis, externalId, deps.logger);
+    // Job has settled terminally (success, or a failure that exhausted/was not
+    // eligible for retry): drop the #295 retry bookkeeping so it does not linger.
+    await clearRetryState(deps.redis, externalId).catch(() => {});
   }
 
   // Advance the matching PipelineExecution — copied from src/routes/internal.ts

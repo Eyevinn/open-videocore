@@ -1,9 +1,15 @@
 // Workspace-scoped search router (issue #10).
 //
-// GET /api/v1/search?q=&tags=&mimeType=&page=&pageSize= — full-text + metadata
-// search over the caller's assets. Behind `authenticate`, so each handler runs
-// with a validated request.workspaceId and the search repo scopes every query
-// to that workspace. `tags` may be repeated or comma-separated.
+// GET /api/v1/search?q=&tags=&mimeType=&tamsFlowId=&tamsTimerange=&page=&pageSize=
+// — full-text + metadata search over the caller's assets. Behind `authenticate`,
+// so each handler runs with a validated request.workspaceId and the search repo
+// scopes every query to that workspace. `tags` may be repeated or comma-separated.
+//
+// TAMS address lookup (issue #168, epic #116): `tamsFlowId` (a flow UUID) and
+// `tamsTimerange` (ADR-008 TAI grammar) let a caller find an asset by its TAMS
+// address. The addressing is projected into the search index from the asset's
+// `structural.tams` block, so the index stays disposable/replayable (rebuildable
+// from asset state alone). A malformed value is a 400 at the boundary.
 //
 // Free-form operator metadata (issue #12) is filtered with `metadata.<key>=<value>`
 // query params (e.g. ?metadata.genre=documentary&metadata.language=sv). Each pair
@@ -13,6 +19,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
+import { TamsFlowIdSchema, TamsTimerangeSchema } from '../data/asset-document.js';
 import { MAX_PAGE_SIZE, type SearchRepository } from '../data/search-repo.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -100,6 +107,13 @@ const searchQuerySchema = z
     q: z.string().min(1).max(512).optional(),
     tags: tagsSchema,
     mimeType: z.string().min(1).max(128).optional(),
+    // TAMS address lookup (issue #168, epic #116). Reuse the field validation
+    // from the asset model (asset-document.ts) rather than re-declaring it:
+    // `tamsFlowId` is a single flow UUID and `tamsTimerange` the ADR-008 TAI
+    // grammar. A malformed value fails here at the boundary (400) before any
+    // repo call, matching the ADR-010 query contract.
+    tamsFlowId: TamsFlowIdSchema.optional(),
+    tamsTimerange: TamsTimerangeSchema.optional(),
     page: z.coerce.number().int().min(1).optional(),
     pageSize: z.coerce.number().int().min(1).max(MAX_PAGE_SIZE).optional()
   })
@@ -150,9 +164,18 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
       }
     },
     async (request) => {
-      const { q, tags, mimeType, page, pageSize } = request.query;
+      const { q, tags, mimeType, tamsFlowId, tamsTimerange, page, pageSize } = request.query;
       const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
-      return repo.search({ q, tags, mimeType, metadata, page, pageSize });
+      return repo.search({
+        q,
+        tags,
+        mimeType,
+        metadata,
+        tamsFlowId,
+        tamsTimerange,
+        page,
+        pageSize
+      });
     }
   );
 };

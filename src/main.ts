@@ -13,6 +13,7 @@ import {
   validatorCompiler
 } from 'fastify-type-provider-zod';
 import { provisionRouter } from './routes/provision.js';
+import { optionalServicesRouter } from './routes/optional-services.js';
 import { OperationStore } from './services/operation-store.js';
 import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';
 import { assetsRouter } from './routes/assets.js';
@@ -35,6 +36,8 @@ import {
   PerWorkspaceCollectionRepository,
   PerWorkspaceProfileRepository
 } from './data/per-workspace-repos.js';
+import type { AssetRepository } from './data/asset-repo.js';
+import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
 import { makeOscProbeRunner } from './pipeline/osc-ffprobe.js';
 import { extractTechnicalMetadata, type ProbeRunner } from './pipeline/metadata-extractor.js';
 import { makeOscSubtitleGenerator } from './pipeline/osc-auto-subtitles.js';
@@ -52,14 +55,25 @@ import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
+import { checkProfilesIndexReachable } from './services/profiles-reachability.js';
 import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
+import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
+import {
+  PackagerEnsureSingleFlight,
+  packagerOscApiFromContext
+} from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
+import {
+  resolvePublicBaseUrl,
+  resolveEncoreProfilesUrl,
+  resolveEncoreProfilesUrlFromParamStore
+} from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
@@ -78,7 +92,11 @@ declare module 'fastify' {
   }
 }
 
-const app = Fastify({ logger: true });
+// maxParamLength defaults to 100 in Fastify, but object-storage multipart
+// upload IDs are longer (~132 chars), so a real uploadId path parameter would
+// otherwise fail to match the /:id/multipart/:uploadId/... routes (404). Raise
+// the cap so the part-url / complete / abort routes accept real upload IDs.
+const app = Fastify({ logger: true, maxParamLength: 500 });
 
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
@@ -112,6 +130,7 @@ await app.register(fastifySwagger, {
       { name: 'collections', description: 'Named asset groups' },
       { name: 'webhooks', description: 'Event notification registrations' },
       { name: 'provision', description: 'OSC stack provisioning and teardown' },
+      { name: 'optional-services', description: 'Per-optional-service (auto-subtitles, scene-detect) provision, deprovision, and status' },
       { name: 'storage', description: 'Bucket and object-storage management' },
       { name: 'admin', description: 'Operational status and background service control' },
     ],
@@ -187,11 +206,41 @@ if (!paramStore) {
 // from the parameter store (or an explicit env-var override for local dev),
 // keyed by the caller's workspace and an optional X-Stack-Name header. The
 // resolver caches results and is invalidated after a provision/teardown.
+// OPTIONAL, opt-in pipeline steps are activated from the STACK RECORD, not
+// boot-time env vars (issue #217). The resolver reads the ACTIVE stack's
+// StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName at resolve
+// time and, when present, builds the corresponding generator via these
+// builders — so a freshly provisioned optional service is picked up on the next
+// pipeline run with NO API restart. When object storage is unavailable the
+// builders are omitted and the steps stay disabled (graceful skip). The
+// runner-tuning knobs (AUTO_SUBTITLES_WRITES_S3, SCENE_DETECT_PATH) are NOT
+// activation switches and remain here.
+const storageBackedForOptionalSteps = Boolean(process.env['MINIO_URL']) || Boolean(paramStore);
+const optionalStepBuilders = storageBackedForOptionalSteps
+  ? {
+      subtitleGenerator: (instanceName: string): SubtitleGenerator =>
+        makeOscSubtitleGenerator({
+          context: oscContext,
+          getInstance,
+          instanceName,
+          writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
+        }),
+      sceneDetector: (instanceName: string): SceneDetector =>
+        makeOscSceneDetector({
+          context: oscContext,
+          getInstance,
+          instanceName,
+          path: process.env['SCENE_DETECT_PATH']
+        })
+    }
+  : {};
+
 const stackResolver = new WorkspaceStackResolver({
   paramStore,
   oscContext,
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
-  couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? ''
+  couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
+  optionalSteps: optionalStepBuilders
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
@@ -218,7 +267,7 @@ await app.register(provisionRouter, {
   osc: oscContext,
   paramStore,
   operationStore,
-  publicBaseUrl: process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, ''),
+  publicBaseUrl: resolvePublicBaseUrl(),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
@@ -239,13 +288,55 @@ await app.register(provisionRouter, {
   getScalerRegistry: () => scalerRegistry
 });
 
+// Per-optional-service provision/deprovision/status endpoints (issue #195).
+// Shared contract for the #187 (auto-subtitles) and #188 (scene-detect)
+// provision cards. Reuses the SAME OperationStore as the whole-stack provision
+// route so 202 operations poll the same GET /api/v1/provision/operations/:id.
+// Status reports the AUTO_SUBTITLES_INSTANCE_NAME / SCENE_DETECT_INSTANCE_NAME
+// env vars via the optional-services registry. NOTE: as of issue #217 the
+// PIPELINE steps are activated from the stack record (StackConfig), not these
+// env vars — so the card's env-var view reflects the deployment's intended
+// configuration, while the runtime step activation follows what was actually
+// provisioned into the active stack.
+await app.register(optionalServicesRouter, {
+  prefix: '/api/v1/optional-services',
+  osc: oscContext,
+  operationStore
+});
+
 // Workspace-scoped resource repositories. These hold NO connection of their
 // own: each delegates to the concrete repository in the stack resolved for the
 // request's workspace (CouchDB-backed when a stack is provisioned, in-memory
 // otherwise — WorkspaceStackResolver decides). The router option interfaces and
 // route handlers are unchanged; only the backing connection is now resolved
 // lazily per workspace at request time instead of as a startup singleton.
-const assetRepository = new PerWorkspaceAssetRepository(stackResolver);
+// Base asset repository. Wrapped below by the TAMS "ready" indexing decorator
+// so no other wiring changes are needed.
+const baseAssetRepository = new PerWorkspaceAssetRepository(stackResolver);
+
+// TAMS "ready"-transition indexing trigger (issue #172, epic #116). SINGLE
+// chokepoint: `withTamsReadyIndexing` decorates the asset repository so every
+// `update()` that transitions an asset INTO `ready` fires the injected indexer
+// once — covering all four pipeline call sites (metadata-extractor, transcode,
+// clip, rewrap) without editing any of them (see src/tams/tams-ready-hook.ts
+// for the trigger-mechanism justification: an inline transition hook, since the
+// ADR-005 CouchDB `_changes` projector does not exist — issue #168).
+//
+// Decoupling: the concrete single-asset index-write path (#170) and the shared
+// config gate (#171) are not yet on main, so we import NEITHER here. The indexer
+// is INJECTED. Until #170 lands there is no concrete indexer to inject, so
+// `tamsIndexer` is undefined and the repository is left unwrapped (indexing is a
+// no-op). When #170 provides `(asset) => Promise<void>`, assign it here and the
+// decorator activates. The config gate is the inline ADR-009 `TAMS_STORE_URL`
+// check inside the hook; #171 will supply the shared gate.
+const tamsIndexer: AssetIndexer | undefined = undefined;
+const assetRepository: AssetRepository = tamsIndexer
+  ? withTamsReadyIndexing(baseAssetRepository, { indexer: tamsIndexer, log: app.log })
+  : baseAssetRepository;
+if (tamsIndexer && !isTamsConfigured()) {
+  app.log.info('TAMS_STORE_URL not set — TAMS ready-transition indexing disabled (config-gated)');
+}
+
 const jobRepository = new PerWorkspaceJobRepository(stackResolver);
 const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
@@ -326,17 +417,26 @@ const thumbnailExtractor = storageAvailable
 
 // Export / re-wrap (issue #19) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to
 // remux a stored object into a different container with `-c copy` (no
-// re-encode), writing the new child asset back to MinIO via a presigned PUT
-// URL. Like the thumbnail runner it needs both an OSC context and object
-// storage; when either is missing POST /:id/export responds 501.
-const rewrapRunner: RewrapRunner | undefined = storageAvailable
-  ? makeOscRewrapRunner({
-      context: oscContext,
-      createJob,
-      getJob,
-      getLogsForInstance,
-      removeJob
-    })
+// re-encode), writing the new child asset back to MinIO. Like the thumbnail
+// extractor it is a factory so the route can supply the workspace's MinIO
+// credentials (resolved from the stack config) at request time: the output goes
+// to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so the runner needs
+// the MinIO credentials + bucket in the job body. A presigned PUT URL does NOT
+// work with ffmpeg's output muxer (issue #316). When object storage is missing
+// POST /:id/export responds 501.
+const rewrapRunner = storageAvailable
+  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): RewrapRunner =>
+      makeOscRewrapRunner({
+        context: oscContext,
+        createJob,
+        getJob,
+        getLogsForInstance,
+        removeJob,
+        s3Endpoint: s3.endpoint,
+        s3AccessKey: s3.accessKey,
+        s3SecretKey: s3.secretKey,
+        s3Bucket: s3.bucket
+      })
   : undefined;
 
 const clipRunner: ClipRunner | undefined = storageAvailable
@@ -349,50 +449,15 @@ const clipRunner: ClipRunner | undefined = storageAvailable
     })
   : undefined;
 
-// Auto-subtitles (issue #114) runs on the long-lived OSC eyevinn-auto-subtitles
-// (Whisper) SERVICE, called over HTTP at its instance URL — NOT an ephemeral job
-// like the ffprobe/thumbnail/clip runners. It is OPTIONAL and opt-in: the
-// service is provisioned separately (it needs an OpenAI key), so the deployment
-// supplies the instance name via AUTO_SUBTITLES_INSTANCE_NAME. When that name is
-// unset (or object storage is missing) the generator is undefined and the
-// `subtitles` pipeline step skips gracefully (never throws — fire-and-forget).
-// AUTO_SUBTITLES_WRITES_S3=true tells the runner the service uploads the result
-// object to S3 itself (so we skip our own upload path).
-const autoSubtitlesInstanceName = process.env['AUTO_SUBTITLES_INSTANCE_NAME'];
-const subtitleGenerator: SubtitleGenerator | undefined =
-  storageAvailable && autoSubtitlesInstanceName
-    ? makeOscSubtitleGenerator({
-        context: oscContext,
-        getInstance,
-        instanceName: autoSubtitlesInstanceName,
-        writesToS3: process.env['AUTO_SUBTITLES_WRITES_S3'] === 'true'
-      })
-    : undefined;
-if (storageAvailable && !autoSubtitlesInstanceName) {
-  app.log.info('AUTO_SUBTITLES_INSTANCE_NAME not set — optional auto-subtitles pipeline step disabled');
-}
-
-// Scene detection (issue #115) runs on the OSC eyevinn-function-scenes media
-// FUNCTION, called over HTTP at its instance URL (NOT an ephemeral job). Like
-// auto-subtitles it is OPTIONAL and opt-in: the function is provisioned
-// separately, so the deployment supplies the instance name via
-// SCENE_DETECT_INSTANCE_NAME. When that name is unset (or object storage is
-// missing) the detector is undefined and the OPTIONAL `scene-detect` pipeline
-// step skips gracefully (never throws — fire-and-forget). SCENE_DETECT_PATH
-// overrides the (un-contract-verified) runtime endpoint path (default '/').
-const sceneDetectInstanceName = process.env['SCENE_DETECT_INSTANCE_NAME'];
-const sceneDetector: SceneDetector | undefined =
-  storageAvailable && sceneDetectInstanceName
-    ? makeOscSceneDetector({
-        context: oscContext,
-        getInstance,
-        instanceName: sceneDetectInstanceName,
-        path: process.env['SCENE_DETECT_PATH']
-      })
-    : undefined;
-if (storageAvailable && !sceneDetectInstanceName) {
-  app.log.info('SCENE_DETECT_INSTANCE_NAME not set — optional scene-detect pipeline step disabled');
-}
+// Auto-subtitles (issue #114) and scene detection (issue #115) are OPTIONAL,
+// opt-in pipeline steps. As of issue #217 their activation is derived from the
+// STACK RECORD (StackConfig.autoSubtitlesInstanceName / sceneDetectInstanceName)
+// rather than boot-time env vars: the stack resolver builds the per-stack
+// generator (via optionalStepBuilders above) at resolve time and exposes it on
+// request.connections, so the assets router reads it live per pipeline run. A
+// freshly provisioned optional service is therefore picked up on the next run
+// with NO restart; when the record carries no instance name the step stays
+// disabled and skips gracefully (fire-and-forget, never throws).
 
 // ABR transcoding via auto-scaling Encore pool (ADR-006). The scaler exposes
 // the same EncoreClient interface as the old static client but manages a
@@ -402,6 +467,11 @@ if (storageAvailable && !sceneDetectInstanceName) {
 // When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
+// Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
+// transcode still non-terminal after this long whose Encore record has been
+// garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
+// than left running forever. Defaults to 30 minutes.
+const encoreStallTimeoutMs = parseInt(process.env['ENCORE_STALL_TIMEOUT_MS'] || String(30 * 60 * 1000), 10);
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -411,14 +481,44 @@ const encoreProfilesUrl =
 
 // Publicly-reachable base URL of this API, used to build the `profilesUrl` we
 // hand to each Encore instance the scaler spawns so Encore fetches profiles
-// from our own GET /api/v1/profiles/index.yml. When unset the scaler falls back
-// to the remote default index (previous behaviour), so Encore still works.
-const publicBaseUrl = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
-const encoreScalerProfilesUrl = publicBaseUrl
-  ? `${publicBaseUrl}/api/v1/profiles/index.yml`
-  : encoreProfilesUrl;
-if (!publicBaseUrl) {
-  app.log.warn('PUBLIC_BASE_URL not set — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+// from our own GET /api/v1/profiles/index.yml. Resolved via the single
+// resolvePublicBaseUrl() seam (issue #219): explicit PUBLIC_BASE_URL override →
+// OSC-derived app URL (none available today) → unset. When unset the scaler
+// falls back to the remote default index (previous behaviour), so Encore still
+// works.
+// Precedence (see resolveEncoreProfilesUrl): explicit ENCORE_PROFILES_URL_OVERRIDE
+// direct override → derived ${PUBLIC_BASE_URL}/api/v1/profiles/index.yml → remote
+// default (encoreProfilesUrl). Either operator-set env var lets an operator point
+// Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
+// so an explicit value is the only lever.
+const publicBaseUrl = resolvePublicBaseUrl();
+// Tier 3 (issue #315): resolve an operator-supplied full profiles-index URL from
+// the provisioned stack record at boot, where the parameter store is already
+// awaited (see paramStore above). Undefined when there is no store, no stack, or
+// the field is unset — in which case resolveEncoreProfilesUrl falls through to
+// the remote default, byte-identical to pre-#315 behaviour.
+const paramStoreProfilesUrl =
+  publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
+    ? undefined // env-var seams (tier 1/2) win; skip the param-store read entirely
+    : await resolveEncoreProfilesUrlFromParamStore({
+        paramStore,
+        namespace: STACK_CONFIG_NAMESPACE,
+        onError: (err) =>
+          app.log.warn(
+            { err },
+            'profiles URL: failed to resolve from parameter store; falling back to remote default index'
+          )
+      });
+const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(
+  encoreProfilesUrl,
+  paramStoreProfilesUrl
+);
+if (
+  !publicBaseUrl &&
+  !process.env['ENCORE_PROFILES_URL_OVERRIDE'] &&
+  !paramStoreProfilesUrl
+) {
+  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set, no parameter-store value / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time
@@ -559,6 +659,30 @@ function activateScaler(redisUrl: string): void {
       if (job.assetId) {
         await assetRepository.update(job.assetId, { status: 'processing' });
       }
+    },
+    // Once per tick, reconcile transcode jobs stuck non-terminal against Encore's
+    // terminal FAILED / garbage-collected (404) outcomes (issue #273). A failed
+    // Encore job never produces a completion message (the callback listener only
+    // enqueues SUCCESSFUL jobs), so without this the VideoCore job stays
+    // `running` and its asset `processing` forever. The scaler owns no repos, so
+    // we supply the repo-driven sweep here; `scalerRegistry` is the EncoreClient
+    // whose getJobStatus() polls Encore. Best-effort: errors are swallowed inside
+    // the sweep so a reconcile failure never breaks the tick.
+    reconcileFailedTranscodes: async () => {
+      await reconcileFailedTranscodes({
+        jobs: jobRepository,
+        assets: assetRepository,
+        pipeline: pipelineRepository,
+        // scalerRegistry implements EncoreClient; getJobStatus() decodes the
+        // workspace from the encore job id and polls the right instance. It is
+        // assigned below (encore = scalerRegistry) before any tick fires.
+        encore: scalerRegistry!,
+        stallTimeoutMs: encoreStallTimeoutMs,
+        logger: {
+          info: (...a: unknown[]) => app.log.info(a),
+          warn: (...a: unknown[]) => app.log.warn(a)
+        }
+      });
     }
   });
   encore = scalerRegistry;
@@ -571,6 +695,83 @@ function activateScaler(redisUrl: string): void {
     queue: makeOscPackagerQueue(redis),
     publicBaseUrl: packagingPublicBaseUrl()
   });
+
+  // On-demand packager provisioning (epic #226, issue #244). The packager is no
+  // longer provisioned at stack-provision time (issue #243): this closure is
+  // invoked the first time a pipeline reaches a `package` step (assets router
+  // `ensurePackaging`). It resolves the stack's coordinates from the parameter
+  // store, then provisions + wires the packager to THIS activated stack Valkey
+  // (`redisUrl`) and packaged-output storage if absent, waiting for readiness
+  // before returning so the packaging job is only enqueued once the packager is
+  // live. It is idempotent (reconciles against OSC ground truth via getInstance)
+  // and reuses the running instance on subsequent executions. Issue #245 wraps
+  // this in a per-stack single-flight guard for concurrent first executions.
+  //
+  // Requires the MinIO root password (packager S3 secret) and the OSC PAT
+  // (packager fetches Encore job data). When either is missing this is a no-op
+  // (undefined), so packaging degrades to the pre-#244 behaviour rather than
+  // failing the pipeline.
+  const packagerMinioPassword = process.env['MINIO_ROOT_PASSWORD'];
+  const packagerPat = oscContext.getPersonalAccessToken();
+  if (packagerMinioPassword && packagerPat) {
+    const packagerApi = packagerOscApiFromContext(oscContext);
+    // Per-stack single-flight guard (issue #245): N concurrent first-execution
+    // requests collapse onto one ensure run per stack, so exactly one packager
+    // is provisioned. Combined with the ground-truth reconciliation inside
+    // ensurePackagerProvisioned (getInstance check + "already taken" tolerance),
+    // a restart mid-provision self-heals without orphaning/duplicating. One
+    // guard per activation; cleared implicitly when the scaler deactivates and
+    // the ensurePackaging closure is dropped.
+    const packagerEnsureGuard = new PackagerEnsureSingleFlight();
+    assetRouterOptions.ensurePackaging = async () => {
+      // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
+      // this activation is bound to. Mirrors resolveStackRedisUrl: the first
+      // provisioned stack for the namespace is the default.
+      let stackName: string | undefined;
+      let minioEndpoint: string | undefined;
+      let packagedBucket = outputBucket;
+      if (paramStore) {
+        try {
+          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            stackName = names[0];
+            const cfg = await paramStore.loadStackConfig(
+              STACK_CONFIG_NAMESPACE,
+              names[0]!
+            );
+            if (cfg?.minioEndpoint) minioEndpoint = cfg.minioEndpoint;
+            if (cfg?.packagedBucket) packagedBucket = cfg.packagedBucket;
+          }
+        } catch (err) {
+          app.log.warn({ err }, 'on-demand packager: failed to resolve stack coordinates');
+        }
+      }
+      if (!stackName || !minioEndpoint) {
+        // No resolvable stack coordinates — cannot provision the packager. Do
+        // not throw: packaging enqueues onto the shared queue regardless, and a
+        // manually/previously provisioned packager may still consume it.
+        app.log.warn('on-demand packager: stack coordinates unavailable, skipping ensure');
+        return;
+      }
+      const result = await packagerEnsureGuard.run({
+        osc: packagerApi,
+        coords: {
+          stackName,
+          redisUrl,
+          minioEndpoint,
+          packagedBucket,
+          publicBaseUrl
+        },
+        secrets: {
+          minioRootPassword: packagerMinioPassword,
+          oscPersonalAccessToken: packagerPat
+        }
+      });
+      if (result.status === 'created') {
+        app.log.info({ stackName }, 'on-demand packager provisioned');
+      }
+    };
+  }
 
   // Encore completion callback poller (background). Drains the Valkey sorted set
   // the callback listener writes to and applies transcode completions even when
@@ -641,6 +842,7 @@ async function deactivateScaler(): Promise<void> {
   assetRouterOptions.encore = undefined;
   assetRouterOptions.packaging = undefined;
   assetRouterOptions.packagingRedis = undefined;
+  assetRouterOptions.ensurePackaging = undefined;
   jobsRouterOptions.redis = undefined;
   encoreCompatRouterOptions.encore = undefined;
   pipelinesRouterOptions.encoreClient = undefined;
@@ -722,12 +924,15 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   thumbnailExtractor,
   rewrapRunner,
   clipRunner,
-  subtitleGenerator,
-  sceneDetector,
   packaging,
   packagingRedis: sharedRedis,
   pipelineRepository,
-  commentRepository
+  commentRepository,
+  // Profile store for per-profile profileParams key validation (issue #290)
+  // and for validating a named transcode profile so a GPU-only (NVENC/CUDA)
+  // profile that cannot run on this platform is rejected 422 before submission
+  // (issue #286).
+  profileRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -775,7 +980,19 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
   repository: assetRepository,
   webhookDispatcher,
   redis: sharedRedis,
-  pipelineRepository
+  pipelineRepository,
+  // Post-package relocation (issue #208, ADR-011). Resolve the stack's MinIO
+  // client + packaged/staging bucket at callback time so a packaging success can
+  // server-side-copy this execution's output to a per-execution
+  // `destinationBucket` override. Reuses the resolver-built MinioClient
+  // (workspace-stack.ts) — no new client construction here. Returns undefined
+  // when the resolved stack has no storage configured (no override relocation is
+  // then possible; executions without an override are unaffected regardless).
+  resolveRelocation: async () => {
+    const conns = await stackResolver.resolve();
+    if (!conns.storageClient) return undefined;
+    return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
+  }
 };
 await app.register(internalRouter, internalRouterOptions);
 
@@ -911,6 +1128,25 @@ app.addHook('onClose', async () => {
 
 const port = parseInt(process.env['PORT'] || '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
+
+// Boot-time reachability self-check for the local Encore profiles index (#284).
+// The server is now listening and every router (incl. profilesRouter) is
+// registered, so the derived profiles URL — encoreScalerProfilesUrl — is fully
+// known and serveable. When it points at THIS app's own local
+// /api/v1/profiles/index.yml (i.e. publicBaseUrl resolved), fetch it exactly as
+// Encore would: an UNAUTHENTICATED GET, no bearer token. A 401/403 (the OSC
+// login wall still gating the path) or any unreachable result is logged as a
+// HARD ERROR, so a silent fallback to the remote default index — which would
+// quietly disable operator-managed profiles — is surfaced loudly. Non-fatal:
+// it never throws and the server keeps running. This is the mechanism that
+// confirms, at boot, whether OSC's 2026-07-08 promise to make /api/v1/profiles
+// publicly accessible for the app actually took effect (this environment cannot
+// reach live OSC to confirm it ahead of time).
+void checkProfilesIndexReachable({
+  profilesIndexUrl: encoreScalerProfilesUrl,
+  usingLocalIndex: Boolean(publicBaseUrl),
+  log: app.log
+}).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router
 // is registered, so a detected object can flow through the full pipeline. The

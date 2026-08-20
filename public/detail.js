@@ -1,15 +1,17 @@
 /**
  * open-videocore ops — standalone detached detail view (detail.js)
  *
- * Entry point for detail.html. Renders exactly ONE detail view (a single asset
- * or a single job) in its own browser window, self-polling at the shared
- * main-UI interval. It reuses the renderer + helper logic from app.js via ES
- * module imports (no duplication), and shares NO module-level state with the
- * opener window (a separate window is a separate JS realm anyway).
+ * Entry point for detail.html. Renders exactly ONE detail view (a single asset,
+ * a single job, or a single pipeline execution) in its own browser window,
+ * self-polling at the shared main-UI interval. It reuses the renderer + helper
+ * logic from app.js via ES module imports (no duplication), and shares NO
+ * module-level state with the opener window (a separate window is a separate JS
+ * realm anyway).
  *
  * URL params:
- *   type   'asset' | 'job'   (which detail renderer to run)
- *   id     the asset or job id to render
+ *   type   'asset' | 'job' | 'pipeline' (alias 'execution')
+ *          (which detail renderer to run)
+ *   id     the asset, job, or pipeline-execution id to render
  *   stack  (optional) the OSC stack name to target; falls back to the
  *          window's own localStorage when absent.
  *
@@ -21,6 +23,7 @@
 import {
   renderAssetDetailBody,
   renderJobDetailBody,
+  renderPipelineDetailBody,
   setStackOverride,
   getActiveStack,
   DETAIL_POLL_INTERVAL_MS,
@@ -30,7 +33,10 @@ function getParam(name) {
   return new URLSearchParams(window.location.search).get(name);
 }
 
-const type = getParam('type');
+// Normalise the requested type. 'execution' is accepted as an alias for
+// 'pipeline' so callers can use either spelling for a pipeline execution.
+const rawType = getParam('type');
+const type = rawType === 'execution' ? 'pipeline' : rawType;
 const id = getParam('id');
 const stackParam = getParam('stack');
 
@@ -107,12 +113,26 @@ async function runJob(bodyEl) {
   document.title = 'Job ' + label + ' — open-videocore ops';
 }
 
+async function runPipeline(bodyEl) {
+  const exec = await renderPipelineDetailBody(id, bodyEl);
+  const label = (exec && exec.pipelineName) ? (exec.pipelineName + ' ' + id) : id;
+  document.title = 'Pipeline ' + label + ' — open-videocore ops';
+  // Stop self-polling once the execution reaches a terminal state. The pipeline
+  // execution status enum is running|done|failed (pipelineExecutionSchema in
+  // src/routes/pipelines.ts), so anything other than 'running' is terminal.
+  if (exec && exec.status !== 'running') {
+    stopPolling();
+  }
+}
+
 async function tick() {
   const bodyEl = document.getElementById('detail-body');
   if (!bodyEl) return;
   try {
     if (type === 'asset') {
       await runAsset(bodyEl);
+    } else if (type === 'pipeline') {
+      await runPipeline(bodyEl);
     } else {
       await runJob(bodyEl);
     }
@@ -131,12 +151,16 @@ function capitalize(s) {
 }
 
 function boot() {
-  if (!id || (type !== 'asset' && type !== 'job')) {
+  if (!id || (type !== 'asset' && type !== 'job' && type !== 'pipeline')) {
     fatal('Missing or invalid "type"/"id" URL parameters.');
     return;
   }
 
-  const heading = type === 'asset' ? 'Asset Detail' : 'Job Detail';
+  const heading = type === 'asset'
+    ? 'Asset Detail'
+    : type === 'pipeline'
+      ? 'Pipeline Execution Detail'
+      : 'Job Detail';
   // Provisional title until the first fetch resolves the friendly name.
   document.title = capitalize(type) + ' ' + id + ' — open-videocore ops';
   buildChrome(heading);

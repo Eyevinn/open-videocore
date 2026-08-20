@@ -134,7 +134,12 @@ export class PerWorkspacePipelineRepository implements PipelineRepository {
   }
   async update(
     id: string,
-    patch: Partial<Pick<PipelineExecution, 'status' | 'steps'>>
+    patch: Partial<
+      Pick<
+        PipelineExecution,
+        'status' | 'steps' | 'resolvedOutputLocation' | 'relocatedPackagingIds'
+      >
+    >
   ): Promise<PipelineExecution | undefined> {
     return (await this.repo()).update(id, patch);
   }

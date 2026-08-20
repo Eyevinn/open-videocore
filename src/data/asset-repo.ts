@@ -322,6 +322,17 @@ export type Asset = {
   provenance?: ProvenanceEntry[];
   // Collection memberships projected onto the asset (ADR-005 structural).
   collections?: string[];
+  // TAMS time-addressable bridge addressing (issue #165, epic #116). Machine/
+  // pipeline-derived addressing of the asset's media into a Time-addressable
+  // Media Store, so it maps onto the ADR-005 `structural` namespace (see
+  // asset-document.ts), NOT the editorial `descriptive` one. Both optional and
+  // additive: absent on assets/documents written before #165.
+  //   - tamsFlowIds: TAMS flow UUIDs. A source can carry many flows (ADR-008),
+  //     so this is a set (array) of ids, not a single id.
+  //   - tamsTimerange: the asset's media timerange in the TAMS TAI grammar
+  //     (validated string, e.g. `[0:0_10:0)`), per ADR-008.
+  tamsFlowIds?: string[];
+  tamsTimerange?: string;
   createdAt: string;
   updatedAt: string;
 };

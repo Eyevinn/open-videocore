@@ -876,9 +876,17 @@ async function renderAssetDetailBody(id, bodyEl) {
     if (asset.slug) {
       kvRows.push(['ULID', '<span class="text-mono text-muted">' + escHtml(asset.id) + '</span>']);
     }
+    // Status cell; when the scene-detect pipeline recorded a failure
+    // (asset.sceneDetectionError, a plain string per src/routes/assets.ts:381),
+    // surface it as a warning right alongside the asset status. Detection never
+    // changes the asset's lifecycle status, so this is purely advisory.
+    var statusCell = renderBadge(asset.status);
+    if (asset.sceneDetectionError) {
+      statusCell += ' <span class="text-mono" style="color:var(--error,#f87171)" title="Scene detection failed">⚠ Scene detection: ' + escHtml(asset.sceneDetectionError) + '</span>';
+    }
     kvRows.push(
       ['Title', escHtml(asset.title || asset.name || '—')],
-      ['Status', renderBadge(asset.status)],
+      ['Status', statusCell],
       ['MIME type', escHtml(asset.mimeType || '—')],
       ['Tags', renderTags(asset.tags)],
       ['Created', escHtml(fmtDate(asset.createdAt))],
@@ -929,6 +937,59 @@ async function renderAssetDetailBody(id, bodyEl) {
       body.appendChild(metaDiv);
     }
 
+    // Scene/shot-detection metadata (issue #197). Shape verified against
+    // src/data/asset-repo.ts: SceneMetadata { boundaries: SceneBoundary[];
+    // sceneCount: number; detectedAt: string } (L159-165) and each
+    // SceneBoundary { startSeconds?; endSeconds?; keyframeSeconds? } (L147-151),
+    // mirrored by sceneMetadataSchema in src/routes/assets.ts:293-297. The field
+    // is `null` until the first successful detection, so only render the section
+    // when boundaries are actually present — never an empty section.
+    var sm = asset.sceneMetadata;
+    if (sm && Array.isArray(sm.boundaries) && sm.boundaries.length > 0) {
+      const sceneDiv = document.createElement('div');
+      sceneDiv.className = 'mt12';
+
+      const sceneTitle = document.createElement('div');
+      sceneTitle.className = 'section-title';
+      // sceneCount is a convenience mirror of boundaries.length; fall back to the
+      // array length if the server omitted/mismatched it.
+      var count = (typeof sm.sceneCount === 'number') ? sm.sceneCount : sm.boundaries.length;
+      sceneTitle.textContent = 'Scenes (' + count + ')';
+      sceneDiv.appendChild(sceneTitle);
+
+      if (sm.detectedAt) {
+        const detectedLine = document.createElement('div');
+        detectedLine.className = 'text-muted';
+        detectedLine.textContent = 'Detected ' + fmtDate(sm.detectedAt);
+        sceneDiv.appendChild(detectedLine);
+      }
+
+      // Format a boundary as "start → end" using whatever seconds fields are
+      // present; every field is optional in the contract, so guard each one.
+      var fmtSecs = function(v) {
+        return (typeof v === 'number') ? v.toFixed(1) + 's' : '—';
+      };
+      var rows = sm.boundaries.map(function(b, i) {
+        var window = fmtSecs(b.startSeconds) + ' → ' + fmtSecs(b.endSeconds);
+        var key = (typeof b.keyframeSeconds === 'number')
+          ? escHtml('key ' + b.keyframeSeconds.toFixed(1) + 's')
+          : '<span class="text-muted">—</span>';
+        return '<tr>' +
+          '<td>' + (i + 1) + '</td>' +
+          '<td class="text-mono">' + escHtml(window) + '</td>' +
+          '<td class="text-mono">' + key + '</td>' +
+          '</tr>';
+      }).join('');
+      var swrap = document.createElement('div');
+      swrap.className = 'table-wrap';
+      swrap.innerHTML =
+        '<table><thead><tr>' +
+        '<th>#</th><th>Window</th><th>Keyframe</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>';
+      sceneDiv.appendChild(swrap);
+      body.appendChild(sceneDiv);
+    }
+
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
     // per execution; refreshed by the Run Pipeline control below.
     const execDiv = document.createElement('div');
@@ -938,7 +999,9 @@ async function renderAssetDetailBody(id, bodyEl) {
     await renderExecutions(id, execDiv);
 
     // Run Pipeline control: pipeline select + optional profile select + trigger.
-    var ENCODE_PIPELINES = ['transcode', 'abr-vod', 'full']; // pipelines with a transcode step
+    // Pipeline options + the transcode gate (ENCODE_PIPELINES) are both derived
+    // from the module-level PIPELINE_CATALOG, so new built-in pipelines show up
+    // here automatically without editing this dialog.
 
     // Load available Encore profiles from the public GET /profiles endpoint.
     // No auth header needed, so use a plain fetch rather than apiFetch.
@@ -960,14 +1023,20 @@ async function renderAssetDetailBody(id, bodyEl) {
       console.warn('GET /profiles request failed; falling back to default ["program"]', e);
     }
 
+    // Build the pipeline options from the shared catalog so future built-in
+    // pipelines appear automatically. Each option label shows the pipeline id
+    // plus its ordered step list, e.g. "subtitles (subtitles)".
+    var pipelineOptions = PIPELINE_CATALOG.map(function(p) {
+      var stepSummary = p.steps.join(' + ');
+      return '<option value="' + escHtml(p.name) + '">' +
+        escHtml(p.name + ' (' + stepSummary + ')') + '</option>';
+    }).join('');
+
     const runDiv = document.createElement('div');
     runDiv.className = 'mt12 flex-gap';
     runDiv.innerHTML = [
       '<select id="pipeline-select" class="input">',
-      '  <option value="transcode">transcode (transcode only)</option>',
-      '  <option value="abr-vod">abr-vod (transcode + package)</option>',
-      '  <option value="ingest">ingest (metadata + thumbnail)</option>',
-      '  <option value="full">full (all steps)</option>',
+      pipelineOptions,
       '</select>',
       '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
       encodeProfiles.map(function(p) { return '<option value="' + escHtml(p) + '">' + escHtml(p) + '</option>'; }).join(''),
@@ -1550,6 +1619,102 @@ async function renderJobDetailBody(id, bodyEl, opts) {
     showMsg(body, 'Failed to load job: ' + err.message, 'error');
     throw err;
   }
+  }
+}
+
+// ─── PIPELINE EXECUTION DETAIL ────────────────────────────────────────────────
+// Fetch and render a single PipelineExecution (issue #193) into `bodyEl`.
+// Contract: GET /api/v1/pipelines/:executionId — response `pipelineExecutionSchema`
+// in src/routes/pipelines.ts (id, assetId, assetName?, pipelineName, status
+// [running|done|failed], steps[], createdAt, updatedAt). Each step (per
+// stepExecutionSchema): name, status [pending|running|done|failed], jobId?,
+// encoreJobId?, error?, startedAt?, completedAt?, progress?.
+//
+// All server-provided text is inserted via escHtml before interpolation. Returns
+// the fetched execution so callers (detail.js) can derive the window title and
+// decide whether to keep polling.
+async function renderPipelineDetailBody(id, bodyEl) {
+  const body = bodyEl;
+  body.innerHTML = '';
+  const loader = loadingEl();
+  body.appendChild(loader);
+
+  try {
+    const exec = await apiFetch('/pipelines/' + encodeURIComponent(id));
+    loader.remove();
+
+    // Colour helper mirroring renderExecutions()'s per-status colouring.
+    const stepColor = function(status) {
+      return { running: 'var(--accent,#60a5fa)', pending: 'var(--text-muted,#9ca3af)', done: 'var(--success,#4ade80)', failed: 'var(--error,#f87171)' }[status] || '';
+    };
+
+    const kvRows = [
+      ['ID', '<span class="text-mono">' + escHtml(exec.id) + '</span>'],
+      ['Pipeline', escHtml(exec.pipelineName || '—')],
+      ['Status', renderBadge(exec.status)],
+    ];
+    if (exec.assetId) {
+      kvRows.push(['Asset', '<span class="text-mono">' + escHtml(exec.assetName || exec.assetId) + '</span>']);
+    }
+    kvRows.push(['Created', escHtml(fmtDate(exec.createdAt))]);
+    kvRows.push(['Updated', escHtml(fmtDate(exec.updatedAt))]);
+
+    const kvDiv = document.createElement('div');
+    kvDiv.className = 'kv-grid';
+    kvDiv.innerHTML = kvRows.map(function(r) {
+      return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+    }).join('');
+    body.appendChild(kvDiv);
+
+    // Per-step list: status, progress, timestamps, and the FULL error text for
+    // failed steps (inline, not tooltip-only). All fields escaped via escHtml.
+    const stepsTitle = document.createElement('div');
+    stepsTitle.className = 'section-title mt12';
+    stepsTitle.textContent = 'Steps';
+    body.appendChild(stepsTitle);
+
+    const steps = Array.isArray(exec.steps) ? exec.steps : [];
+    if (steps.length === 0) {
+      const none = document.createElement('div');
+      none.className = 'text-muted';
+      none.textContent = 'No steps.';
+      body.appendChild(none);
+    } else {
+      const rows = steps.map(function(s) {
+        const cells = [];
+        cells.push('<td>' + escHtml(s.name) + '</td>');
+        cells.push('<td><span style="color:' + stepColor(s.status) + '">' + escHtml(s.status) + '</span></td>');
+        cells.push('<td>' + (s.progress != null ? escHtml(s.progress + '%') : '—') + '</td>');
+        cells.push('<td>' + (s.jobId ? '<span class="text-mono">' + escHtml(s.jobId) + '</span>' : '—') + '</td>');
+        cells.push('<td>' + escHtml(fmtDate(s.startedAt)) + '</td>');
+        cells.push('<td>' + escHtml(fmtDate(s.completedAt)) + '</td>');
+        var row = '<tr>' + cells.join('') + '</tr>';
+        // Full error text on its own spanning row so long strings wrap and are
+        // fully visible (acceptance criterion: not tooltip-only).
+        if (s.error) {
+          row += '<tr class="step-error-row"><td colspan="6" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
+        }
+        return row;
+      }).join('');
+
+      const table = document.createElement('table');
+      table.className = 'mini-table';
+      table.innerHTML =
+        '<thead><tr>' +
+        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Started</th><th>Completed</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody>';
+      body.appendChild(table);
+    }
+
+    const pre = document.createElement('pre');
+    pre.className = 'code-block mt12';
+    pre.textContent = JSON.stringify(exec, null, 2);
+    body.appendChild(pre);
+    return exec;
+  } catch (err) {
+    body.innerHTML = '';
+    showMsg(body, 'Failed to load pipeline execution: ' + err.message, 'error');
+    throw err;
   }
 }
 
@@ -2655,6 +2820,219 @@ async function renderProvisionTab(container) {
     listContent.appendChild(p);
   });
 
+  // ── Optional services: Scene Detection card (issue #198) ──
+  // Reuses the shared per-service endpoints under /optional-services/:key and
+  // the pollOp / pollDeprovisionOp helpers defined above. The service key,
+  // status shape (state: not-configured | configured | active), instance-name
+  // env var, and the empty required-field set are all taken verbatim from the
+  // backend registry — see src/services/optional-services.ts (key 'scene-detect',
+  // fields: []) and src/routes/optional-services.ts (statusSchema). Degrades to a
+  // disabled "not configured" state when SCENE_DETECT_INSTANCE_NAME is unset.
+  const sceneSection = document.createElement('div');
+  sceneSection.className = 'section';
+  const sceneTitle = document.createElement('div');
+  sceneTitle.className = 'section-title';
+  sceneTitle.textContent = 'Scene Detection';
+  sceneSection.appendChild(sceneTitle);
+  const sceneBody = document.createElement('div');
+  sceneBody.appendChild(loadingEl());
+  sceneSection.appendChild(sceneBody);
+  container.appendChild(sceneSection);
+
+  const SCENE_DETECT_KEY = 'scene-detect';
+
+  function renderSceneCard(status) {
+    sceneBody.textContent = '';
+
+    // Map the backend `state` onto a user-facing badge + description.
+    const state = status && status.state;
+    const isActive = state === 'active';
+    const isConfigured = state === 'configured';
+    const notConfigured = !state || state === 'not-configured';
+
+    const badgeStatus = isActive
+      ? 'active'
+      : isConfigured
+        ? 'pending'
+        : 'unknown';
+
+    const kv = document.createElement('div');
+    kv.className = 'kv-grid';
+    const rows = [
+      ['Service', escHtml((status && status.displayName) || 'Scene Detect Media Function')],
+      ['Status', renderBadge(badgeStatus)],
+      ['Instance name',
+        status && status.instanceName
+          ? '<span class="text-mono">' + escHtml(status.instanceName) + '</span>'
+          : '<span class="text-muted">—</span>'],
+      ['Env var',
+        '<span class="text-mono">' +
+          escHtml((status && status.instanceNameEnvVar) || 'SCENE_DETECT_INSTANCE_NAME') +
+          '</span>'],
+    ];
+    if (isActive && status.url) {
+      rows.push(['URL', '<span class="text-mono">' + escHtml(status.url) + '</span>']);
+    }
+    kv.innerHTML = rows.map(function(r) {
+      return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+    }).join('');
+    sceneBody.appendChild(kv);
+
+    const hint = document.createElement('p');
+    hint.className = 'text-muted';
+    hint.style.cssText = 'font-size:12px;margin-top:8px;';
+    if (notConfigured) {
+      hint.textContent = 'SCENE_DETECT_INSTANCE_NAME is not set. Provision an instance below, then set that environment variable to the instance name and restart to enable the scene-detect pipeline step.';
+    } else if (isConfigured) {
+      hint.textContent = 'Configured, but no live instance was found under the configured name. Re-provision to create it.';
+    } else {
+      hint.textContent = 'A live scene-detect instance is running and wired to the pipeline.';
+    }
+    sceneBody.appendChild(hint);
+
+    // Controls: provision (when not active) and deprovision (when there is an
+    // instance name to remove). When not-configured we still allow provisioning
+    // a NEW instance (the operator sets the env var afterwards).
+    const controls = document.createElement('div');
+    controls.className = 'form-row';
+    controls.style.marginTop = '8px';
+
+    // Provision control — needs an instance name (^\w+$ per the backend schema).
+    if (!isActive) {
+      const field = document.createElement('div');
+      field.className = 'form-field grow';
+      const label = document.createElement('label');
+      const inputId = 'scene-provision-name';
+      label.setAttribute('for', inputId);
+      label.textContent = 'Instance name';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = inputId;
+      input.placeholder = 'scenedetect';
+      if (status && status.instanceName) input.value = status.instanceName;
+      field.appendChild(label);
+      field.appendChild(input);
+      controls.appendChild(field);
+
+      const provBtn = document.createElement('button');
+      provBtn.textContent = 'Provision';
+      provBtn.addEventListener('click', function() {
+        const name = input.value.trim();
+        if (!name) { showMsg(sceneMsg, 'Instance name is required.', 'error'); return; }
+        provisionScene(name, provBtn);
+      });
+      controls.appendChild(provBtn);
+    }
+
+    // Deprovision control — only when an instance name is configured (the backend
+    // removes the instance named by SCENE_DETECT_INSTANCE_NAME).
+    if (status && status.instanceName) {
+      const deprovBtn = document.createElement('button');
+      deprovBtn.className = 'btn-danger';
+      deprovBtn.textContent = 'Deprovision';
+      deprovBtn.addEventListener('click', function() {
+        if (!confirm('Deprovision the scene-detect instance "' + status.instanceName + '"?')) return;
+        deprovisionScene(deprovBtn);
+      });
+      controls.appendChild(deprovBtn);
+    }
+
+    sceneBody.appendChild(controls);
+
+    const sceneMsg = document.createElement('div');
+    sceneMsg.id = 'scene-msg';
+    sceneMsg.className = 'mt8';
+    sceneBody.appendChild(sceneMsg);
+  }
+
+  function refreshSceneCard() {
+    apiFetch('/optional-services/' + encodeURIComponent(SCENE_DETECT_KEY))
+      .then(renderSceneCard)
+      .catch(function(err) {
+        sceneBody.textContent = '';
+        const p = document.createElement('p');
+        p.className = 'text-muted';
+        // Degrade gracefully: an unknown key / unreachable endpoint shows a
+        // disabled notice rather than a hard error card.
+        p.textContent = 'Scene detection is unavailable (' + err.message + ').';
+        sceneBody.appendChild(p);
+      });
+  }
+
+  function provisionScene(name, btn) {
+    const sceneMsg = sceneBody.querySelector('#scene-msg');
+    if (sceneMsg) sceneMsg.innerHTML = '';
+    btn.disabled = true;
+    btn.textContent = 'Provisioning…';
+    apiFetch('/optional-services/' + encodeURIComponent(SCENE_DETECT_KEY) + '/provision', {
+      method: 'POST',
+      body: JSON.stringify({ name: name })
+    }).then(function(res) {
+      const opId = res && res.operationId;
+      if (opId) {
+        // Mirror into Active Operations and poll to completion, then refresh.
+        upsertOpRow({ id: opId, type: 'provision', name: name, status: 'pending' });
+        pollOp({ id: opId, type: 'provision', name: name, status: 'pending' });
+        pollSceneOp(opId, btn, 'Provision');
+      } else {
+        btn.disabled = false;
+        btn.textContent = 'Provision';
+        refreshSceneCard();
+      }
+    }).catch(function(err) {
+      if (sceneMsg) showMsg(sceneMsg, 'Error: ' + err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = 'Provision';
+    });
+  }
+
+  function deprovisionScene(btn) {
+    const sceneMsg = sceneBody.querySelector('#scene-msg');
+    if (sceneMsg) sceneMsg.innerHTML = '';
+    btn.disabled = true;
+    btn.textContent = 'Deprovisioning…';
+    apiFetch('/optional-services/' + encodeURIComponent(SCENE_DETECT_KEY), { method: 'DELETE' })
+      .then(function(res) {
+        const opId = res && res.operationId;
+        const name = (res && res.name) || '';
+        if (opId) {
+          upsertOpRow({ id: opId, type: 'deprovision', name: name, status: 'pending' });
+          pollOp({ id: opId, type: 'deprovision', name: name, status: 'pending' });
+          pollSceneOp(opId, btn, 'Deprovision');
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Deprovision';
+          refreshSceneCard();
+        }
+      }).catch(function(err) {
+        if (sceneMsg) showMsg(sceneMsg, 'Error: ' + err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Deprovision';
+      });
+  }
+
+  // Poll a scene-detect optional-service operation to a terminal state, then
+  // re-render the card so the status/badge reflects the new instance state.
+  function pollSceneOp(opId, btn, verb) {
+    apiFetch('/provision/operations/' + encodeURIComponent(opId)).then(function(op) {
+      if (op.status === 'done' || op.status === 'failed') {
+        btn.disabled = false;
+        btn.textContent = verb;
+        const sceneMsg = sceneBody.querySelector('#scene-msg');
+        if (op.status === 'failed' && sceneMsg) {
+          showMsg(sceneMsg, op.error || (verb + ' failed'), 'error');
+        }
+        refreshSceneCard();
+      } else {
+        setTimeout(function() { pollSceneOp(opId, btn, verb); }, 3000);
+      }
+    }).catch(function() {
+      setTimeout(function() { pollSceneOp(opId, btn, verb); }, 5000);
+    });
+  }
+
+  refreshSceneCard();
+
   // Provision form
   const section = document.createElement('div');
   section.className = 'section';
@@ -2886,6 +3264,185 @@ async function renderProvisionTab(container) {
     scalerBody.appendChild(notice);
   });
 
+  // ── Auto-subtitles optional service (issue #196) ──
+  // Provisions the OPT-IN auto-subtitles service via the generic optional-service
+  // endpoints (src/routes/optional-services.ts). This service is NOT part of the
+  // fixed stack: it is discovered by the runtime from AUTO_SUBTITLES_INSTANCE_NAME.
+  //   status:      GET    /api/v1/optional-services/auto-subtitles  -> statusSchema
+  //   provision:   POST   /api/v1/optional-services/auto-subtitles/provision {name,openaikey,...}
+  //                        -> 202 { operationId, key, name, status:'pending' }
+  //   deprovision: DELETE /api/v1/optional-services/auto-subtitles
+  //                        -> 202 { operationId, ... } | 400 when env var unset
+  // Both async ops land in the SHARED operation store, so we reuse pollOp /
+  // pollDeprovisionOp (which poll /provision/operations/:id) unchanged.
+  const OPTIONAL_KEY = 'auto-subtitles';
+  const subSection = document.createElement('div');
+  subSection.className = 'section';
+  const subTitle = document.createElement('div');
+  subTitle.className = 'section-title';
+  subTitle.textContent = 'Auto-subtitles (optional service)';
+  subSection.appendChild(subTitle);
+  const subBody = document.createElement('div');
+  subBody.id = 'auto-subtitles-body';
+  subBody.appendChild(loadingEl());
+  subSection.appendChild(subBody);
+  container.appendChild(subSection);
+
+  function renderAutoSubtitles() {
+    subBody.textContent = '';
+    subBody.appendChild(loadingEl());
+    apiFetch('/optional-services/' + OPTIONAL_KEY).then(function(status) {
+      subBody.textContent = '';
+
+      // Status line: active | configured | not-configured.
+      const state = status && status.state;
+      const badgeText = state === 'active' ? 'Active'
+        : state === 'configured' ? 'Configured'
+        : 'Not configured';
+      // Reuse the existing badge palette (style.css): active -> ready (green),
+      // configured -> pending (amber), not-configured -> unknown (neutral).
+      const badgeCls = state === 'active' ? 'badge-ready'
+        : state === 'configured' ? 'badge-pending'
+        : 'badge-unknown';
+
+      const kvDiv = document.createElement('div');
+      kvDiv.className = 'kv-grid';
+      const rows = [['Status', '<span class="badge ' + badgeCls + '">' + escHtml(badgeText) + '</span>']];
+      if (status && status.instanceName) {
+        rows.push(['Instance name', '<span class="text-mono">' + escHtml(status.instanceName) + '</span>']);
+      }
+      if (status && status.url) {
+        rows.push(['URL', '<span class="text-mono">' + escHtml(status.url) + '</span>']);
+      }
+      rows.push(['Env var', '<span class="text-mono">' + escHtml((status && status.instanceNameEnvVar) || 'AUTO_SUBTITLES_INSTANCE_NAME') + '</span>']);
+      kvDiv.innerHTML = rows.map(function(r) {
+        return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
+      }).join('');
+      subBody.appendChild(kvDiv);
+
+      // Graceful "not configured" guidance: the runtime has the pipeline step
+      // disabled because AUTO_SUBTITLES_INSTANCE_NAME is unset. Provisioning here
+      // creates the instance and returns the name the operator must set into that
+      // env var (the runtime cannot mutate its own env for a future self).
+      if (state === 'not-configured') {
+        const hint = document.createElement('p');
+        hint.className = 'text-muted';
+        hint.style.cssText = 'font-size:13px;margin:8px 0;';
+        hint.textContent = 'AUTO_SUBTITLES_INSTANCE_NAME is not set, so the auto-subtitles pipeline step is disabled. Provision an instance below, then set that env var to the returned instance name and redeploy to enable it.';
+        subBody.appendChild(hint);
+      }
+
+      // Deprovision control — only meaningful when an instance name is configured.
+      if (state === 'active' || state === 'configured') {
+        const delRow = document.createElement('div');
+        delRow.style.cssText = 'margin:8px 0;';
+        const delBtn = document.createElement('button');
+        delBtn.className = 'btn-sm btn-danger';
+        delBtn.textContent = 'Deprovision';
+        const delStatus = document.createElement('span');
+        delStatus.style.cssText = 'margin-left:8px;font-size:12px;';
+        delBtn.addEventListener('click', function() {
+          const nm = (status && status.instanceName) || OPTIONAL_KEY;
+          if (!confirm('Deprovision the auto-subtitles instance "' + nm + '"? This destroys the OSC instance.')) return;
+          delBtn.disabled = true;
+          delStatus.textContent = 'removing…';
+          apiFetch('/optional-services/' + OPTIONAL_KEY, { method: 'DELETE' }).then(function(res) {
+            const opId = res && res.operationId;
+            if (opId) {
+              delStatus.textContent = 'pending…';
+              // Mirror into Active Operations so it survives tab switches, and use
+              // the shared deprovision poller (both poll /provision/operations/:id).
+              opsSection.style.display = '';
+              upsertOpRow({ id: opId, type: 'deprovision', name: nm, status: 'pending' });
+              pollOp({ id: opId, type: 'deprovision', name: nm, status: 'pending' });
+              pollDeprovisionOp(opId, delStatus, null);
+              // Re-read the card once the op likely settled.
+              setTimeout(renderAutoSubtitles, 4000);
+            } else {
+              delStatus.textContent = '✓ removed';
+              setTimeout(renderAutoSubtitles, 500);
+            }
+          }).catch(function(err) {
+            delStatus.textContent = '✗ ' + err.message;
+            delBtn.disabled = false;
+          });
+        });
+        delRow.appendChild(delBtn);
+        delRow.appendChild(delStatus);
+        subBody.appendChild(delRow);
+      }
+
+      // Provision form. `name` and `openaikey` are the required fields per the
+      // registry (src/services/optional-services.ts fields). AWS fields are the
+      // optional S3-upload pass-throughs — omitted here to keep the reference UI
+      // minimal; the backend accepts them via passthrough if ever added.
+      const form = document.createElement('div');
+      form.style.cssText = 'margin-top:12px;';
+      form.innerHTML = [
+        '<div class="section-title" style="font-size:13px;">Provision auto-subtitles</div>',
+        '<div class="form-row">',
+        '  <div class="form-field grow">',
+        '    <label for="asub-name">Instance name</label>',
+        '    <input type="text" id="asub-name" placeholder="autosubtitles" />',
+        '  </div>',
+        '</div>',
+        '<div class="form-row">',
+        '  <div class="form-field grow">',
+        '    <label for="asub-openaikey">OpenAI API key (required)</label>',
+        '    <input type="password" id="asub-openaikey" autocomplete="off" placeholder="sk-…" />',
+        '  </div>',
+        '  <button id="asub-provision-btn">Provision</button>',
+        '</div>',
+        '<div id="asub-msg"></div>',
+      ].join('');
+      subBody.appendChild(form);
+
+      form.querySelector('#asub-provision-btn').addEventListener('click', function() {
+        const name = form.querySelector('#asub-name').value.trim();
+        const openaikey = form.querySelector('#asub-openaikey').value;
+        const msgEl = form.querySelector('#asub-msg');
+        msgEl.innerHTML = '';
+        if (!name) { showMsg(msgEl, 'Instance name is required.', 'error'); return; }
+        if (!openaikey) { showMsg(msgEl, 'OpenAI API key is required.', 'error'); return; }
+        const btn = form.querySelector('#asub-provision-btn');
+        btn.disabled = true;
+        btn.textContent = 'Provisioning…';
+        apiFetch('/optional-services/' + OPTIONAL_KEY + '/provision', {
+          method: 'POST',
+          body: JSON.stringify({ name: name, openaikey: openaikey })
+        }).then(function(res) {
+          // Do not retain the key in the field once submitted.
+          form.querySelector('#asub-openaikey').value = '';
+          const opId = res && res.operationId;
+          if (opId) {
+            opsSection.style.display = '';
+            upsertOpRow({ id: opId, type: 'provision', name: name, status: 'pending' });
+            pollOp({ id: opId, type: 'provision', name: name, status: 'pending' });
+            showMsg(msgEl, 'Provisioning started. Once done, set AUTO_SUBTITLES_INSTANCE_NAME=' + name + ' and redeploy.', 'success');
+            setTimeout(renderAutoSubtitles, 4000);
+          } else {
+            showMsg(msgEl, 'Provisioning started for "' + name + '".', 'success');
+          }
+          btn.disabled = false;
+          btn.textContent = 'Provision';
+        }).catch(function(err) {
+          showMsg(msgEl, 'Error: ' + err.message, 'error');
+          btn.disabled = false;
+          btn.textContent = 'Provision';
+        });
+      });
+    }).catch(function(err) {
+      // Degrade gracefully: if the optional-services endpoint is unreachable
+      // (e.g. not wired in this deployment), show a neutral notice, not an error.
+      subBody.textContent = '';
+      const notice = document.createElement('p');
+      notice.className = 'text-muted';
+      notice.textContent = 'Auto-subtitles service status unavailable (' + err.message + ').';
+      subBody.appendChild(notice);
+    });
+  }
+  renderAutoSubtitles();
+
 }
 
 // Minimal CSS attribute-selector escaper for workspace IDs.
@@ -2896,6 +3453,11 @@ function cssEscape(value) {
 
 // ─── PIPELINES TAB ───────────────────────────────────────────────────────────
 
+// Single source of truth for the built-in pipeline metadata shown in the UI
+// (pipelines tab catalog bar + the execute dialog's pipeline selector). Kept in
+// sync with the backend BUILT_IN_PIPELINES / PIPELINE_DESCRIPTIONS in
+// src/pipeline/pipelines.ts. Adding a new entry here surfaces it automatically
+// in the execute dialog, so there is no separate hardcoded option list to touch.
 var PIPELINE_CATALOG = [
   {
     name: 'transcode',
@@ -2916,12 +3478,31 @@ var PIPELINE_CATALOG = [
     steps: ['extract-metadata', 'thumbnail']
   },
   {
+    name: 'subtitles',
+    label: 'Subtitles',
+    description: 'Auto-generate a subtitle track from the audio using Whisper transcription and attach it to the asset.',
+    steps: ['subtitles']
+  },
+  {
+    name: 'scene-detect',
+    label: 'Scene Detect',
+    description: 'Detect scene/shot boundaries and keyframes and attach them to the asset for clip and trim workflows.',
+    steps: ['scene-detect']
+  },
+  {
     name: 'full',
     label: 'Full',
-    description: 'Full pipeline: metadata extraction, thumbnails, transcode, and HLS/DASH packaging.',
-    steps: ['extract-metadata', 'thumbnail', 'transcode', 'package']
+    description: 'Full pipeline: metadata extraction, thumbnails, auto-subtitles, scene detection, transcode, and HLS/DASH packaging.',
+    steps: ['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']
   }
 ];
+
+// Pipelines whose steps include a transcode step, and therefore need the encode
+// profile selector. Derived from PIPELINE_CATALOG so it stays correct as new
+// pipelines are added (rather than a second hardcoded list to keep in sync).
+var ENCODE_PIPELINES = PIPELINE_CATALOG
+  .filter(function(p) { return p.steps.indexOf('transcode') !== -1; })
+  .map(function(p) { return p.name; });
 
 var STEP_ICONS = {
   'extract-metadata': '🔬',
@@ -2945,7 +3526,7 @@ var STEP_STATUS_CLASS = {
   failed: 'step-failed'
 };
 
-function renderStepChip(step) {
+function renderStepChip(step, errorLineId) {
   var icon = STEP_ICONS[step.name] || '⚙';
   var label = icon + ' ' + step.name;
   if (step.status === 'running' && step.progress != null) {
@@ -2953,7 +3534,16 @@ function renderStepChip(step) {
   }
   var cls = 'pipeline-exec-step ' + (STEP_STATUS_CLASS[step.status] || '');
   if (step.status === 'failed' && step.error) {
-    return '<span class="' + cls + '" title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
+    // Accessible failure: the chip is a focusable button that assistive tech
+    // announces via aria-label, and it toggles a visible inline error line
+    // (aria-controls) so the reason is reachable by keyboard/touch — not just
+    // the hover-only title tooltip (kept as an additional affordance).
+    return '<span class="' + cls + '"' +
+      ' role="button" tabindex="0"' +
+      ' aria-expanded="false"' +
+      (errorLineId ? ' aria-controls="' + escHtml(errorLineId) + '"' : '') +
+      ' aria-label="' + escHtml(step.name + ' step failed: ' + step.error) + '"' +
+      ' title="' + escHtml(step.error) + '">' + escHtml(label) + '</span>';
   }
   return '<span class="' + cls + '">' + escHtml(label) + '</span>';
 }
@@ -2975,10 +3565,54 @@ function renderExecutionRow(exec) {
 
   var steps = document.createElement('div');
   steps.className = 'pipeline-exec-steps';
+  // Unique-ish id prefix so aria-controls references stay unique per row.
+  var rowKey = 'pxerr-' + (exec.id || Math.random().toString(36).slice(2));
+  var errorLines = [];
   steps.innerHTML = exec.steps.map(function(s, i) {
-    return (i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '') + renderStepChip(s);
+    var arrow = i > 0 ? '<span class="pipeline-step-arrow">→</span>' : '';
+    var errId = null;
+    if (s.status === 'failed' && s.error) {
+      errId = rowKey + '-' + i;
+      errorLines.push({ id: errId, name: s.name, error: s.error });
+    }
+    return arrow + renderStepChip(s, errId);
   }).join('');
   row.appendChild(steps);
+
+  // Inline, always-rendered failure reasons under the chip row. These are
+  // visible without hover (touch-safe) and announced by screen readers via a
+  // role="alert" live region; the failed chip toggles the .is-open state.
+  if (errorLines.length > 0) {
+    var errWrap = document.createElement('div');
+    errWrap.className = 'pipeline-exec-errors';
+    errWrap.innerHTML = errorLines.map(function(e) {
+      return '<div class="pipeline-exec-error" id="' + escHtml(e.id) + '" role="alert">' +
+        '<span class="pipeline-exec-error-step">' + escHtml(e.name) + '</span>' +
+        '<span class="pipeline-exec-error-msg">' + escHtml(e.error) + '</span>' +
+        '</div>';
+    }).join('');
+    row.appendChild(errWrap);
+
+    // Wire each failed chip to expand/collapse its inline error line and to be
+    // operable by keyboard (Enter/Space) as an accessible toggle button.
+    var chips = steps.querySelectorAll('.pipeline-exec-step[aria-controls]');
+    chips.forEach(function(chip) {
+      var targetId = chip.getAttribute('aria-controls');
+      var target = targetId ? errWrap.querySelector('#' + CSS.escape(targetId)) : null;
+      var toggle = function() {
+        if (!target) return;
+        var open = target.classList.toggle('is-open');
+        chip.setAttribute('aria-expanded', open ? 'true' : 'false');
+      };
+      chip.addEventListener('click', toggle);
+      chip.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+    });
+  }
 
   // Click on asset name navigates to asset detail.
   meta.querySelector('.asset-link').addEventListener('click', function() {
@@ -3214,6 +3848,7 @@ export {
   renderAssetDetailBody,
   renderAssetFiles,
   renderJobDetailBody,
+  renderPipelineDetailBody,
   openDetailWindow,
   setActiveStack,
   setStackOverride,

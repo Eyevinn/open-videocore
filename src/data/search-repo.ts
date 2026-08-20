@@ -22,6 +22,19 @@ export interface SearchQuery {
   // key/value pair given here, its `metadata` carries that exact value
   // (strict equality on top-level keys).
   metadata?: Record<string, unknown>;
+  // TAMS address lookup (issue #168, TAMS bridge epic #116). The index projects
+  // the asset's machine-derived TAMS addressing (structural.tams, asset-
+  // document.ts) so an asset can be looked up by its TAMS address. Both are
+  // single-valued QUERY fields, matching the ADR-010 query contract:
+  //   - tamsFlowId: a SINGLE flow UUID; an asset matches when this id is a
+  //     MEMBER of its tamsFlowIds[] set (a source carries many flows, ADR-008,
+  //     but a query addresses one flow at a time — ADR-010).
+  //   - tamsTimerange: the canonical TAI timerange string, matched by EQUALITY.
+  // The match is derived purely from the asset document, so the index stays
+  // disposable/replayable: it can be rebuilt from asset state with no side
+  // channel (issue #168 acceptance criterion).
+  tamsFlowId?: string;
+  tamsTimerange?: string;
   page?: number;
   pageSize?: number;
 }
@@ -47,6 +60,14 @@ export function assetTags(asset: Asset): string[] {
 // extracted containerFormat (issue #6) so callers can filter by, e.g., "mp4".
 export function assetMimeType(asset: Asset): string | undefined {
   return asset.technicalMetadata?.containerFormat;
+}
+
+// TAMS flow ids projected onto the asset for address lookup (issue #168). Read
+// defensively — the field is optional/additive (present only on assets bridged
+// into a TAMS, epic #116) and predates by no schema bump (asset-repo.ts).
+export function assetTamsFlowIds(asset: Asset): string[] {
+  const ids = asset.tamsFlowIds;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
 }
 
 export function clampPage(page?: number): number {
@@ -92,6 +113,19 @@ export function matchesQuery(asset: Asset, query: SearchQuery): boolean {
       if (md[key] !== value) {
         return false;
       }
+    }
+  }
+  // TAMS address lookup (issue #168). A query addresses one flow by a single
+  // UUID; the asset matches when that id is a MEMBER of its projected flow set.
+  if (query.tamsFlowId) {
+    if (!assetTamsFlowIds(asset).includes(query.tamsFlowId)) {
+      return false;
+    }
+  }
+  // Canonical timerange is matched by exact equality (ADR-010).
+  if (query.tamsTimerange) {
+    if (asset.tamsTimerange !== query.tamsTimerange) {
+      return false;
     }
   }
   return true;

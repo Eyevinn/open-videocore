@@ -27,6 +27,12 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import type { PackagingService } from '../pipeline/packaging.js';
+import { outputPrefix } from '../pipeline/packaging.js';
+import {
+  parseDestination,
+  relocatePackagedOutput,
+  type RelocationClient
+} from '../pipeline/output-relocation.js';
 import type { JobRepository } from '../data/job-repo.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
@@ -106,6 +112,16 @@ type InternalRouterOptions = {
   // PipelineExecution tracking (PipelineExecution feature). When set, transcode/
   // package completion callbacks advance the matching running execution.
   pipelineRepository?: PipelineRepository;
+  // Post-package relocation (issue #208, ADR-011). Resolves the S3/MinIO client
+  // and the packaged/staging bucket for the stack so a packaging success can
+  // server-side-copy this execution's output to a per-execution
+  // `destinationBucket` override. Returns undefined when storage is not
+  // configured (no override relocation is then possible; behaviour is unchanged
+  // for executions with no override anyway). Reuses the resolver-built
+  // MinioClient (src/services/workspace-stack.ts) — no new client abstraction.
+  resolveRelocation?: () => Promise<
+    { client: RelocationClient; packagedBucket: string } | undefined
+  >;
 };
 
 // Are all steps of an execution terminal (done)? Used to close out an execution.
@@ -223,6 +239,61 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           'package'
         );
         if (execution) {
+          // Post-package relocation (issue #208, ADR-011). If this execution
+          // carries a per-execution destination override, server-side-copy the
+          // packaged output from the default staging bucket to the override
+          // destination and record the resolved location for delivery (#210).
+          // Idempotent per packagingId: the packager callback is at-least-once,
+          // so a repeat success for an already-relocated packagingId must not
+          // re-copy or double-record. packagingId === assetId in our usage
+          // (see packaging.ts:44), and assetId === request.body.jobId.
+          const packagingId = request.body.jobId;
+          const alreadyRelocated =
+            execution.relocatedPackagingIds?.includes(packagingId) ?? false;
+          let relocationPatch:
+            | Partial<
+                Pick<
+                  typeof execution,
+                  'resolvedOutputLocation' | 'relocatedPackagingIds'
+                >
+              >
+            | undefined;
+          if (
+            execution.destinationBucket &&
+            !alreadyRelocated &&
+            opts.resolveRelocation
+          ) {
+            const destination = parseDestination(execution.destinationBucket);
+            const relocation = await opts.resolveRelocation();
+            if (destination && relocation) {
+              try {
+                const result = await relocatePackagedOutput(relocation.client, {
+                  sourceBucket: relocation.packagedBucket,
+                  sourcePrefix: outputPrefix(packagingId),
+                  destination
+                });
+                relocationPatch = {
+                  resolvedOutputLocation: {
+                    bucket: result.destination.bucket,
+                    prefix: result.destination.prefix
+                  },
+                  relocatedPackagingIds: [
+                    ...(execution.relocatedPackagingIds ?? []),
+                    packagingId
+                  ]
+                };
+              } catch (err) {
+                // Leave the relocation un-recorded so the copy is retried on a
+                // subsequent (at-least-once) packager callback. The packaged
+                // output already exists at the default staging location, so the
+                // execution still advances below and downstream is not blocked.
+                fastify.log.error(
+                  { err, packagingId, executionId: execution.id },
+                  'post-package relocation to destination override failed'
+                );
+              }
+            }
+          }
           const now = new Date().toISOString();
           const steps = execution.steps.map((s) =>
             s.name === 'package' && s.status === 'running'
@@ -231,7 +302,8 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           );
           await opts.pipelineRepository.update(execution.id, {
             steps,
-            status: allStepsDone(steps) ? 'done' : 'running'
+            status: allStepsDone(steps) ? 'done' : 'running',
+            ...(relocationPatch ?? {})
           });
         }
       }
@@ -245,12 +317,21 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
     }
   );
 
-  // Packager failure callback (issue #9). No auth — see file header.
+  // Packager failure callback (issue #9, attribution hardened by #209). No auth
+  // — see file header.
   // Path: {CallbackUrl}/packagerCallback/failure
-  // CONTRACT: body: { message }  — jobId not echoed on failure path; we record
-  //   packagingError on all assets that were recently queued (best-effort).
-  //   For simplicity we respond 200 without updating an asset (the asset
-  //   remains in its current state and the error is surfaced in logs).
+  // CONTRACT: body: { message } ONLY — the packager does NOT echo the jobId on
+  //   the failure path (verified from encore-packager callbackListener.ts). So
+  //   we cannot correlate the failure by a packager-supplied id. Instead we
+  //   correlate by open-videocore-side EXECUTION STATE: any pipeline execution
+  //   currently blocked on a running `package` step is awaiting exactly this
+  //   packager callback, so we mark that step (and the execution) failed and
+  //   record the packager's human-readable message as an attributable error on
+  //   the execution record. This is what makes a destination that could not be
+  //   pre-validated (issue #209 — e.g. an external `s3://` endpoint the API
+  //   cannot probe) surface as a clear failure tied to the right execution
+  //   rather than an opaque log line.
+  //   200 — acknowledged (always; the callback is best-effort from the packager).
   app.post(
     '/packagerCallback/failure',
     {
@@ -260,8 +341,52 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       }
     },
     async (request, reply) => {
-      // The packager failure body doesn't include the jobId, so we can only log.
-      fastify.log.error({ msg: 'packager reported failure', message: request.body.message });
+      const message = request.body.message;
+      // Always log — this is the durable record when no execution matches.
+      fastify.log.error({ msg: 'packager reported failure', message });
+
+      // Correlate by execution state (NOT a packager jobId, which is absent).
+      // Every execution stalled on a running `package` step is waiting on the
+      // packager; record the failure reason on each so the error is attributable
+      // on the asset/execution record instead of only in logs.
+      if (opts.pipelineRepository) {
+        try {
+          const running = await opts.pipelineRepository.listAll({ status: 'running' });
+          const now = new Date().toISOString();
+          for (const execution of running.items) {
+            const hasRunningPackage = execution.steps.some(
+              (s) => s.name === 'package' && s.status === 'running'
+            );
+            if (!hasRunningPackage) continue;
+            const steps = execution.steps.map((s) =>
+              s.name === 'package' && s.status === 'running'
+                ? {
+                    ...s,
+                    status: 'failed' as const,
+                    error: `packager failure: ${message}`,
+                    completedAt: now
+                  }
+                : s
+            );
+            await opts.pipelineRepository.update(execution.id, {
+              steps,
+              status: 'failed'
+            });
+            if (opts.webhookDispatcher) {
+              void opts.webhookDispatcher.dispatch({
+                type: 'package.failed',
+                payload: { assetId: execution.assetId, error: message }
+              });
+            }
+          }
+        } catch (err) {
+          // Attribution is best-effort: a repo error must never turn the
+          // packager's callback into a 5xx (it would just be retried). The log
+          // line above is the fallback record.
+          fastify.log.error({ err }, 'failed to attribute packager failure to a running execution');
+        }
+      }
+
       return reply.code(200).send({ ok: true });
     }
   );
