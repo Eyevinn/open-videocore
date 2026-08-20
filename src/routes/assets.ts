@@ -63,6 +63,8 @@ import {
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import { validateProfileParams } from '../pipeline/profile-params.js';
+import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
   type GenerateSubtitlesDeps,
@@ -96,7 +98,6 @@ import {
   proxyManifestUrlsFor
 } from '../pipeline/packaging.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
-import type { ProfileRepository } from '../data/profile-repo.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -582,12 +583,16 @@ type AssetsRouterOptions = {
   // Asset comments (issue #135). Injectable for tests; defaults to an in-memory
   // repository so the comments sub-resource always works.
   commentRepository?: CommentRepository;
-  // Encore transcoding profile store (issue #84). When present, a transcode that
-  // names a stored profile is validated against it before submission: a GPU-only
-  // (NVENC/CUDA) profile that cannot run on this platform tier is rejected 422
-  // rather than submitted to an Encore instance that cannot execute it (issue
-  // #286). When absent (e.g. tests that do not exercise named profiles), the
-  // check is skipped and the profile name is forwarded as before.
+  // Operator-managed Encore transcoding profile store (issue #84). Used by POST
+  // /:id/transcode for two validations before submission:
+  //  - profileParams keys are validated against the SpEL params the chosen
+  //    profile actually declares (issue #290); and
+  //  - a GPU-only (NVENC/CUDA) profile that cannot run on this platform tier is
+  //    rejected 422 rather than submitted to an Encore instance that cannot
+  //    execute it (issue #286).
+  // When absent (e.g. deployments/tests that do not wire the profile store or do
+  // not exercise named profiles), both checks are skipped (permissive) and the
+  // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
 };
 
@@ -1980,6 +1985,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: transcodeBodySchema,
         response: {
           202: transcodeAcceptedSchema,
+          400: errorSchema,
           404: errorSchema,
           409: errorSchema,
           422: errorSchema,
@@ -2010,6 +2016,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const unrunnable = await unrunnableProfileReason(request.body.profile);
       if (unrunnable) {
         return reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+      }
+      // Validate profileParams keys against the SpEL params the chosen profile
+      // actually declares (issue #290). We resolve the profile YAML from the
+      // operator-managed profile store — the same profiles GET /api/v1/profiles
+      // serves and Encore loads — and reject keys that profile does not declare
+      // with a descriptive 400, so a mistyped SpEL param name is an actionable
+      // error rather than a silently-ignored value. Degrades gracefully: a
+      // custom profile (not in the store) or an unresolvable profile is treated
+      // permissively (validateProfileParams passes an undefined YAML through), so
+      // custom/operator profiles are never falsely rejected. An empty/absent map
+      // always passes.
+      if (request.body.profileParams && !request.body.customProfile) {
+        const profileName = request.body.profile ?? 'program';
+        const stored = opts.profileRepository
+          ? await opts.profileRepository.get(profileName)
+          : undefined;
+        const check = validateProfileParams({
+          profileName,
+          profileYaml: stored?.yaml,
+          profileParams: request.body.profileParams
+        });
+        if (!check.ok) {
+          return reply.code(400).send({
+            error: 'unknown_profile_params',
+            message: check.message
+          });
+        }
       }
       try {
         const result = await submitTranscode(
