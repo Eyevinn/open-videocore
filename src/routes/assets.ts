@@ -2928,7 +2928,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   app.delete(
     '/:id',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
         response: { 204: z.null(), 404: errorSchema, 409: errorSchema }
@@ -2946,6 +2946,45 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(204).send(null);
+    }
+  );
+
+  // Undo an archive within the retention window (issue #328, part of the purge
+  // epic #323). Lets an operator revive a soft-deleted asset BEFORE the retention
+  // sweep purges it. The repo's `restore(id)` (sibling to `remove(id)`) bypasses
+  // the state machine — `archived` is otherwise terminal (ALLOWED_TRANSITIONS.
+  // archived stays `[]`) so no ordinary PATCH can revive it — and appends an
+  // audited `archived -> <target>` statusHistory entry (ADR-005: append, never
+  // rewrite). Target status is the pre-archive status when it was `ready`,
+  // otherwise `failed` (see restoreTargetStatus).
+  //   200 — restored asset (now `ready` or `failed`)
+  //   404 — unknown id, OR not currently `archived` (nothing to restore)
+  //   410 — the asset was already purged (its document is now a tombstone)
+  app.post(
+    '/:id/restore',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetSchema, 404: errorSchema, 410: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const id = request.params.id;
+      // Tombstone semantics (issue #326): a purged archived asset's document is
+      // replaced in place by a tombstone. Restoring one must return 410 Gone (the
+      // resource existed and was intentionally purged), NOT 404. getState()
+      // surfaces that distinction for the ULID id path.
+      if (isUlid(id)) {
+        const state = await repo.getState(id);
+        if (state.kind === 'tombstone') {
+          return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
+        }
+      }
+      const restored = await repo.restore(id);
+      if (!restored) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(restored);
     }
   );
 };

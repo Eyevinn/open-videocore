@@ -94,6 +94,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   async remove(id: string): Promise<Asset | undefined> {
     return (await this.repo()).remove(id);
   }
+  async restore(id: string): Promise<Asset | undefined> {
+    return (await this.repo()).restore(id);
+  }
 }
 
 export class PerWorkspaceJobRepository implements JobRepository {
