@@ -33,6 +33,7 @@ import {
   packagerOscApiFromContext,
   teardownOnDemandPackager
 } from '../services/packager-provisioning.js';
+import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
   EXTERNAL_STORAGE_SERVICE_IDS,
   type ExternalStorageCredentials,
@@ -208,7 +209,30 @@ const storageBackendSchema = z.object({
 // Stored-config view returned by GET /:name. Mirrors StackConfig but is
 // declared as a schema for response validation.
 const storedConfigSchema = z.object({
-  status: z.enum(['provisioning', 'ready', 'failed']).optional(),
+  // Packaging-aware readiness (issue #338). This is COMPUTED at read time from
+  // the stored lifecycle status AND the actual service inventory (services[]) —
+  // it is NOT the raw stored StackConfig.status. 'ready' means the stack can
+  // complete the full ingest -> transcode -> package -> deliver flow; 'degraded'
+  // means a required capability (e.g. packaging) is missing; the lifecycle
+  // states 'provisioning'/'failed' mean the stack never finished coming up.
+  status: z.enum(['provisioning', 'ready', 'failed', 'degraded']).optional(),
+  // Machine-readable explanation, present ONLY when status !== 'ready' (issue
+  // #338). `code` is a stable enum a consumer switches on; `capability` names
+  // the specific missing capability for the *_capability_missing codes.
+  reason: z
+    .object({
+      code: z.enum([
+        'stack_provisioning',
+        'stack_provisioning_failed',
+        'core_capability_missing',
+        'packaging_capability_missing'
+      ]),
+      capability: z
+        .enum(['storage', 'database', 'queue', 'packaging'])
+        .optional(),
+      message: z.string()
+    })
+    .optional(),
   minioEndpoint: z.string(),
   couchdbUrl: z.string(),
   redisUrl: z.string(),
@@ -939,7 +963,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         autoSubtitles || sceneDetect
           ? { ...config, options: { autoSubtitles, sceneDetect } }
           : config;
-      return reply.code(200).send(withOptions);
+      // Packaging-aware readiness (issue #338). A stack that structurally cannot
+      // package (no packager in the inventory AND the on-demand packager's
+      // dependencies are not all present) must NOT report ready. The status is
+      // computed from the ACTUAL service inventory (services[]) plus the stored
+      // lifecycle status — not the static stored `status` alone. When degraded
+      // (or provisioning/failed) a machine-readable `reason` names the missing
+      // capability; a fully capable stack reports 'ready' with no reason.
+      const readiness = computeStackReadiness(config);
+      const withReadiness = {
+        ...withOptions,
+        status: readiness.status,
+        ...(readiness.reason ? { reason: readiness.reason } : {})
+      };
+      return reply.code(200).send(withReadiness);
     }
   );
 
