@@ -70,11 +70,13 @@ import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
+import { reconcileStalledPackages } from './pipeline/stalled-package-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
   packagerOscApiFromContext
 } from './services/packager-provisioning.js';
+import { PACKAGER_SERVICE_ID } from './services/stack.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,
@@ -479,6 +481,14 @@ const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || St
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
 // than left running forever. Defaults to 30 minutes.
 const encoreStallTimeoutMs = parseInt(process.env['ENCORE_STALL_TIMEOUT_MS'] || String(30 * 60 * 1000), 10);
+// Bounded timeout (issue #336) for the stalled-package reconciliation sweep: a
+// pipeline `package` step still `running` after this long — because no packager
+// instance consumed the queued job, the packager stalled, or its completion
+// callback was never delivered — is declared failed with a diagnostic message
+// rather than left running forever (observed 22 min / 7 min stuck runs). The
+// packager callback settles a healthy job long before this fires. Defaults to
+// 15 minutes; override via PACKAGE_STALL_TIMEOUT_MS.
+const packageStallTimeoutMs = parseInt(process.env['PACKAGE_STALL_TIMEOUT_MS'] || String(15 * 60 * 1000), 10);
 
 // Instance-global archive retention window in ms (issue #325, foundation for
 // #323). Read from ARCHIVE_RETENTION_MS at boot; unset/0 = never purge, which is
@@ -615,6 +625,33 @@ function activateScaler(redisUrl: string): void {
   const redis = new IORedis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
   sharedRedis = redis;
 
+  // Best-effort probe (issue #336): does a packager instance currently exist for
+  // this stack? The packager instance shares the stack name (like every
+  // STACK_SERVICES instance — see services/packager-provisioning.ts), so a
+  // getInstance(name = stackName) is the ground-truth existence check. Used ONLY
+  // to shape the stalled-package diagnostic (present=true => "no completion
+  // signal"; present=false => "no packager instance"). Any failure surfaces as a
+  // thrown probe, which the reconciler catches and renders as present=unknown —
+  // it never gates the bounded timeout.
+  const probePackagerPresent = async (): Promise<boolean> => {
+    if (!paramStore) {
+      throw new Error('parameter store unavailable; cannot resolve stack name');
+    }
+    const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+    if (names.length === 0) {
+      throw new Error('no provisioned stack; cannot resolve packager instance');
+    }
+    const stackName = names[0]!;
+    const packagerApi = packagerOscApiFromContext(oscContext);
+    const sat = await packagerApi.getServiceAccessToken(PACKAGER_SERVICE_ID);
+    const instance = await packagerApi.getInstance(
+      PACKAGER_SERVICE_ID,
+      stackName,
+      sat
+    );
+    return instance !== undefined && instance !== null;
+  };
+
   scalerRegistry = new WorkspaceEncoreScalerRegistry({
     redis,
     redisUrl,
@@ -692,6 +729,27 @@ function activateScaler(redisUrl: string): void {
         // assigned below (encore = scalerRegistry) before any tick fires.
         encore: scalerRegistry!,
         stallTimeoutMs: encoreStallTimeoutMs,
+        logger: {
+          info: (...a: unknown[]) => app.log.info(a),
+          warn: (...a: unknown[]) => app.log.warn(a)
+        }
+      });
+      // Bound the `package` pipeline step (issue #336) on the same tick: a
+      // `package` step still `running` past packageStallTimeoutMs is failed with
+      // a diagnostic distinguishing "no packager instance" from "no completion
+      // signal". The packager step is advanced ONLY by the packager completion
+      // callback, so without this bound a missing packager / lost callback /
+      // stalled packager job leaves it running forever. Best-effort: the sweep
+      // swallows per-execution errors and never throws into the tick.
+      await reconcileStalledPackages({
+        pipeline: pipelineRepository,
+        // Best-effort presence probe used ONLY to shape the diagnostic message.
+        // It resolves the stack name (the packager instance shares it) and asks
+        // OSC whether a packager instance exists. Any failure -> undefined, and
+        // the message degrades to present=unknown rather than mis-attributing a
+        // cause. Never gates the timeout.
+        packagerPresent: probePackagerPresent,
+        stallTimeoutMs: packageStallTimeoutMs,
         logger: {
           info: (...a: unknown[]) => app.log.info(a),
           warn: (...a: unknown[]) => app.log.warn(a)
