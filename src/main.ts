@@ -506,14 +506,14 @@ const encoreProfilesUrl =
 // hand to each Encore instance the scaler spawns so Encore fetches profiles
 // from our own GET /api/v1/profiles/index.yml. Resolved via the single
 // resolvePublicBaseUrl() seam (issue #219): explicit PUBLIC_BASE_URL override →
-// OSC-derived app URL (none available today) → unset. When unset the scaler
-// falls back to the remote default index (previous behaviour), so Encore still
+// OSC-derived app URL (from the platform-injected OSC_HOSTNAME, issue #283) →
+// unset. When unset (e.g. local dev with no OSC_HOSTNAME) the scaler falls
+// back to the remote default index (previous behaviour), so Encore still
 // works.
 // Precedence (see resolveEncoreProfilesUrl): explicit ENCORE_PROFILES_URL_OVERRIDE
-// direct override → derived ${PUBLIC_BASE_URL}/api/v1/profiles/index.yml → remote
-// default (encoreProfilesUrl). Either operator-set env var lets an operator point
-// Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
-// so an explicit value is the only lever.
+// direct override → derived ${base}/api/v1/profiles/index.yml (base from
+// PUBLIC_BASE_URL or OSC_HOSTNAME) → parameter-store value (issue #315) → remote
+// default (encoreProfilesUrl).
 const publicBaseUrl = resolvePublicBaseUrl();
 // Tier 3 (issue #315): resolve an operator-supplied full profiles-index URL from
 // the provisioned stack record at boot, where the parameter store is already
@@ -541,7 +541,7 @@ if (
   !process.env['ENCORE_PROFILES_URL_OVERRIDE'] &&
   !paramStoreProfilesUrl
 ) {
-  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set, no parameter-store value / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+  app.log.warn('profiles URL unresolved to local store (no PUBLIC_BASE_URL, OSC_HOSTNAME, or ENCORE_PROFILES_URL_OVERRIDE set, and no parameter-store value) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time

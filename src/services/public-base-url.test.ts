@@ -14,12 +14,14 @@ const DEFAULT_INDEX =
 // Save/restore the env vars this resolver reads so tests never leak state.
 const SAVED = {
   override: process.env['ENCORE_PROFILES_URL_OVERRIDE'],
-  base: process.env['PUBLIC_BASE_URL']
+  base: process.env['PUBLIC_BASE_URL'],
+  oscHostname: process.env['OSC_HOSTNAME']
 };
 
 beforeEach(() => {
   delete process.env['ENCORE_PROFILES_URL_OVERRIDE'];
   delete process.env['PUBLIC_BASE_URL'];
+  delete process.env['OSC_HOSTNAME'];
 });
 
 afterEach(() => {
@@ -27,6 +29,8 @@ afterEach(() => {
   else process.env['ENCORE_PROFILES_URL_OVERRIDE'] = SAVED.override;
   if (SAVED.base === undefined) delete process.env['PUBLIC_BASE_URL'];
   else process.env['PUBLIC_BASE_URL'] = SAVED.base;
+  if (SAVED.oscHostname === undefined) delete process.env['OSC_HOSTNAME'];
+  else process.env['OSC_HOSTNAME'] = SAVED.oscHostname;
 });
 
 describe('resolveEncoreProfilesUrl precedence (issue #315)', () => {
@@ -81,8 +85,33 @@ describe('resolveEncoreProfilesUrl precedence (issue #315)', () => {
     expect(resolveEncoreProfilesUrl(DEFAULT_INDEX, '')).toBe(DEFAULT_INDEX);
   });
 
-  it('resolvePublicBaseUrl returns undefined when PUBLIC_BASE_URL is unset', () => {
+  it('resolvePublicBaseUrl returns undefined when neither PUBLIC_BASE_URL nor OSC_HOSTNAME is set', () => {
     expect(resolvePublicBaseUrl()).toBeUndefined();
+  });
+
+  it('resolvePublicBaseUrl derives from OSC_HOSTNAME when PUBLIC_BASE_URL is unset (issue #283)', () => {
+    process.env['OSC_HOSTNAME'] = 'my-app.osaas.io';
+    expect(resolvePublicBaseUrl()).toBe('https://my-app.osaas.io');
+  });
+
+  it('resolvePublicBaseUrl: explicit PUBLIC_BASE_URL wins over OSC_HOSTNAME', () => {
+    process.env['PUBLIC_BASE_URL'] = 'https://app.example';
+    process.env['OSC_HOSTNAME'] = 'my-app.osaas.io';
+    expect(resolvePublicBaseUrl()).toBe('https://app.example');
+  });
+
+  it('resolvePublicBaseUrl normalises OSC_HOSTNAME (trailing slashes stripped)', () => {
+    process.env['OSC_HOSTNAME'] = 'my-app.osaas.io//';
+    expect(resolvePublicBaseUrl()).toBe('https://my-app.osaas.io');
+  });
+
+  it('tier 2: OSC_HOSTNAME-derived base flows through resolveEncoreProfilesUrl', () => {
+    process.env['OSC_HOSTNAME'] = 'my-app.osaas.io';
+    const result = resolveEncoreProfilesUrl(
+      DEFAULT_INDEX,
+      'https://paramstore.example/index.yml'
+    );
+    expect(result).toBe(`https://my-app.osaas.io${LOCAL_PROFILES_INDEX_PATH}`);
   });
 });
 
