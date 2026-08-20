@@ -76,7 +76,6 @@ import {
   PackagerEnsureSingleFlight,
   packagerOscApiFromContext
 } from './services/packager-provisioning.js';
-import { PACKAGER_SERVICE_ID } from './services/stack.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,

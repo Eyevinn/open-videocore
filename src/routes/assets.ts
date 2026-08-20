@@ -672,21 +672,25 @@ const commentSchema = z.object({
   createdAt: z.string()
 });
 
-const ingestUrlSchema = z.object({
-  sourceUrl: z.string().min(1).max(4096),
-  name: z.string().min(1).max(256).optional(),
-  // Editorial title supplied at ingest time (issue #343). Persisted to the
-  // user-writable `descriptive` namespace via the repository's `name` input
-  // (asset-document.ts maps `asset.name` -> `descriptive.title`), so it lands
-  // in the exact same place a later PUT /:id/metadata would set it. `name` is
-  // kept as an alias for backward compatibility; `title` wins when both appear.
-  title: z.string().min(1).max(256).optional(),
-  description: z.string().max(2048).optional(),
-  // First-class editorial tags supplied at ingest time (issue #343). Passed to
-  // the repository's `tags` input, which normalizes (dedupe, first-seen order)
-  // exactly like POST /:id/tags and stores them under `descriptive.tags`.
-  tags: tagsSchema.optional()
-});
+// URL-pull ingest request body (issue #5). `.strict()` (issue #344): unknown /
+// non-actionable properties are REJECTED with a 400 rather than silently
+// accepted and discarded — a silently-dropped field previously made a
+// dropped-metadata bug expensive to discover. The accepted set is exactly the
+// fields the handler acts on: `sourceUrl`, `name`, `description`, plus `title`
+// and `tags`. `title`/`tags` are persisted to the user-writable `descriptive`
+// namespace (issue #343): the repository maps `name`/`title` -> descriptive.title
+// (asset-document.ts) and `tags` -> descriptive.tags, landing in the same place a
+// later PUT /:id/metadata or POST /:id/tags would set them. `title` wins over
+// `name` when both appear.
+const ingestUrlSchema = z
+  .object({
+    sourceUrl: z.string().min(1).max(4096),
+    name: z.string().min(1).max(256).optional(),
+    description: z.string().max(2048).optional(),
+    title: z.string().min(1).max(256).optional(),
+    tags: tagsSchema.optional()
+  })
+  .strict();
 
 const ingestAcceptedSchema = z.object({
   assetId: z.string(),
