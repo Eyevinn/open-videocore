@@ -6,6 +6,10 @@ on:
     paths-ignore:
       - openapi.json
 
+concurrency:
+  group: update-openapi-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   update-openapi:
     name: Regenerate openapi.json
@@ -41,5 +45,12 @@ jobs:
             echo "openapi.json unchanged — nothing to commit"
           else
             git commit -m "chore(openapi): regenerate openapi.json [skip ci]"
-            git push
+            for attempt in 1 2 3; do
+              if git push; then
+                break
+              fi
+              echo "push rejected (attempt $attempt/3) — rebasing onto latest main and retrying"
+              git fetch origin main
+              git rebase origin/main
+            done
           fi
