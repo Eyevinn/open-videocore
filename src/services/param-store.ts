@@ -70,6 +70,16 @@ export type StackConfig = {
   // fields existed have no value here and MUST still load without error.
   autoSubtitlesInstanceName?: string;
   sceneDetectInstanceName?: string;
+  // Operator-supplied FULL Encore profiles-index URL (issue #315). When set,
+  // scaler-spawned Encore instances fetch their transcode profiles from this
+  // exact URL (used DIRECTLY, never re-derived), resolved at boot via
+  // resolveEncoreProfilesUrlFromParamStore (services/public-base-url.ts). This
+  // lets custom profiles work WITHOUT adding a new OSC manifest env-var key.
+  // NON-SECRET: a plain index URL, never carries credentials. Optional for
+  // back-compat, mirroring the fields above: configs written before this field
+  // existed have no value here and MUST still load without error, and an unset
+  // value falls through to the remote default index (byte-identical to today).
+  encoreProfilesUrl?: string;
   // Per-role storage backend metadata (issue #211). Optional for back-compat:
   // configs written before this field existed have no `storage`, in which case
   // both roles are the default per-stack MinIO backend (sourceBucket /

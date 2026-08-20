@@ -168,20 +168,22 @@ export class CouchAssetRepository implements AssetRepository {
     if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
       return undefined;
     }
-    // Concurrent-write safety (issues #278/#279/#281): route the
-    // read-modify-write through the shared conflict-retry wrapper
-    // (updateWithRetry, src/data/couchdb.ts). A `Document update conflict.`
-    // (HTTP 409) from a concurrent writer racing on the same _rev — e.g. a
-    // thumbnail write, or the re-drive path of issue #281 racing an in-flight
-    // extraction, landing between this method's read and put — is refetched and
-    // re-applied rather than surfacing as a terminal failure. applyPatch() is
-    // pure (no writes) so it is safe to re-run per attempt, exactly as
-    // updateWithRetry requires. updateWithRetry carries `_rev` forward, so the
-    // callback returns the bare toDoc(next) wrapper.
+    // Concurrent-write safety (issues #278/#279/#281): route the read-modify-write
+    // through the shared conflict-retry wrapper (updateWithRetry, src/data/couchdb.ts).
+    // A `Document update conflict.` (HTTP 409) from a concurrent writer racing on
+    // the same _rev — e.g. a thumbnail write landing between this method's read
+    // and put, or the re-drive path of issue #281 racing an in-flight
+    // extraction — is refetched and re-applied rather than surfacing as a
+    // terminal failure. Patch application is extracted into `applyPatch` (issue
+    // #278), which is pure (no writes) so it is safe to re-run per attempt,
+    // exactly as updateWithRetry requires.
     let updated: Asset | undefined;
     const written = await updateWithRetry(couch, id, (current) => {
-      updated = this.applyPatch(fromDoc(current), patch);
-      return toDoc(updated);
+      const next = this.applyPatch(fromDoc(current), patch);
+      // Capture the in-memory result to return; updateWithRetry carries _rev and
+      // performs the put (put() forces the partition).
+      updated = next;
+      return toDoc(next);
     });
     // updateWithRetry returns undefined only when the document vanished between
     // the preflight read and the loop (a concurrent delete); patchFn never ran,

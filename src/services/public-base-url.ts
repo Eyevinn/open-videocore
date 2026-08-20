@@ -60,7 +60,7 @@ export const LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml';
  *
  * As of #283 OSC exposes no runtime self-URL, so an operator's ONLY lever for
  * pointing Encore at this deployment's local profile index is an explicit
- * env-var. This resolver gives operators two seams, in strict precedence:
+ * env-var. This resolver gives operators these seams, in strict precedence:
  *
  *   1. `ENCORE_PROFILES_URL_OVERRIDE` (if set) — a DIRECT profiles-URL override.
  *      Always wins. Use this to point Encore at an exact index URL (e.g. this
@@ -70,18 +70,88 @@ export const LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml';
  *   2. Derived local index — when `PUBLIC_BASE_URL` is set (via
  *      {@link resolvePublicBaseUrl}), returns `${base}${LOCAL_PROFILES_INDEX_PATH}`
  *      so Encore loads the operator-managed profiles served by this API.
- *   3. `defaultProfilesUrl` — the caller-supplied remote default (bootstrap seed
- *      index) used when neither override above is set.
+ *   3. Parameter-store value (issue #315) — a FULL profiles-index URL persisted
+ *      in the provisioned stack record and resolved at boot (see
+ *      {@link resolveEncoreProfilesUrlFromParamStore}). Used DIRECTLY. Lets an
+ *      operator point custom profiles at any index WITHOUT a new OSC manifest
+ *      key. Only consulted when neither env-var seam above is set.
+ *   4. `defaultProfilesUrl` — the caller-supplied remote default (bootstrap seed
+ *      index) used when none of the seams above is set. When the parameter-store
+ *      value is absent this is byte-identical to the pre-#315 behaviour.
  *
  * @param defaultProfilesUrl the remote default index URL (from `ENCORE_PROFILES_URL`).
+ * @param paramStoreProfilesUrl optional FULL profiles-index URL resolved at boot
+ *   from the parameter store (issue #315); undefined/empty when unset.
  * @returns the resolved profiles-index URL Encore instances should fetch.
  */
-export function resolveEncoreProfilesUrl(defaultProfilesUrl: string): string {
+export function resolveEncoreProfilesUrl(
+  defaultProfilesUrl: string,
+  paramStoreProfilesUrl?: string
+): string {
   const directOverride = process.env['ENCORE_PROFILES_URL_OVERRIDE']?.replace(/\/+$/, '');
   if (directOverride) return directOverride;
 
   const base = resolvePublicBaseUrl();
   if (base) return `${base}${LOCAL_PROFILES_INDEX_PATH}`;
 
+  // Tier 3 (issue #315): a full profiles-index URL persisted in the parameter
+  // store and resolved at boot. Used directly; normalised for trailing slashes.
+  // An empty/undefined value is treated as unset so the fall-through below is
+  // byte-identical to the pre-#315 behaviour (critical for catalog deploys).
+  const fromParamStore = paramStoreProfilesUrl?.replace(/\/+$/, '');
+  if (fromParamStore) return fromParamStore;
+
   return defaultProfilesUrl;
+}
+
+// StackConfig field name under which an operator-supplied full Encore
+// profiles-index URL is persisted in the parameter store (issue #315). Kept as
+// a shared constant so the resolver and any writer cannot drift.
+export const STACK_ENCORE_PROFILES_URL_FIELD = 'encoreProfilesUrl' as const;
+
+/**
+ * Read the parameter-store-supplied Encore profiles-index URL at boot, for use
+ * as tier 3 of {@link resolveEncoreProfilesUrl} (issue #315).
+ *
+ * The parameter store persists per-stack {@link StackConfig} blobs (there is no
+ * free-standing key/value read on the {@link ParamStore} interface — reads go
+ * through `loadStackConfig`). We therefore read the OPTIONAL
+ * `encoreProfilesUrl` field off the first provisioned stack for the namespace,
+ * mirroring how `resolveStackRedisUrl` (main.ts) discovers the stack's Valkey
+ * URL. The stored value is a FULL profiles-index URL, returned as-is (the
+ * resolver normalises it).
+ *
+ * Contracts verified (issue #315):
+ *   - `ParamStore.listStackNames` / `ParamStore.loadStackConfig`
+ *     (src/services/param-store.ts) — the read API.
+ *   - `StackConfig.encoreProfilesUrl?` (src/services/param-store.ts) — the
+ *     optional coordinate; absent in pre-#315 configs so back-compat holds.
+ *
+ * @returns the stored full profiles-index URL, or `undefined` when there is no
+ *   parameter store, no provisioned stack, or the field is unset. Any read
+ *   error resolves to `undefined` so boot never fails on this optional lookup.
+ */
+export async function resolveEncoreProfilesUrlFromParamStore(deps: {
+  paramStore?: {
+    listStackNames(workspaceId: string): Promise<string[]>;
+    loadStackConfig(
+      workspaceId: string,
+      name: string
+    ): Promise<{ encoreProfilesUrl?: string } | undefined>;
+  };
+  namespace: string;
+  onError?: (err: unknown) => void;
+}): Promise<string | undefined> {
+  const { paramStore, namespace } = deps;
+  if (!paramStore) return undefined;
+  try {
+    const names = await paramStore.listStackNames(namespace);
+    if (names.length === 0) return undefined;
+    const cfg = await paramStore.loadStackConfig(namespace, names[0]!);
+    const url = cfg?.encoreProfilesUrl;
+    return typeof url === 'string' && url.length > 0 ? url : undefined;
+  } catch (err) {
+    deps.onError?.(err);
+    return undefined;
+  }
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-import { makeHttpEncoreClient } from './encore-client.js';
+import { makeHttpEncoreClient, toEncorePayload } from './encore-client.js';
 
 // Minimal Response builder for the injected fetch fake.
 function makeRes(status: number, body = ''): Response {
@@ -19,6 +19,54 @@ function makeRes(status: number, body = ''): Response {
 const BASE = 'https://encore.example.io/';
 const TOKEN = 'test-sat';
 const JOB_ID = 'job-uuid-123';
+
+describe('toEncorePayload profileParams (issue #287)', () => {
+  const base = {
+    externalId: 'workspace-a__job-1',
+    inputUri: 's3://src/in.mp4',
+    outputUri: 's3://out/transcode/a/j',
+    profile: 'x264-crf-parametrized'
+  };
+
+  it('populates the Encore job document profileParams object when supplied', () => {
+    const params = { crf: '18', preset: 'slow', height: '720', keyframes: '48' };
+    const payload = toEncorePayload({ ...base, profileParams: params });
+    // Threaded verbatim into the verified `profileParams` field (SVT Encore
+    // EncoreJob.profileParams: Map<String, Any?>), flat string map, no coercion.
+    expect(payload.profileParams).toEqual(params);
+    // Existing contract fields unaffected.
+    expect(payload.profile).toBe('x264-crf-parametrized');
+    expect(payload.outputFolder).toBe('s3://out/transcode/a/j');
+    expect(payload.inputs).toEqual([{ uri: 's3://src/in.mp4', type: 'AudioVideo' }]);
+  });
+
+  it('omits profileParams entirely when not supplied (backward compatible default)', () => {
+    const payload = toEncorePayload(base);
+    // Absent key -> Encore uses its `{}` default; output unchanged.
+    expect('profileParams' in payload).toBe(false);
+  });
+});
+
+describe('makeHttpEncoreClient.submit forwards profileParams (issue #287)', () => {
+  it('serializes profileParams into the POST /encoreJobs body', async () => {
+    const doFetch = vi.fn().mockResolvedValue(makeRes(200, JSON.stringify({ id: 'enc-1' })));
+    const client = makeHttpEncoreClient({
+      baseUrl: 'https://encore.example.io/',
+      getToken: async () => 'sat',
+      fetch: doFetch as unknown as typeof globalThis.fetch
+    });
+    await client.submit({
+      externalId: 'workspace-a__job-1',
+      inputUri: 's3://src/in.mp4',
+      outputUri: 's3://out/j',
+      profile: 'x264-crf-parametrized',
+      profileParams: { crf: '18', preset: 'slow', height: '720', keyframes: '48' }
+    });
+    const [, init] = doFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body.profileParams).toEqual({ crf: '18', preset: 'slow', height: '720', keyframes: '48' });
+  });
+});
 
 describe('makeHttpEncoreClient.cancel', () => {
   let doFetch: ReturnType<typeof vi.fn>;
