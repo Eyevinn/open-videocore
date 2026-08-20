@@ -173,6 +173,16 @@ export type PackagerSecrets = {
   oscPersonalAccessToken: string;
 };
 
+// Narrow structured logger the ensure step emits per-phase observability onto
+// (issue #335): attempt, ready, failure. Optional so unit tests and callers
+// without a logger keep working; when absent the phases still execute, they are
+// just not logged. Mirrors the { obj }, msg shape of the app (pino) logger used
+// throughout main.ts (e.g. app.log.info({ stackName }, '…')).
+export interface PackagerProvisionLogger {
+  info(obj: Record<string, unknown>, msg: string): void;
+  error(obj: Record<string, unknown>, msg: string): void;
+}
+
 export type EnsurePackagerDeps = {
   osc: PackagerOscApi;
   coords: PackagerStackCoordinates;
@@ -183,6 +193,19 @@ export type EnsurePackagerDeps = {
   // container health check. Callers that must enqueue only after readiness keep
   // this true. (Issue #244 acceptance: wait for readiness THEN enqueue.)
   waitForReady?: boolean;
+  // Optional per-phase logger (issue #335). When provided, ensurePackagerProvisioned
+  // logs an attempt line before createInstance, a ready line after readiness, and
+  // an error line (before rethrowing) on any createInstance/readiness failure —
+  // each tagged with the stack name so a silent no-provision can no longer hide.
+  log?: PackagerProvisionLogger;
+  // Optional inventory-recording hook (issue #335). Invoked exactly once, AFTER a
+  // fresh packager instance is created and (if waitForReady) reported ready, so
+  // the stack's service inventory reflects reality (acceptance: "the packager
+  // appears in the stack's service inventory"). NOT invoked on the 'exists' path
+  // (the instance was recorded by whoever created it) so a reused instance does
+  // not re-write the inventory. A failure to record is logged and rethrown so the
+  // package step fails loudly rather than leaving an unrecorded packager.
+  recordInInventory?: (instanceName: string) => Promise<void>;
 };
 
 // Ensure the packager instance for this stack exists, reconciling against OSC
@@ -201,7 +224,11 @@ export async function ensurePackagerProvisioned(
 ): Promise<EnsurePackagerResult> {
   const { osc, coords, secrets } = deps;
   const waitForReady = deps.waitForReady ?? true;
+  const log = deps.log;
   const name = coords.stackName;
+  // Common structured context for every log line: the tenant/stack name and the
+  // packager serviceId, so a provisioning failure is attributable (issue #335).
+  const logCtx = { stackName: name, serviceId: PACKAGER_SERVICE_ID };
 
   const sat = await osc.getServiceAccessToken(PACKAGER_SERVICE_ID);
 
@@ -231,6 +258,10 @@ export async function ensurePackagerProvisioned(
     s3SecretRef: `{{secrets.${s3SecretName}}}`
   });
 
+  // Phase: attempt. Logged BEFORE createInstance so an OSC create that hangs or
+  // throws leaves a trail identifying the tenant + stack (issue #335).
+  log?.info(logCtx, 'on-demand packager: creating instance');
+
   try {
     await osc.createInstance(PACKAGER_SERVICE_ID, sat, body);
   } catch (err) {
@@ -240,14 +271,53 @@ export async function ensurePackagerProvisioned(
     // this is the ground-truth safety net beneath the #245 single-flight lock.
     const msg = err instanceof Error ? err.message : String(err);
     if (!msg.includes('already taken') && !msg.includes('already exists')) {
+      // Phase: failure. Log with tenant + stack, then rethrow so the caller's
+      // package step transitions to `failed` instead of swallowing this and
+      // leaving no packager and no error (the issue #335 root symptom).
+      log?.error(
+        { ...logCtx, phase: 'create', error: msg },
+        'on-demand packager: createInstance failed'
+      );
       throw err;
     }
     return { status: 'exists', instanceName: name };
   }
 
   if (waitForReady) {
-    await osc.waitForInstanceReady(PACKAGER_SERVICE_ID, name);
+    try {
+      await osc.waitForInstanceReady(PACKAGER_SERVICE_ID, name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Phase: failure (readiness timeout / error). Same surface-and-fail-loud
+      // contract as a create failure.
+      log?.error(
+        { ...logCtx, phase: 'ready', error: msg },
+        'on-demand packager: readiness wait failed'
+      );
+      throw err;
+    }
   }
+
+  // Phase: ready. The packager is created and (if awaited) live.
+  log?.info(logCtx, 'on-demand packager: ready');
+
+  // Record the freshly created packager in the stack's service inventory so the
+  // inventory reflects reality (issue #335 acceptance). A recording failure is
+  // logged and rethrown so we never report success while leaving the packager
+  // absent from the inventory — the exact invisibility this fix removes.
+  if (deps.recordInInventory) {
+    try {
+      await deps.recordInInventory(name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log?.error(
+        { ...logCtx, phase: 'record-inventory', error: msg },
+        'on-demand packager: failed to record instance in stack inventory'
+      );
+      throw err;
+    }
+  }
+
   return { status: 'created', instanceName: name };
 }
 
