@@ -4887,7 +4887,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Re-drive completed synchronously; body reports the resolved lifecycle status. A wedged asset (processing with a technicalMetadataError) that extracts successfully returns status \"ready\".",
+            "description": "Default Response",
             "content": {
               "application/json": {
                 "schema": {
