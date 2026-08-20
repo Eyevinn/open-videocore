@@ -60,6 +60,7 @@ import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
+import { retentionRouter, archiveRetentionMsFromEnv } from './routes/retention.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
@@ -472,6 +473,13 @@ const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || St
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
 // than left running forever. Defaults to 30 minutes.
 const encoreStallTimeoutMs = parseInt(process.env['ENCORE_STALL_TIMEOUT_MS'] || String(30 * 60 * 1000), 10);
+
+// Instance-global archive retention window in ms (issue #325, foundation for
+// #323). Read from ARCHIVE_RETENTION_MS at boot; unset/0 = never purge, which is
+// behaviourally identical to today's every-deployment default. Held as a live
+// mutable var so PATCH /api/v1/retention/config hot-swaps it with no restart,
+// mirroring how the scaler config PATCH mutates its live vars.
+let archiveRetentionMs = archiveRetentionMsFromEnv();
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -1082,6 +1090,20 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   }
 };
 await app.register(scalerRouter, scalerRouterOptions);
+
+// Archive retention config (issue #325, foundation for #323). Instance-global,
+// hot-reloadable retention window read from ARCHIVE_RETENTION_MS at boot (unset/0
+// = never purge, identical to today). Registered by reference and mirrors the
+// scaler config mechanism: PATCH /api/v1/retention/config hot-swaps the window
+// via a live mutable var + onConfigChange, no restart required.
+const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: string } = {
+  prefix: '/api/v1/retention',
+  retentionMs: archiveRetentionMsFromEnv(),
+  onConfigChange: (cfg) => {
+    archiveRetentionMs = cfg.retentionMs;
+  }
+};
+await app.register(retentionRouter, retentionRouterOptions);
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
 
