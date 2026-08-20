@@ -5474,6 +5474,12 @@
                     ],
                     "additionalProperties": false
                   },
+                  "profileParams": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
                   "destinationBucket": {
                     "type": "string",
                     "minLength": 1,
