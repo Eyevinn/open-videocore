@@ -69,7 +69,11 @@ import {
   packagerOscApiFromContext
 } from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
-import { resolvePublicBaseUrl, resolveEncoreProfilesUrl } from './services/public-base-url.js';
+import {
+  resolvePublicBaseUrl,
+  resolveEncoreProfilesUrl,
+  resolveEncoreProfilesUrlFromParamStore
+} from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
@@ -488,9 +492,33 @@ const encoreProfilesUrl =
 // Encore at the local profile store; #283 confirmed OSC exposes no runtime self-URL,
 // so an explicit value is the only lever.
 const publicBaseUrl = resolvePublicBaseUrl();
-const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(encoreProfilesUrl);
-if (!publicBaseUrl && !process.env['ENCORE_PROFILES_URL_OVERRIDE']) {
-  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
+// Tier 3 (issue #315): resolve an operator-supplied full profiles-index URL from
+// the provisioned stack record at boot, where the parameter store is already
+// awaited (see paramStore above). Undefined when there is no store, no stack, or
+// the field is unset — in which case resolveEncoreProfilesUrl falls through to
+// the remote default, byte-identical to pre-#315 behaviour.
+const paramStoreProfilesUrl =
+  publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
+    ? undefined // env-var seams (tier 1/2) win; skip the param-store read entirely
+    : await resolveEncoreProfilesUrlFromParamStore({
+        paramStore,
+        namespace: STACK_CONFIG_NAMESPACE,
+        onError: (err) =>
+          app.log.warn(
+            { err },
+            'profiles URL: failed to resolve from parameter store; falling back to remote default index'
+          )
+      });
+const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(
+  encoreProfilesUrl,
+  paramStoreProfilesUrl
+);
+if (
+  !publicBaseUrl &&
+  !process.env['ENCORE_PROFILES_URL_OVERRIDE'] &&
+  !paramStoreProfilesUrl
+) {
+  app.log.warn('profiles URL unresolved to local store (neither PUBLIC_BASE_URL nor ENCORE_PROFILES_URL_OVERRIDE set, no parameter-store value / no OSC-derived app URL) — Encore instances will fetch profiles from the remote default index instead of the local profile store');
 }
 
 // Live scaler/queue wiring. These are mutable holders, not startup-time
