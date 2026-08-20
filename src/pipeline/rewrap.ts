@@ -3,16 +3,17 @@
 // Given a stored video object, re-wrap (remux) it into a DIFFERENT container
 // format WITHOUT re-encoding the elementary streams. ffmpeg's `-c copy` copies
 // every stream verbatim; only the container changes. The output becomes a NEW
-// child asset whose objectKey is `<workspaceId>/exports/<newAssetId>.<format>`.
+// child asset whose objectKey is `exports/<newAssetId>.<format>`.
 // The output container is chosen purely by the destination key's file
 // extension — ffmpeg infers the muxer from it.
 //
 // OSC wiring (mirrors issue #6 ffprobe / issue #7 thumbnails): a single
 // ephemeral eyevinn-ffmpeg-s3 job downloads the presigned source GET URL, runs
-// ffmpeg `-i <src> -c copy <dst>`, and uploads the output to the presigned PUT
-// URL. The actual OSC job dispatch is injected as a `RewrapRunner` so the
-// orchestration/storage logic here stays testable and OSC specifics live in
-// osc-rewrap.ts.
+// ffmpeg `-i <src> -c copy s3://bucket/<outputKey>`, writing the output back to
+// MinIO natively (NOT a presigned PUT URL, which ffmpeg's output muxer cannot
+// write to — issue #316). The actual OSC job dispatch is injected as a
+// `RewrapRunner` so the orchestration/storage logic here stays testable and OSC
+// specifics live in osc-rewrap.ts.
 //
 // Like thumbnails (and unlike fire-and-forget metadata extraction) this is
 // AWAITED by the route: the caller gets back the new child asset (or an error)
@@ -43,9 +44,10 @@ export class UnsupportedFormatError extends Error {
   }
 }
 
-// TTL for the presigned source GET + output PUT URLs handed to the runner.
-// Short by design: the job reads the source and writes the output once,
-// immediately. Mirrors thumbnailUrlTtlSeconds (issue #7).
+// TTL for the presigned source GET URL handed to the runner. Short by design:
+// the job reads the source once, immediately. The OUTPUT is written natively to
+// `s3://bucket/key` by the runner, so no output PUT URL is minted (issue #316).
+// Mirrors thumbnailUrlTtlSeconds (issue #7).
 export const DEFAULT_REWRAP_URL_TTL_SECONDS = 30 * 60; // 30 minutes
 
 export function rewrapUrlTtlSeconds(): number {
@@ -62,10 +64,13 @@ export function rewrapObjectKey(newAssetId: string, format: RewrapFormat): strin
 }
 
 // Runs the OSC ffmpeg job: download the source GET URL, remux with `-c copy`,
-// upload the result to the destination PUT URL. Injected so tests stub it and
-// the OSC specifics stay in one place (osc-rewrap.ts). Throws on a
+// and write the result natively to `s3://bucket/<outputKey>`. The runner is
+// handed the destination OBJECT KEY (not a presigned PUT URL — ffmpeg's output
+// muxer cannot write to an HTTPS PUT endpoint, issue #316) and builds the S3 URI
+// itself from the bucket baked into it at construction. Injected so tests stub
+// it and the OSC specifics stay in one place (osc-rewrap.ts). Throws on a
 // runner/transport failure; the orchestrator surfaces that to the caller.
-export type RewrapRunner = (sourceUrl: string, putUrl: string) => Promise<void>;
+export type RewrapRunner = (sourceUrl: string, outputKey: string) => Promise<void>;
 
 export type RewrapParams = {
   sourceAssetId: string;
@@ -92,12 +97,18 @@ export type RewrapDeps = {
 // Run one export / re-wrap to completion and return the new child asset.
 //
 // Flow: create the child asset (parentId = source) -> advance to `processing`
-// -> mint presigned source GET + output PUT URLs -> dispatch the ffmpeg `-c
-// copy` job -> on success advance the child to `ready` with its objectKey set.
+// -> mint a presigned source GET URL -> dispatch the ffmpeg `-c copy` job
+// (writing natively to s3://bucket/outputKey) -> VERIFY the output object
+// actually exists in storage -> only then advance the child to `ready` with its
+// objectKey set.
 //
-// On a runner failure the child asset is marked `failed` (so the partial export
-// is observable) and the error is re-thrown for the route to map to a 502. The
-// source asset is never mutated — an export is a pure read of the source.
+// On a runner failure — OR when the runner resolves but the output object is
+// absent (issue #316: ffmpeg-s3 reports a terminal "success" status even when it
+// could not write the output, e.g. a misconfigured destination) — the child
+// asset is marked `failed` (so the broken export is observable and never exposes
+// a `/files` URL for a nonexistent object) and the error is re-thrown for the
+// route to map to a 502. The source asset is never mutated — an export is a pure
+// read of the source.
 export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<Asset> {
   const { sourceAssetId, objectKey, targetFormat, outputName, asVersion } = params;
 
@@ -141,15 +152,29 @@ export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<As
 
   try {
     const sourceUrl = await deps.storage.presignedGet(objectKey, ttl);
-    const putUrl = await deps.storage.presignedPut(outputKey, ttl);
-    await deps.runner(sourceUrl, putUrl);
+    // The runner writes the output natively to s3://bucket/outputKey; it needs
+    // the destination object key, not a presigned PUT URL (issue #316).
+    await deps.runner(sourceUrl, outputKey);
+
+    // Defense in depth (issue #316). The runner can resolve "successfully" even
+    // when ffmpeg wrote no output (ffmpeg-s3 reaches a terminal status the poller
+    // does not treat as a failure). Confirm the object actually exists before
+    // flipping the child to `ready`; otherwise we would expose a `/files` URL for
+    // an object that MinIO answers with NoSuchKey.
+    const stat = await deps.storage.statObject(outputKey);
+    if (!stat) {
+      throw new Error(
+        `rewrap output object "${outputKey}" not found in storage after the job reported success`
+      );
+    }
   } catch (err) {
-    // Surface the partial export as a failed child asset, then re-throw.
+    // Surface the broken/partial export as a failed child asset, then re-throw.
     await deps.assets.update(child.id, { status: 'failed' });
     throw err;
   }
 
-  // Output object has landed: record the key and advance to ready.
+  // Output object has landed and is verified present: record the key and advance
+  // to ready.
   await deps.assets.update(child.id, { objectKey: outputKey });
   const ready = await deps.assets.update(child.id, { status: 'ready' });
   // `update` returns the full asset; fall back to a re-read defensively.
