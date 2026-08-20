@@ -10558,6 +10558,12 @@
                     },
                     "additionalProperties": true
                   },
+                  "profileParams": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
                   "progressCallbackUri": {
                     "type": "string"
                   }
