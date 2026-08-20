@@ -98,6 +98,7 @@ import {
   proxyManifestUrlsFor
 } from '../pipeline/packaging.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
+import { isProfileRunnable } from '../services/profile-runnability.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
@@ -549,9 +550,12 @@ type AssetsRouterOptions = {
   // that still pass it continue to type-check.
   thumbnailPublicBaseUrl?: string;
   // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
-  // job (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
-  // object storage), POST /:id/export responds 501.
-  rewrapRunner?: RewrapRunner;
+  // job (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
+  // extractor it may be a factory that receives the workspace's s3Config so the
+  // OSC job can write the output directly to the right MinIO bucket via
+  // `s3://bucket/key` (a presigned PUT URL does NOT work — issue #316). When
+  // absent (or no object storage), POST /:id/export responds 501.
+  rewrapRunner?: RewrapRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner);
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
   // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
@@ -579,11 +583,16 @@ type AssetsRouterOptions = {
   // Asset comments (issue #135). Injectable for tests; defaults to an in-memory
   // repository so the comments sub-resource always works.
   commentRepository?: CommentRepository;
-  // Operator-managed Encore profile store (issue #84). Used by POST
-  // /:id/transcode to validate profileParams keys against the SpEL params the
-  // chosen profile actually declares (issue #290). When absent, profileParams
-  // key validation is skipped (permissive) so the transcode route still works
-  // in deployments/tests that do not wire the profile store.
+  // Operator-managed Encore transcoding profile store (issue #84). Used by POST
+  // /:id/transcode for two validations before submission:
+  //  - profileParams keys are validated against the SpEL params the chosen
+  //    profile actually declares (issue #290); and
+  //  - a GPU-only (NVENC/CUDA) profile that cannot run on this platform tier is
+  //    rejected 422 rather than submitted to an Encore instance that cannot
+  //    execute it (issue #286).
+  // When absent (e.g. deployments/tests that do not wire the profile store or do
+  // not exercise named profiles), both checks are skipped (permissive) and the
+  // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
 };
 
@@ -850,6 +859,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const clipRunnerOrchestrator = opts.clip ?? runClip;
   const storageFor = opts.storageFor;
 
+  // Resolve whether a named transcode profile can execute on this platform tier
+  // (issue #286). Returns a human message when the profile is a stored GPU-only
+  // (NVENC/CUDA) profile that cannot run on OSC's CPU-only Encore instances, so
+  // the caller can reject with a clear 422 instead of submitting an unrunnable
+  // job. Returns undefined (allow) when: no profile store is wired; no profile
+  // name was given (preset defaults handle it); the named profile is unknown to
+  // the store (forwarded verbatim as before — Encore resolves or rejects it); or
+  // the named profile is runnable.
+  async function unrunnableProfileReason(profileName: string | undefined): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const stored = await opts.profileRepository.get(profileName);
+    if (!stored) return undefined;
+    if (isProfileRunnable(stored.yaml)) return undefined;
+    return `profile "${profileName}" requires GPU (NVENC/CUDA) hardware encoding, which is not available on this platform — choose a CPU-encoded profile`;
+  }
+
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
@@ -1012,6 +1037,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
 
     void firstStep; // pre-flight above used firstStep; execution drives the loop
+
+    // Reject a named GPU-only (NVENC/CUDA) profile the platform cannot execute
+    // (issue #286) up front, when the pipeline includes a transcode step, so no
+    // dangling running execution is created for a job Encore cannot run.
+    if (steps.includes('transcode')) {
+      const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
+      if (unrunnable) {
+        reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+        return undefined;
+      }
+    }
 
     // Pre-flight the per-execution destination override against the configured
     // storage credentials (issue #209). A caller can supply a destination whose
@@ -1894,6 +1930,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           400: errorSchema,
           404: errorSchema,
           409: errorSchema,
+          422: errorSchema,
           501: errorSchema,
           502: errorSchema
         }
@@ -1915,6 +1952,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           error: 'not_configured',
           message: 'transcoding is not configured'
         });
+      }
+      // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
+      // platform tier (issue #286) before submitting to Encore.
+      const unrunnable = await unrunnableProfileReason(request.body.profile);
+      if (unrunnable) {
+        return reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
       }
       // Validate profileParams keys against the SpEL params the chosen profile
       // actually declares (issue #290). We resolve the profile YAML from the
@@ -2330,6 +2373,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'export / re-wrap is not configured'
         });
       }
+      // Resolve the injected runner. In production it is a factory that needs
+      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the
+      // output to `s3://bucket/key` natively (issue #316); tests inject a plain
+      // RewrapRunner and no s3Config, so fall back to using it directly. Mirrors
+      // the thumbnail extractor resolution above.
+      const s3Cfg = request.connections?.s3Config;
+      const resolvedRewrapRunner =
+        typeof opts.rewrapRunner === 'function' && s3Cfg
+          ? (opts.rewrapRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner)({
+              ...s3Cfg,
+              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
+            })
+          : (opts.rewrapRunner as RewrapRunner);
       try {
         const child = await rewrapRunner(
           {
@@ -2342,7 +2398,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             assets: repo,
             storage: storageFor(),
-            runner: opts.rewrapRunner,
+            runner: resolvedRewrapRunner,
             ...opts.rewrapDeps
           }
         );

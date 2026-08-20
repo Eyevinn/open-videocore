@@ -119,6 +119,70 @@ describe('profiles CRUD router (issue #84)', () => {
   });
 });
 
+// A minimal but representative GPU-only (NVENC/CUDA) profile YAML, matching the
+// seeded program-nvenc-h265 / nvenc-test shape (Eyevinn/encore-test-profiles):
+// every video encode uses `codec: hevc_nvenc` plus CUDA-only scale filters.
+const NVENC_YAML = [
+  'name: nvenc-test',
+  'scaling: bicubic',
+  'filterSettings:',
+  '  scaleFilter: scale_cuda',
+  'encodes:',
+  '  - type: VideoEncode',
+  '    codec: hevc_nvenc',
+  '    format: mp4',
+  '    height: 1080',
+  ''
+].join('\n');
+
+// A normal CPU (x264) profile, runnable on OSC's CPU-only Encore instances.
+const CPU_YAML = 'name: program\nencodes:\n  - type: X264Encode\n    height: 1080\n';
+
+describe('GPU-only profiles are not offered as runnable (issue #286)', () => {
+  let repo: InMemoryProfileRepository;
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    repo = new InMemoryProfileRepository();
+    app = await buildApp(repo);
+    await repo.create({ name: 'program', yaml: CPU_YAML });
+    await repo.create({ name: 'nvenc-test', yaml: NVENC_YAML });
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('excludes GPU-only profiles from the selectable picker but flags them in items', async () => {
+    const list = await app.inject({ method: 'GET', url: '/api/v1/profiles' });
+    expect(list.statusCode).toBe(200);
+    const body = list.json();
+    // The runnable selectable set offered to callers/UI excludes the GPU-only one.
+    expect(body.profiles).toEqual(['program']);
+    // But the full items list still surfaces it, explicitly flagged unrunnable.
+    const nvenc = body.items.find((p: { name: string }) => p.name === 'nvenc-test');
+    const program = body.items.find((p: { name: string }) => p.name === 'program');
+    expect(nvenc.runnable).toBe(false);
+    expect(program.runnable).toBe(true);
+  });
+
+  it('excludes GPU-only profiles from the Encore-facing index.yml', async () => {
+    const index = await app.inject({ method: 'GET', url: '/api/v1/profiles/index.yml' });
+    expect(index.statusCode).toBe(200);
+    expect(index.body).toContain('program: program/yaml');
+    expect(index.body).not.toContain('nvenc-test');
+  });
+
+  it('annotates a single profile with runnable', async () => {
+    const nvenc = await app.inject({ method: 'GET', url: '/api/v1/profiles/nvenc-test' });
+    expect(nvenc.statusCode).toBe(200);
+    expect(nvenc.json().runnable).toBe(false);
+
+    const program = await app.inject({ method: 'GET', url: '/api/v1/profiles/program' });
+    expect(program.json().runnable).toBe(true);
+  });
+});
+
 describe('profile bootstrap (issue #84)', () => {
   afterEach(() => {
     vi.restoreAllMocks();
