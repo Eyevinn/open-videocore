@@ -15,7 +15,8 @@ import {
 import { provisionRouter } from './routes/provision.js';
 import { optionalServicesRouter } from './routes/optional-services.js';
 import { OperationStore } from './services/operation-store.js';
-import { ensureParameterStore, paramStoreFromEnv } from './services/param-store.js';
+import { ensureParameterStore, paramStoreFromEnv, type StackConfig } from './services/param-store.js';
+import { PACKAGER_SERVICE_ID } from './services/stack.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
 import { jobsRouter } from './routes/jobs.js';
@@ -740,36 +741,60 @@ function activateScaler(redisUrl: string): void {
       // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
       // this activation is bound to. Mirrors resolveStackRedisUrl: the first
       // provisioned stack for the namespace is the default.
+      //
+      // Issue #335: this resolution used to swallow failures — a param-store
+      // error was warn-logged, and an unresolvable stack returned silently — so
+      // the packager was never created, no error surfaced, and packaging hung
+      // invisibly. It now FAILS LOUDLY: a param-store error and unresolvable
+      // coordinates both throw, so the package step transitions to `failed` with
+      // a message identifying the cause instead of no-op'ing.
+      if (!paramStore) {
+        throw new Error(
+          'on-demand packager: parameter store is not configured, cannot resolve stack coordinates for provisioning'
+        );
+      }
       let stackName: string | undefined;
       let minioEndpoint: string | undefined;
       let packagedBucket = outputBucket;
-      if (paramStore) {
-        try {
-          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-          if (names.length > 0) {
-            stackName = names[0];
-            const cfg = await paramStore.loadStackConfig(
-              STACK_CONFIG_NAMESPACE,
-              names[0]!
-            );
-            if (cfg?.minioEndpoint) minioEndpoint = cfg.minioEndpoint;
-            if (cfg?.packagedBucket) packagedBucket = cfg.packagedBucket;
-          }
-        } catch (err) {
-          app.log.warn({ err }, 'on-demand packager: failed to resolve stack coordinates');
+      let stackCfg: StackConfig | undefined;
+      try {
+        const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+        if (names.length > 0) {
+          stackName = names[0];
+          stackCfg = await paramStore.loadStackConfig(
+            STACK_CONFIG_NAMESPACE,
+            names[0]!
+          );
+          if (stackCfg?.minioEndpoint) minioEndpoint = stackCfg.minioEndpoint;
+          if (stackCfg?.packagedBucket) packagedBucket = stackCfg.packagedBucket;
         }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        app.log.error(
+          { err },
+          'on-demand packager: failed to resolve stack coordinates'
+        );
+        throw new Error(
+          `on-demand packager: failed to resolve stack coordinates: ${message}`
+        );
       }
       if (!stackName || !minioEndpoint) {
-        // No resolvable stack coordinates — cannot provision the packager. Do
-        // not throw: packaging enqueues onto the shared queue regardless, and a
-        // manually/previously provisioned packager may still consume it.
-        app.log.warn('on-demand packager: stack coordinates unavailable, skipping ensure');
-        return;
+        // No resolvable stack coordinates — cannot provision the packager onto a
+        // known stack. Fail loudly (issue #335) rather than silently skipping,
+        // which left packaging jobs on a queue with no consumer.
+        app.log.error(
+          { stackName },
+          'on-demand packager: stack coordinates unavailable, cannot provision'
+        );
+        throw new Error(
+          'on-demand packager: stack coordinates unavailable (no provisioned stack or missing MinIO endpoint), cannot provision packager'
+        );
       }
+      const resolvedStackName = stackName;
       const result = await packagerEnsureGuard.run({
         osc: packagerApi,
         coords: {
-          stackName,
+          stackName: resolvedStackName,
           redisUrl,
           minioEndpoint,
           packagedBucket,
@@ -778,10 +803,52 @@ function activateScaler(redisUrl: string): void {
         secrets: {
           minioRootPassword: packagerMinioPassword,
           oscPersonalAccessToken: packagerPat
+        },
+        log: app.log,
+        // Record the created packager in the stack's service inventory (issue
+        // #335 acceptance). The packager shares the stack name and is NOT part of
+        // STACK_SERVICES, so it was previously absent from services[]. We append
+        // it (idempotently) so the inventory reflects reality and deprovision can
+        // see it. Best-effort ground-truth read-modify-write against the stored
+        // config; a failure here rethrows into the ensure step (fail loud).
+        recordInInventory: async (instanceName) => {
+          const current = await paramStore.loadStackConfig(
+            STACK_CONFIG_NAMESPACE,
+            resolvedStackName
+          );
+          if (!current) {
+            app.log.warn(
+              { stackName: resolvedStackName },
+              'on-demand packager: stack config missing, cannot record packager in inventory'
+            );
+            return;
+          }
+          const already = current.services.some(
+            (s) =>
+              s.serviceId === PACKAGER_SERVICE_ID &&
+              s.instanceName === instanceName
+          );
+          if (already) return;
+          const updated: StackConfig = {
+            ...current,
+            services: [
+              ...current.services,
+              { serviceId: PACKAGER_SERVICE_ID, instanceName }
+            ]
+          };
+          await paramStore.storeStackConfig(
+            STACK_CONFIG_NAMESPACE,
+            resolvedStackName,
+            updated
+          );
+          app.log.info(
+            { stackName: resolvedStackName, serviceId: PACKAGER_SERVICE_ID },
+            'on-demand packager: recorded instance in stack inventory'
+          );
         }
       });
       if (result.status === 'created') {
-        app.log.info({ stackName }, 'on-demand packager provisioned');
+        app.log.info({ stackName: resolvedStackName }, 'on-demand packager provisioned');
       }
     };
   }
