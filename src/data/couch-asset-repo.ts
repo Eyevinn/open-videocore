@@ -172,78 +172,14 @@ export class CouchAssetRepository implements AssetRepository {
     // the shared conflict-retry wrapper (updateWithRetry, src/data/couchdb.ts).
     // A `Document update conflict.` (HTTP 409) from a concurrent writer racing on
     // the same _rev — e.g. a thumbnail write landing between this method's read
-    // and put — is refetched and re-applied rather than surfacing as a terminal
-    // failure. The applied field-merge below is pure (no writes) so it is safe to
-    // re-run per attempt, exactly as updateWithRetry requires.
+    // and put, or the re-drive path of issue #281 racing an in-flight
+    // extraction — is refetched and re-applied rather than surfacing as a
+    // terminal failure. Patch application is extracted into `applyPatch` (issue
+    // #278), which is pure (no writes) so it is safe to re-run per attempt,
+    // exactly as updateWithRetry requires.
     let updated: Asset | undefined;
     const written = await updateWithRetry(couch, id, (current) => {
-      const existing = fromDoc(current);
-      const now = new Date().toISOString();
-      const next: Asset = { ...existing, updatedAt: now };
-      if (patch.name !== undefined) next.name = patch.name;
-      if (patch.description !== undefined) next.description = patch.description;
-      if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
-      if (patch.technicalMetadata !== undefined) {
-        next.technicalMetadata = patch.technicalMetadata;
-        if (patch.technicalMetadata !== null) {
-          next.technicalMetadataError = undefined;
-        }
-      }
-      if (patch.technicalMetadataError !== undefined) {
-        next.technicalMetadataError = patch.technicalMetadataError;
-      }
-      if (patch.manifestUrls !== undefined) {
-        next.manifestUrls = patch.manifestUrls;
-        next.packagingError = undefined;
-      }
-      if (patch.packagingError !== undefined) {
-        next.packagingError = patch.packagingError;
-      }
-      if (patch.renditions !== undefined) {
-        next.renditions = patch.renditions;
-      }
-      if (patch.thumbnails !== undefined) {
-        next.thumbnails = patch.thumbnails;
-      }
-      if (patch.metadata !== undefined) {
-        next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
-      }
-      if (patch.tags !== undefined) {
-        next.tags = normalizeTags(patch.tags);
-      }
-      if (patch.audioTracks !== undefined) {
-        next.audioTracks = patch.audioTracks;
-      }
-      if (patch.subtitleTracks !== undefined) {
-        next.subtitleTracks = patch.subtitleTracks;
-      }
-      if (patch.subtitlesError !== undefined) {
-        // `null` clears the error (successful attach); a string records a failure.
-        next.subtitlesError = patch.subtitlesError ?? undefined;
-      }
-      if (patch.sceneMetadata !== undefined) {
-        next.sceneMetadata = patch.sceneMetadata;
-        // A successful detection clears any stale error.
-        if (patch.sceneMetadata !== null) {
-          next.sceneDetectionError = undefined;
-        }
-      }
-      if (patch.sceneDetectionError !== undefined) {
-        next.sceneDetectionError = patch.sceneDetectionError;
-      }
-      if (patch.versionGroupId !== undefined) {
-        next.versionGroupId = patch.versionGroupId;
-      }
-      if (patch.status !== undefined) {
-        const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
-        next.status = applied.status;
-        next.statusHistory = applied.statusHistory;
-      }
-      // Append provenance for whichever namespaces this patch touched (issue #53).
-      const entries = provenanceForPatch(patch, now);
-      if (entries.length > 0) {
-        next.provenance = [...(existing.provenance ?? []), ...entries];
-      }
+      const next = this.applyPatch(fromDoc(current), patch);
       // Capture the in-memory result to return; updateWithRetry carries _rev and
       // performs the put (put() forces the partition).
       updated = next;
@@ -253,6 +189,79 @@ export class CouchAssetRepository implements AssetRepository {
     // the preflight read and the loop (a concurrent delete); patchFn never ran,
     // so `updated` is still undefined too. Preserve the not-found contract.
     return written ? updated : undefined;
+  }
+
+  // Pure patch application (issue #278/#281): given the current asset and a
+  // patch, compute the next asset. NO writes and NO side effects, so it is safe
+  // to run more than once inside updateWithRetry's retry loop.
+  private applyPatch(existing: Asset, patch: UpdateAssetInput): Asset {
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, updatedAt: now };
+    if (patch.name !== undefined) next.name = patch.name;
+    if (patch.description !== undefined) next.description = patch.description;
+    if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    if (patch.technicalMetadata !== undefined) {
+      next.technicalMetadata = patch.technicalMetadata;
+      if (patch.technicalMetadata !== null) {
+        next.technicalMetadataError = undefined;
+      }
+    }
+    if (patch.technicalMetadataError !== undefined) {
+      next.technicalMetadataError = patch.technicalMetadataError;
+    }
+    if (patch.manifestUrls !== undefined) {
+      next.manifestUrls = patch.manifestUrls;
+      next.packagingError = undefined;
+    }
+    if (patch.packagingError !== undefined) {
+      next.packagingError = patch.packagingError;
+    }
+    if (patch.renditions !== undefined) {
+      next.renditions = patch.renditions;
+    }
+    if (patch.thumbnails !== undefined) {
+      next.thumbnails = patch.thumbnails;
+    }
+    if (patch.metadata !== undefined) {
+      next.metadata = applyMetadata(existing.metadata, patch.metadata, patch.replaceMetadata ?? false);
+    }
+    if (patch.tags !== undefined) {
+      next.tags = normalizeTags(patch.tags);
+    }
+    if (patch.audioTracks !== undefined) {
+      next.audioTracks = patch.audioTracks;
+    }
+    if (patch.subtitleTracks !== undefined) {
+      next.subtitleTracks = patch.subtitleTracks;
+    }
+    if (patch.subtitlesError !== undefined) {
+      // `null` clears the error (successful attach); a string records a failure.
+      next.subtitlesError = patch.subtitlesError ?? undefined;
+    }
+    if (patch.sceneMetadata !== undefined) {
+      next.sceneMetadata = patch.sceneMetadata;
+      // A successful detection clears any stale error.
+      if (patch.sceneMetadata !== null) {
+        next.sceneDetectionError = undefined;
+      }
+    }
+    if (patch.sceneDetectionError !== undefined) {
+      next.sceneDetectionError = patch.sceneDetectionError;
+    }
+    if (patch.versionGroupId !== undefined) {
+      next.versionGroupId = patch.versionGroupId;
+    }
+    if (patch.status !== undefined) {
+      const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
+      next.status = applied.status;
+      next.statusHistory = applied.statusHistory;
+    }
+    // Append provenance for whichever namespaces this patch touched (issue #53).
+    const entries = provenanceForPatch(patch, now);
+    if (entries.length > 0) {
+      next.provenance = [...(existing.provenance ?? []), ...entries];
+    }
+    return next;
   }
 
   async transitionReviewState(
