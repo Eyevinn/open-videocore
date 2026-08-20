@@ -41,6 +41,7 @@ import {
   type ProfileRepository
 } from '../data/profile-repo.js';
 import { bootstrapProfiles } from '../services/profile-bootstrap.js';
+import { isProfileRunnable } from '../services/profile-runnability.js';
 
 export type ProfilesRouterOptions = {
   // Profile repository (CouchDB-backed per-workspace in production).
@@ -54,13 +55,21 @@ const errorSchema = z.object({ error: z.string(), message: z.string().optional()
 const profileSchema = z.object({
   name: z.string(),
   yaml: z.string(),
+  // Whether this profile can execute on the running Encore instances on this
+  // platform tier (issue #286). False for GPU-only (NVENC/CUDA) profiles, which
+  // cannot run on OSC's CPU-only Encore instances. Callers/UI MUST NOT offer a
+  // non-runnable profile as selectable; a transcode naming one is rejected 422.
+  runnable: z.boolean(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
 
 // The list response keeps the historical `profiles: string[]` (sorted names,
-// "none" excluded) for the existing UI picker, and adds `items` with the full
-// profile objects for management views.
+// "none" excluded) for the existing UI picker — now further narrowed to the
+// RUNNABLE selectable set (GPU-only profiles removed) so callers never pick a
+// profile that cannot execute (issue #286). `items` carries the full profile
+// objects (each annotated with `runnable`) for management views, so operators
+// can still see the excluded GPU-only profiles flagged unrunnable.
 const listResponseSchema = z.object({
   profiles: z.array(z.string()),
   items: z.array(profileSchema)
@@ -99,10 +108,14 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
     '/',
     { schema: { response: { 200: listResponseSchema } } },
     async (_request, reply) => {
-      const items = await repo.list();
+      const stored = await repo.list();
+      const items = stored.map((p) => ({ ...p, runnable: isProfileRunnable(p.yaml) }));
+      // The picker only offers profiles that can actually execute on this
+      // platform: "none" excluded (historical) AND GPU-only profiles excluded
+      // (issue #286) so a caller cannot select an unrunnable profile.
       const profiles = items
+        .filter((p) => p.name !== 'none' && p.runnable)
         .map((p) => p.name)
-        .filter((name) => name !== 'none')
         .sort((a, b) => a.localeCompare(b));
       return reply.code(200).send({ profiles, items });
     }
@@ -123,7 +136,11 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
     },
     async (_request, reply) => {
       const items = await repo.list();
+      // GPU-only (NVENC/CUDA) profiles are excluded from the Encore-facing index
+      // (issue #286): the CPU-only Encore instances the scaler spawns must not
+      // load a profile they cannot execute.
       const lines = items
+        .filter((p) => isProfileRunnable(p.yaml))
         .map((p) => p.name)
         .sort((a, b) => a.localeCompare(b))
         .map((name) => `${name}: ${name}/yaml`);
@@ -175,7 +192,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
         });
       }
       const profile = await repo.create(request.body);
-      return reply.code(201).send(profile);
+      return reply.code(201).send({ ...profile, runnable: isProfileRunnable(profile.yaml) });
     }
   );
 
@@ -193,7 +210,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
       if (!profile) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(profile);
+      return reply.code(200).send({ ...profile, runnable: isProfileRunnable(profile.yaml) });
     }
   );
 
@@ -232,7 +249,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send({ ...updated, runnable: isProfileRunnable(updated.yaml) });
     }
   );
 
