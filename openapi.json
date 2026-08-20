@@ -2327,14 +2327,14 @@
                     "minLength": 1,
                     "maxLength": 256
                   },
+                  "description": {
+                    "type": "string",
+                    "maxLength": 2048
+                  },
                   "title": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256
-                  },
-                  "description": {
-                    "type": "string",
-                    "maxLength": 2048
                   },
                   "tags": {
                     "type": "array",
