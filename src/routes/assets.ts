@@ -810,19 +810,43 @@ async function latestRelocatedLocation(
   return undefined;
 }
 
+// Normalize an object-key or key-prefix so it NEVER embeds the bucket name as
+// its first path segment (issue #342). Object keys in open-videocore follow a
+// single convention: the bucket is carried SEPARATELY (as the storage binding),
+// never inside the key. Rendition `objectKey` (exposed as `s3Uri.key`) and the
+// proxy `/:id/stream/*` route (`outputPrefix(id)/...`) already obey this, but
+// packaged `objectKeyPrefix` — derived from a stored manifest URL whose path is
+// `/<packagedBucket>/packaged/<id>/index.m3u8` — historically kept the bucket as
+// its leading segment, causing off-by-one path errors when the proxy/delivery
+// handlers construct keys.
+//
+// This is also the BACK-COMPAT read shim: assets packaged before #342 persisted
+// the bucket-embedded prefix, so we strip a leading `<bucket>/` here at read time
+// (in ADDITION to normalizing new writes) so already-packaged assets keep
+// resolving. Stripping is guarded on the KNOWN packaged bucket only — an
+// unrelated leading segment that merely resembles a bucket is left untouched.
+function stripBucketPrefix(key: string, bucket: string): string {
+  const clean = key.replace(/^\/+/, '');
+  if (!bucket) return clean;
+  const prefix = `${bucket.replace(/^\/+|\/+$/g, '')}/`;
+  return clean.startsWith(prefix) ? clean.slice(prefix.length) : clean;
+}
+
 // Derive the object-key prefix backing a streaming package from its manifest
 // URL — the manifest's parent "directory" (e.g.
 // `https://minio/packaged/<id>/hls/master.m3u8` -> `packaged/<id>/hls/`). The
 // URL path is used when parseable; otherwise the raw string is treated as a
-// path. Segment objects live under this prefix.
-function objectKeyPrefixFromManifest(manifestUrl: string): string {
+// path. Segment objects live under this prefix. The bucket, if present as the
+// leading path segment, is stripped so the returned prefix follows the
+// bucket-excluded convention (issue #342); pass the effective packaged bucket.
+function objectKeyPrefixFromManifest(manifestUrl: string, bucket: string): string {
   let path = manifestUrl;
   try {
     path = new URL(manifestUrl).pathname;
   } catch {
     // Not an absolute URL; treat the value itself as a path.
   }
-  path = path.replace(/^\/+/, '');
+  path = stripBucketPrefix(path, bucket);
   const lastSlash = path.lastIndexOf('/');
   return lastSlash >= 0 ? path.slice(0, lastSlash + 1) : '';
 }
@@ -832,8 +856,12 @@ function objectKeyPrefixFromManifest(manifestUrl: string): string {
 // `packaged/<id>/index.m3u8`. Used to re-host a stored (proxied/MinIO) manifest
 // URL against an external object-store / CDN origin (issue #213) while keeping
 // the deterministic manifest name. A query string, if any, is dropped: delivery
-// URLs must never carry signed/credential query params.
-function objectKeyFromManifest(manifestUrl: string): string {
+// URLs must never carry signed/credential query params. The internal packaged
+// bucket, if present as the leading path segment, is stripped so the returned
+// key follows the bucket-excluded convention (issue #342) — the external origin
+// (`packagedBase`) already carries its own bucket, so leaving the internal
+// bucket in would double it (`<endpoint>/<extBucket>/<packagedBucket>/...`).
+function objectKeyFromManifest(manifestUrl: string, bucket: string): string {
   let path = manifestUrl;
   try {
     path = new URL(manifestUrl).pathname;
@@ -842,7 +870,7 @@ function objectKeyFromManifest(manifestUrl: string): string {
     const q = path.indexOf('?');
     if (q >= 0) path = path.slice(0, q);
   }
-  return path.replace(/^\/+/, '');
+  return stripBucketPrefix(path, bucket);
 }
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
@@ -1630,9 +1658,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // proxy/public delivery modes below, which only apply to the per-stack
         // MinIO backend that blocks external GETs.
         if (packagedBase) {
+          const rehostBucket = request.connections?.packagedBucket ?? packagedBucket();
           const rehost = (manifestUrl: string | undefined): string | undefined => {
             if (!manifestUrl) return undefined;
-            return externalObjectUrl(packagedBase, objectKeyFromManifest(manifestUrl));
+            return externalObjectUrl(packagedBase, objectKeyFromManifest(manifestUrl, rehostBucket));
           };
           return reply.code(200).send({
             assetId: asset.id,
@@ -1884,8 +1913,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       // manifestUrls -> streaming fileGroups. `id` is the fixed package type so
       // each format yields at most one stable group id ("hls"/"dash"). The
-      // objectKeyPrefix is derived from the manifest's path so callers can locate
-      // the segment objects that back the package.
+      // objectKeyPrefix is derived from the manifest's path and normalized to
+      // EXCLUDE the packaged bucket (issue #342) so it follows the same
+      // bucket-excluded convention as rendition objectKey and the proxy route —
+      // callers construct segment keys without special-casing an embedded bucket.
+      // Passing the effective packaged bucket also strips the bucket from prefixes
+      // persisted before #342 (back-compat on read).
+      const packagedBucketName = request.connections?.packagedBucket ?? packagedBucket();
       const fileGroups: z.infer<typeof assetFileGroupSchema>[] = [];
       const manifests = asset.manifestUrls;
       if (manifests?.hls) {
@@ -1894,7 +1928,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           type: 'hls-package',
           name: 'HLS',
           manifestUrl: manifests.hls,
-          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls)
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls, packagedBucketName)
         });
       }
       if (manifests?.dash) {
@@ -1903,7 +1937,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           type: 'dash-package',
           name: 'DASH',
           manifestUrl: manifests.dash,
-          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash)
+          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash, packagedBucketName)
         });
       }
 
