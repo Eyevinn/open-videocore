@@ -44,16 +44,14 @@ export type OscJobApi = {
   s3Bucket: string;
 };
 
-// Build an ffmpeg command that seeks to each timecode and writes one JPEG per
-// frame to `s3://bucket/<objectKey>`. One job covers all frames in a single pass.
-export function thumbnailCmdLine(sourceUrl: string, frames: FrameTarget[], bucket: string): string {
-  if (frames.length === 0) throw new Error('no frames requested');
-  return frames
-    .map(
-      (f) =>
-        `-y -ss ${f.timecodeSeconds} -i "${sourceUrl}" -frames:v 1 -f image2 "s3://${bucket}/${f.objectKey}"`
-    )
-    .join(' ');
+// Build an ffmpeg command that seeks to ONE timecode and writes a single JPEG to
+// `s3://bucket/<objectKey>`. One frame per invocation (issue #332): chaining
+// several `-i`/output pairs into one `cmdLineArgs` string produced a single
+// ffmpeg command whose multi-input/multi-output-file semantics wrote only the
+// last output object (last-write-wins), so each timecode overwrote the previous.
+// Each frame now runs as its own independent ffmpeg job.
+export function thumbnailFrameCmdLine(sourceUrl: string, frame: FrameTarget, bucket: string): string {
+  return `-y -ss ${frame.timecodeSeconds} -i "${sourceUrl}" -frames:v 1 -f image2 "s3://${bucket}/${frame.objectKey}"`;
 }
 
 function thumbnailJobName(): string {
@@ -62,28 +60,54 @@ function thumbnailJobName(): string {
   return `thumb${ts}${rand}`.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
 }
 
+// Extract a single frame as its own ephemeral eyevinn-ffmpeg-s3 job: dispatch,
+// wait for completion, then best-effort remove the spent instance. Throws if the
+// job ends in a failure status so the caller can attribute the failure to this
+// one frame (issue #332).
+async function extractOneFrame(api: OscJobApi, sourceUrl: string, frame: FrameTarget, sat: string): Promise<void> {
+  const name = thumbnailJobName();
+  await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {
+    name,
+    cmdLineArgs: thumbnailFrameCmdLine(sourceUrl, frame, api.s3Bucket),
+    awsAccessKeyId: api.s3AccessKey,
+    awsSecretAccessKey: api.s3SecretKey,
+    s3EndpointUrl: api.s3Endpoint
+  });
+  try {
+    const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
+    if (status === 'Failed' || status === 'Error') {
+      throw new Error(`OSC thumbnail job "${name}" ended with status "${status}"`);
+    }
+  } finally {
+    try {
+      await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);
+    } catch {
+      // ignore cleanup failure
+    }
+  }
+}
+
 export function makeOscThumbnailExtractor(api: OscJobApi): FrameExtractor {
   return async (sourceUrl: string, frames: FrameTarget[]): Promise<void> => {
+    if (frames.length === 0) throw new Error('no frames requested');
     const sat = await api.context.getServiceAccessToken(FFPROBE_SERVICE_ID);
-    const name = thumbnailJobName();
-    await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {
-      name,
-      cmdLineArgs: thumbnailCmdLine(sourceUrl, frames, api.s3Bucket),
-      awsAccessKeyId: api.s3AccessKey,
-      awsSecretAccessKey: api.s3SecretKey,
-      s3EndpointUrl: api.s3Endpoint
-    });
-    try {
-      const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
-      if (status === 'Failed' || status === 'Error') {
-        throw new Error(`OSC thumbnail job "${name}" ended with status "${status}"`);
-      }
-    } finally {
+
+    // One independent job per frame so each timecode lands at its own distinct
+    // key (issue #332). A single frame failing must not prevent the others from
+    // being written, so failures are collected rather than short-circuiting the
+    // batch — the orchestrator (pipeline/thumbnail.ts) verifies which objects
+    // actually exist and records only those. We surface an aggregate error only
+    // when EVERY frame failed, so a total failure still propagates to the route.
+    const failures: string[] = [];
+    for (const frame of frames) {
       try {
-        await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);
-      } catch {
-        // ignore cleanup failure
+        await extractOneFrame(api, sourceUrl, frame, sat);
+      } catch (err) {
+        failures.push(err instanceof Error ? err.message : String(err));
       }
+    }
+    if (failures.length === frames.length) {
+      throw new Error(`all ${frames.length} thumbnail frame job(s) failed: ${failures.join('; ')}`);
     }
   };
 }
