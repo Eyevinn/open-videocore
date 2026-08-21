@@ -214,9 +214,22 @@ in the ops UI.
 
 **Search**
 
+The single canonical search endpoint. It combines an exact-filter tier (`tags`,
+`mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text
+tier (`q`, over name and description) behind one contract; all filters are ANDed
+and results are paginated (`page`/`pageSize`, returned as `{ assets, total,
+page }`).
+
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/search` | Full-text and metadata search |
+| `GET` | `/api/v1/search` | Full-text and metadata search (canonical) |
+
+> **Deprecated:** `GET /api/v1/assets/search?q=<term>` is a legacy free-text-only
+> alias that returns `{ items }`. It resolves the same assets as
+> `GET /api/v1/search/?q=<term>` and is retained for backward compatibility; new
+> integrations should use the canonical `/api/v1/search` endpoint above. The
+> alias is marked `deprecated` in the OpenAPI spec and sends a `Deprecation`
+> response header.
 
 **Auto-scaler**
 
