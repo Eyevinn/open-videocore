@@ -159,6 +159,15 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
     '/',
     {
       schema: {
+        tags: ['search'],
+        summary: 'Search assets',
+        description:
+          'The single canonical search endpoint. Combines an exact-filter tier ' +
+          '(`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a ' +
+          'free-text tier (`q`, matched case-insensitively over name and description). ' +
+          'All filters are ANDed; omit them all to list every asset in the workspace. ' +
+          'Results are paginated via `page`/`pageSize` and returned as ' +
+          '`{ assets, total, page }`.',
         querystring: searchQuerySchema,
         response: { 200: searchResultSchema, 400: errorSchema }
       }
