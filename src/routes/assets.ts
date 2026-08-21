@@ -97,6 +97,11 @@ import {
   packagedRelocationOrigin,
   proxyManifestUrlsFor
 } from '../pipeline/packaging.js';
+import {
+  isManifestPath,
+  rewriteManifest,
+  type ManifestRewriteContext
+} from '../pipeline/manifest-rewrite.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
@@ -761,6 +766,29 @@ function assetsBaseUrl(requestUrl: string): string {
   return prefix;
 }
 
+// The absolute-or-relative URL prefix, up to and INCLUDING the `<id>/stream`
+// segment (no trailing slash), that a proxied manifest's child references must
+// be rewritten against so they resolve back through this route (issue #340).
+// `requestUrl` is the full mounted request path, e.g.
+// `/api/v1/assets/<id>/stream/v0/playlist.m3u8`; `wildcard` is the object path
+// captured by `*` (e.g. `v0/playlist.m3u8`). We strip the wildcard (and its
+// leading slash) off the path to recover `.../assets/<id>/stream`, then prefix
+// the configured PUBLIC_BASE_URL when set (12-factor; mirrors assetsBaseUrl) so
+// the rewritten URLs share the origin the delivery endpoint advertises. Falls
+// back to the same-origin relative path when PUBLIC_BASE_URL is unset.
+function streamProxyBaseUrl(requestUrl: string, wildcard: string): string {
+  const pathOnly = requestUrl.split('?')[0];
+  const suffix = wildcard.replace(/^\/+/, '');
+  // Remove the wildcard tail (and the slash separating it from `stream`).
+  let base = pathOnly;
+  if (suffix.length > 0 && base.endsWith(suffix)) {
+    base = base.slice(0, base.length - suffix.length);
+  }
+  base = base.replace(/\/+$/, '');
+  const configured = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
+  return configured ? `${configured}${base}` : base;
+}
+
 // Content-Type for a packaged object served through the proxy route (issue
 // #201), inferred from its extension. Covers the CMAF/HLS/DASH file types the
 // packager emits; unknown types fall back to a generic binary stream so the
@@ -785,6 +813,20 @@ function contentTypeForPackagedObject(relativePath: string): string {
   if (lower.endsWith('.ts')) return 'video/mp2t';
   if (lower.endsWith('.vtt')) return 'text/vtt';
   return 'application/octet-stream';
+}
+
+// Buffer a Readable object body into a UTF-8 string. Used only for manifests
+// (small text files) served through the proxy delivery route, which are rewritten
+// before sending (issue #340). Segment bodies are NEVER buffered — they stream
+// through untouched — so this stays bounded to manifest-sized payloads.
+async function readStreamToString(
+  stream: import('stream').Readable
+): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 // Parse a single-range HTTP `Range` header of the form `bytes=<start>-<end>`
@@ -1889,10 +1931,52 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           .send({ error: 'range_not_satisfiable' });
       }
 
-      // Manifests must not be cached long (segments may roll); segments are
-      // immutable so may be cached. Keep it conservative and let a fronting
-      // CDN/proxy override if desired. Accept-Ranges advertises range support so
-      // a player knows it can issue ranged segment GETs.
+      // Manifests (.m3u8/.mpd) are rewritten so their child references — variant
+      // playlists, the audio group, CMAF init + media segments, DASH
+      // BaseURL/SegmentTemplate — resolve back through THIS proxy prefix instead
+      // of escaping to a bare object-store host or an unsigned URL (issue #340,
+      // building on #333). The rewrite is a text transform applied ONLY to the
+      // proxied response: the stored bytes are never mutated. Because the
+      // transform changes the body length, a manifest is served whole (200) and
+      // never as a Range slice — Range remains for the (untouched) segment bytes.
+      if (isManifestPath(relative)) {
+        let manifestBody: string;
+        try {
+          const stream = await packagedStorage.getObject(objectKey);
+          manifestBody = await readStreamToString(stream);
+        } catch (err) {
+          if (
+            (err as { code?: string }).code === 'NoSuchKey' ||
+            (err as { code?: string }).code === 'NotFound'
+          ) {
+            return reply.code(404).send({ error: 'not_found' });
+          }
+          throw err;
+        }
+
+        // Proxy base up to and including `<id>/stream` (no trailing slash), so
+        // `<proxyBase>/<relative>` is a proxy URL for a packaged object. Derived
+        // from the request path (minus the wildcard tail), PUBLIC_BASE_URL-aware
+        // so the rewritten URLs share the origin the delivery endpoint advertises.
+        const proxyBase = streamProxyBaseUrl(request.url, request.params['*']);
+        const rewriteCtx: ManifestRewriteContext = {
+          proxyBase,
+          manifestRelativePath: relative,
+          packagedPrefix: outputPrefix(asset.id),
+          packagedBucket: bucket
+        };
+        const rewritten = rewriteManifest(relative, manifestBody, rewriteCtx);
+
+        return reply
+          .header('Content-Type', contentType)
+          .header('Cache-Control', 'no-cache')
+          .send(rewritten);
+      }
+
+      // Segments are immutable so may be cached; manifests handled above. Keep it
+      // conservative and let a fronting CDN/proxy override if desired.
+      // Accept-Ranges advertises range support so a player knows it can issue
+      // ranged segment GETs.
       reply
         .header('Content-Type', contentType)
         .header('Cache-Control', 'no-cache')

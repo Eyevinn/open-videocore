@@ -137,8 +137,12 @@ function asset(id: string): Asset {
 }
 
 describe('GET /:id/stream/*', () => {
-  it('returns 200 + the master manifest body with the HLS content type', async () => {
+  it('returns 200 + the master manifest with the HLS content type and a rewritten variant URI', async () => {
     const id = 'asset-1';
+    // A bare variant-playlist line in the master. Once rewritten it must resolve
+    // back through the proxy prefix (issue #340), not stay a bare relative path
+    // that a player would (correctly) resolve against the manifest URL anyway —
+    // but which breaks the moment the packager emits a prefix-absolute path.
     const body = Buffer.from('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv/playlist.m3u8\n');
     const app = await buildApp({
       assets: new Map([[id, asset(id)]]),
@@ -151,13 +155,17 @@ describe('GET /:id/stream/*', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toBe('application/vnd.apple.mpegurl');
-    expect(res.headers['accept-ranges']).toBe('bytes');
-    expect(res.rawPayload.equals(body)).toBe(true);
+    // The variant URI now points back through the proxy stream prefix.
+    expect(res.body).toContain(`/api/v1/assets/${id}/stream/v/playlist.m3u8`);
+    // The original bare relative reference is gone (rewritten).
+    expect(res.body).not.toMatch(/^v\/playlist\.m3u8$/m);
+    // Manifests are rewritten in full, so Range is not advertised on them.
+    expect(res.headers['accept-ranges']).toBeUndefined();
   });
 
   it('returns 200 for a nested child path (audio group playlist)', async () => {
     const id = 'asset-1';
-    const body = Buffer.from('#EXTM3U\n#EXT-X-TARGETDURATION:6\n');
+    const body = Buffer.from('#EXTM3U\n#EXT-X-TARGETDURATION:6\nseg-1.m4s\n');
     const app = await buildApp({
       assets: new Map([[id, asset(id)]]),
       objects: new Map([[`packaged/${id}/audio/audio.m3u8`, { body }]])
@@ -169,7 +177,9 @@ describe('GET /:id/stream/*', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toBe('application/vnd.apple.mpegurl');
-    expect(res.rawPayload.equals(body)).toBe(true);
+    // A segment referenced relative to a nested variant resolves into that
+    // variant's directory under the proxy prefix.
+    expect(res.body).toContain(`/api/v1/assets/${id}/stream/audio/seg-1.m4s`);
   });
 
   it('serves the DASH manifest with the DASH content type', async () => {
