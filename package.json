@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "generate:openapi": "bash scripts/generate-openapi.sh",
-    "tams:backfill": "tsx scripts/tams-backfill.ts"
+    "tams:backfill": "tsx scripts/tams-backfill.ts",
+    "postversion": "git push && git push --tags"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.2",
