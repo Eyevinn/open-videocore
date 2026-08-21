@@ -65,7 +65,18 @@ const renditionSchema = z.object({
 
 const assetSchema = z.object({
   id: z.string(),
-  name: z.string(),
+  // Canonical editorial title of the asset (issue #347) — the same single
+  // documented location for title as GET /assets/:id. Whether a client set the
+  // title through the ingest `title` field or the legacy `name` alias, it is
+  // persisted to `descriptive.title` and surfaced here as `name`.
+  name: z
+    .string()
+    .describe(
+      'Canonical editorial title of the asset (persisted at ' +
+        '`descriptive.title`). The free-text `q` parameter matches against ' +
+        'this field regardless of whether the client set the title through ' +
+        'the ingest `title` field or the legacy `name` alias.'
+    ),
   description: z.string().optional(),
   status: z.string(),
   parentId: z.string().optional(),
@@ -104,7 +115,17 @@ const tagsSchema = z
 
 const searchQuerySchema = z
   .object({
-    q: z.string().min(1).max(512).optional(),
+    q: z
+      .string()
+      .min(1)
+      .max(512)
+      .optional()
+      .describe(
+        'Case-insensitive free-text query matched against the asset title ' +
+          '(the canonical `name` field, persisted at `descriptive.title`) and ' +
+          'description. Matches title whether the client set it through the ' +
+          'ingest `title` field or the legacy `name` alias (issue #347).'
+      ),
     tags: tagsSchema,
     mimeType: z.string().min(1).max(128).optional(),
     // TAMS address lookup (issue #168, epic #116). Reuse the field validation
