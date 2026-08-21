@@ -1541,7 +1541,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -1946,7 +1947,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -2325,7 +2327,8 @@
                   "name": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": 256
+                    "maxLength": 256,
+                    "description": "Legacy alias for `title` (issue #347). The editorial title of the asset. `title` and `name` are two input spellings of the SAME canonical field: both persist to `descriptive.title` and are read back as the `name` property on GET /assets/:id, list, and search responses. Prefer `title`; `title` wins when both are supplied."
                   },
                   "description": {
                     "type": "string",
@@ -2334,7 +2337,8 @@
                   "title": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": 256
+                    "maxLength": 256,
+                    "description": "The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to `descriptive.title` and is read back as the `name` property on GET /assets/:id, list, and search responses (there is NO separate top-level `title` field on responses). Accepted as an alias of `name`; `title` wins when both are supplied."
                   },
                   "tags": {
                     "type": "array",
@@ -2457,7 +2461,8 @@
             },
             "in": "query",
             "name": "q",
-            "required": true
+            "required": true,
+            "description": "Case-insensitive free-text query matched against the asset title (the canonical `name` field, persisted at `descriptive.title`) and description \u2014 regardless of whether the client set the title through the ingest `title` field or the legacy `name` alias (issue #347)."
           }
         ],
         "responses": {
@@ -2477,7 +2482,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -2868,7 +2874,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -3320,7 +3327,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -3779,7 +3787,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -4269,7 +4278,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                           },
                           "slug": {
                             "type": "string"
@@ -6655,7 +6665,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -7166,7 +7177,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -7681,7 +7693,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -8590,7 +8603,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -8988,7 +9002,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -9402,7 +9417,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -9813,7 +9829,8 @@
                       "type": "string"
                     },
                     "name": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
                     },
                     "slug": {
                       "type": "string"
@@ -11942,7 +11959,8 @@
             },
             "in": "query",
             "name": "q",
-            "required": false
+            "required": false,
+            "description": "Case-insensitive free-text query matched against the asset title (the canonical `name` field, persisted at `descriptive.title`) and description. Matches title whether the client set it through the ingest `title` field or the legacy `name` alias (issue #347)."
           },
           {
             "schema": {
@@ -12027,7 +12045,8 @@
                             "type": "string"
                           },
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Canonical editorial title of the asset (persisted at `descriptive.title`). The free-text `q` parameter matches against this field regardless of whether the client set the title through the ingest `title` field or the legacy `name` alias."
                           },
                           "description": {
                             "type": "string"

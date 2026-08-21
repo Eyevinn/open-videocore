@@ -431,7 +431,19 @@ const tracksSchema = z.object({
 
 const assetSchema = z.object({
   id: z.string(),
-  name: z.string(),
+  // Canonical editorial title of the asset (issue #347). This is the ONE
+  // documented location for title on every response — GET /assets/:id, list,
+  // and search all expose title here as `name`. There is no separate top-level
+  // `title` field on responses; on ingest the `title` (or legacy `name`) input
+  // persists to `descriptive.title` (asset-document.ts) and surfaces here.
+  name: z
+    .string()
+    .describe(
+      'Canonical editorial title of the asset. Set on ingest via `title` (or ' +
+        'the legacy `name` alias) and persisted to `descriptive.title`; this ' +
+        'is the single documented location for title across GET, list, and ' +
+        'search responses. There is no separate top-level `title` field.'
+    ),
   // Human-readable, URL-safe slug (issue #131). Present on assets created after
   // slugs were introduced; absent/undefined for pre-existing slug-less assets.
   slug: z.string().optional(),
@@ -685,9 +697,32 @@ const commentSchema = z.object({
 const ingestUrlSchema = z
   .object({
     sourceUrl: z.string().min(1).max(4096),
-    name: z.string().min(1).max(256).optional(),
+    name: z
+      .string()
+      .min(1)
+      .max(256)
+      .optional()
+      .describe(
+        'Legacy alias for `title` (issue #347). The editorial title of the ' +
+          'asset. `title` and `name` are two input spellings of the SAME ' +
+          'canonical field: both persist to `descriptive.title` and are read ' +
+          'back as the `name` property on GET /assets/:id, list, and search ' +
+          'responses. Prefer `title`; `title` wins when both are supplied.'
+      ),
     description: z.string().max(2048).optional(),
-    title: z.string().min(1).max(256).optional(),
+    title: z
+      .string()
+      .min(1)
+      .max(256)
+      .optional()
+      .describe(
+        'The editorial title of the asset (issue #347). This is the ' +
+          'canonical write path for title: it persists to `descriptive.title` ' +
+          'and is read back as the `name` property on GET /assets/:id, list, ' +
+          'and search responses (there is NO separate top-level `title` field ' +
+          'on responses). Accepted as an alias of `name`; `title` wins when ' +
+          'both are supplied.'
+      ),
     tags: tagsSchema.optional()
   })
   .strict();
@@ -1436,7 +1471,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     {
       
       schema: {
-        querystring: z.object({ q: z.string().min(1) }),
+        querystring: z.object({
+          q: z
+            .string()
+            .min(1)
+            .describe(
+              'Case-insensitive free-text query matched against the asset ' +
+                'title (the canonical `name` field, persisted at ' +
+                '`descriptive.title`) and description — regardless of whether ' +
+                'the client set the title through the ingest `title` field or ' +
+                'the legacy `name` alias (issue #347).'
+            )
+        }),
         response: { 200: z.object({ items: z.array(assetSchema) }) }
       }
     },
@@ -2774,7 +2820,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // (which shallow-merges), this sets the entire metadata object to the request
   // body, dropping any keys not present. Workspace-scoped and behind
   // `authenticate`.
-  //   200 — metadata replaced, full asset returned
+  //
+  // Title is NOT part of this free-form `metadata`/`custom` bag (issue #347):
+  // the canonical editorial title lives at `descriptive.title` and is exposed on
+  // every response — including the full asset returned here — as the top-level
+  // `name` property. This endpoint never reads or writes title; a `title` key
+  // placed inside the `metadata` body is stored as free-form custom metadata and
+  // has NO effect on the asset's title. Set title via the ingest `title` field.
+  //   200 — metadata replaced, full asset returned (title is the `name` field)
   //   404 — unknown/foreign asset (existence not leaked)
   app.put(
     '/:id/metadata',
