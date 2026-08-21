@@ -1275,3 +1275,67 @@ body.detail-standalone .assets-side {
   max-width: none;
   min-height: 0;
 }
+
+/* ─── Shared ops-UI table primitive (issue #367) ────────────────────────────
+ * Styling for the reusable table primitive in public/ops-ui-table.js. Reuses
+ * the existing .pagination / .page-indicator / .empty / .spinner / .btn-ghost
+ * classes; the rules below only add the primitive-specific chrome (filter bar
+ * and sortable header buttons) so adopting tables inherit a consistent look. */
+.ops-table {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ops-table-caption {
+  padding: 12px 16px 0;
+}
+
+.ops-table-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ops-filter-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ops-table-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Sortable column header button — tri-state (none/asc/desc). */
+.ops-th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.ops-th-sort:hover {
+  color: var(--text);
+}
+
+.ops-th-sort:focus-visible {
+  outline: 2px solid var(--accent, #6366f1);
+  outline-offset: 2px;
+}
+
+.ops-sort-arrow {
+  font-size: 10px;
+  color: var(--text-muted);
+}
