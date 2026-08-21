@@ -2449,6 +2449,11 @@
     },
     "/api/v1/assets/search": {
       "get": {
+        "summary": "DEPRECATED \u2014 use GET /api/v1/search/",
+        "tags": [
+          "search"
+        ],
+        "description": "Deprecated free-text alias. Use the canonical `GET /api/v1/search/?q=<term>` endpoint instead, which serves the same free-text results plus tag, mimeType, metadata, and TAMS filters with `total`/`page` pagination. This alias only accepts `q` and returns `{ items }`; it is retained for backward compatibility and will be removed in a future major version.",
         "parameters": [
           {
             "schema": {
@@ -2460,6 +2465,7 @@
             "required": true
           }
         ],
+        "deprecated": true,
         "responses": {
           "200": {
             "description": "Default Response",
@@ -11933,6 +11939,11 @@
     },
     "/api/v1/search/": {
       "get": {
+        "summary": "Search assets",
+        "tags": [
+          "search"
+        ],
+        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset in the workspace. Results are paginated via `page`/`pageSize` and returned as `{ assets, total, page }`.",
         "parameters": [
           {
             "schema": {

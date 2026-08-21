@@ -1473,16 +1473,41 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // DEPRECATED free-text alias (issue #346). The canonical, fully-featured search
+  // contract is `GET /api/v1/search/` (routes/search.ts) — it exposes the tiered
+  // exact-filter + free-text surface (`q`, `tags`, `mimeType`, `metadata.<key>`,
+  // TAMS address lookup, pagination) over the wired search projection (#345).
+  //
+  // This endpoint predates that contract and only ever accepted `q` (a free-text
+  // term matched over name/description via AssetRepository.search). Its match
+  // semantics are IDENTICAL to the canonical endpoint's `q` tier (proven by the
+  // #345 parity regression, test/search-parity.test.ts), so it answers the same
+  // asset set for the same query and never returns silently-empty where the
+  // canonical one would answer. It is retained as a backward-compatible alias and
+  // marked `deprecated` in the OpenAPI spec; callers should migrate to
+  // `GET /api/v1/search/?q=<term>`, which additionally returns `{ total, page }`.
   app.get(
     '/search',
     {
-      
       schema: {
+        tags: ['search'],
+        summary: 'DEPRECATED — use GET /api/v1/search/',
+        description:
+          'Deprecated free-text alias. Use the canonical `GET /api/v1/search/?q=<term>` ' +
+          'endpoint instead, which serves the same free-text results plus tag, mimeType, ' +
+          'metadata, and TAMS filters with `total`/`page` pagination. This alias only ' +
+          'accepts `q` and returns `{ items }`; it is retained for backward compatibility ' +
+          'and will be removed in a future major version.',
+        deprecated: true,
         querystring: z.object({ q: z.string().min(1) }),
         response: { 200: z.object({ items: z.array(assetSchema) }) }
       }
     },
-    async (request) => {
+    async (request, reply) => {
+      // Advertise the canonical replacement on every response (RFC 8594 style),
+      // so clients can discover the migration target without reading the spec.
+      reply.header('deprecation', 'true');
+      reply.header('link', '</api/v1/search/>; rel="successor-version"');
       const items = await repo.search(request.query.q);
       return { items };
     }
