@@ -710,6 +710,19 @@ function activateScaler(redisUrl: string): void {
         await assetRepository.update(job.assetId, { status: 'processing' });
       }
     },
+    // Durably capture each Encore dispatch on the Job record (ADR-012, #380).
+    // The scaler already records the attempt count in the TTL'd Valkey key and
+    // clears it on re-dispatch/settle; this appends the same attempt to the
+    // CouchDB-backed encodeAttemptLog so the history survives after the Valkey
+    // key expires (#374 reads attempts after the job finishes). The scaler owns
+    // no repositories, so we resolve the job here by its encoreJobId. Best-
+    // effort: the scaler swallows failures so a durable-write hiccup never
+    // re-queues an already-dispatched job.
+    onEncodeDispatched: async (encoreJobId: string, attempt: number) => {
+      const found = await jobRepository.findByEncoreJobId(encoreJobId);
+      if (!found) return;
+      await jobRepository.appendEncodeAttempt(found.job.id, { index: attempt });
+    },
     // Once per tick, reconcile transcode jobs stuck non-terminal against Encore's
     // terminal FAILED / garbage-collected (404) outcomes (issue #273). A failed
     // Encore job never produces a completion message (the callback listener only
