@@ -1,4 +1,4 @@
-# ADR-012: loudnorm pass mode — single-pass shipped default, two-pass as future orchestration
+# ADR-013: loudnorm pass mode — single-pass shipped default, two-pass as future orchestration
 
 **Status:** PROPOSED 2026-08-22
 **Date:** 2026-08-22
