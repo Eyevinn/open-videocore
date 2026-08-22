@@ -173,6 +173,19 @@ export interface JobRepository {
     id: string,
     attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
   ): Promise<Job | undefined>;
+  // Durably close out the CURRENT (last) encode attempt on completion (#381).
+  // #380 appends an attempt with only { index, startedAt } at dispatch time;
+  // this stamps that same attempt's `endedAt` (always) and, for a failed
+  // attempt, its `classification` (the retry-policy FailureClass). It does NOT
+  // append a new attempt — it enriches the one already in the log — so a
+  // never-retried job ends with exactly one attempt whose startedAt+endedAt are
+  // both set (encodeAttempts === 1). If the log is somehow empty (e.g. the
+  // dispatch append was lost), a single attempt is synthesised so the field is
+  // never 0. Returns the updated job, or undefined if the job id is unknown.
+  completeEncodeAttempt(
+    id: string,
+    completion: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined>;
 }
 
 // The Encore job id we issue when submitting a transcode job. It embeds a
@@ -255,6 +268,42 @@ export function appendEncodeAttemptToJob(
   return { ...existing, encodeAttemptLog: log, encodeAttempts: log.length, updatedAt: now };
 }
 
+// Close out the CURRENT (last) encode attempt on completion (ADR-012, #381).
+// Pure helper shared by both backends so the enrich-in-place semantics never
+// drift. #380 appends { index, startedAt } at dispatch; this stamps that same
+// (last) attempt's `endedAt` (always) and, on a failed attempt, its
+// `classification`. It enriches in place rather than appending, so a
+// never-retried job keeps exactly one attempt with both timestamps set
+// (encodeAttempts stays 1). If the log is empty (dispatch append lost), a
+// single attempt is synthesised — start = end = now — so the count is never 0
+// and elapsed-time-excluding-retries (last endedAt - startedAt) is derivable.
+export function completeEncodeAttemptOnJob(
+  existing: Job,
+  completion: { endedAt?: string; classification?: FailureClass },
+  now: string
+): Job {
+  const log = existing.encodeAttemptLog ? [...existing.encodeAttemptLog] : [];
+  const endedAt = completion.endedAt ?? now;
+  if (log.length === 0) {
+    // No dispatch attempt was recorded — synthesise one so the field has a
+    // single reading (start = end = endedAt) and is never 0.
+    log.push({
+      index: 1,
+      startedAt: endedAt,
+      endedAt,
+      ...(completion.classification !== undefined ? { classification: completion.classification } : {})
+    });
+  } else {
+    const last = log[log.length - 1];
+    log[log.length - 1] = {
+      ...last,
+      endedAt,
+      ...(completion.classification !== undefined ? { classification: completion.classification } : {})
+    };
+  }
+  return { ...existing, encodeAttemptLog: log, encodeAttempts: log.length, updatedAt: now };
+}
+
 // ---------------------------------------------------------------------------
 // In-memory implementation
 // ---------------------------------------------------------------------------
@@ -333,6 +382,19 @@ export class InMemoryJobRepository implements JobRepository {
       return undefined;
     }
     const next = appendEncodeAttemptToJob(existing, attempt, new Date().toISOString());
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  async completeEncodeAttempt(
+    id: string,
+    completion: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const next = completeEncodeAttemptOnJob(existing, completion, new Date().toISOString());
     this.store.set(id, next);
     return { ...next };
   }

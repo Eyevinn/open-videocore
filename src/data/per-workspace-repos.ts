@@ -126,6 +126,12 @@ export class PerWorkspaceJobRepository implements JobRepository {
   ): Promise<Job | undefined> {
     return (await this.repo()).appendEncodeAttempt(id, attempt);
   }
+  async completeEncodeAttempt(
+    id: string,
+    completion: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    return (await this.repo()).completeEncodeAttempt(id, completion);
+  }
 }
 
 // Encore transcode client that resolves the stack's Encore at call time. Throws
