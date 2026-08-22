@@ -104,6 +104,7 @@ import {
 } from '../pipeline/manifest-rewrite.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
+import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
@@ -1040,6 +1041,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return `profile "${profileName}" requires GPU (NVENC/CUDA) hardware encoding, which is not available on this platform — choose a CPU-encoded profile`;
   }
 
+  // Resolve whether a named transcode profile declares colour signalling that is
+  // not carriable at its pixel format (issue #377): e.g. an 8-bit stream tagged
+  // PQ/HLG or BT.2020, HDR10 mastering metadata on a non-PQ output, or mastering
+  // metadata on an HLG output. Returns a human message naming both offending
+  // values so the caller can reject with a clear 422 BEFORE an encode is paid
+  // for, rather than shipping a mistagged output. Returns undefined (allow) when
+  // no profile store is wired, no profile name was given, the named profile is
+  // unknown to the store (forwarded verbatim — Encore resolves or rejects it),
+  // or the profile's colour signalling is carriable (including legitimate 10-bit
+  // SDR and genuine HDR10/HLG profiles).
+  async function uncarriableColourReason(profileName: string | undefined): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const stored = await opts.profileRepository.get(profileName);
+    if (!stored) return undefined;
+    const check = validateProfileColourSignalling(stored.yaml);
+    if (check.ok) return undefined;
+    return `profile "${profileName}" declares colour signalling that is not carriable at its pixel format — ${check.reason}`;
+  }
+
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
@@ -1234,6 +1254,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
       if (unrunnable) {
         reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+        return undefined;
+      }
+      // Reject a profile whose colour signalling is not carriable at its pixel
+      // format (issue #377) before a running execution is created, so a
+      // mistagged (e.g. 8-bit-tagged-PQ) output is never produced.
+      const uncarriable = await uncarriableColourReason(encodeOpts?.profile);
+      if (uncarriable) {
+        reply.code(422).send({ error: 'profile_colour_uncarriable', message: uncarriable });
         return undefined;
       }
     }
@@ -2343,6 +2371,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const unrunnable = await unrunnableProfileReason(request.body.profile);
       if (unrunnable) {
         return reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+      }
+      // Reject a profile whose colour signalling is not carriable at its pixel
+      // format (issue #377) before submitting to Encore, so a mistagged output
+      // (e.g. an 8-bit stream tagged PQ) is never encoded and paid for.
+      const uncarriable = await uncarriableColourReason(request.body.profile);
+      if (uncarriable) {
+        return reply.code(422).send({ error: 'profile_colour_uncarriable', message: uncarriable });
       }
       // Validate profileParams keys against the SpEL params the chosen profile
       // actually declares (issue #290). We resolve the profile YAML from the
