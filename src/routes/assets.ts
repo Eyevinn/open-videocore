@@ -64,7 +64,11 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
-import { resolveBurnInSource, buildSubtitlesFilter } from '../pipeline/burn-in.js';
+import {
+  resolveBurnInSource,
+  buildSubtitlesFilter,
+  checkBurnInObjectAvailable
+} from '../pipeline/burn-in.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
@@ -2409,9 +2413,41 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           if (resolved.reason === 'unsupported_format') {
             return reply.code(422).send({ error: 'burn_in_unsupported_format', message: resolved.message });
           }
-          // not_ready: the referenced track exists but its file has not landed
-          // yet. #389 owns the wait/queue/fail policy; surface it distinctly.
+          // not_ready: the referenced track exists but its objectKey is still
+          // undefined (asset-repo says the file has not landed). Distinct from
+          // the object-existence race below (#389) — here we have no key at all.
           return reply.code(409).send({ error: 'burn_in_source_not_ready', message: resolved.message });
+        }
+        // #389: CLOSE the generation race. `resolveBurnInSource` proved the
+        // request NAMES a concrete key; now verify the key's BYTES have actually
+        // landed in the workspace object store BEFORE dispatch. Subtitle
+        // generation is fire-and-forget (subtitle-generator.ts), so a resolved
+        // key — a caller-supplied `sidecarKey`, or a `subtitleTrack.objectKey`
+        // set before the generation callback landed — can point at an object that
+        // does not yet exist or is still zero-length. Either would silently burn
+        // NO captions, so we FAIL the submission with a specific 409
+        // (`burn_in_source_not_available`, distinct from #388's
+        // `burn_in_source_not_ready` no-objectKey case) and never dispatch. The
+        // check reuses WorkspaceStorage.statObject (src/data/storage.ts:92-102),
+        // the same presence plumbing the rest of the routes use, against the
+        // workspace/source bucket where generated sidecars land
+        // (subtitle-generator.ts:101-103 destinationKey). ADR-014 D1/D2 chose the
+        // explicit-source model, so a clear error at submit time is the natural
+        // guarantee (no open-ended wait).
+        if (!storageFor) {
+          // No object store wired on this deployment — we cannot verify the
+          // sidecar exists, so we MUST NOT dispatch a possibly-captionless burn.
+          return reply.code(501).send({
+            error: 'burn_in_storage_unavailable',
+            message: 'burn-in requires object storage to verify the caption source exists, but object storage is not configured on this deployment'
+          });
+        }
+        const availability = await checkBurnInObjectAvailable(resolved.objectKey, storageFor());
+        if (!availability.available) {
+          return reply.code(409).send({
+            error: 'burn_in_source_not_available',
+            message: availability.message
+          });
         }
         burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, request.body.burnIn.forceStyle);
       }

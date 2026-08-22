@@ -16,6 +16,7 @@ import {
   resolveBurnInSource,
   buildSubtitlesFilter,
   inferFormatFromKey,
+  checkBurnInObjectAvailable,
   BURN_IN_PROFILE_PARAM_KEY,
   BURN_IN_ACCEPTED_FORMATS
 } from './burn-in.js';
@@ -119,5 +120,35 @@ describe('helpers + constants', () => {
 
   it('threads through the subtitlesFilter profileParams key', () => {
     expect(BURN_IN_PROFILE_PARAM_KEY).toBe('subtitlesFilter');
+  });
+});
+
+// Object-existence check that closes the fire-and-forget generation race
+// (issue #389). A fake stat reader stands in for WorkspaceStorage.statObject
+// (src/data/storage.ts:92-102): `undefined` == NotFound; a `{ size }` == present.
+describe('checkBurnInObjectAvailable (issue #389 race close)', () => {
+  const readerFor = (objects: Record<string, number>) => ({
+    async statObject(key: string) {
+      return Object.prototype.hasOwnProperty.call(objects, key)
+        ? { size: objects[key]! }
+        : undefined;
+    }
+  });
+
+  it('returns available when the object exists and is non-empty', async () => {
+    const r = await checkBurnInObjectAvailable('cap.vtt', readerFor({ 'cap.vtt': 100 }));
+    expect(r.available).toBe(true);
+  });
+
+  it('returns absent when the object does not exist (stat undefined)', async () => {
+    const r = await checkBurnInObjectAvailable('missing.vtt', readerFor({}));
+    expect(r).toMatchObject({ available: false, reason: 'absent', objectKey: 'missing.vtt' });
+    if (!r.available) expect(r.message).toContain('missing.vtt');
+  });
+
+  it('treats a zero-length object as not-available (empty)', async () => {
+    const r = await checkBurnInObjectAvailable('empty.vtt', readerFor({ 'empty.vtt': 0 }));
+    expect(r).toMatchObject({ available: false, reason: 'empty', objectKey: 'empty.vtt' });
+    if (!r.available) expect(r.message).toContain('empty');
   });
 });
