@@ -280,3 +280,82 @@ describe('POST /:id/transcode burn-in generation race (issue #389)', () => {
     expect(h.submitted[0].profileParams?.['subtitlesFilter']).toBeUndefined();
   });
 });
+
+// Styling/positioning contract + force_style hardening (issue #390). The default
+// styling is whatever the sidecar carries; `forceStyle` is an OPTIONAL, VALIDATED
+// override. These tests prove: (a) an allowlisted style is composed correctly into
+// the filter that reaches Encore; (b) an injection/breakout attempt is REJECTED at
+// request time with a 422 and NEVER reaches the composed filter / Encore submit.
+describe('POST /:id/transcode burn-in styling contract (issue #390)', () => {
+  it('composes a valid allowlisted forceStyle into the subtitles filter (202)', async () => {
+    const key = 'subtitles/asset-1/track-1.vtt';
+    const h = await buildApp({ [key]: 1234 });
+    const id = await seedAsset(h.repo);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/transcode`,
+      payload: {
+        profile: 'program',
+        burnIn: {
+          source: { type: 'sidecarKey', objectKey: key },
+          forceStyle: 'FontName=Sans,FontSize=24,Alignment=2,MarginV=40'
+        }
+      }
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(h.submitted).toHaveLength(1);
+    expect(h.submitted[0].profileParams?.['subtitlesFilter']).toBe(
+      `subtitles=${key}:force_style='FontName=Sans,FontSize=24,Alignment=2,MarginV=40'`
+    );
+  });
+
+  it('REJECTS a filter-injection breakout attempt with 422 and NEVER submits to Encore', async () => {
+    const key = 'subtitles/asset-1/track-1.vtt';
+    const h = await buildApp({ [key]: 1234 });
+    const id = await seedAsset(h.repo);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/transcode`,
+      payload: {
+        profile: 'program',
+        burnIn: {
+          source: { type: 'sidecarKey', objectKey: key },
+          // Attempts to close force_style='...' and chain a second filter.
+          forceStyle: "FontName=X',subtitles=evil.srt"
+        }
+      }
+    });
+
+    expect(res.statusCode).toBe(422);
+    const body = res.json() as { error: string; message: string };
+    expect(body.error).toBe('burn_in_invalid_force_style');
+    // The malicious fragment never reached a composed filter or Encore.
+    expect(h.submitted).toHaveLength(0);
+    expect(res.payload).not.toContain('evil');
+  });
+
+  it('REJECTS a non-allowlisted style key with 422', async () => {
+    const key = 'subtitles/asset-1/track-1.vtt';
+    const h = await buildApp({ [key]: 1234 });
+    const id = await seedAsset(h.repo);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/transcode`,
+      payload: {
+        profile: 'program',
+        burnIn: {
+          source: { type: 'sidecarKey', objectKey: key },
+          forceStyle: 'Evil=1'
+        }
+      }
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect((res.json() as { error: string }).error).toBe('burn_in_invalid_force_style');
+    expect(h.submitted).toHaveLength(0);
+  });
+});
