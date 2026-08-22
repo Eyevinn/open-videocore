@@ -801,6 +801,21 @@ function assetsBaseUrl(requestUrl: string): string {
   return prefix;
 }
 
+// True when `value` is an absolute URL (has a scheme + host a player can fetch),
+// false for a bare path like `/openvideocore-packaged/<id>/index.m3u8`. Used by
+// the delivery endpoint (issue #341) to decide whether a resolved manifest URL
+// is already externally resolvable or must be routed through the stream proxy.
+function isAbsoluteUrl(value: string): boolean {
+  try {
+    // The URL constructor throws on a relative/bare path (no base), so a
+    // successful parse means the value carries a scheme + authority.
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // The absolute-or-relative URL prefix, up to and INCLUDING the `<id>/stream`
 // segment (no trailing slash), that a proxied manifest's child references must
 // be rewritten against so they resolve back through this route (issue #340).
@@ -1871,12 +1886,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
         try {
-          const hls = asset.manifestUrls.hls
-            ? resolvePublicManifestUrl(asset.manifestUrls.hls)
-            : undefined;
-          const dash = asset.manifestUrls.dash
-            ? resolvePublicManifestUrl(asset.manifestUrls.dash)
-            : undefined;
+          // In the default `public` mode, `resolvePublicManifestUrl` returns a
+          // genuinely public absolute URL only when PACKAGED_PUBLIC_BASE_URL is
+          // configured. On the zero-config per-stack MinIO backend it hands back
+          // the stored value verbatim (issue #320), which is a bare object-key
+          // path (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
+          // scheme/host and no signature — not fetchable by a player, and OSC
+          // MinIO blocks external presigned/public GETs. When the resolved value
+          // is still non-absolute, route the manifest through the authorized
+          // stream proxy instead (issue #341), mirroring the DELIVERY_MODE=proxy
+          // branch above so `delivery.hls`/`delivery.dash` are always absolute,
+          // resolvable URLs — consistent with how `source` is emitted. The proxy
+          // base is derived from PUBLIC_BASE_URL / request context via
+          // `assetsBaseUrl`, never hardcoded.
+          const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
+          const toAbsolute = (
+            stored: string | undefined,
+            proxyUrl: string | undefined
+          ): string | undefined => {
+            if (!stored) return undefined;
+            const resolved = resolvePublicManifestUrl(stored);
+            return isAbsoluteUrl(resolved) ? resolved : proxyUrl;
+          };
+          const hls = toAbsolute(asset.manifestUrls.hls, proxied.hls);
+          const dash = toAbsolute(asset.manifestUrls.dash, proxied.dash);
           return reply.code(200).send({
             assetId: asset.id,
             urls: { hls, dash },
