@@ -86,7 +86,9 @@ const updateBodySchema = z.object({
 
 const bootstrapResponseSchema = z.object({
   seeded: z.number(),
-  skipped: z.boolean()
+  skipped: z.boolean(),
+  // Count of built-in profiles newly created this run (issue #385).
+  builtinSeeded: z.number()
 });
 
 export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
