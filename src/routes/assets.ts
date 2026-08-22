@@ -64,6 +64,7 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
+import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
@@ -2356,12 +2357,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // always passes.
       if (request.body.profileParams && !request.body.customProfile) {
         const profileName = request.body.profile ?? 'program';
-        const stored = opts.profileRepository
-          ? await opts.profileRepository.get(profileName)
-          : undefined;
+        // Resolve the profile YAML while distinguishing a genuine not-found from
+        // an unreachable profile store (issue #392). A store outage makes
+        // ProfileRepository.get() THROW (couch-profile-repo does not catch); the
+        // resolver captures that so a store outage no longer turns a transcode
+        // submit into an uncaught 500. Behaviour stays PERMISSIVE: in BOTH the
+        // not-found and store-unreachable cases we pass an undefined YAML into
+        // validateProfileParams exactly as before, so the request still submits.
+        const resolution = await resolveProfileYaml(opts.profileRepository, profileName);
+        // The resolved status is kept as a local so the sibling issues can
+        // consume the distinction: #393 (logging the store-unreachable case) and
+        // #394 (a response warning field). Neither is implemented here.
         const check = validateProfileParams({
           profileName,
-          profileYaml: stored?.yaml,
+          profileYaml: resolution.status === 'found' ? resolution.yaml : undefined,
           profileParams: request.body.profileParams
         });
         // Only a hard reject (`ok: false`) turns into a 400. Both a genuine
