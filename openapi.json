@@ -5197,6 +5197,41 @@
                     },
                     "encoreJobId": {
                       "type": "string"
+                    },
+                    "warning": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "enum": [
+                            "profile_params_unvalidated"
+                          ],
+                          "description": "Stable machine-readable warning code."
+                        },
+                        "message": {
+                          "type": "string",
+                          "description": "Human-readable explanation naming the profile and the unvalidated keys."
+                        },
+                        "profile": {
+                          "type": "string",
+                          "description": "The profile name whose declared params could not be resolved."
+                        },
+                        "unvalidatedKeys": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "The profileParams keys that were forwarded to Encore without validation."
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "profile",
+                        "unvalidatedKeys"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Present only when profileParams validation could not be performed because the profile YAML was unresolvable (a custom profile not in the store, or the profile store was unreachable). The request was still accepted and the keys were forwarded to Encore unchecked."
                     }
                   },
                   "required": [
