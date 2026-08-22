@@ -2364,6 +2364,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           profileYaml: stored?.yaml,
           profileParams: request.body.profileParams
         });
+        // Only a hard reject (`ok: false`) turns into a 400. Both a genuine
+        // pass and the explicit skipped/permissive result (`validated: false`,
+        // profile YAML unresolvable) keep `ok: true` and are request-accepted;
+        // richer handling of the skipped result (logging, response warning) is
+        // deferred to sibling issues #392/#393/#394. (issue #391)
         if (!check.ok) {
           return reply.code(400).send({
             error: 'unknown_profile_params',
