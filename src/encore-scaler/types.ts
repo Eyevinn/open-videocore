@@ -63,6 +63,15 @@ export type EncoreScalerConfig = {
   // `queued` to `running`. Best-effort: failures are swallowed so a repo hiccup
   // never re-queues an already-dispatched job.
   onDispatched?: (encoreJobId: string) => Promise<void>;
+  // Invoked after each successful dispatch to durably capture the encode attempt
+  // (ADR-012, #380). The scaler has no job repository of its own, so main.ts
+  // wires this to jobRepository.appendEncodeAttempt so the attempt history is
+  // written to CouchDB alongside the TTL'd Valkey retry counter — and therefore
+  // survives after the Valkey key expires or is cleared on re-dispatch/settle.
+  // `attempt` is the same dispatch number recorded in Valkey (1 on first
+  // dispatch). Best-effort: failures are swallowed so a durable-write hiccup
+  // never re-queues an already-dispatched job.
+  onEncodeDispatched?: (encoreJobId: string, attempt: number) => Promise<void>;
   // Invoked once per tick to reconcile transcode jobs stuck in a non-terminal
   // state against Encore's terminal FAILED/404 outcomes (issue #273). The scaler
   // has no job repository of its own, so main.ts wires this up to run the

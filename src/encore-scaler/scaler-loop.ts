@@ -263,7 +263,7 @@ export class EncoreScalerLoop {
     inst: EncoreInstanceRecord,
     job: QueuedJob
   ): Promise<boolean> {
-    const { redis, workspaceId, getToken, onDispatched } = this.config;
+    const { redis, workspaceId, getToken, onDispatched, onEncodeDispatched } = this.config;
     try {
       const token = await getToken();
       // Inject the paired callback listener URL so Encore POSTs progress to the
@@ -301,6 +301,18 @@ export class EncoreScalerLoop {
         await recordDispatch(redis, job.jobId, job.payload, attemptNumber);
       } catch {
         // Swallowed: dispatch itself succeeded; the job just loses retry state.
+      }
+
+      // Durably capture the encode attempt on the Job record (ADR-012, #380).
+      // This mirrors the Valkey counter above but writes to CouchDB via the
+      // repo hook, so the attempt history outlives the TTL'd/cleared Valkey key.
+      // Best-effort, same rationale as recordDispatch: never fail dispatch here.
+      if (onEncodeDispatched) {
+        try {
+          await onEncodeDispatched(job.jobId, attemptNumber);
+        } catch {
+          // Swallowed: dispatch itself succeeded; only durable capture is lost.
+        }
       }
       if (encoreUuid && encoreUuid !== job.jobId) {
         await redis.set(keys.jobUuid(job.jobId), encoreUuid, 'EX', 86_400);
