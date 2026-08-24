@@ -2486,6 +2486,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           profileYaml: resolution.status === 'found' ? resolution.yaml : undefined,
           profileParams: request.body.profileParams
         });
+        // When validation was SKIPPED (the profile YAML could not be resolved),
+        // the request still succeeds permissively — but a mistyped profile name
+        // plus a mistyped param name would otherwise pass silently, and a store
+        // outage would silently skip validation for its whole duration. Emit ONE
+        // log line so an operator gets feedback (issue #393). No behavioural
+        // change: the request is still accepted regardless. The same skipped
+        // signal will be surfaced in the response by #394. We distinguish a
+        // store outage (warn — an operator should notice; carry the captured
+        // error) from an ordinary profile-not-found / custom-profile use (info)
+        // via a machine-readable `reason` field.
+        if (check.ok && !check.validated) {
+          const skipped = {
+            profileName: check.profileName,
+            unvalidatedKeys: check.unvalidatedKeys
+          };
+          if (resolution.status === 'store-unreachable') {
+            request.log.warn(
+              { ...skipped, reason: 'store-unreachable' as const, err: resolution.error },
+              'profileParams validation skipped: profile store unreachable'
+            );
+          } else {
+            request.log.info(
+              { ...skipped, reason: 'profile-not-found' as const },
+              'profileParams validation skipped: profile not found'
+            );
+          }
+        }
         // Only a hard reject (`ok: false`) turns into a 400. Both a genuine
         // pass and the explicit skipped/permissive result (`validated: false`,
         // profile YAML unresolvable) keep `ok: true` and are request-accepted;
