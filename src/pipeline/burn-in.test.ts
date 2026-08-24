@@ -16,8 +16,11 @@ import {
   resolveBurnInSource,
   buildSubtitlesFilter,
   inferFormatFromKey,
+  checkBurnInObjectAvailable,
+  validateForceStyle,
   BURN_IN_PROFILE_PARAM_KEY,
-  BURN_IN_ACCEPTED_FORMATS
+  BURN_IN_ACCEPTED_FORMATS,
+  BURN_IN_ALLOWED_STYLE_KEYS
 } from './burn-in.js';
 import type { SubtitleTrack } from '../data/asset-repo.js';
 
@@ -87,13 +90,19 @@ describe('resolveBurnInSource — subtitleTrack mode (ADR-014 D2.b)', () => {
   });
 });
 
-describe('buildSubtitlesFilter (ADR-014 D3)', () => {
+describe('buildSubtitlesFilter (ADR-014 D3; hardened by #390)', () => {
   it('builds the bare subtitles= filter when no forceStyle is given', () => {
     expect(buildSubtitlesFilter('subtitles/a/cap.srt')).toBe('subtitles=subtitles/a/cap.srt');
   });
 
-  it('appends force_style when supplied', () => {
+  it('appends a validated, allowlisted force_style when supplied', () => {
     expect(buildSubtitlesFilter('cap.vtt', 'FontName=Sans,FontSize=24')).toBe(
+      "subtitles=cap.vtt:force_style='FontName=Sans,FontSize=24'"
+    );
+  });
+
+  it('canonicalises whitespace around validated entries', () => {
+    expect(buildSubtitlesFilter('cap.vtt', ' FontName = Sans , FontSize = 24 ')).toBe(
       "subtitles=cap.vtt:force_style='FontName=Sans,FontSize=24'"
     );
   });
@@ -102,8 +111,91 @@ describe('buildSubtitlesFilter (ADR-014 D3)', () => {
     expect(buildSubtitlesFilter('cap.vtt', '   ')).toBe('subtitles=cap.vtt');
   });
 
-  it('strips single quotes from forceStyle so it cannot break out of the quoting', () => {
-    expect(buildSubtitlesFilter('cap.vtt', "FontName='X")).toBe("subtitles=cap.vtt:force_style='FontName=X'");
+  // SECURITY (issue #390): defence-in-depth. Even if an unvalidated string reaches
+  // buildSubtitlesFilter directly, an injection attempt must NOT be composed
+  // verbatim — it is dropped, leaving the bare filter, so no caller quote/comma/
+  // colon can appear in the emitted filtergraph.
+  it('drops (never forwards verbatim) an injection attempt with a breakout quote+filter', () => {
+    const out = buildSubtitlesFilter('cap.vtt', "FontName=X',subtitles=evil.srt");
+    expect(out).toBe('subtitles=cap.vtt');
+    expect(out).not.toContain('evil');
+    expect(out).not.toContain("'");
+  });
+
+  it('drops a value containing a colon breakout attempt', () => {
+    const out = buildSubtitlesFilter('cap.vtt', 'FontName=X:force_style=Y');
+    expect(out).toBe('subtitles=cap.vtt');
+  });
+});
+
+describe('validateForceStyle — explicit allowlist + safe charset (issue #390)', () => {
+  it('accepts an allowlisted Key=Value list and returns a canonical string', () => {
+    const r = validateForceStyle('FontName=Sans,FontSize=24,Alignment=2,MarginV=40');
+    expect(r).toEqual({ ok: true, canonical: 'FontName=Sans,FontSize=24,Alignment=2,MarginV=40' });
+  });
+
+  it('accepts an ASS colour value using the &H hex prefix', () => {
+    const r = validateForceStyle('PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000');
+    expect(r).toEqual({ ok: true, canonical: 'PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000' });
+  });
+
+  it('trims interior whitespace and re-joins with a single comma (canonicalisation)', () => {
+    const r = validateForceStyle('  FontName = DejaVu Sans ,  Bold = 1 ');
+    expect(r).toEqual({ ok: true, canonical: 'FontName=DejaVu Sans,Bold=1' });
+  });
+
+  it('REJECTS a single-quote breakout that would escape force_style=\'...\'', () => {
+    const r = validateForceStyle("FontName=X',subtitles=evil.srt");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(['unsafe_value', 'unknown_key']).toContain(r.code);
+  });
+
+  it('REJECTS a colon breakout attempt (would chain a second filter option)', () => {
+    const r = validateForceStyle('FontName=X:force_style=Y');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('unsafe_value');
+  });
+
+  it('REJECTS a backslash', () => {
+    const r = validateForceStyle('FontName=A\\B');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('unsafe_value');
+  });
+
+  it('REJECTS a newline in a value', () => {
+    const r = validateForceStyle('FontName=A\nB');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('unsafe_value');
+  });
+
+  it('REJECTS a key that is not on the allowlist', () => {
+    const r = validateForceStyle('Evil=1');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('unknown_key');
+  });
+
+  it('REJECTS an entry that is not a Key=Value pair', () => {
+    const r = validateForceStyle('FontName');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('malformed_entry');
+  });
+
+  it('REJECTS an empty entry from a doubled/trailing comma (no silent drop)', () => {
+    const r = validateForceStyle('FontName=Sans,,FontSize=24');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('empty_entry');
+  });
+
+  it('REJECTS an over-length override', () => {
+    const r = validateForceStyle('FontName=' + 'A'.repeat(600));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe('too_long');
+  });
+
+  it('exposes the documented allowlist including positioning keys', () => {
+    expect(BURN_IN_ALLOWED_STYLE_KEYS).toContain('Alignment');
+    expect(BURN_IN_ALLOWED_STYLE_KEYS).toContain('MarginV');
+    expect(BURN_IN_ALLOWED_STYLE_KEYS).toContain('FontName');
   });
 });
 
@@ -119,5 +211,35 @@ describe('helpers + constants', () => {
 
   it('threads through the subtitlesFilter profileParams key', () => {
     expect(BURN_IN_PROFILE_PARAM_KEY).toBe('subtitlesFilter');
+  });
+});
+
+// Object-existence check that closes the fire-and-forget generation race
+// (issue #389). A fake stat reader stands in for WorkspaceStorage.statObject
+// (src/data/storage.ts:92-102): `undefined` == NotFound; a `{ size }` == present.
+describe('checkBurnInObjectAvailable (issue #389 race close)', () => {
+  const readerFor = (objects: Record<string, number>) => ({
+    async statObject(key: string) {
+      return Object.prototype.hasOwnProperty.call(objects, key)
+        ? { size: objects[key]! }
+        : undefined;
+    }
+  });
+
+  it('returns available when the object exists and is non-empty', async () => {
+    const r = await checkBurnInObjectAvailable('cap.vtt', readerFor({ 'cap.vtt': 100 }));
+    expect(r.available).toBe(true);
+  });
+
+  it('returns absent when the object does not exist (stat undefined)', async () => {
+    const r = await checkBurnInObjectAvailable('missing.vtt', readerFor({}));
+    expect(r).toMatchObject({ available: false, reason: 'absent', objectKey: 'missing.vtt' });
+    if (!r.available) expect(r.message).toContain('missing.vtt');
+  });
+
+  it('treats a zero-length object as not-available (empty)', async () => {
+    const r = await checkBurnInObjectAvailable('empty.vtt', readerFor({ 'empty.vtt': 0 }));
+    expect(r).toMatchObject({ available: false, reason: 'empty', objectKey: 'empty.vtt' });
+    if (!r.available) expect(r.message).toContain('empty');
   });
 });
