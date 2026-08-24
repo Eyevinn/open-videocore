@@ -40,6 +40,10 @@ export type WorkspaceEncoreScalerConfig = {
   // Forwarded to every per-workspace scaler loop: invoked after a queued job is
   // dispatched to an Encore instance so the Job record can advance queued->running.
   onDispatched?: (encoreJobId: string) => Promise<void>;
+  // Forwarded to every per-workspace scaler loop: invoked after each dispatch to
+  // durably capture the encode attempt on the Job record (ADR-012, #380), so the
+  // attempt history outlives the TTL'd Valkey retry counter.
+  onEncodeDispatched?: (encoreJobId: string, attempt: number) => Promise<void>;
   // Forwarded to every per-workspace scaler loop: invoked once per tick to
   // reconcile transcode jobs stuck non-terminal against Encore FAILED/404
   // outcomes (issue #273). The scaler owns no repos, so main.ts supplies the
@@ -73,6 +77,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       s3Config,
       profilesUrl: this.config.profilesUrl,
       onDispatched: this.config.onDispatched,
+      onEncodeDispatched: this.config.onEncodeDispatched,
       reconcileFailedTranscodes: this.config.reconcileFailedTranscodes
     };
 
