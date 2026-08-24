@@ -13,8 +13,31 @@ import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository, typ
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
+import type { FailureClass } from '../encore-scaler/retry-policy.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
+
+// Mirrors FailureClass (src/encore-scaler/retry-policy.ts:70). Kept as a local
+// literal enum because FailureClass is a type-only union with no runtime value
+// to import; the two are asserted to stay in sync at build time below.
+const FAILURE_CLASSES = ['transport', 'io-retryable', 'deterministic'] as const;
+// Compile-time guard: fails typecheck if FailureClass and FAILURE_CLASSES drift.
+type _AssertFailureClassInSync = FailureClass extends (typeof FAILURE_CLASSES)[number]
+  ? (typeof FAILURE_CLASSES)[number] extends FailureClass
+    ? true
+    : never
+  : never;
+const _failureClassInSync: _AssertFailureClassInSync = true;
+void _failureClassInSync;
+
+// One Encore dispatch (attempt) of a transcode job (ADR-012, #380/#381).
+// `startedAt` is stamped at dispatch; `endedAt`/`classification` on completion.
+const encodeAttemptSchema = z.object({
+  index: z.number(),
+  startedAt: z.string(),
+  endedAt: z.string().optional(),
+  classification: z.enum(FAILURE_CLASSES).optional()
+});
 
 const jobSchema = z.object({
   id: z.string(),
@@ -25,6 +48,9 @@ const jobSchema = z.object({
   progress: z.number(),
   bytesTransferred: z.number(),
   totalBytes: z.number().optional(),
+  // Number of ingest/URL-pull attempts (retry tracking for URL-pull ingest).
+  // This is the INGEST attempt count and is distinct from `encodeAttempts`
+  // below (which counts Encore dispatches of a transcode job).
   attempts: z.number(),
   error: z.string().optional(),
   // Transcode-job fields (issue #8). Present only when type === 'transcode'.
@@ -33,6 +59,17 @@ const jobSchema = z.object({
   encoreInstanceId: z.string().optional(), // which pool instance is running this job
   profile: z.string().optional(),
   renditionAssetIds: z.array(z.string()).optional(),
+  // --- Durable encode-attempt capture (ADR-012, #380/#381) ---
+  // Count of Encore dispatches for this transcode job (1 on first dispatch,
+  // incremented on each transport-class re-dispatch). DISTINCT from `attempts`
+  // above, which counts ingest/URL-pull attempts. Absent until the first
+  // dispatch is recorded; a completed, never-retried transcode reports 1.
+  encodeAttempts: z.number().optional(),
+  // Append-only log of each Encore dispatch, in dispatch order. To attribute
+  // elapsed time to the SUCCESSFUL attempt alone (excluding retries), take the
+  // LAST entry and compute `endedAt - startedAt`; this is the single documented
+  // read for elapsed-time-excluding-retries.
+  encodeAttemptLog: z.array(encodeAttemptSchema).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -139,8 +176,15 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
   app.get(
     '/:id',
     {
-      
+
       schema: {
+        description:
+          'Read a single job. For transcode jobs, `encodeAttempts` is the number ' +
+          'of Encore dispatches and `encodeAttemptLog` records each dispatch in ' +
+          'order (index, startedAt, endedAt?, classification?). This is DISTINCT ' +
+          'from `attempts`, which counts ingest/URL-pull attempts. To obtain the ' +
+          'elapsed time of the successful encode alone (excluding retries), read ' +
+          'the LAST entry of `encodeAttemptLog` and compute endedAt − startedAt.',
         params: z.object({ id: z.string() }),
         response: { 200: jobSchema, 404: errorSchema }
       }
