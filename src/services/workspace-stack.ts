@@ -42,6 +42,7 @@ import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-clie
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
 import type { SceneDetector } from '../pipeline/scene-detector.js';
 import type { Context } from '@osaas/client-core';
+import type { ResolverHealthSignal } from './resolver-health.js';
 
 // Builders that turn a stored optional-service instance name (from the stack
 // record) into the corresponding pipeline-step generator (issue #217). main.ts
@@ -309,6 +310,7 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
+  private resolverHealth: ResolverHealthSignal | undefined;
 
   constructor(opts: {
     paramStore: ParamStore | undefined;
@@ -319,12 +321,18 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
+    // Aggregate degraded-resolution signal (issue #422). Optional so existing
+    // callers/tests are unaffected; when supplied the resolver emits on every
+    // degraded fallback (no-storage / stale last-known-good) so an operator can
+    // detect a degraded-but-not-crashed instance via /health without logs.
+    resolverHealth?: ResolverHealthSignal;
   }) {
     this.paramStore = opts.paramStore;
     this.oscContext = opts.oscContext;
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
+    this.resolverHealth = opts.resolverHealth;
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -342,12 +350,20 @@ export class WorkspaceStackResolver {
     // bypassing the parameter store entirely.
     const envConnections = buildEnvConnections(this.oscContext);
     if (envConnections) {
+      // Explicit env override is an intended, healthy configuration — not a
+      // degraded fallback. Clear any prior degraded gauge (issue #422).
+      this.resolverHealth?.markHealthy();
       this.cache.set(cacheKey, { connections: envConnections, expiresAt: Date.now() + CACHE_TTL_MS });
       return envConnections;
     }
 
     const ps = this.paramStore;
-    if (!ps) return buildInMemoryConnections();
+    if (!ps) {
+      // No parameter store configured: the resolver serves no-op in-memory
+      // (no-storage) connections. Signal this degraded state (issue #422).
+      this.resolverHealth?.markNoStorageFallback();
+      return buildInMemoryConnections();
+    }
 
     // Resolve the stack config: an explicit stack name addresses that stack
     // directly; otherwise use the first provisioned stack as the workspace
@@ -373,7 +389,14 @@ export class WorkspaceStackResolver {
         }
       }
     } catch {
-      // Fall through to in-memory
+      // A refresh (parameter-store read) failed. This is the location where the
+      // last-known-good stale fallback (issue #420) will serve previously cached
+      // ready-stack connections; that path is not in this branch yet, so control
+      // falls through to the no-storage fallback selected below. The stale-signal
+      // hook (resolverHealth.markStaleLastKnownGood) is defined and ready for
+      // that path (issue #422); we do not emit it here because this branch does
+      // not actually serve stale data — it drops to no-storage, which the
+      // selection below signals.
     }
 
     // A partially-provisioned/failed stack must never be treated as a live,
@@ -383,10 +406,22 @@ export class WorkspaceStackResolver {
     // them here. buildConnectionsFromStack also returns null for empty/invalid
     // coordinates (issue #105 defence-in-depth). In every skip case we fall back
     // to no-op in-memory connections so /health and infra routes stay up.
-    const connections =
-      (config && isReadyStack(config)
+    const liveConnections =
+      config && isReadyStack(config)
         ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
-        : null) ?? buildInMemoryConnections();
+        : null;
+
+    // Emit the aggregate degraded-resolution signal (issue #422): a null live
+    // build here means we could not connect a ready stack and are dropping to
+    // the no-op in-memory (no-storage) fallback. A live build is healthy and
+    // clears any prior degraded gauge.
+    if (liveConnections) {
+      this.resolverHealth?.markHealthy();
+    } else {
+      this.resolverHealth?.markNoStorageFallback();
+    }
+
+    const connections = liveConnections ?? buildInMemoryConnections();
 
     this.cache.set(cacheKey, { connections, expiresAt: Date.now() + CACHE_TTL_MS });
     return connections;

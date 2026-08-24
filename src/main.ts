@@ -29,6 +29,7 @@ import { storageRouter } from './routes/storage.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
+import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
@@ -176,8 +177,21 @@ await app.register(helmet, {
 // On OSC this is injected at runtime; locally set it in .env.
 const oscContext = new Context();
 
-// Health endpoints are intentionally unauthenticated for liveness probing.
-app.get('/health', async () => ({ status: 'ok', service: 'open-videocore-api' }));
+// Aggregate degraded-resolution signal for the stack resolver (issue #422).
+// Created before the health endpoints and the resolver so both share one
+// instance: the resolver writes it on every degraded fallback and /health reads
+// it, giving operators a queryable/alertable signal that an instance is serving
+// no-storage or stale last-known-good connections — without reading logs.
+const resolverHealth = new ResolverHealthSignal();
+
+// Health endpoints are intentionally unauthenticated for liveness probing. The
+// `resolver` field (issue #422) reports the aggregate degraded-resolution state
+// so a degraded-but-not-crashed instance is alertable from /health alone.
+app.get('/health', async () => ({
+  status: 'ok',
+  service: 'open-videocore-api',
+  resolver: resolverHealth.snapshot()
+}));
 app.get('/healthz', async () => ({ status: 'ok' }));
 
 // OSC parameter store (issue #31, ADR-002). Persists provisioned stack
@@ -248,7 +262,8 @@ const stackResolver = new WorkspaceStackResolver({
   oscContext,
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
-  optionalSteps: optionalStepBuilders
+  optionalSteps: optionalStepBuilders,
+  resolverHealth
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
