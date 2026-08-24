@@ -21,6 +21,7 @@ import {
   type ParamStore,
   type StackConfig,
   type StorageBackendConfig,
+  isReadyStack,
   stripCredentials
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
@@ -371,6 +372,18 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // (ADR-002), and there is no per-caller token for these routes. Parameter
   // store scoping uses the deployment's own tenant id (deriveWorkspaceId).
 
+  // In-flight provisioning guard (issue #417). Repeated or concurrent POST /
+  // calls for the SAME stack name must not each spawn a fresh set of companion
+  // object-storage / document-store instances (which was minting new
+  // companion-password secret generations each retry). This per-process Set
+  // holds the names whose background provisioning closure is currently running;
+  // a second call that arrives while one is in flight converges to the existing
+  // work instead of starting a duplicate set. It is a fast in-process guard that
+  // complements the persisted 'provisioning' marker written to the parameter
+  // store below (which additionally covers repeats across process restarts and
+  // is the durable source of truth for convergence).
+  const inFlightProvisions = new Set<string>();
+
   app.post(
     '/',
     {
@@ -424,6 +437,84 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
       setImmediate(async () => {
         ops.update(op.id, { status: 'running' });
+
+        // Idempotency guard (issue #417). Before creating any companion
+        // instance, converge on the existing stack instead of minting a fresh
+        // companion set (which each retry did, leaving orphaned instances and
+        // extra companion-password secret generations).
+        //
+        //   1. In-process lock: if a background flow for this name is already
+        //      running, do NOT start a second one — report the in-flight state
+        //      and return. The instance names are deterministic (every companion
+        //      uses the stack name) so the running flow already converges OSC
+        //      instances; a parallel flow would only race saveSecret and waste
+        //      OSC calls.
+        //   2. Persisted convergence: read the stored StackConfig for this
+        //      name (durable across process restarts). A 'ready' config means
+        //      the stack already exists — return its coordinates without
+        //      creating anything. A 'provisioning' marker means a prior attempt
+        //      is (or was) mid-flight; we resume/converge rather than duplicate.
+        if (inFlightProvisions.has(name)) {
+          ops.update(op.id, {
+            status: 'done',
+            completedAt: Date.now(),
+            result: {
+              name,
+              status: 'in_progress',
+              message:
+                'provisioning for this stack is already in progress; ' +
+                'converging on the existing operation rather than creating a ' +
+                'duplicate companion set'
+            }
+          });
+          return;
+        }
+        inFlightProvisions.add(name);
+
+        try {
+          if (paramStore) {
+            try {
+              const wsId = await deriveWorkspaceId(osc);
+              const existing = await paramStore.loadStackConfig(wsId, name);
+              // A completed stack: converge, return its coordinates, create
+              // nothing. isReadyStack treats a legacy status-less config as
+              // ready (param-store.ts:102).
+              if (existing && isReadyStack(existing)) {
+                ops.update(op.id, {
+                  status: 'done',
+                  completedAt: Date.now(),
+                  result: {
+                    name,
+                    minioEndpoint: existing.minioEndpoint,
+                    couchdbUrl: existing.couchdbUrl,
+                    redisUrl: existing.redisUrl
+                  }
+                });
+                return;
+              }
+              // No completed config yet: record a 'provisioning' marker BEFORE
+              // creating any companion so a repeated call (this process or a
+              // fresh one after a restart) sees an attempt is in flight and
+              // converges instead of starting a new companion set. This is
+              // best-effort — a marker-write failure must not block the live
+              // provision, so it is logged and provisioning continues.
+              await paramStore.storeStackConfig(wsId, name, {
+                status: 'provisioning',
+                minioEndpoint: '',
+                couchdbUrl: '',
+                redisUrl: '',
+                sourceBucket: SOURCE_BUCKET,
+                packagedBucket: PACKAGED_BUCKET,
+                storage: storageMetadata,
+                services: []
+              });
+            } catch (err) {
+              app.log.warn(
+                { err, name },
+                'idempotency pre-flight (param store) failed; continuing provision'
+              );
+            }
+          }
 
       // secretRef registers a value as an OSC secret scoped to a specific
       // serviceId and returns the {{secrets.<name>}} reference to embed in the
@@ -882,6 +973,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             completedAt: Date.now(),
             error: `provisioning failed at ${currentService}: ${message}`
           });
+        }
+        } finally {
+          // Release the in-process idempotency guard (issue #417) whether the
+          // flow completed, converged, or failed, so a later legitimate retry
+          // (e.g. resuming after a partial failure) is not blocked.
+          inFlightProvisions.delete(name);
         }
       });
     }
