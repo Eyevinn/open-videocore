@@ -42,6 +42,7 @@ import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-clie
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
 import type { SceneDetector } from '../pipeline/scene-detector.js';
 import type { Context } from '@osaas/client-core';
+import type { ResolverHealthSignal } from './resolver-health.js';
 
 // Builders that turn a stored optional-service instance name (from the stack
 // record) into the corresponding pipeline-step generator (issue #217). main.ts
@@ -348,6 +349,11 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
+  // Aggregate degraded-resolution signal (issue #422). When supplied the
+  // resolver emits on every degraded fallback (no-storage / stale
+  // last-known-good) so an operator can detect a degraded-but-not-crashed
+  // instance via /health without logs.
+  private resolverHealth: ResolverHealthSignal | undefined;
   // Diagnostic/observability logger. `info`/`warn` carry the read-path
   // diagnostics (issue #415: (namespace, stack name) correlation on each
   // resolve); `error` surfaces a transient parameter-store refresh failure
@@ -364,6 +370,11 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
+    // Aggregate degraded-resolution signal (issue #422). Optional so existing
+    // callers/tests are unaffected; when supplied the resolver emits on every
+    // degraded fallback (no-storage / stale last-known-good) so an operator can
+    // detect a degraded-but-not-crashed instance via /health without logs.
+    resolverHealth?: ResolverHealthSignal;
     // Injected logger so read-path diagnostics (issue #415) and transient
     // parameter-store refresh failures (issue #419) are observable. Optional;
     // defaults to a noop for callers/tests that don't wire one.
@@ -374,6 +385,7 @@ export class WorkspaceStackResolver {
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
+    this.resolverHealth = opts.resolverHealth;
     this.log = opts.log ?? noopLogger;
   }
 
@@ -392,6 +404,9 @@ export class WorkspaceStackResolver {
     // bypassing the parameter store entirely.
     const envConnections = buildEnvConnections(this.oscContext);
     if (envConnections) {
+      // Explicit env override is an intended, healthy configuration — not a
+      // degraded fallback. Clear any prior degraded gauge (issue #422).
+      this.resolverHealth?.markHealthy();
       // Env-override is not a ready-stack resolution: it is never eligible for
       // the last-known-good fallback (invariant: env-override path unchanged).
       this.cache.set(cacheKey, {
@@ -404,7 +419,12 @@ export class WorkspaceStackResolver {
     }
 
     const ps = this.paramStore;
-    if (!ps) return buildInMemoryConnections();
+    if (!ps) {
+      // No parameter store configured: the resolver serves no-op in-memory
+      // (no-storage) connections. Signal this degraded state (issue #422).
+      this.resolverHealth?.markNoStorageFallback();
+      return buildInMemoryConnections();
+    }
 
     // Resolve the stack config: an explicit stack name addresses that stack
     // directly; otherwise use the first provisioned stack as the workspace
@@ -483,6 +503,10 @@ export class WorkspaceStackResolver {
       // last-known-good is the post-failure path only; any future retry (#421)
       // runs before we get here.
       if (servingLastKnownGood && cached) {
+        // Serving stale-but-good ready-stack connections is a degraded (but not
+        // crashed) state: signal it so /health surfaces the stale fallback
+        // (issue #422).
+        this.resolverHealth?.markStaleLastKnownGood();
         // Serve stale-but-good WITHOUT extending expiresAt or resetting
         // resolvedAt: the entry stays past-TTL so the next request re-attempts a
         // fresh refresh, and MAX_STALE_MS keeps counting from first success so
@@ -505,6 +529,17 @@ export class WorkspaceStackResolver {
       config && isReadyStack(config)
         ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
         : null;
+
+    // Emit the aggregate degraded-resolution signal (issue #422): a null build
+    // here means we could not connect a ready stack and are dropping to the
+    // no-op in-memory (no-storage) fallback. A live build is healthy and clears
+    // any prior degraded gauge.
+    if (built) {
+      this.resolverHealth?.markHealthy();
+    } else {
+      this.resolverHealth?.markNoStorageFallback();
+    }
+
     const connections = built ?? buildInMemoryConnections();
 
     // Only a resolution built from a real ready-stack config is eligible to be
