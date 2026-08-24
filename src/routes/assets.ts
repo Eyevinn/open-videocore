@@ -67,7 +67,9 @@ import { validateProfileParams } from '../pipeline/profile-params.js';
 import {
   resolveBurnInSource,
   buildSubtitlesFilter,
-  checkBurnInObjectAvailable
+  checkBurnInObjectAvailable,
+  validateForceStyle,
+  BURN_IN_FORCE_STYLE_MAX_LENGTH
 } from '../pipeline/burn-in.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
@@ -157,18 +159,41 @@ const customProfileSchema = z.object({
 // injection surface). Values omitted -> unchanged default output.
 const profileParamsSchema = z.record(z.string(), z.string());
 
-// Burn-in caption source (issue #388, ADR-014 D2). Optional + additive: absent
-// => no burn-in, today's transcodes unchanged. `source` is a discriminated union
-// on `type`; `forceStyle` is a free-form libass style string forwarded verbatim.
-// Format gating (srt/vtt only, ttml rejected) and objectKey resolution happen in
-// the handler (resolveBurnInSource) so the not-ready/not-found/unsupported cases
-// map to descriptive 4xx responses rather than opaque schema errors.
+// Burn-in caption source (issue #388, ADR-014 D2; styling contract hardened by
+// issue #390). Optional + additive: absent => no burn-in, today's transcodes
+// unchanged. `source` is a discriminated union on `type`. Format gating (srt/vtt
+// only, ttml rejected) and objectKey resolution happen in the handler
+// (resolveBurnInSource) so the not-ready/not-found/unsupported cases map to
+// descriptive 4xx responses rather than opaque schema errors.
+//
+// STYLING CONTRACT (issue #390): the default on-screen appearance is WHATEVER THE
+// SIDECAR CARRIES — a vtt sidecar's cue settings convey position/styling; an srt
+// sidecar conveys none, so the burn-in renderer's defaults apply. `forceStyle` is
+// an OPTIONAL, EXPLICIT, VALIDATED override — NOT a free-form ffmpeg filter
+// string. It is a comma-separated list of `Key=Value` libass style directives
+// where every Key is allowlisted (validateForceStyle / BURN_IN_ALLOWED_STYLE_KEYS
+// in ../pipeline/burn-in.ts) and every Value uses a strict safe charset. Any value
+// containing quotes, commas (outside the separator), colons, semicolons,
+// backslashes or newlines — i.e. anything that could escape `force_style='...'`
+// and inject filtergraph content — is REJECTED with a 422 (see the handler). The
+// schema bounds length; the exact allowlist/charset check runs in the handler so
+// the rejection carries a specific, actionable message.
 const burnInSchema = z.object({
-  source: z.discriminatedUnion('type', [
-    z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
-    z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
-  ]),
-  forceStyle: z.string().max(1024).optional()
+  source: z
+    .discriminatedUnion('type', [
+      z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
+      z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
+    ])
+    .describe(
+      'Caption source, resolved to one workspace-local sidecar object key. Burn-in supports srt and vtt only; a ttml source (or track) is rejected with 422 (ADR-014 D4).'
+    ),
+  forceStyle: z
+    .string()
+    .max(BURN_IN_FORCE_STYLE_MAX_LENGTH)
+    .optional()
+    .describe(
+      "Optional styling/positioning override. Default styling is whatever the sidecar carries (vtt cue settings convey position/styling; srt conveys none, so the renderer defaults apply). This is NOT a free-form ffmpeg filter string: it is a comma-separated list of 'Key=Value' libass style directives drawn from an allowlist (FontName, FontSize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, Outline, Shadow, Spacing, Alignment, MarginL, MarginR, MarginV, BorderStyle). Positioning is expressed via Alignment (numpad 1-9) and MarginV. Values may only use letters, digits and the limited set '&#.+%- '; any quote, comma (outside the separator), colon, semicolon, backslash or newline is rejected with 422. Example: \"FontName=Sans,FontSize=24,Alignment=2,MarginV=40\"."
+    )
 });
 
 const transcodeBodySchema = z
@@ -2475,6 +2500,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // wait). Absent `burnIn` => no filter, clean rendition (unchanged).
       let burnInSubtitlesFilter: string | undefined;
       if (request.body.burnIn) {
+        // Styling override (issue #390): validate the caller's `forceStyle` against
+        // the allowlist + safe charset BEFORE resolving/dispatching. This CLOSES
+        // the filter-injection hole #388 left (raw forwarding into
+        // force_style='...'): a quote/comma/colon/backslash/newline — anything that
+        // could escape the quoting and inject filtergraph content — is rejected
+        // here with a 422 and never reaches buildSubtitlesFilter. Only the
+        // canonical, allowlisted string is composed into the filter.
+        let canonicalForceStyle: string | undefined;
+        if (request.body.burnIn.forceStyle !== undefined && request.body.burnIn.forceStyle.trim() !== '') {
+          const styleCheck = validateForceStyle(request.body.burnIn.forceStyle);
+          if (!styleCheck.ok) {
+            return reply.code(422).send({ error: 'burn_in_invalid_force_style', message: styleCheck.message });
+          }
+          canonicalForceStyle = styleCheck.canonical;
+        }
         const resolved = resolveBurnInSource(
           request.body.burnIn.source,
           asset.subtitleTracks
@@ -2522,7 +2562,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             message: availability.message
           });
         }
-        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, request.body.burnIn.forceStyle);
+        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, canonicalForceStyle);
       }
       try {
         const result = await submitTranscode(
