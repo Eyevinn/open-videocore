@@ -12,6 +12,14 @@ import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod
 import { profilesRouter } from '../src/routes/profiles.js';
 import { InMemoryProfileRepository } from '../src/data/inmemory-profile-repo.js';
 import { parseProfileIndex, bootstrapProfiles } from '../src/services/profile-bootstrap.js';
+import {
+  LOUDNORM_PROFILE_NAME,
+  LOUDNORM_TARGET_PARAM,
+  LOUDNORM_DEFAULT_TARGET_LUFS,
+  LOUDNORM_FILTER
+} from '../src/services/builtin-profiles.js';
+import { isProfileRunnable } from '../src/services/profile-runnability.js';
+import { declaredProfileParamKeys } from '../src/pipeline/profile-params.js';
 
 const BOOTSTRAP_URL = 'https://example.test/profiles.yml';
 
@@ -216,10 +224,15 @@ describe('profile bootstrap (issue #84)', () => {
       indexUrl: 'https://example.test/dir/profiles.yml'
     });
 
-    expect(result).toEqual({ seeded: 1, skipped: false });
+    // One remote profile seeded (`program`); built-ins (issue #385) are also
+    // ensured, so builtinSeeded reflects the loudnorm profile added on a fresh
+    // store. The remote `program` profile is still present with its exact YAML.
+    expect(result.seeded).toBe(1);
+    expect(result.skipped).toBe(false);
+    expect(result.builtinSeeded).toBeGreaterThanOrEqual(1);
     const stored = await repo.list();
-    expect(stored.map((p) => p.name)).toEqual(['program']);
-    expect(stored[0].yaml).toBe('name: program\n');
+    const program = stored.find((p) => p.name === 'program');
+    expect(program?.yaml).toBe('name: program\n');
   });
 
   it('skips seeding when profiles already exist', async () => {
@@ -229,7 +242,64 @@ describe('profile bootstrap (issue #84)', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await bootstrapProfiles({ repository: repo, indexUrl: 'https://example.test/profiles.yml' });
-    expect(result).toEqual({ seeded: 0, skipped: true });
+    // Remote-index seeding is skipped because the store already held a profile,
+    // but built-ins (issue #385) are still ensured without any remote fetch.
+    expect(result.seeded).toBe(0);
+    expect(result.skipped).toBe(true);
+    expect(result.builtinSeeded).toBeGreaterThanOrEqual(1);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('built-in loudness-normalisation profile (issue #385)', () => {
+  it('ships single-pass loudnorm with a -23 LUFS default target parametrised via profileParams', () => {
+    // The shipped filter is single-pass loudnorm (ADR-013), with the integrated
+    // target defaulted to -23 LUFS (broadcast EBU R128) via a profileParams SpEL
+    // expression, and TP=-1 / LRA=7 as the fixed EBU R128 companions.
+    expect(LOUDNORM_DEFAULT_TARGET_LUFS).toBe(-23);
+    expect(LOUDNORM_FILTER).toBe(
+      `loudnorm=I=#{profileParams['${LOUDNORM_TARGET_PARAM}']?:-23}:TP=-1:LRA=7`
+    );
+    // The target key is auto-allowlisted for POST /:id/transcode because the
+    // allowlist extractor (#290) derives keys from exactly this SpEL shape.
+    expect(declaredProfileParamKeys(LOUDNORM_FILTER).has(LOUDNORM_TARGET_PARAM)).toBe(true);
+  });
+
+  it('is seeded by bootstrap, appears in the served index.yml and is runnable', async () => {
+    const repo = new InMemoryProfileRepository();
+    // A store that already holds a profile: remote-index seeding is skipped, but
+    // the built-in loudnorm profile must still be ensured (issue #385).
+    await repo.create({ name: 'existing', yaml: 'x: 1\n' });
+    vi.stubGlobal('fetch', vi.fn());
+    await bootstrapProfiles({ repository: repo, indexUrl: 'https://example.test/profiles.yml' });
+    vi.restoreAllMocks();
+
+    const app = await buildApp(repo);
+    try {
+      // The stored profile is CPU-only (no NVENC/CUDA) -> runnable.
+      const stored = await repo.get(LOUDNORM_PROFILE_NAME);
+      expect(stored).toBeDefined();
+      expect(isProfileRunnable(stored!.yaml)).toBe(true);
+
+      // It appears in the runnable selectable picker.
+      const list = await app.inject({ method: 'GET', url: '/api/v1/profiles' });
+      expect(list.json().profiles).toContain(LOUDNORM_PROFILE_NAME);
+
+      // It appears in the public Encore-facing index.yml (runnable-gated).
+      const index = await app.inject({ method: 'GET', url: '/api/v1/profiles/index.yml' });
+      expect(index.statusCode).toBe(200);
+      expect(index.body).toContain(`${LOUDNORM_PROFILE_NAME}: ${LOUDNORM_PROFILE_NAME}/yaml`);
+
+      // Its served YAML carries the parametrised single-pass loudnorm filter.
+      const yaml = await app.inject({
+        method: 'GET',
+        url: `/api/v1/profiles/${LOUDNORM_PROFILE_NAME}/yaml`
+      });
+      expect(yaml.statusCode).toBe(200);
+      expect(yaml.body).toContain(LOUDNORM_FILTER);
+      expect(yaml.body).toContain('type: AudioEncode');
+    } finally {
+      await app.close();
+    }
   });
 });
