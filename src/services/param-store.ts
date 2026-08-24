@@ -203,6 +203,47 @@ function assertNoCredentials(config: StackConfig): void {
   }
 }
 
+// Minimal structured logger surface, compatible with Fastify's / pino's
+// `log.level(obj, msg)` shape (mirrors DispatcherLogger in
+// webhook-dispatcher.ts and TamsConfigLogger in tams/tams-config.ts). Injected
+// so both the read/write-path diagnostics (issue #415, info/warn) and the retry
+// attempts (issue #421, debug/warn/error) are observable without coupling to a
+// concrete logger. ALL methods are optional so a caller/test can wire only the
+// levels it cares about (e.g. `{ debug }`); the client fills the gaps with a
+// no-op via the resolved logger below.
+export type ParamStoreLogger = {
+  info?: (obj: unknown, msg?: string) => void;
+  warn?: (obj: unknown, msg?: string) => void;
+  debug?: (obj: unknown, msg?: string) => void;
+  error?: (obj: unknown, msg?: string) => void;
+};
+
+// Back-compat alias for the issue #415 diagnostic-logger name still referenced
+// by callers (e.g. paramStoreFromEnv). Same shape as ParamStoreLogger.
+export type ParamStoreDiagLog = ParamStoreLogger;
+
+// A fully-populated logger the client can call unconditionally: every method is
+// present so the issue #415 diagnostic call sites (diag.info/diag.warn) and the
+// issue #421 retry call sites (diag.debug/diag.error) never guard for undefined.
+type ResolvedParamStoreLogger = Required<ParamStoreLogger>;
+
+// Tuning knobs for the bounded retry-with-backoff around the param-store HTTP
+// round-trip (issue #421). Defaults are conservative so a request-scoped
+// preHandler resolve cannot hang: at most RETRY attempts and RETRY_MAX_ELAPSED
+// wall-clock across all of them, jittered exponential backoff between tries.
+export type ParamStoreRetryConfig = {
+  // Total number of attempts including the first (so `3` = 1 try + 2 retries).
+  attempts?: number;
+  // Base backoff in ms; delay grows exponentially: base * 2^(attempt-1).
+  baseDelayMs?: number;
+  // Hard cap on any single backoff delay.
+  maxDelayMs?: number;
+  // Hard cap on total wall-clock spent across all attempts+backoffs. Once this
+  // budget is exhausted we stop retrying even if attempts remain, so a
+  // preHandler cannot hang beyond it.
+  maxElapsedMs?: number;
+};
+
 export type HttpParamStoreConfig = {
   // Base URL of the eyevinn-app-config-svc instance, resolved at runtime from
   // PARAMETER_STORE_INSTANCE_NAME via the OSC SDK (getInstance().url).
@@ -216,30 +257,75 @@ export type HttpParamStoreConfig = {
   fetch?: typeof globalThis.fetch;
   // Per-request timeout in milliseconds. All external OSC calls must be bounded.
   timeoutMs?: number;
-  // OPTIONAL diagnostic logger (issue #415). When supplied, the client emits the
-  // EXACT key it writes and the EXACT key it reads (plus the outcome: written /
-  // hit / miss / error). This makes a write-vs-read failure in the
-  // self-provisioning flow determinable from the logs — a stored key that is
-  // never read (or a read key that never matches a written key) pins the defect
-  // to one side. Defaults to a no-op: no behaviour change when unset.
-  log?: ParamStoreDiagLog;
+  // OPTIONAL logger. Carries the issue #415 read/write-path diagnostics
+  // (info/warn: the EXACT key written and the EXACT key read, plus the outcome,
+  // so a write-vs-read mismatch in the self-provisioning flow is determinable
+  // from the logs) AND the issue #421 retry observability (debug per retry, warn
+  // on non-retryable, error on exhaustion). Defaults to a no-op: no behaviour
+  // change when unset.
+  log?: ParamStoreLogger;
+  // Optional retry tuning (issue #421). Omitted keys fall back to DEFAULT_RETRY.
+  retry?: ParamStoreRetryConfig;
+  // Injectable sleep for tests, so backoff waits can be advanced deterministically
+  // without real timers. Defaults to a real setTimeout-based delay.
+  sleep?: (ms: number) => Promise<void>;
 };
 
-// Minimal structured-logger shape the param-store diagnostics (issue #415) use.
-// Compatible with the Fastify/pino logger already threaded through the app, so
-// callers pass their existing `request.log` / `app.log` unchanged.
-export interface ParamStoreDiagLog {
-  info(obj: Record<string, unknown>, msg: string): void;
-  warn(obj: Record<string, unknown>, msg: string): void;
-}
-
-// No-op logger so the client can call log.* unconditionally when none supplied.
-const NOOP_DIAG_LOG: ParamStoreDiagLog = {
+// No-op logger so the client can call every method unconditionally when none is
+// supplied (or when a caller wires only some levels).
+const NOOP_DIAG_LOG: ResolvedParamStoreLogger = {
   info() {},
-  warn() {}
+  warn() {},
+  debug() {},
+  error() {}
 };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+
+// Retry defaults (issue #421). 3 attempts total (1 + 2 retries), exponential
+// backoff from 100ms capped at 2s per wait, and a 6s total wall-clock budget so
+// the whole retry loop stays well under a reasonable preHandler timeout.
+const DEFAULT_RETRY: Required<ParamStoreRetryConfig> = {
+  attempts: 3,
+  baseDelayMs: 100,
+  maxDelayMs: 2_000,
+  maxElapsedMs: 6_000
+};
+
+// Marker error thrown when the param-store returns a definitive HTTP status
+// that must NOT be retried (4xx auth/config). Carries the status so callers can
+// still surface a precise message. Retryable 5xx are thrown as plain errors.
+export class NonRetryableParamStoreError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'NonRetryableParamStoreError';
+    this.status = status;
+  }
+}
+
+// Classify a thrown failure as retryable. Retryable: network/timeout/TLS blips
+// (fetch rejects: AbortError from the timeout, ECONNRESET, self-signed-cert /
+// TLS errors) and server-side 5xx. Non-retryable: 4xx auth/config, signalled by
+// NonRetryableParamStoreError, which must never be retried (a hard auth failure
+// will not self-correct and retrying only delays the caller). Unknown thrown
+// values default to retryable — a transient blip is the more likely cause of an
+// unexpected rejection than a permanent condition, and the attempt cap bounds it.
+function isRetryable(err: unknown): boolean {
+  if (err instanceof NonRetryableParamStoreError) return false;
+  return true;
+}
+
+// Full-jitter exponential backoff: pick a random delay in [0, capped-exp) so
+// concurrent callers do not synchronise their retries (thundering herd).
+function backoffDelay(attempt: number, cfg: Required<ParamStoreRetryConfig>): number {
+  const exp = cfg.baseDelayMs * 2 ** (attempt - 1);
+  const capped = Math.min(exp, cfg.maxDelayMs);
+  return Math.floor(Math.random() * capped);
+}
+
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 // HTTP-backed parameter store client for eyevinn-app-config-svc.
 //
@@ -258,7 +344,18 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   const doFetch = config.fetch ?? globalThis.fetch;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const base = config.baseUrl.replace(/\/$/, '');
-  const diag = config.log ?? NOOP_DIAG_LOG;
+  // Single resolved logger used for BOTH the issue #415 read/write-path
+  // diagnostics (diag.info/diag.warn) and the issue #421 retry observability
+  // (diag.debug/diag.error). Each supplied method overrides the corresponding
+  // no-op, so a caller that wires only some levels (e.g. `{ debug }`) still lets
+  // the client call every method unconditionally. Defaults to the full no-op
+  // when no logger is supplied.
+  const diag: ResolvedParamStoreLogger = { ...NOOP_DIAG_LOG, ...config.log };
+  const sleep = config.sleep ?? realSleep;
+  const retry: Required<ParamStoreRetryConfig> = {
+    ...DEFAULT_RETRY,
+    ...config.retry
+  };
 
   function configUrl(key?: string): string {
     const path = key ? `/${encodeURIComponent(key)}` : '';
@@ -275,6 +372,59 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // Bounded retry-with-backoff around a single param-store round-trip (issue
+  // #421). `op` runs one full attempt (headers + fetch + status handling) and
+  // either resolves, throws a retryable error (network/timeout/TLS/5xx), or
+  // throws a NonRetryableParamStoreError (4xx). We retry retryable failures with
+  // full-jitter exponential backoff up to `attempts` tries AND `maxElapsedMs`
+  // wall-clock, whichever comes first. On exhaustion the last error propagates
+  // to the caller (workspace-stack resolve()'s catch, where issue #420's
+  // last-known-good fallback then takes over) rather than being swallowed here.
+  async function withRetry<T>(label: string, op: () => Promise<T>): Promise<T> {
+    const start = Date.now();
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= retry.attempts; attempt++) {
+      try {
+        return await op();
+      } catch (err) {
+        lastErr = err;
+        const elapsed = Date.now() - start;
+        const message = err instanceof Error ? err.message : String(err);
+        if (!isRetryable(err)) {
+          diag.warn(
+            { op: label, attempt, elapsedMs: elapsed, error: message },
+            'param-store call failed with a non-retryable error; not retrying'
+          );
+          throw err;
+        }
+        const isLastAttempt = attempt >= retry.attempts;
+        // Compute the next backoff, but never sleep past the wall-clock budget.
+        const delay = backoffDelay(attempt, retry);
+        const budgetExhausted = elapsed + delay >= retry.maxElapsedMs;
+        if (isLastAttempt || budgetExhausted) {
+          diag.error(
+            {
+              op: label,
+              attempt,
+              attempts: retry.attempts,
+              elapsedMs: elapsed,
+              error: message
+            },
+            'param-store call exhausted retries; handing off to fallback'
+          );
+          throw err;
+        }
+        diag.debug(
+          { op: label, attempt, nextDelayMs: delay, elapsedMs: elapsed, error: message },
+          'param-store call failed; retrying after backoff'
+        );
+        await sleep(delay);
+      }
+    }
+    // Unreachable: the loop always returns or throws, but satisfy the type checker.
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
   async function buildHeaders(): Promise<Record<string, string>> {
@@ -323,54 +473,70 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 
     async loadStackConfig(workspaceId, name) {
       const key = stackConfigKey(workspaceId, name);
-      const h = await buildHeaders();
-      const res = await withTimeout((signal) =>
-        doFetch(configUrl(key), { method: 'GET', headers: h, signal })
-      );
-      if (res.status === 404) {
-        // READ-PATH diagnostic (issue #415): the EXACT key we looked up returned
-        // a miss. Compare this key to the 'param-store write ok' key for the same
-        // stack: if the store logged a successful write of THIS key, the value is
-        // present and the miss is spurious; if the written key DIFFERS (e.g. a
-        // namespace / stack-name mismatch), the defect is a read-side key
-        // derivation bug — not a failed write.
-        diag.warn(
-          { op: 'loadStackConfig', workspaceId, name, key, status: 404 },
-          'param-store read miss'
+      // Wrap the read round-trip in bounded retry-with-backoff (issue #421) and
+      // thread the issue #415 read-path diagnostics through inside the op so a
+      // spurious miss / key mismatch is still logged on the attempt that
+      // resolves. 4xx/malformed-value throw NonRetryableParamStoreError so the
+      // retry loop stops immediately; 5xx/network/timeout are retried.
+      return withRetry('loadStackConfig', async () => {
+        const h = await buildHeaders();
+        const res = await withTimeout((signal) =>
+          doFetch(configUrl(key), { method: 'GET', headers: h, signal })
         );
-        return undefined;
-      }
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        diag.warn(
+        if (res.status === 404) {
+          // READ-PATH diagnostic (issue #415): the EXACT key we looked up
+          // returned a miss. Compare this key to the 'param-store write ok' key
+          // for the same stack: if the store logged a successful write of THIS
+          // key, the value is present and the miss is spurious; if the written
+          // key DIFFERS (e.g. a namespace / stack-name mismatch), the defect is a
+          // read-side key derivation bug — not a failed write.
+          diag.warn(
+            { op: 'loadStackConfig', workspaceId, name, key, status: 404 },
+            'param-store read miss'
+          );
+          return undefined;
+        }
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          const msg = `parameter store read failed: ${res.status} ${text}`.trim();
+          diag.warn(
+            { op: 'loadStackConfig', workspaceId, name, key, status: res.status },
+            'param-store read failed'
+          );
+          // 4xx (auth/config) will not self-correct — do not retry (issue #421).
+          if (res.status >= 400 && res.status < 500) {
+            throw new NonRetryableParamStoreError(msg, res.status);
+          }
+          throw new Error(msg);
+        }
+        const body = (await res.json().catch(() => ({}))) as { value?: string };
+        if (typeof body.value !== 'string' || body.value.length === 0) {
+          // READ-PATH diagnostic (issue #415): the key resolved (200) but carried
+          // no value — a stored-empty / partial-write signature distinct from a
+          // key mismatch (which would 404 above).
+          diag.warn(
+            { op: 'loadStackConfig', workspaceId, name, key, status: res.status, empty: true },
+            'param-store read returned empty value'
+          );
+          return undefined;
+        }
+        // READ-PATH diagnostic (issue #415): the EXACT key that resolved to a
+        // stored config. A hit here for the same key the write logged confirms
+        // the round-trip works and moves the investigation elsewhere.
+        diag.info(
           { op: 'loadStackConfig', workspaceId, name, key, status: res.status },
-          'param-store read failed'
+          'param-store read hit'
         );
-        throw new Error(`parameter store read failed: ${res.status} ${text}`.trim());
-      }
-      const body = (await res.json().catch(() => ({}))) as { value?: string };
-      if (typeof body.value !== 'string' || body.value.length === 0) {
-        // READ-PATH diagnostic (issue #415): the key resolved (200) but carried
-        // no value — a stored-empty / partial-write signature distinct from a
-        // key mismatch (which would 404 above).
-        diag.warn(
-          { op: 'loadStackConfig', workspaceId, name, key, status: res.status, empty: true },
-          'param-store read returned empty value'
-        );
-        return undefined;
-      }
-      // READ-PATH diagnostic (issue #415): the EXACT key that resolved to a
-      // stored config. A hit here for the same key the write logged confirms the
-      // round-trip works and moves the investigation elsewhere.
-      diag.info(
-        { op: 'loadStackConfig', workspaceId, name, key, status: res.status },
-        'param-store read hit'
-      );
-      try {
-        return JSON.parse(body.value) as StackConfig;
-      } catch {
-        throw new Error(`parameter store value for "${key}" is not valid JSON`);
-      }
+        try {
+          return JSON.parse(body.value) as StackConfig;
+        } catch {
+          // A malformed stored value is not a transient blip — do not retry.
+          throw new NonRetryableParamStoreError(
+            `parameter store value for "${key}" is not valid JSON`,
+            200
+          );
+        }
+      });
     },
 
     async deleteStackConfig(workspaceId, name) {
@@ -387,21 +553,31 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 
     async listStackNames(workspaceId) {
       const prefix = `openvideocore/${workspaceId}/`;
-      const h = await buildHeaders();
       // The app-config-svc list endpoint returns { items: [{ key, value }], total }
-      // with a configurable limit. We fetch up to 200 to cover realistic use.
-      const res = await withTimeout((signal) =>
-        doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
-      );
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`parameter store list failed: ${res.status} ${text}`.trim());
-      }
-      const body = (await res.json()) as { items?: { key: string }[] };
-      return (body.items ?? [])
-        .map((item) => item.key)
-        .filter((key) => key.startsWith(prefix))
-        .map((key) => key.slice(prefix.length));
+      // with a configurable limit. We fetch up to 100 to cover realistic use.
+      // This GET is the stack-resolver refresh round-trip (issue #421): wrap it
+      // in bounded retry-with-backoff so a boot-time TLS blip or timeout does not
+      // turn into a full storage outage for the instance.
+      return withRetry('listStackNames', async () => {
+        const h = await buildHeaders();
+        const res = await withTimeout((signal) =>
+          doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+        );
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          const msg = `parameter store list failed: ${res.status} ${text}`.trim();
+          // 4xx (auth/config) will not self-correct — do not retry (issue #421).
+          if (res.status >= 400 && res.status < 500) {
+            throw new NonRetryableParamStoreError(msg, res.status);
+          }
+          throw new Error(msg);
+        }
+        const body = (await res.json()) as { items?: { key: string }[] };
+        return (body.items ?? [])
+          .map((item) => item.key)
+          .filter((key) => key.startsWith(prefix))
+          .map((key) => key.slice(prefix.length));
+      });
     }
   };
 }

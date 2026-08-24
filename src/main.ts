@@ -270,8 +270,11 @@ const stackResolver = new WorkspaceStackResolver({
   // every no-storage / stale fallback so /health reports a degraded-but-not-
   // crashed instance without reading logs.
   resolverHealth,
-  // Diagnostic logger (issue #415): logs the (namespace, stack name) the
-  // resolver reads with so a read-back miss correlates with the write key.
+  // Diagnostic/observability logger. Read-path diagnostics (issue #415): logs
+  // the (namespace, stack name) the resolver reads with so a read-back miss
+  // correlates with the write key. Also surfaces transient parameter-store
+  // refresh failures instead of swallowing them (issue #419) so a subsequent
+  // 501 from the storage routes is traceable.
   log: app.log
 });
 
