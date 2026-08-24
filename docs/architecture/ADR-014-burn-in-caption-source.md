@@ -158,10 +158,11 @@ burnIn: {
     | { type: "sidecarKey"; objectKey: string }   // (a) explicit sidecar
     | { type: "subtitleTrack"; trackId: string }   // (b) existing track ref
 
-  // OPTIONAL. Free-form FFmpeg `force_style` string forwarded verbatim into the
-  // subtitles filter (e.g. "FontName=Sans,FontSize=24"). Omitted ⇒ no
-  // force_style segment. Callers are responsible for valid libass style syntax;
-  // the API does not parse it (see D3 escaping note).
+  // OPTIONAL. An EXPLICIT, VALIDATED, allowlisted libass `force_style` override
+  // (e.g. "FontName=Sans,FontSize=24,Alignment=2,MarginV=40"). NOT a free-form
+  // filter string — see D5 (hardened by issue #390): comma-separated Key=Value
+  // directives, allowlisted keys + strict safe value charset, anything else is a
+  // 422. Omitted ⇒ styling is whatever the sidecar carries (D5).
   forceStyle?: string
 }
 ```
@@ -266,6 +267,64 @@ because the encore-doc does not pin the `subtitles=` file-path resolution.
   message ("burn-in supports srt/vtt; convert or supply an srt/vtt source"). If
   ttml burn-in is needed later, add an explicit ttml→(srt|vtt) conversion step —
   out of scope here.
+
+### D5 — Styling & positioning contract: **sidecar-carried by default; `forceStyle` is an explicit, allowlisted override — NOT a free-form filter string** (issue #390)
+
+The burn-in parent issue requires the styling/positioning behaviour to be stated
+explicitly, even if the answer is "whatever the sidecar carries." This decision
+pins it, and HARDENS the `forceStyle` field #388 shipped.
+
+**Default styling = whatever the sidecar carries.** The on-screen appearance of a
+burned caption defaults to the styling the sidecar itself conveys:
+
+- **vtt** — carries **cue settings** (position, line, align, size) and inline cue
+  styling; these determine placement/appearance and are honoured by the renderer.
+- **srt** — carries **no styling or positioning**; the burn-in renderer's own
+  defaults apply (default font/size, bottom-centre placement).
+- **ttml** — **not a burn-in format** (D4). It is rejected at request time. (It
+  *can* carry rich styling, but the sidecar generator never emits it and the
+  FFmpeg `subtitles` filter does not convert it inline — so ttml conveys nothing
+  to the burn-in path because the path refuses it.)
+
+So the **format/styling asymmetry** is: burn-in supports **srt** and **vtt**;
+**vtt** conveys position/styling via cue settings, **srt** conveys none, **ttml**
+is rejected. `SubtitleTrack` (#114) may carry ttml, but burn-in will not consume
+it.
+
+**Optional override — `forceStyle` — is explicit and validated, NOT free-form.**
+Encore's `filters` accepts `subtitles=<file>:force_style='...'` (C1,
+eyevinn.github.io/encore-doc), so an override is offered. But it is exposed as an
+**explicit, documented, allowlisted request field**, not a free-form filter
+string:
+
+- **Filter-injection is the hazard.** #388 forwarded `forceStyle` VERBATIM into
+  `force_style='...'`. A caller could embed `'`, `"`, `,`, `:`, `\`, `;` or a
+  newline to escape the quoted segment and inject arbitrary filtergraph content
+  (e.g. `FontName=X',subtitles=evil.srt` chains a second filter). That is both a
+  security vulnerability and a violation of #390's acceptance line "No free-form
+  ffmpeg filter string is accepted from callers for styling."
+- **The hardened contract (implemented in `src/pipeline/burn-in.ts`
+  `validateForceStyle`).** `forceStyle` is a comma-separated list of `Key=Value`
+  libass style directives where **every Key is on an allowlist**
+  (`BURN_IN_ALLOWED_STYLE_KEYS`: FontName, FontSize, PrimaryColour,
+  SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut,
+  Outline, Shadow, Spacing, Alignment, MarginL, MarginR, MarginV, BorderStyle) and
+  **every Value matches a strict safe charset** (letters, digits and the limited
+  set `&#.+%- ` — no character that can escape the quoting or the filtergraph).
+  Anything else — an unknown key, an unsafe value, a malformed entry, an empty
+  entry, or an over-length string — is **rejected with a 422**
+  (`burn_in_invalid_force_style`) at request time. Only the canonical, validated
+  string is ever composed into the filter (`buildSubtitlesFilter`), which
+  additionally re-validates as defence in depth and drops (never forwards) any
+  value that is not clean. **Positioning** is expressed through `Alignment`
+  (numpad 1-9) and `MarginV`; there is no free-form position escape.
+- **Predictability.** Because the accepted directives are enumerated in the
+  OpenAPI field description, a caller can predict the on-screen appearance before
+  submitting: omit `forceStyle` ⇒ sidecar styling (or renderer defaults for srt);
+  supply an allowlisted set ⇒ exactly those overrides.
+
+This supersedes D2's original "free-form `forceStyle` forwarded verbatim / API
+does not parse it" note: the API now DOES parse and validate it.
 
 ## Consequences
 

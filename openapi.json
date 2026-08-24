@@ -1222,11 +1222,15 @@
                     },
                     "skipped": {
                       "type": "boolean"
+                    },
+                    "builtinSeeded": {
+                      "type": "number"
                     }
                   },
                   "required": [
                     "seeded",
-                    "skipped"
+                    "skipped",
+                    "builtinSeeded"
                   ],
                   "additionalProperties": false
                 }
@@ -5258,11 +5262,13 @@
                             ],
                             "additionalProperties": false
                           }
-                        ]
+                        ],
+                        "description": "Caption source, resolved to one workspace-local sidecar object key. Burn-in supports srt and vtt only; a ttml source (or track) is rejected with 422 (ADR-014 D4)."
                       },
                       "forceStyle": {
                         "type": "string",
-                        "maxLength": 1024
+                        "maxLength": 512,
+                        "description": "Optional styling/positioning override. Default styling is whatever the sidecar carries (vtt cue settings convey position/styling; srt conveys none, so the renderer defaults apply). This is NOT a free-form ffmpeg filter string: it is a comma-separated list of 'Key=Value' libass style directives drawn from an allowlist (FontName, FontSize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, Outline, Shadow, Spacing, Alignment, MarginL, MarginR, MarginV, BorderStyle). Positioning is expressed via Alignment (numpad 1-9) and MarginV. Values may only use letters, digits and the limited set '&#.+%- '; any quote, comma (outside the separator), colon, semicolon, backslash or newline is rejected with 422. Example: \"FontName=Sans,FontSize=24,Alignment=2,MarginV=40\"."
                       }
                     },
                     "required": [
@@ -10458,6 +10464,39 @@
                               "type": "string"
                             }
                           },
+                          "encodeAttempts": {
+                            "type": "number"
+                          },
+                          "encodeAttemptLog": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "index": {
+                                  "type": "number"
+                                },
+                                "startedAt": {
+                                  "type": "string"
+                                },
+                                "endedAt": {
+                                  "type": "string"
+                                },
+                                "classification": {
+                                  "type": "string",
+                                  "enum": [
+                                    "transport",
+                                    "io-retryable",
+                                    "deterministic"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "index",
+                                "startedAt"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -10576,6 +10615,39 @@
                         "type": "string"
                       }
                     },
+                    "encodeAttempts": {
+                      "type": "number"
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "startedAt": {
+                            "type": "string"
+                          },
+                          "endedAt": {
+                            "type": "string"
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -10625,6 +10697,7 @@
         }
       },
       "get": {
+        "description": "Read a single job. For transcode jobs, `encodeAttempts` is the number of Encore dispatches and `encodeAttemptLog` records each dispatch in order (index, startedAt, endedAt?, classification?). This is DISTINCT from `attempts`, which counts ingest/URL-pull attempts. To obtain the elapsed time of the successful encode alone (excluding retries), read the LAST entry of `encodeAttemptLog` and compute endedAt \u2212 startedAt.",
         "parameters": [
           {
             "schema": {
@@ -10701,6 +10774,39 @@
                       "type": "array",
                       "items": {
                         "type": "string"
+                      }
+                    },
+                    "encodeAttempts": {
+                      "type": "number"
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "startedAt": {
+                            "type": "string"
+                          },
+                          "endedAt": {
+                            "type": "string"
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
                       }
                     },
                     "createdAt": {
