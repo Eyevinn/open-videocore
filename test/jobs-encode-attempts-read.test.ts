@@ -49,13 +49,13 @@ describe('GET /api/v1/jobs/:id encode attempts (issue #382)', () => {
 
     // First dispatch fails with a transport-class error and is re-dispatched.
     await h.jobs.appendEncodeAttempt(job.id, { startedAt: '2026-08-22T10:00:00.000Z' });
-    await h.jobs.completeEncodeAttempt(job.id, {
+    await h.jobs.finalizeEncodeAttempt(job.id, {
       endedAt: '2026-08-22T10:00:35.000Z',
       classification: 'transport'
     });
     // Second (successful) dispatch.
     await h.jobs.appendEncodeAttempt(job.id, { startedAt: '2026-08-22T10:01:00.000Z' });
-    await h.jobs.completeEncodeAttempt(job.id, { endedAt: '2026-08-22T10:03:00.000Z' });
+    await h.jobs.finalizeEncodeAttempt(job.id, { endedAt: '2026-08-22T10:03:00.000Z' });
 
     const res = await h.app.inject({ method: 'GET', url: `/api/v1/jobs/${job.id}` });
     expect(res.statusCode).toBe(200);
@@ -90,7 +90,7 @@ describe('GET /api/v1/jobs/:id encode attempts (issue #382)', () => {
     const job = await h.jobs.create({ type: 'transcode', assetId: 'asset-2' });
 
     await h.jobs.appendEncodeAttempt(job.id, { startedAt: '2026-08-22T11:00:00.000Z' });
-    await h.jobs.completeEncodeAttempt(job.id, { endedAt: '2026-08-22T11:01:30.000Z' });
+    await h.jobs.finalizeEncodeAttempt(job.id, { endedAt: '2026-08-22T11:01:30.000Z' });
 
     const res = await h.app.inject({ method: 'GET', url: `/api/v1/jobs/${job.id}` });
     expect(res.statusCode).toBe(200);

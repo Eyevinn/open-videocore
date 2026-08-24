@@ -126,11 +126,11 @@ export class PerWorkspaceJobRepository implements JobRepository {
   ): Promise<Job | undefined> {
     return (await this.repo()).appendEncodeAttempt(id, attempt);
   }
-  async completeEncodeAttempt(
+  async finalizeEncodeAttempt(
     id: string,
-    completion: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: FailureClass }
   ): Promise<Job | undefined> {
-    return (await this.repo()).completeEncodeAttempt(id, completion);
+    return (await this.repo()).finalizeEncodeAttempt(id, patch);
   }
 }
 

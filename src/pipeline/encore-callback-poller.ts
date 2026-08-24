@@ -37,7 +37,6 @@ import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { decideRetry, clearRetryState } from '../encore-scaler/retry-store.js';
-import { classifyEncoreFailure, type FailureClass } from '../encore-scaler/retry-policy.js';
 
 // Resolve the correct Encore job API URL using the reverse UUID mapping stored
 // at dispatch time. The callback listener always uses its own configured Encore
@@ -218,34 +217,6 @@ async function decrementActiveJobs(
   }
 }
 
-// Durably close out the current (final) encode attempt on the Job record when
-// an attempt ends — either a FAILED attempt about to be re-dispatched, or the
-// terminal settle of the job (success or exhausted/non-retryable failure) — per
-// #381. #380 appended this attempt (index + startedAt) at dispatch time via the
-// scaler's onEncodeDispatched hook; here we stamp endedAt (always) and, for a
-// failed attempt, its retry-policy classification, so per-attempt timing and
-// class are derivable from the durable log alone (independent of the TTL'd
-// Valkey retry keys). Best-effort: a durable-write failure is logged and
-// swallowed so it never blocks slot release, retry-state cleanup, or a pending
-// re-dispatch.
-async function recordAttemptCompletion(
-  deps: PollerDeps,
-  jobLocalId: string,
-  externalId: string,
-  completion: { endedAt: string; classification?: FailureClass }
-): Promise<void> {
-  try {
-    await deps.jobRepository.completeEncodeAttempt(jobLocalId, completion);
-  } catch (err) {
-    deps.logger.warn({
-      msg: 'encore-callback-poller: failed to record encode-attempt completion',
-      jobLocalId,
-      externalId,
-      err
-    });
-  }
-}
-
 // Process one queue message: fetch the Encore job, resolve our job, complete the
 // transcode, and advance the matching PipelineExecution.
 //
@@ -329,11 +300,10 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
 
-  // #381: classification to stamp on the current (final) encode attempt when it
-  // settles as a FAILURE. Left undefined for a successful attempt (a success has
-  // no failure class). Set from the retry gate's decision below when the job
-  // settles terminal after a failure, so per-attempt classification is durable.
-  let terminalFailureClass: FailureClass | undefined;
+  // #381: the retry classification for the attempt being settled terminally.
+  // Set from the retry gate's decision on the settle branch below; consumed
+  // after completeTranscode to finalize the durable encode-attempt log.
+  let terminalFailureClass: import('../encore-scaler/retry-policy.js').FailureClass | undefined;
 
   // #295: before settling a FAILED job terminal, ask the retry gate whether this
   // is a transport-class failure (S3 pool-acquire timeout on write / severed read
@@ -375,15 +345,20 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
           backoffMs: decision.backoffMs,
           failureMessage
         });
-        // #381: close out the FAILED attempt's durable record BEFORE the retry
-        // re-dispatches. #380 appended this attempt (index + startedAt) at
-        // dispatch time; here we stamp its endedAt and the retry classification
-        // (transport/io-retryable) so per-attempt timing + class are derivable.
-        // The next dispatch's onEncodeDispatched appends a fresh attempt.
-        await recordAttemptCompletion(deps, found.job.id, externalId, {
-          endedAt: new Date().toISOString(),
-          classification: decision.failureClass
-        });
+        // #381: close out the attempt that just FAILED before the retry is
+        // dispatched. Stamp its endedAt + the retry classification onto the
+        // durable encode-attempt log (appended at dispatch time by #380), so this
+        // attempt keeps a distinct start/end pair and its class. The subsequent
+        // re-dispatch appends a fresh (open) attempt entry via onEncodeDispatched.
+        // Best-effort: a durable-write hiccup must not block the retry.
+        try {
+          await deps.jobRepository.finalizeEncodeAttempt(found.job.id, {
+            endedAt: new Date().toISOString(),
+            classification: decision.failureClass
+          });
+        } catch (err) {
+          deps.logger.warn({ msg: 'encore-callback-poller: failed to finalize encode attempt (retry)', jobId: found.job.id, externalId, err });
+        }
         // Free the slot on the instance that ran the FAILED attempt so the
         // scaler can dispatch the retry (and other work) — the retry re-enters
         // the queue and will be dispatched by the loop like any other job.
@@ -392,25 +367,17 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       }
       if (decision?.action === 'settle') {
         // Retries exhausted or non-retryable: fall through to settle terminal,
-        // then clear the retry bookkeeping. Carry the failure class so the
-        // durable attempt record gets its classification stamped below (#381).
-        terminalFailureClass = decision.failureClass;
+        // then clear the retry bookkeeping.
         deps.logger.info({
           msg: 'encore-callback-poller: encode failure settling terminal',
           externalId,
           reason: decision.reason,
           failureClass: decision.failureClass
         });
+        // #381: carry the classification so the terminal attempt's durable log
+        // entry records why this final attempt failed.
+        terminalFailureClass = decision.failureClass;
       }
-    }
-    // #381: when the retry gate is unavailable (non-scaler deployment, or the
-    // gate threw), decision is undefined and we still settle terminal. Classify
-    // the raw Encore message directly so the failed attempt still records a
-    // class rather than none.
-    if (terminalFailureClass === undefined) {
-      terminalFailureClass = classifyEncoreFailure(
-        job.message ?? `encore status: ${status}`
-      );
     }
   }
 
@@ -430,18 +397,23 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   // Free the slot on the Encore instance that ran this job so the scaler can
   // reuse its capacity. Only on a terminal completion that actually applied.
   if (result.applied) {
-    // #381: the job has settled terminally — close out the final encode attempt's
-    // durable record. Stamp its endedAt (always) so elapsed time attributable to
-    // this attempt alone (endedAt - startedAt) is derivable, and, on a terminal
-    // FAILURE, its classification. On SUCCESS no class is set. A never-retried
-    // job therefore ends with exactly one attempt whose startedAt+endedAt are
-    // both set (encodeAttempts === 1). Best-effort: a durable-write hiccup here
-    // must not block slot release or retry-state cleanup.
-    await recordAttemptCompletion(deps, found.job.id, externalId, {
-      endedAt: new Date().toISOString(),
-      classification: success ? undefined : terminalFailureClass
-    });
     await decrementActiveJobs(deps.redis, externalId, deps.logger);
+    // #381: close out the final (open) encode-attempt on the durable log now
+    // that the job has settled terminally. On success the attempt records only
+    // endedAt (no failure classification), so the elapsed time of the successful
+    // attempt is derivable from its start/end pair. On a settled failure it also
+    // records the retry classification captured above. If no dispatch was ever
+    // recorded (pre-#380 job) the helper synthesises a single finalised attempt
+    // so the field reads exactly one attempt and is never 0. Best-effort: a
+    // durable-write hiccup must not block the completion flow.
+    try {
+      await deps.jobRepository.finalizeEncodeAttempt(found.job.id, {
+        endedAt: new Date().toISOString(),
+        ...(success ? {} : { classification: terminalFailureClass })
+      });
+    } catch (err) {
+      deps.logger.warn({ msg: 'encore-callback-poller: failed to finalize encode attempt (terminal)', jobId: found.job.id, externalId, err });
+    }
     // Job has settled terminally (success, or a failure that exhausted/was not
     // eligible for retry): drop the #295 retry bookkeeping so it does not linger.
     await clearRetryState(deps.redis, externalId).catch(() => {});

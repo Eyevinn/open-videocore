@@ -173,18 +173,15 @@ export interface JobRepository {
     id: string,
     attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
   ): Promise<Job | undefined>;
-  // Durably close out the CURRENT (last) encode attempt on completion (#381).
-  // #380 appends an attempt with only { index, startedAt } at dispatch time;
-  // this stamps that same attempt's `endedAt` (always) and, for a failed
-  // attempt, its `classification` (the retry-policy FailureClass). It does NOT
-  // append a new attempt — it enriches the one already in the log — so a
-  // never-retried job ends with exactly one attempt whose startedAt+endedAt are
-  // both set (encodeAttempts === 1). If the log is somehow empty (e.g. the
-  // dispatch append was lost), a single attempt is synthesised so the field is
-  // never 0. Returns the updated job, or undefined if the job id is unknown.
-  completeEncodeAttempt(
+  // Durably close out the latest (open) encode-attempt on completion (ADR-012,
+  // #381): stamp its `endedAt` and, for failures, the retry `classification`
+  // from retry-policy.ts. Called by the callback poller at the decide/complete
+  // path. Finalises the last log entry in place (does NOT append), so a job that
+  // never retried keeps exactly one attempt with one timing pair. Returns the
+  // updated job, or undefined if the job id is unknown.
+  finalizeEncodeAttempt(
     id: string,
-    completion: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: FailureClass }
   ): Promise<Job | undefined>;
 }
 
@@ -268,39 +265,49 @@ export function appendEncodeAttemptToJob(
   return { ...existing, encodeAttemptLog: log, encodeAttempts: log.length, updatedAt: now };
 }
 
-// Close out the CURRENT (last) encode attempt on completion (ADR-012, #381).
-// Pure helper shared by both backends so the enrich-in-place semantics never
-// drift. #380 appends { index, startedAt } at dispatch; this stamps that same
-// (last) attempt's `endedAt` (always) and, on a failed attempt, its
-// `classification`. It enriches in place rather than appending, so a
-// never-retried job keeps exactly one attempt with both timestamps set
-// (encodeAttempts stays 1). If the log is empty (dispatch append lost), a
-// single attempt is synthesised — start = end = now — so the count is never 0
-// and elapsed-time-excluding-retries (last endedAt - startedAt) is derivable.
-export function completeEncodeAttemptOnJob(
+// Durably finalise the LATEST (open) encode-attempt on a job's log by stamping
+// its `endedAt` and (for failures) `classification` (ADR-012, #381). Pure helper
+// shared by both backends so completion semantics never drift.
+//
+// #380 appends one attempt entry per Encore dispatch at dispatch time, carrying
+// only `index`/`startedAt`. #381 closes that entry out on completion: the poller
+// calls this at the decide/complete path so every attempt ends up with a
+// distinct start/end timing pair (the successful attempt's elapsed time is then
+// derivable) and, for failures, the retry classification from retry-policy.ts.
+//
+// The last log entry is the currently-running attempt (attempts are appended in
+// dispatch order and only the most recent is open). We finalise that entry in
+// place rather than appending, so `encodeAttempts`/log length are UNCHANGED — a
+// job that never retried keeps exactly one attempt with one timing pair.
+//
+// Defensive fallback: if the log is empty (e.g. a job dispatched before #380, so
+// no attempt was ever appended), we synthesise one finalised attempt so the
+// field still has a single non-zero reading rather than staying absent.
+export function finalizeLatestEncodeAttemptOnJob(
   existing: Job,
-  completion: { endedAt?: string; classification?: FailureClass },
+  patch: { endedAt?: string; classification?: FailureClass },
   now: string
 ): Job {
-  const log = existing.encodeAttemptLog ? [...existing.encodeAttemptLog] : [];
-  const endedAt = completion.endedAt ?? now;
+  const endedAt = patch.endedAt ?? now;
+  const log = existing.encodeAttemptLog ? existing.encodeAttemptLog.map((a) => ({ ...a })) : [];
   if (log.length === 0) {
-    // No dispatch attempt was recorded — synthesise one so the field has a
-    // single reading (start = end = endedAt) and is never 0.
-    log.push({
+    // No dispatch was ever recorded: synthesise a single finalised attempt so
+    // the never-retried job still reads exactly one attempt (never 0). Its
+    // startedAt falls back to endedAt since no dispatch timestamp exists.
+    const entry: EncodeAttempt = {
       index: 1,
       startedAt: endedAt,
       endedAt,
-      ...(completion.classification !== undefined ? { classification: completion.classification } : {})
-    });
-  } else {
-    const last = log[log.length - 1];
-    log[log.length - 1] = {
-      ...last,
-      endedAt,
-      ...(completion.classification !== undefined ? { classification: completion.classification } : {})
+      ...(patch.classification !== undefined ? { classification: patch.classification } : {})
     };
+    return { ...existing, encodeAttemptLog: [entry], encodeAttempts: 1, updatedAt: now };
   }
+  const lastIdx = log.length - 1;
+  log[lastIdx] = {
+    ...log[lastIdx],
+    endedAt,
+    ...(patch.classification !== undefined ? { classification: patch.classification } : {})
+  };
   return { ...existing, encodeAttemptLog: log, encodeAttempts: log.length, updatedAt: now };
 }
 
@@ -386,15 +393,15 @@ export class InMemoryJobRepository implements JobRepository {
     return { ...next };
   }
 
-  async completeEncodeAttempt(
+  async finalizeEncodeAttempt(
     id: string,
-    completion: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: FailureClass }
   ): Promise<Job | undefined> {
     const existing = this.store.get(id);
     if (!existing) {
       return undefined;
     }
-    const next = completeEncodeAttemptOnJob(existing, completion, new Date().toISOString());
+    const next = finalizeLatestEncodeAttemptOnJob(existing, patch, new Date().toISOString());
     this.store.set(id, next);
     return { ...next };
   }

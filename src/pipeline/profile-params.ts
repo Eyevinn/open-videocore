@@ -55,7 +55,15 @@ export function declaredProfileParamKeys(profileYaml: string): Set<string> {
 }
 
 export type ProfileParamsValidation =
-  | { ok: true }
+  // A genuine pass: the caller's keys were checked against the profile's
+  // declared set and all were accepted (or nothing was sent).
+  | { ok: true; validated: true }
+  // Skipped / permissive: the profile YAML could not be resolved, so no check
+  // was performed. `ok` stays true (request-accepted, fail-open) but the result
+  // is explicitly labelled so callers can distinguish it from a real pass and,
+  // if they wish, log a note or surface a warning. Carries the profile name and
+  // the (sorted) keys that went unchecked. (issue #391)
+  | { ok: true; validated: false; profileName: string; unvalidatedKeys: string[] }
   | {
       ok: false;
       // The keys the caller sent that the chosen profile does not declare.
@@ -74,8 +82,11 @@ export type ProfileParamsValidation =
 //   - `profileYaml` undefined (profile YAML not
 //     resolvable — e.g. a custom profile, or the
 //     profile store is unavailable)              -> PERMISSIVE: ok, no reject,
-//     so custom / operator-added profiles are never falsely rejected. Callers
-//     may log a note; we do not fail closed.
+//     so custom / operator-added profiles are never falsely rejected. This path
+//     returns an EXPLICIT skipped result — `{ ok: true, validated: false, ... }`
+//     carrying the profile name and the sent keys that went unchecked — so a
+//     caller can machine-distinguish "skipped, not checked" from a genuine pass
+//     and log a note or surface a warning. We still do not fail closed. (#391)
 //   - profile declares NO params but caller sent
 //     keys                                       -> reject: nothing is accepted.
 //   - caller sent a key the profile does declare -> passes through unchanged.
@@ -92,21 +103,29 @@ export function validateProfileParams(input: {
   const sentKeys = profileParams ? Object.keys(profileParams) : [];
   if (sentKeys.length === 0) {
     // Empty / absent map is always fine — profiles with no declared params
-    // accept it, and so does everything else.
-    return { ok: true };
+    // accept it, and so does everything else. This is a genuine pass.
+    return { ok: true, validated: true };
   }
 
   if (profileYaml === undefined) {
     // Undeterminable profile (custom profile or profile store unreachable):
     // prefer permissive-with-note over hard-reject so a custom/operator profile
-    // whose param set we cannot read is never falsely rejected.
-    return { ok: true };
+    // whose param set we cannot read is never falsely rejected. Return an
+    // EXPLICIT skipped result so callers can tell this apart from a real pass:
+    // ok stays true (request-accepted) but validated is false and the result
+    // carries the profile name and the (sorted) sent keys that went unchecked.
+    return {
+      ok: true,
+      validated: false,
+      profileName,
+      unvalidatedKeys: [...sentKeys].sort((a, b) => a.localeCompare(b))
+    };
   }
 
   const allowed = declaredProfileParamKeys(profileYaml);
   const unknownKeys = sentKeys.filter((k) => !allowed.has(k));
   if (unknownKeys.length === 0) {
-    return { ok: true };
+    return { ok: true, validated: true };
   }
 
   const allowedKeys = [...allowed].sort((a, b) => a.localeCompare(b));
