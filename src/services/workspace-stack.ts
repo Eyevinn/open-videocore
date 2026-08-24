@@ -58,6 +58,18 @@ export type OptionalStepBuilders = {
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
 
+// Minimal logger surface (compatible with Fastify's logger and mirroring
+// DispatcherLogger in services/webhook-dispatcher.ts). Injected so a transient
+// parameter-store refresh failure is observable instead of being silently
+// swallowed (issue #419). Defaults to a noop so callers/tests that don't wire a
+// logger keep working.
+export type StackResolverLogger = {
+  warn: (obj: unknown, msg?: string) => void;
+  error: (obj: unknown, msg?: string) => void;
+};
+
+const noopLogger: StackResolverLogger = { warn: () => {}, error: () => {} };
+
 export type WorkspaceConnections = {
   assets: AssetRepository;
   jobs: JobRepository;
@@ -309,6 +321,7 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
+  private log: StackResolverLogger;
 
   constructor(opts: {
     paramStore: ParamStore | undefined;
@@ -319,12 +332,17 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
+    // Injected logger so a transient parameter-store refresh failure is
+    // observable (issue #419). Optional; defaults to a noop for callers/tests
+    // that don't wire one.
+    log?: StackResolverLogger;
   }) {
     this.paramStore = opts.paramStore;
     this.oscContext = opts.oscContext;
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
+    this.log = opts.log ?? noopLogger;
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -372,8 +390,23 @@ export class WorkspaceStackResolver {
           config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
         }
       }
-    } catch {
-      // Fall through to in-memory
+    } catch (err) {
+      // The parameter-store round-trip failed (token issue, TLS blip, timeout,
+      // non-2xx from listStackNames()/loadStackConfig()). We deliberately do NOT
+      // change the fallback behaviour here (tracked separately) — but we must no
+      // longer swallow the error silently (issue #419). Log the real error with
+      // the stack identifier being resolved and a clear indication that we are
+      // degrading to the in-memory (no object storage) path, so a subsequent 501
+      // from GET /api/v1/storage/buckets can be correlated to this root cause.
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          stackName: stackName ?? '(workspace default)',
+          fallback: 'in-memory (no object storage)'
+        },
+        'stack resolver: parameter-store refresh failed; falling back to in-memory connections without object storage'
+      );
+      // Fall through to in-memory (unchanged).
     }
 
     // A partially-provisioned/failed stack must never be treated as a live,

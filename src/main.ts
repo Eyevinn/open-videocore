@@ -248,7 +248,10 @@ const stackResolver = new WorkspaceStackResolver({
   oscContext,
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
-  optionalSteps: optionalStepBuilders
+  optionalSteps: optionalStepBuilders,
+  // Surface transient parameter-store refresh failures instead of swallowing
+  // them (issue #419) so a subsequent 501 from the storage routes is traceable.
+  log: app.log
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
