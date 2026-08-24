@@ -65,7 +65,13 @@ import {
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
-import { resolveBurnInSource, buildSubtitlesFilter } from '../pipeline/burn-in.js';
+import {
+  resolveBurnInSource,
+  buildSubtitlesFilter,
+  checkBurnInObjectAvailable,
+  validateForceStyle,
+  BURN_IN_FORCE_STYLE_MAX_LENGTH
+} from '../pipeline/burn-in.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
@@ -154,18 +160,41 @@ const customProfileSchema = z.object({
 // injection surface). Values omitted -> unchanged default output.
 const profileParamsSchema = z.record(z.string(), z.string());
 
-// Burn-in caption source (issue #388, ADR-014 D2). Optional + additive: absent
-// => no burn-in, today's transcodes unchanged. `source` is a discriminated union
-// on `type`; `forceStyle` is a free-form libass style string forwarded verbatim.
-// Format gating (srt/vtt only, ttml rejected) and objectKey resolution happen in
-// the handler (resolveBurnInSource) so the not-ready/not-found/unsupported cases
-// map to descriptive 4xx responses rather than opaque schema errors.
+// Burn-in caption source (issue #388, ADR-014 D2; styling contract hardened by
+// issue #390). Optional + additive: absent => no burn-in, today's transcodes
+// unchanged. `source` is a discriminated union on `type`. Format gating (srt/vtt
+// only, ttml rejected) and objectKey resolution happen in the handler
+// (resolveBurnInSource) so the not-ready/not-found/unsupported cases map to
+// descriptive 4xx responses rather than opaque schema errors.
+//
+// STYLING CONTRACT (issue #390): the default on-screen appearance is WHATEVER THE
+// SIDECAR CARRIES — a vtt sidecar's cue settings convey position/styling; an srt
+// sidecar conveys none, so the burn-in renderer's defaults apply. `forceStyle` is
+// an OPTIONAL, EXPLICIT, VALIDATED override — NOT a free-form ffmpeg filter
+// string. It is a comma-separated list of `Key=Value` libass style directives
+// where every Key is allowlisted (validateForceStyle / BURN_IN_ALLOWED_STYLE_KEYS
+// in ../pipeline/burn-in.ts) and every Value uses a strict safe charset. Any value
+// containing quotes, commas (outside the separator), colons, semicolons,
+// backslashes or newlines — i.e. anything that could escape `force_style='...'`
+// and inject filtergraph content — is REJECTED with a 422 (see the handler). The
+// schema bounds length; the exact allowlist/charset check runs in the handler so
+// the rejection carries a specific, actionable message.
 const burnInSchema = z.object({
-  source: z.discriminatedUnion('type', [
-    z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
-    z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
-  ]),
-  forceStyle: z.string().max(1024).optional()
+  source: z
+    .discriminatedUnion('type', [
+      z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
+      z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
+    ])
+    .describe(
+      'Caption source, resolved to one workspace-local sidecar object key. Burn-in supports srt and vtt only; a ttml source (or track) is rejected with 422 (ADR-014 D4).'
+    ),
+  forceStyle: z
+    .string()
+    .max(BURN_IN_FORCE_STYLE_MAX_LENGTH)
+    .optional()
+    .describe(
+      "Optional styling/positioning override. Default styling is whatever the sidecar carries (vtt cue settings convey position/styling; srt conveys none, so the renderer defaults apply). This is NOT a free-form ffmpeg filter string: it is a comma-separated list of 'Key=Value' libass style directives drawn from an allowlist (FontName, FontSize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, Outline, Shadow, Spacing, Alignment, MarginL, MarginR, MarginV, BorderStyle). Positioning is expressed via Alignment (numpad 1-9) and MarginV. Values may only use letters, digits and the limited set '&#.+%- '; any quote, comma (outside the separator), colon, semicolon, backslash or newline is rejected with 422. Example: \"FontName=Sans,FontSize=24,Alignment=2,MarginV=40\"."
+    )
 });
 
 const transcodeBodySchema = z
@@ -2507,6 +2536,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // wait). Absent `burnIn` => no filter, clean rendition (unchanged).
       let burnInSubtitlesFilter: string | undefined;
       if (request.body.burnIn) {
+        // Styling override (issue #390): validate the caller's `forceStyle` against
+        // the allowlist + safe charset BEFORE resolving/dispatching. This CLOSES
+        // the filter-injection hole #388 left (raw forwarding into
+        // force_style='...'): a quote/comma/colon/backslash/newline — anything that
+        // could escape the quoting and inject filtergraph content — is rejected
+        // here with a 422 and never reaches buildSubtitlesFilter. Only the
+        // canonical, allowlisted string is composed into the filter.
+        let canonicalForceStyle: string | undefined;
+        if (request.body.burnIn.forceStyle !== undefined && request.body.burnIn.forceStyle.trim() !== '') {
+          const styleCheck = validateForceStyle(request.body.burnIn.forceStyle);
+          if (!styleCheck.ok) {
+            return reply.code(422).send({ error: 'burn_in_invalid_force_style', message: styleCheck.message });
+          }
+          canonicalForceStyle = styleCheck.canonical;
+        }
         const resolved = resolveBurnInSource(
           request.body.burnIn.source,
           asset.subtitleTracks
@@ -2518,11 +2562,43 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           if (resolved.reason === 'unsupported_format') {
             return reply.code(422).send({ error: 'burn_in_unsupported_format', message: resolved.message });
           }
-          // not_ready: the referenced track exists but its file has not landed
-          // yet. #389 owns the wait/queue/fail policy; surface it distinctly.
+          // not_ready: the referenced track exists but its objectKey is still
+          // undefined (asset-repo says the file has not landed). Distinct from
+          // the object-existence race below (#389) — here we have no key at all.
           return reply.code(409).send({ error: 'burn_in_source_not_ready', message: resolved.message });
         }
-        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, request.body.burnIn.forceStyle);
+        // #389: CLOSE the generation race. `resolveBurnInSource` proved the
+        // request NAMES a concrete key; now verify the key's BYTES have actually
+        // landed in the workspace object store BEFORE dispatch. Subtitle
+        // generation is fire-and-forget (subtitle-generator.ts), so a resolved
+        // key — a caller-supplied `sidecarKey`, or a `subtitleTrack.objectKey`
+        // set before the generation callback landed — can point at an object that
+        // does not yet exist or is still zero-length. Either would silently burn
+        // NO captions, so we FAIL the submission with a specific 409
+        // (`burn_in_source_not_available`, distinct from #388's
+        // `burn_in_source_not_ready` no-objectKey case) and never dispatch. The
+        // check reuses WorkspaceStorage.statObject (src/data/storage.ts:92-102),
+        // the same presence plumbing the rest of the routes use, against the
+        // workspace/source bucket where generated sidecars land
+        // (subtitle-generator.ts:101-103 destinationKey). ADR-014 D1/D2 chose the
+        // explicit-source model, so a clear error at submit time is the natural
+        // guarantee (no open-ended wait).
+        if (!storageFor) {
+          // No object store wired on this deployment — we cannot verify the
+          // sidecar exists, so we MUST NOT dispatch a possibly-captionless burn.
+          return reply.code(501).send({
+            error: 'burn_in_storage_unavailable',
+            message: 'burn-in requires object storage to verify the caption source exists, but object storage is not configured on this deployment'
+          });
+        }
+        const availability = await checkBurnInObjectAvailable(resolved.objectKey, storageFor());
+        if (!availability.available) {
+          return reply.code(409).send({
+            error: 'burn_in_source_not_available',
+            message: availability.message
+          });
+        }
+        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, canonicalForceStyle);
       }
       try {
         const result = await submitTranscode(
