@@ -65,6 +65,7 @@ import {
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
+import { resolveBurnInSource, buildSubtitlesFilter } from '../pipeline/burn-in.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
@@ -153,11 +154,26 @@ const customProfileSchema = z.object({
 // injection surface). Values omitted -> unchanged default output.
 const profileParamsSchema = z.record(z.string(), z.string());
 
+// Burn-in caption source (issue #388, ADR-014 D2). Optional + additive: absent
+// => no burn-in, today's transcodes unchanged. `source` is a discriminated union
+// on `type`; `forceStyle` is a free-form libass style string forwarded verbatim.
+// Format gating (srt/vtt only, ttml rejected) and objectKey resolution happen in
+// the handler (resolveBurnInSource) so the not-ready/not-found/unsupported cases
+// map to descriptive 4xx responses rather than opaque schema errors.
+const burnInSchema = z.object({
+  source: z.discriminatedUnion('type', [
+    z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
+    z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
+  ]),
+  forceStyle: z.string().max(1024).optional()
+});
+
 const transcodeBodySchema = z
   .object({
     profile: z.string().min(1).optional(),
     customProfile: customProfileSchema.optional(),
-    profileParams: profileParamsSchema.optional()
+    profileParams: profileParamsSchema.optional(),
+    burnIn: burnInSchema.optional()
   })
   .refine((b) => !(b.profile && b.customProfile), {
     message: 'specify either profile or customProfile, not both'
@@ -2453,6 +2469,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
       }
+      // Burn-in caption source (issue #388, ADR-014). Optional + additive:
+      // resolve the requested source to ONE concrete workspace-local S3 object
+      // key and build the FFmpeg `subtitles=` filter that gets threaded into the
+      // selected profile's VideoEncode filters via profileParams (D3). Format
+      // gating (srt/vtt only) rejects ttml at request time (D4); a referenced
+      // track with no stored file yet is a distinct "not ready" outcome whose
+      // wait/queue policy #389 owns — here we surface it as a 409 so the caller
+      // learns the source is not yet burnable (this issue does not implement the
+      // wait). Absent `burnIn` => no filter, clean rendition (unchanged).
+      let burnInSubtitlesFilter: string | undefined;
+      if (request.body.burnIn) {
+        const resolved = resolveBurnInSource(
+          request.body.burnIn.source,
+          asset.subtitleTracks
+        );
+        if (!resolved.ok) {
+          if (resolved.reason === 'track_not_found') {
+            return reply.code(404).send({ error: 'subtitle_track_not_found', message: resolved.message });
+          }
+          if (resolved.reason === 'unsupported_format') {
+            return reply.code(422).send({ error: 'burn_in_unsupported_format', message: resolved.message });
+          }
+          // not_ready: the referenced track exists but its file has not landed
+          // yet. #389 owns the wait/queue/fail policy; surface it distinctly.
+          return reply.code(409).send({ error: 'burn_in_source_not_ready', message: resolved.message });
+        }
+        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, request.body.burnIn.forceStyle);
+      }
       try {
         const result = await submitTranscode(
           {
@@ -2462,6 +2506,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
+            burnInSubtitlesFilter,
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },

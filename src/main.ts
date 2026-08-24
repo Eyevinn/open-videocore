@@ -190,7 +190,10 @@ const paramStore = await paramStoreFromEnv(
     getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
     getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat)
   },
-  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc')
+  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc'),
+  // Diagnostic logger (issue #415): emits the exact StackConfig key written vs.
+  // read so a persistence/read-back failure is attributable to one path.
+  app.log
 );
 if (!paramStore) {
   app.log.warn(
@@ -248,7 +251,10 @@ const stackResolver = new WorkspaceStackResolver({
   oscContext,
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
-  optionalSteps: optionalStepBuilders
+  optionalSteps: optionalStepBuilders,
+  // Diagnostic logger (issue #415): logs the (namespace, stack name) the
+  // resolver reads with so a read-back miss correlates with the write key.
+  log: app.log
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
