@@ -7,9 +7,24 @@
 // observability for the pull worker — clients poll GET /api/v1/jobs/:id to see
 // status, progress, and any terminal error.
 
+import type { FailureClass } from '../encore-scaler/retry-policy.js';
+
 // ---------------------------------------------------------------------------
 // Job model + lifecycle
 // ---------------------------------------------------------------------------
+
+// A single dispatch of a transcode job to an Encore instance (ADR-012, #379).
+// Persisted durably on the Job record so the attempt history outlives the
+// TTL'd Valkey retry keys (#380). `startedAt` is stamped when the scaler
+// dispatches the attempt; `endedAt`/`classification` are populated on
+// completion by the poller (#381). `classification` reuses the retry policy's
+// FailureClass (src/encore-scaler/retry-policy.ts:70) — do NOT redefine it.
+export type EncodeAttempt = {
+  index: number;
+  startedAt: string;
+  endedAt?: string;
+  classification?: FailureClass;
+};
 
 // Job lifecycle. A job is created `pending`. Transcode jobs then sit `queued`
 // while they wait in the Encore auto-scaler's local Redis queue (ADR-006), and
@@ -61,6 +76,17 @@ export type Job = {
   profile?: string;
   // Child asset ids created for each produced rendition on completion.
   renditionAssetIds?: string[];
+  // --- Durable encode-attempt capture (ADR-012, #380) ---
+  // Count of Encore dispatches for this transcode job; 1 on the first dispatch,
+  // incremented on each transport-class re-dispatch. Distinct from `attempts`
+  // above, which counts ingest/URL-pull attempts and is UNCHANGED. Undefined
+  // until the first dispatch is recorded. Survives independently of the TTL'd
+  // Valkey `encore:job-attempts:{id}` counter.
+  encodeAttempts?: number;
+  // Append-only log of each Encore dispatch, in dispatch order. Written
+  // durably alongside the Valkey counter at dispatch time; clearing the Valkey
+  // retry state does NOT clear this log.
+  encodeAttemptLog?: EncodeAttempt[];
   createdAt: string;
   updatedAt: string;
 };
@@ -92,6 +118,11 @@ export type UpdateJobInput = {
   encoreInternalJobId?: string;
   profile?: string;
   renditionAssetIds?: string[];
+  // Durable encode-attempt fields (ADR-012, #380). Normally written via the
+  // dedicated appendEncodeAttempt() path, but exposed here so a full record can
+  // be patched (and so applyJobPatch carries them through unchanged).
+  encodeAttempts?: number;
+  encodeAttemptLog?: EncodeAttempt[];
 };
 
 const ALLOWED_JOB_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
@@ -132,6 +163,26 @@ export interface JobRepository {
   // the job is looked up by the opaque encoreJobId we issued when submitting.
   // Returns the job, or undefined if unknown.
   findByEncoreJobId(encoreJobId: string): Promise<{ job: Job } | undefined>;
+  // Durably append one Encore dispatch to the job's encode-attempt log and
+  // bump encodeAttempts (ADR-012, #380). Separate from update() so the append
+  // is atomic and free of status-transition validation: the scaler calls this
+  // at dispatch time alongside the Valkey retry counter, and the durable log
+  // survives after the Valkey key is cleared. Returns the updated job, or
+  // undefined if the job id is unknown.
+  appendEncodeAttempt(
+    id: string,
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined>;
+  // Durably close out the latest (open) encode-attempt on completion (ADR-012,
+  // #381): stamp its `endedAt` and, for failures, the retry `classification`
+  // from retry-policy.ts. Called by the callback poller at the decide/complete
+  // path. Finalises the last log entry in place (does NOT append), so a job that
+  // never retried keeps exactly one attempt with one timing pair. Returns the
+  // updated job, or undefined if the job id is unknown.
+  finalizeEncodeAttempt(
+    id: string,
+    patch: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined>;
 }
 
 // The Encore job id we issue when submitting a transcode job. It embeds a
@@ -184,7 +235,80 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.encoreInternalJobId !== undefined) next.encoreInternalJobId = patch.encoreInternalJobId;
   if (patch.profile !== undefined) next.profile = patch.profile;
   if (patch.renditionAssetIds !== undefined) next.renditionAssetIds = patch.renditionAssetIds;
+  if (patch.encodeAttempts !== undefined) next.encodeAttempts = patch.encodeAttempts;
+  if (patch.encodeAttemptLog !== undefined) next.encodeAttemptLog = patch.encodeAttemptLog;
   return next;
+}
+
+// Durably append one Encore dispatch to a job's encode-attempt log and bump
+// encodeAttempts (ADR-012, #380). Pure helper shared by both backends so the
+// append semantics (index = new length, count = log length) never drift.
+//
+// This is what makes attempt history outlive the Valkey retry TTL: the scaler
+// writes the Valkey counter (which is cleared on re-dispatch/settle) AND calls
+// this to append to the durable record, which is never cleared by retry logic.
+// The append is idempotent-ish only by position: callers record one attempt per
+// actual dispatch. `startedAt` defaults to now when omitted.
+export function appendEncodeAttemptToJob(
+  existing: Job,
+  attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass },
+  now: string
+): Job {
+  const log = existing.encodeAttemptLog ? [...existing.encodeAttemptLog] : [];
+  const entry: EncodeAttempt = {
+    index: attempt.index ?? log.length + 1,
+    startedAt: attempt.startedAt ?? now,
+    ...(attempt.endedAt !== undefined ? { endedAt: attempt.endedAt } : {}),
+    ...(attempt.classification !== undefined ? { classification: attempt.classification } : {})
+  };
+  log.push(entry);
+  return { ...existing, encodeAttemptLog: log, encodeAttempts: log.length, updatedAt: now };
+}
+
+// Durably finalise the LATEST (open) encode-attempt on a job's log by stamping
+// its `endedAt` and (for failures) `classification` (ADR-012, #381). Pure helper
+// shared by both backends so completion semantics never drift.
+//
+// #380 appends one attempt entry per Encore dispatch at dispatch time, carrying
+// only `index`/`startedAt`. #381 closes that entry out on completion: the poller
+// calls this at the decide/complete path so every attempt ends up with a
+// distinct start/end timing pair (the successful attempt's elapsed time is then
+// derivable) and, for failures, the retry classification from retry-policy.ts.
+//
+// The last log entry is the currently-running attempt (attempts are appended in
+// dispatch order and only the most recent is open). We finalise that entry in
+// place rather than appending, so `encodeAttempts`/log length are UNCHANGED — a
+// job that never retried keeps exactly one attempt with one timing pair.
+//
+// Defensive fallback: if the log is empty (e.g. a job dispatched before #380, so
+// no attempt was ever appended), we synthesise one finalised attempt so the
+// field still has a single non-zero reading rather than staying absent.
+export function finalizeLatestEncodeAttemptOnJob(
+  existing: Job,
+  patch: { endedAt?: string; classification?: FailureClass },
+  now: string
+): Job {
+  const endedAt = patch.endedAt ?? now;
+  const log = existing.encodeAttemptLog ? existing.encodeAttemptLog.map((a) => ({ ...a })) : [];
+  if (log.length === 0) {
+    // No dispatch was ever recorded: synthesise a single finalised attempt so
+    // the never-retried job still reads exactly one attempt (never 0). Its
+    // startedAt falls back to endedAt since no dispatch timestamp exists.
+    const entry: EncodeAttempt = {
+      index: 1,
+      startedAt: endedAt,
+      endedAt,
+      ...(patch.classification !== undefined ? { classification: patch.classification } : {})
+    };
+    return { ...existing, encodeAttemptLog: [entry], encodeAttempts: 1, updatedAt: now };
+  }
+  const lastIdx = log.length - 1;
+  log[lastIdx] = {
+    ...log[lastIdx],
+    endedAt,
+    ...(patch.classification !== undefined ? { classification: patch.classification } : {})
+  };
+  return { ...existing, encodeAttemptLog: log, encodeAttempts: log.length, updatedAt: now };
 }
 
 // ---------------------------------------------------------------------------
@@ -254,5 +378,31 @@ export class InMemoryJobRepository implements JobRepository {
       }
     }
     return undefined;
+  }
+
+  async appendEncodeAttempt(
+    id: string,
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const next = appendEncodeAttemptToJob(existing, attempt, new Date().toISOString());
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  async finalizeEncodeAttempt(
+    id: string,
+    patch: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const next = finalizeLatestEncodeAttemptOnJob(existing, patch, new Date().toISOString());
+    this.store.set(id, next);
+    return { ...next };
   }
 }

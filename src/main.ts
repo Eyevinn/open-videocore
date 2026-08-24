@@ -190,7 +190,10 @@ const paramStore = await paramStoreFromEnv(
     getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
     getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat)
   },
-  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc')
+  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc'),
+  // Diagnostic logger (issue #415): emits the exact StackConfig key written vs.
+  // read so a persistence/read-back failure is attributable to one path.
+  app.log
 );
 if (!paramStore) {
   app.log.warn(
@@ -248,7 +251,10 @@ const stackResolver = new WorkspaceStackResolver({
   oscContext,
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
-  optionalSteps: optionalStepBuilders
+  optionalSteps: optionalStepBuilders,
+  // Diagnostic logger (issue #415): logs the (namespace, stack name) the
+  // resolver reads with so a read-back miss correlates with the write key.
+  log: app.log
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
@@ -709,6 +715,19 @@ function activateScaler(redisUrl: string): void {
       if (job.assetId) {
         await assetRepository.update(job.assetId, { status: 'processing' });
       }
+    },
+    // Durably capture each Encore dispatch on the Job record (ADR-012, #380).
+    // The scaler already records the attempt count in the TTL'd Valkey key and
+    // clears it on re-dispatch/settle; this appends the same attempt to the
+    // CouchDB-backed encodeAttemptLog so the history survives after the Valkey
+    // key expires (#374 reads attempts after the job finishes). The scaler owns
+    // no repositories, so we resolve the job here by its encoreJobId. Best-
+    // effort: the scaler swallows failures so a durable-write hiccup never
+    // re-queues an already-dispatched job.
+    onEncodeDispatched: async (encoreJobId: string, attempt: number) => {
+      const found = await jobRepository.findByEncoreJobId(encoreJobId);
+      if (!found) return;
+      await jobRepository.appendEncodeAttempt(found.job.id, { index: attempt });
     },
     // Once per tick, reconcile transcode jobs stuck non-terminal against Encore's
     // terminal FAILED / garbage-collected (404) outcomes (issue #273). A failed

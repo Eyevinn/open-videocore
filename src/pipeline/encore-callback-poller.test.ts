@@ -367,3 +367,115 @@ describe('encore-callback-poller sweep — FAILED job reconciliation', () => {
     return externalId.slice(sep + 2);
   }
 });
+
+// #381: on completion the poller must close out the durable encode-attempt log
+// (endedAt + classification for failures) so the never-retried job reads exactly
+// one attempt with one timing pair and the successful attempt's elapsed time is
+// derivable.
+//
+// Contracts verified (CLAUDE.md rule 7):
+//   - JobRepository.appendEncodeAttempt / finalizeEncodeAttempt + Job.encodeAttempts /
+//     encodeAttemptLog (src/data/job-repo.ts).
+//   - decideRetry deterministic-failure => settle 'not-retryable', class
+//     'deterministic' (src/encore-scaler/retry-store.ts / retry-policy.ts).
+describe('encore-callback-poller — durable encode-attempt finalisation (#381)', () => {
+  let redis: FakeRedis;
+  let jobs: InMemoryJobRepository;
+  let assets: InMemoryAssetRepository;
+  let pipelines: InMemoryPipelineRepository;
+
+  beforeEach(() => {
+    redis = new FakeRedis();
+    jobs = new InMemoryJobRepository();
+    assets = new InMemoryAssetRepository();
+    pipelines = new InMemoryPipelineRepository();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function deps(fetchFn: ReturnType<typeof vi.fn>) {
+    vi.stubGlobal('fetch', fetchFn);
+    return {
+      redis: redis as unknown as import('ioredis').Redis,
+      jobRepository: jobs,
+      assetRepository: assets,
+      pipelineRepository: pipelines,
+      oscContext: OSC_CONTEXT_STUB,
+      queueKey: QUEUE_KEY,
+      logger: NOOP_LOGGER
+    };
+  }
+
+  function findLocalJobId(externalId: string): string {
+    const sep = externalId.indexOf('__');
+    return externalId.slice(sep + 2);
+  }
+
+  it('records one finalised attempt (endedAt, no class) for a successful job', async () => {
+    const encoreUuid = 'uuid-succ-metrics';
+    const { externalId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    // The scaler advances a dispatched job queued->running (main.ts onDispatched);
+    // completeTranscode only settles a running job to done.
+    await jobs.update(localId, { status: 'running' });
+    // Simulate the #380 dispatch-time append (one open attempt).
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+
+    const fetchFn = makeFetch({
+      successfulUuids: [encoreUuid],
+      jobDocs: { [encoreUuid]: { externalId, status: 'SUCCESSFUL', output: [] } }
+    });
+    const d = deps(fetchFn);
+
+    const message = JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
+    await redis.zadd(QUEUE_KEY, Date.now(), message);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(localId))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    const job = await jobs.get(localId);
+    expect(job?.encodeAttempts).toBe(1);
+    expect(job?.encodeAttemptLog).toHaveLength(1);
+    const attempt = job!.encodeAttemptLog![0];
+    expect(attempt.startedAt).toBeDefined();
+    expect(attempt.endedAt).toBeDefined();
+    expect(attempt.classification).toBeUndefined();
+  });
+
+  it('records the failure classification on the settled terminal attempt', async () => {
+    const encoreUuid = 'uuid-fail-metrics';
+    // A deterministic failure message => settle 'not-retryable', class 'deterministic'.
+    const errorMsg = 'Error parsing ProbeResult from output';
+    const { externalId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+
+    const fetchFn = makeFetch({
+      failedUuids: [encoreUuid],
+      jobDocs: { [encoreUuid]: { externalId, status: 'FAILED', message: errorMsg } }
+    });
+    const d = deps(fetchFn);
+
+    const message = JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
+    await redis.zadd(QUEUE_KEY, Date.now(), message);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(localId))?.status === 'failed');
+    } finally {
+      stop();
+    }
+
+    const job = await jobs.get(localId);
+    expect(job?.encodeAttempts).toBe(1);
+    const attempt = job!.encodeAttemptLog![0];
+    expect(attempt.endedAt).toBeDefined();
+    expect(attempt.classification).toBe('deterministic');
+  });
+});
