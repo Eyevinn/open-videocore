@@ -58,13 +58,11 @@ export type OptionalStepBuilders = {
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
 
-// Minimal logger surface (compatible with Fastify's logger and mirroring
-// DispatcherLogger in services/webhook-dispatcher.ts). Injected so a transient
-// parameter-store refresh failure is observable instead of being silently
-// swallowed (issue #419). The `info`/`warn` methods also carry the read-path
-// diagnostics added in issue #415 (namespace/stack-name correlation), so this
-// single logger surface covers both concerns. Defaults to a noop so
-// callers/tests that don't wire a logger keep working.
+// Minimal logger surface (compatible with Fastify's logger). Injected so the
+// read-path diagnostics (issue #415, info/warn) and a transient parameter-store
+// refresh failure (issue #419, error) are observable instead of being silently
+// swallowed. Defaults to a noop so callers/tests that don't wire a logger keep
+// working.
 export type StackResolverLogger = {
   info: (obj: unknown, msg?: string) => void;
   warn: (obj: unknown, msg?: string) => void;
@@ -76,6 +74,15 @@ const noopLogger: StackResolverLogger = {
   warn: () => {},
   error: () => {}
 };
+
+// Maximum staleness bound for the last-known-good fallback (issue #420,
+// architect sign-off condition 1). When a param-store refresh THROWS on a
+// cache-miss but a prior successful ready-stack resolution exists, keep serving
+// that resolution rather than dropping to no-storage — but only while within
+// MAX_STALE_MS measured from the ORIGINAL successful resolve time (12x
+// CACHE_TTL_MS = 1h). Past this bound we drop to no-storage; we never serve a
+// stale ready-stack resolution indefinitely.
+const MAX_STALE_MS = 60 * 60 * 1000; // 1h = 12x CACHE_TTL_MS
 
 export type WorkspaceConnections = {
   assets: AssetRepository;
@@ -109,7 +116,20 @@ export type WorkspaceConnections = {
   sceneDetector: SceneDetector | undefined;
 };
 
-type CacheEntry = { connections: WorkspaceConnections; expiresAt: number };
+// A cached resolution. `fromReadyStack` records whether `connections` were
+// built from a real ready-stack config (buildConnectionsFromStack /
+// isReadyStack) versus an env-override or no-storage in-memory fallback — only
+// the former is eligible for the last-known-good fallback (issue #420,
+// architect invariant: last-known-good applies ONLY to a prior entry built from
+// a real ready-stack config, never to a cached in-memory fallback).
+// `resolvedAt` is the ORIGINAL successful resolve time and is preserved across
+// TTL refreshes so MAX_STALE_MS is measured from first success, not last serve.
+type CacheEntry = {
+  connections: WorkspaceConnections;
+  expiresAt: number;
+  fromReadyStack: boolean;
+  resolvedAt: number;
+};
 
 // True if the value is a non-empty, parseable absolute URL. A partially
 // provisioned stack can persist empty-string coordinates; feeding those to nano
@@ -372,7 +392,14 @@ export class WorkspaceStackResolver {
     // bypassing the parameter store entirely.
     const envConnections = buildEnvConnections(this.oscContext);
     if (envConnections) {
-      this.cache.set(cacheKey, { connections: envConnections, expiresAt: Date.now() + CACHE_TTL_MS });
+      // Env-override is not a ready-stack resolution: it is never eligible for
+      // the last-known-good fallback (invariant: env-override path unchanged).
+      this.cache.set(cacheKey, {
+        connections: envConnections,
+        expiresAt: Date.now() + CACHE_TTL_MS,
+        fromReadyStack: false,
+        resolvedAt: Date.now()
+      });
       return envConnections;
     }
 
@@ -423,24 +450,48 @@ export class WorkspaceStackResolver {
         }
       }
     } catch (err) {
-      // The parameter-store round-trip failed (token issue, TLS blip, timeout,
-      // non-2xx from listStackNames()/loadStackConfig()). We deliberately do NOT
-      // change the fallback behaviour here (tracked separately) — but we must no
-      // longer swallow the error silently (issue #419). Log the real error with
-      // its message + stack, the stack identifier being resolved, the read
-      // namespace (issue #415 correlation), and a clear indication that we are
-      // degrading to the in-memory (no object storage) path, so a subsequent 501
-      // from GET /api/v1/storage/buckets can be correlated to this root cause.
+      // A THROWN refresh error means we couldn't refresh — NOT that the stack
+      // ceased to exist (issue #420, architect sign-off). We must no longer
+      // swallow it silently (issue #419): log the real error with message +
+      // stack, the stack identifier, the read namespace (issue #415
+      // correlation), and the outcome, so a subsequent 501 from
+      // GET /api/v1/storage/buckets is traceable — whether we serve
+      // last-known-good or fall through to no-storage.
+      const servingLastKnownGood =
+        !!cached &&
+        cached.fromReadyStack &&
+        Date.now() - cached.resolvedAt < MAX_STALE_MS;
       this.log.error(
         {
           err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
           namespace: STACK_CONFIG_NAMESPACE,
           stackName: stackName ?? '(workspace default)',
-          fallback: 'in-memory (no object storage)'
+          fallback: servingLastKnownGood
+            ? 'last-known-good (stale ready-stack resolution)'
+            : 'in-memory (no object storage)'
         },
-        'stack resolver: parameter-store refresh failed; falling back to in-memory connections without object storage'
+        'stack resolver: parameter-store refresh failed; serving fallback resolution'
       );
-      // Fall through to in-memory (unchanged).
+      // If a prior successful ready-stack resolution is still in cache and
+      // within the MAX_STALE_MS bound (measured from its ORIGINAL resolve time),
+      // serve that last-known-good resolution rather than dropping to
+      // no-storage — a previously-healthy instance must not return 501 for all
+      // storage ops on a single failed refresh. Only a THROWN error takes this
+      // path: a successful load returning `undefined` (genuine 404 /
+      // never-persisted #413) falls through below and drops to no-storage — we
+      // never fabricate a stack. Ordering (architect condition 2):
+      // last-known-good is the post-failure path only; any future retry (#421)
+      // runs before we get here.
+      if (servingLastKnownGood && cached) {
+        // Serve stale-but-good WITHOUT extending expiresAt or resetting
+        // resolvedAt: the entry stays past-TTL so the next request re-attempts a
+        // fresh refresh, and MAX_STALE_MS keeps counting from first success so
+        // we never serve indefinitely.
+        return cached.connections;
+      }
+      // No eligible last-known-good (first-resolve-at-boot, an in-memory/
+      // env-override prior entry, or past MAX_STALE_MS): fall through to
+      // no-storage, unchanged from prior behaviour.
     }
 
     // A partially-provisioned/failed stack must never be treated as a live,
@@ -450,12 +501,21 @@ export class WorkspaceStackResolver {
     // them here. buildConnectionsFromStack also returns null for empty/invalid
     // coordinates (issue #105 defence-in-depth). In every skip case we fall back
     // to no-op in-memory connections so /health and infra routes stay up.
-    const connections =
-      (config && isReadyStack(config)
+    const built =
+      config && isReadyStack(config)
         ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
-        : null) ?? buildInMemoryConnections();
+        : null;
+    const connections = built ?? buildInMemoryConnections();
 
-    this.cache.set(cacheKey, { connections, expiresAt: Date.now() + CACHE_TTL_MS });
+    // Only a resolution built from a real ready-stack config is eligible to be
+    // served as last-known-good on a later failed refresh (issue #420
+    // invariant). A no-storage in-memory fallback is not.
+    this.cache.set(cacheKey, {
+      connections,
+      expiresAt: Date.now() + CACHE_TTL_MS,
+      fromReadyStack: built !== null,
+      resolvedAt: Date.now()
+    });
     return connections;
   }
 
