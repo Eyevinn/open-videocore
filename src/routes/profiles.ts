@@ -42,6 +42,7 @@ import {
 } from '../data/profile-repo.js';
 import { bootstrapProfiles } from '../services/profile-bootstrap.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
+import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
 
 export type ProfilesRouterOptions = {
   // Profile repository (CouchDB-backed per-workspace in production).
@@ -181,7 +182,7 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
     {
       schema: {
         body: createBodySchema,
-        response: { 201: profileSchema, 400: errorSchema, 409: errorSchema }
+        response: { 201: profileSchema, 400: errorSchema, 409: errorSchema, 422: errorSchema }
       }
     },
     async (request, reply) => {
@@ -190,6 +191,13 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
           error: 'invalid_name',
           message: 'profile name may contain only letters, digits, dot, dash and underscore'
         });
+      }
+      // Reject a profile whose colour signalling is not carriable at its pixel
+      // format at registration time (issue #377), so a mistagged profile (e.g.
+      // 8-bit tagged PQ) can never enter the store and be selected for an encode.
+      const colour = validateProfileColourSignalling(request.body.yaml);
+      if (!colour.ok) {
+        return reply.code(422).send({ error: 'profile_colour_uncarriable', message: colour.reason });
       }
       const profile = await repo.create(request.body);
       return reply.code(201).send({ ...profile, runnable: isProfileRunnable(profile.yaml) });
@@ -241,10 +249,16 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
       schema: {
         params: z.object({ name: z.string() }),
         body: updateBodySchema,
-        response: { 200: profileSchema, 404: errorSchema }
+        response: { 200: profileSchema, 404: errorSchema, 422: errorSchema }
       }
     },
     async (request, reply) => {
+      // Reject an update that would introduce colour signalling not carriable at
+      // the profile's pixel format (issue #377) before it is persisted.
+      const colour = validateProfileColourSignalling(request.body.yaml);
+      if (!colour.ok) {
+        return reply.code(422).send({ error: 'profile_colour_uncarriable', message: colour.reason });
+      }
       const updated = await repo.update(request.params.name, request.body.yaml);
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });

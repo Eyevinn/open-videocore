@@ -14,6 +14,7 @@ import { Client as MinioClient } from 'minio';
 import {
   isReadyStack,
   type ParamStore,
+  type ParamStoreDiagLog,
   type StackConfig,
   type StorageBackendConfig
 } from './param-store.js';
@@ -309,6 +310,11 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
+  // OPTIONAL diagnostic logger (issue #415). When supplied, the resolver logs
+  // the (namespace, stack name) pair it reads with on each resolve so a
+  // read-back miss can be correlated with the write key logged by the
+  // param-store client. Optional so existing callers/tests are unaffected.
+  private log: ParamStoreDiagLog | undefined;
 
   constructor(opts: {
     paramStore: ParamStore | undefined;
@@ -319,12 +325,15 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
+    // OPTIONAL diagnostic logger (issue #415), see field doc above.
+    log?: ParamStoreDiagLog;
   }) {
     this.paramStore = opts.paramStore;
     this.oscContext = opts.oscContext;
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
+    this.log = opts.log;
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -355,6 +364,14 @@ export class WorkspaceStackResolver {
     let config: StackConfig | undefined;
     try {
       if (stackName) {
+        // READ-PATH diagnostic (issue #415): the resolver reads by the
+        // X-Stack-Name-derived name under STACK_CONFIG_NAMESPACE. This is the
+        // (namespace, name) pair whose derived key must equal the key the
+        // provision route wrote; the param-store client logs the concrete key.
+        this.log?.info(
+          { source: 'x-stack-name', namespace: STACK_CONFIG_NAMESPACE, stackName },
+          'resolver reading stack config by requested name'
+        );
         config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
@@ -362,18 +379,35 @@ export class WorkspaceStackResolver {
         // all storage/asset operations.
         if (!config) {
           const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+          this.log?.info(
+            { namespace: STACK_CONFIG_NAMESPACE, requested: stackName, listed: names },
+            'requested stack not found; falling back to first listed stack'
+          );
           if (names.length > 0) {
             config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
           }
         }
       } else {
+        // READ-PATH diagnostic (issue #415): no X-Stack-Name header, so the
+        // resolver uses the FIRST listed stack as the default. If the list is
+        // empty here but the provision route logged a successful write, the
+        // write key and the list prefix disagree — a read-side namespace/key bug.
         const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+        this.log?.info(
+          { source: 'default', namespace: STACK_CONFIG_NAMESPACE, listed: names },
+          'resolver reading default stack config (no X-Stack-Name)'
+        );
         if (names.length > 0) {
           config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
         }
       }
-    } catch {
-      // Fall through to in-memory
+    } catch (err) {
+      // Fall through to in-memory. Log so a read-path failure (issue #415) is
+      // visible rather than silently degrading to in-memory connections.
+      this.log?.warn(
+        { err, namespace: STACK_CONFIG_NAMESPACE, stackName },
+        'resolver failed to load stack config; degrading to in-memory'
+      );
     }
 
     // A partially-provisioned/failed stack must never be treated as a live,

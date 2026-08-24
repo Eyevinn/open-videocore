@@ -27,6 +27,7 @@ import type {
   UpdateJobInput,
   Job
 } from './job-repo.js';
+import type { FailureClass } from '../encore-scaler/retry-policy.js';
 import type { SearchRepository, SearchQuery, SearchResult } from './search-repo.js';
 import type {
   WebhookRepository,
@@ -118,6 +119,18 @@ export class PerWorkspaceJobRepository implements JobRepository {
   }
   async findByEncoreJobId(encoreJobId: string): Promise<{ job: Job } | undefined> {
     return (await this.repo()).findByEncoreJobId(encoreJobId);
+  }
+  async appendEncodeAttempt(
+    id: string,
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    return (await this.repo()).appendEncodeAttempt(id, attempt);
+  }
+  async finalizeEncodeAttempt(
+    id: string,
+    patch: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    return (await this.repo()).finalizeEncodeAttempt(id, patch);
   }
 }
 
