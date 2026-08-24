@@ -91,13 +91,15 @@ describe('declaredProfileParamKeys (issue #290)', () => {
 });
 
 describe('validateProfileParams (issue #290)', () => {
-  it('passes a known key through unchanged', () => {
+  it('passes a known key through unchanged (genuine validated pass)', () => {
     const r = validateProfileParams({
       profileName: 'x264-crf-parametrized',
       profileYaml: X264_CRF_PARAMETRIZED_YAML,
       profileParams: { crf: '20', preset: 'slow' }
     });
     expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.validated).toBe(true);
   });
 
   it('rejects an unknown key with the accepted set named', () => {
@@ -125,25 +127,44 @@ describe('validateProfileParams (issue #290)', () => {
     expect(r.message).toContain('accepts no profileParams');
   });
 
-  it('accepts an absent map for any profile', () => {
-    expect(
-      validateProfileParams({ profileName: 'program', profileYaml: PROGRAM_YAML, profileParams: undefined }).ok
-    ).toBe(true);
+  it('accepts an absent map for any profile as a genuine pass', () => {
+    const r = validateProfileParams({
+      profileName: 'program',
+      profileYaml: PROGRAM_YAML,
+      profileParams: undefined
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.validated).toBe(true);
   });
 
-  it('accepts an empty map for any profile', () => {
-    expect(
-      validateProfileParams({ profileName: 'program', profileYaml: PROGRAM_YAML, profileParams: {} }).ok
-    ).toBe(true);
+  it('accepts an empty map for any profile as a genuine pass', () => {
+    const r = validateProfileParams({
+      profileName: 'program',
+      profileYaml: PROGRAM_YAML,
+      profileParams: {}
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.validated).toBe(true);
   });
 
-  it('is permissive when the profile YAML cannot be resolved (custom/unknown profile)', () => {
+  it('returns an explicit skipped result when the profile YAML cannot be resolved (issue #391)', () => {
     const r = validateProfileParams({
       profileName: 'my-custom',
       profileYaml: undefined,
-      profileParams: { anything: 'goes' }
+      // Deliberately unsorted so we can assert unvalidatedKeys is sorted.
+      profileParams: { zeta: '1', alpha: '2', mid: '3' }
     });
+    // Still request-accepted (permissive behaviour is unchanged)...
     expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // ...but explicitly labelled as NOT validated, and machine-distinguishable
+    // from a genuine pass.
+    expect(r.validated).toBe(false);
+    if (r.validated) return;
+    expect(r.profileName).toBe('my-custom');
+    expect(r.unvalidatedKeys).toEqual(['alpha', 'mid', 'zeta']);
   });
 });
 
