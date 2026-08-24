@@ -16,7 +16,7 @@
 //     chain ((dialogueEnhanceFilters + mixFilters + filters).joinToString(","),
 //     AudioEncode.kt). YAML path: `encodes[] where type == "AudioEncode" ->
 //     .filters[]`. loudnorm form: `loudnorm=I=-23:TP=-1:LRA=7`.
-//   - docs/architecture/ADR-013-loudnorm-pass-mode.md (#384): DECISION = ship
+//   - docs/architecture/ADR-015-loudnorm-pass-mode.md (#384): DECISION = ship
 //     single-pass DYNAMIC loudnorm as a profile-only change (NOT two-pass
 //     measure-then-apply orchestration). So this profile carries a single
 //     `loudnorm=...` filter element; the target rides profileParams.
@@ -58,7 +58,7 @@ export const LOUDNORM_PROFILE_NAME = 'loudnorm-ebu-r128';
 
 // The single-pass loudnorm filter string, with the integrated-loudness target
 // (`I=`) supplied via a profileParams SpEL expression defaulting to -23 LUFS.
-// Per ADR-013 this is single-pass DYNAMIC loudnorm (one ffmpeg invocation, no
+// Per ADR-015 this is single-pass DYNAMIC loudnorm (one ffmpeg invocation, no
 // measure-then-apply). The `I=` value is the only parametrised field; TP/LRA are
 // the fixed EBU R128 companions. This exact string becomes one element of the
 // AudioEncode.filters list and reaches ffmpeg verbatim (contract #383).
@@ -66,7 +66,8 @@ export const LOUDNORM_PROFILE_NAME = 'loudnorm-ebu-r128';
 // NOTE (issue #386, DEFERRED): audible / MEASURED verification that the output
 // integrated loudness actually lands on the requested target is issue #386 and is
 // deferred for live measurement — 0 Encore instances are provisioned for this
-// workspace (see ADR-013 "Empirical validation: DEFERRED"). No measured result is
+// workspace (see ADR-015 "Accuracy vs cost trade-off": live measurement BLOCKED
+// in this environment). No measured result is
 // fabricated here; this ships the parametrised profile only.
 export const LOUDNORM_FILTER = `loudnorm=I=#{profileParams['${LOUDNORM_TARGET_PARAM}']?:${LOUDNORM_DEFAULT_TARGET_LUFS}}:TP=-1:LRA=7`;
 

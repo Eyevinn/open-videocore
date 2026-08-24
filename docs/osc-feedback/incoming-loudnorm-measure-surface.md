@@ -3,11 +3,11 @@
 **Date:** 2026-08-22
 **Surface:** backend-api / architecture
 **Service:** `encore` (SVT Encore)
-**Related:** ADR-012, decision #384, contract spike #383
+**Related:** ADR-015, decision #384, contract spike #383
 
 ## What we needed
 
-To evaluate a two-pass (measure-then-apply) loudness-normalisation flow (ADR-012,
+To evaluate a two-pass (measure-then-apply) loudness-normalisation flow (ADR-015,
 Option B), a `measure` Encore job would run
 `loudnorm=I=…:TP=…:LRA=…:print_format=json` and emit the measured integrated
 loudness, true peak, LRA and threshold. Our completion path must then read those
@@ -38,6 +38,6 @@ measure→apply hand-off has no reliable value source and stays deferred.
 
 ## Current mitigation
 
-ADR-012 ships single-pass dynamic `loudnorm` as the default (profile-only, no
+ADR-015 ships single-pass dynamic `loudnorm` as the default (profile-only, no
 measurement needed) and records two-pass as a documented future option pending
 this answer plus the deferred live test from #383.
