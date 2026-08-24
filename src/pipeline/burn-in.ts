@@ -148,6 +148,64 @@ export function resolveBurnInSource(
   return { ok: true, objectKey: track.objectKey, format: track.format };
 }
 
+// The minimal object-store surface the availability check needs: stat a
+// workspace-local key and report its size (or `undefined` when the object is
+// absent). This is EXACTLY the shape of `WorkspaceStorage.statObject`
+// (src/data/storage.ts:92-102), which returns `{ size, etag } | undefined` —
+// `undefined` for a NotFound object. We depend on the narrow method, not the
+// whole class, so the check stays unit-testable with a fake and reuses the
+// existing presence plumbing rather than adding a new object-store method.
+export type SidecarStatReader = {
+  statObject(objectKey: string): Promise<{ size: number } | undefined>;
+};
+
+// The outcome of the object-existence check that CLOSES the generation race
+// (issue #389). `resolveBurnInSource` proves the request NAMES a concrete key;
+// this proves the key's BYTES have actually landed in the workspace bucket —
+// because subtitle generation is fire-and-forget, a resolved key (a `sidecarKey`
+// the caller supplied, or a `subtitleTrack.objectKey` set before the generation
+// callback landed) can point at an object that does not yet exist or is still
+// zero-length. Either case would silently burn NO captions, so both fail here.
+export type BurnInAvailability =
+  // The object exists and is non-empty — safe to dispatch the burn-in encode.
+  | { available: true }
+  // The object does not exist at all (HEAD/stat returned not-found).
+  | { available: false; reason: 'absent'; objectKey: string; message: string }
+  // The object exists but is zero-length — an empty sidecar burns nothing, so
+  // treat it as not-available (same clear error).
+  | { available: false; reason: 'empty'; objectKey: string; message: string };
+
+// Verify the resolved sidecar object ACTUALLY EXISTS (and is non-empty) in the
+// workspace object store before a burn-in-opted transcode is dispatched. This is
+// the enforcement issue #389 adds on top of ADR-014 D2's resolution: model 2
+// (explicit source) makes the guarantee a CLEAR ERROR at submit time rather than
+// an open-ended wait (ADR-014 D1 / issue #389). A HEAD/stat miss => `absent`; a
+// zero-byte object => `empty`. Never let a burned rendition dispatch against a
+// missing/empty sidecar.
+export async function checkBurnInObjectAvailable(
+  objectKey: string,
+  storage: SidecarStatReader
+): Promise<BurnInAvailability> {
+  const stat = await storage.statObject(objectKey);
+  if (!stat) {
+    return {
+      available: false,
+      reason: 'absent',
+      objectKey,
+      message: `burn-in caption source '${objectKey}' does not exist in the workspace object store yet (subtitle generation is fire-and-forget; the sidecar has not landed) — retry once the sidecar is available`
+    };
+  }
+  if (stat.size <= 0) {
+    return {
+      available: false,
+      reason: 'empty',
+      objectKey,
+      message: `burn-in caption source '${objectKey}' exists but is empty (0 bytes) — an empty sidecar burns no captions; retry once the sidecar has content`
+    };
+  }
+  return { available: true };
+}
+
 // Escape a single-quoted libass `force_style` value so it cannot break out of
 // the `force_style='...'` quoting in the FFmpeg filter string. Single quotes are
 // the only metacharacter that terminates the quoted segment; we drop them (they
