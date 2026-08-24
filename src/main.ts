@@ -252,8 +252,11 @@ const stackResolver = new WorkspaceStackResolver({
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
   optionalSteps: optionalStepBuilders,
-  // Diagnostic logger (issue #415): logs the (namespace, stack name) the
-  // resolver reads with so a read-back miss correlates with the write key.
+  // Diagnostic/observability logger. Read-path diagnostics (issue #415): logs
+  // the (namespace, stack name) the resolver reads with so a read-back miss
+  // correlates with the write key. Also surfaces transient parameter-store
+  // refresh failures instead of swallowing them (issue #419) so a subsequent
+  // 501 from the storage routes is traceable.
   log: app.log
 });
 

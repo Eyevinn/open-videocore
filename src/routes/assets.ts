@@ -64,7 +64,14 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
-import { resolveBurnInSource, buildSubtitlesFilter } from '../pipeline/burn-in.js';
+import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
+import {
+  resolveBurnInSource,
+  buildSubtitlesFilter,
+  checkBurnInObjectAvailable,
+  validateForceStyle,
+  BURN_IN_FORCE_STYLE_MAX_LENGTH
+} from '../pipeline/burn-in.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
@@ -153,18 +160,41 @@ const customProfileSchema = z.object({
 // injection surface). Values omitted -> unchanged default output.
 const profileParamsSchema = z.record(z.string(), z.string());
 
-// Burn-in caption source (issue #388, ADR-014 D2). Optional + additive: absent
-// => no burn-in, today's transcodes unchanged. `source` is a discriminated union
-// on `type`; `forceStyle` is a free-form libass style string forwarded verbatim.
-// Format gating (srt/vtt only, ttml rejected) and objectKey resolution happen in
-// the handler (resolveBurnInSource) so the not-ready/not-found/unsupported cases
-// map to descriptive 4xx responses rather than opaque schema errors.
+// Burn-in caption source (issue #388, ADR-014 D2; styling contract hardened by
+// issue #390). Optional + additive: absent => no burn-in, today's transcodes
+// unchanged. `source` is a discriminated union on `type`. Format gating (srt/vtt
+// only, ttml rejected) and objectKey resolution happen in the handler
+// (resolveBurnInSource) so the not-ready/not-found/unsupported cases map to
+// descriptive 4xx responses rather than opaque schema errors.
+//
+// STYLING CONTRACT (issue #390): the default on-screen appearance is WHATEVER THE
+// SIDECAR CARRIES — a vtt sidecar's cue settings convey position/styling; an srt
+// sidecar conveys none, so the burn-in renderer's defaults apply. `forceStyle` is
+// an OPTIONAL, EXPLICIT, VALIDATED override — NOT a free-form ffmpeg filter
+// string. It is a comma-separated list of `Key=Value` libass style directives
+// where every Key is allowlisted (validateForceStyle / BURN_IN_ALLOWED_STYLE_KEYS
+// in ../pipeline/burn-in.ts) and every Value uses a strict safe charset. Any value
+// containing quotes, commas (outside the separator), colons, semicolons,
+// backslashes or newlines — i.e. anything that could escape `force_style='...'`
+// and inject filtergraph content — is REJECTED with a 422 (see the handler). The
+// schema bounds length; the exact allowlist/charset check runs in the handler so
+// the rejection carries a specific, actionable message.
 const burnInSchema = z.object({
-  source: z.discriminatedUnion('type', [
-    z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
-    z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
-  ]),
-  forceStyle: z.string().max(1024).optional()
+  source: z
+    .discriminatedUnion('type', [
+      z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
+      z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
+    ])
+    .describe(
+      'Caption source, resolved to one workspace-local sidecar object key. Burn-in supports srt and vtt only; a ttml source (or track) is rejected with 422 (ADR-014 D4).'
+    ),
+  forceStyle: z
+    .string()
+    .max(BURN_IN_FORCE_STYLE_MAX_LENGTH)
+    .optional()
+    .describe(
+      "Optional styling/positioning override. Default styling is whatever the sidecar carries (vtt cue settings convey position/styling; srt conveys none, so the renderer defaults apply). This is NOT a free-form ffmpeg filter string: it is a comma-separated list of 'Key=Value' libass style directives drawn from an allowlist (FontName, FontSize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, Outline, Shadow, Spacing, Alignment, MarginL, MarginR, MarginV, BorderStyle). Positioning is expressed via Alignment (numpad 1-9) and MarginV. Values may only use letters, digits and the limited set '&#.+%- '; any quote, comma (outside the separator), colon, semicolon, backslash or newline is rejected with 422. Example: \"FontName=Sans,FontSize=24,Alignment=2,MarginV=40\"."
+    )
 });
 
 const transcodeBodySchema = z
@@ -180,7 +210,36 @@ const transcodeBodySchema = z
 
 const transcodeAcceptedSchema = z.object({
   jobId: z.string(),
-  encoreJobId: z.string()
+  encoreJobId: z.string(),
+  // Non-fatal notice (issue #394). Present ONLY when profileParams validation
+  // could not be performed because the profile YAML was unresolvable — either a
+  // custom profile that is not in the operator profile store, or the profile
+  // store was unreachable. The request was still accepted (202) and the
+  // profileParams keys were forwarded to Encore UNCHECKED. Absent when the keys
+  // were validated against the profile's declared params, or when the request
+  // carried no profileParams at all.
+  warning: z
+    .object({
+      code: z
+        .literal('profile_params_unvalidated')
+        .describe('Stable machine-readable warning code.'),
+      message: z
+        .string()
+        .describe('Human-readable explanation naming the profile and the unvalidated keys.'),
+      profile: z
+        .string()
+        .describe('The profile name whose declared params could not be resolved.'),
+      unvalidatedKeys: z
+        .array(z.string())
+        .describe('The profileParams keys that were forwarded to Encore without validation.')
+    })
+    .describe(
+      'Present only when profileParams validation could not be performed because the ' +
+        'profile YAML was unresolvable (a custom profile not in the store, or the profile ' +
+        'store was unreachable). The request was still accepted and the keys were forwarded ' +
+        'to Encore unchecked.'
+    )
+    .optional()
 });
 
 // Free-form, operator-defined metadata (issue #12). Values must be
@@ -2415,6 +2474,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'transcoding is not configured'
         });
       }
+      // Non-fatal warning surfaced in the 202 response when profileParams
+      // validation was SKIPPED (profile YAML unresolvable) — issue #394. Set
+      // inside the skipped branch below; spread into the accepted response only
+      // when present. Undefined when validation ran (passed) or there were no
+      // profileParams.
+      let profileParamsWarning:
+        | { code: 'profile_params_unvalidated'; message: string; profile: string; unvalidatedKeys: string[] }
+        | undefined;
       // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
       // platform tier (issue #286) before submitting to Encore.
       const unrunnable = await unrunnableProfileReason(request.body.profile);
@@ -2440,14 +2507,61 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // always passes.
       if (request.body.profileParams && !request.body.customProfile) {
         const profileName = request.body.profile ?? 'program';
-        const stored = opts.profileRepository
-          ? await opts.profileRepository.get(profileName)
-          : undefined;
+        // Resolve the profile YAML while distinguishing a genuine not-found from
+        // an unreachable profile store (issue #392). A store outage makes
+        // ProfileRepository.get() THROW (couch-profile-repo does not catch); the
+        // resolver captures that so a store outage no longer turns a transcode
+        // submit into an uncaught 500. Behaviour stays PERMISSIVE: in BOTH the
+        // not-found and store-unreachable cases we pass an undefined YAML into
+        // validateProfileParams exactly as before, so the request still submits.
+        const resolution = await resolveProfileYaml(opts.profileRepository, profileName);
+        // The resolved status is kept as a local so the sibling issues can
+        // consume the distinction: #393 (logging the store-unreachable case) and
+        // #394 (a response warning field). Neither is implemented here.
         const check = validateProfileParams({
           profileName,
-          profileYaml: stored?.yaml,
+          profileYaml: resolution.status === 'found' ? resolution.yaml : undefined,
           profileParams: request.body.profileParams
         });
+        // When validation was SKIPPED (the profile YAML could not be resolved),
+        // the request still succeeds permissively — but a mistyped profile name
+        // plus a mistyped param name would otherwise pass silently, and a store
+        // outage would silently skip validation for its whole duration. Emit ONE
+        // log line so an operator gets feedback (issue #393). No behavioural
+        // change: the request is still accepted regardless. The same skipped
+        // signal will be surfaced in the response by #394. We distinguish a
+        // store outage (warn — an operator should notice; carry the captured
+        // error) from an ordinary profile-not-found / custom-profile use (info)
+        // via a machine-readable `reason` field.
+        if (check.ok && !check.validated) {
+          const skipped = {
+            profileName: check.profileName,
+            unvalidatedKeys: check.unvalidatedKeys
+          };
+          // Surface the skipped validation as a non-fatal warning in the 202
+          // response (issue #394). The request is still accepted; these keys
+          // were forwarded to Encore unchecked.
+          profileParamsWarning = {
+            code: 'profile_params_unvalidated',
+            message:
+              `profileParams validation was skipped: profile '${check.profileName}' could not be ` +
+              `resolved, so the following keys were forwarded to Encore unchecked: ` +
+              `${check.unvalidatedKeys.join(', ')}.`,
+            profile: check.profileName,
+            unvalidatedKeys: check.unvalidatedKeys
+          };
+          if (resolution.status === 'store-unreachable') {
+            request.log.warn(
+              { ...skipped, reason: 'store-unreachable' as const, err: resolution.error },
+              'profileParams validation skipped: profile store unreachable'
+            );
+          } else {
+            request.log.info(
+              { ...skipped, reason: 'profile-not-found' as const },
+              'profileParams validation skipped: profile not found'
+            );
+          }
+        }
         // Only a hard reject (`ok: false`) turns into a 400. Both a genuine
         // pass and the explicit skipped/permissive result (`validated: false`,
         // profile YAML unresolvable) keep `ok: true` and are request-accepted;
@@ -2471,6 +2585,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // wait). Absent `burnIn` => no filter, clean rendition (unchanged).
       let burnInSubtitlesFilter: string | undefined;
       if (request.body.burnIn) {
+        // Styling override (issue #390): validate the caller's `forceStyle` against
+        // the allowlist + safe charset BEFORE resolving/dispatching. This CLOSES
+        // the filter-injection hole #388 left (raw forwarding into
+        // force_style='...'): a quote/comma/colon/backslash/newline — anything that
+        // could escape the quoting and inject filtergraph content — is rejected
+        // here with a 422 and never reaches buildSubtitlesFilter. Only the
+        // canonical, allowlisted string is composed into the filter.
+        let canonicalForceStyle: string | undefined;
+        if (request.body.burnIn.forceStyle !== undefined && request.body.burnIn.forceStyle.trim() !== '') {
+          const styleCheck = validateForceStyle(request.body.burnIn.forceStyle);
+          if (!styleCheck.ok) {
+            return reply.code(422).send({ error: 'burn_in_invalid_force_style', message: styleCheck.message });
+          }
+          canonicalForceStyle = styleCheck.canonical;
+        }
         const resolved = resolveBurnInSource(
           request.body.burnIn.source,
           asset.subtitleTracks
@@ -2482,11 +2611,43 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           if (resolved.reason === 'unsupported_format') {
             return reply.code(422).send({ error: 'burn_in_unsupported_format', message: resolved.message });
           }
-          // not_ready: the referenced track exists but its file has not landed
-          // yet. #389 owns the wait/queue/fail policy; surface it distinctly.
+          // not_ready: the referenced track exists but its objectKey is still
+          // undefined (asset-repo says the file has not landed). Distinct from
+          // the object-existence race below (#389) — here we have no key at all.
           return reply.code(409).send({ error: 'burn_in_source_not_ready', message: resolved.message });
         }
-        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, request.body.burnIn.forceStyle);
+        // #389: CLOSE the generation race. `resolveBurnInSource` proved the
+        // request NAMES a concrete key; now verify the key's BYTES have actually
+        // landed in the workspace object store BEFORE dispatch. Subtitle
+        // generation is fire-and-forget (subtitle-generator.ts), so a resolved
+        // key — a caller-supplied `sidecarKey`, or a `subtitleTrack.objectKey`
+        // set before the generation callback landed — can point at an object that
+        // does not yet exist or is still zero-length. Either would silently burn
+        // NO captions, so we FAIL the submission with a specific 409
+        // (`burn_in_source_not_available`, distinct from #388's
+        // `burn_in_source_not_ready` no-objectKey case) and never dispatch. The
+        // check reuses WorkspaceStorage.statObject (src/data/storage.ts:92-102),
+        // the same presence plumbing the rest of the routes use, against the
+        // workspace/source bucket where generated sidecars land
+        // (subtitle-generator.ts:101-103 destinationKey). ADR-014 D1/D2 chose the
+        // explicit-source model, so a clear error at submit time is the natural
+        // guarantee (no open-ended wait).
+        if (!storageFor) {
+          // No object store wired on this deployment — we cannot verify the
+          // sidecar exists, so we MUST NOT dispatch a possibly-captionless burn.
+          return reply.code(501).send({
+            error: 'burn_in_storage_unavailable',
+            message: 'burn-in requires object storage to verify the caption source exists, but object storage is not configured on this deployment'
+          });
+        }
+        const availability = await checkBurnInObjectAvailable(resolved.objectKey, storageFor());
+        if (!availability.available) {
+          return reply.code(409).send({
+            error: 'burn_in_source_not_available',
+            message: availability.message
+          });
+        }
+        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, canonicalForceStyle);
       }
       try {
         const result = await submitTranscode(
@@ -2503,7 +2664,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           },
           { jobs, assets: repo, encore: opts.encore }
         );
-        return reply.code(202).send(result);
+        return reply
+          .code(202)
+          .send({ ...result, ...(profileParamsWarning ? { warning: profileParamsWarning } : {}) });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
