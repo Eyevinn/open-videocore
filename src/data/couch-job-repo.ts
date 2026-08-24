@@ -9,6 +9,7 @@
 import {
   applyJobPatch,
   appendEncodeAttemptToJob,
+  finalizeLatestEncodeAttemptOnJob,
   decodeEncoreJobId,
   type CreateJobInput,
   type EncodeAttempt,
@@ -122,6 +123,26 @@ export class CouchJobRepository implements JobRepository {
     }
     const existing = fromDoc(doc);
     const next = appendEncodeAttemptToJob(existing, attempt, new Date().toISOString());
+    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
+    return next;
+  }
+
+  // Durably finalise the latest (open) encode-attempt on completion (#381).
+  // Read-modify-write against the current CouchDB revision so the close-out
+  // lands on top of the latest persisted state (the dispatch-time append from
+  // #380). Finalises the last log entry in place — never appends — so the
+  // attempt count is unchanged.
+  async finalizeEncodeAttempt(
+    id: string,
+    patch: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const existing = fromDoc(doc);
+    const next = finalizeLatestEncodeAttemptOnJob(existing, patch, new Date().toISOString());
     await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;
   }
