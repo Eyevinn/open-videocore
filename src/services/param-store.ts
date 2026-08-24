@@ -216,6 +216,27 @@ export type HttpParamStoreConfig = {
   fetch?: typeof globalThis.fetch;
   // Per-request timeout in milliseconds. All external OSC calls must be bounded.
   timeoutMs?: number;
+  // OPTIONAL diagnostic logger (issue #415). When supplied, the client emits the
+  // EXACT key it writes and the EXACT key it reads (plus the outcome: written /
+  // hit / miss / error). This makes a write-vs-read failure in the
+  // self-provisioning flow determinable from the logs — a stored key that is
+  // never read (or a read key that never matches a written key) pins the defect
+  // to one side. Defaults to a no-op: no behaviour change when unset.
+  log?: ParamStoreDiagLog;
+};
+
+// Minimal structured-logger shape the param-store diagnostics (issue #415) use.
+// Compatible with the Fastify/pino logger already threaded through the app, so
+// callers pass their existing `request.log` / `app.log` unchanged.
+export interface ParamStoreDiagLog {
+  info(obj: Record<string, unknown>, msg: string): void;
+  warn(obj: Record<string, unknown>, msg: string): void;
+}
+
+// No-op logger so the client can call log.* unconditionally when none supplied.
+const NOOP_DIAG_LOG: ParamStoreDiagLog = {
+  info() {},
+  warn() {}
 };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -237,6 +258,7 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   const doFetch = config.fetch ?? globalThis.fetch;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const base = config.baseUrl.replace(/\/$/, '');
+  const diag = config.log ?? NOOP_DIAG_LOG;
 
   function configUrl(key?: string): string {
     const path = key ? `/${encodeURIComponent(key)}` : '';
@@ -281,8 +303,22 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
       );
       if (!res.ok) {
         const text = await res.text().catch(() => '');
+        // WRITE-PATH diagnostic (issue #415): the exact key we attempted to
+        // write and the store's rejection. If this fires, the config never
+        // reached the store — the defect is on the write side.
+        diag.warn(
+          { op: 'storeStackConfig', workspaceId, name, key, status: res.status },
+          'param-store write failed'
+        );
         throw new Error(`parameter store write failed: ${res.status} ${text}`.trim());
       }
+      // WRITE-PATH diagnostic (issue #415): records the EXACT key persisted so it
+      // can be compared byte-for-byte against the key a later read derives. A
+      // written key that no read ever matches pins the defect to the read side.
+      diag.info(
+        { op: 'storeStackConfig', workspaceId, name, key, status: res.status },
+        'param-store write ok'
+      );
     },
 
     async loadStackConfig(workspaceId, name) {
@@ -291,13 +327,45 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
       const res = await withTimeout((signal) =>
         doFetch(configUrl(key), { method: 'GET', headers: h, signal })
       );
-      if (res.status === 404) return undefined;
+      if (res.status === 404) {
+        // READ-PATH diagnostic (issue #415): the EXACT key we looked up returned
+        // a miss. Compare this key to the 'param-store write ok' key for the same
+        // stack: if the store logged a successful write of THIS key, the value is
+        // present and the miss is spurious; if the written key DIFFERS (e.g. a
+        // namespace / stack-name mismatch), the defect is a read-side key
+        // derivation bug — not a failed write.
+        diag.warn(
+          { op: 'loadStackConfig', workspaceId, name, key, status: 404 },
+          'param-store read miss'
+        );
+        return undefined;
+      }
       if (!res.ok) {
         const text = await res.text().catch(() => '');
+        diag.warn(
+          { op: 'loadStackConfig', workspaceId, name, key, status: res.status },
+          'param-store read failed'
+        );
         throw new Error(`parameter store read failed: ${res.status} ${text}`.trim());
       }
       const body = (await res.json().catch(() => ({}))) as { value?: string };
-      if (typeof body.value !== 'string' || body.value.length === 0) return undefined;
+      if (typeof body.value !== 'string' || body.value.length === 0) {
+        // READ-PATH diagnostic (issue #415): the key resolved (200) but carried
+        // no value — a stored-empty / partial-write signature distinct from a
+        // key mismatch (which would 404 above).
+        diag.warn(
+          { op: 'loadStackConfig', workspaceId, name, key, status: res.status, empty: true },
+          'param-store read returned empty value'
+        );
+        return undefined;
+      }
+      // READ-PATH diagnostic (issue #415): the EXACT key that resolved to a
+      // stored config. A hit here for the same key the write logged confirms the
+      // round-trip works and moves the investigation elsewhere.
+      diag.info(
+        { op: 'loadStackConfig', workspaceId, name, key, status: res.status },
+        'param-store read hit'
+      );
       try {
         return JSON.parse(body.value) as StackConfig;
       } catch {
@@ -386,7 +454,12 @@ async function resolveParamStoreBaseUrl(
 // will surface a 501).
 export async function paramStoreFromEnv(
   resolver: ParamStoreUrlResolver,
-  getOscToken: () => Promise<string>
+  getOscToken: () => Promise<string>,
+  // OPTIONAL diagnostic logger (issue #415). Threaded into the HTTP client so
+  // production emits the exact written/read key pairs used to determine whether
+  // a StackConfig persistence failure is on the write or read path. Optional so
+  // existing callers/tests are unaffected (defaults to the client's no-op).
+  log?: ParamStoreDiagLog
 ): Promise<ParamStore | undefined> {
   const apiKey = process.env['PARAMETER_STORE_API_KEY'];
   if (!apiKey) return undefined;
@@ -395,7 +468,7 @@ export async function paramStoreFromEnv(
     DEFAULT_PARAM_STORE_INSTANCE_NAME;
   const baseUrl = await resolveParamStoreBaseUrl(resolver, instanceName);
   if (!baseUrl) return undefined;
-  return makeHttpParamStore({ baseUrl, apiKey, getOscToken });
+  return makeHttpParamStore({ baseUrl, apiKey, getOscToken, ...(log ? { log } : {}) });
 }
 
 const VALKEY_SERVICE_ID = 'valkey-io-valkey';

@@ -27,6 +27,7 @@ import {
 } from '../data/job-repo.js';
 import type { EncoreProfile } from './encode-presets.js';
 import type { EncoreClient } from './encore-client.js';
+import { BURN_IN_PROFILE_PARAM_KEY } from './burn-in.js';
 
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
 
@@ -47,6 +48,16 @@ export type SubmitTranscodeParams = {
   // default output. Verified shape: SVT Encore `EncoreJob.profileParams`
   // (github.com/svt/encore, encore-common/.../model/EncoreJob.kt).
   profileParams?: Record<string, string>;
+  // Per-request burn-in filter (issue #388, ADR-014 D3). When set, this is the
+  // fully-resolved FFmpeg `subtitles=<key>[:force_style='...']` string built by
+  // src/pipeline/burn-in.ts. It is threaded into the Encore job's
+  // `profileParams` under the `subtitlesFilter` SpEL key
+  // (BURN_IN_PROFILE_PARAM_KEY), so a burn-in-capable server-side profile's
+  // VideoEncode `filters` list can reference it via
+  // `#{profileParams['subtitlesFilter']?:''}`. Omitting it => no burn-in filter
+  // (clean rendition), so a single submission can mix burned and clean profiles
+  // and existing transcodes are unaffected.
+  burnInSubtitlesFilter?: string;
   // S3 bucket names so we can build the s3:// URIs Encore reads/writes.
   sourceBucket: string;
   outputBucket: string;
@@ -97,7 +108,15 @@ export async function submitTranscode(
     // at the callback listener paired with the chosen Encore instance (ADR-006),
     // so it is not set here.
     const encoreProfile = params.customProfile ? params.customProfile.name : profileName;
-    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, profileParams: params.profileParams, progressCallbackUri: undefined });
+    // Burn-in opt-in (issue #388, ADR-014 D3): merge the resolved subtitles
+    // filter into profileParams under the `subtitlesFilter` SpEL key so the
+    // selected profile's VideoEncode filters can pick it up. This is additive —
+    // when no burn-in was requested the key is absent and the profile's default
+    // (`''`) applies, so the rendition carries NO subtitles filter (clean).
+    const profileParams = params.burnInSubtitlesFilter
+      ? { ...(params.profileParams ?? {}), [BURN_IN_PROFILE_PARAM_KEY]: params.burnInSubtitlesFilter }
+      : params.profileParams;
+    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, profileParams, progressCallbackUri: undefined });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {
       await deps.jobs.update(job.id, { encoreInternalJobId });

@@ -61,14 +61,21 @@ const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
 // Minimal logger surface (compatible with Fastify's logger and mirroring
 // DispatcherLogger in services/webhook-dispatcher.ts). Injected so a transient
 // parameter-store refresh failure is observable instead of being silently
-// swallowed (issue #419). Defaults to a noop so callers/tests that don't wire a
-// logger keep working.
+// swallowed (issue #419). The `info`/`warn` methods also carry the read-path
+// diagnostics added in issue #415 (namespace/stack-name correlation), so this
+// single logger surface covers both concerns. Defaults to a noop so
+// callers/tests that don't wire a logger keep working.
 export type StackResolverLogger = {
+  info: (obj: unknown, msg?: string) => void;
   warn: (obj: unknown, msg?: string) => void;
   error: (obj: unknown, msg?: string) => void;
 };
 
-const noopLogger: StackResolverLogger = { warn: () => {}, error: () => {} };
+const noopLogger: StackResolverLogger = {
+  info: () => {},
+  warn: () => {},
+  error: () => {}
+};
 
 export type WorkspaceConnections = {
   assets: AssetRepository;
@@ -321,6 +328,11 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
+  // Diagnostic/observability logger. `info`/`warn` carry the read-path
+  // diagnostics (issue #415: (namespace, stack name) correlation on each
+  // resolve); `error` surfaces a transient parameter-store refresh failure
+  // instead of silently swallowing it (issue #419). Defaults to a noop so
+  // existing callers/tests are unaffected.
   private log: StackResolverLogger;
 
   constructor(opts: {
@@ -332,9 +344,9 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
-    // Injected logger so a transient parameter-store refresh failure is
-    // observable (issue #419). Optional; defaults to a noop for callers/tests
-    // that don't wire one.
+    // Injected logger so read-path diagnostics (issue #415) and transient
+    // parameter-store refresh failures (issue #419) are observable. Optional;
+    // defaults to a noop for callers/tests that don't wire one.
     log?: StackResolverLogger;
   }) {
     this.paramStore = opts.paramStore;
@@ -373,6 +385,14 @@ export class WorkspaceStackResolver {
     let config: StackConfig | undefined;
     try {
       if (stackName) {
+        // READ-PATH diagnostic (issue #415): the resolver reads by the
+        // X-Stack-Name-derived name under STACK_CONFIG_NAMESPACE. This is the
+        // (namespace, name) pair whose derived key must equal the key the
+        // provision route wrote; the param-store client logs the concrete key.
+        this.log?.info(
+          { source: 'x-stack-name', namespace: STACK_CONFIG_NAMESPACE, stackName },
+          'resolver reading stack config by requested name'
+        );
         config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
@@ -380,12 +400,24 @@ export class WorkspaceStackResolver {
         // all storage/asset operations.
         if (!config) {
           const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+          this.log?.info(
+            { namespace: STACK_CONFIG_NAMESPACE, requested: stackName, listed: names },
+            'requested stack not found; falling back to first listed stack'
+          );
           if (names.length > 0) {
             config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
           }
         }
       } else {
+        // READ-PATH diagnostic (issue #415): no X-Stack-Name header, so the
+        // resolver uses the FIRST listed stack as the default. If the list is
+        // empty here but the provision route logged a successful write, the
+        // write key and the list prefix disagree — a read-side namespace/key bug.
         const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+        this.log?.info(
+          { source: 'default', namespace: STACK_CONFIG_NAMESPACE, listed: names },
+          'resolver reading default stack config (no X-Stack-Name)'
+        );
         if (names.length > 0) {
           config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
         }
@@ -395,12 +427,14 @@ export class WorkspaceStackResolver {
       // non-2xx from listStackNames()/loadStackConfig()). We deliberately do NOT
       // change the fallback behaviour here (tracked separately) — but we must no
       // longer swallow the error silently (issue #419). Log the real error with
-      // the stack identifier being resolved and a clear indication that we are
+      // its message + stack, the stack identifier being resolved, the read
+      // namespace (issue #415 correlation), and a clear indication that we are
       // degrading to the in-memory (no object storage) path, so a subsequent 501
       // from GET /api/v1/storage/buckets can be correlated to this root cause.
       this.log.error(
         {
           err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE,
           stackName: stackName ?? '(workspace default)',
           fallback: 'in-memory (no object storage)'
         },

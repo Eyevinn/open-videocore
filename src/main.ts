@@ -190,7 +190,10 @@ const paramStore = await paramStoreFromEnv(
     getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
     getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat)
   },
-  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc')
+  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc'),
+  // Diagnostic logger (issue #415): emits the exact StackConfig key written vs.
+  // read so a persistence/read-back failure is attributable to one path.
+  app.log
 );
 if (!paramStore) {
   app.log.warn(
@@ -249,8 +252,11 @@ const stackResolver = new WorkspaceStackResolver({
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
   optionalSteps: optionalStepBuilders,
-  // Surface transient parameter-store refresh failures instead of swallowing
-  // them (issue #419) so a subsequent 501 from the storage routes is traceable.
+  // Diagnostic/observability logger. Read-path diagnostics (issue #415): logs
+  // the (namespace, stack name) the resolver reads with so a read-back miss
+  // correlates with the write key. Also surfaces transient parameter-store
+  // refresh failures instead of swallowing them (issue #419) so a subsequent
+  // 501 from the storage routes is traceable.
   log: app.log
 });
 
