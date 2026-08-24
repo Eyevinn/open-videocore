@@ -10,6 +10,7 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import type { Redis } from 'ioredis';
 import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository, type JobStatus } from '../data/job-repo.js';
+import { FAILURE_CLASSES } from '../encore-scaler/retry-policy.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
@@ -33,6 +34,40 @@ const jobSchema = z.object({
   encoreInstanceId: z.string().optional(), // which pool instance is running this job
   profile: z.string().optional(),
   renditionAssetIds: z.array(z.string()).optional(),
+  // --- Durable encode-attempt capture (ADR-012, #380/#382) ---
+  // Number of times this transcode job was dispatched to an Encore instance,
+  // inclusive of the first (1 on the first dispatch). Distinct from `attempts`
+  // above, which counts URL-pull ingest attempts and is UNCHANGED. Absent on
+  // ingest jobs; a transcode that succeeded on its first dispatch reports 1.
+  encodeAttempts: z
+    .number()
+    .optional()
+    .describe(
+      'Number of Encore dispatches for this transcode job (>=1 once dispatched). Distinct from the ingest-only `attempts` field. Absent on ingest jobs.'
+    ),
+  // Per-attempt history for a transcode job, one entry per dispatch in dispatch
+  // order. The last entry is the successful attempt; elapsed encode time
+  // EXCLUDING RETRIES is that last entry's (endedAt - startedAt). Absent on
+  // ingest jobs.
+  encodeAttemptLog: z
+    .array(
+      z.object({
+        index: z.number().describe('1-based attempt number in dispatch order.'),
+        startedAt: z.string().describe('ISO-8601 UTC time this dispatch began.'),
+        endedAt: z
+          .string()
+          .optional()
+          .describe('ISO-8601 UTC time this dispatch settled; absent while still running.'),
+        classification: z
+          .enum(FAILURE_CLASSES)
+          .optional()
+          .describe('Failure class; set only on a FAILED attempt. Absent on the successful attempt.')
+      })
+    )
+    .optional()
+    .describe(
+      'Per-dispatch encode history. Elapsed time excluding retries = the last (successful) entry: Date.parse(endedAt) - Date.parse(startedAt).'
+    ),
   createdAt: z.string(),
   updatedAt: z.string()
 });

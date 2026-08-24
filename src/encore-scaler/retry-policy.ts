@@ -67,7 +67,13 @@
 // retried forever: it is retried at most MAX_ENCODE_ATTEMPTS times and then fails
 // clearly with the last Encore error message surfaced to the caller.
 
-export type FailureClass = 'transport' | 'io-retryable' | 'deterministic';
+// Runtime source of truth for the failure classifications (ADR-012). The Zod
+// enum surfaced on the job read API (src/routes/jobs.ts) derives from this array
+// so the wire schema can never drift from the type. `FailureClass` is derived
+// from it, so the union and the array stay in lockstep by construction.
+export const FAILURE_CLASSES = ['transport', 'io-retryable', 'deterministic'] as const;
+
+export type FailureClass = (typeof FAILURE_CLASSES)[number];
 
 // Maximum number of times a single job is DISPATCHED to an Encore instance,
 // inclusive of the first attempt. 3 = first attempt + up to 2 re-dispatches.

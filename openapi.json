@@ -10365,6 +10365,45 @@
                               "type": "string"
                             }
                           },
+                          "encodeAttempts": {
+                            "type": "number",
+                            "description": "Number of Encore dispatches for this transcode job (>=1 once dispatched). Distinct from the ingest-only `attempts` field. Absent on ingest jobs."
+                          },
+                          "encodeAttemptLog": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "index": {
+                                  "type": "number",
+                                  "description": "1-based attempt number in dispatch order."
+                                },
+                                "startedAt": {
+                                  "type": "string",
+                                  "description": "ISO-8601 UTC time this dispatch began."
+                                },
+                                "endedAt": {
+                                  "type": "string",
+                                  "description": "ISO-8601 UTC time this dispatch settled; absent while still running."
+                                },
+                                "classification": {
+                                  "type": "string",
+                                  "enum": [
+                                    "transport",
+                                    "io-retryable",
+                                    "deterministic"
+                                  ],
+                                  "description": "Failure class; set only on a FAILED attempt. Absent on the successful attempt."
+                                }
+                              },
+                              "required": [
+                                "index",
+                                "startedAt"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "description": "Per-dispatch encode history. Elapsed time excluding retries = the last (successful) entry: Date.parse(endedAt) - Date.parse(startedAt)."
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -10482,6 +10521,45 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "encodeAttempts": {
+                      "type": "number",
+                      "description": "Number of Encore dispatches for this transcode job (>=1 once dispatched). Distinct from the ingest-only `attempts` field. Absent on ingest jobs."
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number",
+                            "description": "1-based attempt number in dispatch order."
+                          },
+                          "startedAt": {
+                            "type": "string",
+                            "description": "ISO-8601 UTC time this dispatch began."
+                          },
+                          "endedAt": {
+                            "type": "string",
+                            "description": "ISO-8601 UTC time this dispatch settled; absent while still running."
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ],
+                            "description": "Failure class; set only on a FAILED attempt. Absent on the successful attempt."
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "description": "Per-dispatch encode history. Elapsed time excluding retries = the last (successful) entry: Date.parse(endedAt) - Date.parse(startedAt)."
                     },
                     "createdAt": {
                       "type": "string"
@@ -10609,6 +10687,45 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "encodeAttempts": {
+                      "type": "number",
+                      "description": "Number of Encore dispatches for this transcode job (>=1 once dispatched). Distinct from the ingest-only `attempts` field. Absent on ingest jobs."
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number",
+                            "description": "1-based attempt number in dispatch order."
+                          },
+                          "startedAt": {
+                            "type": "string",
+                            "description": "ISO-8601 UTC time this dispatch began."
+                          },
+                          "endedAt": {
+                            "type": "string",
+                            "description": "ISO-8601 UTC time this dispatch settled; absent while still running."
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ],
+                            "description": "Failure class; set only on a FAILED attempt. Absent on the successful attempt."
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "description": "Per-dispatch encode history. Elapsed time excluding retries = the last (successful) entry: Date.parse(endedAt) - Date.parse(startedAt)."
                     },
                     "createdAt": {
                       "type": "string"
