@@ -14,7 +14,6 @@ import { Client as MinioClient } from 'minio';
 import {
   isReadyStack,
   type ParamStore,
-  type ParamStoreDiagLog,
   type StackConfig,
   type StorageBackendConfig
 } from './param-store.js';
@@ -58,6 +57,25 @@ export type OptionalStepBuilders = {
 };
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+
+// Minimal logger surface (compatible with Fastify's logger and mirroring
+// DispatcherLogger in services/webhook-dispatcher.ts). Injected so a transient
+// parameter-store refresh failure is observable instead of being silently
+// swallowed (issue #419). The `info`/`warn` methods also carry the read-path
+// diagnostics added in issue #415 (namespace/stack-name correlation), so this
+// single logger surface covers both concerns. Defaults to a noop so
+// callers/tests that don't wire a logger keep working.
+export type StackResolverLogger = {
+  info: (obj: unknown, msg?: string) => void;
+  warn: (obj: unknown, msg?: string) => void;
+  error: (obj: unknown, msg?: string) => void;
+};
+
+const noopLogger: StackResolverLogger = {
+  info: () => {},
+  warn: () => {},
+  error: () => {}
+};
 
 export type WorkspaceConnections = {
   assets: AssetRepository;
@@ -310,11 +328,12 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
-  // OPTIONAL diagnostic logger (issue #415). When supplied, the resolver logs
-  // the (namespace, stack name) pair it reads with on each resolve so a
-  // read-back miss can be correlated with the write key logged by the
-  // param-store client. Optional so existing callers/tests are unaffected.
-  private log: ParamStoreDiagLog | undefined;
+  // Diagnostic/observability logger. `info`/`warn` carry the read-path
+  // diagnostics (issue #415: (namespace, stack name) correlation on each
+  // resolve); `error` surfaces a transient parameter-store refresh failure
+  // instead of silently swallowing it (issue #419). Defaults to a noop so
+  // existing callers/tests are unaffected.
+  private log: StackResolverLogger;
 
   constructor(opts: {
     paramStore: ParamStore | undefined;
@@ -325,15 +344,17 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
-    // OPTIONAL diagnostic logger (issue #415), see field doc above.
-    log?: ParamStoreDiagLog;
+    // Injected logger so read-path diagnostics (issue #415) and transient
+    // parameter-store refresh failures (issue #419) are observable. Optional;
+    // defaults to a noop for callers/tests that don't wire one.
+    log?: StackResolverLogger;
   }) {
     this.paramStore = opts.paramStore;
     this.oscContext = opts.oscContext;
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
-    this.log = opts.log;
+    this.log = opts.log ?? noopLogger;
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -402,12 +423,24 @@ export class WorkspaceStackResolver {
         }
       }
     } catch (err) {
-      // Fall through to in-memory. Log so a read-path failure (issue #415) is
-      // visible rather than silently degrading to in-memory connections.
-      this.log?.warn(
-        { err, namespace: STACK_CONFIG_NAMESPACE, stackName },
-        'resolver failed to load stack config; degrading to in-memory'
+      // The parameter-store round-trip failed (token issue, TLS blip, timeout,
+      // non-2xx from listStackNames()/loadStackConfig()). We deliberately do NOT
+      // change the fallback behaviour here (tracked separately) — but we must no
+      // longer swallow the error silently (issue #419). Log the real error with
+      // its message + stack, the stack identifier being resolved, the read
+      // namespace (issue #415 correlation), and a clear indication that we are
+      // degrading to the in-memory (no object storage) path, so a subsequent 501
+      // from GET /api/v1/storage/buckets can be correlated to this root cause.
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE,
+          stackName: stackName ?? '(workspace default)',
+          fallback: 'in-memory (no object storage)'
+        },
+        'stack resolver: parameter-store refresh failed; falling back to in-memory connections without object storage'
       );
+      // Fall through to in-memory (unchanged).
     }
 
     // A partially-provisioned/failed stack must never be treated as a live,
