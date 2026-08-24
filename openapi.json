@@ -1222,11 +1222,15 @@
                     },
                     "skipped": {
                       "type": "boolean"
+                    },
+                    "builtinSeeded": {
+                      "type": "number"
                     }
                   },
                   "required": [
                     "seeded",
-                    "skipped"
+                    "skipped",
+                    "builtinSeeded"
                   ],
                   "additionalProperties": false
                 }
