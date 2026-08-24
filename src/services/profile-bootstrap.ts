@@ -6,12 +6,22 @@
 // fetch the referenced YAML file (resolved relative to the index URL) and store
 // name + YAML content. Subsequent bootstraps are a no-op once profiles exist.
 //
+// Built-in profiles (issue #385): some profiles are a capability of THIS API and
+// must ship as part of the standard served set regardless of the remote index
+// (e.g. the loudness-normalisation profile). They are seeded from
+// src/services/builtin-profiles.ts on EVERY bootstrap run (including startup),
+// so they are always present in GET /index.yml even when profiles already exist
+// or the remote index is unreachable. An operator edit to a built-in profile is
+// preserved: an existing profile of the same name is left untouched.
+//
 // Contract sources verified before writing (CLAUDE.md rule 7):
 //   - src/data/profile-repo.ts — ProfileRepository.count/create/get signatures.
 //   - src/routes/profiles.ts (pre-change) — the trivial `key: value` index
 //     parser + FETCH_TIMEOUT_MS convention reused here.
+//   - src/services/builtin-profiles.ts — BUILTIN_PROFILES [{ name, yaml }].
 
 import type { ProfileRepository } from '../data/profile-repo.js';
+import { BUILTIN_PROFILES } from './builtin-profiles.js';
 
 // Timeout for each upstream fetch so a slow/hung index host can't block startup.
 const FETCH_TIMEOUT_MS = 5000;
@@ -23,8 +33,34 @@ export type BootstrapLogger = {
 
 export type BootstrapResult = {
   seeded: number;
-  skipped: boolean; // true when profiles already existed and bootstrap was a no-op
+  skipped: boolean; // true when remote-index seeding was a no-op (profiles existed)
+  // Count of built-in profiles newly created this run (issue #385). Built-ins are
+  // always ensured, independent of the remote-index skip guard, so this can be
+  // non-zero even when `skipped` is true.
+  builtinSeeded: number;
 };
+
+// Ensure every built-in profile (src/services/builtin-profiles.ts) exists in the
+// store. An existing profile of the same name is left untouched so an operator's
+// edit to a built-in is preserved. Returns the count newly created. Failures for
+// one profile are logged and do not abort the others.
+async function ensureBuiltinProfiles(
+  repository: ProfileRepository,
+  log?: BootstrapLogger
+): Promise<number> {
+  let created = 0;
+  for (const profile of BUILTIN_PROFILES) {
+    try {
+      const already = await repository.get(profile.name);
+      if (already) continue;
+      await repository.create({ name: profile.name, yaml: profile.yaml });
+      created += 1;
+    } catch (err) {
+      log?.warn({ err, profile: profile.name }, 'profile bootstrap: built-in seed failed');
+    }
+  }
+  return created;
+}
 
 // Parse the flat Encore profile index: one `name: relative-url` per line. Nested
 // / indented lines, comments and blanks are skipped (the index is a flat map).
@@ -69,11 +105,19 @@ export async function bootstrapProfiles(opts: {
 }): Promise<BootstrapResult> {
   const { repository, indexUrl, force = false, log } = opts;
 
-  if (!force) {
-    const existing = await repository.count();
-    if (existing > 0) {
-      return { seeded: 0, skipped: true };
-    }
+  // Capture whether the store was empty BEFORE seeding built-ins — otherwise the
+  // built-ins we add below would themselves trip the "profiles already exist"
+  // skip guard on a genuinely fresh store and suppress the remote-index seed.
+  const preExisting = force ? 0 : await repository.count();
+
+  // Built-in profiles (issue #385) are ALWAYS ensured, independent of the
+  // remote-index skip guard below, so they ship as part of the standard served
+  // set even on a store that already holds profiles or when the remote index is
+  // unreachable.
+  const builtinSeeded = await ensureBuiltinProfiles(repository, log);
+
+  if (!force && preExisting > 0) {
+    return { seeded: 0, skipped: true, builtinSeeded };
   }
 
   const indexBody = await fetchText(indexUrl);
@@ -95,6 +139,6 @@ export async function bootstrapProfiles(opts: {
     }
   }
 
-  log?.info({ seeded, indexUrl }, 'profile bootstrap complete');
-  return { seeded, skipped: false };
+  log?.info({ seeded, builtinSeeded, indexUrl }, 'profile bootstrap complete');
+  return { seeded, skipped: false, builtinSeeded };
 }
