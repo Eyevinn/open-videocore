@@ -203,6 +203,34 @@ function assertNoCredentials(config: StackConfig): void {
   }
 }
 
+// Minimal structured logger surface, compatible with Fastify's / pino's
+// `log.level(obj, msg)` shape (mirrors DispatcherLogger in
+// webhook-dispatcher.ts and TamsConfigLogger in tams/tams-config.ts). Injected
+// so retry attempts are observable without coupling to a concrete logger. All
+// methods are optional so existing call sites need not supply a logger.
+export type ParamStoreLogger = {
+  debug?: (obj: unknown, msg?: string) => void;
+  warn?: (obj: unknown, msg?: string) => void;
+  error?: (obj: unknown, msg?: string) => void;
+};
+
+// Tuning knobs for the bounded retry-with-backoff around the param-store HTTP
+// round-trip (issue #421). Defaults are conservative so a request-scoped
+// preHandler resolve cannot hang: at most RETRY attempts and RETRY_MAX_ELAPSED
+// wall-clock across all of them, jittered exponential backoff between tries.
+export type ParamStoreRetryConfig = {
+  // Total number of attempts including the first (so `3` = 1 try + 2 retries).
+  attempts?: number;
+  // Base backoff in ms; delay grows exponentially: base * 2^(attempt-1).
+  baseDelayMs?: number;
+  // Hard cap on any single backoff delay.
+  maxDelayMs?: number;
+  // Hard cap on total wall-clock spent across all attempts+backoffs. Once this
+  // budget is exhausted we stop retrying even if attempts remain, so a
+  // preHandler cannot hang beyond it.
+  maxElapsedMs?: number;
+};
+
 export type HttpParamStoreConfig = {
   // Base URL of the eyevinn-app-config-svc instance, resolved at runtime from
   // PARAMETER_STORE_INSTANCE_NAME via the OSC SDK (getInstance().url).
@@ -216,9 +244,61 @@ export type HttpParamStoreConfig = {
   fetch?: typeof globalThis.fetch;
   // Per-request timeout in milliseconds. All external OSC calls must be bounded.
   timeoutMs?: number;
+  // Optional injectable logger for retry observability (issue #421).
+  log?: ParamStoreLogger;
+  // Optional retry tuning (issue #421). Omitted keys fall back to DEFAULT_RETRY.
+  retry?: ParamStoreRetryConfig;
+  // Injectable sleep for tests, so backoff waits can be advanced deterministically
+  // without real timers. Defaults to a real setTimeout-based delay.
+  sleep?: (ms: number) => Promise<void>;
 };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+
+// Retry defaults (issue #421). 3 attempts total (1 + 2 retries), exponential
+// backoff from 100ms capped at 2s per wait, and a 6s total wall-clock budget so
+// the whole retry loop stays well under a reasonable preHandler timeout.
+const DEFAULT_RETRY: Required<ParamStoreRetryConfig> = {
+  attempts: 3,
+  baseDelayMs: 100,
+  maxDelayMs: 2_000,
+  maxElapsedMs: 6_000
+};
+
+// Marker error thrown when the param-store returns a definitive HTTP status
+// that must NOT be retried (4xx auth/config). Carries the status so callers can
+// still surface a precise message. Retryable 5xx are thrown as plain errors.
+export class NonRetryableParamStoreError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'NonRetryableParamStoreError';
+    this.status = status;
+  }
+}
+
+// Classify a thrown failure as retryable. Retryable: network/timeout/TLS blips
+// (fetch rejects: AbortError from the timeout, ECONNRESET, self-signed-cert /
+// TLS errors) and server-side 5xx. Non-retryable: 4xx auth/config, signalled by
+// NonRetryableParamStoreError, which must never be retried (a hard auth failure
+// will not self-correct and retrying only delays the caller). Unknown thrown
+// values default to retryable — a transient blip is the more likely cause of an
+// unexpected rejection than a permanent condition, and the attempt cap bounds it.
+function isRetryable(err: unknown): boolean {
+  if (err instanceof NonRetryableParamStoreError) return false;
+  return true;
+}
+
+// Full-jitter exponential backoff: pick a random delay in [0, capped-exp) so
+// concurrent callers do not synchronise their retries (thundering herd).
+function backoffDelay(attempt: number, cfg: Required<ParamStoreRetryConfig>): number {
+  const exp = cfg.baseDelayMs * 2 ** (attempt - 1);
+  const capped = Math.min(exp, cfg.maxDelayMs);
+  return Math.floor(Math.random() * capped);
+}
+
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 // HTTP-backed parameter store client for eyevinn-app-config-svc.
 //
@@ -237,6 +317,12 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   const doFetch = config.fetch ?? globalThis.fetch;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const base = config.baseUrl.replace(/\/$/, '');
+  const log = config.log;
+  const sleep = config.sleep ?? realSleep;
+  const retry: Required<ParamStoreRetryConfig> = {
+    ...DEFAULT_RETRY,
+    ...config.retry
+  };
 
   function configUrl(key?: string): string {
     const path = key ? `/${encodeURIComponent(key)}` : '';
@@ -253,6 +339,59 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  // Bounded retry-with-backoff around a single param-store round-trip (issue
+  // #421). `op` runs one full attempt (headers + fetch + status handling) and
+  // either resolves, throws a retryable error (network/timeout/TLS/5xx), or
+  // throws a NonRetryableParamStoreError (4xx). We retry retryable failures with
+  // full-jitter exponential backoff up to `attempts` tries AND `maxElapsedMs`
+  // wall-clock, whichever comes first. On exhaustion the last error propagates
+  // to the caller (workspace-stack resolve()'s catch, where issue #420's
+  // last-known-good fallback then takes over) rather than being swallowed here.
+  async function withRetry<T>(label: string, op: () => Promise<T>): Promise<T> {
+    const start = Date.now();
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= retry.attempts; attempt++) {
+      try {
+        return await op();
+      } catch (err) {
+        lastErr = err;
+        const elapsed = Date.now() - start;
+        const message = err instanceof Error ? err.message : String(err);
+        if (!isRetryable(err)) {
+          log?.warn?.(
+            { op: label, attempt, elapsedMs: elapsed, error: message },
+            'param-store call failed with a non-retryable error; not retrying'
+          );
+          throw err;
+        }
+        const isLastAttempt = attempt >= retry.attempts;
+        // Compute the next backoff, but never sleep past the wall-clock budget.
+        const delay = backoffDelay(attempt, retry);
+        const budgetExhausted = elapsed + delay >= retry.maxElapsedMs;
+        if (isLastAttempt || budgetExhausted) {
+          log?.error?.(
+            {
+              op: label,
+              attempt,
+              attempts: retry.attempts,
+              elapsedMs: elapsed,
+              error: message
+            },
+            'param-store call exhausted retries; handing off to fallback'
+          );
+          throw err;
+        }
+        log?.debug?.(
+          { op: label, attempt, nextDelayMs: delay, elapsedMs: elapsed, error: message },
+          'param-store call failed; retrying after backoff'
+        );
+        await sleep(delay);
+      }
+    }
+    // Unreachable: the loop always returns or throws, but satisfy the type checker.
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
   async function buildHeaders(): Promise<Record<string, string>> {
@@ -287,22 +426,33 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 
     async loadStackConfig(workspaceId, name) {
       const key = stackConfigKey(workspaceId, name);
-      const h = await buildHeaders();
-      const res = await withTimeout((signal) =>
-        doFetch(configUrl(key), { method: 'GET', headers: h, signal })
-      );
-      if (res.status === 404) return undefined;
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`parameter store read failed: ${res.status} ${text}`.trim());
-      }
-      const body = (await res.json().catch(() => ({}))) as { value?: string };
-      if (typeof body.value !== 'string' || body.value.length === 0) return undefined;
-      try {
-        return JSON.parse(body.value) as StackConfig;
-      } catch {
-        throw new Error(`parameter store value for "${key}" is not valid JSON`);
-      }
+      return withRetry('loadStackConfig', async () => {
+        const h = await buildHeaders();
+        const res = await withTimeout((signal) =>
+          doFetch(configUrl(key), { method: 'GET', headers: h, signal })
+        );
+        if (res.status === 404) return undefined;
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          const msg = `parameter store read failed: ${res.status} ${text}`.trim();
+          // 4xx (auth/config) will not self-correct — do not retry (issue #421).
+          if (res.status >= 400 && res.status < 500) {
+            throw new NonRetryableParamStoreError(msg, res.status);
+          }
+          throw new Error(msg);
+        }
+        const body = (await res.json().catch(() => ({}))) as { value?: string };
+        if (typeof body.value !== 'string' || body.value.length === 0) return undefined;
+        try {
+          return JSON.parse(body.value) as StackConfig;
+        } catch {
+          // A malformed stored value is not a transient blip — do not retry.
+          throw new NonRetryableParamStoreError(
+            `parameter store value for "${key}" is not valid JSON`,
+            200
+          );
+        }
+      });
     },
 
     async deleteStackConfig(workspaceId, name) {
@@ -319,21 +469,31 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 
     async listStackNames(workspaceId) {
       const prefix = `openvideocore/${workspaceId}/`;
-      const h = await buildHeaders();
       // The app-config-svc list endpoint returns { items: [{ key, value }], total }
-      // with a configurable limit. We fetch up to 200 to cover realistic use.
-      const res = await withTimeout((signal) =>
-        doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
-      );
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`parameter store list failed: ${res.status} ${text}`.trim());
-      }
-      const body = (await res.json()) as { items?: { key: string }[] };
-      return (body.items ?? [])
-        .map((item) => item.key)
-        .filter((key) => key.startsWith(prefix))
-        .map((key) => key.slice(prefix.length));
+      // with a configurable limit. We fetch up to 100 to cover realistic use.
+      // This GET is the stack-resolver refresh round-trip (issue #421): wrap it
+      // in bounded retry-with-backoff so a boot-time TLS blip or timeout does not
+      // turn into a full storage outage for the instance.
+      return withRetry('listStackNames', async () => {
+        const h = await buildHeaders();
+        const res = await withTimeout((signal) =>
+          doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+        );
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          const msg = `parameter store list failed: ${res.status} ${text}`.trim();
+          // 4xx (auth/config) will not self-correct — do not retry (issue #421).
+          if (res.status >= 400 && res.status < 500) {
+            throw new NonRetryableParamStoreError(msg, res.status);
+          }
+          throw new Error(msg);
+        }
+        const body = (await res.json()) as { items?: { key: string }[] };
+        return (body.items ?? [])
+          .map((item) => item.key)
+          .filter((key) => key.startsWith(prefix))
+          .map((key) => key.slice(prefix.length));
+      });
     }
   };
 }
