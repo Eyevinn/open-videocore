@@ -210,7 +210,36 @@ const transcodeBodySchema = z
 
 const transcodeAcceptedSchema = z.object({
   jobId: z.string(),
-  encoreJobId: z.string()
+  encoreJobId: z.string(),
+  // Non-fatal notice (issue #394). Present ONLY when profileParams validation
+  // could not be performed because the profile YAML was unresolvable — either a
+  // custom profile that is not in the operator profile store, or the profile
+  // store was unreachable. The request was still accepted (202) and the
+  // profileParams keys were forwarded to Encore UNCHECKED. Absent when the keys
+  // were validated against the profile's declared params, or when the request
+  // carried no profileParams at all.
+  warning: z
+    .object({
+      code: z
+        .literal('profile_params_unvalidated')
+        .describe('Stable machine-readable warning code.'),
+      message: z
+        .string()
+        .describe('Human-readable explanation naming the profile and the unvalidated keys.'),
+      profile: z
+        .string()
+        .describe('The profile name whose declared params could not be resolved.'),
+      unvalidatedKeys: z
+        .array(z.string())
+        .describe('The profileParams keys that were forwarded to Encore without validation.')
+    })
+    .describe(
+      'Present only when profileParams validation could not be performed because the ' +
+        'profile YAML was unresolvable (a custom profile not in the store, or the profile ' +
+        'store was unreachable). The request was still accepted and the keys were forwarded ' +
+        'to Encore unchecked.'
+    )
+    .optional()
 });
 
 // Free-form, operator-defined metadata (issue #12). Values must be
@@ -2445,6 +2474,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'transcoding is not configured'
         });
       }
+      // Non-fatal warning surfaced in the 202 response when profileParams
+      // validation was SKIPPED (profile YAML unresolvable) — issue #394. Set
+      // inside the skipped branch below; spread into the accepted response only
+      // when present. Undefined when validation ran (passed) or there were no
+      // profileParams.
+      let profileParamsWarning:
+        | { code: 'profile_params_unvalidated'; message: string; profile: string; unvalidatedKeys: string[] }
+        | undefined;
       // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
       // platform tier (issue #286) before submitting to Encore.
       const unrunnable = await unrunnableProfileReason(request.body.profile);
@@ -2499,6 +2536,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         if (check.ok && !check.validated) {
           const skipped = {
             profileName: check.profileName,
+            unvalidatedKeys: check.unvalidatedKeys
+          };
+          // Surface the skipped validation as a non-fatal warning in the 202
+          // response (issue #394). The request is still accepted; these keys
+          // were forwarded to Encore unchecked.
+          profileParamsWarning = {
+            code: 'profile_params_unvalidated',
+            message:
+              `profileParams validation was skipped: profile '${check.profileName}' could not be ` +
+              `resolved, so the following keys were forwarded to Encore unchecked: ` +
+              `${check.unvalidatedKeys.join(', ')}.`,
+            profile: check.profileName,
             unvalidatedKeys: check.unvalidatedKeys
           };
           if (resolution.status === 'store-unreachable') {
@@ -2615,7 +2664,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           },
           { jobs, assets: repo, encore: opts.encore }
         );
-        return reply.code(202).send(result);
+        return reply
+          .code(202)
+          .send({ ...result, ...(profileParamsWarning ? { warning: profileParamsWarning } : {}) });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
