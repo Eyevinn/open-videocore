@@ -206,13 +206,26 @@ function assertNoCredentials(config: StackConfig): void {
 // Minimal structured logger surface, compatible with Fastify's / pino's
 // `log.level(obj, msg)` shape (mirrors DispatcherLogger in
 // webhook-dispatcher.ts and TamsConfigLogger in tams/tams-config.ts). Injected
-// so retry attempts are observable without coupling to a concrete logger. All
-// methods are optional so existing call sites need not supply a logger.
+// so both the read/write-path diagnostics (issue #415, info/warn) and the retry
+// attempts (issue #421, debug/warn/error) are observable without coupling to a
+// concrete logger. ALL methods are optional so a caller/test can wire only the
+// levels it cares about (e.g. `{ debug }`); the client fills the gaps with a
+// no-op via the resolved logger below.
 export type ParamStoreLogger = {
-  debug?: (obj: unknown, msg?: string) => void;
+  info?: (obj: unknown, msg?: string) => void;
   warn?: (obj: unknown, msg?: string) => void;
+  debug?: (obj: unknown, msg?: string) => void;
   error?: (obj: unknown, msg?: string) => void;
 };
+
+// Back-compat alias for the issue #415 diagnostic-logger name still referenced
+// by callers (e.g. paramStoreFromEnv). Same shape as ParamStoreLogger.
+export type ParamStoreDiagLog = ParamStoreLogger;
+
+// A fully-populated logger the client can call unconditionally: every method is
+// present so the issue #415 diagnostic call sites (diag.info/diag.warn) and the
+// issue #421 retry call sites (diag.debug/diag.error) never guard for undefined.
+type ResolvedParamStoreLogger = Required<ParamStoreLogger>;
 
 // Tuning knobs for the bounded retry-with-backoff around the param-store HTTP
 // round-trip (issue #421). Defaults are conservative so a request-scoped
@@ -244,13 +257,27 @@ export type HttpParamStoreConfig = {
   fetch?: typeof globalThis.fetch;
   // Per-request timeout in milliseconds. All external OSC calls must be bounded.
   timeoutMs?: number;
-  // Optional injectable logger for retry observability (issue #421).
+  // OPTIONAL logger. Carries the issue #415 read/write-path diagnostics
+  // (info/warn: the EXACT key written and the EXACT key read, plus the outcome,
+  // so a write-vs-read mismatch in the self-provisioning flow is determinable
+  // from the logs) AND the issue #421 retry observability (debug per retry, warn
+  // on non-retryable, error on exhaustion). Defaults to a no-op: no behaviour
+  // change when unset.
   log?: ParamStoreLogger;
   // Optional retry tuning (issue #421). Omitted keys fall back to DEFAULT_RETRY.
   retry?: ParamStoreRetryConfig;
   // Injectable sleep for tests, so backoff waits can be advanced deterministically
   // without real timers. Defaults to a real setTimeout-based delay.
   sleep?: (ms: number) => Promise<void>;
+};
+
+// No-op logger so the client can call every method unconditionally when none is
+// supplied (or when a caller wires only some levels).
+const NOOP_DIAG_LOG: ResolvedParamStoreLogger = {
+  info() {},
+  warn() {},
+  debug() {},
+  error() {}
 };
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -317,7 +344,13 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   const doFetch = config.fetch ?? globalThis.fetch;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const base = config.baseUrl.replace(/\/$/, '');
-  const log = config.log;
+  // Single resolved logger used for BOTH the issue #415 read/write-path
+  // diagnostics (diag.info/diag.warn) and the issue #421 retry observability
+  // (diag.debug/diag.error). Each supplied method overrides the corresponding
+  // no-op, so a caller that wires only some levels (e.g. `{ debug }`) still lets
+  // the client call every method unconditionally. Defaults to the full no-op
+  // when no logger is supplied.
+  const diag: ResolvedParamStoreLogger = { ...NOOP_DIAG_LOG, ...config.log };
   const sleep = config.sleep ?? realSleep;
   const retry: Required<ParamStoreRetryConfig> = {
     ...DEFAULT_RETRY,
@@ -360,7 +393,7 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
         const elapsed = Date.now() - start;
         const message = err instanceof Error ? err.message : String(err);
         if (!isRetryable(err)) {
-          log?.warn?.(
+          diag.warn(
             { op: label, attempt, elapsedMs: elapsed, error: message },
             'param-store call failed with a non-retryable error; not retrying'
           );
@@ -371,7 +404,7 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
         const delay = backoffDelay(attempt, retry);
         const budgetExhausted = elapsed + delay >= retry.maxElapsedMs;
         if (isLastAttempt || budgetExhausted) {
-          log?.error?.(
+          diag.error(
             {
               op: label,
               attempt,
@@ -383,7 +416,7 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
           );
           throw err;
         }
-        log?.debug?.(
+        diag.debug(
           { op: label, attempt, nextDelayMs: delay, elapsedMs: elapsed, error: message },
           'param-store call failed; retrying after backoff'
         );
@@ -420,21 +453,56 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
       );
       if (!res.ok) {
         const text = await res.text().catch(() => '');
+        // WRITE-PATH diagnostic (issue #415): the exact key we attempted to
+        // write and the store's rejection. If this fires, the config never
+        // reached the store — the defect is on the write side.
+        diag.warn(
+          { op: 'storeStackConfig', workspaceId, name, key, status: res.status },
+          'param-store write failed'
+        );
         throw new Error(`parameter store write failed: ${res.status} ${text}`.trim());
       }
+      // WRITE-PATH diagnostic (issue #415): records the EXACT key persisted so it
+      // can be compared byte-for-byte against the key a later read derives. A
+      // written key that no read ever matches pins the defect to the read side.
+      diag.info(
+        { op: 'storeStackConfig', workspaceId, name, key, status: res.status },
+        'param-store write ok'
+      );
     },
 
     async loadStackConfig(workspaceId, name) {
       const key = stackConfigKey(workspaceId, name);
+      // Wrap the read round-trip in bounded retry-with-backoff (issue #421) and
+      // thread the issue #415 read-path diagnostics through inside the op so a
+      // spurious miss / key mismatch is still logged on the attempt that
+      // resolves. 4xx/malformed-value throw NonRetryableParamStoreError so the
+      // retry loop stops immediately; 5xx/network/timeout are retried.
       return withRetry('loadStackConfig', async () => {
         const h = await buildHeaders();
         const res = await withTimeout((signal) =>
           doFetch(configUrl(key), { method: 'GET', headers: h, signal })
         );
-        if (res.status === 404) return undefined;
+        if (res.status === 404) {
+          // READ-PATH diagnostic (issue #415): the EXACT key we looked up
+          // returned a miss. Compare this key to the 'param-store write ok' key
+          // for the same stack: if the store logged a successful write of THIS
+          // key, the value is present and the miss is spurious; if the written
+          // key DIFFERS (e.g. a namespace / stack-name mismatch), the defect is a
+          // read-side key derivation bug — not a failed write.
+          diag.warn(
+            { op: 'loadStackConfig', workspaceId, name, key, status: 404 },
+            'param-store read miss'
+          );
+          return undefined;
+        }
         if (!res.ok) {
           const text = await res.text().catch(() => '');
           const msg = `parameter store read failed: ${res.status} ${text}`.trim();
+          diag.warn(
+            { op: 'loadStackConfig', workspaceId, name, key, status: res.status },
+            'param-store read failed'
+          );
           // 4xx (auth/config) will not self-correct — do not retry (issue #421).
           if (res.status >= 400 && res.status < 500) {
             throw new NonRetryableParamStoreError(msg, res.status);
@@ -442,7 +510,23 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
           throw new Error(msg);
         }
         const body = (await res.json().catch(() => ({}))) as { value?: string };
-        if (typeof body.value !== 'string' || body.value.length === 0) return undefined;
+        if (typeof body.value !== 'string' || body.value.length === 0) {
+          // READ-PATH diagnostic (issue #415): the key resolved (200) but carried
+          // no value — a stored-empty / partial-write signature distinct from a
+          // key mismatch (which would 404 above).
+          diag.warn(
+            { op: 'loadStackConfig', workspaceId, name, key, status: res.status, empty: true },
+            'param-store read returned empty value'
+          );
+          return undefined;
+        }
+        // READ-PATH diagnostic (issue #415): the EXACT key that resolved to a
+        // stored config. A hit here for the same key the write logged confirms
+        // the round-trip works and moves the investigation elsewhere.
+        diag.info(
+          { op: 'loadStackConfig', workspaceId, name, key, status: res.status },
+          'param-store read hit'
+        );
         try {
           return JSON.parse(body.value) as StackConfig;
         } catch {
@@ -546,7 +630,12 @@ async function resolveParamStoreBaseUrl(
 // will surface a 501).
 export async function paramStoreFromEnv(
   resolver: ParamStoreUrlResolver,
-  getOscToken: () => Promise<string>
+  getOscToken: () => Promise<string>,
+  // OPTIONAL diagnostic logger (issue #415). Threaded into the HTTP client so
+  // production emits the exact written/read key pairs used to determine whether
+  // a StackConfig persistence failure is on the write or read path. Optional so
+  // existing callers/tests are unaffected (defaults to the client's no-op).
+  log?: ParamStoreDiagLog
 ): Promise<ParamStore | undefined> {
   const apiKey = process.env['PARAMETER_STORE_API_KEY'];
   if (!apiKey) return undefined;
@@ -555,7 +644,7 @@ export async function paramStoreFromEnv(
     DEFAULT_PARAM_STORE_INSTANCE_NAME;
   const baseUrl = await resolveParamStoreBaseUrl(resolver, instanceName);
   if (!baseUrl) return undefined;
-  return makeHttpParamStore({ baseUrl, apiKey, getOscToken });
+  return makeHttpParamStore({ baseUrl, apiKey, getOscToken, ...(log ? { log } : {}) });
 }
 
 const VALKEY_SERVICE_ID = 'valkey-io-valkey';

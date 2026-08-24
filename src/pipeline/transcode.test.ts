@@ -77,3 +77,86 @@ describe('submitTranscode profileParams threading (issue #287)', () => {
     expect(submitted[0].profileParams).toBeUndefined();
   });
 });
+
+// Burn-in filter threading (issue #388, ADR-014 D3). Per-rendition opt-in maps
+// to Encore by injecting the resolved `subtitles=<key>[:force_style='...']`
+// filter into the selected profile's VideoEncode filters via the
+// `subtitlesFilter` profileParams SpEL key. These assert the pipeline threads
+// that filter into the Encore submit payload's profileParams — and that a clean
+// (no-burnIn) submission carries NO such key, so one submission can yield both a
+// burned and a clean rendition.
+describe('submitTranscode burn-in filter threading (issue #388)', () => {
+  it('injects the resolved subtitles filter under the subtitlesFilter profileParams key', async () => {
+    const jobs = fakeJobs();
+    const { encore, submitted } = fakeEncore();
+
+    await submitTranscode(
+      {
+        ...baseParams,
+        preset: 'abr-1080p-burnin',
+        burnInSubtitlesFilter: "subtitles=subtitles/asset-1/trk.srt:force_style='FontSize=24'"
+      },
+      { jobs, assets: {} as AssetRepository, encore }
+    );
+
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0].profileParams).toEqual({
+      subtitlesFilter: "subtitles=subtitles/asset-1/trk.srt:force_style='FontSize=24'"
+    });
+  });
+
+  it('merges the burn-in filter alongside caller-supplied profileParams (both preserved)', async () => {
+    const jobs = fakeJobs();
+    const { encore, submitted } = fakeEncore();
+
+    await submitTranscode(
+      {
+        ...baseParams,
+        preset: 'x264-crf-parametrized',
+        profileParams: { crf: '18', preset: 'slow' },
+        burnInSubtitlesFilter: 'subtitles=subtitles/asset-1/trk.vtt'
+      },
+      { jobs, assets: {} as AssetRepository, encore }
+    );
+
+    expect(submitted[0].profileParams).toEqual({
+      crf: '18',
+      preset: 'slow',
+      subtitlesFilter: 'subtitles=subtitles/asset-1/trk.vtt'
+    });
+  });
+
+  it('a clean submission (no burnIn) carries NO subtitlesFilter key — clean rendition', async () => {
+    const jobs = fakeJobs();
+    const { encore, submitted } = fakeEncore();
+
+    await submitTranscode(
+      { ...baseParams, preset: 'abr-1080p', profileParams: { crf: '20' } },
+      { jobs, assets: {} as AssetRepository, encore }
+    );
+
+    // The caller-supplied params are forwarded verbatim, with NO burn-in key
+    // added, so the profile's default (`''`) applies and no captions are burned.
+    expect(submitted[0].profileParams).toEqual({ crf: '20' });
+    expect(submitted[0].profileParams).not.toHaveProperty('subtitlesFilter');
+  });
+
+  it('two submissions from one caller — one burned, one clean — differ only by the burn-in key (per-rendition opt-in)', async () => {
+    const jobs = fakeJobs();
+    const { encore, submitted } = fakeEncore();
+
+    // Burned rendition/profile.
+    await submitTranscode(
+      { ...baseParams, preset: 'abr-1080p-burnin', burnInSubtitlesFilter: 'subtitles=cap.srt' },
+      { jobs, assets: {} as AssetRepository, encore }
+    );
+    // Clean rendition/profile in the same ladder.
+    await submitTranscode(
+      { ...baseParams, preset: 'abr-480p' },
+      { jobs, assets: {} as AssetRepository, encore }
+    );
+
+    expect(submitted[0].profileParams).toEqual({ subtitlesFilter: 'subtitles=cap.srt' });
+    expect(submitted[1].profileParams).toBeUndefined();
+  });
+});
