@@ -10423,6 +10423,39 @@
                               "type": "string"
                             }
                           },
+                          "encodeAttempts": {
+                            "type": "number"
+                          },
+                          "encodeAttemptLog": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "index": {
+                                  "type": "number"
+                                },
+                                "startedAt": {
+                                  "type": "string"
+                                },
+                                "endedAt": {
+                                  "type": "string"
+                                },
+                                "classification": {
+                                  "type": "string",
+                                  "enum": [
+                                    "transport",
+                                    "io-retryable",
+                                    "deterministic"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "index",
+                                "startedAt"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -10541,6 +10574,39 @@
                         "type": "string"
                       }
                     },
+                    "encodeAttempts": {
+                      "type": "number"
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "startedAt": {
+                            "type": "string"
+                          },
+                          "endedAt": {
+                            "type": "string"
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -10590,6 +10656,7 @@
         }
       },
       "get": {
+        "description": "Read a single job. For transcode jobs, `encodeAttempts` is the number of Encore dispatches and `encodeAttemptLog` records each dispatch in order (index, startedAt, endedAt?, classification?). This is DISTINCT from `attempts`, which counts ingest/URL-pull attempts. To obtain the elapsed time of the successful encode alone (excluding retries), read the LAST entry of `encodeAttemptLog` and compute endedAt \u2212 startedAt.",
         "parameters": [
           {
             "schema": {
@@ -10666,6 +10733,39 @@
                       "type": "array",
                       "items": {
                         "type": "string"
+                      }
+                    },
+                    "encodeAttempts": {
+                      "type": "number"
+                    },
+                    "encodeAttemptLog": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "startedAt": {
+                            "type": "string"
+                          },
+                          "endedAt": {
+                            "type": "string"
+                          },
+                          "classification": {
+                            "type": "string",
+                            "enum": [
+                              "transport",
+                              "io-retryable",
+                              "deterministic"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "index",
+                          "startedAt"
+                        ],
+                        "additionalProperties": false
                       }
                     },
                     "createdAt": {
