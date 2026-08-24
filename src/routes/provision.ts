@@ -319,6 +319,57 @@ async function deriveWorkspaceId(_osc: Context): Promise<string> {
   return STACK_CONFIG_NAMESPACE;
 }
 
+// Reliably persist the fully-resolved StackConfig as the FINAL provisioning
+// step (issue #416). Storage-dependent endpoints (e.g. POST
+// /api/v1/assets/ingest-url -> storageFor()) can only resolve a usable stack
+// once this write lands: the resolver reads back the SAME key this writes
+// (stackConfigKey(workspaceId, name), param-store.ts:131) under the symmetric
+// STACK_CONFIG_NAMESPACE (workspace-stack.ts:303). A silently-swallowed write
+// failure therefore leaves nothing to read back and every storage endpoint
+// reports "object storage is not configured for this stack".
+//
+// This helper AWAITS the write and RETRIES a bounded number of times on
+// transient failure. If every attempt fails it RE-THROWS so the caller marks
+// the provision operation `failed` rather than `done` — the failure is surfaced
+// on the operation instead of being logged and discarded. The write is
+// idempotent (POST overwrites, param-store.ts:272), so a retry after a partial
+// network failure converges. `delayMs` is injectable so tests run without
+// real timers.
+export async function persistStackConfig(opts: {
+  paramStore: ParamStore;
+  workspaceId: string;
+  name: string;
+  config: StackConfig;
+  maxAttempts?: number;
+  delayMs?: (attempt: number) => Promise<void>;
+}): Promise<void> {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const delayMs =
+    opts.delayMs ??
+    ((attempt: number) =>
+      new Promise<void>((r) => setTimeout(r, attempt * 2_000)));
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await opts.paramStore.storeStackConfig(
+        opts.workspaceId,
+        opts.name,
+        opts.config
+      );
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxAttempts) break;
+      await delayMs(attempt);
+    }
+  }
+  throw new Error(
+    `failed to persist stack config for "${opts.name}" after ${maxAttempts} attempt(s): ${
+      lastErr instanceof Error ? lastErr.message : String(lastErr)
+    }`
+  );
+}
+
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
   fastify,
   opts
@@ -787,10 +838,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // re-supplying every endpoint. Credentials are stripped from any
         // URL-shaped value before storage; param-store.ts asserts none remain.
         //
-        // Persistence failure is logged but does NOT fail the provision: the
-        // stack is already live and the response below still hands the operator
-        // every coordinate. The stored copy is a convenience cache, not the
-        // source of truth, so a write error must not strand a healthy stack.
+        // This is the FINAL provisioning step and it is LOAD-BEARING (issue
+        // #416): storage-dependent endpoints resolve `storageFor()` only from
+        // this persisted config. The write is AWAITED and RETRIED
+        // (persistStackConfig); if it ultimately fails the operation is marked
+        // `failed` rather than `done` so the failure is surfaced to the caller
+        // instead of leaving a live-but-unresolvable stack with nothing to read
+        // back. Because the stack IS live, we do NOT overwrite the store with a
+        // 'failed'-status partial here — the OSC instances remain and a retry of
+        // the provision (idempotent) can re-attempt the write.
         if (paramStore) {
           const stackConfig: StackConfig = {
             status: 'ready',
@@ -814,18 +870,36 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               instanceName: name
             }))
           };
+          const workspaceId = await deriveWorkspaceId(osc);
           try {
-            const workspaceId = await deriveWorkspaceId(osc);
-            await paramStore.storeStackConfig(workspaceId, name, stackConfig);
-            // The new stack is now discoverable: drop any cached connections so
-            // the next request resolves it immediately.
-            onStackChange?.(workspaceId);
+            await persistStackConfig({
+              paramStore,
+              workspaceId,
+              name,
+              config: stackConfig
+            });
           } catch (err) {
             request.log.error(
               { err, name },
               'failed to persist stack config to parameter store'
             );
+            // The stack is live but unresolvable without the stored config, so
+            // fail the operation loudly rather than reporting success (#416).
+            // The caller can retry the (idempotent) provision to re-attempt the
+            // write. Return early so the `done` update below does not run.
+            ops.update(op.id, {
+              status: 'failed',
+              completedAt: Date.now(),
+              error:
+                err instanceof Error
+                  ? err.message
+                  : 'failed to persist stack config'
+            });
+            return;
           }
+          // The new stack is now discoverable: drop any cached connections so
+          // the next request resolves it immediately.
+          onStackChange?.(workspaceId);
         } else {
           request.log.warn(
             'parameter store not configured — stack coordinates not persisted'
