@@ -58,6 +58,23 @@ export type OptionalStepBuilders = {
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
 
+// Minimal logger surface (compatible with Fastify's logger). Injected so the
+// read-path diagnostics (issue #415, info/warn) and a transient parameter-store
+// refresh failure (issue #419, error) are observable instead of being silently
+// swallowed. Defaults to a noop so callers/tests that don't wire a logger keep
+// working.
+export type StackResolverLogger = {
+  info: (obj: unknown, msg?: string) => void;
+  warn: (obj: unknown, msg?: string) => void;
+  error: (obj: unknown, msg?: string) => void;
+};
+
+const noopLogger: StackResolverLogger = {
+  info: () => {},
+  warn: () => {},
+  error: () => {}
+};
+
 // Maximum staleness bound for the last-known-good fallback (issue #420,
 // architect sign-off condition 1). When a param-store refresh THROWS on a
 // cache-miss but a prior successful ready-stack resolution exists, keep serving
@@ -331,6 +348,12 @@ export class WorkspaceStackResolver {
   private minioPassword: string;
   private couchPassword: string;
   private optionalSteps: OptionalStepBuilders;
+  // Diagnostic/observability logger. `info`/`warn` carry the read-path
+  // diagnostics (issue #415: (namespace, stack name) correlation on each
+  // resolve); `error` surfaces a transient parameter-store refresh failure
+  // instead of silently swallowing it (issue #419). Defaults to a noop so
+  // existing callers/tests are unaffected.
+  private log: StackResolverLogger;
 
   constructor(opts: {
     paramStore: ParamStore | undefined;
@@ -341,12 +364,17 @@ export class WorkspaceStackResolver {
     // stack record (issue #217). Optional so callers/tests that don't wire the
     // optional services get the graceful-skip behaviour (steps disabled).
     optionalSteps?: OptionalStepBuilders;
+    // Injected logger so read-path diagnostics (issue #415) and transient
+    // parameter-store refresh failures (issue #419) are observable. Optional;
+    // defaults to a noop for callers/tests that don't wire one.
+    log?: StackResolverLogger;
   }) {
     this.paramStore = opts.paramStore;
     this.oscContext = opts.oscContext;
     this.minioPassword = opts.minioPassword;
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
+    this.log = opts.log ?? noopLogger;
   }
 
   // Resolve the backing-service connections for a workspace. When `stackName`
@@ -384,6 +412,14 @@ export class WorkspaceStackResolver {
     let config: StackConfig | undefined;
     try {
       if (stackName) {
+        // READ-PATH diagnostic (issue #415): the resolver reads by the
+        // X-Stack-Name-derived name under STACK_CONFIG_NAMESPACE. This is the
+        // (namespace, name) pair whose derived key must equal the key the
+        // provision route wrote; the param-store client logs the concrete key.
+        this.log?.info(
+          { source: 'x-stack-name', namespace: STACK_CONFIG_NAMESPACE, stackName },
+          'resolver reading stack config by requested name'
+        );
         config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
@@ -391,33 +427,62 @@ export class WorkspaceStackResolver {
         // all storage/asset operations.
         if (!config) {
           const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+          this.log?.info(
+            { namespace: STACK_CONFIG_NAMESPACE, requested: stackName, listed: names },
+            'requested stack not found; falling back to first listed stack'
+          );
           if (names.length > 0) {
             config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
           }
         }
       } else {
+        // READ-PATH diagnostic (issue #415): no X-Stack-Name header, so the
+        // resolver uses the FIRST listed stack as the default. If the list is
+        // empty here but the provision route logged a successful write, the
+        // write key and the list prefix disagree — a read-side namespace/key bug.
         const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+        this.log?.info(
+          { source: 'default', namespace: STACK_CONFIG_NAMESPACE, listed: names },
+          'resolver reading default stack config (no X-Stack-Name)'
+        );
         if (names.length > 0) {
           config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
         }
       }
-    } catch {
+    } catch (err) {
       // A THROWN refresh error means we couldn't refresh — NOT that the stack
-      // ceased to exist (issue #420, architect sign-off). If a prior successful
-      // ready-stack resolution is still in cache and within the MAX_STALE_MS
-      // bound (measured from its ORIGINAL resolve time), serve that
-      // last-known-good resolution rather than dropping to no-storage — a
-      // previously-healthy instance must not return 501 for all storage ops on
-      // a single failed refresh. Only a THROWN error takes this path: a
-      // successful load returning `undefined` (genuine 404 / never-persisted
-      // #413) falls through below and drops to no-storage — we never fabricate
-      // a stack. Ordering (architect condition 2): last-known-good is the
-      // post-failure path only; any future retry (#421) runs before we get here.
-      if (
-        cached &&
+      // ceased to exist (issue #420, architect sign-off). We must no longer
+      // swallow it silently (issue #419): log the real error with message +
+      // stack, the stack identifier, the read namespace (issue #415
+      // correlation), and the outcome, so a subsequent 501 from
+      // GET /api/v1/storage/buckets is traceable — whether we serve
+      // last-known-good or fall through to no-storage.
+      const servingLastKnownGood =
+        !!cached &&
         cached.fromReadyStack &&
-        Date.now() - cached.resolvedAt < MAX_STALE_MS
-      ) {
+        Date.now() - cached.resolvedAt < MAX_STALE_MS;
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE,
+          stackName: stackName ?? '(workspace default)',
+          fallback: servingLastKnownGood
+            ? 'last-known-good (stale ready-stack resolution)'
+            : 'in-memory (no object storage)'
+        },
+        'stack resolver: parameter-store refresh failed; serving fallback resolution'
+      );
+      // If a prior successful ready-stack resolution is still in cache and
+      // within the MAX_STALE_MS bound (measured from its ORIGINAL resolve time),
+      // serve that last-known-good resolution rather than dropping to
+      // no-storage — a previously-healthy instance must not return 501 for all
+      // storage ops on a single failed refresh. Only a THROWN error takes this
+      // path: a successful load returning `undefined` (genuine 404 /
+      // never-persisted #413) falls through below and drops to no-storage — we
+      // never fabricate a stack. Ordering (architect condition 2):
+      // last-known-good is the post-failure path only; any future retry (#421)
+      // runs before we get here.
+      if (servingLastKnownGood && cached) {
         // Serve stale-but-good WITHOUT extending expiresAt or resetting
         // resolvedAt: the entry stays past-TTL so the next request re-attempts a
         // fresh refresh, and MAX_STALE_MS keeps counting from first success so

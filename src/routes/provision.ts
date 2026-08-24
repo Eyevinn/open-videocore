@@ -21,6 +21,7 @@ import {
   type ParamStore,
   type StackConfig,
   type StorageBackendConfig,
+  isReadyStack,
   stripCredentials
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
@@ -319,6 +320,57 @@ async function deriveWorkspaceId(_osc: Context): Promise<string> {
   return STACK_CONFIG_NAMESPACE;
 }
 
+// Reliably persist the fully-resolved StackConfig as the FINAL provisioning
+// step (issue #416). Storage-dependent endpoints (e.g. POST
+// /api/v1/assets/ingest-url -> storageFor()) can only resolve a usable stack
+// once this write lands: the resolver reads back the SAME key this writes
+// (stackConfigKey(workspaceId, name), param-store.ts:131) under the symmetric
+// STACK_CONFIG_NAMESPACE (workspace-stack.ts:303). A silently-swallowed write
+// failure therefore leaves nothing to read back and every storage endpoint
+// reports "object storage is not configured for this stack".
+//
+// This helper AWAITS the write and RETRIES a bounded number of times on
+// transient failure. If every attempt fails it RE-THROWS so the caller marks
+// the provision operation `failed` rather than `done` — the failure is surfaced
+// on the operation instead of being logged and discarded. The write is
+// idempotent (POST overwrites, param-store.ts:272), so a retry after a partial
+// network failure converges. `delayMs` is injectable so tests run without
+// real timers.
+export async function persistStackConfig(opts: {
+  paramStore: ParamStore;
+  workspaceId: string;
+  name: string;
+  config: StackConfig;
+  maxAttempts?: number;
+  delayMs?: (attempt: number) => Promise<void>;
+}): Promise<void> {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const delayMs =
+    opts.delayMs ??
+    ((attempt: number) =>
+      new Promise<void>((r) => setTimeout(r, attempt * 2_000)));
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await opts.paramStore.storeStackConfig(
+        opts.workspaceId,
+        opts.name,
+        opts.config
+      );
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxAttempts) break;
+      await delayMs(attempt);
+    }
+  }
+  throw new Error(
+    `failed to persist stack config for "${opts.name}" after ${maxAttempts} attempt(s): ${
+      lastErr instanceof Error ? lastErr.message : String(lastErr)
+    }`
+  );
+}
+
 export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async (
   fastify,
   opts
@@ -370,6 +422,18 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // middleware authenticates to OSC using this deployment's own OSC_ACCESS_TOKEN
   // (ADR-002), and there is no per-caller token for these routes. Parameter
   // store scoping uses the deployment's own tenant id (deriveWorkspaceId).
+
+  // In-flight provisioning guard (issue #417). Repeated or concurrent POST /
+  // calls for the SAME stack name must not each spawn a fresh set of companion
+  // object-storage / document-store instances (which was minting new
+  // companion-password secret generations each retry). This per-process Set
+  // holds the names whose background provisioning closure is currently running;
+  // a second call that arrives while one is in flight converges to the existing
+  // work instead of starting a duplicate set. It is a fast in-process guard that
+  // complements the persisted 'provisioning' marker written to the parameter
+  // store below (which additionally covers repeats across process restarts and
+  // is the durable source of truth for convergence).
+  const inFlightProvisions = new Set<string>();
 
   app.post(
     '/',
@@ -424,6 +488,84 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
 
       setImmediate(async () => {
         ops.update(op.id, { status: 'running' });
+
+        // Idempotency guard (issue #417). Before creating any companion
+        // instance, converge on the existing stack instead of minting a fresh
+        // companion set (which each retry did, leaving orphaned instances and
+        // extra companion-password secret generations).
+        //
+        //   1. In-process lock: if a background flow for this name is already
+        //      running, do NOT start a second one — report the in-flight state
+        //      and return. The instance names are deterministic (every companion
+        //      uses the stack name) so the running flow already converges OSC
+        //      instances; a parallel flow would only race saveSecret and waste
+        //      OSC calls.
+        //   2. Persisted convergence: read the stored StackConfig for this
+        //      name (durable across process restarts). A 'ready' config means
+        //      the stack already exists — return its coordinates without
+        //      creating anything. A 'provisioning' marker means a prior attempt
+        //      is (or was) mid-flight; we resume/converge rather than duplicate.
+        if (inFlightProvisions.has(name)) {
+          ops.update(op.id, {
+            status: 'done',
+            completedAt: Date.now(),
+            result: {
+              name,
+              status: 'in_progress',
+              message:
+                'provisioning for this stack is already in progress; ' +
+                'converging on the existing operation rather than creating a ' +
+                'duplicate companion set'
+            }
+          });
+          return;
+        }
+        inFlightProvisions.add(name);
+
+        try {
+          if (paramStore) {
+            try {
+              const wsId = await deriveWorkspaceId(osc);
+              const existing = await paramStore.loadStackConfig(wsId, name);
+              // A completed stack: converge, return its coordinates, create
+              // nothing. isReadyStack treats a legacy status-less config as
+              // ready (param-store.ts:102).
+              if (existing && isReadyStack(existing)) {
+                ops.update(op.id, {
+                  status: 'done',
+                  completedAt: Date.now(),
+                  result: {
+                    name,
+                    minioEndpoint: existing.minioEndpoint,
+                    couchdbUrl: existing.couchdbUrl,
+                    redisUrl: existing.redisUrl
+                  }
+                });
+                return;
+              }
+              // No completed config yet: record a 'provisioning' marker BEFORE
+              // creating any companion so a repeated call (this process or a
+              // fresh one after a restart) sees an attempt is in flight and
+              // converges instead of starting a new companion set. This is
+              // best-effort — a marker-write failure must not block the live
+              // provision, so it is logged and provisioning continues.
+              await paramStore.storeStackConfig(wsId, name, {
+                status: 'provisioning',
+                minioEndpoint: '',
+                couchdbUrl: '',
+                redisUrl: '',
+                sourceBucket: SOURCE_BUCKET,
+                packagedBucket: PACKAGED_BUCKET,
+                storage: storageMetadata,
+                services: []
+              });
+            } catch (err) {
+              app.log.warn(
+                { err, name },
+                'idempotency pre-flight (param store) failed; continuing provision'
+              );
+            }
+          }
 
       // secretRef registers a value as an OSC secret scoped to a specific
       // serviceId and returns the {{secrets.<name>}} reference to embed in the
@@ -787,10 +929,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // re-supplying every endpoint. Credentials are stripped from any
         // URL-shaped value before storage; param-store.ts asserts none remain.
         //
-        // Persistence failure is logged but does NOT fail the provision: the
-        // stack is already live and the response below still hands the operator
-        // every coordinate. The stored copy is a convenience cache, not the
-        // source of truth, so a write error must not strand a healthy stack.
+        // This is the FINAL provisioning step and it is LOAD-BEARING (issue
+        // #416): storage-dependent endpoints resolve `storageFor()` only from
+        // this persisted config. The write is AWAITED and RETRIED
+        // (persistStackConfig); if it ultimately fails the operation is marked
+        // `failed` rather than `done` so the failure is surfaced to the caller
+        // instead of leaving a live-but-unresolvable stack with nothing to read
+        // back. Because the stack IS live, we do NOT overwrite the store with a
+        // 'failed'-status partial here — the OSC instances remain and a retry of
+        // the provision (idempotent) can re-attempt the write.
         if (paramStore) {
           const stackConfig: StackConfig = {
             status: 'ready',
@@ -814,18 +961,36 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               instanceName: name
             }))
           };
+          const workspaceId = await deriveWorkspaceId(osc);
           try {
-            const workspaceId = await deriveWorkspaceId(osc);
-            await paramStore.storeStackConfig(workspaceId, name, stackConfig);
-            // The new stack is now discoverable: drop any cached connections so
-            // the next request resolves it immediately.
-            onStackChange?.(workspaceId);
+            await persistStackConfig({
+              paramStore,
+              workspaceId,
+              name,
+              config: stackConfig
+            });
           } catch (err) {
             request.log.error(
               { err, name },
               'failed to persist stack config to parameter store'
             );
+            // The stack is live but unresolvable without the stored config, so
+            // fail the operation loudly rather than reporting success (#416).
+            // The caller can retry the (idempotent) provision to re-attempt the
+            // write. Return early so the `done` update below does not run.
+            ops.update(op.id, {
+              status: 'failed',
+              completedAt: Date.now(),
+              error:
+                err instanceof Error
+                  ? err.message
+                  : 'failed to persist stack config'
+            });
+            return;
           }
+          // The new stack is now discoverable: drop any cached connections so
+          // the next request resolves it immediately.
+          onStackChange?.(workspaceId);
         } else {
           request.log.warn(
             'parameter store not configured — stack coordinates not persisted'
@@ -882,6 +1047,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             completedAt: Date.now(),
             error: `provisioning failed at ${currentService}: ${message}`
           });
+        }
+        } finally {
+          // Release the in-process idempotency guard (issue #417) whether the
+          // flow completed, converged, or failed, so a later legitimate retry
+          // (e.g. resuming after a partial failure) is not blocked.
+          inFlightProvisions.delete(name);
         }
       });
     }
