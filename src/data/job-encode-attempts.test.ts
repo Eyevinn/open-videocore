@@ -88,6 +88,89 @@ describe('durable encode-attempt persistence (#380)', () => {
     expect(result).toBeUndefined();
   });
 
+  // --- #381: finalise the open attempt on completion ------------------------
+  // Contract: JobRepository.finalizeEncodeAttempt(id, { endedAt?, classification? })
+  // stamps the LAST (open) attempt in place (does NOT append), so the count is
+  // unchanged and the successful attempt's elapsed time is derivable.
+  it('finalises the never-retried attempt with one timing pair (never 0)', async () => {
+    const repo = new InMemoryJobRepository();
+    const job = await repo.create({ type: 'transcode', assetId: 'asset-1' });
+
+    // One dispatch (open attempt), then a successful completion closes it.
+    await repo.appendEncodeAttempt(job.id, { index: 1 });
+    const done = await repo.finalizeEncodeAttempt(job.id, { endedAt: new Date().toISOString() });
+
+    expect(done!.encodeAttempts).toBe(1);
+    expect(done!.encodeAttemptLog).toHaveLength(1);
+    const only = done!.encodeAttemptLog![0];
+    expect(only.startedAt).toBeDefined();
+    expect(only.endedAt).toBeDefined();
+    // Success => no failure classification.
+    expect(only.classification).toBeUndefined();
+    // Elapsed time of the successful attempt is derivable from the pair.
+    expect(new Date(only.endedAt!).getTime()).toBeGreaterThanOrEqual(new Date(only.startedAt).getTime());
+  });
+
+  it('records three attempts with distinct timing pairs and per-attempt class after two retries', async () => {
+    const repo = new InMemoryJobRepository();
+    const job = await repo.create({ type: 'transcode', assetId: 'asset-1' });
+
+    // Attempt 1 dispatched then finalised as a transport failure (retried).
+    await repo.appendEncodeAttempt(job.id, { index: 1 });
+    await repo.finalizeEncodeAttempt(job.id, { endedAt: new Date().toISOString(), classification: 'transport' });
+    // Attempt 2 dispatched then finalised as io-retryable (retried).
+    await repo.appendEncodeAttempt(job.id, { index: 2 });
+    await repo.finalizeEncodeAttempt(job.id, { endedAt: new Date().toISOString(), classification: 'io-retryable' });
+    // Attempt 3 dispatched then finalised on success (no class).
+    await repo.appendEncodeAttempt(job.id, { index: 3 });
+    const after = await repo.finalizeEncodeAttempt(job.id, { endedAt: new Date().toISOString() });
+
+    expect(after!.encodeAttempts).toBe(3);
+    const log = after!.encodeAttemptLog!;
+    expect(log.map((a) => a.index)).toEqual([1, 2, 3]);
+    expect(log.map((a) => a.classification)).toEqual(['transport', 'io-retryable', undefined]);
+    // Every attempt has a distinct, complete start/end pair.
+    for (const a of log) {
+      expect(a.startedAt).toBeDefined();
+      expect(a.endedAt).toBeDefined();
+    }
+  });
+
+  it('finalising in place does not append or change the attempt count', async () => {
+    const repo = new InMemoryJobRepository();
+    const job = await repo.create({ type: 'transcode', assetId: 'asset-1' });
+
+    await repo.appendEncodeAttempt(job.id, { index: 1 });
+    const finalised = await repo.finalizeEncodeAttempt(job.id, {
+      endedAt: new Date().toISOString(),
+      classification: 'deterministic'
+    });
+
+    expect(finalised!.encodeAttemptLog).toHaveLength(1);
+    expect(finalised!.encodeAttempts).toBe(1);
+    expect(finalised!.encodeAttemptLog![0].classification).toBe('deterministic');
+  });
+
+  it('synthesises one finalised attempt when no dispatch was ever recorded (pre-#380 job)', async () => {
+    const repo = new InMemoryJobRepository();
+    const job = await repo.create({ type: 'transcode', assetId: 'asset-1' });
+
+    // No appendEncodeAttempt — the log is empty (job dispatched before #380).
+    const finalised = await repo.finalizeEncodeAttempt(job.id, { classification: 'transport' });
+
+    // The field still reads exactly one attempt, never 0.
+    expect(finalised!.encodeAttempts).toBe(1);
+    expect(finalised!.encodeAttemptLog).toHaveLength(1);
+    expect(finalised!.encodeAttemptLog![0].endedAt).toBeDefined();
+    expect(finalised!.encodeAttemptLog![0].classification).toBe('transport');
+  });
+
+  it('finalizeEncodeAttempt returns undefined for an unknown job id', async () => {
+    const repo = new InMemoryJobRepository();
+    const result = await repo.finalizeEncodeAttempt('nope', {});
+    expect(result).toBeUndefined();
+  });
+
   it('defaults index to the next log position when omitted', async () => {
     const repo = new InMemoryJobRepository();
     const job = await repo.create({ type: 'transcode', assetId: 'asset-1' });
