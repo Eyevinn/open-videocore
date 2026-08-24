@@ -65,6 +65,7 @@ import {
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
+import { resolveBurnInSource, buildSubtitlesFilter } from '../pipeline/burn-in.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import {
   generateSubtitles,
@@ -105,6 +106,7 @@ import {
 } from '../pipeline/manifest-rewrite.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
 import { isProfileRunnable } from '../services/profile-runnability.js';
+import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
@@ -152,11 +154,26 @@ const customProfileSchema = z.object({
 // injection surface). Values omitted -> unchanged default output.
 const profileParamsSchema = z.record(z.string(), z.string());
 
+// Burn-in caption source (issue #388, ADR-014 D2). Optional + additive: absent
+// => no burn-in, today's transcodes unchanged. `source` is a discriminated union
+// on `type`; `forceStyle` is a free-form libass style string forwarded verbatim.
+// Format gating (srt/vtt only, ttml rejected) and objectKey resolution happen in
+// the handler (resolveBurnInSource) so the not-ready/not-found/unsupported cases
+// map to descriptive 4xx responses rather than opaque schema errors.
+const burnInSchema = z.object({
+  source: z.discriminatedUnion('type', [
+    z.object({ type: z.literal('sidecarKey'), objectKey: z.string().min(1).max(1024) }),
+    z.object({ type: z.literal('subtitleTrack'), trackId: z.string().min(1) })
+  ]),
+  forceStyle: z.string().max(1024).optional()
+});
+
 const transcodeBodySchema = z
   .object({
     profile: z.string().min(1).optional(),
     customProfile: customProfileSchema.optional(),
-    profileParams: profileParamsSchema.optional()
+    profileParams: profileParamsSchema.optional(),
+    burnIn: burnInSchema.optional()
   })
   .refine((b) => !(b.profile && b.customProfile), {
     message: 'specify either profile or customProfile, not both'
@@ -831,6 +848,21 @@ function assetsBaseUrl(requestUrl: string): string {
   return prefix;
 }
 
+// True when `value` is an absolute URL (has a scheme + host a player can fetch),
+// false for a bare path like `/openvideocore-packaged/<id>/index.m3u8`. Used by
+// the delivery endpoint (issue #341) to decide whether a resolved manifest URL
+// is already externally resolvable or must be routed through the stream proxy.
+function isAbsoluteUrl(value: string): boolean {
+  try {
+    // The URL constructor throws on a relative/bare path (no base), so a
+    // successful parse means the value carries a scheme + authority.
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // The absolute-or-relative URL prefix, up to and INCLUDING the `<id>/stream`
 // segment (no trailing slash), that a proxied manifest's child references must
 // be rewritten against so they resolve back through this route (issue #340).
@@ -1070,6 +1102,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return `profile "${profileName}" requires GPU (NVENC/CUDA) hardware encoding, which is not available on this platform — choose a CPU-encoded profile`;
   }
 
+  // Resolve whether a named transcode profile declares colour signalling that is
+  // not carriable at its pixel format (issue #377): e.g. an 8-bit stream tagged
+  // PQ/HLG or BT.2020, HDR10 mastering metadata on a non-PQ output, or mastering
+  // metadata on an HLG output. Returns a human message naming both offending
+  // values so the caller can reject with a clear 422 BEFORE an encode is paid
+  // for, rather than shipping a mistagged output. Returns undefined (allow) when
+  // no profile store is wired, no profile name was given, the named profile is
+  // unknown to the store (forwarded verbatim — Encore resolves or rejects it),
+  // or the profile's colour signalling is carriable (including legitimate 10-bit
+  // SDR and genuine HDR10/HLG profiles).
+  async function uncarriableColourReason(profileName: string | undefined): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const stored = await opts.profileRepository.get(profileName);
+    if (!stored) return undefined;
+    const check = validateProfileColourSignalling(stored.yaml);
+    if (check.ok) return undefined;
+    return `profile "${profileName}" declares colour signalling that is not carriable at its pixel format — ${check.reason}`;
+  }
+
   // Fire-and-forget technical metadata extraction (issue #6). Detached, never
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
@@ -1264,6 +1315,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
       if (unrunnable) {
         reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
+        return undefined;
+      }
+      // Reject a profile whose colour signalling is not carriable at its pixel
+      // format (issue #377) before a running execution is created, so a
+      // mistagged (e.g. 8-bit-tagged-PQ) output is never produced.
+      const uncarriable = await uncarriableColourReason(encodeOpts?.profile);
+      if (uncarriable) {
+        reply.code(422).send({ error: 'profile_colour_uncarriable', message: uncarriable });
         return undefined;
       }
     }
@@ -1901,12 +1960,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
         try {
-          const hls = asset.manifestUrls.hls
-            ? resolvePublicManifestUrl(asset.manifestUrls.hls)
-            : undefined;
-          const dash = asset.manifestUrls.dash
-            ? resolvePublicManifestUrl(asset.manifestUrls.dash)
-            : undefined;
+          // In the default `public` mode, `resolvePublicManifestUrl` returns a
+          // genuinely public absolute URL only when PACKAGED_PUBLIC_BASE_URL is
+          // configured. On the zero-config per-stack MinIO backend it hands back
+          // the stored value verbatim (issue #320), which is a bare object-key
+          // path (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
+          // scheme/host and no signature — not fetchable by a player, and OSC
+          // MinIO blocks external presigned/public GETs. When the resolved value
+          // is still non-absolute, route the manifest through the authorized
+          // stream proxy instead (issue #341), mirroring the DELIVERY_MODE=proxy
+          // branch above so `delivery.hls`/`delivery.dash` are always absolute,
+          // resolvable URLs — consistent with how `source` is emitted. The proxy
+          // base is derived from PUBLIC_BASE_URL / request context via
+          // `assetsBaseUrl`, never hardcoded.
+          const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
+          const toAbsolute = (
+            stored: string | undefined,
+            proxyUrl: string | undefined
+          ): string | undefined => {
+            if (!stored) return undefined;
+            const resolved = resolvePublicManifestUrl(stored);
+            return isAbsoluteUrl(resolved) ? resolved : proxyUrl;
+          };
+          const hls = toAbsolute(asset.manifestUrls.hls, proxied.hls);
+          const dash = toAbsolute(asset.manifestUrls.dash, proxied.dash);
           return reply.code(200).send({
             assetId: asset.id,
             urls: { hls, dash },
@@ -2382,6 +2459,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (unrunnable) {
         return reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
       }
+      // Reject a profile whose colour signalling is not carriable at its pixel
+      // format (issue #377) before submitting to Encore, so a mistagged output
+      // (e.g. an 8-bit stream tagged PQ) is never encoded and paid for.
+      const uncarriable = await uncarriableColourReason(request.body.profile);
+      if (uncarriable) {
+        return reply.code(422).send({ error: 'profile_colour_uncarriable', message: uncarriable });
+      }
       // Validate profileParams keys against the SpEL params the chosen profile
       // actually declares (issue #290). We resolve the profile YAML from the
       // operator-managed profile store — the same profiles GET /api/v1/profiles
@@ -2461,6 +2545,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
       }
+      // Burn-in caption source (issue #388, ADR-014). Optional + additive:
+      // resolve the requested source to ONE concrete workspace-local S3 object
+      // key and build the FFmpeg `subtitles=` filter that gets threaded into the
+      // selected profile's VideoEncode filters via profileParams (D3). Format
+      // gating (srt/vtt only) rejects ttml at request time (D4); a referenced
+      // track with no stored file yet is a distinct "not ready" outcome whose
+      // wait/queue policy #389 owns — here we surface it as a 409 so the caller
+      // learns the source is not yet burnable (this issue does not implement the
+      // wait). Absent `burnIn` => no filter, clean rendition (unchanged).
+      let burnInSubtitlesFilter: string | undefined;
+      if (request.body.burnIn) {
+        const resolved = resolveBurnInSource(
+          request.body.burnIn.source,
+          asset.subtitleTracks
+        );
+        if (!resolved.ok) {
+          if (resolved.reason === 'track_not_found') {
+            return reply.code(404).send({ error: 'subtitle_track_not_found', message: resolved.message });
+          }
+          if (resolved.reason === 'unsupported_format') {
+            return reply.code(422).send({ error: 'burn_in_unsupported_format', message: resolved.message });
+          }
+          // not_ready: the referenced track exists but its file has not landed
+          // yet. #389 owns the wait/queue/fail policy; surface it distinctly.
+          return reply.code(409).send({ error: 'burn_in_source_not_ready', message: resolved.message });
+        }
+        burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, request.body.burnIn.forceStyle);
+      }
       try {
         const result = await submitTranscode(
           {
@@ -2470,6 +2582,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
+            burnInSubtitlesFilter,
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },

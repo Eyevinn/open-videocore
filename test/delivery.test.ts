@@ -71,13 +71,16 @@ async function createAsset(app: FastifyInstance): Promise<string> {
 
 afterEach(() => {
   delete process.env['DELIVERY_URL_TTL_SECONDS'];
+  delete process.env['PUBLIC_BASE_URL'];
+  delete process.env['DELIVERY_MODE'];
+  delete process.env['PACKAGED_PUBLIC_BASE_URL'];
 });
 
 describe('GET /:id/delivery', () => {
   it('returns packaged HLS/DASH manifest URLs when available', async () => {
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, {
+    await repo.update(id, {
       manifestUrls: {
         hls: 'https://cdn.example/packaged/x/index.m3u8',
         dash: 'https://cdn.example/packaged/x/manifest.mpd'
@@ -97,7 +100,7 @@ describe('GET /:id/delivery', () => {
   it('returns only the format that was packaged', async () => {
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, {
+    await repo.update(id, {
       manifestUrls: { hls: 'https://cdn.example/packaged/x/index.m3u8' }
     });
     const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
@@ -110,7 +113,7 @@ describe('GET /:id/delivery', () => {
   it('falls back to a presigned source URL when not yet packaged', async () => {
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, { objectKey: `ingest/${id}` });
+    await repo.update(id, { objectKey: `ingest/${id}` });
 
     const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
     expect(res.statusCode).toBe(200);
@@ -123,7 +126,7 @@ describe('GET /:id/delivery', () => {
   it('prefers packaged manifests over the source object', async () => {
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, {
+    await repo.update(id, {
       objectKey: `ingest/${id}`,
       manifestUrls: { hls: 'https://cdn.example/packaged/x/index.m3u8' }
     });
@@ -150,7 +153,7 @@ describe('GET /:id/delivery', () => {
   it.skip('does not leak existence across workspaces (404)', async () => {
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, { objectKey: `ingest/${id}` });
+    await repo.update(id, { objectKey: `ingest/${id}` });
     const res = await app.inject({
       method: 'GET',
       url: `/api/v1/assets/${id}/delivery`,
@@ -162,7 +165,7 @@ describe('GET /:id/delivery', () => {
   it('returns 501 for a source-only asset when storage is not configured', async () => {
     const { app, repo } = await buildApp({ withStorage: false });
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, { objectKey: `ingest/${id}` });
+    await repo.update(id, { objectKey: `ingest/${id}` });
     const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
     expect(res.statusCode).toBe(501);
     expect(res.json().error).toBe('not_configured');
@@ -171,7 +174,7 @@ describe('GET /:id/delivery', () => {
   it('still serves packaged manifests when storage is not configured', async () => {
     const { app, repo } = await buildApp({ withStorage: false });
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, {
+    await repo.update(id, {
       manifestUrls: { hls: 'https://cdn.example/packaged/x/index.m3u8' }
     });
     const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
@@ -179,10 +182,91 @@ describe('GET /:id/delivery', () => {
     expect(res.json().urls.hls).toBeDefined();
   });
 
+  // Issue #341: on the zero-config per-stack MinIO backend the stored
+  // manifestUrls are bare object-key paths (no scheme/host/signature) and OSC
+  // MinIO blocks external presigned/public GETs. The manifest branch must route
+  // these through the authorized stream proxy so `hls`/`dash` are absolute,
+  // resolvable URLs — consistent with how `source` is emitted.
+  it('routes bare-path manifests through the absolute stream proxy URL', async () => {
+    process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: {
+        hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+        dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+      }
+    });
+
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.urls.hls).toBe(
+      `https://api.example.test/api/v1/assets/${id}/stream/index.m3u8`
+    );
+    expect(body.urls.dash).toBe(
+      `https://api.example.test/api/v1/assets/${id}/stream/manifest.mpd`
+    );
+  });
+
+  it('emits only the packaged format through the proxy for bare-path manifests', async () => {
+    process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    const body = res.json();
+    expect(body.urls.hls).toBe(
+      `https://api.example.test/api/v1/assets/${id}/stream/index.m3u8`
+    );
+    expect(body.urls.dash).toBeUndefined();
+  });
+
+  it('routes bare-path manifests through the proxy in DELIVERY_MODE=proxy', async () => {
+    process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+    process.env['DELIVERY_MODE'] = 'proxy';
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: {
+        hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+        dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+      }
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    const body = res.json();
+    expect(body.urls.hls).toBe(
+      `https://api.example.test/api/v1/assets/${id}/stream/index.m3u8`
+    );
+    expect(body.urls.dash).toBe(
+      `https://api.example.test/api/v1/assets/${id}/stream/manifest.mpd`
+    );
+  });
+
+  it('preserves already-absolute public manifest URLs unchanged', async () => {
+    // When the stored manifestUrls are already absolute + resolvable (e.g. a
+    // configured public/CDN origin), the delivery endpoint must not rewrite them
+    // through the proxy — only bare paths are routed.
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: {
+        hls: 'https://cdn.example/packaged/x/index.m3u8',
+        dash: 'https://cdn.example/packaged/x/manifest.mpd'
+      }
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    const body = res.json();
+    expect(body.urls.hls).toBe('https://cdn.example/packaged/x/index.m3u8');
+    expect(body.urls.dash).toBe('https://cdn.example/packaged/x/manifest.mpd');
+  });
+
   it('requires authentication', async () => {
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, { objectKey: `ingest/${id}` });
+    await repo.update(id, { objectKey: `ingest/${id}` });
     const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery` });
     expect(res.statusCode).toBe(401);
   });
@@ -191,7 +275,7 @@ describe('GET /:id/delivery', () => {
     process.env['DELIVERY_URL_TTL_SECONDS'] = '120';
     const { app, repo } = await buildApp();
     const id = await createAsset(app);
-    await repo.update('workspace-a', id, { objectKey: `ingest/${id}` });
+    await repo.update(id, { objectKey: `ingest/${id}` });
     const before = Date.now();
     const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
     const body = res.json();

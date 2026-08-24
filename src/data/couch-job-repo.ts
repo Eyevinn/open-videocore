@@ -8,14 +8,18 @@
 
 import {
   applyJobPatch,
+  appendEncodeAttemptToJob,
+  finalizeLatestEncodeAttemptOnJob,
   decodeEncoreJobId,
   type CreateJobInput,
+  type EncodeAttempt,
   type Job,
   type JobRepository,
   type JobStatus,
   type JobType,
   type UpdateJobInput
 } from './job-repo.js';
+import type { FailureClass } from '../encore-scaler/retry-policy.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'job';
@@ -103,6 +107,45 @@ export class CouchJobRepository implements JobRepository {
     await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;
   }
+
+  // Durably append one Encore dispatch to the job's encode-attempt log (#380).
+  // Read-modify-write against the current CouchDB revision so the append lands
+  // on top of the latest persisted state. This is the durable capture that
+  // outlives the Valkey retry TTL: it is never cleared by clearRetryState.
+  async appendEncodeAttempt(
+    id: string,
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const existing = fromDoc(doc);
+    const next = appendEncodeAttemptToJob(existing, attempt, new Date().toISOString());
+    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
+    return next;
+  }
+
+  // Durably finalise the latest (open) encode-attempt on completion (#381).
+  // Read-modify-write against the current CouchDB revision so the close-out
+  // lands on top of the latest persisted state (the dispatch-time append from
+  // #380). Finalises the last log entry in place — never appends — so the
+  // attempt count is unchanged.
+  async finalizeEncodeAttempt(
+    id: string,
+    patch: { endedAt?: string; classification?: FailureClass }
+  ): Promise<Job | undefined> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    const existing = fromDoc(doc);
+    const next = finalizeLatestEncodeAttemptOnJob(existing, patch, new Date().toISOString());
+    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
+    return next;
+  }
 }
 
 function toDoc(job: Job): Record<string, unknown> {
@@ -122,6 +165,8 @@ function toDoc(job: Job): Record<string, unknown> {
     encoreInternalJobId: job.encoreInternalJobId,
     profile: job.profile,
     renditionAssetIds: job.renditionAssetIds,
+    encodeAttempts: job.encodeAttempts,
+    encodeAttemptLog: job.encodeAttemptLog,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
   };
@@ -143,6 +188,8 @@ function fromDoc(doc: StoredDoc): Job {
     encoreInternalJobId: doc['encoreInternalJobId'] as string | undefined,
     profile: doc['profile'] as string | undefined,
     renditionAssetIds: doc['renditionAssetIds'] as string[] | undefined,
+    encodeAttempts: doc['encodeAttempts'] as number | undefined,
+    encodeAttemptLog: doc['encodeAttemptLog'] as EncodeAttempt[] | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };
