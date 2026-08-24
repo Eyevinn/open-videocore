@@ -416,7 +416,7 @@ export class WorkspaceStackResolver {
         // X-Stack-Name-derived name under STACK_CONFIG_NAMESPACE. This is the
         // (namespace, name) pair whose derived key must equal the key the
         // provision route wrote; the param-store client logs the concrete key.
-        this.log?.info(
+        this.log?.info?.(
           { source: 'x-stack-name', namespace: STACK_CONFIG_NAMESPACE, stackName },
           'resolver reading stack config by requested name'
         );
@@ -427,7 +427,7 @@ export class WorkspaceStackResolver {
         // all storage/asset operations.
         if (!config) {
           const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
-          this.log?.info(
+          this.log?.info?.(
             { namespace: STACK_CONFIG_NAMESPACE, requested: stackName, listed: names },
             'requested stack not found; falling back to first listed stack'
           );
@@ -441,7 +441,7 @@ export class WorkspaceStackResolver {
         // empty here but the provision route logged a successful write, the
         // write key and the list prefix disagree — a read-side namespace/key bug.
         const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
-        this.log?.info(
+        this.log?.info?.(
           { source: 'default', namespace: STACK_CONFIG_NAMESPACE, listed: names },
           'resolver reading default stack config (no X-Stack-Name)'
         );

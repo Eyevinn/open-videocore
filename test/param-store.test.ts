@@ -137,6 +137,128 @@ describe('makeHttpParamStore', () => {
   });
 });
 
+describe('makeHttpParamStore retry-with-backoff (issue #421)', () => {
+  // A no-op sleep so backoff waits resolve instantly in tests (the retry policy
+  // is exercised; the wall-clock backoff itself is unit-irrelevant here).
+  const noSleep = async () => {};
+
+  it('retries a transient failure then succeeds within the retry budget (listStackNames)', async () => {
+    const key = stackConfigKey('workspace-a', 'mystack');
+    const okBody = JSON.stringify({ items: [{ key }] });
+    const fetch = vi
+      .fn()
+      // First round-trip: a TLS blip (fetch rejects), as observed at boot.
+      .mockRejectedValueOnce(new Error('self-signed certificate in certificate chain'))
+      // Second round-trip: succeeds.
+      .mockResolvedValueOnce(
+        new Response(okBody, {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      );
+    const debug = vi.fn();
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep,
+      log: { debug }
+    });
+
+    const names = await store.listStackNames('workspace-a');
+
+    expect(names).toEqual(['mystack']);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    // The transient failure was logged at debug before the successful retry.
+    expect(debug).toHaveBeenCalledOnce();
+  });
+
+  it('retries a transient 5xx then succeeds (loadStackConfig)', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('boom', { status: 503 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ value: JSON.stringify(sampleConfig) }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      );
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep
+    });
+
+    const loaded = await store.loadStackConfig('workspace-a', 'mystack');
+    expect(loaded).toEqual(sampleConfig);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('exhausts retries on persistent failure and propagates the error to the fallback', async () => {
+    const fetch = vi.fn(async () => {
+      throw new Error('ETIMEDOUT');
+    });
+    const error = vi.fn();
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep,
+      retry: { attempts: 3 },
+      log: { error }
+    });
+
+    await expect(store.listStackNames('workspace-a')).rejects.toThrow(/ETIMEDOUT/);
+    // 3 attempts total (1 + 2 retries), then propagates (issue #420 fallback).
+    expect(fetch).toHaveBeenCalledTimes(3);
+    // Exhaustion is logged at error before handing off.
+    expect(error).toHaveBeenCalledOnce();
+  });
+
+  it('does NOT retry a 4xx auth/config failure (hard failure)', async () => {
+    const fetch = vi.fn(async () => new Response('forbidden', { status: 403 }));
+    const warn = vi.fn();
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep,
+      log: { warn }
+    });
+
+    await expect(store.listStackNames('workspace-a')).rejects.toThrow(
+      /parameter store list failed: 403/
+    );
+    // A single attempt — a 403 will not self-correct, so no retry.
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it('honours the attempts cap (single attempt when attempts=1)', async () => {
+    const fetch = vi.fn(async () => {
+      throw new Error('ECONNRESET');
+    });
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep,
+      retry: { attempts: 1 }
+    });
+
+    await expect(store.loadStackConfig('workspace-a', 'mystack')).rejects.toThrow(
+      /ECONNRESET/
+    );
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+});
+
 describe('ensureParameterStore', () => {
   const log = { info: vi.fn(), warn: vi.fn() };
 
