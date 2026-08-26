@@ -271,15 +271,6 @@ export type HttpParamStoreConfig = {
   sleep?: (ms: number) => Promise<void>;
 };
 
-// No-op logger so the client can call every method unconditionally when none is
-// supplied (or when a caller wires only some levels).
-const NOOP_DIAG_LOG: ResolvedParamStoreLogger = {
-  info() {},
-  warn() {},
-  debug() {},
-  error() {}
-};
-
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 // Retry defaults (issue #421). 3 attempts total (1 + 2 retries), exponential
@@ -350,7 +341,19 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   // no-op, so a caller that wires only some levels (e.g. `{ debug }`) still lets
   // the client call every method unconditionally. Defaults to the full no-op
   // when no logger is supplied.
-  const diag: ResolvedParamStoreLogger = { ...NOOP_DIAG_LOG, ...config.log };
+  // Call THROUGH the supplied logger rather than spreading it (issue #438).
+  // Spreading a live pino instance copies its per-level methods as detached
+  // function references; pino's internal LOG then throws because `this[writeSym]`
+  // is undefined off the instance, masking the real failure. Invoking src?.<level>
+  // keeps `this` bound to the source logger, and the optional chaining preserves
+  // the no-op-when-unset semantics the client relies on per method.
+  const src = config.log;
+  const diag: ResolvedParamStoreLogger = {
+    info: (obj, msg) => src?.info?.(obj, msg),
+    warn: (obj, msg) => src?.warn?.(obj, msg),
+    debug: (obj, msg) => src?.debug?.(obj, msg),
+    error: (obj, msg) => src?.error?.(obj, msg)
+  };
   const sleep = config.sleep ?? realSleep;
   const retry: Required<ParamStoreRetryConfig> = {
     ...DEFAULT_RETRY,

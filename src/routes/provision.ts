@@ -21,6 +21,7 @@ import {
   type ParamStore,
   type StackConfig,
   type StorageBackendConfig,
+  NonRetryableParamStoreError,
   isReadyStack,
   stripCredentials
 } from '../services/param-store.js';
@@ -266,6 +267,15 @@ const storedConfigSchema = z.object({
 
 const notFoundSchema = z.object({ error: z.string() });
 const notConfiguredSchema = z.object({ error: z.string() });
+// Structured upstream-dependency failure (issue #439). Mirrors the project-wide
+// 502 convention used across the other routes: `error` is a machine-readable
+// code, `message` a human-readable detail (e.g. asset-upload.ts:94,
+// profiles.ts:176). Used when the parameter store itself fails to resolve the
+// stored coordinates — distinct from a genuine 404 "no such stack".
+const upstreamFailureSchema = z.object({
+  error: z.string(),
+  message: z.string().optional()
+});
 
 type Instance = { url?: string } & Record<string, unknown>;
 
@@ -1096,6 +1106,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   //   - 200  stored coordinates returned
   //   - 404  no coordinates stored for this workspace + name
   //   - 501  parameter store not configured on this deployment
+  //   - 502  the parameter store threw while resolving the stored coordinates
+  //          (a genuine upstream refresh/read failure — issue #439). Distinct
+  //          from 404: 404 means the store answered "no such stack"; 502 means
+  //          the store could not answer at all.
   app.get(
     '/:name',
     {
@@ -1104,7 +1118,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         response: {
           200: storedConfigSchema,
           404: notFoundSchema,
-          501: notConfiguredSchema
+          501: notConfiguredSchema,
+          502: upstreamFailureSchema
         }
       }
     },
@@ -1118,8 +1133,35 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         });
       }
 
+      // Resolve the stored coordinates from the parameter store. This read can
+      // fail for two DISTINCT reasons that MUST NOT collapse into the same
+      // response (issue #439):
+      //   - the store answers cleanly with a miss -> `config` is undefined ->
+      //     the stack genuinely does not exist for this workspace -> 404.
+      //   - the store itself fails to answer (4xx auth/config surfaced as
+      //     NonRetryableParamStoreError, or 5xx/network exhausting the bounded
+      //     retry as a plain Error) -> the coordinates could not be resolved ->
+      //     a deliberate, structured 502 rather than an unhandled bare 500.
       const workspaceId = await deriveWorkspaceId(osc);
-      const config = await paramStore.loadStackConfig(workspaceId, name);
+      let config: StackConfig | undefined;
+      try {
+        config = await paramStore.loadStackConfig(workspaceId, name);
+      } catch (err) {
+        // Log the underlying failure via the diagnostic logger for operator
+        // visibility (the response body deliberately does not leak store
+        // internals). A NonRetryableParamStoreError carries the upstream status.
+        request.log.error(
+          { err, name, workspaceId },
+          'provision-status resolution failed: parameter store read error'
+        );
+        return reply.code(502).send({
+          error: 'stack_resolution_failed',
+          message:
+            err instanceof NonRetryableParamStoreError
+              ? `could not resolve stored coordinates for stack "${name}" (parameter store returned ${err.status})`
+              : `could not resolve stored coordinates for stack "${name}" (parameter store unavailable)`
+        });
+      }
       if (!config) {
         return reply.code(404).send({ error: `no stored config for stack "${name}"` });
       }
