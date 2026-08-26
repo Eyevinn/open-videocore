@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import pino from 'pino';
 import {
   ensureParameterStore,
   makeHttpParamStore,
@@ -6,6 +7,7 @@ import {
   stackConfigKey,
   stripCredentials,
   type OscInstanceApi,
+  type ParamStoreLogger,
   type StackConfig
 } from '../src/services/param-store.js';
 
@@ -256,6 +258,147 @@ describe('makeHttpParamStore retry-with-backoff (issue #421)', () => {
       /ECONNRESET/
     );
     expect(fetch).toHaveBeenCalledOnce();
+  });
+});
+
+// Regression test for issue #440 (crash from #437, fix from #438).
+//
+// #437 crashed at runtime with `TypeError: this[writeSym] is not a function`.
+// Root cause: makeHttpParamStore built its diagnostic logger by SPREADING the
+// injected logger into a plain object — `const diag = { ...NOOP, ...config.log }`
+// (src/services/param-store.ts:353). A real pino instance exposes its level
+// methods (info/warn/debug/error) as OWN-ENUMERABLE properties bound to the
+// instance's internal `writeSym`. Spreading copies the function REFERENCES but
+// rebinds `this` to the plain `diag` object at call time; the plain object has
+// no `writeSym`, so the first diag.* call throws.
+//
+// In production the logger passed to paramStoreFromEnv is `app.log` — a live
+// pino instance (src/main.ts:210) — so the bug only manifests with a real pino
+// logger, never with the vi.fn() stubs used by the tests above. This test wires
+// a REAL pino instance to reproduce it.
+//
+// Expected: FAILS on the pre-fix spread implementation (the diag call throws),
+// PASSES once #438 lands (call THROUGH the logger instead of spreading it).
+describe('makeHttpParamStore diagnostic logger binding (issue #440 regression)', () => {
+  const noSleep = async () => {};
+
+  // A real pino instance writing each JSON log line into `lines`, so we can
+  // assert the underlying logger actually received the original object + message
+  // (not merely that no error was thrown). pino level codes: debug=20, info=30,
+  // warn=40, error=50 (confirmed against pino@10 in node_modules).
+  function makeCapturingPino(): { logger: ParamStoreLogger; lines: Array<Record<string, unknown>> } {
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = pino(
+      { level: 'debug' },
+      {
+        write(chunk: string) {
+          lines.push(JSON.parse(chunk) as Record<string, unknown>);
+        }
+      }
+    );
+    return { logger, lines };
+  }
+
+  it('invokes info/warn/debug/error through a real pino logger without detaching (none throw; underlying logger receives obj+msg)', async () => {
+    const { logger, lines } = makeCapturingPino();
+
+    // storeStackConfig emits diag.warn (write-failure path) then throws on !ok;
+    // a successful write emits diag.info. Drive a success to exercise diag.info.
+    const okFetch = vi.fn(async () => new Response(null, { status: 200 }));
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: okFetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep,
+      log: logger
+    });
+
+    // On the pre-fix spread build, this throws `this[writeSym] is not a function`
+    // at the first diag.info call INSIDE storeStackConfig — the assertion that it
+    // resolves is what catches the regression.
+    await expect(
+      store.storeStackConfig('workspace-a', 'mystack', {
+        minioEndpoint: 'https://minio.example.osaas.io',
+        couchdbUrl: 'https://couch.example.osaas.io',
+        redisUrl: 'redis://valkey.svc.cluster.local:6379',
+        sourceBucket: 'openvideocore-source',
+        packagedBucket: 'openvideocore-packaged',
+        services: [{ serviceId: 'minio-minio', instanceName: 'mystack' }]
+      })
+    ).resolves.toBeUndefined();
+
+    // The underlying pino logger actually received the diagnostic object + msg
+    // (info level 30), proving we called THROUGH it, not into a detached copy.
+    const info = lines.find((l) => l['level'] === 30);
+    expect(info).toBeDefined();
+    expect(info?.['op']).toBe('storeStackConfig');
+    expect(info?.['key']).toBe(stackConfigKey('workspace-a', 'mystack'));
+    expect(info?.['msg']).toBe('param-store write ok');
+  });
+
+  it('exercises every diag level (debug on retry, error on exhaustion) through the real pino logger', async () => {
+    const { logger, lines } = makeCapturingPino();
+
+    // Persistent transient failure: withRetry logs diag.debug on the first
+    // retryable attempt and diag.error on exhaustion. Both call sites live on
+    // the SAME resolved `diag`, so both must survive the spread-vs-callthrough
+    // fix. On the buggy build the first diag.debug throws.
+    const fetch = vi.fn(async () => {
+      throw new Error('ETIMEDOUT');
+    });
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep,
+      retry: { attempts: 3 },
+      log: logger
+    });
+
+    // The refresh (listStackNames) fails persistently. The UNDERLYING ERROR
+    // (ETIMEDOUT) must propagate — NOT `this[writeSym] is not a function` from
+    // the logger detaching. On the pre-fix build the diag.debug call throws
+    // first and masks ETIMEDOUT, so this assertion fails for the right reason.
+    await expect(store.listStackNames('workspace-a')).rejects.toThrow(/ETIMEDOUT/);
+
+    // debug (20) logged on each pre-exhaustion retry; error (50) on exhaustion.
+    const debug = lines.find((l) => l['level'] === 20);
+    const error = lines.find((l) => l['level'] === 50);
+    expect(debug).toBeDefined();
+    expect(debug?.['op']).toBe('listStackNames');
+    expect(error).toBeDefined();
+    expect(error?.['op']).toBe('listStackNames');
+    // The exhaustion record carries the real underlying error, not the logger's.
+    expect(error?.['error']).toMatch(/ETIMEDOUT/);
+    expect(error?.['msg']).toBe('param-store call exhausted retries; handing off to fallback');
+  });
+
+  it('logs the underlying param-store refresh failure rather than the logger throwing (non-retryable 4xx via withRetry)', async () => {
+    const { logger, lines } = makeCapturingPino();
+
+    // A 403 is a NonRetryableParamStoreError: withRetry logs diag.warn then
+    // rethrows immediately. The rethrown error must be the param-store failure,
+    // never a logger self-crash.
+    const fetch = vi.fn(async () => new Response('forbidden', { status: 403 }));
+    const store = makeHttpParamStore({
+      baseUrl: 'https://config.example.osaas.io',
+      getOscToken: async () => 'test-sat',
+      apiKey: 'key123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      sleep: noSleep,
+      log: logger
+    });
+
+    await expect(store.listStackNames('workspace-a')).rejects.toThrow(
+      /parameter store list failed: 403/
+    );
+
+    const warn = lines.find((l) => l['level'] === 40);
+    expect(warn).toBeDefined();
+    expect(warn?.['op']).toBe('listStackNames');
+    expect(warn?.['error']).toMatch(/parameter store list failed: 403/);
   });
 });
 
