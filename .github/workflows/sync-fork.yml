@@ -19,7 +19,7 @@ jobs:
   sync-fork:
     name: Sync fork (${{ inputs.environment || 'prod' }})
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Validate environment
         env:
@@ -38,4 +38,4 @@ jobs:
           OSC_ACCESS_TOKEN: unused
           OSC_API_KEY: ${{ secrets.OSC_API_KEY }}
           ENV: ${{ inputs.environment || 'prod' }}
-        run: osc --env "$ENV" admin sync-fork eyevinn-open-videocore
+        run: osc --env "$ENV" admin sync-fork eyevinn-open-videocore --wait
