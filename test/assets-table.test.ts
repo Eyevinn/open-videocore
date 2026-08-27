@@ -236,6 +236,81 @@ describe('URL-state round-trip (shared contract)', () => {
   });
 });
 
+describe('page-scoped narrowing caveat (operator-facing disclosure)', () => {
+  // The list/search endpoints have no server-side date-range param, and the
+  // search (q) tier has no status param, so those refinements narrow the current
+  // page client-side while the pager total still reflects the full server set.
+  // The table must DISCLOSE that to the operator with a visible note whenever
+  // such a filter is active — a code comment is not sufficient.
+  const caveatOf = (t: { el: HTMLElement }) =>
+    t.el.querySelector<HTMLElement>('.ops-table-caveat');
+
+  it('hides the caveat when no page-scoped narrowing filter is active', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [{ id: 'a1', name: 'n', status: 'ready', createdAt: '2026-01-01T00:00:00Z' }], total: 1 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const note = caveatOf(t);
+    expect(note).not.toBeNull();
+    expect(note!.hidden).toBe(true);
+  });
+
+  it('shows the caveat when a created-date-range filter is active (list tier)', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [{ id: 'a1', name: 'n', status: 'ready', createdAt: '2026-01-01T00:00:00Z' }], total: 500 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('from', '2026-01-01');
+    await tick();
+
+    const note = caveatOf(t);
+    expect(note!.hidden).toBe(false);
+    expect(note!.textContent).toMatch(/current page only/i);
+  });
+
+  it('shows the caveat when a status filter is active on the search (q) tier', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [], total: 0 }),
+      search: () => ({ assets: [{ id: 's1', name: 'hit', status: 'ready', createdAt: '2026-02-02T00:00:00Z' }], total: 40, page: 1 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('q', 'hello');
+    await tick();
+    // q alone (no status) does not narrow client-side — caveat stays hidden.
+    expect(caveatOf(t)!.hidden).toBe(true);
+
+    t.state.setFilter('status', 'ready');
+    await tick();
+    // q + status => the FTS tier narrows status client-side => caveat shows.
+    expect(caveatOf(t)!.hidden).toBe(false);
+  });
+
+  it('does NOT show the caveat for a status filter on the list (no-q) tier', async () => {
+    // On the list tier, status IS a server-side param, so it does not narrow the
+    // page — the caveat must stay hidden.
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [], total: 0 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('status', 'processing');
+    await tick();
+
+    expect(caveatOf(t)!.hidden).toBe(true);
+  });
+});
+
 describe('shared table states', () => {
   it('renders an error row when the backend fetch rejects', async () => {
     const apiFetch = vi.fn(async () => {

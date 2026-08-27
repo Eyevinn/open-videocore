@@ -41,8 +41,10 @@
  *   Response envelope (searchResultSchema, src/routes/search.ts:95-99):
  *     { assets, total, page }.
  *
- * KNOWN CONTRACT GAPS (logged as OSC/backend friction, see
- * docs/osc-feedback/incoming-assets-table-server-sort-filter.md):
+ * KNOWN CONTRACT GAPS (logged as OSC/backend friction). The friction log lives
+ * in the SEPARATE eng-open-videocore-agents repo at
+ * `docs/osc-feedback/incoming-assets-table-server-sort-filter.md` — it is NOT in
+ * this (customer) repo, so do not go looking for that path here:
  *   1. Neither endpoint accepts a server-side `sort` param; the list endpoint is
  *      fixed to createdAt-ascending. So created-date DESC and the status/title
  *      sorts are applied to the CURRENT PAGE client-side. Created-date ASC is the
@@ -183,6 +185,21 @@ function applyClientSort(rows, sort) {
     return out;
   }
   return out;
+}
+
+// Decide whether the current filter state triggers a PAGE-SCOPED narrowing —
+// i.e. a refinement the backend cannot do, so we drop rows from the already-
+// fetched page client-side while the pager total still reflects the full,
+// un-narrowed server set. This is true when a created-date range is set on
+// either tier, or a status filter is active on the FTS (`q`) tier. When it is
+// true the pager's "of N" total overstates what is actually reachable through
+// paging, so we surface a visible caveat to the operator (not just a comment).
+function isPageScopedNarrowingActive(filters) {
+  const f = filters || {};
+  const q = (f.q || '').trim();
+  const hasDateRange = Boolean(f.from || f.to);
+  const hasSearchStatus = Boolean(q) && Boolean(f.status);
+  return hasDateRange || hasSearchStatus;
 }
 
 // ─── Data-source router: choose the FTS tier or the exact/range list tier ─────
@@ -466,6 +483,26 @@ export function createAssetsTable(deps) {
     emptyText: 'No assets found.',
   });
 
+  // Operator-facing caveat for page-scoped narrowing (blocking review finding).
+  // Because date-range and search+status refinements run against the current
+  // page only (the backend has no such params — see the friction log referenced
+  // in the header), the pager can report a system-wide total it is not actually
+  // paging through. Disclose that in the UI, not just in code comments. The note
+  // is inserted just below the shared filter bar and toggled on every reload().
+  const caveat = document.createElement('div');
+  caveat.className = 'ops-table-caveat';
+  caveat.setAttribute('role', 'note');
+  caveat.hidden = true;
+  caveat.textContent =
+    'Date-range and search+status filters apply to the current page only — ' +
+    'the total count and paging reflect the full unfiltered result set.';
+  const filterBarEl = table.el.querySelector('.ops-table-filters');
+  if (filterBarEl && filterBarEl.parentNode) {
+    filterBarEl.parentNode.insertBefore(caveat, filterBarEl.nextSibling);
+  } else {
+    table.el.insertBefore(caveat, table.el.firstChild);
+  }
+
   // Guard so the URL sync we do inside the state subscription does not itself
   // re-enter as a "user change" (it does not — applyTableState only touches the
   // URL — but the flag keeps intent explicit and future-proofs re-entrancy).
@@ -475,6 +512,11 @@ export function createAssetsTable(deps) {
     if (loading) return;
     loading = true;
     const snap = table.state.getState();
+
+    // Show/hide the operator-facing page-scoped-narrowing caveat for the current
+    // filter state (see isPageScopedNarrowingActive). Toggled every reload so it
+    // tracks filter changes exactly.
+    caveat.hidden = !isPageScopedNarrowingActive(snap.filters);
 
     // 3) Mirror the current interaction state into the URL (shared contract) so a
     //    refresh/share reproduces the view. Replace (not push) — control changes

@@ -1306,6 +1306,23 @@ body.detail-standalone .assets-side {
   gap: 4px;
 }
 
+/* Operator-facing caveat shown when a page-scoped narrowing filter (date-range,
+   or search+status) is active — the backend cannot narrow these server-side, so
+   the pager total reflects the full unfiltered set. See public/assets-table.js
+   and the friction log in the eng-open-videocore-agents repo. */
+.ops-table-caveat {
+  padding: 8px 16px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.ops-table-caveat[hidden] {
+  display: none;
+}
+
 .ops-table-scroll {
   flex: 1;
   min-height: 0;
