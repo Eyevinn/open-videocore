@@ -1291,6 +1291,25 @@ body.detail-standalone .assets-side {
   padding: 12px 16px 0;
 }
 
+/* Honest-cap disclosure: shown when the jobs endpoint's true total exceeds the
+ * bounded newest-100 window we fetch (the endpoint has no server-side
+ * sort/filter/search). Warns the operator that filters + counts apply to that
+ * window only. Toggled via the element's `hidden` attribute in jobs-table.js. */
+.ops-table-truncation {
+  margin: 8px 16px 0;
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--warning);
+  border: 1px solid var(--warning);
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.ops-table-truncation[hidden] {
+  display: none;
+}
+
 .ops-table-filters {
   display: flex;
   flex-wrap: wrap;
@@ -1355,6 +1374,44 @@ body.detail-standalone .assets-side {
 .ops-sort-arrow {
   font-size: 10px;
   color: var(--text-muted);
+}
+
+/* Jobs-table filter controls (issue #370). Small, labelled inputs that sit in
+ * the shared .ops-table-filters bar. Colours reuse the app's CSS variables. */
+.ops-filter-slot-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ops-filter-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.ops-filter-select,
+.ops-filter-date,
+.ops-filter-search {
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 8px;
+  background: var(--surface, #1a1a1a);
+  color: var(--text, #eee);
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+}
+
+.ops-filter-search {
+  min-width: 220px;
+}
+
+.ops-filter-select:focus-visible,
+.ops-filter-date:focus-visible,
+.ops-filter-search:focus-visible {
+  outline: 2px solid var(--accent, #6366f1);
+  outline-offset: 1px;
 }
 
 /* Assets table filter controls (issue #369). Each control is a <label> that

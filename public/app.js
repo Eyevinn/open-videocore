@@ -8,6 +8,7 @@
  * only with fully-escaped, controlled template strings.
  */
 
+import { createJobsTable } from './jobs-table.js';
 // Shared assets-table wiring (issue #369). Composes the merged shared table
 // primitive (#367/#372) and URL-state contract (#368/#373) against the verified
 // GET /api/v1/assets/ + GET /api/v1/search/ contracts. See public/assets-table.js.
@@ -1177,16 +1178,20 @@ async function renderAssetDetailBody(id, bodyEl) {
 }
 
 // ─── JOBS TAB ────────────────────────────────────────────────────────────────
+//
+// The jobs table is composed from the shared ops-UI table primitive
+// (public/ops-ui-table.js) + the URL-state contract (public/table-url-state.js)
+// via public/jobs-table.js. app.js only owns the surrounding tab chrome (header,
+// detail side panel, watch-folder footer, poll timer) and injects its fetch +
+// formatting helpers into the table. Sort/filter/pagination/URL-state all live
+// in the shared primitives — none of it is reinvented here (issue #370).
 
-// Jobs tab pagination + polling state.
-const JOBS_PAGE_SIZE = 20;
-const jobsState = { offset: 0, total: 0, selectedId: null };
 let jobsPollTimer = null;
+// The live jobs-table instance for the current tab render (used by the poll
+// timer and the in-panel cancel refresh).
+let jobsTableInstance = null;
 
 async function renderJobsTab(container) {
-  jobsState.offset = 0;
-  jobsState.selectedId = null;
-
   // Layout: full-height table on the left, detail side panel on the right (hidden initially).
   const layout = document.createElement('div');
   layout.className = 'assets-layout';
@@ -1207,22 +1212,6 @@ async function renderJobsTab(container) {
   ].join('');
   main.appendChild(header);
 
-  const tableScroll = document.createElement('div');
-  tableScroll.className = 'assets-table-scroll';
-  tableScroll.id = 'jobs-table-wrap';
-  main.appendChild(tableScroll);
-
-  const pagination = document.createElement('div');
-  pagination.className = 'pagination';
-  pagination.id = 'jobs-pagination';
-  pagination.style.display = 'none';
-  pagination.innerHTML = [
-    '<span class="page-indicator" id="jobs-page-indicator"></span>',
-    '<button id="jobs-prev" class="btn-ghost">Previous</button>',
-    '<button id="jobs-next" class="btn-ghost">Next</button>',
-  ].join('');
-  main.appendChild(pagination);
-
   // ── Side detail panel (created on demand) ──
   const detailPanel = document.createElement('div');
   detailPanel.id = 'job-detail';
@@ -1230,20 +1219,28 @@ async function renderJobsTab(container) {
   detailPanel.style.display = 'none';
   layout.appendChild(detailPanel);
 
+  // ── Jobs table (shared primitive + URL-state contract) ──
+  // The table owns sort/filter/pagination + URL sync; app.js injects the fetch
+  // helper and the formatters, plus row-select and cancel callbacks that reuse
+  // the existing detail panel and the existing DELETE /jobs/:id path.
+  const jobsTable = createJobsTable({
+    apiFetch,
+    fmtDate,
+    renderBadge,
+    onSelect: function(jobId) {
+      showJobDetail(jobId, detailPanel);
+    },
+    onCancel: function(jobId) {
+      return apiFetch('/jobs/' + encodeURIComponent(jobId), { method: 'DELETE' }).then(function() {
+        if (jobId && detailPanel.style.display !== 'none') showJobDetail(jobId, detailPanel);
+      });
+    },
+  });
+  jobsTableInstance = jobsTable;
+  main.appendChild(jobsTable.el);
+
   header.querySelector('#jobs-refresh').addEventListener('click', function() {
-    loadJobs(detailPanel);
-  });
-  pagination.querySelector('#jobs-prev').addEventListener('click', function() {
-    if (jobsState.offset >= JOBS_PAGE_SIZE) {
-      jobsState.offset -= JOBS_PAGE_SIZE;
-      loadJobs(detailPanel);
-    }
-  });
-  pagination.querySelector('#jobs-next').addEventListener('click', function() {
-    if (jobsState.offset + JOBS_PAGE_SIZE < jobsState.total) {
-      jobsState.offset += JOBS_PAGE_SIZE;
-      loadJobs(detailPanel);
-    }
+    jobsTable.refresh();
   });
 
   // ── Background service status (watch folder) — compact footer in the main column ──
@@ -1297,113 +1294,20 @@ async function renderJobsTab(container) {
   }
   refreshWatchFolderStatus();
 
-  await loadJobs(detailPanel);
+  await jobsTable.refresh();
 
-  // Auto-refresh the table (only the table, not the whole tab) every 5s.
+  // Auto-refresh the table (only the table, not the whole tab) every 5s. The
+  // table re-fetches its bounded working window and re-applies the current
+  // sort/filter/page client-side; `silent` avoids the loading flash.
   if (jobsPollTimer) clearInterval(jobsPollTimer);
   jobsPollTimer = setInterval(function() {
-    if (document.getElementById('jobs-table-wrap')) {
-      loadJobs(detailPanel, true);
+    if (jobsTable.el.isConnected) {
+      jobsTable.refresh(true);
     } else {
       clearInterval(jobsPollTimer);
       jobsPollTimer = null;
     }
   }, DETAIL_POLL_INTERVAL_MS);
-}
-
-async function loadJobs(detailPanel, silent) {
-  const wrap = document.getElementById('jobs-table-wrap');
-  const pagination = document.getElementById('jobs-pagination');
-  if (!wrap) return;
-  let loader = null;
-  if (!silent) {
-    wrap.innerHTML = '';
-    loader = loadingEl();
-    wrap.appendChild(loader);
-  }
-
-  let jobs = [];
-  try {
-    const qs = 'limit=' + JOBS_PAGE_SIZE + '&offset=' + jobsState.offset;
-    const res = await apiFetch('/jobs?' + qs);
-    jobs = (res && res.items) || [];
-    jobsState.total = (res && typeof res.total === 'number') ? res.total : jobs.length;
-  } catch (err) {
-    if (silent) return;
-    wrap.innerHTML = '';
-    showMsg(wrap, 'Failed to load jobs: ' + err.message, 'error');
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-  if (loader) loader.remove();
-  wrap.innerHTML = '';
-
-  if (jobs.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    empty.textContent = jobsState.offset > 0 ? 'No more jobs.' : 'No jobs yet.';
-    wrap.appendChild(empty);
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-
-  const rows = jobs.map(function(j) {
-    const selected = j.id === jobsState.selectedId ? ' class="row-selected"' : '';
-    return '<tr data-id="' + escHtml(j.id) + '"' + selected + '>' +
-      '<td class="cell-id">' + escHtml(j.id) + '</td>' +
-      '<td>' + escHtml(j.type) + '</td>' +
-      '<td>' + renderBadge(j.status) + '</td>' +
-      '<td class="cell-id">' + escHtml(j.assetId || '—') + '</td>' +
-      '<td>' + (j.progress != null ? escHtml(j.progress + '%') : '—') + '</td>' +
-      '<td>' + escHtml(fmtDate(j.createdAt)) + '</td>' +
-      '<td>' +
-        ((j.status === 'running' || j.status === 'pending')
-          ? '<button class="btn-danger job-cancel-btn" data-id="' + escHtml(j.id) + '" style="font-size:12px;padding:3px 8px;">Cancel</button>'
-          : '') +
-      '</td>' +
-      '</tr>';
-  }).join('');
-
-  const table = document.createElement('table');
-  table.innerHTML = '<thead><tr>' +
-    '<th>ID</th><th>Type</th><th>Status</th><th>Asset ID</th><th>Progress</th><th>Created</th><th></th>' +
-    '</tr></thead><tbody>' + rows + '</tbody>';
-  wrap.appendChild(table);
-
-  table.querySelectorAll('tbody tr').forEach(function(tr) {
-    tr.addEventListener('click', function() {
-      table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
-      tr.classList.add('row-selected');
-      jobsState.selectedId = tr.dataset.id;
-      showJobDetail(tr.dataset.id, detailPanel);
-    });
-  });
-
-  table.querySelectorAll('.job-cancel-btn').forEach(function(btn) {
-    btn.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      btn.disabled = true;
-      try {
-        await apiFetch('/jobs/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
-        await loadJobs(detailPanel);
-        if (jobsState.selectedId === btn.dataset.id) showJobDetail(btn.dataset.id, detailPanel);
-      } catch (err) {
-        btn.disabled = false;
-        alert('Error: ' + err.message);
-      }
-    });
-  });
-
-  if (pagination) {
-    const totalPages = Math.max(1, Math.ceil(jobsState.total / JOBS_PAGE_SIZE));
-    const currentPage = Math.floor(jobsState.offset / JOBS_PAGE_SIZE) + 1;
-    pagination.style.display = 'flex';
-    pagination.querySelector('#jobs-page-indicator').textContent =
-      'Page ' + currentPage + ' of ' + totalPages + ' (' + jobsState.total + ' total)';
-    pagination.querySelector('#jobs-prev').disabled = jobsState.offset === 0;
-    pagination.querySelector('#jobs-next').disabled =
-      jobsState.offset + JOBS_PAGE_SIZE >= jobsState.total;
-  }
 }
 
 async function showJobDetail(id, detailPanel) {
@@ -1422,9 +1326,10 @@ async function showJobDetail(id, detailPanel) {
   detailPanel.querySelector('#close-job-detail').addEventListener('click', function() {
     detailPanel.style.display = 'none';
     detailPanel.innerHTML = '';
-    jobsState.selectedId = null;
-    var table = document.querySelector('#jobs-table-wrap table');
-    if (table) table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
+    if (jobsTableInstance) jobsTableInstance.setSelected(null);
+    if (jobsTableInstance && jobsTableInstance.el) {
+      jobsTableInstance.el.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
+    }
   });
 
   detailPanel.querySelector('#popout-job-detail').addEventListener('click', function() {
@@ -1442,7 +1347,7 @@ async function showJobDetail(id, detailPanel) {
     },
     afterCancel: function() {
       showJobDetail(id, detailPanel);
-      loadJobs(detailPanel);
+      if (jobsTableInstance) jobsTableInstance.refresh();
     },
   });
 }
