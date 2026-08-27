@@ -8,6 +8,11 @@
  * only with fully-escaped, controlled template strings.
  */
 
+// Shared assets-table wiring (issue #369). Composes the merged shared table
+// primitive (#367/#372) and URL-state contract (#368/#373) against the verified
+// GET /api/v1/assets/ + GET /api/v1/search/ contracts. See public/assets-table.js.
+import { createAssetsTable } from './assets-table.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -448,17 +453,17 @@ function setupTabs() {
 }
 
 // ─── ASSETS TAB ──────────────────────────────────────────────────────────────
-
-// Assets tab pagination state.
-const ASSETS_PAGE_SIZE = 20;
-// `wedgedOnly` (issue #282) toggles the client-side filter that shows only assets
-// stuck in `processing` with a `technicalMetadataError` set.
-const assetsState = { offset: 0, total: 0, wedgedOnly: false };
+//
+// The table itself (sort / filter / pagination + URL state) is provided by the
+// shared assets-table wiring in public/assets-table.js (issue #369), which
+// composes the merged shared table primitive (#367/#372) and URL-state contract
+// (#368/#373) against the verified GET /api/v1/assets/ + GET /api/v1/search/
+// contracts. This tab owns only the surrounding chrome: the upload/ingest modals
+// and the detail side panel. `assetsTable` holds the live instance so the modals
+// and row actions can trigger a reload.
+let assetsTable = null;
 
 async function renderAssetsTab(container) {
-  assetsState.offset = 0;
-  assetsState.wedgedOnly = false;
-
   // Layout: full-height table on the left, detail side panel on the right (hidden initially).
   const layout = document.createElement('div');
   layout.className = 'assets-layout';
@@ -474,10 +479,6 @@ async function renderAssetsTab(container) {
   header.innerHTML = [
     '<span class="section-title">Assets</span>',
     '<div class="flex-gap">',
-    '  <label class="wedged-filter" title="Show only assets stuck in processing with a metadata extraction error">',
-    '    <input type="checkbox" id="assets-wedged-only" />',
-    '    <span>Needs attention</span>',
-    '  </label>',
     '  <button id="btn-open-upload" class="header-btn">Upload File</button>',
     '  <button id="btn-open-ingest" class="header-btn">Ingest URL</button>',
     '  <button id="assets-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
@@ -485,28 +486,53 @@ async function renderAssetsTab(container) {
   ].join('');
   main.appendChild(header);
 
-  const tableScroll = document.createElement('div');
-  tableScroll.className = 'assets-table-scroll';
-  tableScroll.id = 'assets-table-wrap';
-  main.appendChild(tableScroll);
-
-  const pagination = document.createElement('div');
-  pagination.className = 'pagination';
-  pagination.id = 'assets-pagination';
-  pagination.style.display = 'none';
-  pagination.innerHTML = [
-    '<span class="page-indicator" id="assets-page-indicator"></span>',
-    '<button id="assets-prev" class="btn-ghost">Previous</button>',
-    '<button id="assets-next" class="btn-ghost">Next</button>',
-  ].join('');
-  main.appendChild(pagination);
-
   // ── Side detail panel (created on demand) ──
   const detailPanel = document.createElement('div');
   detailPanel.id = 'asset-detail';
   detailPanel.className = 'assets-side';
   detailPanel.style.display = 'none';
   layout.appendChild(detailPanel);
+
+  // ── Shared assets table (sort / filter / pagination + URL state) ──
+  // The status filter (a proper lifecycle-state select) subsumes the old
+  // "Needs attention" checkbox: operators isolate `processing` via the status
+  // filter; the per-row "Needs attention" badge + inline Re-drive action are
+  // preserved by the table's Status/Actions column renderers.
+  assetsTable = createAssetsTable({
+    apiFetch,
+    renderBadge,
+    renderTags,
+    fmtDate,
+    isAssetWedged,
+    onRowClick: function (id) {
+      showAssetDetail(id, detailPanel);
+    },
+    onDelete: async function (id) {
+      if (!confirm('Archive asset ' + id + '?')) return false;
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(id), { method: 'DELETE' });
+        return true;
+      } catch (err) {
+        alert('Error: ' + err.message);
+        return false;
+      }
+    },
+    onRedrive: async function (id) {
+      // Re-run the extractor synchronously via the recovery path of
+      // POST /assets/:id/extract-metadata (200 { assetId, status }, issue #281).
+      try {
+        await apiFetch('/assets/' + encodeURIComponent(id) + '/extract-metadata', {
+          method: 'POST',
+          body: JSON.stringify({}),
+        });
+        return true;
+      } catch (err) {
+        alert('Re-drive failed: ' + err.message);
+        return false;
+      }
+    },
+  });
+  main.appendChild(assetsTable.el);
 
   // ── Upload modal ──
   header.querySelector('#btn-open-upload').addEventListener('click', function() {
@@ -552,7 +578,7 @@ async function renderAssetsTab(container) {
             throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
           }
           close();
-          await loadAssets(detailPanel);
+          if (assetsTable) assetsTable.reload();
         } catch (err) {
           showMsg(uploadProgress, 'Error: ' + err.message, 'error');
           uploadBtn.disabled = false;
@@ -590,7 +616,7 @@ async function renderAssetsTab(container) {
           if (titleVal) reqBody.title = titleVal;
           await apiFetch('/assets/ingest-url', { method: 'POST', body: JSON.stringify(reqBody) });
           close();
-          await loadAssets(detailPanel);
+          if (assetsTable) assetsTable.reload();
         } catch (err) {
           showMsg(msgEl, 'Error: ' + err.message, 'error');
         }
@@ -599,177 +625,8 @@ async function renderAssetsTab(container) {
   });
 
   header.querySelector('#assets-refresh').addEventListener('click', function() {
-    loadAssets(detailPanel);
+    if (assetsTable) assetsTable.reload();
   });
-  // "Needs attention" toggle (issue #282): filter the list down to wedged
-  // assets (processing + technicalMetadataError). Reset paging so the filtered
-  // view starts at the first page.
-  header.querySelector('#assets-wedged-only').addEventListener('change', function(e) {
-    assetsState.wedgedOnly = !!e.target.checked;
-    assetsState.offset = 0;
-    loadAssets(detailPanel);
-  });
-  pagination.querySelector('#assets-prev').addEventListener('click', function() {
-    if (assetsState.offset >= ASSETS_PAGE_SIZE) {
-      assetsState.offset -= ASSETS_PAGE_SIZE;
-      loadAssets(detailPanel);
-    }
-  });
-  pagination.querySelector('#assets-next').addEventListener('click', function() {
-    if (assetsState.offset + ASSETS_PAGE_SIZE < assetsState.total) {
-      assetsState.offset += ASSETS_PAGE_SIZE;
-      loadAssets(detailPanel);
-    }
-  });
-
-  await loadAssets(detailPanel);
-}
-
-async function loadAssets(detailPanel) {
-  const wrap = document.getElementById('assets-table-wrap');
-  const pagination = document.getElementById('assets-pagination');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  const loader = loadingEl();
-  wrap.appendChild(loader);
-
-  let assets = [];
-  try {
-    // When the "Needs attention" filter is active, narrow server-side to
-    // `processing` (the only status a wedged asset can hold — ASSET_STATUSES,
-    // src/data/asset-repo.ts:28) via the list endpoint's `status` query param
-    // (listQuerySchema, src/routes/assets.ts:187-192), then keep only the rows
-    // that also carry a `technicalMetadataError`. The `technicalMetadataError`
-    // field is part of the list item shape (assetSchema in listSchema), so the
-    // client can decide wedged-ness without a second request.
-    let qs = 'limit=' + ASSETS_PAGE_SIZE + '&offset=' + assetsState.offset;
-    if (assetsState.wedgedOnly) qs += '&status=processing';
-    const res = await apiFetch('/assets?' + qs);
-    if (Array.isArray(res)) {
-      assets = res;
-      assetsState.total = res.length;
-    } else {
-      assets = (res && (res.items || res.assets)) || [];
-      assetsState.total = (res && typeof res.total === 'number') ? res.total : assets.length;
-    }
-    if (assetsState.wedgedOnly) {
-      assets = filterWedgedAssets(assets);
-      // The server total counts all `processing` assets, not just wedged ones;
-      // reflect the filtered count so paging/indicator stay honest for this page.
-      assetsState.total = assets.length;
-    }
-  } catch (err) {
-    wrap.innerHTML = '';
-    showMsg(wrap, 'Failed to load assets: ' + err.message, 'error');
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-  loader.remove();
-
-  if (assets.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    empty.textContent = assetsState.wedgedOnly
-      ? 'No assets need attention.'
-      : (assetsState.offset > 0 ? 'No more assets.' : 'No assets found.');
-    wrap.appendChild(empty);
-    if (pagination) pagination.style.display = 'none';
-    return;
-  }
-
-  // Build table using escaped values
-  const rows = assets.map(function(a) {
-    var thumb = a.thumbnails && a.thumbnails.length
-      ? '<img src="/api/v1/assets/' + escHtml(a.id) + '/thumbnails/0" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
-      : '<div class="thumb-xs thumb-placeholder"></div>';
-    // Wedged assets (issue #282): stuck in `processing` with a
-    // `technicalMetadataError`. Flag them with a badge (the error text is the
-    // tooltip so the operator sees the reason on hover) and offer an inline
-    // re-drive action that hits POST /assets/:id/extract-metadata.
-    var wedged = isAssetWedged(a);
-    var statusCell = renderBadge(a.status);
-    if (wedged) {
-      statusCell += ' <span class="badge badge-attention asset-wedged-flag" data-id="' + escHtml(a.id) +
-        '" title="' + escHtml(a.technicalMetadataError) + '">Needs attention</span>';
-    }
-    var actionsCell =
-      (wedged
-        ? '<button class="btn-ghost asset-redrive-btn" data-id="' + escHtml(a.id) +
-          '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
-        : '') +
-      '<button class="btn-danger asset-delete-btn" data-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Archive</button>';
-    return '<tr data-id="' + escHtml(a.id) + '"' + (wedged ? ' class="row-wedged"' : '') + '>' +
-      '<td style="width:52px;padding:4px 6px">' + thumb + '</td>' +
-      '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
-      '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
-      '<td>' + statusCell + '</td>' +
-      '<td>' + renderTags(a.tags) + '</td>' +
-      '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
-      '<td>' + actionsCell + '</td>' +
-      '</tr>';
-  }).join('');
-
-  const table = document.createElement('table');
-  table.innerHTML = '<thead><tr><th></th><th>ID</th><th>Name / Title</th><th>Status</th><th>Tags</th><th>Created</th><th>Actions</th></tr></thead>' +
-    '<tbody>' + rows + '</tbody>';
-  wrap.appendChild(table);
-
-  // Row click opens the side detail panel; the row highlights.
-  table.querySelectorAll('tbody tr').forEach(function(tr) {
-    tr.addEventListener('click', function() {
-      table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
-      tr.classList.add('row-selected');
-      showAssetDetail(tr.dataset.id, detailPanel);
-    });
-  });
-
-  table.querySelectorAll('.asset-delete-btn').forEach(function(btn) {
-    btn.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      if (!confirm('Archive asset ' + btn.dataset.id + '?')) return;
-      try {
-        await apiFetch('/assets/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
-        await loadAssets(detailPanel);
-      } catch (err) {
-        alert('Error: ' + err.message);
-      }
-    });
-  });
-
-  // Inline re-drive (issue #282). Re-runs the extractor synchronously via the
-  // recovery path of POST /assets/:id/extract-metadata (200 { assetId, status }
-  // per issue #281). We reload the list afterwards so the resulting status
-  // change is reflected (a recovered asset drops out of the "Needs attention"
-  // view and shows `ready`; a still-failing one stays flagged).
-  table.querySelectorAll('.asset-redrive-btn').forEach(function(btn) {
-    btn.addEventListener('click', async function(e) {
-      e.stopPropagation();
-      var prev = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = 'Re-driving…';
-      try {
-        await apiFetch('/assets/' + encodeURIComponent(btn.dataset.id) + '/extract-metadata',
-          { method: 'POST', body: JSON.stringify({}) });
-        await loadAssets(detailPanel);
-      } catch (err) {
-        btn.disabled = false;
-        btn.textContent = prev;
-        alert('Re-drive failed: ' + err.message);
-      }
-    });
-  });
-
-  // Pagination controls
-  if (pagination) {
-    const totalPages = Math.max(1, Math.ceil(assetsState.total / ASSETS_PAGE_SIZE));
-    const currentPage = Math.floor(assetsState.offset / ASSETS_PAGE_SIZE) + 1;
-    pagination.style.display = 'flex';
-    pagination.querySelector('#assets-page-indicator').textContent =
-      'Page ' + currentPage + ' of ' + totalPages + ' (' + assetsState.total + ' assets)';
-    pagination.querySelector('#assets-prev').disabled = assetsState.offset === 0;
-    pagination.querySelector('#assets-next').disabled =
-      assetsState.offset + ASSETS_PAGE_SIZE >= assetsState.total;
-  }
 }
 
 async function showAssetDetail(id, detailPanel) {
