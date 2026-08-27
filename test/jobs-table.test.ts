@@ -194,6 +194,44 @@ describe('createJobsTable composition', () => {
     expect(lastUrl).toContain('jobs.status=failed');
   });
 
+  it('discloses window truncation when the server total exceeds the fetched window', async () => {
+    // A full window (JOBS_WORKING_SET_MAX rows) while the server reports MORE
+    // jobs than that => the client-side filter/count only sees the newest window.
+    const windowItems = Array.from({ length: JOBS_WORKING_SET_MAX }, (_, i) => ({
+      id: 'job-' + i,
+      type: 'transcode',
+      status: 'done',
+      assetId: 'asset-' + i,
+      progress: 100,
+      createdAt: '2026-01-01T10:00:00.000Z',
+      updatedAt: '2026-01-01T11:00:00.000Z',
+    }));
+    const apiFetch = vi
+      .fn()
+      .mockResolvedValue({ items: windowItems, total: JOBS_WORKING_SET_MAX + 250 });
+    const table = createJobsTable({ apiFetch, win: null });
+    document.body.appendChild(table.el);
+    await table.refresh();
+    const banner = table.el.querySelector('.ops-table-truncation') as HTMLElement | null;
+    expect(banner).not.toBeNull();
+    expect(banner?.hidden).toBe(false);
+    // Honest cap: names both the window size and the true system-wide total.
+    expect(banner?.textContent).toContain('newest ' + JOBS_WORKING_SET_MAX);
+    expect(banner?.textContent).toContain('of ' + (JOBS_WORKING_SET_MAX + 250));
+  });
+
+  it('hides the truncation banner when the window holds every job (total <= items.length)', async () => {
+    // makeJobs() is 5 rows and total is 5 => nothing beyond the window.
+    const apiFetch = vi.fn().mockResolvedValue({ items: makeJobs(), total: 5 });
+    const table = createJobsTable({ apiFetch, win: null });
+    document.body.appendChild(table.el);
+    await table.refresh();
+    const banner = table.el.querySelector('.ops-table-truncation') as HTMLElement | null;
+    expect(banner).not.toBeNull();
+    expect(banner?.hidden).toBe(true);
+    expect(banner?.textContent).toBe('');
+  });
+
   it('surfaces a fetch error through the shared error state', async () => {
     const apiFetch = vi.fn().mockRejectedValue(new Error('boom'));
     const table = createJobsTable({ apiFetch, win: null });

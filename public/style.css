@@ -1291,6 +1291,25 @@ body.detail-standalone .assets-side {
   padding: 12px 16px 0;
 }
 
+/* Honest-cap disclosure: shown when the jobs endpoint's true total exceeds the
+ * bounded newest-100 window we fetch (the endpoint has no server-side
+ * sort/filter/search). Warns the operator that filters + counts apply to that
+ * window only. Toggled via the element's `hidden` attribute in jobs-table.js. */
+.ops-table-truncation {
+  margin: 8px 16px 0;
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--warning);
+  border: 1px solid var(--warning);
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.ops-table-truncation[hidden] {
+  display: none;
+}
+
 .ops-table-filters {
   display: flex;
   flex-wrap: wrap;

@@ -36,9 +36,16 @@
  *   - applies sort / status filter / date-range / id-text-search CLIENT-SIDE
  *     over that bounded window.
  * The missing server-side capabilities are logged as API friction so the backend
- * can add them; when it does, this file swaps the client-side passes for real
- * query params without changing the UI. The URL-state contract already reserves
- * sort/status/q/from/to/page keys, so no URL change is needed at that point.
+ * can add them (see the OSC-feedback log in the sibling `eng-open-videocore-agents`
+ * repo: docs/osc-feedback/incoming-jobs-table-server-sort-filter.md); when it
+ * does, this file swaps the client-side passes for real query params without
+ * changing the UI. The URL-state contract already reserves sort/status/q/from/to/
+ * page keys, so no URL change is needed at that point.
+ *
+ * Until then, because the client-side passes only see the bounded newest-100
+ * window, the table renders an operator-visible truncation banner whenever the
+ * server's true total (res.total) exceeds that window, so counts like a
+ * "Failed only" "N of N" are never mistaken for the complete system-wide set.
  *
  * Security note: mirrors app.js / the primitive's XSS posture — every dynamic
  * value is escaped (escHtml) before entering a cell's innerHTML string.
@@ -307,6 +314,11 @@ export function createJobsTable(deps) {
   // The full bounded working window (fetched once per server round-trip). Client
   // sort/filter/search/paging derive their view from this.
   let workingSet = [];
+  // The true, system-wide job count reported by the server (`res.total` from
+  // GET /api/v1/jobs/ -> { items, total }; src/data/job-repo.ts:356 sets
+  // total = all.length). Kept distinct from the client-filtered count so the
+  // truncation banner can tell the operator the honest total.
+  let serverTotal = 0;
   let selectedId = null;
 
   // Map URL sort (field/dir) -> primitive initialSort (columnKey/direction).
@@ -394,6 +406,28 @@ export function createJobsTable(deps) {
     ],
   });
 
+  // ── Honest-cap disclosure banner ──────────────────────────────────────────
+  // The jobs endpoint has NO server-side sort/filter/search (contract: only
+  // limit/offset, src/routes/jobs.ts:91-93). We fetch the newest
+  // JOBS_WORKING_SET_MAX (100) and sort/filter/page CLIENT-SIDE. When the true
+  // server total (res.total) exceeds the window we actually hold, the operator
+  // MUST be told that filters and counts only reflect that window — otherwise
+  // "Failed only" showing e.g. "3 of 3" would falsely imply the complete
+  // failure set, hiding any failed job older than the 100th-most-recent. This
+  // banner makes the cap visible. role="status" so assistive tech announces it.
+  const truncationBanner = document.createElement('div');
+  truncationBanner.className = 'ops-table-truncation';
+  truncationBanner.setAttribute('role', 'status');
+  truncationBanner.hidden = true;
+  // Insert directly above the filter bar so it reads before the controls it
+  // qualifies. The primitive appended: caption, filters, scroll, pagination.
+  const filterBarEl = table.el.querySelector('.ops-table-filters');
+  if (filterBarEl && filterBarEl.parentNode) {
+    filterBarEl.parentNode.insertBefore(truncationBanner, filterBarEl);
+  } else {
+    table.el.appendChild(truncationBanner);
+  }
+
   // ── Derive the current view (filter -> sort -> page) from the working set ──
   function currentUrlState() {
     const snap = table.state.getState();
@@ -457,7 +491,24 @@ export function createJobsTable(deps) {
     const pageRows = pageJobs(filtered, snap.offset, JOBS_PAGE_SIZE);
     table.setRows(pageRows);
     wireRowInteractions();
+    updateTruncationBanner();
     syncUrl();
+  }
+
+  // Show/hide the honest-cap banner. The window is truncated when the server's
+  // true total exceeds the number of rows we actually hold in the working set;
+  // in that case sort/filter/search/counts only apply to the newest window.
+  function updateTruncationBanner() {
+    const held = workingSet.length;
+    const truncated = serverTotal > held;
+    truncationBanner.hidden = !truncated;
+    if (truncated) {
+      truncationBanner.textContent =
+        'Showing the newest ' + held + ' of ' + serverTotal +
+        ' jobs — filters and counts apply to this window only.';
+    } else {
+      truncationBanner.textContent = '';
+    }
   }
 
   // ── Fetch the bounded server window (the ONLY network path) ──
@@ -470,6 +521,10 @@ export function createJobsTable(deps) {
       const qs = 'limit=' + JOBS_WORKING_SET_MAX + '&offset=0';
       const res = await apiFetch('/jobs?' + qs);
       workingSet = (res && Array.isArray(res.items)) ? res.items : [];
+      // Capture the true system-wide total (res.total) so the truncation banner
+      // reflects reality once there are >100 jobs. Fall back to the window size
+      // if a caller/stub omits it, so we never over-claim truncation.
+      serverTotal = (res && typeof res.total === 'number') ? res.total : workingSet.length;
       renderView();
     } catch (err) {
       if (silent) return;
