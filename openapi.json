@@ -12220,6 +12220,132 @@
         }
       }
     },
+    "/api/v1/logs/": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "description": "List operational log records as a cursor-paged, newest-first stream. Pass `cursor` (from a prior response `nextCursor`) to page forward; a null `nextCursor` marks the last page. Filter server-side with `from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-insensitive message substring). Set `order=asc` to reverse the default newest-first sort. This endpoint is cursor/sequence-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473).",
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "cursor",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "in": "query",
+            "name": "from",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "in": "query",
+            "name": "to",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "q",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            },
+            "in": "query",
+            "name": "order",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "seq": {
+                            "type": "integer"
+                          },
+                          "timestamp": {
+                            "type": "string"
+                          },
+                          "message": {
+                            "type": "string"
+                          },
+                          "level": {
+                            "type": "string",
+                            "enum": [
+                              "debug",
+                              "info",
+                              "warn",
+                              "error"
+                            ]
+                          },
+                          "category": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "seq",
+                          "timestamp",
+                          "message"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "nextCursor": {
+                      "type": "string",
+                      "nullable": true
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "nextCursor"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/search/": {
       "get": {
         "summary": "Search assets",
@@ -13751,6 +13877,10 @@
     {
       "name": "admin",
       "description": "Operational status and background service control"
+    },
+    {
+      "name": "logs",
+      "description": "Cursor-paged operational log stream"
     }
   ]
 }

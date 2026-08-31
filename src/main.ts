@@ -63,6 +63,8 @@ import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { retentionRouter, archiveRetentionMsFromEnv } from './routes/retention.js';
+import { logsRouter } from './routes/logs.js';
+import { LogStore } from './services/log-store.js';
 import {
   ArchivedAssetPurgeLoop,
   archivePurgeIntervalMsFromEnv
@@ -145,6 +147,7 @@ await app.register(fastifySwagger, {
       { name: 'optional-services', description: 'Per-optional-service (auto-subtitles, scene-detect) provision, deprovision, and status' },
       { name: 'storage', description: 'Bucket and object-storage management' },
       { name: 'admin', description: 'Operational status and background service control' },
+      { name: 'logs', description: 'Cursor-paged operational log stream' },
     ],
     components: {
       securitySchemes: {
@@ -299,6 +302,13 @@ app.addHook('preHandler', async (request) => {
 });
 
 const operationStore = new OperationStore();
+
+// In-memory operational log store backing GET /api/v1/logs (issue #473). There
+// is no persistent log store today; this is the minimal append-only, sequence-
+// keyed source that satisfies cursor paging + the log record shape, modelled on
+// operationStore above. Registered by reference so future producers can append
+// to the same instance the router reads.
+const logStore = new LogStore();
 
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
@@ -1333,6 +1343,12 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
   }
 };
 await app.register(retentionRouter, retentionRouterOptions);
+
+// Operational logs listing (issue #473). Cursor/sequence-paged, newest-first,
+// append-only log stream over the in-memory logStore. Offset paging is
+// deliberately excluded (#371): only a bounded `limit` + opaque `cursor`, so
+// appended entries never shift an in-flight page.
+await app.register(logsRouter, { prefix: '/api/v1/logs', logStore });
 
 // Archived-asset retention purge sweep (issue #327, part of #323). An
 // INDEPENDENT unref'd, overlap-guarded interval — NOT folded into the Encore
