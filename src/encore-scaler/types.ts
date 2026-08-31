@@ -79,6 +79,15 @@ export type EncoreScalerConfig = {
   // reconciler.ts). Best-effort: failures are swallowed so a sweep error never
   // breaks the tick's scaling/dispatch work.
   reconcileFailedTranscodes?: () => Promise<void>;
+  // Invoked by reconcile() when it detects that one or more tracked jobs have
+  // silently vanished from an Encore instance's live QUEUED/IN_PROGRESS set
+  // without ever producing a completion callback (issue #449, ADR-016 Direction
+  // 2 — reconcile-driven terminal settle). The scaler owns no repositories, so
+  // it only raises the signal; main.ts wires this up to drive each dropped job
+  // to a terminal `failed` state via the shared idempotent settle path. The ids
+  // are our externalIds (encoreJobId). Best-effort: failures are swallowed so a
+  // repo/settle hiccup never breaks the tick's scaling/dispatch work.
+  onJobsDropped?: (encoreJobIds: string[]) => Promise<void>;
 };
 
 export type EncoreInstanceRecord = {
