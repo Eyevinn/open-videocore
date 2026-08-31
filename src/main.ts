@@ -964,6 +964,18 @@ function activateScaler(redisUrl: string): void {
     // "packaging-queue"; overridable so the poller can target a differently
     // named packager queue without a code change.
     packagingQueueKey: process.env['PACKAGING_QUEUE_KEY'],
+    // #464: bounds for the independent job-status reconciliation sweep. All keep
+    // the poller's own defaults (30s interval, page size 100, no instance cap)
+    // when the env var is unset, so behaviour is unchanged out of the box.
+    sweepIntervalMs: process.env['ENCORE_SWEEP_INTERVAL_MS']
+      ? parseInt(process.env['ENCORE_SWEEP_INTERVAL_MS'], 10)
+      : undefined,
+    sweepPageSize: process.env['ENCORE_SWEEP_PAGE_SIZE']
+      ? parseInt(process.env['ENCORE_SWEEP_PAGE_SIZE'], 10)
+      : undefined,
+    sweepMaxInstances: process.env['ENCORE_SWEEP_MAX_INSTANCES']
+      ? parseInt(process.env['ENCORE_SWEEP_MAX_INSTANCES'], 10)
+      : undefined,
     logger: app.log
   });
 

@@ -91,6 +91,18 @@ type PollerDeps = {
   // "packaging-queue". Overridable so a deployment can point at a differently
   // named packager queue without a code change.
   packagingQueueKey?: string;
+  // #464: bounds for the independent reconciliation sweep. All optional; when
+  // unset the poller applies the defaults below so behaviour is identical to
+  // before these knobs existed. Threaded the same way queueKey/packagingQueueKey
+  // are (raw value in, default applied here), so no new config-passing style is
+  // introduced. main.ts reads them from ENCORE_SWEEP_* env vars.
+  //   sweepIntervalMs   — how often the reconciliation loop runs.
+  //   sweepPageSize     — per-instance findByStatus page size (per-cycle fan-out
+  //                       bound on jobs pulled from one instance per status).
+  //   sweepMaxInstances — optional cap on Encore instances scanned per cycle.
+  sweepIntervalMs?: number;
+  sweepPageSize?: number;
+  sweepMaxInstances?: number;
   logger: Logger;
 };
 
@@ -506,7 +518,24 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
 //   { _embedded: { encoreJobs: [{ id: "<uuid>", externalId: "...", ... }] },
 //     page: { totalElements: N } }
 // (verified from Encore source and OSC docs, 2026-07-07)
-const SWEEP_INTERVAL_MS = 30_000;
+//
+// #464 — THE single independent job-status reconciliation loop. sweepTerminalJobs
+// (below) is the one and only periodic reconciler that polls the authoritative
+// per-instance Encore status endpoint for non-terminal scaler-managed jobs and
+// drives any job terminal-at-instance but non-terminal locally to its correct
+// terminal state via the SHARED handleMessage -> completeTranscode path (idempotent
+// — it skips jobs already terminal locally and messages already queued/processing,
+// so a job that ALSO received its real callback is never double-processed). Do NOT
+// add a second control loop; extend this one. Cross-references #448 (its terminal-
+// reconciliation counterpart) — the two coordinate rather than duplicate: a still-
+// `running` retry left by handleMessage is exactly what #448's reconciler leaves
+// alone, so they never double-settle a job.
+//
+// Interval and per-cycle fan-out (page size, instances scanned) are bounded and
+// configurable via ENCORE_SWEEP_* env vars (defaults below keep behaviour
+// unchanged when unset).
+const DEFAULT_SWEEP_INTERVAL_MS = 30_000;
+const DEFAULT_SWEEP_PAGE_SIZE = 100;
 
 // Encore terminal statuses we reconcile in the sweep. Both are handled by the
 // SAME discovery → synthesize-message → enqueue mechanism; handleMessage derives
@@ -524,8 +553,17 @@ const SWEEP_STATUSES = ['SUCCESSFUL', 'FAILED'] as const;
 export async function sweepTerminalJobs(deps: PollerDeps, queueKey: string): Promise<void> {
   const { redis, oscContext, logger, jobRepository } = deps;
 
+  // Per-cycle fan-out bounds (#464). Page size caps jobs pulled per instance per
+  // status; maxInstances optionally caps how many Encore instances are scanned in
+  // one cycle so a very large pool cannot make a single sweep unbounded. Defaults
+  // preserve today's behaviour (page size 100, no instance cap) when env is unset.
+  const pageSize = deps.sweepPageSize ?? DEFAULT_SWEEP_PAGE_SIZE;
+  const maxInstances = deps.sweepMaxInstances;
+
   const poolKeys = await redis.keys('encore:pool:*');
   if (poolKeys.length === 0) return;
+
+  let instancesScanned = 0;
 
   let sat: string;
   try {
@@ -540,6 +578,12 @@ export async function sweepTerminalJobs(deps: PollerDeps, queueKey: string): Pro
   for (const poolKey of poolKeys) {
     const poolRaw = await redis.hgetall(poolKey).catch(() => ({}));
     for (const instanceJson of Object.values(poolRaw)) {
+      // #464: bound instances scanned per cycle when configured. A non-scanned
+      // instance is simply picked up on the next sweep, so no job is stranded —
+      // reconciliation still completes within a bounded number of intervals.
+      if (maxInstances !== undefined && instancesScanned >= maxInstances) return;
+      instancesScanned++;
+
       let record: EncoreInstanceRecord;
       try { record = JSON.parse(instanceJson) as EncoreInstanceRecord; } catch { continue; }
 
@@ -549,7 +593,7 @@ export async function sweepTerminalJobs(deps: PollerDeps, queueKey: string): Pro
       for (const status of SWEEP_STATUSES) {
         const searchUrl =
           `${record.url.replace(/\/+$/, '')}/encoreJobs/search/findByStatus` +
-          `?status=${status}&page=0&size=100`;
+          `?status=${status}&page=0&size=${pageSize}`;
         let encoreJobs: Array<{ id?: string }> = [];
         try {
           const res = await fetch(searchUrl, { headers: { authorization: `Bearer ${sat}` } });
@@ -650,11 +694,14 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   // closes the "job looks stuck running after an Encore failure" gap. First sweep
   // fires after SWEEP_INTERVAL_MS, not immediately, so the normal queue-drain
   // path gets first chance on startup.
+  // #464: interval is configurable (ENCORE_SWEEP_INTERVAL_MS) but defaults to the
+  // original 30s so behaviour is unchanged when unset.
+  const sweepIntervalMs = deps.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
   const sweepTimer = setInterval(() => {
     void sweepTerminalJobs(deps, queueKey).catch((err) => {
       deps.logger.warn({ msg: 'encore-callback-poller: sweep error', err });
     });
-  }, SWEEP_INTERVAL_MS);
+  }, sweepIntervalMs);
   sweepTimer.unref?.();
 
   const loop = async (): Promise<void> => {
