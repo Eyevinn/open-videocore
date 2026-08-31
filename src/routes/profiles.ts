@@ -132,6 +132,19 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
     '/index.yml',
     {
       schema: {
+        // Machine-readable profile-count signal for monitoring consumers (issue
+        // #460). The `/index.yml` body/status contract is FIXED by a downstream
+        // headerless YAML consumer, so an empty store still returns 200 with a
+        // valid YAML mapping (`{}` — issue #459) and cannot itself signal "zero
+        // profiles vs. something wrong". A monitoring probe therefore reads the
+        // `x-profile-count` RESPONSE HEADER (the number of runnable profiles in
+        // the emitted index) and can alert on `0` WITHOUT parsing the YAML.
+        description:
+          'Public Encore-format profile index (name -> :name/yaml). Served without auth. ' +
+          'Response header `x-profile-count` carries the number of runnable profiles ' +
+          'in the emitted index so monitoring consumers can distinguish an empty store ' +
+          '(x-profile-count: 0, body `{}`) from a failure WITHOUT parsing the YAML body. ' +
+          'The body and 200 status are unchanged by this header (issue #460).',
         response: {
           200: z.string()
         }
@@ -148,6 +161,14 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
         .sort((a, b) => a.localeCompare(b))
         .map((name) => `${name}: ${name}/yaml`);
       reply.header('content-type', 'text/yaml; charset=utf-8');
+      // Expose the runnable-profile count as a response header so monitoring
+      // consumers can alert on an empty store WITHOUT parsing the YAML body,
+      // and WITHOUT changing the fixed 200/body contract the headerless Encore
+      // YAML consumer depends on (issue #460). The count is exactly `lines.length`
+      // — the number of profile entries actually written to the body (runnable
+      // profiles after the `isProfileRunnable` filter), so header and body always
+      // agree: `0` iff the body is the empty mapping `{}`.
+      reply.header('x-profile-count', String(lines.length));
       // An empty list must still be a valid YAML mapping. A zero-byte body makes
       // downstream YAML parsers fail with "No content to map due to end-of-input",
       // so emit an empty mapping (`{}`) instead (issue #459).
