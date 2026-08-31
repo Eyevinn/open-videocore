@@ -70,7 +70,10 @@ import {
 import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
 import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
-import { reconcileFailedTranscodes } from './pipeline/failed-transcode-reconciler.js';
+import {
+  reconcileFailedTranscodes,
+  settleFailedTranscode
+} from './pipeline/failed-transcode-reconciler.js';
 import { reconcileStalledPackages } from './pipeline/stalled-package-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
@@ -794,6 +797,41 @@ function activateScaler(redisUrl: string): void {
           warn: (...a: unknown[]) => app.log.warn(a)
         }
       });
+    },
+    // When the scaler's reconcile() detects that tracked jobs have silently
+    // vanished from an Encore instance's live QUEUED/IN_PROGRESS set with no
+    // completion callback (issue #449, ADR-016 Direction 2 — reconcile-driven
+    // terminal settle), it raises the ids here. The scaler owns no repositories,
+    // so main.ts performs the terminal write: resolve each id to its Job (by the
+    // encoreJobId / externalId it was submitted with, as onDispatched does) and
+    // route it through the SAME idempotent settle path the #273 sweep uses
+    // (completeTranscode({ success: false }) + pipeline-lock release). Reusing
+    // settleFailedTranscode guarantees identical asset/pipeline side-effects and
+    // first-terminal-write-wins idempotency, so a late SUCCESSFUL callback cannot
+    // clobber the settle. Best-effort per id: one job's failure never blocks the
+    // rest, and the scaler already swallows a thrown hook.
+    onJobsDropped: async (encoreJobIds: string[]) => {
+      for (const encoreJobId of encoreJobIds) {
+        try {
+          const found = await jobRepository.findByEncoreJobId(encoreJobId);
+          if (!found) continue;
+          await settleFailedTranscode(
+            {
+              jobs: jobRepository,
+              assets: assetRepository,
+              pipeline: pipelineRepository,
+              logger: {
+                info: (...a: unknown[]) => app.log.info(a),
+                warn: (...a: unknown[]) => app.log.warn(a)
+              }
+            },
+            found.job,
+            'dropped by Encore: gone from active set with no completion'
+          );
+        } catch (err) {
+          app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');
+        }
+      }
     }
   });
   encore = scalerRegistry;

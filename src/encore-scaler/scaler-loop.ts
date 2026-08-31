@@ -193,6 +193,14 @@ export class EncoreScalerLoop {
     const entries = Object.entries(raw);
     if (entries.length === 0) return; // empty pool — nothing to reconcile
 
+    // Accumulate the externalIds (our encoreJobId) of jobs this reconcile
+    // observes as silently dropped — tracked as running against an instance but
+    // no longer present in that instance's live QUEUED/IN_PROGRESS set with no
+    // completion callback (issue #449, ADR-016 Direction 2). The scaler owns no
+    // repositories, so it only raises the signal via onJobsDropped; the terminal
+    // write is owned by the reconciler/main.ts repo layer.
+    const droppedJobIds: string[] = [];
+
     for (const [instanceId, instanceJson] of entries) {
       try {
         let record: EncoreInstanceRecord;
@@ -206,23 +214,34 @@ export class EncoreScalerLoop {
 
         const token = await getToken();
         const base = record.url.replace(/\/$/, '');
-        // Count both QUEUED and IN_PROGRESS — a freshly dispatched job sits in
-        // QUEUED until Encore picks it up, so counting only IN_PROGRESS would
-        // make the instance look idle immediately after dispatch and trigger a
-        // spurious scale-up on the next tick.
+        // Fetch both QUEUED and IN_PROGRESS job documents (not just counts) — a
+        // freshly dispatched job sits in QUEUED until Encore picks it up, so
+        // counting only IN_PROGRESS would make the instance look idle
+        // immediately after dispatch and trigger a spurious scale-up on the next
+        // tick. We request the documents (size=100) rather than size=1 so we can
+        // read each active job's externalId and thereby tell WHICH tracked jobs
+        // (if any) have silently vanished — the dropped-job signal for #449.
+        // Contract: Encore /encoreJobs/search/findByStatus returns Spring
+        // HATEOAS pages { _embedded: { encoreJobs: [{ id, externalId, ... }] },
+        // page: { totalElements: N } } (verified in
+        // encore-callback-poller.ts:505-508, SVT Encore, 2026-07-07).
         const [resQ, resP] = await Promise.all([
-          fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=1`, {
+          fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=100`, {
             headers: { authorization: `Bearer ${token}` }
           }),
-          fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=1`, {
+          fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`, {
             headers: { authorization: `Bearer ${token}` }
           })
         ]);
         if (!resQ.ok || !resP.ok) continue;
 
+        type EncoreJobPage = {
+          _embedded?: { encoreJobs?: Array<{ externalId?: string }> };
+          page?: { totalElements?: number };
+        };
         const [bodyQ, bodyP] = await Promise.all([
-          resQ.json().catch(() => ({})) as Promise<{ page?: { totalElements?: number } }>,
-          resP.json().catch(() => ({})) as Promise<{ page?: { totalElements?: number } }>
+          resQ.json().catch(() => ({})) as Promise<EncoreJobPage>,
+          resP.json().catch(() => ({})) as Promise<EncoreJobPage>
         ]);
         const queuedCount = bodyQ.page?.totalElements;
         const inProgressCount = bodyP.page?.totalElements;
@@ -235,6 +254,42 @@ export class EncoreScalerLoop {
             `[encore-scaler] reconcile: correcting stale activeJobs for instance ${instanceId}: ` +
               `tracked=${record.activeJobs} actual=${actualCount}`
           );
+
+          // tracked > actual is the silently-dropped signal (ADR-016): a job we
+          // think is running has left Encore's active set with no completion.
+          // Resolve exactly which of our jobs vanished by diffing the jobs we
+          // track against this instance (jobInstance hash, written at dispatch,
+          // scaler-loop.ts:290) — restricted to those still marked `running`
+          // (jobStatus hash, scaler-loop.ts:291) — against the externalIds
+          // Encore still reports active. Anything tracked-running for this
+          // instance that Encore no longer lists is dropped.
+          if (actualCount < record.activeJobs) {
+            const activeExternalIds = new Set<string>();
+            for (const j of bodyQ._embedded?.encoreJobs ?? []) {
+              if (j.externalId) activeExternalIds.add(j.externalId);
+            }
+            for (const j of bodyP._embedded?.encoreJobs ?? []) {
+              if (j.externalId) activeExternalIds.add(j.externalId);
+            }
+
+            const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
+            const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
+            for (const [jobId, mappedInstanceId] of Object.entries(trackedInstances)) {
+              if (mappedInstanceId !== instanceId) continue;
+              // Only jobs still locally marked running are candidates; a job the
+              // callback poller / cancel already settled has a terminal status.
+              const st = (trackedStatuses[jobId] ?? '').toUpperCase();
+              if (st !== 'RUNNING' && st !== 'QUEUED') continue;
+              if (activeExternalIds.has(jobId)) continue; // still live on Encore
+              droppedJobIds.push(jobId);
+              // Overwrite the stale Valkey status (written `running` at dispatch,
+              // scaler-loop.ts:291) so a subsequent makeScalingEncoreClient
+              // getJobStatus (index.ts:41) agrees with the durable job record and
+              // does not re-report `running` (ADR-016 Point 3).
+              await redis.hset(keys.jobStatus(workspaceId), jobId, 'FAILED');
+            }
+          }
+
           record.activeJobs = actualCount;
           // Do NOT update lastIdleAt here. The idle clock must only advance when
           // the callback poller confirms the completion (via decrementActiveJobs).
@@ -252,6 +307,23 @@ export class EncoreScalerLoop {
         // Swallow per-instance errors so one unreachable instance does not
         // break reconciliation (or the tick) for the rest of the pool.
         continue;
+      }
+    }
+
+    // Raise the dropped-job signal (issue #449, ADR-016). The scaler owns no
+    // repositories, so main.ts wires onJobsDropped to drive each id to a
+    // terminal `failed` state through the shared idempotent settle path.
+    // Best-effort: a hook failure must never break the tick, exactly as the
+    // other repo-bridge hooks are treated (scaler-loop.ts:341-347).
+    if (droppedJobIds.length > 0 && this.config.onJobsDropped) {
+      try {
+        await this.config.onJobsDropped(droppedJobIds);
+      } catch (err) {
+        console.error(
+          '[encore-scaler] onJobsDropped error (workspace=%s):',
+          workspaceId,
+          err
+        );
       }
     }
   }

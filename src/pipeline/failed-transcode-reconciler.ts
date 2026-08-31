@@ -113,7 +113,7 @@ export async function reconcileFailedTranscodes(
     }
 
     if (status === 'failed') {
-      await settleFailed(deps, job, 'transcode failed on Encore');
+      await settleFailedTranscode(deps, job, 'transcode failed on Encore');
       failed += 1;
       continue;
     }
@@ -127,7 +127,7 @@ export async function reconcileFailedTranscodes(
       const updatedAtMs = Date.parse(job.updatedAt);
       const ageMs = Number.isNaN(updatedAtMs) ? 0 : now() - updatedAtMs;
       if (ageMs > stallTimeoutMs) {
-        await settleFailed(
+        await settleFailedTranscode(
           deps,
           job,
           'transcode timed out: Encore has no record of the job'
@@ -144,12 +144,25 @@ export async function reconcileFailedTranscodes(
   return { scanned, failed };
 }
 
+// Dependencies needed to settle a single job to `failed`. A strict subset of
+// ReconcileFailedTranscodesDeps so callers outside the sweep (e.g. the scaler's
+// dropped-job hook in main.ts, issue #449) can reuse the exact same terminal
+// path without depending on an EncoreClient/clock.
+export type SettleFailedDeps = Pick<
+  ReconcileFailedTranscodesDeps,
+  'jobs' | 'assets' | 'pipeline' | 'logger'
+>;
+
 // Settle a single failed transcode: run completeTranscode({ success: false }) to
 // mark the Job failed and take the source asset out of `processing`, then
-// release the running pipeline lock. Errors are swallowed (logged) so one job's
-// failure to settle never aborts the sweep.
-async function settleFailed(
-  deps: ReconcileFailedTranscodesDeps,
+// release the running pipeline lock. Idempotent (first-terminal-write-wins):
+// completeTranscode no-ops when the job is already terminal, so a late callback
+// arriving after this settle cannot clobber it (ADR-016 Point 3). Errors are
+// swallowed (logged) so one job's failure to settle never aborts the caller.
+// Exported so the scaler's reconcile-driven dropped-job path (issue #449) funnels
+// through the identical asset/pipeline side-effects as the #273 sweep.
+export async function settleFailedTranscode(
+  deps: SettleFailedDeps,
   job: Job,
   error: string
 ): Promise<void> {
