@@ -11,9 +11,13 @@
 //   2. EncoreScalerLoop.tick() over a minimal in-memory Valkey fake with a
 //      stubbed fetch: an instance whose trust probe is not yet ready receives
 //      NO job; once the probe passes it becomes eligible and the queued job is
-//      dispatched. A quarantined instance (probe timed out) also receives no job.
+//      dispatched. The gate is a bounded WAIT across re-probes (#463): an early
+//      PKIX/handshake failure does NOT quarantine — the instance stays
+//      ineligible and a later successful probe makes it eligible. Only a probe
+//      that keeps failing PAST the bounded-wait deadline quarantines the
+//      instance, which then also receives no job.
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Redis } from 'ioredis';
 import { EncoreScalerLoop } from './scaler-loop.js';
 import { probeCallbackTrust } from './callback-trust-probe.js';
@@ -182,13 +186,24 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
     loop = new EncoreScalerLoop(makeConfig(redis));
   });
 
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.useRealTimers();
+  });
+
   function queueOneJob(): void {
     const job = { jobId: `${WS}__job-1`, payload: { externalId: `${WS}__job-1` }, enqueuedAt: Date.now() };
     // Queue is consumed via rpoplpush (pop from the tail): put it there.
     redis.lists.set(keys.queue(WS), [JSON.stringify(job)]);
   }
 
-  it('withholds the first job while callback-ingress trust is NOT yet ready, then dispatches once the probe passes', async () => {
+  it('an early PKIX failure does NOT quarantine (bounded wait) — instance stays ineligible, then becomes eligible once a later probe passes', async () => {
+    // Fake timers so we can advance time WITHIN the bounded wait between ticks
+    // (an early PKIX probe fails ~1s after spawn; the ingress cert becomes
+    // trusted ~35s later — well inside the default 60_000ms deadline).
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+
     seedInstance(redis, {
       instanceId: 'inst-1',
       url: 'https://encore-1.osaas.io',
@@ -198,7 +213,7 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
     });
     queueOneJob();
 
-    // --- Tick 1: probe FAILS with a PKIX handshake error -> no dispatch. ---
+    // --- Tick 1 (t=0): probe FAILS with a PKIX handshake error (the #463 race).
     globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url === LISTENER_URL) {
@@ -217,25 +232,20 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
 
     // The job stayed in the queue: no dispatch happened.
     expect(await redis.llen(keys.queue(WS))).toBe(1);
-    // The instance was quarantined and is NOT trust-ready.
+    // The instance is NOT quarantined (still inside the bounded wait) and NOT
+    // trust-ready — it simply gets no job this tick. The first-probe deadline
+    // was stamped and persisted so a later tick re-probes against it.
     let inst = readInstance(redis, 'inst-1');
     expect(inst.callbackTrustReady).toBeFalsy();
-    expect(inst.callbackTrustQuarantinedAt).toBeTruthy();
+    expect(inst.callbackTrustQuarantinedAt).toBeFalsy();
+    expect(inst.callbackTrustFirstProbeAt).toBe(0);
     // No job-instance mapping recorded (nothing was dispatched).
     expect(await redis.hget(keys.jobInstance(WS), `${WS}__job-1`)).toBeNull();
 
-    // A quarantined instance is a terminal skip for THIS record. To prove the
-    // "once the probe passes it becomes eligible" half, reset the instance to an
-    // un-probed state (as a fresh spawn would be) and let the probe succeed.
-    seedInstance(redis, {
-      instanceId: 'inst-1',
-      url: 'https://encore-1.osaas.io',
-      callbackListenerUrl: LISTENER_URL,
-      activeJobs: 0,
-      lastIdleAt: Date.now()
-    });
-
-    // --- Tick 2: probe SUCCEEDS (200) and the Encore POST succeeds -> dispatch. ---
+    // --- Tick 2 (t=35s, still inside the 60s window): probe now SUCCEEDS and
+    // the Encore POST succeeds -> dispatch. The SAME instance record (with its
+    // persisted callbackTrustFirstProbeAt) is re-probed; nothing was reset.
+    vi.setSystemTime(35_000);
     globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url === LISTENER_URL) {
@@ -262,9 +272,61 @@ describe('EncoreScalerLoop first-job callback-trust gate (#463)', () => {
     inst = readInstance(redis, 'inst-1');
     expect(inst.callbackTrustReady).toBe(true);
     expect(inst.callbackTrustConfirmedAt).toBeTruthy();
+    expect(inst.callbackTrustQuarantinedAt).toBeFalsy();
     expect(inst.activeJobs).toBe(1);
+  });
 
-    globalThis.fetch = realFetch;
+  it('an instance whose probe keeps failing PAST the bounded wait IS quarantined and stays ineligible', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+
+    seedInstance(redis, {
+      instanceId: 'inst-slow',
+      url: 'https://encore-slow.osaas.io',
+      callbackListenerUrl: LISTENER_URL,
+      activeJobs: 0,
+      lastIdleAt: Date.now()
+    });
+    queueOneJob();
+
+    // The probe fails with a PKIX handshake error on every tick.
+    globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === LISTENER_URL) {
+        const err = new Error('fetch failed');
+        (err as Error & { cause?: unknown }).cause = Object.assign(
+          new Error('unable to verify the first certificate'),
+          { code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' }
+        );
+        throw err;
+      }
+      throw new Error(`unexpected fetch to ${url} before trust confirmed`);
+    }) as unknown as typeof fetch;
+
+    // --- Tick 1 (t=0): stamps the first-probe deadline, stays ineligible but
+    // NOT yet quarantined.
+    await loop.tick();
+    let inst = readInstance(redis, 'inst-slow');
+    expect(inst.callbackTrustFirstProbeAt).toBe(0);
+    expect(inst.callbackTrustQuarantinedAt).toBeFalsy();
+    expect(await redis.llen(keys.queue(WS))).toBe(1);
+
+    // --- Tick 2 (t=61s > default 60_000ms deadline): now quarantined. ---
+    vi.setSystemTime(61_000);
+    await loop.tick();
+
+    inst = readInstance(redis, 'inst-slow');
+    expect(inst.callbackTrustReady).toBeFalsy();
+    expect(inst.callbackTrustQuarantinedAt).toBeTruthy();
+    // Still no dispatch — the job remains queued and no mapping was recorded.
+    expect(await redis.llen(keys.queue(WS))).toBe(1);
+    expect(await redis.hget(keys.jobInstance(WS), `${WS}__job-1`)).toBeNull();
+
+    // --- Tick 3: a quarantined instance stays ineligible (terminal skip). ---
+    vi.setSystemTime(120_000);
+    await loop.tick();
+    expect(await redis.llen(keys.queue(WS))).toBe(1);
+    expect(await redis.hget(keys.jobInstance(WS), `${WS}__job-1`)).toBeNull();
   });
 
   it('an already-warm (trust-ready) instance is NOT re-probed — no added latency', async () => {

@@ -105,10 +105,18 @@ export type EncoreInstanceRecord = {
   // epoch-ms the probe passed (observability); `callbackTrustReady` is the gate.
   callbackTrustReady?: boolean;
   callbackTrustConfirmedAt?: number;
-  // Set when the trust probe fails to pass within callbackTrustTimeoutMs
-  // (issue #463): the instance is quarantined from job assignment and NOT
-  // dispatched to. Records the epoch-ms the quarantine was applied so the
-  // condition is queryable rather than silently retried forever.
+  // Epoch-ms of the FIRST trust probe attempt for this instance (issue #463).
+  // The trust gate is a bounded WAIT across re-probes, not a single shot: an
+  // early probe can fail with a transient PKIX/handshake error because the
+  // per-instance callback-listener ingress certificate becomes trusted ~35s
+  // after spawn. We therefore re-probe on later ticks and only quarantine once
+  // (Date.now() - callbackTrustFirstProbeAt) exceeds callbackTrustTimeoutMs.
+  // Persisted so the deadline survives across ticks and instance reloads.
+  callbackTrustFirstProbeAt?: number;
+  // Set when the trust probe fails to pass within the bounded wait
+  // callbackTrustTimeoutMs (issue #463): the instance is quarantined from job
+  // assignment and NOT dispatched to. Records the epoch-ms the quarantine was
+  // applied so the condition is queryable rather than silently retried forever.
   callbackTrustQuarantinedAt?: number;
   activeJobs: number; // jobs currently running on this instance
   lastIdleAt: number; // epoch ms when activeJobs last reached 0

@@ -284,12 +284,25 @@ export class EncoreScalerLoop {
   //     instance-pool.ts:135-137). Fail open: allow dispatch as before so this
   //     gate never regresses the reconcile-from-OSC path.
   //
-  // The probe runs at most ONCE per instance. On success the record is stamped
-  // callbackTrustReady=true and persisted so no future tick re-probes. On a
-  // bounded-timeout the instance is quarantined and a structured error is
-  // emitted via the logger (instanceId + ingress hostname) rather than thrown
-  // into the tick loop. A transient non-timeout failure (ingress still spinning
-  // up) is left un-quarantined so a later tick re-probes.
+  // The gate is a bounded WAIT across re-probes, not a single shot (issue #463).
+  // The tick loop re-invokes this each tick, so we probe again on later ticks:
+  //   - On success the record is stamped callbackTrustReady=true and persisted
+  //     so no future tick re-probes.
+  //   - A probe failure (tls-trust, connection, OR timeout) while still inside
+  //     the bounded window is NOT quarantining — we return false (ineligible
+  //     this tick) so a later tick re-probes. This lets the transient PKIX race
+  //     (the ingress cert becomes trusted ~35s after spawn) resolve instead of
+  //     permanently sidelining an instance on an early fast-fail PKIX error.
+  //   - Only once the elapsed time since the FIRST probe exceeds the bounded
+  //     deadline do we quarantine the instance and emit a structured error
+  //     (instanceId + ingress hostname) rather than throw into the tick loop.
+  //
+  // callbackTrustTimeoutMs plays TWO roles here (intentionally the same value):
+  //   1. the per-probe AbortSignal window for a single HTTPS handshake, and
+  //   2. the overall cross-tick bounded-wait deadline measured from the first
+  //      probe. A PKIX/handshake failure fast-fails (~1s) and does NOT consume
+  //      the AbortSignal window, so the deadline is what actually bounds the
+  //      wait across re-probes.
   private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
     if (inst.callbackTrustReady) return true;
     if (inst.callbackTrustQuarantinedAt) return false;
@@ -305,6 +318,13 @@ export class EncoreScalerLoop {
       // keep the raw URL for logging if it does not parse
     }
 
+    // Stamp (and persist) the first-probe epoch so the bounded-wait deadline
+    // survives across ticks and instances reloaded from Valkey.
+    if (inst.callbackTrustFirstProbeAt === undefined) {
+      inst.callbackTrustFirstProbeAt = Date.now();
+      await updateInstance(this.config.redis, this.config.workspaceId, inst);
+    }
+
     const result = await probeCallbackTrust(inst.callbackListenerUrl, timeoutMs);
 
     if (result.ok) {
@@ -314,29 +334,32 @@ export class EncoreScalerLoop {
       return true;
     }
 
-    if (result.errorClass === 'timeout' || result.errorClass === 'tls-trust') {
-      // Bounded wait exceeded, or a concrete PKIX/handshake failure surfaced:
-      // quarantine the instance from job assignment and surface a structured,
-      // queryable error (instanceId + ingress hostname). Do NOT throw — keep the
-      // tick non-fatal.
-      inst.callbackTrustQuarantinedAt = Date.now();
-      await updateInstance(this.config.redis, this.config.workspaceId, inst);
-      console.error(
-        '[encore-scaler] callback-trust probe failed — quarantining instance from job assignment',
-        {
-          workspaceId: this.config.workspaceId,
-          instanceId: inst.instanceId,
-          callbackIngressHostname: hostname,
-          errorClass: result.errorClass,
-          detail: result.detail,
-          timeoutMs
-        }
-      );
+    // Probe failed. If we are still inside the bounded wait, do NOT quarantine —
+    // stay ineligible this tick and let a later tick re-probe so the transient
+    // PKIX/handshake race can resolve. This treats tls-trust, connection, and a
+    // per-probe timeout identically while the deadline has not been exceeded.
+    const elapsedMs = Date.now() - inst.callbackTrustFirstProbeAt;
+    if (elapsedMs <= timeoutMs) {
       return false;
     }
 
-    // Transient connection error (DNS/ingress not up yet): not ready, but not a
-    // trust failure — leave un-quarantined so a later tick re-probes.
+    // Bounded wait EXCEEDED: quarantine the instance from job assignment and
+    // surface a structured, queryable error (instanceId + ingress hostname). Do
+    // NOT throw — keep the tick non-fatal.
+    inst.callbackTrustQuarantinedAt = Date.now();
+    await updateInstance(this.config.redis, this.config.workspaceId, inst);
+    console.error(
+      '[encore-scaler] callback-trust bounded wait exceeded — quarantining instance from job assignment',
+      {
+        workspaceId: this.config.workspaceId,
+        instanceId: inst.instanceId,
+        callbackIngressHostname: hostname,
+        errorClass: result.errorClass,
+        detail: result.detail,
+        timeoutMs,
+        elapsedMs
+      }
+    );
     return false;
   }
 
