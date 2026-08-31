@@ -25,6 +25,10 @@ export type WorkspaceEncoreScalerConfig = {
   maxInstances: number;
   minInstances?: number;
   idleTimeoutMs: number;
+  // Bounded wait (ms) forwarded to every per-workspace scaler loop for the
+  // outbound callback-listener TLS-trust probe that gates first-job dispatch
+  // (issue #463). Undefined uses the loop's built-in default.
+  callbackTrustTimeoutMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   tickIntervalMs?: number;
@@ -76,6 +80,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       maxInstances: this.config.maxInstances,
       minInstances: this.config.minInstances,
       idleTimeoutMs: this.config.idleTimeoutMs,
+      callbackTrustTimeoutMs: this.config.callbackTrustTimeoutMs,
       oscContext: this.config.oscContext,
       redis: this.config.redis,
       redisUrl: this.config.redisUrl,
