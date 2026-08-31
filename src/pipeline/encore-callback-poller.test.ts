@@ -359,6 +359,80 @@ describe('encore-callback-poller sweep — FAILED job reconciliation', () => {
     expect(enqueued).toEqual({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
   });
 
+  // #464 AC: "a job whose completion callback is dropped entirely reaches the
+  // correct terminal state via reconciliation within one bounded interval." The
+  // FAILED direction is proven by the first test in this block; this proves the
+  // SUCCESSFUL direction end-to-end (sweep discovery -> shared handleMessage ->
+  // completeTranscode) rather than only asserting the enqueue.
+  it('#464: a dropped SUCCESSFUL callback reaches terminal `done` via one reconciliation pass', async () => {
+    const encoreUuid = 'uuid-success-e2e';
+    const { externalId, assetId, pipelineId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    // The scaler advances a dispatched job queued->running; completeTranscode only
+    // settles a running job to done (mirrors the #381 successful-metrics test).
+    await jobs.update(findLocalJobId(externalId), { status: 'running' });
+
+    const fetchFn = makeFetch({
+      successfulUuids: [encoreUuid],
+      jobDocs: { [encoreUuid]: { externalId, status: 'SUCCESSFUL', output: [] } }
+    });
+    const d = deps(fetchFn);
+
+    // One sweep discovers the unreconciled SUCCESSFUL job and enqueues it; the
+    // poller then drains it through the unchanged handleMessage path.
+    await sweepTerminalJobs(d, QUEUE_KEY);
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(1);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(findLocalJobId(externalId)))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    expect((await jobs.get(findLocalJobId(externalId)))?.status).toBe('done');
+    expect((await assets.get(assetId))?.status).toBe('ready');
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.steps.find((s) => s.name === 'transcode')?.status).toBe('done');
+  });
+
+  // #464 idempotency AC: a job that ALSO received its real callback (already
+  // terminal `done` locally) must not be double-processed by the sweep. Companion
+  // to the FAILED-terminal skip test above, covering the SUCCESSFUL direction.
+  it('#464: does not re-enqueue a SUCCESSFUL job already terminal (`done`) locally', async () => {
+    const encoreUuid = 'uuid-success-done';
+    await seedScenario(redis, jobs, assets, pipelines, { encoreUuid, jobStatus: 'done' });
+
+    const fetchFn = makeFetch({
+      successfulUuids: [encoreUuid],
+      jobDocs: { [encoreUuid]: { externalId: 'ignored', status: 'SUCCESSFUL', output: [] } }
+    });
+    const d = deps(fetchFn);
+
+    await sweepTerminalJobs(d, QUEUE_KEY);
+
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(0);
+  });
+
+  // #464 fan-out bound: sweepMaxInstances caps Encore instances scanned per cycle.
+  // With the cap at 0, no instance is scanned and nothing is enqueued (the job is
+  // simply reconciled on a later cycle — no job is stranded).
+  it('#464: honours the sweepMaxInstances per-cycle fan-out bound', async () => {
+    const encoreUuid = 'uuid-bounded';
+    const { externalId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+
+    const fetchFn = makeFetch({
+      failedUuids: [encoreUuid],
+      jobDocs: { [encoreUuid]: { externalId, status: 'FAILED', message: 'x' } }
+    });
+    const d = { ...deps(fetchFn), sweepMaxInstances: 0 };
+
+    await sweepTerminalJobs(d, QUEUE_KEY);
+
+    // No instance scanned this cycle -> no findByStatus fetch, nothing enqueued.
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(0);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   // The InMemoryJobRepository assigns sequential ids; recover the local id from
   // the encoreJobId we embedded so assertions don't depend on that counter.
   function findLocalJobId(externalId: string): string {
