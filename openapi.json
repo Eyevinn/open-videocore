@@ -1205,6 +1205,7 @@
     },
     "/api/v1/profiles/index.yml": {
       "get": {
+        "description": "Public Encore-format profile index (name -> :name/yaml). Served without auth. Response header `x-profile-count` carries the number of runnable profiles in the emitted index so monitoring consumers can distinguish an empty store (x-profile-count: 0, body `{}`) from a failure WITHOUT parsing the YAML body. The body and 200 status are unchanged by this header (issue #460).",
         "responses": {
           "200": {
             "description": "Default Response",
