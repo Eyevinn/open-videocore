@@ -148,7 +148,13 @@ export const profilesRouter: FastifyPluginAsync<ProfilesRouterOptions> = async (
         .sort((a, b) => a.localeCompare(b))
         .map((name) => `${name}: ${name}/yaml`);
       reply.header('content-type', 'text/yaml; charset=utf-8');
-      return reply.code(200).send(lines.join('\n') + (lines.length > 0 ? '\n' : ''));
+      // An empty list must still be a valid YAML mapping. A zero-byte body makes
+      // downstream YAML parsers fail with "No content to map due to end-of-input",
+      // so emit an empty mapping (`{}`) instead (issue #459).
+      if (lines.length === 0) {
+        return reply.code(200).send('{}\n');
+      }
+      return reply.code(200).send(lines.join('\n') + '\n');
     }
   );
 
