@@ -502,6 +502,13 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
+// Bounded wait (issue #463) for the outbound TLS-trust probe to a freshly
+// spawned instance's per-instance callback-listener ingress before that instance
+// is eligible for its FIRST job. Closes the race between the ingress certificate
+// becoming ready/trusted and the instance beginning to process (and fail) its
+// first job. On timeout the instance is quarantined from job assignment rather
+// than dispatched to. Defaults to 60s; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
+const encoreCallbackTrustTimeoutMs = parseInt(process.env['ENCORE_CALLBACK_TRUST_TIMEOUT_MS'] || String(60 * 1000), 10);
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -685,6 +692,9 @@ function activateScaler(redisUrl: string): void {
     oscContext,
     maxInstances: encoreMaxInstances,
     idleTimeoutMs: encoreIdleTimeoutMs,
+    // Gate first-job dispatch on confirmed outbound callback-listener TLS trust
+    // (issue #463): bounded wait before a freshly spawned instance is eligible.
+    callbackTrustTimeoutMs: encoreCallbackTrustTimeoutMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,

@@ -31,6 +31,11 @@ import {
   updateInstance
 } from './instance-pool.js';
 import { recordDispatch } from './retry-store.js';
+import { probeCallbackTrust } from './callback-trust-probe.js';
+
+// Default bounded wait for the outbound callback-listener TLS-trust probe
+// (issue #463) when EncoreScalerConfig.callbackTrustTimeoutMs is unset.
+export const DEFAULT_CALLBACK_TRUST_TIMEOUT_MS = 60_000;
 
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
@@ -136,6 +141,16 @@ export class EncoreScalerLoop {
 
     // 5. Dispatch pending jobs to instances with spare capacity.
     for (const inst of instances) {
+      // Gate first-job dispatch on confirmed outbound TLS trust to the paired
+      // callback-listener ingress (issue #463). An instance that has never been
+      // probed is NOT eligible for its first job until the probe passes; an
+      // instance that has already passed once (callbackTrustReady) skips this
+      // entirely, so warm instances incur no added latency. A quarantined
+      // instance is never dispatched to. This never throws into the tick: a
+      // probe failure keeps the job in the queue for a later tick.
+      if (!(await this.ensureCallbackTrust(inst))) {
+        continue; // not eligible this tick — leave its capacity unused
+      }
       while (inst.activeJobs < JOBS_PER_INSTANCE) {
         const claimed = await redis.rpoplpush(
           keys.queue(workspaceId),
@@ -254,6 +269,75 @@ export class EncoreScalerLoop {
         continue;
       }
     }
+  }
+
+  // First-job readiness gate (issue #463): confirm this instance's OUTBOUND TLS
+  // trust path to its per-instance callback-listener ingress is established
+  // before the instance is marked eligible for its first job. Returns true when
+  // the instance may receive jobs this tick, false when it must be skipped.
+  //
+  // Idempotency / no added latency for warm instances:
+  //   - callbackTrustReady === true  -> already confirmed, return true, no probe.
+  //   - callbackTrustQuarantinedAt set -> previously timed out, skip (false).
+  //   - callbackListenerUrl undefined -> nothing to probe against (e.g. an
+  //     instance re-discovered from OSC where the listener URL is unknown, see
+  //     instance-pool.ts:135-137). Fail open: allow dispatch as before so this
+  //     gate never regresses the reconcile-from-OSC path.
+  //
+  // The probe runs at most ONCE per instance. On success the record is stamped
+  // callbackTrustReady=true and persisted so no future tick re-probes. On a
+  // bounded-timeout the instance is quarantined and a structured error is
+  // emitted via the logger (instanceId + ingress hostname) rather than thrown
+  // into the tick loop. A transient non-timeout failure (ingress still spinning
+  // up) is left un-quarantined so a later tick re-probes.
+  private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
+    if (inst.callbackTrustReady) return true;
+    if (inst.callbackTrustQuarantinedAt) return false;
+    // No listener URL to probe (reconciled-from-OSC instance): fail open.
+    if (!inst.callbackListenerUrl) return true;
+
+    const timeoutMs =
+      this.config.callbackTrustTimeoutMs ?? DEFAULT_CALLBACK_TRUST_TIMEOUT_MS;
+    let hostname = inst.callbackListenerUrl;
+    try {
+      hostname = new URL(inst.callbackListenerUrl).hostname;
+    } catch {
+      // keep the raw URL for logging if it does not parse
+    }
+
+    const result = await probeCallbackTrust(inst.callbackListenerUrl, timeoutMs);
+
+    if (result.ok) {
+      inst.callbackTrustReady = true;
+      inst.callbackTrustConfirmedAt = Date.now();
+      await updateInstance(this.config.redis, this.config.workspaceId, inst);
+      return true;
+    }
+
+    if (result.errorClass === 'timeout' || result.errorClass === 'tls-trust') {
+      // Bounded wait exceeded, or a concrete PKIX/handshake failure surfaced:
+      // quarantine the instance from job assignment and surface a structured,
+      // queryable error (instanceId + ingress hostname). Do NOT throw — keep the
+      // tick non-fatal.
+      inst.callbackTrustQuarantinedAt = Date.now();
+      await updateInstance(this.config.redis, this.config.workspaceId, inst);
+      console.error(
+        '[encore-scaler] callback-trust probe failed — quarantining instance from job assignment',
+        {
+          workspaceId: this.config.workspaceId,
+          instanceId: inst.instanceId,
+          callbackIngressHostname: hostname,
+          errorClass: result.errorClass,
+          detail: result.detail,
+          timeoutMs
+        }
+      );
+      return false;
+    }
+
+    // Transient connection error (DNS/ingress not up yet): not ready, but not a
+    // trust failure — leave un-quarantined so a later tick re-probes.
+    return false;
   }
 
   // POST a queued job's raw Encore payload to a chosen instance and record the

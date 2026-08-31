@@ -35,6 +35,15 @@ export type EncoreScalerConfig = {
   // scaler pre-warms up to this many instances regardless of pending work.
   minInstances?: number;
   idleTimeoutMs: number; // default 5 * 60 * 1000
+  // Bounded wait (ms) for an instance's outbound TLS trust probe to its paired
+  // per-instance callback-listener ingress to succeed before that instance is
+  // marked eligible for its FIRST job (issue #463). The probe is a real HTTPS
+  // request whose failure surfaces a PKIX/handshake/connection error — a
+  // race exists between the callback-listener ingress certificate becoming
+  // ready/trusted and the instance beginning to process (and fail) its first
+  // job. On timeout the instance is quarantined from job assignment rather than
+  // dispatched to. Default 60_000; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
+  callbackTrustTimeoutMs?: number;
   // Redis connection string, passed to each paired callback listener so it can
   // put completion messages on the packaging queue.
   redisUrl: string;
@@ -87,6 +96,20 @@ export type EncoreInstanceRecord = {
   // HTTP base URL of the paired callback listener spawned alongside this
   // Encore instance. Undefined until the listener is ready.
   callbackListenerUrl?: string;
+  // Set once the scaler has confirmed this instance's OUTBOUND TLS trust path
+  // to its per-instance callback-listener ingress hostname is established
+  // (issue #463): a real HTTPS probe to callbackListenerUrl that would surface
+  // a PKIX/handshake/connection failure. Until this is set the instance is NOT
+  // eligible for its first job. Once set it is never re-probed (no added
+  // latency for already-warm instances). `callbackTrustConfirmedAt` records the
+  // epoch-ms the probe passed (observability); `callbackTrustReady` is the gate.
+  callbackTrustReady?: boolean;
+  callbackTrustConfirmedAt?: number;
+  // Set when the trust probe fails to pass within callbackTrustTimeoutMs
+  // (issue #463): the instance is quarantined from job assignment and NOT
+  // dispatched to. Records the epoch-ms the quarantine was applied so the
+  // condition is queryable rather than silently retried forever.
+  callbackTrustQuarantinedAt?: number;
   activeJobs: number; // jobs currently running on this instance
   lastIdleAt: number; // epoch ms when activeJobs last reached 0
 };
