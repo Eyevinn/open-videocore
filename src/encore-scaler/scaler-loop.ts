@@ -310,8 +310,16 @@ export class EncoreScalerLoop {
       if (onEncodeDispatched) {
         try {
           await onEncodeDispatched(job.jobId, attemptNumber);
-        } catch {
-          // Swallowed: dispatch itself succeeded; only durable capture is lost.
+        } catch (err) {
+          // Best-effort by design (never re-queue an already-dispatched job),
+          // but the failure must be OBSERVABLE (issue #451): a silently dropped
+          // append left dispatched jobs with attempts:0 and no encodeAttemptLog.
+          console.warn(
+            '[encore-scaler] dispatch: onEncodeDispatched failed to durably append encode attempt %d for %s:',
+            attemptNumber,
+            job.jobId,
+            err
+          );
         }
       }
       if (encoreUuid && encoreUuid !== job.jobId) {
@@ -341,8 +349,14 @@ export class EncoreScalerLoop {
       if (onDispatched) {
         try {
           await onDispatched(job.jobId);
-        } catch {
-          // Swallowed: dispatch itself succeeded.
+        } catch (err) {
+          // Best-effort by design, but observable (issue #451): a dropped
+          // queued->running flip must not vanish silently either.
+          console.warn(
+            '[encore-scaler] dispatch: onDispatched failed to advance job %s to running:',
+            job.jobId,
+            err
+          );
         }
       }
       return true;

@@ -20,7 +20,7 @@ import {
   type UpdateJobInput
 } from './job-repo.js';
 import type { FailureClass } from '../encore-scaler/retry-policy.js';
-import type { StoredDoc, StackCouch } from './couchdb.js';
+import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'job';
 
@@ -93,58 +93,75 @@ export class CouchJobRepository implements JobRepository {
     return { job };
   }
 
+  // Concurrent-write safety (issue #451, reusing the #278 primitive): route the
+  // read-modify-write through updateWithRetry so a `Document update conflict.`
+  // (HTTP 409) from a concurrent writer racing on the same _rev — e.g. the
+  // sibling encodeAttemptLog append and the queued->running flip both firing in
+  // one dispatch(), or a progress/reconcile write landing between this read and
+  // put — is refetched and re-applied rather than silently dropped. patchFn is
+  // pure (no writes), so it is safe to re-run per attempt.
   async update(
     id: string,
     patch: UpdateJobInput
   ): Promise<Job | undefined> {
     const couch = this.couchFor();
-    const doc = await couch.get(id);
-    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
-      return undefined;
-    }
-    const existing = fromDoc(doc);
-    const next = applyJobPatch(existing, patch, new Date().toISOString());
-    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
-    return next;
+    let updated: Job | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      if (current.resourceType !== RESOURCE_TYPE) {
+        // Not a job doc: return it unchanged so the write is a no-op, then the
+        // not-found contract is preserved below (updated stays undefined).
+        return current;
+      }
+      updated = applyJobPatch(fromDoc(current), patch, new Date().toISOString());
+      return toDoc(updated);
+    });
+    return written ? updated : undefined;
   }
 
   // Durably append one Encore dispatch to the job's encode-attempt log (#380).
   // Read-modify-write against the current CouchDB revision so the append lands
   // on top of the latest persisted state. This is the durable capture that
   // outlives the Valkey retry TTL: it is never cleared by clearRetryState.
+  // Routed through updateWithRetry (#451): the sibling `update` (queued->running)
+  // fires in the same dispatch() against the same doc, so a raw get+put here
+  // races and 409s — the scaler swallowed that failure, dropping the log. The
+  // retry refetches _rev and re-appends so the append is not lost.
   async appendEncodeAttempt(
     id: string,
     attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
   ): Promise<Job | undefined> {
     const couch = this.couchFor();
-    const doc = await couch.get(id);
-    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
-      return undefined;
-    }
-    const existing = fromDoc(doc);
-    const next = appendEncodeAttemptToJob(existing, attempt, new Date().toISOString());
-    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
-    return next;
+    let updated: Job | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      if (current.resourceType !== RESOURCE_TYPE) {
+        return current;
+      }
+      updated = appendEncodeAttemptToJob(fromDoc(current), attempt, new Date().toISOString());
+      return toDoc(updated);
+    });
+    return written ? updated : undefined;
   }
 
   // Durably finalise the latest (open) encode-attempt on completion (#381).
   // Read-modify-write against the current CouchDB revision so the close-out
   // lands on top of the latest persisted state (the dispatch-time append from
   // #380). Finalises the last log entry in place — never appends — so the
-  // attempt count is unchanged.
+  // attempt count is unchanged. Routed through updateWithRetry (#451) for the
+  // same conflict-retry safety as the other read-modify-write paths.
   async finalizeEncodeAttempt(
     id: string,
     patch: { endedAt?: string; classification?: FailureClass }
   ): Promise<Job | undefined> {
     const couch = this.couchFor();
-    const doc = await couch.get(id);
-    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
-      return undefined;
-    }
-    const existing = fromDoc(doc);
-    const next = finalizeLatestEncodeAttemptOnJob(existing, patch, new Date().toISOString());
-    await couch.put(id, { ...toDoc(next), _rev: doc._rev });
-    return next;
+    let updated: Job | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      if (current.resourceType !== RESOURCE_TYPE) {
+        return current;
+      }
+      updated = finalizeLatestEncodeAttemptOnJob(fromDoc(current), patch, new Date().toISOString());
+      return toDoc(updated);
+    });
+    return written ? updated : undefined;
   }
 }
 
