@@ -1279,14 +1279,17 @@ const onObjectStored =
       }
     : undefined;
 
-if (storageAvailable) {
-  await app.register(assetUploadRouter, {
-    prefix: '/api/v1/assets',
-    repository: assetRepository,
-    storageFor,
-    onObjectStored
-  });
-}
+// Registered UNCONDITIONALLY (mirroring assetsRouter above, main.ts:1184) so
+// the upload/multipart routes always enter the route tree and therefore the
+// generated OpenAPI spec (issue #479). When object storage is not wired,
+// storageFor is undefined and every storage-backed handler responds 501
+// not_configured rather than the whole router silently disappearing.
+await app.register(assetUploadRouter, {
+  prefix: '/api/v1/assets',
+  repository: assetRepository,
+  storageFor: storageAvailable ? storageFor : undefined,
+  onObjectStored
+});
 
 // Watch-folder ingest (issue #16). Opt-in via WATCH_FOLDER_ENABLED=true. It is
 // a global background service watching a single source bucket, so it needs a
