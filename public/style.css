@@ -1433,3 +1433,37 @@ body.detail-standalone .assets-side {
   font: inherit;
   padding: 5px 8px;
 }
+
+/* Logs table — level badges (issue #371). `level` is an OPTIONAL log field; the
+   cell shows a coloured pill per severity when present, else a dash. */
+.log-level {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.log-level-debug {
+  background: var(--surface-muted, #2a2a2a);
+  color: var(--text-muted, #999);
+}
+.log-level-info {
+  background: rgba(56, 139, 253, 0.16);
+  color: #6cb0ff;
+}
+.log-level-warn {
+  background: rgba(210, 153, 34, 0.18);
+  color: #e3b341;
+}
+.log-level-error {
+  background: rgba(248, 81, 73, 0.18);
+  color: #ff7b72;
+}
+
+/* The message column carries the free-text search target; let it breathe. */
+.log-message {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
