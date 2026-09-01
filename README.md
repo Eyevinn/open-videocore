@@ -140,6 +140,16 @@ A generated [openapi.json](openapi.json) is committed to the repo and kept up to
 
 Interactive documentation is also at `/api-docs` when the service is running.
 
+> **Collection paths and the trailing slash.** Each collection root below (for
+> example `POST /api/v1/assets` to create an asset record, or `GET /api/v1/assets`
+> to list) is served both with and without a trailing slash — `POST /api/v1/assets`
+> and `POST /api/v1/assets/` reach the same handler. The generated
+> [openapi.json](openapi.json) keys these collection-root operations with a
+> trailing slash (`/api/v1/assets/`), because that is the path the framework emits
+> for a route mounted at a router's prefix root. The tables below use the shorter,
+> slash-free form for readability. Both forms are valid at runtime; neither returns
+> a 404.
+
 Key endpoints:
 
 **Health**
