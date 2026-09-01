@@ -5,6 +5,10 @@ terraform {
       source  = "registry.terraform.io/EyevinnOSC/osc"
       version = "0.5.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.0.0"
+    }
   }
 }
 

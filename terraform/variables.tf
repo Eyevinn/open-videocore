@@ -30,3 +30,13 @@ variable "open_videocore_name" {
   type        = string
   description = "Name of the open-videocore instance. Lower case letters and numbers only"
 }
+
+## --- Valkey (backing store for the parameter store) ---
+
+variable "valkey_password" {
+  type        = string
+  default     = null
+  sensitive   = true
+  nullable    = true
+  description = "Password for the Valkey instance backing the parameter store. Leave null to auto-generate"
+}
