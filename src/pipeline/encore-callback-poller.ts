@@ -103,6 +103,18 @@ type PollerDeps = {
   sweepIntervalMs?: number;
   sweepPageSize?: number;
   sweepMaxInstances?: number;
+  // On-demand packager provisioning (epic #226, issue #244; #496). The SAME
+  // closure the assets router receives as `ensurePackaging` (src/routes/assets.ts
+  // opts, called at assets.ts:1484 on the manual package-start path). Threaded in
+  // here so the AUTOMATIC transcode->package handoff below provisions + waits for
+  // the packager BEFORE enqueueing, mirroring the manual path's ordering: on a
+  // stack where the packager was never provisioned this path previously ZADD'd a
+  // job onto a queue with zero consumers, and reconcileStalledPackages (#336)
+  // failed the step 15 minutes later. Idempotent + concurrency-safe (issue #245):
+  // a reused running instance returns immediately. When absent (the queue stack
+  // isn't active, or a test pre-wires packaging) the handoff proceeds as before.
+  // Throwing fails the `package` step with a diagnostic instead of enqueueing.
+  ensurePackaging?: () => Promise<void>;
   logger: Logger;
 };
 
@@ -457,6 +469,39 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
         if (nextIdx >= 0 && steps[nextIdx].name === 'package') {
           const encoreJobUrl = await resolveEncoreJobUrl(externalId, deps.redis);
           if (encoreJobUrl) {
+            // On-demand packager provisioning (epic #226, issue #244; #496):
+            // ensure the packager is provisioned + wired + ready BEFORE enqueueing,
+            // exactly as the manual package-start path does at
+            // src/routes/assets.ts:1484. This automatic transcode->package handoff
+            // previously ZADD'd straight onto the queue, so on a stack where the
+            // packager had not yet been provisioned the job landed on a queue with
+            // no consumer and reconcileStalledPackages (#336) failed the step 15
+            // minutes later. Idempotent/concurrency-safe (issue #245): a reused
+            // running instance returns immediately. When no ensure hook is wired
+            // (the queue stack isn't active, or a test pre-wires packaging) this is
+            // skipped and packaging proceeds as before. A provisioning failure
+            // fails the `package` step with a diagnostic rather than silently
+            // enqueueing onto a queue nothing will consume.
+            try {
+              if (deps.ensurePackaging) {
+                await deps.ensurePackaging();
+              }
+            } catch (err) {
+              const emsg = err instanceof Error ? err.message : String(err);
+              steps[nextIdx] = {
+                ...steps[nextIdx],
+                status: 'failed',
+                error: `on-demand packager provisioning failed before packaging handoff: ${emsg}`,
+                completedAt: now
+              };
+              await deps.pipelineRepository.update(execution.id, { steps, status: 'failed' });
+              deps.logger.error({
+                msg: 'encore-callback-poller: ensurePackaging failed at transcode->package handoff',
+                assetId: found.job.assetId,
+                err
+              });
+              return;
+            }
             steps[nextIdx] = { ...steps[nextIdx], status: 'running', startedAt: now };
             await deps.pipelineRepository.update(execution.id, { steps, status: 'running' });
             // OSC-native handoff (#94): push the packaging job onto the

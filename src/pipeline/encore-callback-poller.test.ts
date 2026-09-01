@@ -158,7 +158,7 @@ async function seedScenario(
   jobs: InMemoryJobRepository,
   assets: InMemoryAssetRepository,
   pipelines: InMemoryPipelineRepository,
-  opts: { encoreUuid: string; jobStatus?: 'queued' | 'failed' | 'done' }
+  opts: { encoreUuid: string; jobStatus?: 'queued' | 'failed' | 'done'; withPackageStep?: boolean }
 ): Promise<{ externalId: string; assetId: string; pipelineId: string }> {
   const record: EncoreInstanceRecord = {
     instanceId: INSTANCE_ID,
@@ -187,11 +187,13 @@ async function seedScenario(
   await redis.set(keys.uuidToExternalId(opts.encoreUuid), externalId);
   await redis.set(keys.jobEncoreUrl(externalId), `${BASE_URL}/encoreJobs/${opts.encoreUuid}`);
 
-  // Pipeline with a running `transcode` step bound to this Encore job.
+  // Pipeline with a running `transcode` step bound to this Encore job. When
+  // withPackageStep is set, a pending `package` step follows so the SUCCESSFUL
+  // completion path exercises the transcode->package handoff (#496).
   const execution = await pipelines.create({
     assetId: asset.id,
     pipelineName: 'transcode',
-    steps: ['transcode']
+    steps: opts.withPackageStep ? ['transcode', 'package'] : ['transcode']
   });
   const steps = execution.steps.map((s) =>
     s.name === 'transcode'
@@ -551,5 +553,148 @@ describe('encore-callback-poller — durable encode-attempt finalisation (#381)'
     const attempt = job!.encodeAttemptLog![0];
     expect(attempt.endedAt).toBeDefined();
     expect(attempt.classification).toBe('deterministic');
+  });
+});
+
+// #496: on the automatic transcode->package handoff the poller must call the SAME
+// on-demand packager provisioning hook the manual package-start path uses
+// (src/routes/assets.ts:1484) BEFORE enqueueing the packaging job — otherwise, on
+// a stack where the packager was never provisioned, the job lands on a queue with
+// no consumer and reconcileStalledPackages (#336) fails the step 15 minutes later.
+describe('encore-callback-poller — transcode->package handoff provisioning (#496)', () => {
+  const PACKAGING_QUEUE_KEY = 'encore-packager:jobs';
+  let redis: FakeRedis;
+  let jobs: InMemoryJobRepository;
+  let assets: InMemoryAssetRepository;
+  let pipelines: InMemoryPipelineRepository;
+
+  beforeEach(() => {
+    redis = new FakeRedis();
+    jobs = new InMemoryJobRepository();
+    assets = new InMemoryAssetRepository();
+    pipelines = new InMemoryPipelineRepository();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function findLocalJobId(externalId: string): string {
+    const sep = externalId.indexOf('__');
+    return externalId.slice(sep + 2);
+  }
+
+  // A SUCCESSFUL Encore job whose pipeline has a pending `package` step next.
+  function successFetch(externalId: string, encoreUuid: string) {
+    return makeFetch({
+      successfulUuids: [encoreUuid],
+      jobDocs: { [encoreUuid]: { externalId, status: 'SUCCESSFUL', output: [] } }
+    });
+  }
+
+  function baseDeps(
+    fetchFn: ReturnType<typeof vi.fn>,
+    ensurePackaging?: () => Promise<void>
+  ) {
+    vi.stubGlobal('fetch', fetchFn);
+    return {
+      redis: redis as unknown as import('ioredis').Redis,
+      jobRepository: jobs,
+      assetRepository: assets,
+      pipelineRepository: pipelines,
+      oscContext: OSC_CONTEXT_STUB,
+      queueKey: QUEUE_KEY,
+      packagingQueueKey: PACKAGING_QUEUE_KEY,
+      ensurePackaging,
+      logger: NOOP_LOGGER
+    };
+  }
+
+  // Seed a transcode+package pipeline in the running-transcode state, then enqueue
+  // the completion message the callback listener would have written.
+  async function seedAndEnqueue(encoreUuid: string) {
+    const seeded = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid,
+      withPackageStep: true
+    });
+    // completeTranscode only settles a running job to done (mirrors the #464 test).
+    await jobs.update(findLocalJobId(seeded.externalId), { status: 'running' });
+    const message = JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
+    await redis.zadd(QUEUE_KEY, Date.now(), message);
+    return seeded;
+  }
+
+  it('calls ensurePackaging BEFORE enqueueing the packaging job', async () => {
+    const encoreUuid = 'uuid-handoff-ensure';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+
+    // The ensure hook asserts, at call time, that the packaging queue is still
+    // empty — proving provisioning is awaited before the ZADD.
+    const ensurePackaging = vi.fn(async () => {
+      expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    });
+    const d = baseDeps(successFetch(externalId, encoreUuid), ensurePackaging);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(ensurePackaging).toHaveBeenCalledTimes(1);
+    // The packaging job was enqueued (jobId = assetId) and the step is running.
+    const enqueued = JSON.parse(redis.zmembers(PACKAGING_QUEUE_KEY)[0]!);
+    expect(enqueued.jobId).toBe((await pipelines.get(pipelineId))!.assetId);
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  it('fails the package step with a diagnostic and does NOT enqueue when ensurePackaging throws', async () => {
+    const encoreUuid = 'uuid-handoff-throw';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+
+    const ensurePackaging = vi.fn(async () => {
+      throw new Error('packager provisioning blew up');
+    });
+    const d = baseDeps(successFetch(externalId, encoreUuid), ensurePackaging);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await pipelines.get(pipelineId))?.status === 'failed');
+    } finally {
+      stop();
+    }
+
+    expect(ensurePackaging).toHaveBeenCalledTimes(1);
+    // Nothing was pushed onto the packager's input queue.
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.status).toBe('failed');
+    const pkg = execution?.steps.find((s) => s.name === 'package');
+    expect(pkg?.status).toBe('failed');
+    expect(pkg?.error).toContain('packager provisioning blew up');
+    expect(pkg?.error).toContain('provisioning failed before packaging handoff');
+    // The transcode step still completed — the failure is isolated to `package`.
+    expect(execution?.steps.find((s) => s.name === 'transcode')?.status).toBe('done');
+  });
+
+  it('preserves prior behaviour (enqueues) when ensurePackaging is undefined', async () => {
+    const encoreUuid = 'uuid-handoff-noop';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+
+    // No ensure hook wired — the queue stack path where packaging was pre-provisioned.
+    const d = baseDeps(successFetch(externalId, encoreUuid), undefined);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(1);
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
   });
 });
