@@ -36,7 +36,12 @@ export type StorageFactory = () => WorkspaceStorage;
 
 export type AssetUploadRouterOptions = {
   repository: AssetRepository;
-  storageFor: StorageFactory;
+  // Per-request MinIO wrapper factory. When undefined (no object storage wired
+  // on this deployment) the router is still registered — so its routes appear
+  // in the route tree and the generated OpenAPI spec (issue #479) — but every
+  // storage-backed handler responds 501 not_configured. Mirrors the assets
+  // router's optional-storage degradation (routes/assets.ts:595).
+  storageFor?: StorageFactory;
   // Fire-and-forget technical metadata extraction (issue #6). When provided,
   // upload-complete kicks off an ffprobe extraction against the freshly stored
   // object. Detached and non-blocking; never throws. Absent in deployments
@@ -107,6 +112,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const { repository: repo, storageFor } = opts;
 
+  // Uniform 501 for storage-backed handlers when no object storage is wired.
+  // The routes are always registered (so they appear in the spec, issue #479);
+  // this keeps runtime behaviour clean when storage is absent instead of the
+  // whole router silently disappearing.
+  const notConfigured = 'object storage is not configured';
+
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {
       return reply.code(err.statusCode).send({ error: 'forbidden', message: err.message });
@@ -136,9 +147,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     {
       
       bodyLimit: 10 * 1024 * 1024 * 1024, // 10 GiB — body is streamed, not buffered
-      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 413: errorSchema } }
+      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 413: errorSchema, 501: errorSchema } }
     },
     async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({ error: 'not_configured', message: notConfigured });
+      }
       const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
@@ -171,8 +185,11 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   // --- Single-part: presigned PUT URL (kept for server-to-server use) ----
   app.post(
     '/:id/upload-url',
-    {  schema: { params: idParams, response: { 200: urlResponse, 404: errorSchema } } },
+    {  schema: { params: idParams, response: { 200: urlResponse, 404: errorSchema, 501: errorSchema } } },
     async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({ error: 'not_configured', message: notConfigured });
+      }
       const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
@@ -190,9 +207,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/multipart/initiate',
     {
       
-      schema: { params: idParams, response: { 200: initiateResponse, 404: errorSchema } }
+      schema: { params: idParams, response: { 200: initiateResponse, 404: errorSchema, 501: errorSchema } }
     },
     async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({ error: 'not_configured', message: notConfigured });
+      }
       const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
@@ -214,10 +234,13 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: {
         params: multipartParams,
         querystring: z.object({ partNumber: partNumberSchema }),
-        response: { 200: partUrlResponse, 404: errorSchema }
+        response: { 200: partUrlResponse, 404: errorSchema, 501: errorSchema }
       }
     },
     async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({ error: 'not_configured', message: notConfigured });
+      }
       const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
@@ -245,10 +268,13 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: {
         params: multipartParams,
         body: completeBody,
-        response: { 200: assetStatusResponse, 404: errorSchema }
+        response: { 200: assetStatusResponse, 404: errorSchema, 501: errorSchema }
       }
     },
     async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({ error: 'not_configured', message: notConfigured });
+      }
       const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
@@ -269,9 +295,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/multipart/:uploadId',
     {
       
-      schema: { params: multipartParams, response: { 204: z.null(), 404: errorSchema } }
+      schema: { params: multipartParams, response: { 204: z.null(), 404: errorSchema, 501: errorSchema } }
     },
     async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({ error: 'not_configured', message: notConfigured });
+      }
       const asset = await loadAsset(request.params.id);
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
@@ -291,9 +320,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/upload-complete',
     {
       
-      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema } }
+      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 501: errorSchema } }
     },
     async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({ error: 'not_configured', message: notConfigured });
+      }
       const existing = await loadAsset(request.params.id);
       if (!existing) {
         return reply.code(404).send({ error: 'not_found' });
