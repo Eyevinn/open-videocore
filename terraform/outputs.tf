@@ -71,3 +71,12 @@ output "parameter_store_api_key" {
   value       = var.parameter_store_api_key
   sensitive   = true
 }
+
+## --- open-videocore instance (#485) ---
+# Public URL of the provisioned open-videocore instance. `instance_url` is the
+# computed URL attribute exposed by the OSC provider, matching the paramstore
+# example convention (examples/paramstore/main.tf lines 117, 131-132).
+output "open_videocore_url" {
+  description = "Public URL of the open-videocore instance"
+  value       = osc_eyevinn_open_videocore.this.instance_url
+}
