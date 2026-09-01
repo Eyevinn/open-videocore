@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "generate:openapi": "bash scripts/generate-openapi.sh",
+    "check:spec-route-parity": "tsx scripts/check-spec-route-parity.ts",
     "tams:backfill": "tsx scripts/tams-backfill.ts",
     "postversion": "git push && git push --tags"
   },
