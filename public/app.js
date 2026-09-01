@@ -13,6 +13,11 @@ import { createJobsTable } from './jobs-table.js';
 // primitive (#367/#372) and URL-state contract (#368/#373) against the verified
 // GET /api/v1/assets/ + GET /api/v1/search/ contracts. See public/assets-table.js.
 import { createAssetsTable } from './assets-table.js';
+// Shared logs-table wiring (issue #371). Composes the merged shared table
+// primitive (#367/#372) in CURSOR paging mode and the URL-state contract
+// (#368/#373) against the verified GET /api/v1/logs/ contract. See
+// public/logs-table.js.
+import { createLogsTable } from './logs-table.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -3716,10 +3721,50 @@ async function renderTranscodersTab(container) {
   await load();
 }
 
+// ─── Logs tab ────────────────────────────────────────────────────────────────
+// The logs table itself (cursor paging, time-range + message filters, order
+// toggle, URL-state sync) lives entirely in the shared primitive composed by
+// public/logs-table.js (issue #371). app.js only owns the surrounding tab chrome
+// (header + Refresh button) and injects its fetch + date formatter. Unlike the
+// jobs tab there is NO auto-poll: logs are append-only and cursor-paged, so a
+// background poll would fight the operator's in-flight cursor page; Refresh is
+// explicit instead.
+
+let logsTableInstance = null;
+
+async function renderLogsTab(container) {
+  const layout = document.createElement('div');
+  layout.className = 'assets-layout';
+  container.appendChild(layout);
+
+  const main = document.createElement('div');
+  main.className = 'assets-main';
+  layout.appendChild(main);
+
+  const header = document.createElement('div');
+  header.className = 'assets-main-header';
+  header.innerHTML = [
+    '<span class="section-title">Logs</span>',
+    '<div class="flex-gap">',
+    '  <button id="logs-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
+    '</div>',
+  ].join('');
+  main.appendChild(header);
+
+  const logsTable = createLogsTable({ apiFetch, fmtDate });
+  logsTableInstance = logsTable;
+  main.appendChild(logsTable.el);
+
+  header.querySelector('#logs-refresh').addEventListener('click', function () {
+    logsTable.reload();
+  });
+}
+
 // ─── Tab renderer registry ───────────────────────────────────────────────────
 
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
+TAB_RENDERERS['logs'] = renderLogsTab;
 TAB_RENDERERS['transcoders'] = renderTranscodersTab;
 TAB_RENDERERS['pipelines'] = renderPipelinesTab;
 TAB_RENDERERS['profiles'] = renderProfilesTab;
