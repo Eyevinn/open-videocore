@@ -47,3 +47,27 @@ output "app_config_svc_service_id" {
   description = "Service ID of the eyevinn-app-config-svc parameter store instance"
   value       = osc_eyevinn_app_config_svc.this.service_id
 }
+
+## --- open-videocore parameter-store wiring (#485 consumes these) ---
+#
+# PARAMETER_STORE_INSTANCE_NAME IS derivable from the contract: README.md:126
+# defines it as the name of the eyevinn-app-config-svc instance (default
+# ovcconfig), and paramstore.tf sets that resource's `name` to
+# var.paramstore_name (mirrors example line 100). We surface the resource's
+# actual `name` attribute so #485 wires the instance from the applied value.
+output "parameter_store_instance_name" {
+  description = "Value for PARAMETER_STORE_INSTANCE_NAME on the open-videocore instance (#485). Name of the eyevinn-app-config-svc instance per README.md:126."
+  value       = osc_eyevinn_app_config_svc.this.name
+}
+
+# PARAMETER_STORE_API_KEY is NOT derivable from the verified provider contract:
+# osc_eyevinn_app_config_svc exposes no ConfigApiKey attribute
+# (examples/paramstore/main.tf outputs lines 125-136). It is passed in via the
+# sensitive var.parameter_store_api_key (obtained out-of-band; see
+# terraform/PARAMETER_STORE_API_KEY.md) and re-exported here so #485 wires it as
+# PARAMETER_STORE_API_KEY without re-declaring the variable.
+output "parameter_store_api_key" {
+  description = "Value for PARAMETER_STORE_API_KEY on the open-videocore instance (#485). Sourced out-of-band via var.parameter_store_api_key; see terraform/PARAMETER_STORE_API_KEY.md."
+  value       = var.parameter_store_api_key
+  sensitive   = true
+}
