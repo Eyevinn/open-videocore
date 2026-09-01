@@ -115,6 +115,16 @@ const app = Fastify({ logger: true, maxParamLength: 500 });
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
 
+// Route inventory for the spec/route parity check (issue #480). The onRoute
+// hook fires synchronously for every route as it is registered — added here,
+// before any router, so it captures the complete surface. It is a pure
+// read-only collector with no request-path effect; the collected list is only
+// consumed when OPENAPI_ROUTE_DUMP points at a file (see after app.listen).
+const registeredRoutes: Array<{ method: string | string[]; url: string }> = [];
+app.addHook('onRoute', (routeOptions) => {
+  registeredRoutes.push({ method: routeOptions.method, url: routeOptions.url });
+});
+
 // Pass binary/media upload bodies through as a stream for PUT /:id/upload.
 // Registered before plugins so child scopes inherit these parsers.
 // The route handler reads request.body as a Readable and pipes it to MinIO.
@@ -1448,6 +1458,22 @@ app.addHook('onClose', async () => {
 
 const port = parseInt(process.env['PORT'] || '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
+
+// Spec/route parity check support (issue #480). When OPENAPI_ROUTE_DUMP is set,
+// the app has now finished registering every router (onRoute has fired for all
+// of them). Write the captured route inventory to that path and exit cleanly,
+// BEFORE the background loops below spin up — those need live OSC connectivity
+// that the parity check does not. This makes the enumeration reuse the real
+// boot path (identical to generate-openapi.sh) rather than a hand-maintained
+// route list that could itself drift.
+const routeDumpPath = process.env['OPENAPI_ROUTE_DUMP'];
+if (routeDumpPath) {
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(routeDumpPath, JSON.stringify(registeredRoutes, null, 2));
+  app.log.info({ routeDumpPath, count: registeredRoutes.length }, 'openapi route dump written; exiting');
+  await app.close();
+  process.exit(0);
+}
 
 // Boot-time reachability self-check for the local Encore profiles index (#284).
 // The server is now listening and every router (incl. profilesRouter) is
