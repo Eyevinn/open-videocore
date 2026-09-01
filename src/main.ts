@@ -890,6 +890,15 @@ function activateScaler(redisUrl: string): void {
   // (packager fetches Encore job data). When either is missing this is a no-op
   // (undefined), so packaging degrades to the pre-#244 behaviour rather than
   // failing the pipeline.
+  // Hold the ensure closure in a local so the SAME reference can be handed both to
+  // the assets router (manual package-start path) and to the callback poller (the
+  // automatic transcode->package handoff, #496). deactivateScaler() clears
+  // assetRouterOptions.ensurePackaging on teardown, so the poller must NOT read
+  // that field at call time — it would go stale independently. Since the poller's
+  // lifecycle is bound to this same activation (started below, stopped in
+  // deactivateScaler), capturing the closure directly keeps it valid for exactly
+  // as long as the poller runs.
+  let ensurePackaging: (() => Promise<void>) | undefined;
   const packagerMinioPassword = process.env['MINIO_ROOT_PASSWORD'];
   const packagerPat = oscContext.getPersonalAccessToken();
   if (packagerMinioPassword && packagerPat) {
@@ -902,7 +911,7 @@ function activateScaler(redisUrl: string): void {
     // guard per activation; cleared implicitly when the scaler deactivates and
     // the ensurePackaging closure is dropped.
     const packagerEnsureGuard = new PackagerEnsureSingleFlight();
-    assetRouterOptions.ensurePackaging = async () => {
+    ensurePackaging = async () => {
       // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
       // this activation is bound to. Mirrors resolveStackRedisUrl: the first
       // provisioned stack for the namespace is the default.
@@ -1016,6 +1025,8 @@ function activateScaler(redisUrl: string): void {
         app.log.info({ stackName: resolvedStackName }, 'on-demand packager provisioned');
       }
     };
+    // Manual package-start path (src/routes/assets.ts:1484) reads this off opts.
+    assetRouterOptions.ensurePackaging = ensurePackaging;
   }
 
   // Encore completion callback poller (background). Drains the Valkey sorted set
@@ -1044,6 +1055,12 @@ function activateScaler(redisUrl: string): void {
     sweepMaxInstances: process.env['ENCORE_SWEEP_MAX_INSTANCES']
       ? parseInt(process.env['ENCORE_SWEEP_MAX_INSTANCES'], 10)
       : undefined,
+    // On-demand packager provisioning for the automatic transcode->package handoff
+    // (#496). The SAME closure the assets router uses for the manual package-start
+    // path — captured directly (not read off assetRouterOptions, which
+    // deactivateScaler clears independently). undefined when the packager secrets
+    // are absent, exactly as for the manual path, so the handoff is a no-op then.
+    ensurePackaging,
     logger: app.log
   });
 
