@@ -871,7 +871,7 @@ function activateScaler(redisUrl: string): void {
   // and receive a completion callback.
   packaging = new PackagingService({
     assets: assetRepository,
-    queue: makeOscPackagerQueue(redis),
+    queue: makeOscPackagerQueue(redis, undefined, app.log),
     publicBaseUrl: packagingPublicBaseUrl()
   });
 

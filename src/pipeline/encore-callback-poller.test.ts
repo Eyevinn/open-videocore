@@ -27,11 +27,22 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { sweepTerminalJobs, startEncoreCallbackPoller } from './encore-callback-poller.js';
+import { sweepTerminalJobs, startEncoreCallbackPoller, purgeStalePackagingJobs } from './encore-callback-poller.js';
+import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
 import { InMemoryJobRepository, encodeEncoreJobId } from '../data/job-repo.js';
 import { InMemoryAssetRepository } from '../data/asset-repo.js';
 import { InMemoryPipelineRepository } from '../data/pipeline-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+
+// Parse a ZRANGEBYSCORE score bound the way Valkey does: '-inf'/'+inf' and the
+// exclusive '(' prefix (e.g. '(1700000000000'). Kept alongside FakeRedis so its
+// zrangebyscore can honour the #498 stale-purge query's exclusive upper bound.
+function parseScoreBound(b: string): { value: number; exclusive: boolean } {
+  if (b === '-inf') return { value: -Infinity, exclusive: false };
+  if (b === '+inf') return { value: Infinity, exclusive: false };
+  const exclusive = b.startsWith('(');
+  return { value: Number(exclusive ? b.slice(1) : b), exclusive };
+}
 
 // --- Minimal in-memory Redis --------------------------------------------------
 // Extends the FakeRedis idea from test/encore-scaler-idle-timeout.test.ts with
@@ -88,8 +99,15 @@ class FakeRedis {
   async zrem(key: string, member: string): Promise<number> {
     return this.zset(key).delete(member) ? 1 : 0;
   }
-  async zrangebyscore(key: string, _min: string, _max: string, withScores?: string): Promise<string[]> {
-    const entries = [...this.zset(key).entries()].sort((a, b) => a[1] - b[1]);
+  async zrangebyscore(key: string, min: string, max: string, withScores?: string): Promise<string[]> {
+    // Honour the score bounds (including '-inf'/'+inf' and the exclusive '(' form
+    // ioredis passes, e.g. `(1700000000000`) so the #498 stale-purge query can be
+    // exercised. Prior callers passed ('-inf','+inf') and still get every member.
+    const lo = parseScoreBound(min);
+    const hi = parseScoreBound(max);
+    const entries = [...this.zset(key).entries()]
+      .filter(([, s]) => (lo.exclusive ? s > lo.value : s >= lo.value) && (hi.exclusive ? s < hi.value : s <= hi.value))
+      .sort((a, b) => a[1] - b[1]);
     if (withScores) return entries.flatMap(([m, s]) => [m, String(s)]);
     return entries.map(([m]) => m);
   }
@@ -696,5 +714,160 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(1);
     const execution = await pipelines.get(pipelineId);
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+});
+
+// #498: a packaging job ZADD'd onto encore-packager:jobs while no packager exists
+// sits there indefinitely (nothing expires unconsumed entries). When a packager is
+// later provisioned on-demand it drains EVERY queued member in arrival order,
+// including ancient ghosts referencing dead Encore jobs. Because the packager's
+// failure callback carries no jobId, that ghost's failure is misattributed to
+// WHATEVER execution currently has a running `package` step — killing an unrelated
+// fresh run. purgeStalePackagingJobs removes any entry older than the stall bound
+// BEFORE every enqueue so a newly-provisioned packager can never drain such a ghost.
+describe('encore-callback-poller — stale packaging-job purge (#498)', () => {
+  const PACKAGING_QUEUE_KEY = 'encore-packager:jobs';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('purges (ZREM) and logs a queue entry older than the stall bound', async () => {
+    const redis = new FakeRedis();
+    const now = 1_700_000_000_000;
+    const ghost = JSON.stringify({ jobId: 'ancient-asset', url: `${BASE_URL}/encoreJobs/dead` });
+    // Enqueued just past the 15-minute stall bound ago -> a ghost.
+    await redis.zadd(PACKAGING_QUEUE_KEY, now - (DEFAULT_PACKAGE_STALL_TIMEOUT_MS + 60_000), ghost);
+
+    const warnings: Array<Record<string, unknown>> = [];
+    const logger = { warn: (o: Record<string, unknown>) => warnings.push(o) };
+
+    await purgeStalePackagingJobs(redis as unknown as import('ioredis').Redis, PACKAGING_QUEUE_KEY, {
+      logger,
+      now: () => now
+    });
+
+    // The ghost is gone and its removal was logged (no silent drops) with content + age.
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    const purgeLog = warnings.find((w) => w.entry === ghost);
+    expect(purgeLog).toBeDefined();
+    expect(purgeLog!.ageMs).toBe(DEFAULT_PACKAGE_STALL_TIMEOUT_MS + 60_000);
+  });
+
+  it('does NOT purge an entry still within the stall bound', async () => {
+    const redis = new FakeRedis();
+    const now = 1_700_000_000_000;
+    const fresh = JSON.stringify({ jobId: 'fresh-asset', url: `${BASE_URL}/encoreJobs/live` });
+    // Enqueued one minute ago -> well within the 15-minute bound, must survive.
+    await redis.zadd(PACKAGING_QUEUE_KEY, now - 60_000, fresh);
+
+    const warnings: unknown[] = [];
+    await purgeStalePackagingJobs(redis as unknown as import('ioredis').Redis, PACKAGING_QUEUE_KEY, {
+      logger: { warn: (o: unknown) => warnings.push(o) },
+      now: () => now
+    });
+
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toEqual([fresh]);
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('never throws when the purge scan errors — the real enqueue is not blocked', async () => {
+    // A redis whose scan rejects. purgeStalePackagingJobs must swallow + log it and
+    // resolve, so the caller's subsequent ZADD still runs.
+    const boom = {
+      zrangebyscore: vi.fn(async () => {
+        throw new Error('valkey unreachable');
+      }),
+      zrem: vi.fn(async () => 1)
+    };
+    const warnings: unknown[] = [];
+
+    await expect(
+      purgeStalePackagingJobs(boom as unknown as import('ioredis').Redis, PACKAGING_QUEUE_KEY, {
+        logger: { warn: (o: unknown) => warnings.push(o) }
+      })
+    ).resolves.toBeUndefined();
+
+    // Scan failed before any removal; the failure was logged, not thrown.
+    expect(boom.zrem).not.toHaveBeenCalled();
+    expect(warnings).toHaveLength(1);
+  });
+
+  it('purges the ghost BEFORE ZADDing the fresh job at the real handoff (ordering)', async () => {
+    const redis = new FakeRedis();
+    const jobs = new InMemoryJobRepository();
+    const assets = new InMemoryAssetRepository();
+    const pipelines = new InMemoryPipelineRepository();
+    const encoreUuid = 'uuid-498-order';
+
+    const seeded = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid,
+      withPackageStep: true
+    });
+    // completeTranscode only settles a running job to done.
+    const localJobId = seeded.externalId.slice(seeded.externalId.indexOf('__') + 2);
+    await jobs.update(localJobId, { status: 'running' });
+
+    // A ghost from ~20 minutes ago already sitting on the packager queue.
+    const ghost = JSON.stringify({ jobId: 'ancient-asset', url: `${BASE_URL}/encoreJobs/ghost` });
+    await redis.zadd(
+      PACKAGING_QUEUE_KEY,
+      Date.now() - (DEFAULT_PACKAGE_STALL_TIMEOUT_MS + 5 * 60_000),
+      ghost
+    );
+
+    // The completion message that drives the transcode->package handoff.
+    await redis.zadd(
+      QUEUE_KEY,
+      Date.now(),
+      JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` })
+    );
+
+    const zaddSpy = vi.spyOn(redis, 'zadd');
+    const zremSpy = vi.spyOn(redis, 'zrem');
+
+    vi.stubGlobal(
+      'fetch',
+      makeFetch({
+        successfulUuids: [encoreUuid],
+        jobDocs: { [encoreUuid]: { externalId: seeded.externalId, status: 'SUCCESSFUL', output: [] } }
+      })
+    );
+
+    const stop = startEncoreCallbackPoller({
+      redis: redis as unknown as import('ioredis').Redis,
+      jobRepository: jobs,
+      assetRepository: assets,
+      pipelineRepository: pipelines,
+      oscContext: OSC_CONTEXT_STUB,
+      queueKey: QUEUE_KEY,
+      packagingQueueKey: PACKAGING_QUEUE_KEY,
+      logger: NOOP_LOGGER
+    });
+    try {
+      await waitFor(() =>
+        redis.zmembers(PACKAGING_QUEUE_KEY).some((m) => JSON.parse(m).jobId === seeded.assetId)
+      );
+    } finally {
+      stop();
+    }
+
+    // The ghost was purged; only the fresh job remains on the packager queue.
+    const members = redis.zmembers(PACKAGING_QUEUE_KEY);
+    expect(members).toHaveLength(1);
+    expect(JSON.parse(members[0]!).jobId).toBe(seeded.assetId);
+
+    // Ordering: the ZREM that removed the ghost ran BEFORE the ZADD of the fresh job.
+    const ghostZremIdx = zremSpy.mock.calls.findIndex(
+      (c) => c[0] === PACKAGING_QUEUE_KEY && c[1] === ghost
+    );
+    const freshZaddIdx = zaddSpy.mock.calls.findIndex(
+      (c) => c[0] === PACKAGING_QUEUE_KEY && typeof c[2] === 'string' && JSON.parse(c[2] as string).jobId === seeded.assetId
+    );
+    expect(ghostZremIdx).toBeGreaterThanOrEqual(0);
+    expect(freshZaddIdx).toBeGreaterThanOrEqual(0);
+    expect(zremSpy.mock.invocationCallOrder[ghostZremIdx]!).toBeLessThan(
+      zaddSpy.mock.invocationCallOrder[freshZaddIdx]!
+    );
   });
 });

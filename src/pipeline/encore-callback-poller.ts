@@ -37,6 +37,7 @@ import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { decideRetry, clearRetryState } from '../encore-scaler/retry-store.js';
+import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
 
 // Resolve the correct Encore job API URL using the reverse UUID mapping stored
 // at dispatch time. The callback listener always uses its own configured Encore
@@ -118,6 +119,64 @@ type PollerDeps = {
   logger: Logger;
 };
 
+// Purge stale ("ghost") entries from the packager's input queue BEFORE a new
+// packaging job is enqueued (#498). A job ZADD'd onto encore-packager:jobs while
+// no packager instance exists sits there indefinitely — nothing expires or purges
+// unconsumed entries. When a packager is later provisioned on-demand (#496/#497)
+// it drains EVERY queued member in arrival order, including ancient ones that
+// reference Encore jobs/instances long gone. Because the packager's
+// /packagerCallback/failure carries no jobId (packager contract gap — see
+// docs/osc-feedback/incoming-encore-packager-contract.md findings #2 and #6), the
+// failure handler in src/routes/internal.ts cannot attribute a ghost's failure to
+// its own (dead) job, so it fails WHATEVER execution currently has a running
+// `package` step — misattributing the ghost's failure to an unrelated, freshly
+// enqueued, healthy packaging run (observed live on stack ovctest 2026-09-01).
+//
+// The bound is DEFAULT_PACKAGE_STALL_TIMEOUT_MS — the SAME window
+// reconcileStalledPackages (#336) uses to fail a stuck `package` step. A queue
+// entry older than that timeout is definitionally a ghost: any execution it
+// belonged to would already have been failed by the stalled-package reconciler,
+// so no pipeline step could still be waiting on it. Scores are the enqueue
+// timestamp (Date.now() at ZADD time — the established scoring convention), so we
+// ZRANGEBYSCORE for members below the cutoff and ZREM them. Purely defensive: any
+// Redis error is caught + logged and NEVER thrown into the enqueue path — a purge
+// hiccup must not block a real packaging job from being queued. Every purged entry
+// is logged (no silent drops) with its content and age for operator inspection.
+export async function purgeStalePackagingJobs(
+  redis: Pick<Redis, 'zrangebyscore' | 'zrem'>,
+  queueKey: string,
+  opts: { logger: Pick<Logger, 'warn'>; now?: () => number; staleBoundMs?: number }
+): Promise<void> {
+  const now = opts.now ?? (() => Date.now());
+  const staleBoundMs = opts.staleBoundMs ?? DEFAULT_PACKAGE_STALL_TIMEOUT_MS;
+  const cutoff = now() - staleBoundMs;
+  try {
+    // Members whose score (enqueue time) is strictly older than the cutoff. The
+    // exclusive upper bound `(<cutoff>` keeps an entry sitting exactly on the
+    // boundary rather than aging it out a millisecond early.
+    const stale = await redis.zrangebyscore(queueKey, '-inf', `(${cutoff}`, 'WITHSCORES');
+    // WITHSCORES returns a flat [member, score, member, score, ...] array.
+    for (let i = 0; i < stale.length; i += 2) {
+      const member = stale[i]!;
+      const score = Number(stale[i + 1]);
+      const removed = await redis.zrem(queueKey, member);
+      if (removed > 0) {
+        opts.logger.warn({
+          msg: 'encore-callback-poller: purged stale packaging job before enqueue',
+          queueKey,
+          entry: member,
+          enqueuedAt: new Date(score).toISOString(),
+          ageMs: now() - score,
+          staleBoundMs
+        });
+      }
+    }
+  } catch (err) {
+    // Defensive: a purge failure must never block the real enqueue that follows.
+    opts.logger.warn({ msg: 'encore-callback-poller: stale packaging-job purge failed — continuing to enqueue', queueKey, err });
+  }
+}
+
 // Push a packaging job onto the packager's input queue (#94). We ZADD the
 // { jobId, url } envelope onto the sorted set (score = Date.now() for FIFO), the
 // same producer operation the callback-listener uses; the packager consumes it
@@ -132,6 +191,12 @@ async function enqueuePackagingJob(
 ): Promise<void> {
   const queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
   const message = JSON.stringify({ jobId: assetId, url: encoreJobUrl });
+  // #498: purge stale ghost entries BEFORE our ZADD so the packager instance this
+  // job's own on-demand provisioning (#496/#497) just brought up can never drain
+  // an ancient job whose no-jobId failure callback would be misattributed to THIS
+  // fresh, healthy run. Best-effort — purgeStalePackagingJobs never throws, so a
+  // purge hiccup cannot block the enqueue below.
+  await purgeStalePackagingJobs(deps.redis, queueKey, { logger: deps.logger });
   try {
     await deps.redis.zadd(queueKey, Date.now(), message);
     deps.logger.info({ msg: 'encore-callback-poller: enqueued packaging job', queueKey, assetId, url: encoreJobUrl });
