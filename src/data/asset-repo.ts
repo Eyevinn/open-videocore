@@ -175,6 +175,33 @@ export type ManifestUrls = {
   dash?: string;
 };
 
+// The durable packaged-output location on the packaged object store (issue
+// #502). The packager writes each package under a job-specific prefix
+// (`<assetId>/<packagerJobId>/`, per the packager's instance `OutputFolder` +
+// `OutputSubfolderTemplate` default `$INPUTNAME$/$JOBID$` — verified in ADR-011
+// and docs/osc-feedback/incoming-per-job-packager-output.md). Delivery/stream
+// previously assumed a FLAT per-asset prefix (`packaged/<assetId>/index.m3u8`)
+// and 404ed against the real, job-nested objects. This block persists the exact
+// location so stream/delivery can resolve the real manifest objects without
+// re-deriving a (wrong) flat path:
+//   - bucket:        the packaged bucket name the objects live in.
+//   - prefix:        the full packaged prefix the packager wrote under
+//                    (`<assetId>/<packagerJobId>/`), captured from the callback's
+//                    `outputPath`. Includes a trailing slash.
+//   - masterHlsKey:  object key of the master HLS manifest (prefix + filename),
+//                    e.g. `<assetId>/<packagerJobId>/index.m3u8`.
+//   - masterDashKey: object key of the master DASH manifest (prefix + filename),
+//                    e.g. `<assetId>/<packagerJobId>/manifest.mpd`.
+// Every field is optional/additive so assets packaged before #502 (block absent)
+// round-trip unchanged; the delivery layer lazily resolves the prefix for those
+// by listing the packaged bucket under `<assetId>/` (see packaging.ts).
+export type PackagedOutput = {
+  bucket?: string;
+  prefix?: string;
+  masterHlsKey?: string;
+  masterDashKey?: string;
+};
+
 // One ABR rendition produced by a transcode job (issue #8, redesigned #79).
 // Renditions are EMBEDDED variants of a single asset, not separate child
 // assets. An asset represents a piece of content; all of its transcoded
@@ -277,6 +304,11 @@ export type Asset = {
   // asset's lifecycle status — it only annotates the record.
   manifestUrls?: ManifestUrls;
   packagingError?: string;
+  // Durable packaged-output location (issue #502). Set from the packager success
+  // callback's `outputPath` alongside `manifestUrls`, so stream/delivery can
+  // resolve the REAL, job-nested manifest objects instead of a derived flat path.
+  // Optional/additive: absent on assets packaged before #502 (lazy-resolved).
+  packagedOutput?: PackagedOutput;
   // ABR renditions produced by transcoding (issue #8). Populated on the SOURCE
   // asset when a transcode job completes; undefined until then.
   renditions?: Rendition[];
@@ -387,6 +419,11 @@ export type UpdateAssetInput = {
   // leaves `manifestUrls` untouched. Neither field changes `status`.
   manifestUrls?: ManifestUrls;
   packagingError?: string;
+  // Set by the packaging pipeline (issue #502) alongside `manifestUrls`: the
+  // durable packaged-output location (bucket + job-nested prefix + master
+  // manifest keys) captured from the packager callback's `outputPath`. Does not
+  // change `status`. Additive — omitted on legacy packaging callbacks.
+  packagedOutput?: PackagedOutput;
   // Set by the transcode pipeline (issue #8) on the source asset when a
   // transcode job completes. Does not change `status`.
   renditions?: Rendition[];
@@ -980,6 +1017,9 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (patch.packagingError !== undefined) {
       next.packagingError = patch.packagingError;
+    }
+    if (patch.packagedOutput !== undefined) {
+      next.packagedOutput = patch.packagedOutput;
     }
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;

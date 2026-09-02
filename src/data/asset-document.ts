@@ -252,6 +252,20 @@ export const AssetDocumentSchema = z.object({
     .object({
       renditions: z.array(RenditionSchema).default([]),
       manifests: z.object({ hls: z.string().optional(), dash: z.string().optional() }).optional(),
+      // Durable packaged-output location (issue #502): the packaged bucket, the
+      // full job-nested prefix (`<assetId>/<packagerJobId>/`) the packager wrote
+      // under, and the master HLS/DASH manifest object keys. Persisted so
+      // stream/delivery resolves the REAL manifest objects rather than a derived
+      // flat path. Optional so documents written before #502 (field absent) still
+      // deserialize — no schemaVersion bump required.
+      packagedOutput: z
+        .object({
+          bucket: z.string().optional(),
+          prefix: z.string().optional(),
+          masterHlsKey: z.string().optional(),
+          masterDashKey: z.string().optional()
+        })
+        .optional(),
       thumbnails: z.array(ThumbnailSchema).optional(),
       collections: z.array(z.string()).default([]),
       derivedFrom: z.string().nullable().optional(),
@@ -393,6 +407,23 @@ export function toAssetDocument(
   if (asset.packagingError) {
     doc.structural.packagingError = asset.packagingError;
   }
+  // Durable packaged-output location (issue #502). Only persisted when the asset
+  // carries at least one coordinate, so pre-#502 assets round-trip with the field
+  // absent (back-compat).
+  if (
+    asset.packagedOutput &&
+    (asset.packagedOutput.bucket ||
+      asset.packagedOutput.prefix ||
+      asset.packagedOutput.masterHlsKey ||
+      asset.packagedOutput.masterDashKey)
+  ) {
+    doc.structural.packagedOutput = {
+      bucket: asset.packagedOutput.bucket,
+      prefix: asset.packagedOutput.prefix,
+      masterHlsKey: asset.packagedOutput.masterHlsKey,
+      masterDashKey: asset.packagedOutput.masterDashKey
+    };
+  }
   if (asset.subtitlesError) {
     doc.structural.subtitlesError = asset.subtitlesError;
   }
@@ -467,6 +498,16 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     technicalMetadataError: technical.technicalMetadataError,
     manifestUrls,
     packagingError: doc.structural?.packagingError,
+    // Durable packaged-output location (issue #502). Absent block maps back to
+    // undefined so pre-#502 assets stay clean (lazy-resolved at delivery time).
+    packagedOutput: doc.structural?.packagedOutput
+      ? {
+          bucket: doc.structural.packagedOutput.bucket,
+          prefix: doc.structural.packagedOutput.prefix,
+          masterHlsKey: doc.structural.packagedOutput.masterHlsKey,
+          masterDashKey: doc.structural.packagedOutput.masterDashKey
+        }
+      : undefined,
     subtitlesError: doc.structural?.subtitlesError,
     // Scene-detection metadata (issue #115). Absent structural.sceneDetection
     // maps to `undefined` (never detected) rather than `null`; the flat type

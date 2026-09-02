@@ -28,7 +28,7 @@
 // behaviour. The queue contract for the packager is not formally documented in
 // the OSC catalog — see docs/osc-feedback/incoming-issue9-packaging.md.
 
-import type { AssetRepository, ManifestUrls } from '../data/asset-repo.js';
+import type { AssetRepository, ManifestUrls, PackagedOutput } from '../data/asset-repo.js';
 import type { StorageBackendConfig } from '../services/param-store.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
@@ -416,7 +416,17 @@ export class PackagingService implements PackagingTrigger {
     // "/rendition_x264_3100/job-abc/"). Append known shaka-packager-s3 manifest
     // filenames to construct public URLs. Falls back to our deterministic names.
     const manifestUrls = outputPathToManifestUrls(payload.outputPath, base, assetId);
-    await this.deps.assets.update(assetId, { manifestUrls });
+    // Durably persist the ACTUAL packaged-object location (issue #502): the
+    // packaged bucket, the full job-nested prefix (`<assetId>/<packagerJobId>/`)
+    // reported via `outputPath`, and the master HLS/DASH object keys. Delivery/
+    // stream reads these to resolve the real manifest objects instead of a
+    // derived flat path. Omitted (undefined) when the packager reported no
+    // `outputPath`, so the record only ever holds a verified location.
+    const packagedOutput = packagedOutputFromCallback(payload.outputPath, packagedBucket());
+    await this.deps.assets.update(assetId, {
+      manifestUrls,
+      ...(packagedOutput ? { packagedOutput } : {})
+    });
     return true;
   }
 
@@ -427,6 +437,176 @@ export class PackagingService implements PackagingTrigger {
     await this.deps.assets.update(assetId, { packagingError: message });
     return true;
   }
+}
+
+// The deterministic master-manifest filenames the packager's shaka-packager-s3
+// backend produces under the output directory (HLS `index.m3u8`, DASH
+// `manifest.mpd`). Kept as named constants so the manifest-URL builder and the
+// packaged-output key derivation (issue #502) stay in lock-step and never drift.
+export const MASTER_HLS_FILENAME = 'index.m3u8';
+export const MASTER_DASH_FILENAME = 'manifest.mpd';
+
+// Derive the durable packaged-output location (issue #502) from the packager
+// callback's `outputPath`. `outputPath` is the packager's CMAF output DIRECTORY
+// — the full, job-nested prefix it wrote every object under
+// (`<assetId>/<packagerJobId>/`, from the packager's instance `OutputFolder` +
+// `OutputSubfolderTemplate` default `$INPUTNAME$/$JOBID$`; verified in ADR-011
+// and docs/osc-feedback/incoming-per-job-packager-output.md). We normalise it to
+// an object-key prefix (no scheme/bucket, trailing slash) and append the
+// deterministic master-manifest filenames to build the master HLS/DASH keys, so
+// stream/delivery can resolve the REAL objects that exist.
+//
+// When `outputPath` is absent (a legacy packager or a callback that omits it) we
+// return undefined — the asset then relies on the lazy-resolution fallback
+// (`resolvePackagedPrefix`) at delivery time rather than persisting a guessed
+// flat prefix. `bucket` is the effective packaged bucket for this deployment.
+export function packagedOutputFromCallback(
+  outputPath: string | undefined,
+  bucket: string
+): PackagedOutput | undefined {
+  const prefix = normalizePackagedPrefix(outputPath, bucket);
+  if (prefix === undefined) {
+    return undefined;
+  }
+  return {
+    bucket,
+    prefix,
+    masterHlsKey: `${prefix}${MASTER_HLS_FILENAME}`,
+    masterDashKey: `${prefix}${MASTER_DASH_FILENAME}`
+  };
+}
+
+// Normalise the packager's `outputPath` to a bucket-excluded, trailing-slash
+// object-key prefix, or undefined when it carries no usable path. Handles the
+// forms the packager may report:
+//   - a full `s3://<bucket>/<assetId>/<jobId>/` URI (strips scheme + bucket),
+//   - an absolute or relative path (`/<bucket>/<assetId>/<jobId>/` or
+//     `<assetId>/<jobId>/`),
+// stripping a leading `<bucket>/` segment so the returned prefix follows the
+// bucket-excluded object-key convention (issue #342) that the `/:id/stream/*`
+// proxy and relocation both use. A trailing slash is always present so callers
+// can append a filename directly.
+function normalizePackagedPrefix(
+  outputPath: string | undefined,
+  bucket?: string
+): string | undefined {
+  if (!outputPath) return undefined;
+  let path = outputPath.trim();
+  if (path.length === 0) return undefined;
+  // Strip an s3://<bucket>/ (or any scheme://host/) prefix down to the path.
+  const schemeMatch = /^[a-z][a-z0-9+.-]*:\/\/[^/]+\//i.exec(path);
+  if (schemeMatch) {
+    path = path.slice(schemeMatch[0].length);
+  } else {
+    path = path.replace(/^\/+/, '');
+  }
+  // Strip a leading bucket segment if present (bucket-excluded convention #342).
+  const effectiveBucket = (bucket ?? packagedBucket()).replace(/^\/+|\/+$/g, '');
+  if (effectiveBucket) {
+    const bucketPrefix = `${effectiveBucket}/`;
+    if (path.startsWith(bucketPrefix)) {
+      path = path.slice(bucketPrefix.length);
+    }
+  }
+  path = path.replace(/^\/+/, '');
+  if (path.length === 0) return undefined;
+  // Always terminate with a single trailing slash so it is an object-key prefix.
+  return path.endsWith('/') ? path : `${path}/`;
+}
+
+// The minimal object-store list surface the lazy-resolution fallback needs. It
+// mirrors `listObjectsV2(bucket, prefix, recursive) -> stream of { name }`
+// (minio ^8.x; verified in src/pipeline/output-relocation.ts:29-40 and
+// src/data/storage.ts:226) so the real MinioClient satisfies it and tests can
+// inject a lightweight fake without a live object store.
+export interface PackagedObjectLister {
+  listObjectsV2(
+    bucketName: string,
+    prefix: string,
+    recursive: boolean
+  ): import('node:stream').Readable;
+}
+
+// Resolve an asset's packaged location for delivery/stream (issue #502).
+//
+// Preferred path: the durable `packagedOutput` persisted from the packager
+// callback (`<assetId>/<packagerJobId>/` + master keys) — used verbatim, no
+// object-store round-trip.
+//
+// Back-compat fallback: assets packaged BEFORE #502 have no persisted prefix.
+// For those we lazily list the packaged bucket under `<assetId>/` and pick the
+// NEWEST job prefix (lexicographically greatest immediate sub-segment — the
+// packager's `$JOBID$` is a monotonic/ULID-like id, so the greatest is the most
+// recent package), then derive the master keys under it. Returns undefined when
+// nothing is found (the caller then falls back to its existing flat-prefix
+// behaviour, unchanged).
+export async function resolvePackagedOutput(
+  asset: { id: string; packagedOutput?: PackagedOutput },
+  lister: PackagedObjectLister,
+  bucket: string = packagedBucket()
+): Promise<PackagedOutput | undefined> {
+  const persisted = asset.packagedOutput;
+  if (persisted?.prefix) {
+    return persisted;
+  }
+  const prefix = await lazyResolvePackagedPrefix(asset.id, lister, bucket);
+  if (!prefix) return undefined;
+  return {
+    bucket,
+    prefix,
+    masterHlsKey: `${prefix}${MASTER_HLS_FILENAME}`,
+    masterDashKey: `${prefix}${MASTER_DASH_FILENAME}`
+  };
+}
+
+// List the packaged bucket under `<assetId>/` and return the newest job prefix
+// (`<assetId>/<packagerJobId>/`), or undefined when the asset has no packaged
+// objects. The newest job is the lexicographically greatest first path segment
+// beneath `<assetId>/` — the packager's `$JOBID$` sorts monotonically. Errors
+// from the lister reject so the caller can decide (it falls back to the flat
+// prefix on failure).
+async function lazyResolvePackagedPrefix(
+  assetId: string,
+  lister: PackagedObjectLister,
+  bucket: string
+): Promise<string | undefined> {
+  const assetPrefix = `${assetId}/`;
+  const keys = await listKeysUnderPrefix(lister, bucket, assetPrefix);
+  let newestJob: string | undefined;
+  for (const key of keys) {
+    if (!key.startsWith(assetPrefix)) continue;
+    const rest = key.slice(assetPrefix.length);
+    const slash = rest.indexOf('/');
+    // A direct object at `<assetId>/index.m3u8` (a legacy FLAT package, no job
+    // subfolder) has no nested job segment — treat `<assetId>/` itself as the
+    // prefix so those still resolve.
+    if (slash < 0) {
+      newestJob ??= '';
+      continue;
+    }
+    const job = rest.slice(0, slash);
+    if (newestJob === undefined || newestJob === '' || job > newestJob) {
+      newestJob = job;
+    }
+  }
+  if (newestJob === undefined) return undefined;
+  return newestJob === '' ? assetPrefix : `${assetPrefix}${newestJob}/`;
+}
+
+function listKeysUnderPrefix(
+  lister: PackagedObjectLister,
+  bucket: string,
+  prefix: string
+): Promise<string[]> {
+  return new Promise<string[]>((resolve, reject) => {
+    const keys: string[] = [];
+    const stream = lister.listObjectsV2(bucket, prefix, true);
+    stream.on('data', (obj: { name?: string }) => {
+      if (obj.name) keys.push(obj.name);
+    });
+    stream.on('end', () => resolve(keys));
+    stream.on('error', reject);
+  });
 }
 
 // Build manifest URLs from the packager's reported outputPath. The packager's

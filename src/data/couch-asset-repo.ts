@@ -245,6 +245,9 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.packagingError !== undefined) {
       next.packagingError = patch.packagingError;
     }
+    if (patch.packagedOutput !== undefined) {
+      next.packagedOutput = patch.packagedOutput;
+    }
     if (patch.renditions !== undefined) {
       next.renditions = patch.renditions;
     }
