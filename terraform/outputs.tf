@@ -71,3 +71,14 @@ output "parameter_store_api_key" {
   value       = var.parameter_store_api_key
   sensitive   = true
 }
+
+## --- open-videocore instance (#485) ---
+# Public URL of the open-videocore API. Attribute name `instance_url` is the
+# Read-Only URL attribute verified from the osc_eyevinn_open_videocore provider
+# docs (EyevinnOSC/osc 0.9.0: "instance_url (String) URL to the created
+# instance"). Append /api/v1, /ui or /api-docs per README to reach the API,
+# dashboard or interactive docs.
+output "open_videocore_instance_url" {
+  description = "Public URL of the provisioned open-videocore instance"
+  value       = osc_eyevinn_open_videocore.this.instance_url
+}
