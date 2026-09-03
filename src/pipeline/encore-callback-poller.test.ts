@@ -71,6 +71,15 @@ class FakeRedis {
     this.strings.set(key, value);
     return 'OK';
   }
+  async del(...keys: string[]): Promise<number> {
+    let removed = 0;
+    for (const key of keys) {
+      if (this.strings.delete(key)) removed++;
+      if (this.hashes.delete(key)) removed++;
+      if (this.zsets.delete(key)) removed++;
+    }
+    return removed;
+  }
   async keys(pattern: string): Promise<string[]> {
     // Only '*'-suffix globs are used by the sweep (e.g. 'encore:pool:*').
     const re = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
@@ -713,6 +722,51 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
 
     expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(1);
     const execution = await pipelines.get(pipelineId);
+    expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // #525 regression: reproduces a bulk-cleanup-triggered dispatch gap where
+  // Encore's POST /encoreJobs response omitted `id` (or the pool record was
+  // wiped by scale-down before completion). scaler-loop.ts dispatch() only
+  // writes jobUuid / uuidToExternalId / jobEncoreUrl inside the
+  // `if (encoreUuid && ...)` branch, so none of those Redis keys exist here —
+  // yet the callback listener still observed Encore's own webhook independently
+  // and delivered a working `message.url`. Before the #525 fix this made
+  // resolveEncoreJobUrl(externalId, redis) come back empty at the packaging
+  // handoff (both the direct key AND the pool+UUID fallback miss), silently
+  // failing the `package` step with "Encore instance no longer available for
+  // packaging" even though the instance was fine — with nothing logged between
+  // "completing transcode" and "applied encore completion" to explain it. The
+  // fix reuses the `url` already resolved (and proven reachable) earlier in
+  // handleMessage instead of re-deriving it from those dispatch-time keys.
+  it('#525: still packages when dispatch never captured the Encore UUID, using the callback message URL', async () => {
+    const encoreUuid = 'uuid-handoff-no-dispatch-mapping';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+
+    // Simulate the dispatch-time capture gap: no jobEncoreUrl, no
+    // uuidToExternalId mapping — exactly what happens when scaler-loop.ts's
+    // dispatch() `if (encoreUuid && ...)` guard was skipped.
+    await redis.del(keys.jobEncoreUrl(externalId));
+    await redis.del(keys.uuidToExternalId(encoreUuid));
+
+    const d = baseDeps(successFetch(externalId, encoreUuid), undefined);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+    } finally {
+      stop();
+    }
+
+    // Packaging was enqueued using the callback message's own URL, not a
+    // Redis-reconstructed one.
+    const enqueued = JSON.parse(redis.zmembers(PACKAGING_QUEUE_KEY)[0]!);
+    expect(enqueued).toEqual({
+      jobId: (await pipelines.get(pipelineId))!.assetId,
+      url: `${BASE_URL}/encoreJobs/${encoreUuid}`
+    });
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.status).toBe('running');
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
   });
 });
