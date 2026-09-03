@@ -378,6 +378,8 @@ pnpm test         # run test suite
 
 The ops UI is at `http://localhost:3000/ui` and the interactive API docs are at `http://localhost:3000/api-docs`. To regenerate `openapi.json` after adding routes, run `pnpm generate:openapi`.
 
+The static, task-oriented docs site at `public/docs/` (served at `http://localhost:3000/ui/docs/`) is generated from `openapi.json` by `pnpm generate:docs` (see `scripts/generate-docs.ts`) — don't hand-edit files under `public/docs/`. A GitHub Actions workflow (`.github/workflows/update-openapi.yml`) runs both `generate:openapi` and `generate:docs` on every push to `main` and commits the results, so the reference section never drifts from the real contract.
+
 For local development against real OSC services, set your `OSC_ACCESS_TOKEN`, then provision a stack via the Provision tab in the ops UI.
 
 ### Contributing

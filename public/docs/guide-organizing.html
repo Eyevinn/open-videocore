@@ -278,14 +278,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <p>A collection is a named, flat group of assets — useful for shows, campaigns, or any grouping that doesn't belong on the asset record itself.</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/collections \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;name&quot;: &quot;Q3 keynotes&quot;}&#x27;</code></pre></div>
+  -d '{&quot;name&quot;: &quot;Q3 keynotes&quot;}'</code></pre></div>
 <p>Add and remove assets with <code>PUT /api/v1/collections/{id}/assets/{assetId}</code> / <code>DELETE /api/v1/collections/{id}/assets/{assetId}</code>. Full shape in the <a href="ref-collections.html">Collections reference</a>.</p>
 
 <h2 id="webhooks">Webhooks</h2>
 <p>Register an HTTP endpoint to be notified as assets and jobs change state, instead of polling:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/webhooks \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;url&quot;: &quot;https://your-app.example.com/hooks/videocore&quot;, &quot;events&quot;: [&quot;asset.ready&quot;, &quot;transcode.complete&quot;, &quot;package.complete&quot;]}&#x27;</code></pre></div>
+  -d '{&quot;url&quot;: &quot;https://your-app.example.com/hooks/videocore&quot;, &quot;events&quot;: [&quot;asset.ready&quot;, &quot;transcode.complete&quot;, &quot;package.complete&quot;]}'</code></pre></div>
 <p>Available events: <code>asset.ready</code>, <code>asset.failed</code>, <code>transcode.complete</code>, <code>transcode.failed</code>, <code>package.complete</code>, <code>package.failed</code>. Pass a <code>secret</code> to have deliveries signed. Full shape in the <a href="ref-webhooks.html">Webhooks reference</a>.</p>
 
     

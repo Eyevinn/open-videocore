@@ -272,7 +272,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     
     <div class="crumb"><a href="index.html">Docs</a> / Guides / Operating a workspace</div>
     <h1>Operating a workspace</h1>
-    <p class="lede">Provision a workspace&#x27;s backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.</p>
+    <p class="lede">Provision a workspace's backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.</p>
     
 <p>Day-to-day asset operations don't need any of this — it's for the person standing up and tuning a workspace. For first-time setup, see <a href="installation.html">Installation</a>.</p>
 
@@ -280,14 +280,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <p>One call stands up a workspace's object storage, metadata store, and queue. The transcoder and packager are <em>not</em> included — both are provisioned lazily, the first time they're actually needed.</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/provision \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;name&quot;: &quot;mystack&quot;}&#x27;</code></pre></div>
+  -d '{&quot;name&quot;: &quot;mystack&quot;}'</code></pre></div>
 <p>This is asynchronous — poll <code>GET /api/v1/provision/operations/{id}</code> for <code>status</code>. Tear a stack down with <code>DELETE /api/v1/provision/{name}</code>. Full shape in the <a href="ref-provisioning.html">Provisioning reference</a>.</p>
 
 <h2 id="scaler">Tune the transcoder auto-scaler</h2>
 <p>The auto-scaler keeps a per-workspace pool of transcoder instances and scales it on demand. By default it scales to zero when idle, trading standing cost for cold-start latency on the first job of a burst.</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X PATCH https://&lt;your-instance&gt;/api/v1/scaler/config \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;minInstances&quot;: 1, &quot;maxInstances&quot;: 3, &quot;idleTimeoutMs&quot;: 300000}&#x27;</code></pre></div>
+  -d '{&quot;minInstances&quot;: 1, &quot;maxInstances&quot;: 3, &quot;idleTimeoutMs&quot;: 300000}'</code></pre></div>
 <p>Set <code>minInstances</code> to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See <code>GET /api/v1/scaler/status</code> for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
 
 <h2 id="optional-services">Optional services</h2>

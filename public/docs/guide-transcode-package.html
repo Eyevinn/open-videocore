@@ -284,7 +284,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <h2 id="transcode">2. Submit a transcode job</h2>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/transcode \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;profile&quot;: &quot;&lt;profile-name&gt;&quot;}&#x27;</code></pre></div>
+  -d '{&quot;profile&quot;: &quot;&lt;profile-name&gt;&quot;}'</code></pre></div>
 <p>This returns a <a href="data-model.html#job">Job</a> of type <code>transcode</code>. Poll <code>GET /api/v1/jobs/{id}</code> for <code>status</code>, <code>progress</code>, and — once done — <code>renditionAssetIds</code>, the child assets holding each rendition.</p>
 <div class="callout">The first transcode submitted to an idle workspace pays a cold-start cost while the auto-scaler spins up a transcoder instance (roughly 60–120s). See <a href="guide-operating.html#scaler">Operating a workspace &rarr; auto-scaler</a> to trade that off against standing cost with a warm floor.</div>
 
@@ -296,7 +296,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <p>To avoid manually sequencing the two calls above and polling each job in turn, run them as a single pipeline execution:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/execute \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;pipeline&quot;: &quot;transcode-and-package&quot;, &quot;profile&quot;: &quot;&lt;profile-name&gt;&quot;}&#x27;</code></pre></div>
+  -d '{&quot;pipeline&quot;: &quot;transcode-and-package&quot;, &quot;profile&quot;: &quot;&lt;profile-name&gt;&quot;}'</code></pre></div>
 <p>Poll <code>GET /api/v1/assets/{id}/executions/{execId}</code> for a single <code>status</code> covering every step. See <a href="ref-pipelines.html">Pipelines reference</a> for the execution shape, and <code>GET /api/v1/assets/{id}/pipelines</code> to list which pipeline names are available to run.</p>
 
     

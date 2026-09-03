@@ -278,20 +278,20 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <p>Extract one or more poster frames at arbitrary timecodes:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/thumbnails \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;timecodes&quot;: [&quot;00:00:05&quot;, &quot;00:01:30&quot;]}&#x27;</code></pre></div>
+  -d '{&quot;timecodes&quot;: [&quot;00:00:05&quot;, &quot;00:01:30&quot;]}'</code></pre></div>
 <p>List them with <code>GET /api/v1/assets/{id}/thumbnails</code>, or fetch one by index with <code>GET /api/v1/assets/{id}/thumbnails/{index}</code>.</p>
 
 <h2 id="clip">Clip a segment</h2>
 <p>Cut a time range out of an asset into a new, independent child asset — the source is untouched:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/clip \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;startTime&quot;: &quot;00:02:00&quot;, &quot;endTime&quot;: &quot;00:02:30&quot;}&#x27;</code></pre></div>
+  -d '{&quot;startTime&quot;: &quot;00:02:00&quot;, &quot;endTime&quot;: &quot;00:02:30&quot;}'</code></pre></div>
 
 <h2 id="export">Export / re-wrap</h2>
 <p>Change container format (e.g. MP4 → MOV) without re-encoding the essence:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/export \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;format&quot;: &quot;mov&quot;}&#x27;</code></pre></div>
+  -d '{&quot;format&quot;: &quot;mov&quot;}'</code></pre></div>
 <p>Both clip and export return a job — poll it the same way as a transcode job. Full request/response shapes in the <a href="ref-assets.html">Assets reference</a>.</p>
 
     

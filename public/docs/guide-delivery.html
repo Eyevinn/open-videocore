@@ -282,7 +282,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 
 <h2 id="stream">Streaming manifests and segments</h2>
 <p>Manifest URLs returned above point back at:</p>
-<div class="code-block"><div class="code-label">Path</div><pre><code>GET /api/v1/assets/{{id}}/stream/*</code></pre></div>
+<div class="code-block"><div class="code-label">Path</div><pre><code>GET /api/v1/assets/{id}/stream/*</code></pre></div>
 <p>This proxy-streams the packaged HLS/DASH manifest and its media segments, so player requests never need direct access to the underlying object storage bucket or its credentials.</p>
 
     

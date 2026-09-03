@@ -280,14 +280,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <p>An asset always starts as a record you create explicitly, or one created for you by the ingest-from-URL shortcut below.</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;title&quot;: &quot;Keynote recording&quot;, &quot;description&quot;: &quot;Opening keynote, main stage&quot;}&#x27;</code></pre></div>
+  -d '{&quot;title&quot;: &quot;Keynote recording&quot;, &quot;description&quot;: &quot;Opening keynote, main stage&quot;}'</code></pre></div>
 <p>See <code>POST /api/v1/assets/</code> — full field list in the <a href="ref-assets.html#post-api-v1-assets">Assets reference</a>.</p>
 
 <h2 id="url">2. Ingest from a public URL</h2>
 <p>If the source file is already reachable over HTTP(S), skip the manual create step — this creates the asset and starts the download in one call:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/ingest-url \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{&quot;sourceUrl&quot;: &quot;https://example.com/video.mp4&quot;, &quot;title&quot;: &quot;Keynote recording&quot;}&#x27;</code></pre></div>
+  -d '{&quot;sourceUrl&quot;: &quot;https://example.com/video.mp4&quot;, &quot;title&quot;: &quot;Keynote recording&quot;}'</code></pre></div>
 <p>This returns a <a href="data-model.html#job">Job</a> of type <code>ingest-url</code>. Poll <code>GET /api/v1/jobs/{id}</code> until <code>status</code> is <code>done</code>; the job's <code>assetId</code> is the asset to work with next.</p>
 
 <h2 id="direct-upload">3. Direct upload (small files)</h2>
@@ -315,7 +315,7 @@ curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/upload-compl
 <p>Point open-videocore at an object storage bucket and it will pick up new files automatically, without any per-file API call:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/storage/buckets/&lt;bucket&gt;/watch-folder/toggle \
   -H &quot;Content-Type: application/json&quot; \
-  -d &#x27;{{&quot;enabled&quot;: true}}&#x27;</code></pre></div>
+  -d '{&quot;enabled&quot;: true}'</code></pre></div>
 <p>See <a href="ref-storage.html">Storage reference</a> for bucket listing and the poller's own start/stop controls in <a href="ref-admin.html">Admin</a>.</p>
 
 <div class="callout">Every path above ends at the same place: an <a href="data-model.html#asset">Asset</a> with <code>status</code> moving from <code>uploading</code> to <code>processing</code> to <code>ready</code> (or <code>failed</code>). Watch that field, or an <a href="guide-organizing.html#webhooks">asset.ready / asset.failed webhook</a>, rather than polling the job directly once the source file has landed.</div>
