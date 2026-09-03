@@ -168,7 +168,7 @@ OSC My Apps run the customer's own git repo on open-source `web-runner-{node,pyt
 
 **Follow-up ADRs needed:**
 - ADR-002: API authentication and multi-tenancy model (after open question 2 is answered).
-- ADR-003: Delivery and CDN integration (after open question 4 is answered).
+- ADR-003: Delivery and CDN integration (after open question 4 is answered). **WRITTEN 2026-09-03** — see ADR-003, which documents the implemented `/delivery` + `/stream/*` contract (issues #502/#503/#506, #509).
 - ADR-004: Search backend evolution (if PostgreSQL FTS proves insufficient at scale, or when an OSC search service enters the catalog).
 
 ---
