@@ -30,7 +30,7 @@ import {
   spawnInstance,
   updateInstance
 } from './instance-pool.js';
-import { recordDispatch } from './retry-store.js';
+import { recordDispatch, requeueInterruptedByScaleDown } from './retry-store.js';
 import { probeCallbackTrust } from './callback-trust-probe.js';
 
 // Default bounded wait for the outbound callback-listener TLS-trust probe
@@ -166,6 +166,15 @@ export class EncoreScalerLoop {
         survivors.push(inst);
         continue;
       }
+
+      // #514: whether we drain (real.count > 0) or tear down (real.count === 0),
+      // any job STILL MAPPED to this scaled-away instance that Encore no longer
+      // reports active and that never went terminal is work lost to the scale-down
+      // event — an 'interrupted_by_scaledown', NOT a real failure. Classify and
+      // re-enqueue those jobs here (the drain/teardown boundary is the exact point
+      // the interruption becomes well-defined, per #513). real.activeExternalIds is
+      // the authoritative "still running on Encore" set from fetchRealActiveState.
+      await this.requeueScaleDownInterruptions(inst.instanceId, real.activeExternalIds);
 
       if (real.count > 0) {
         // The instance has real in-flight work even though the tracked count (or
@@ -321,6 +330,80 @@ export class EncoreScalerLoop {
       // Any error means we could not confirm the real state — surface undefined
       // so callers stay conservative (never destroy on an unconfirmed count).
       return undefined;
+    }
+  }
+
+  // #514: re-enqueue jobs lost to a scale-down of `instanceId`.
+  //
+  // Called at the drain/teardown boundary (issue #513 defines when a job is "lost
+  // to scale-down"). For every job still MAPPED to this scaled-away instance in
+  // keys.jobInstance whose local status is still non-terminal AND which Encore no
+  // longer reports active (not in `activeExternalIds`), the work was interrupted
+  // by the scale-down rather than failed. We classify it as
+  // 'interrupted_by_scaledown' (a distinct, clearly-recoverable retry reason,
+  // retry-policy.ts) and re-enqueue it onto the Valkey queue via
+  // requeueInterruptedByScaleDown so downstream retry logic auto-retries it with
+  // no operator intervention and without surfacing a generic failure.
+  //
+  // This intentionally does NOT reclassify a job that is still active on Encore
+  // (it is being drained, not lost) or one that already reached a terminal local
+  // status (a genuine failure/cancel/success already settled it) — so a real
+  // 'deterministic' failure is never reclassified as scale-down interruption.
+  //
+  // CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+  //   - Job->instance ownership map: keys.jobInstance (encore:job-instance:{ws}),
+  //     written at dispatch (scaler-loop.ts dispatch: redis.hset(keys.jobInstance
+  //     ...)). Local status: keys.jobStatus (types.ts:165-166).
+  //   - Non-terminal test mirrors reconcile()'s dropped-job diff
+  //     (scaler-loop.ts: st !== 'RUNNING' && st !== 'QUEUED') and the terminal
+  //     status vocabulary in index.ts:38-42 (DONE/SUCCESSFUL/FAILED/CANCELLED).
+  //   - activeExternalIds semantics: fetchRealActiveState (scaler-loop.ts) — the
+  //     externalIds Encore still reports QUEUED/IN_PROGRESS for this instance.
+  //   - Re-enqueue path: requeueInterruptedByScaleDown (retry-store.ts).
+  // Best-effort: a per-job failure must never break the scale-down/tick work.
+  private async requeueScaleDownInterruptions(
+    instanceId: string,
+    activeExternalIds: Set<string>
+  ): Promise<void> {
+    const { redis, workspaceId } = this.config;
+    try {
+      const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
+      const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
+      for (const [jobId, mappedInstanceId] of Object.entries(trackedInstances)) {
+        if (mappedInstanceId !== instanceId) continue;
+        // Still running on Encore: it is being drained, not lost — leave it.
+        if (activeExternalIds.has(jobId)) continue;
+        // Only non-terminal jobs are interruption candidates. A job the callback
+        // poller / cancel / a genuine failure already settled carries a terminal
+        // status (DONE/SUCCESSFUL/FAILED/CANCELLED) and must NOT be reclassified.
+        const st = (trackedStatuses[jobId] ?? '').toUpperCase();
+        if (st !== 'RUNNING' && st !== 'QUEUED') continue;
+
+        const requeued = await requeueInterruptedByScaleDown(redis, workspaceId, jobId);
+        if (requeued) {
+          console.warn(
+            `[encore-scaler] scale-down: job ${jobId} interrupted by scale-down of ` +
+              `instance ${instanceId} (not terminal, not active on Encore); ` +
+              `classified interrupted_by_scaledown and re-enqueued`
+          );
+        } else {
+          // Payload unavailable (e.g. TTL expired): cannot rebuild the job, so
+          // leave it for reconcile()'s generic dropped-job path rather than fake
+          // a payload. Observable so the gap is diagnosable (issue #451 style).
+          console.warn(
+            `[encore-scaler] scale-down: job ${jobId} interrupted by scale-down of ` +
+              `instance ${instanceId} but its payload is unavailable — cannot ` +
+              `re-enqueue; leaving for dropped-job reconciliation`
+          );
+        }
+      }
+    } catch (err) {
+      console.error(
+        '[encore-scaler] scale-down interruption re-enqueue error (workspace=%s, instance=%s):',
+        workspaceId,
+        instanceId,
+        err
+      );
     }
   }
 

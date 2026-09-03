@@ -30,7 +30,7 @@ import {
   backoffForAttempt,
   classifyEncoreFailure,
   isRetryableFailureClass,
-  type FailureClass
+  type MessageFailureClass
 } from './retry-policy.js';
 
 const PAYLOAD_TTL_SECONDS = 86_400; // 24h, matches the dispatch-time UUID/URL keys.
@@ -54,9 +54,76 @@ export async function clearRetryState(redis: Redis, jobId: string): Promise<void
   await redis.del(keys.jobPayload(jobId), keys.jobAttempts(jobId));
 }
 
+// Re-enqueue a job whose worker was removed/drained mid-flight (#514,
+// 'interrupted_by_scaledown'). The job did NOT fail — its shared-pool instance
+// was scaled away (issue #513 drain boundary) — so this is UNCONDITIONALLY
+// recoverable and is auto-re-queued with NO backoff and WITHOUT consuming a
+// genuine encode attempt (the interrupted run produced no failure, so it must not
+// count toward MAX_ENCODE_ATTEMPTS).
+//
+// Returns true when the job was rebuilt from its stored payload and re-queued;
+// false when the original payload is unavailable (e.g. TTL expired) so the caller
+// can fall back to the generic dropped-job path rather than fabricate a payload.
+//
+// CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+//   - Re-enqueue = LPUSH a QueuedJob onto keys.queue, exactly as decideRetry()
+//     (retry-store.ts:143) and the router submit path (index.ts:29). The scaler
+//     loop RPOPLPUSHes and JSON.parses whatever is on the queue
+//     (scaler-loop.ts:218-231).
+//   - Caller-facing status kept in 'RUNNING' so getJobStatus() maps it to
+//     `running` (index.ts:38-39) and the job is never observed as settled while
+//     the re-dispatch is pending — same invariant decideRetry() upholds
+//     (retry-store.ts:132).
+//   - Stale per-attempt mappings dropped so the callback poller resolves the fresh
+//     dispatch, not the scaled-away instance (mirrors retry-store.ts:136-140).
+//   - keys / QueuedJob shape: src/encore-scaler/types.ts:141-189.
+export async function requeueInterruptedByScaleDown(
+  redis: Redis,
+  workspaceId: string,
+  jobId: string
+): Promise<boolean> {
+  const payloadRaw = await redis.get(keys.jobPayload(jobId));
+  if (!payloadRaw) return false;
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(payloadRaw) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+
+  // Preserve the prior dispatch count so the loop persists it unchanged: a
+  // scale-down interruption is NOT a failed attempt, so it must not advance
+  // toward the bound. Fall back to 0 (first dispatch) when unknown.
+  const attemptsRaw = await redis.get(keys.jobAttempts(jobId));
+  const attemptsSoFar = Number(attemptsRaw ?? '0') || 0;
+
+  const requeued: QueuedJob = {
+    jobId,
+    payload,
+    enqueuedAt: Date.now(),
+    // No backoff: the work was interrupted, not failing, so re-run immediately.
+    attempts: attemptsSoFar
+  };
+
+  // Keep the job non-terminal and drop the stale mapping to the scaled-away
+  // instance BEFORE re-queuing, so it is never observed as settled/failed
+  // between the interruption and the fresh dispatch.
+  await redis.hset(keys.jobStatus(workspaceId), jobId, 'RUNNING');
+  await redis.hdel(keys.jobInstance(workspaceId), jobId);
+  await redis.del(keys.jobUuid(jobId), keys.jobEncoreUrl(jobId));
+
+  await redis.lpush(keys.queue(workspaceId), JSON.stringify(requeued));
+  return true;
+}
+
+// decideRetry only ever classifies via classifyEncoreFailure(), which returns a
+// message-derived class (never the topology-event 'interrupted_by_scaledown', #514
+// — that is classified structurally at the scaler's drain boundary, not here). So
+// the decision's failureClass is a MessageFailureClass, which is exactly what the
+// caller-facing encode-attempt log (finalizeEncodeAttempt) accepts.
 export type RetryDecision =
-  | { action: 'retry'; attempt: number; failureClass: FailureClass; backoffMs: number }
-  | { action: 'settle'; reason: 'exhausted' | 'not-retryable'; failureClass: FailureClass };
+  | { action: 'retry'; attempt: number; failureClass: MessageFailureClass; backoffMs: number }
+  | { action: 'settle'; reason: 'exhausted' | 'not-retryable'; failureClass: MessageFailureClass };
 
 // The gate. Given an observed Encore failure `message` for jobId, decide whether
 // to re-dispatch (transport/IO class + retries remaining) or settle terminal.

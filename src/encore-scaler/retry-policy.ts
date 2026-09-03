@@ -66,8 +66,42 @@
 // The bound guarantees a genuinely bad source (whatever its signature) is not
 // retried forever: it is retried at most MAX_ENCODE_ATTEMPTS times and then fails
 // clearly with the last Encore error message surfaced to the caller.
+//
+// SCALE-DOWN INTERRUPTION (#514) — a FOURTH class, not message-derived
+// -------------------------------------------------------------------
+//   'interrupted_by_scaledown' — the job did not fail: its shared-pool worker was
+//                         removed/drained mid-job (issue #513 drain-don't-kill
+//                         defines the boundary). The work is lost to a topology
+//                         event, NOT to a real processing failure, so it is
+//                         indistinguishable from a genuine failure only if you look
+//                         at a message string — which is exactly why this class is
+//                         NOT inferred from the Encore `message`. It is classified
+//                         structurally at the drain/teardown boundary (the scaler
+//                         observes a job mapped to a scaled-away instance that Encore
+//                         no longer reports active and that never went terminal) and
+//                         is CLEARLY recoverable: it is always re-enqueued so
+//                         downstream retry logic auto-retries it without operator
+//                         intervention. Because it is not message-derived,
+//                         classifyEncoreFailure() never returns it — a real
+//                         'deterministic' failure message can never be reclassified
+//                         as scale-down interruption.
 
-export type FailureClass = 'transport' | 'io-retryable' | 'deterministic';
+// The three MESSAGE-DERIVED failure classes: everything classifyEncoreFailure()
+// can infer from an Encore `message` string. This is the ONLY set that is ever
+// recorded on the caller-facing encode-attempt log (EncodeAttempt.classification,
+// src/data/job-repo.ts) — a completed encode attempt always failed (or not) with
+// a message, never with a topology event. Keeping this a distinct, narrower type
+// means widening the internal FailureClass for #514 does NOT widen the
+// caller-facing classification enum (that is #515's concern, out of scope here).
+export type MessageFailureClass = 'transport' | 'io-retryable' | 'deterministic';
+
+// The full INTERNAL classification. Adds 'interrupted_by_scaledown' (#514): work
+// lost when a shared-pool worker is drained/removed mid-job — not a message-derived
+// failure but a topology event. This class is only ever produced structurally at
+// the scaler's drain/teardown boundary (scaler-loop.ts), never by
+// classifyEncoreFailure(), and it is never written to the caller-facing
+// EncodeAttempt.classification field.
+export type FailureClass = MessageFailureClass | 'interrupted_by_scaledown';
 
 // Maximum number of times a single job is DISPATCHED to an Encore instance,
 // inclusive of the first attempt. 3 = first attempt + up to 2 re-dispatches.
@@ -117,7 +151,15 @@ const IO_RETRYABLE_SIGNATURES: readonly string[] = [
 // Classify an Encore failure by its `message` string. An empty/absent message
 // is treated as 'deterministic' (we have no transport evidence, so do not burn
 // retries on an unexplained failure).
-export function classifyEncoreFailure(message: string | undefined): FailureClass {
+//
+// This function only ever returns the three MESSAGE-DERIVED classes
+// ('transport' | 'io-retryable' | 'deterministic'). It NEVER returns
+// 'interrupted_by_scaledown': scale-down interruption is a topology event, not a
+// property of any failure string, so it is classified structurally at the
+// drain/teardown boundary (see scaler-loop.ts) — never inferred from a message.
+// This guarantees a genuine 'deterministic' failure message can never be
+// reclassified as scale-down interruption (#514 acceptance criterion).
+export function classifyEncoreFailure(message: string | undefined): MessageFailureClass {
   if (!message) return 'deterministic';
   const hay = message.toLowerCase();
   // Transport signatures take precedence — a transport failure that also
@@ -133,8 +175,26 @@ export function classifyEncoreFailure(message: string | undefined): FailureClass
 }
 
 // Is this failure class eligible for a bounded retry?
+//
+// 'interrupted_by_scaledown' (#514) is CLEARLY recoverable: the job never failed,
+// its worker was removed mid-flight, so it must be auto-retried by re-enqueue with
+// no operator intervention. Unlike the transport/IO classes, its recoverability is
+// not bounded by MAX_ENCODE_ATTEMPTS on the message-retry path — it does not
+// consume a genuine encode attempt (the run produced no failure), and re-enqueue
+// is handled directly at the drain boundary rather than via decideRetry().
 export function isRetryableFailureClass(cls: FailureClass): boolean {
-  return cls === 'transport' || cls === 'io-retryable';
+  return (
+    cls === 'transport' ||
+    cls === 'io-retryable' ||
+    cls === 'interrupted_by_scaledown'
+  );
+}
+
+// Is this failure class a scale-down interruption (#514)? A tiny, explicit
+// predicate so downstream code can treat "work lost to a topology event" distinctly
+// from a real processing failure without string-comparing the union member.
+export function isScaleDownInterruption(cls: FailureClass): boolean {
+  return cls === 'interrupted_by_scaledown';
 }
 
 // Milliseconds to wait before dispatching the NEXT attempt, given how many
