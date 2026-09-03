@@ -2334,23 +2334,48 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const packagedBucketName = request.connections?.packagedBucket ?? packagedBucket();
       const fileGroups: z.infer<typeof assetFileGroupSchema>[] = [];
       const manifests = asset.manifestUrls;
-      if (manifests?.hls) {
-        fileGroups.push({
-          id: 'hls',
-          type: 'hls-package',
-          name: 'HLS',
-          manifestUrl: manifests.hls,
-          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls, packagedBucketName)
-        });
-      }
-      if (manifests?.dash) {
-        fileGroups.push({
-          id: 'dash',
-          type: 'dash-package',
-          name: 'DASH',
-          manifestUrl: manifests.dash,
-          objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash, packagedBucketName)
-        });
+
+      // Resolve each manifest to an absolute, fetchable URL the same way
+      // /:id/delivery does (issue #341 fix, previously applied only there): on
+      // the zero-config MinIO backend `manifestUrls.hls`/`.dash` is stored as a
+      // bare bucket-relative object-key path (e.g.
+      // `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no scheme/host,
+      // so the ops UI's "Open" link (public/app.js) was unclickable. Route
+      // through the authorized stream proxy when the stored value doesn't
+      // already resolve to something absolute.
+      const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
+      const toAbsoluteManifestUrl = (stored: string, proxyUrl: string | undefined): string => {
+        const resolved = resolvePublicManifestUrl(stored);
+        return isAbsoluteUrl(resolved) ? resolved : proxyUrl ?? resolved;
+      };
+
+      try {
+        if (manifests?.hls) {
+          fileGroups.push({
+            id: 'hls',
+            type: 'hls-package',
+            name: 'HLS',
+            manifestUrl: toAbsoluteManifestUrl(manifests.hls, proxied.hls),
+            objectKeyPrefix: objectKeyPrefixFromManifest(manifests.hls, packagedBucketName)
+          });
+        }
+        if (manifests?.dash) {
+          fileGroups.push({
+            id: 'dash',
+            type: 'dash-package',
+            name: 'DASH',
+            manifestUrl: toAbsoluteManifestUrl(manifests.dash, proxied.dash),
+            objectKeyPrefix: objectKeyPrefixFromManifest(manifests.dash, packagedBucketName)
+          });
+        }
+      } catch (err) {
+        if (err instanceof PublicManifestBaseUrlError) {
+          return reply.code(501).send({
+            error: 'not_configured',
+            message: err.message
+          });
+        }
+        throw err;
       }
 
       return reply.code(200).send({ files, fileGroups });
