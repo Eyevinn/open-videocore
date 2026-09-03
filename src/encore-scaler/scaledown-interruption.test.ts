@@ -131,7 +131,10 @@ class FakeRedis {
 
 const WS = 'ws1';
 
-function makeConfig(redis: FakeRedis): EncoreScalerConfig {
+function makeConfig(
+  redis: FakeRedis,
+  overrides?: Partial<EncoreScalerConfig>
+): EncoreScalerConfig {
   return {
     workspaceId: WS,
     maxInstances: 2,
@@ -140,7 +143,8 @@ function makeConfig(redis: FakeRedis): EncoreScalerConfig {
     redisUrl: 'redis://fake',
     oscContext: {} as EncoreScalerConfig['oscContext'],
     redis: redis as unknown as EncoreScalerConfig['redis'],
-    getToken: async () => 'test-token'
+    getToken: async () => 'test-token',
+    ...overrides
   };
 }
 
@@ -221,6 +225,36 @@ describe('scale-down interruption classification + re-enqueue (#514)', () => {
     expect(await redis.hget(keys.jobInstance(WS), 'job-lost')).toBeNull();
   });
 
+  it('fires onJobInterrupted with the recoverable reason so the caller-facing record can be annotated (#515)', async () => {
+    const redis = new FakeRedis();
+    const instanceId = 'inst-1';
+
+    await seedPool(redis, {
+      instanceId,
+      url: 'https://encore.example',
+      activeJobs: 0,
+      lastIdleAt: 0
+    });
+    await redis.hset(keys.jobInstance(WS), 'job-lost', instanceId);
+    await redis.hset(keys.jobStatus(WS), 'job-lost', 'running');
+    await redis.set(keys.jobPayload('job-lost'), JSON.stringify(PAYLOAD));
+    await redis.set(keys.jobAttempts('job-lost'), '1');
+
+    vi.stubGlobal('fetch', fetchMock([], []));
+    destroyInstanceMock.mockResolvedValue(undefined);
+
+    // #515: the scaler owns no repositories; it raises the interruption via the
+    // onJobInterrupted hook (main.ts wires it to annotate the caller-facing Job).
+    const onJobInterrupted = vi.fn(async () => undefined);
+    await new EncoreScalerLoop(makeConfig(redis, { onJobInterrupted })).tick();
+
+    // Re-enqueued (the #514 behaviour) AND the caller-facing hook fired exactly
+    // once with the distinguishable, recoverable reason.
+    expect(await redis.lrange(keys.queue(WS), 0, -1)).toHaveLength(1);
+    expect(onJobInterrupted).toHaveBeenCalledTimes(1);
+    expect(onJobInterrupted).toHaveBeenCalledWith('job-lost', 'interrupted_by_scaledown');
+  });
+
   it('does NOT reclassify a genuine terminal FAILED (deterministic) job as scale-down interruption', async () => {
     const redis = new FakeRedis();
     const instanceId = 'inst-1';
@@ -242,12 +276,16 @@ describe('scale-down interruption classification + re-enqueue (#514)', () => {
     vi.stubGlobal('fetch', fetchMock([], []));
     destroyInstanceMock.mockResolvedValue(undefined);
 
-    await new EncoreScalerLoop(makeConfig(redis)).tick();
+    // A genuine failure must NOT surface a recoverable interruption to the caller.
+    const onJobInterrupted = vi.fn(async () => undefined);
+    await new EncoreScalerLoop(makeConfig(redis, { onJobInterrupted })).tick();
 
     // NOT re-enqueued: the queue stays empty.
     expect(await redis.lrange(keys.queue(WS), 0, -1)).toHaveLength(0);
     // Terminal status left untouched — a real failure is not turned into a retry.
     expect(await redis.hget(keys.jobStatus(WS), 'job-failed')).toBe('FAILED');
+    // And the caller-facing interruption hook never fired.
+    expect(onJobInterrupted).not.toHaveBeenCalled();
   });
 
   it('does NOT reclassify a job still active on Encore (draining, not lost)', async () => {
