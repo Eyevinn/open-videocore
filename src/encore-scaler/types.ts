@@ -129,6 +129,13 @@ export type EncoreInstanceRecord = {
   callbackTrustQuarantinedAt?: number;
   activeJobs: number; // jobs currently running on this instance
   lastIdleAt: number; // epoch ms when activeJobs last reached 0
+  // Set when scale-down has selected this instance for teardown but it still
+  // has real in-flight work (issue #513, drain-don't-kill). A draining instance
+  // is removed from routing (never dispatched a new job) and is only torn down
+  // once its real active-job count reaches zero. This prevents scale-down from
+  // ever killing an instance with a genuine in-flight transcode when the tracked
+  // activeJobs count has diverged from the instance's real IN_PROGRESS state.
+  draining?: boolean;
 };
 
 export type QueuedJob = {
