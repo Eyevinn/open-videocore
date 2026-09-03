@@ -195,5 +195,14 @@ export const keys = {
   // How many times this job has been *dispatched* to an Encore instance (#295).
   // Starts at 1 on first dispatch and increments on each transport-class
   // re-dispatch. Bounded by MAX_ENCODE_ATTEMPTS. 24h TTL; cleared on settle.
-  jobAttempts: (encoreJobId: string) => `encore:job-attempts:${encoreJobId}`
+  jobAttempts: (encoreJobId: string) => `encore:job-attempts:${encoreJobId}`,
+  // #525 pt.2: set of encoreJobIds (externalIds) whose packaging has been
+  // handed off but not yet confirmed complete, keyed per Encore instance. The
+  // scaler's teardown eligibility check treats a non-empty set here as real
+  // work, even when Encore itself already reports the instance's transcode
+  // job(s) terminal — closing the race where scale-down destroys an instance
+  // (minInstances:0, short idleTimeoutMs) before the packager has had a
+  // chance to GET that instance's /encoreJobs/{uuid} endpoint. See
+  // src/encore-scaler/packaging-pin.ts.
+  pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`
 };

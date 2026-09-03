@@ -32,6 +32,7 @@ import {
 } from './instance-pool.js';
 import { recordDispatch, requeueInterruptedByScaleDown } from './retry-store.js';
 import { probeCallbackTrust } from './callback-trust-probe.js';
+import { hasPendingPackaging } from './packaging-pin.js';
 
 // Default bounded wait for the outbound callback-listener TLS-trust probe
 // (issue #463) when EncoreScalerConfig.callbackTrustTimeoutMs is unset.
@@ -176,12 +177,27 @@ export class EncoreScalerLoop {
       // the authoritative "still running on Encore" set from fetchRealActiveState.
       await this.requeueScaleDownInterruptions(inst.instanceId, real.activeExternalIds);
 
-      if (real.count > 0) {
-        // The instance has real in-flight work even though the tracked count (or
-        // the age clock) marked it a teardown candidate. Do NOT destroy it. Mark
-        // it draining so dispatch routes no new jobs to it, and reconcile the
-        // tracked activeJobs up to the real count so the divergence is corrected.
-        // It will be torn down on a later tick once real.count reaches zero.
+      // #525 pt.2: Encore reporting zero real in-flight work is NOT the same as
+      // "nothing still needs this instance". The transcode->package handoff
+      // pins an instance (encore:pending-packaging:{instanceId}) the moment its
+      // job completes, BEFORE the tracked activeJobs is decremented, so this
+      // check always sees the pin before the instance could otherwise look
+      // idle. A pinned instance is treated exactly like one with real.count > 0
+      // below: drained, not destroyed, until the packager has fetched its job
+      // document (pin cleared by the success callback) or the pin's defensive
+      // TTL expires. See src/encore-scaler/packaging-pin.ts.
+      const pendingPackaging = await hasPendingPackaging(redis, inst.instanceId);
+
+      if (real.count > 0 || pendingPackaging) {
+        // The instance has real in-flight work, or packaging is still pending
+        // against it, even though the tracked count (or the age clock) marked
+        // it a teardown candidate. Do NOT destroy it. Mark it draining so
+        // dispatch routes no new jobs to it, and reconcile the tracked
+        // activeJobs up to the real count (Encore-side work only — a packaging
+        // pin with no real Encore job is not "active" work for dispatch
+        // purposes) so the divergence is corrected. It will be torn down on a
+        // later tick once both real.count and the pending-packaging set are
+        // empty.
         const nextActive = real.count;
         const drainingRecord: EncoreInstanceRecord = {
           ...inst,
@@ -191,7 +207,8 @@ export class EncoreScalerLoop {
         if (inst.draining !== true || inst.activeJobs !== nextActive) {
           console.warn(
             `[encore-scaler] scale-down: instance ${inst.instanceId} has real in-flight ` +
-              `work (tracked=${inst.activeJobs} real=${nextActive}); draining instead of destroying`
+              `work (tracked=${inst.activeJobs} real=${nextActive}) or pending packaging ` +
+              `(${pendingPackaging}); draining instead of destroying`
           );
         }
         await updateInstance(redis, workspaceId, drainingRecord);
@@ -199,7 +216,7 @@ export class EncoreScalerLoop {
         continue;
       }
 
-      // Confirmed real.count === 0: safe to tear down.
+      // Confirmed real.count === 0 and no pending packaging: safe to tear down.
       await destroyInstance(inst.instanceId, this.config);
       activeCount -= 1;
     }

@@ -40,6 +40,7 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import type { Redis } from 'ioredis';
 
 // Packager callback schemas (verified from encore-packager callbackListener.ts 2026-07-07).
@@ -239,6 +240,26 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           'package'
         );
         if (execution) {
+          // #525 pt.2: packaging for this execution is confirmed complete —
+          // release the pin (packaging-pin.ts) that kept the transcode
+          // instance alive against premature scale-down while this was
+          // pending. Best-effort: a release failure must never fail the
+          // packager's callback (it would just retry); the pin's own TTL is
+          // the safety net if this never runs.
+          if (opts.redis) {
+            try {
+              const encoreJobId = execution.steps.find((s) => s.name === 'transcode')?.encoreJobId;
+              const decoded = encoreJobId ? decodeEncoreJobId(encoreJobId) : undefined;
+              if (encoreJobId && decoded) {
+                const instanceId = await opts.redis.hget(keys.jobInstance(decoded.workspaceId), encoreJobId);
+                if (instanceId) {
+                  await unpinInstanceForPackaging(opts.redis, instanceId, encoreJobId);
+                }
+              }
+            } catch (err) {
+              fastify.log.warn({ err, executionId: execution.id }, 'failed to release packaging pin after packager success');
+            }
+          }
           // Post-package relocation (issue #208, ADR-011). If this execution
           // carries a per-execution destination override, server-side-copy the
           // packaged output from the default staging bucket to the override
@@ -433,6 +454,39 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         { jobs: jobRepository, assets: repository }
       );
 
+      // #525 pt.2: pin the instance that ran this job against premature
+      // scale-down BEFORE decrementActiveJobs below makes it look idle to the
+      // scaler's teardown check — mirrors the same fix in
+      // encore-callback-poller.ts (this route is this deployment's OTHER
+      // transcode->package handoff path, subject to the identical race).
+      // Released below on every exit that doesn't hand off to a genuinely
+      // enqueued packaging job, by the packager's success callback once
+      // packaging completes, or by the pin's own TTL otherwise.
+      let pinnedInstanceId: string | undefined;
+      if (result.applied && success && opts.redis) {
+        const decoded = decodeEncoreJobId(externalId);
+        if (decoded) {
+          try {
+            const instanceId = await opts.redis.hget(keys.jobInstance(decoded.workspaceId), externalId);
+            if (instanceId) {
+              await pinInstanceForPackaging(opts.redis, instanceId, externalId);
+              pinnedInstanceId = instanceId;
+            }
+          } catch (err) {
+            fastify.log.warn({ err, externalId }, 'failed to pin instance for packaging handoff');
+          }
+        }
+      }
+      const releasePendingPackagingPin = async (): Promise<void> => {
+        if (!pinnedInstanceId || !opts.redis) return;
+        try {
+          await unpinInstanceForPackaging(opts.redis, pinnedInstanceId, externalId);
+        } catch (err) {
+          fastify.log.warn({ err, externalId, instanceId: pinnedInstanceId }, 'failed to release packaging pin');
+        }
+      };
+      let packagingHandedOff = false;
+
       // Free the slot on the Encore instance that ran this job so the scaler
       // can reuse its capacity. Only on a terminal completion that applied.
       if (result.applied) {
@@ -472,6 +526,9 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                 steps[nextIdx] = { ...steps[nextIdx], status: 'running', startedAt: now };
                 await opts.pipelineRepository.update(execution.id, { steps, status: 'running' });
                 void opts.packaging.triggerPackaging(found.job.assetId, encoreJobUrl);
+                // #525 pt.2: packaging is genuinely in flight — leave the pin
+                // in place until the packager's success callback releases it.
+                packagingHandedOff = true;
               } else {
                 steps[nextIdx] = {
                   ...steps[nextIdx],
@@ -489,6 +546,13 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
             }
           }
         }
+      }
+
+      // #525 pt.2: any path above that did not hand this job's pin off to a
+      // genuinely enqueued packaging job must release it here rather than
+      // waiting out its TTL.
+      if (!packagingHandedOff) {
+        await releasePendingPackagingPin();
       }
 
       // Notify subscribers (issue #13). Fire-and-forget; only emitted when the

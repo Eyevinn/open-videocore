@@ -51,6 +51,7 @@ import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from '../src
 class FakeRedis {
   private hashes = new Map<string, Map<string, string>>();
   private lists = new Map<string, string[]>();
+  private sets = new Map<string, Set<string>>();
 
   private hash(key: string): Map<string, string> {
     let h = this.hashes.get(key);
@@ -59,6 +60,14 @@ class FakeRedis {
       this.hashes.set(key, h);
     }
     return h;
+  }
+  private set_(key: string): Set<string> {
+    let s = this.sets.get(key);
+    if (!s) {
+      s = new Set();
+      this.sets.set(key, s);
+    }
+    return s;
   }
 
   async hgetall(key: string): Promise<Record<string, string>> {
@@ -76,6 +85,23 @@ class FakeRedis {
   }
   async rpoplpush(): Promise<string | null> {
     return null; // queue is always empty in these tests
+  }
+  // #525 pt.2: scale-down teardown now checks the packaging pin (SCARD).
+  // No test in this file ever pins an instance, so this is always empty.
+  async sadd(key: string, member: string): Promise<number> {
+    const s = this.set_(key);
+    const isNew = !s.has(member);
+    s.add(member);
+    return isNew ? 1 : 0;
+  }
+  async srem(key: string, member: string): Promise<number> {
+    return this.set_(key).delete(member) ? 1 : 0;
+  }
+  async scard(key: string): Promise<number> {
+    return this.set_(key).size;
+  }
+  async pexpire(): Promise<number> {
+    return 1;
   }
 }
 
