@@ -263,6 +263,99 @@ describe('GET /:id/delivery', () => {
     expect(body.urls.dash).toBe('https://cdn.example/packaged/x/manifest.mpd');
   });
 
+  // Issue #506: a configured + packaged asset must return a fully-resolvable
+  // ABSOLUTE playback URL and an explicit `ready` status, so a consuming app can
+  // trust the URL plays without workarounds.
+  it('returns status=ready with an absolute playback URL for a configured, packaged asset', async () => {
+    process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: {
+        hls: `/openvideocore-packaged/${id}/abc/index.m3u8`
+      }
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe('ready');
+    expect(body.urls.hls).toBe(
+      `https://api.example.test/api/v1/assets/${id}/stream/index.m3u8`
+    );
+    // The advertised URL is absolute (fully resolvable), not a bare path.
+    expect(() => new URL(body.urls.hls)).not.toThrow();
+  });
+
+  // Issue #506: an already-public (absolute) manifest is `ready` and returned
+  // verbatim.
+  it('returns status=ready for an already-absolute public manifest', async () => {
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: { hls: 'https://cdn.example/packaged/x/index.m3u8' }
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    const body = res.json();
+    expect(body.status).toBe('ready');
+    expect(body.urls.hls).toBe('https://cdn.example/packaged/x/index.m3u8');
+  });
+
+  // Issue #506: packaged output exists but public delivery is NOT configured
+  // (PUBLIC_BASE_URL unset → the stream proxy can only yield a relative,
+  // non-resolvable URL). The response must NOT look ready: it returns an
+  // unambiguous `not_configured` status, no playable URL, and the persisted
+  // packaged-location metadata (#502) for deterministic client-side resolution.
+  it('returns status=not_configured (no URL) when public delivery is unconfigured', async () => {
+    // PUBLIC_BASE_URL intentionally unset (cleared by afterEach).
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` },
+      packagedOutput: {
+        bucket: 'openvideocore-packaged',
+        prefix: `${id}/abc/`,
+        masterHlsKey: `${id}/abc/index.m3u8`
+      }
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe('not_configured');
+    expect(body.urls.hls).toBeUndefined();
+    expect(body.urls.dash).toBeUndefined();
+    // Enough metadata for a client to resolve objects deterministically.
+    expect(body.resolution.packagedBucket).toBe('openvideocore-packaged');
+    expect(body.resolution.packagedPrefix).toBe(`${id}/abc/`);
+    expect(body.resolution.masterHlsKey).toBe(`${id}/abc/index.m3u8`);
+  });
+
+  // Issue #506: same unconfigured case under DELIVERY_MODE=proxy — the proxy
+  // base is relative without PUBLIC_BASE_URL, so it is `not_configured`, never a
+  // 200 advertising a bare relative URL.
+  it('returns status=not_configured in DELIVERY_MODE=proxy when PUBLIC_BASE_URL is unset', async () => {
+    process.env['DELIVERY_MODE'] = 'proxy';
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+    });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe('not_configured');
+    expect(body.urls.hls).toBeUndefined();
+  });
+
+  // Issue #506: a not-yet-packaged asset (no manifests, no source object) is an
+  // unambiguous non-ready response — never a 200 that looks ready.
+  it('returns 404 no_delivery for a not-yet-packaged asset', async () => {
+    const { app } = await buildApp();
+    const id = await createAsset(app);
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toBe('no_delivery');
+  });
+
   it('requires authentication', async () => {
     const { app, repo } = await buildApp();
     const id = await createAsset(app);

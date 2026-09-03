@@ -4752,6 +4752,13 @@
                     "assetId": {
                       "type": "string"
                     },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "ready",
+                        "not_configured"
+                      ]
+                    },
                     "urls": {
                       "type": "object",
                       "properties": {
@@ -4767,12 +4774,31 @@
                       },
                       "additionalProperties": false
                     },
+                    "resolution": {
+                      "type": "object",
+                      "properties": {
+                        "packagedBucket": {
+                          "type": "string"
+                        },
+                        "packagedPrefix": {
+                          "type": "string"
+                        },
+                        "masterHlsKey": {
+                          "type": "string"
+                        },
+                        "masterDashKey": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
                     "expiresAt": {
                       "type": "string"
                     }
                   },
                   "required": [
                     "assetId",
+                    "status",
                     "urls",
                     "expiresAt"
                   ],
