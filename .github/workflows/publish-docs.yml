@@ -4,28 +4,30 @@ name: Publish docs to My Pages
 # "videocore" (https://videocore.pages.osaas.io/) — dispatched manually, or
 # automatically whenever a GitHub Release is published, so the public docs
 # track what ships rather than every commit to main.
+#
+# Mirrors Eyevinn/osaas-landing-app's mypages-stage-deploy.yml mechanism:
+# a tenant-scoped Personal Access Token (OSC_ACCESS_TOKEN, x-pat-jwt) drives
+# deploy.svc.prod.osaas.io directly to create/publish the page, and
+# `aws s3 sync --delete` uploads straight to the tenant's My Pages MinIO
+# bucket using tenant-scoped root credentials — not the admin-scoped
+# OSC_API_KEY already used by sync-fork.yml, which cannot create or own a
+# per-tenant My Page.
 on:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'OSC environment to publish to'
-        required: true
-        default: 'prod'
-        type: choice
-        options:
-          - prod
-          - dev
-          - stage
+  workflow_dispatch: {}
 
 concurrency:
   group: publish-docs-mypages
   cancel-in-progress: false
 
+env:
+  PAGE_NAME: videocore
+  API_BASE: https://deploy.svc.prod.osaas.io
+
 jobs:
   publish:
-    name: Publish to My Pages (${{ inputs.environment || 'prod' }})
+    name: Publish to My Pages
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -44,29 +46,164 @@ jobs:
 
       # Regenerates public/docs/ from the openapi.json already committed at
       # this ref (no live server needed, see scripts/generate-docs.ts) so a
-      # manual dispatch always publishes the freshest reference, even if run
-      # against an older tag before update-openapi.yml last ran.
+      # manual dispatch always publishes the freshest reference, even against
+      # an older tag from before update-openapi.yml last ran.
       - name: Regenerate docs
         run: pnpm generate:docs
 
-      - name: Install OSC CLI
-        run: npm install -g @osaas/cli
-
-      # `osc web publish --sync` creates the My Page if it doesn't exist yet,
-      # uploads public/docs/ to its backing bucket, removes anything no
-      # longer present (--sync), and marks the new content live — the same
-      # OSC_API_KEY-based auth already used by sync-fork.yml.
-      - name: Publish to My Pages
+      # GET .../mypages/videocore -> 200 if it exists (the common case once
+      # the page has been created once). On 404, create it. 409 means a
+      # concurrent request just created it - treat as success either way.
+      # 503 + Retry-After means the tenant's backing MinIO instance is still
+      # lazily provisioning - retry within a bounded ~90s budget. `aws s3
+      # sync` alone cannot do this step: it has no way to provision the
+      # page's Ingress/DNS on first creation.
+      - name: Ensure My Page 'videocore' exists
         env:
-          OSC_ACCESS_TOKEN: unused
-          OSC_API_KEY: ${{ secrets.OSC_API_KEY }}
-          ENV: ${{ inputs.environment || 'prod' }}
-        run: osc --env "$ENV" web publish --sync videocore public/docs
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          status=$(curl -s -o /tmp/mypage-get-body.json -w '%{http_code}' \
+            -H "x-pat-jwt: Bearer ${OSC_ACCESS_TOKEN}" \
+            "${API_BASE}/mypages/${PAGE_NAME}")
+
+          if [ "$status" = "200" ]; then
+            echo "My Page '${PAGE_NAME}' already exists - updating in place."
+            exit 0
+          fi
+
+          if [ "$status" = "401" ]; then
+            echo "::error::GET /mypages/${PAGE_NAME} returned 401 Unauthorized. Check that the OSC_ACCESS_TOKEN secret is a valid, unexpired tenant Personal Access Token."
+            cat /tmp/mypage-get-body.json
+            exit 1
+          fi
+
+          if [ "$status" != "404" ]; then
+            echo "::error::GET /mypages/${PAGE_NAME} failed unexpectedly: HTTP ${status}"
+            cat /tmp/mypage-get-body.json
+            exit 1
+          fi
+
+          echo "My Page '${PAGE_NAME}' does not exist yet - creating it."
+
+          budget_ms=90000
+          start_ms=$(date +%s%3N)
+          while true; do
+            status=$(curl -s -D /tmp/mypage-create-headers.txt -o /tmp/mypage-create-body.json -w '%{http_code}' \
+              -X POST \
+              -H "x-pat-jwt: Bearer ${OSC_ACCESS_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\": \"${PAGE_NAME}\"}" \
+              "${API_BASE}/mypages")
+
+            if [ "$status" = "201" ] || [ "$status" = "409" ]; then
+              echo "POST /mypages returned ${status} - page '${PAGE_NAME}' now exists."
+              break
+            fi
+
+            if [ "$status" = "401" ]; then
+              echo "::error::POST /mypages returned 401 Unauthorized creating '${PAGE_NAME}'. Check that the OSC_ACCESS_TOKEN secret is a valid tenant Personal Access Token."
+              cat /tmp/mypage-create-body.json
+              exit 1
+            fi
+
+            if [ "$status" = "503" ]; then
+              retry_after=$(grep -i '^retry-after:' /tmp/mypage-create-headers.txt | awk '{print $2}' | tr -d '\r')
+              retry_after=${retry_after:-5}
+              now_ms=$(date +%s%3N)
+              elapsed_ms=$((now_ms - start_ms))
+              wait_ms=$((retry_after * 1000))
+              if [ $((elapsed_ms + wait_ms)) -gt "$budget_ms" ]; then
+                echo "::error::POST /mypages still 503 after ${elapsed_ms}ms (retry budget ${budget_ms}ms exhausted) creating '${PAGE_NAME}'."
+                cat /tmp/mypage-create-body.json
+                exit 1
+              fi
+              echo "POST /mypages: got 503 (still provisioning), retrying in ${retry_after}s (elapsed ${elapsed_ms}ms)"
+              sleep "${retry_after}"
+              continue
+            fi
+
+            echo "::error::POST /mypages failed: HTTP ${status}"
+            cat /tmp/mypage-create-body.json
+            exit 1
+          done
+
+      # Direct `aws s3 sync --delete` against the tenant's dedicated My Pages
+      # MinIO instance, using tenant-scoped root credentials.
+      # --endpoint-url is a non-AWS host; AWS CLI v2's default `auto`
+      # addressing_style falls back to path-style for any custom endpoint
+      # with no extra flags required. Credentials are scoped to this step's
+      # env block only - never exported repo-wide, and never sharing the
+      # admin-scoped OSC_API_KEY secret used by sync-fork.yml.
+      - name: Sync docs to My Pages MinIO bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MYPAGES_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MYPAGES_MINIO_SECRET_KEY }}
+          AWS_DEFAULT_REGION: 'us-east-1'
+          MYPAGES_MINIO_ENDPOINT_URL: ${{ secrets.MYPAGES_MINIO_ENDPOINT_URL }}
+        run: |
+          aws s3 sync public/docs/ "s3://${PAGE_NAME}" \
+            --endpoint-url "${MYPAGES_MINIO_ENDPOINT_URL}" \
+            --delete
+
+      # Empty body ({}) keeps today's behaviour: copy dir-index keys, mark
+      # live, no deletions. We deliberately do NOT send {files, prune: true}
+      # here: `aws s3 sync --delete` above already pruned orphaned objects
+      # directly at the object-storage layer.
+      - name: Finalize publish (mark live)
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          budget_ms=90000
+          start_ms=$(date +%s%3N)
+          while true; do
+            status=$(curl -s -D /tmp/mypage-publish-headers.txt -o /tmp/mypage-publish-body.json -w '%{http_code}' \
+              -X POST \
+              -H "x-pat-jwt: Bearer ${OSC_ACCESS_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{}' \
+              "${API_BASE}/mypages/${PAGE_NAME}/publish")
+
+            if [ "$status" = "200" ]; then
+              echo "Published. Response:"
+              cat /tmp/mypage-publish-body.json
+              break
+            fi
+
+            if [ "$status" = "401" ]; then
+              echo "::error::POST /mypages/${PAGE_NAME}/publish returned 401 Unauthorized. Check that the OSC_ACCESS_TOKEN secret is a valid tenant Personal Access Token."
+              cat /tmp/mypage-publish-body.json
+              exit 1
+            fi
+
+            if [ "$status" = "503" ]; then
+              retry_after=$(grep -i '^retry-after:' /tmp/mypage-publish-headers.txt | awk '{print $2}' | tr -d '\r')
+              retry_after=${retry_after:-5}
+              now_ms=$(date +%s%3N)
+              elapsed_ms=$((now_ms - start_ms))
+              wait_ms=$((retry_after * 1000))
+              if [ $((elapsed_ms + wait_ms)) -gt "$budget_ms" ]; then
+                echo "::error::POST /mypages/${PAGE_NAME}/publish still 503 after ${elapsed_ms}ms (retry budget ${budget_ms}ms exhausted)."
+                cat /tmp/mypage-publish-body.json
+                exit 1
+              fi
+              echo "POST /mypages/${PAGE_NAME}/publish: got 503 (still provisioning), retrying in ${retry_after}s (elapsed ${elapsed_ms}ms)"
+              sleep "${retry_after}"
+              continue
+            fi
+
+            echo "::error::POST /mypages/${PAGE_NAME}/publish failed: HTTP ${status}"
+            cat /tmp/mypage-publish-body.json
+            exit 1
+          done
 
       - name: Smoke test
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' https://videocore.pages.osaas.io/)
-          echo "https://videocore.pages.osaas.io/ returned HTTP $code"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://${PAGE_NAME}.pages.osaas.io/")
+          echo "https://${PAGE_NAME}.pages.osaas.io/ returned HTTP $code"
           if [ "$code" != "200" ]; then
             echo "Smoke test failed: expected HTTP 200, got $code"
             exit 1
