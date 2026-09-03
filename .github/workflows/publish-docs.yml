@@ -1,0 +1,73 @@
+name: Publish docs to My Pages
+
+# Publishes the generated docs site (public/docs/) to the OSC My Pages site
+# "videocore" (https://videocore.pages.osaas.io/) — dispatched manually, or
+# automatically whenever a GitHub Release is published, so the public docs
+# track what ships rather than every commit to main.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'OSC environment to publish to'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - prod
+          - dev
+          - stage
+
+concurrency:
+  group: publish-docs-mypages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to My Pages (${{ inputs.environment || 'prod' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Regenerates public/docs/ from the openapi.json already committed at
+      # this ref (no live server needed, see scripts/generate-docs.ts) so a
+      # manual dispatch always publishes the freshest reference, even if run
+      # against an older tag before update-openapi.yml last ran.
+      - name: Regenerate docs
+        run: pnpm generate:docs
+
+      - name: Install OSC CLI
+        run: npm install -g @osaas/cli
+
+      # `osc web publish --sync` creates the My Page if it doesn't exist yet,
+      # uploads public/docs/ to its backing bucket, removes anything no
+      # longer present (--sync), and marks the new content live — the same
+      # OSC_API_KEY-based auth already used by sync-fork.yml.
+      - name: Publish to My Pages
+        env:
+          OSC_ACCESS_TOKEN: unused
+          OSC_API_KEY: ${{ secrets.OSC_API_KEY }}
+          ENV: ${{ inputs.environment || 'prod' }}
+        run: osc --env "$ENV" web publish --sync videocore public/docs
+
+      - name: Smoke test
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://videocore.pages.osaas.io/)
+          echo "https://videocore.pages.osaas.io/ returned HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "Smoke test failed: expected HTTP 200, got $code"
+            exit 1
+          fi
