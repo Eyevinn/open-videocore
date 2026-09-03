@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>open-videocore documentation · open-videocore docs</title>
+<title>Ingesting media · open-videocore docs</title>
 <style>
 :root{
   --bg:#ffffff; --bg-side:#f6f7f9; --bg-code:#1e2530; --text:#1c2128; --text-dim:#5b6572;
@@ -119,7 +119,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     
     <div class="nav-top"><a href="introduction.html" class="nav-top-link">Introduction</a><a href="data-model.html" class="nav-top-link">Data model</a><a href="installation.html" class="nav-top-link">Installation</a><a href="authentication.html" class="nav-top-link">Authentication &amp; errors</a></div>
     <div class="nav-section-label">Guides</div>
-    <div class="nav-guides"><a href="guide-ingest.html" class="nav-guide-link">Ingesting media</a><a href="guide-transcode-package.html" class="nav-guide-link">Transcoding &amp; packaging</a><a href="guide-metadata-search.html" class="nav-guide-link">Metadata, tags &amp; search</a><a href="guide-thumbnails-clips-export.html" class="nav-guide-link">Thumbnails, clips &amp; export</a><a href="guide-delivery.html" class="nav-guide-link">Delivery &amp; playback</a><a href="guide-organizing.html" class="nav-guide-link">Organizing: collections &amp; webhooks</a><a href="guide-operating.html" class="nav-guide-link">Operating a workspace</a></div>
+    <div class="nav-guides"><a href="guide-ingest.html" class="nav-guide-link active">Ingesting media</a><a href="guide-transcode-package.html" class="nav-guide-link">Transcoding &amp; packaging</a><a href="guide-metadata-search.html" class="nav-guide-link">Metadata, tags &amp; search</a><a href="guide-thumbnails-clips-export.html" class="nav-guide-link">Thumbnails, clips &amp; export</a><a href="guide-delivery.html" class="nav-guide-link">Delivery &amp; playback</a><a href="guide-organizing.html" class="nav-guide-link">Organizing: collections &amp; webhooks</a><a href="guide-operating.html" class="nav-guide-link">Operating a workspace</a></div>
     <div class="nav-section-label">API reference</div>
     
 <div class="nav-group">
@@ -270,28 +270,58 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   </nav>
   <main class="main">
     
-<h1>open-videocore</h1>
-<p class="lede">Headless, API-first media asset management middleware that runs entirely on Open Source Cloud. Ingest, transcode, package, search, and deliver video — one REST API per workspace, backed by its own provisioned stack.</p>
-<div class="hero-links">
-  <a href="installation.html">Install on OSC &rarr;</a>
-  <a href="introduction.html">Read the introduction</a>
-  <a href="api-reference.html">Browse the API reference</a>
-</div>
+    <div class="crumb"><a href="index.html">Docs</a> / Guides / Ingesting media</div>
+    <h1>Ingesting media</h1>
+    <p class="lede">Get source video into open-videocore: from a URL, direct upload, presigned/multipart upload, or an object storage watch-folder.</p>
+    
+<p>Every asset starts as a record, then gets its source media attached to it one of four ways. Pick the one that matches where your video already lives.</p>
 
-<h2 id="guides">Guides</h2>
-<p class="group-blurb">Task-oriented walkthroughs — what you can do, and how. Each one links to the exact endpoints involved.</p>
-<div class="card-grid"><a class="card" href="guide-ingest.html"><div class="card-title">Ingesting media</div><div class="card-desc">Get source video into open-videocore: from a URL, direct upload, presigned/multipart upload, or an object storage watch-folder.</div></a><a class="card" href="guide-transcode-package.html"><div class="card-title">Transcoding &amp; packaging</div><div class="card-desc">Turn source media into an ABR ladder and package it as HLS/DASH — as separate steps, or chained in one pipeline.</div></a><a class="card" href="guide-metadata-search.html"><div class="card-title">Metadata, tags &amp; search</div><div class="card-desc">Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.</div></a><a class="card" href="guide-thumbnails-clips-export.html"><div class="card-title">Thumbnails, clips &amp; export</div><div class="card-desc">Extract poster frames, cut a sub-segment into a new asset, and re-wrap into a different container.</div></a><a class="card" href="guide-delivery.html"><div class="card-title">Delivery &amp; playback</div><div class="card-desc">Get a playable URL for an asset — proxied HLS/DASH manifests or a presigned source download.</div></a><a class="card" href="guide-organizing.html"><div class="card-title">Organizing: collections &amp; webhooks</div><div class="card-desc">Group related assets into collections, and get HTTP notifications when asset and job state changes.</div></a><a class="card" href="guide-operating.html"><div class="card-title">Operating a workspace</div><div class="card-desc">Provision a workspace&#x27;s backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.</div></a></div>
+<h2 id="create">1. Create the asset record</h2>
+<p>An asset always starts as a record you create explicitly, or one created for you by the ingest-from-URL shortcut below.</p>
+<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &#x27;{&quot;title&quot;: &quot;Keynote recording&quot;, &quot;description&quot;: &quot;Opening keynote, main stage&quot;}&#x27;</code></pre></div>
+<p>See <code>POST /api/v1/assets/</code> — full field list in the <a href="ref-assets.html#post-api-v1-assets">Assets reference</a>.</p>
 
-<h2 id="reference">Reference</h2>
-<p class="group-blurb">Looking for one endpoint's exact parameters or response shape? The <a href="api-reference.html">API reference</a> covers all 100 endpoints, generated from the committed <code>openapi.json</code>.</p>
-<div class="card-grid">
-  <a class="card" href="introduction.html"><div class="card-title">Introduction</div><div class="card-desc">What open-videocore is and how it's put together.</div></a>
-  <a class="card" href="data-model.html"><div class="card-title">Data model</div><div class="card-desc">Core entities and how they relate.</div></a>
-  <a class="card" href="installation.html"><div class="card-title">Installation</div><div class="card-desc">Launch an instance on OSC.</div></a>
-  <a class="card" href="authentication.html"><div class="card-title">Authentication &amp; errors</div><div class="card-desc">Bearer tokens and API conventions.</div></a>
-</div>
+<h2 id="url">2. Ingest from a public URL</h2>
+<p>If the source file is already reachable over HTTP(S), skip the manual create step — this creates the asset and starts the download in one call:</p>
+<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/ingest-url \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &#x27;{&quot;sourceUrl&quot;: &quot;https://example.com/video.mp4&quot;, &quot;title&quot;: &quot;Keynote recording&quot;}&#x27;</code></pre></div>
+<p>This returns a <a href="data-model.html#job">Job</a> of type <code>ingest-url</code>. Poll <code>GET /api/v1/jobs/{id}</code> until <code>status</code> is <code>done</code>; the job's <code>assetId</code> is the asset to work with next.</p>
+
+<h2 id="direct-upload">3. Direct upload (small files)</h2>
+<p>For files you already have locally and that are small enough to send in one request:</p>
+<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X PUT https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/upload \
+  -H &quot;Content-Type: video/mp4&quot; \
+  --data-binary @video.mp4</code></pre></div>
+
+<h2 id="presigned">4. Presigned upload (browser / large single-part)</h2>
+<p>To upload directly to object storage from a browser or client without proxying bytes through the API, get a presigned URL first, upload to it, then tell the API the upload finished:</p>
+<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/upload-url
+# -&gt; { &quot;url&quot;: &quot;https://...&quot;, ... } — PUT your file bytes to that URL, then:
+curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/upload-complete</code></pre></div>
+
+<h2 id="multipart">5. Multipart upload (large files)</h2>
+<p>For files too large for a single PUT, initiate a multipart upload, request a presigned URL per part, upload each part directly to storage, then complete:</p>
+<ol>
+  <li><code>POST /api/v1/assets/{id}/multipart/initiate</code></li>
+  <li><code>GET /api/v1/assets/{id}/multipart/{uploadId}/part-url</code> — once per part</li>
+  <li><code>POST /api/v1/assets/{id}/multipart/{uploadId}/complete</code></li>
+  <li>If something goes wrong: <code>DELETE /api/v1/assets/{id}/multipart/{uploadId}</code> — abort</li>
+</ol>
+
+<h2 id="watch-folder">6. Watch-folder ingest</h2>
+<p>Point open-videocore at an object storage bucket and it will pick up new files automatically, without any per-file API call:</p>
+<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/storage/buckets/&lt;bucket&gt;/watch-folder/toggle \
+  -H &quot;Content-Type: application/json&quot; \
+  -d &#x27;{{&quot;enabled&quot;: true}}&#x27;</code></pre></div>
+<p>See <a href="ref-storage.html">Storage reference</a> for bucket listing and the poller's own start/stop controls in <a href="ref-admin.html">Admin</a>.</p>
+
+<div class="callout">Every path above ends at the same place: an <a href="data-model.html#asset">Asset</a> with <code>status</code> moving from <code>uploading</code> to <code>processing</code> to <code>ready</code> (or <code>failed</code>). Watch that field, or an <a href="guide-organizing.html#webhooks">asset.ready / asset.failed webhook</a>, rather than polling the job directly once the source file has landed.</div>
 
     
+    <div class="pager"><a href="data-model.html"><span class="dir">&larr; Previous</span>Data model</a><a href="guide-transcode-package.html" style="text-align:right"><span class="dir">Next &rarr;</span>Transcoding &amp; packaging</a></div>
     <footer class="doc-footer">The API reference is generated from <code>openapi.json</code>, committed in the open-videocore repository. Interactive, always-current reference docs are also served at <code>/api-docs</code> on any running instance.</footer>
   </main>
 </div>
