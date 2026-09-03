@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://videocore.pages.osaas.io/ref-health.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-provisioning.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-optional-services.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-profiles.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-assets.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-jobs.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-pipelines.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-encore.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-scaler.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-retention.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-logs.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-search.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-webhooks.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-collections.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-storage.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-admin.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-internal.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/ref-ui.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/api-reference.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/guide-ingest.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/guide-transcode-package.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/guide-metadata-search.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/guide-thumbnails-clips-export.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/guide-delivery.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/guide-organizing.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/guide-operating.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/agentic-examples.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/introduction.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/data-model.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/installation.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/authentication.html</loc></url>
+  <url><loc>https://videocore.pages.osaas.io/</loc></url>
+</urlset>

@@ -3,24 +3,24 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Metadata, tags &amp; search · open-videocore docs</title>
-<meta name="description" content="Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.">
-<link rel="canonical" href="https://videocore.pages.osaas.io/guide-metadata-search.html">
+<title>Agentic examples · open-videocore docs</title>
+<meta name="description" content="Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.">
+<link rel="canonical" href="https://videocore.pages.osaas.io/agentic-examples.html">
 <link rel="icon" href="data:,">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="open-videocore documentation">
-<meta property="og:title" content="Metadata, tags &amp; search">
-<meta property="og:description" content="Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.">
-<meta property="og:url" content="https://videocore.pages.osaas.io/guide-metadata-search.html">
+<meta property="og:title" content="Agentic examples">
+<meta property="og:description" content="Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.">
+<meta property="og:url" content="https://videocore.pages.osaas.io/agentic-examples.html">
 <meta property="og:image" content="https://videocore.pages.osaas.io/og-image.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="open-videocore — API-first media asset management on Open Source Cloud">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Metadata, tags &amp; search">
-<meta name="twitter:description" content="Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.">
+<meta name="twitter:title" content="Agentic examples">
+<meta name="twitter:description" content="Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.">
 <meta name="twitter:image" content="https://videocore.pages.osaas.io/og-image.png">
-<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"Metadata, tags & search","description":"Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.","url":"https://videocore.pages.osaas.io/guide-metadata-search.html","isPartOf":{"@type":"WebSite","name":"open-videocore documentation","url":"https://videocore.pages.osaas.io/"},"breadcrumb":{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Docs","item":"https://videocore.pages.osaas.io/"},{"@type":"ListItem","position":2,"name":"Metadata, tags & search","item":"https://videocore.pages.osaas.io/guide-metadata-search.html"}]}}</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"Agentic examples","description":"Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.","url":"https://videocore.pages.osaas.io/agentic-examples.html","isPartOf":{"@type":"WebSite","name":"open-videocore documentation","url":"https://videocore.pages.osaas.io/"},"breadcrumb":{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Docs","item":"https://videocore.pages.osaas.io/"},{"@type":"ListItem","position":2,"name":"Agentic examples","item":"https://videocore.pages.osaas.io/agentic-examples.html"}]}}</script>
 <style>
 :root{
   --bg:#ffffff; --bg-side:#f6f7f9; --bg-code:#1e2530; --text:#1c2128; --text-dim:#5b6572;
@@ -137,9 +137,9 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     
     <div class="nav-top"><a href="introduction.html" class="nav-top-link">Introduction</a><a href="data-model.html" class="nav-top-link">Data model</a><a href="installation.html" class="nav-top-link">Installation</a><a href="authentication.html" class="nav-top-link">Authentication &amp; errors</a></div>
     <div class="nav-section-label">Guides</div>
-    <div class="nav-guides"><a href="guide-ingest.html" class="nav-guide-link">Ingesting media</a><a href="guide-transcode-package.html" class="nav-guide-link">Transcoding &amp; packaging</a><a href="guide-metadata-search.html" class="nav-guide-link active">Metadata, tags &amp; search</a><a href="guide-thumbnails-clips-export.html" class="nav-guide-link">Thumbnails, clips &amp; export</a><a href="guide-delivery.html" class="nav-guide-link">Delivery &amp; playback</a><a href="guide-organizing.html" class="nav-guide-link">Organizing: collections &amp; webhooks</a><a href="guide-operating.html" class="nav-guide-link">Operating a workspace</a></div>
+    <div class="nav-guides"><a href="guide-ingest.html" class="nav-guide-link">Ingesting media</a><a href="guide-transcode-package.html" class="nav-guide-link">Transcoding &amp; packaging</a><a href="guide-metadata-search.html" class="nav-guide-link">Metadata, tags &amp; search</a><a href="guide-thumbnails-clips-export.html" class="nav-guide-link">Thumbnails, clips &amp; export</a><a href="guide-delivery.html" class="nav-guide-link">Delivery &amp; playback</a><a href="guide-organizing.html" class="nav-guide-link">Organizing: collections &amp; webhooks</a><a href="guide-operating.html" class="nav-guide-link">Operating a workspace</a></div>
     <div class="nav-section-label">Agentic examples</div>
-    <div class="nav-guides"><a href="agentic-examples.html" class="nav-guide-link">Agentic examples</a></div>
+    <div class="nav-guides"><a href="agentic-examples.html" class="nav-guide-link active">Agentic examples</a></div>
     <div class="nav-section-label">API reference</div>
     
 <div class="nav-group">
@@ -290,40 +290,54 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   </nav>
   <main class="main">
     
-    <div class="crumb"><a href="index.html">Docs</a> / Guides / Metadata, tags &amp; search</div>
-    <h1>Metadata, tags &amp; search</h1>
-    <p class="lede">Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.</p>
+    <div class="crumb"><a href="index.html">Docs</a> / Agentic examples</div>
+    <h1>Agentic examples</h1>
+    <p class="lede">Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.</p>
     
-<p>Assets carry two kinds of metadata — technical (read off the file itself) and free-form (whatever your application wants to attach) — plus tags, and both feed the same search endpoint.</p>
+<p>open-videocore is a plain REST API with a committed <a href="api-reference.html"><code>openapi.json</code></a> — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given your instance URL and a token to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: give the agent your instance URL, point it at the guides or the raw endpoints, and describe the outcome you want.</p>
+<div class="callout">Each example below assumes the agent already knows your instance URL (<code>https://&lt;your-instance&gt;</code>) and has your <a href="authentication.html">bearer token</a> available — as an environment variable, a secret store, or pasted into the conversation the same way you'd hand it any other API credential.</div>
 
-<h2 id="technical">1. Extract technical metadata</h2>
-<p>Codec, resolution, duration, and bitrate are not known until you ask for them:</p>
-<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/extract-metadata</code></pre></div>
-<p>Results land on the asset's <code>technicalMetadata</code> field (see the <a href="data-model.html#asset">Asset</a> entity).</p>
+<h2 id="review-link">Send a large file for review</h2>
+<p><strong>Scenario:</strong> you have a large video file on your own machine and need someone else to review it, without emailing a multi-gigabyte attachment or waiting on a slow file-sharing upload.</p>
+<div class="code-block"><div class="code-label">Prompt</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs to
+review by Friday. Upload it to my open-videocore instance at
+https://&lt;your-instance&gt;, wait until it's ready, package it for streaming,
+and give me a playback link I can send her.</code></pre></div>
+<p>What the agent does, mapped to the real calls:</p>
+<ol>
+  <li><code>POST /api/v1/assets/</code> — create the asset record</li>
+  <li>Because the file is large, a <a href="guide-ingest.html#multipart">multipart upload</a>: <code>POST /api/v1/assets/{id}/multipart/initiate</code> → <code>GET /api/v1/assets/{id}/multipart/{uploadId}/part-url</code> — per part → <code>POST /api/v1/assets/{id}/multipart/{uploadId}/complete</code></li>
+  <li>Poll <code>GET /api/v1/assets/{id}</code> until <code>status</code> leaves <code>uploading</code></li>
+  <li><code>POST /api/v1/assets/{id}/execute</code> — run the transcode-and-package pipeline (see <a href="guide-transcode-package.html">Transcoding &amp; packaging</a>), then poll the execution</li>
+  <li><code>GET /api/v1/assets/{id}/delivery</code> for the playback URL (see <a href="guide-delivery.html">Delivery &amp; playback</a>)</li>
+</ol>
+<p>If the agent also has messaging tools connected, the same prompt can end with "...and send Jana a Slack message with the link" — the video handling is exactly the same either way.</p>
 
-<h2 id="freeform">2. Attach free-form metadata</h2>
-<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X PUT https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/metadata \
-  -H &quot;Content-Type: application/json&quot; \
-  -d '{&quot;key-value&quot;: &quot;pairs specific to your application&quot;}'</code></pre></div>
-<p>This is a full replace, not a merge — see <code>PUT /api/v1/assets/{id}/metadata</code> in the <a href="ref-assets.html">Assets reference</a>.</p>
+<h2 id="highlights-collection">Build a highlights collection from tagged clips</h2>
+<p><strong>Scenario:</strong> pull every clip that matches a tag into one collection for an editor, without hand-searching the library.</p>
+<div class="code-block"><div class="code-label">Prompt</div><pre><code>Find all assets tagged "goal" from this week's match footage on my
+open-videocore instance and put them in a new collection called
+"Matchday highlights" for the editing team.</code></pre></div>
+<p>What the agent does:</p>
+<ol>
+  <li><code>GET /api/v1/search</code> — filter by tags=goal, see Metadata, tags & search (<a href="guide-metadata-search.html#search">guide</a>)</li>
+  <li><code>POST /api/v1/collections/</code> — create "Matchday highlights"</li>
+  <li><code>PUT /api/v1/collections/{id}/assets/{assetId}</code> — once per matching asset (see <a href="guide-organizing.html#collections">Organizing: collections &amp; webhooks</a>)</li>
+</ol>
 
-<h2 id="tags">3. Tag assets</h2>
-<div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/tags \
-  -H &quot;Content-Type: application/json&quot; \
-  -d '{&quot;tag&quot;: &quot;keynote&quot;}'</code></pre></div>
-<p>Remove one with <code>DELETE /api/v1/assets/{id}/tags/{tag}</code>.</p>
-
-<h2 id="search">4. Search</h2>
-<p>One endpoint covers both free text and exact filters, ANDed together and paginated:</p>
-<div class="code-block"><div class="code-label">Request</div><pre><code>curl &quot;https://&lt;your-instance&gt;/api/v1/search?q=keynote&amp;tags=stage-a&amp;page=1&amp;pageSize=20&quot;</code></pre></div>
-<p>Exact-filter fields: <code>tags</code>, <code>mimeType</code>, <code>metadata.&lt;key&gt;</code>, <code>tamsFlowId</code>, <code>tamsTimerange</code>. Free text (<code>q</code>) matches over name and description. Full shape in the <a href="ref-search.html">Search reference</a>.</p>
-<div class="callout warn"><code>GET /api/v1/assets/search</code> is a deprecated, free-text-only alias kept for backward compatibility — new integrations should use <code>/api/v1/search</code> above.</div>
-
-<h2 id="tracks">5. Audio and subtitle tracks</h2>
-<p>List an asset's tracks with <code>GET /api/v1/assets/{id}/tracks</code>; add or remove one with <code>POST /api/v1/assets/{id}/audio-tracks</code> / <code>POST /api/v1/assets/{id}/subtitle-tracks</code> and their <code>DELETE</code> counterparts. See the <a href="ref-assets.html">Assets reference</a> for the full set.</p>
+<h2 id="notify-on-ready">Get notified when uploads finish processing</h2>
+<p><strong>Scenario:</strong> stop manually checking whether ingested files have finished processing.</p>
+<div class="code-block"><div class="code-label">Prompt</div><pre><code>Turn on watch-folder ingest for the "raw-uploads" bucket on my
+open-videocore instance, and register a webhook so we get pinged whenever
+an asset finishes processing or fails.</code></pre></div>
+<p>What the agent does:</p>
+<ol>
+  <li><code>POST /api/v1/storage/buckets/{bucket}/watch-folder/toggle</code> — {"enabled": true} (see <a href="guide-ingest.html#watch-folder">Ingesting media</a>)</li>
+  <li><code>POST /api/v1/webhooks/</code> — events: ["asset.ready", "asset.failed"] (see <a href="guide-organizing.html#webhooks">Organizing: collections &amp; webhooks</a>)</li>
+</ol>
 
     
-    <div class="pager"><a href="guide-transcode-package.html"><span class="dir">&larr; Previous</span>Transcoding &amp; packaging</a><a href="guide-thumbnails-clips-export.html" style="text-align:right"><span class="dir">Next &rarr;</span>Thumbnails, clips &amp; export</a></div>
+    <div class="pager"><a href="guide-operating.html"><span class="dir">&larr; Previous</span>Operating a workspace</a><a href="api-reference.html" style="text-align:right"><span class="dir">Next &rarr;</span>API reference</a></div>
     <footer class="doc-footer">The API reference is generated from <code>openapi.json</code>, committed in the open-videocore repository. Interactive, always-current reference docs are also served at <code>/api-docs</code> on any running instance.</footer>
   </main>
 </div>
