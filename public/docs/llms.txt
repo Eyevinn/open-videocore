@@ -22,6 +22,7 @@
 - [Data model](https://videocore.pages.osaas.io/data-model.html): The core entities open-videocore manages — Asset, Job, Pipeline Execution, Profile, Collection, Webhook, Stack, and more — and how they relate.
 - [Installation](https://videocore.pages.osaas.io/installation.html): Step-by-step instructions for launching an instance of open-videocore on Open Source Cloud (OSC).
 - [Authentication & errors](https://videocore.pages.osaas.io/authentication.html): How to authenticate requests to the open-videocore API with a bearer token, plus its error and status-code conventions.
+- [Documentation](https://videocore.pages.osaas.io/docs.html): Guides, data model, installation, and the full API reference for open-videocore — start here for anything docs-related.
 
 ## API reference
 
