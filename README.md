@@ -29,7 +29,7 @@ Headless, API-first media asset management (MAM) middleware that runs entirely o
 - **Multi-language** — per-asset audio track and subtitle track management
 - **Collections** — named groups for organising assets
 - **Search** — full-text and metadata field filtering
-- **Delivery** — playback URLs (HLS/DASH manifests or presigned source download)
+- **Delivery** — playback URLs (HLS/DASH manifests proxy-streamed through the API, or presigned source download); see [ADR-003](docs/architecture/ADR-003-delivery-and-stream-url-contract.md) for the full `/delivery` + `/stream/*` contract
 - **Webhooks** — HTTP event notifications for asset and job lifecycle events
 - **Ops UI** — built-in dashboard at `/ui` for managing assets, jobs, and buckets
 
@@ -187,7 +187,8 @@ Key endpoints:
 | `GET` | `/api/v1/assets/:id/thumbnails/:index` | Get a single thumbnail |
 | `POST` | `/api/v1/assets/:id/clip` | Clip a time segment into a new asset |
 | `POST` | `/api/v1/assets/:id/export` | Re-wrap into a different container format |
-| `GET` | `/api/v1/assets/:id/delivery` | Get playback URLs |
+| `GET` | `/api/v1/assets/:id/delivery` | Get playback URLs (see [ADR-003](docs/architecture/ADR-003-delivery-and-stream-url-contract.md)) |
+| `GET` | `/api/v1/assets/:id/stream/*` | Proxy-stream packaged HLS/DASH manifests and segments (see [ADR-003](docs/architecture/ADR-003-delivery-and-stream-url-contract.md)) |
 | `PUT` | `/api/v1/assets/:id/metadata` | Replace free-form metadata |
 | `GET` | `/api/v1/assets/:id/tracks` | List audio and subtitle tracks |
 | `POST` | `/api/v1/assets/:id/audio-tracks` | Add an audio track |
