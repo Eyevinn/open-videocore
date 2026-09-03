@@ -392,7 +392,7 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   // #381: the retry classification for the attempt being settled terminally.
   // Set from the retry gate's decision on the settle branch below; consumed
   // after completeTranscode to finalize the durable encode-attempt log.
-  let terminalFailureClass: import('../encore-scaler/retry-policy.js').FailureClass | undefined;
+  let terminalFailureClass: import('../encore-scaler/retry-policy.js').MessageFailureClass | undefined;
 
   // #295: before settling a FAILED job terminal, ask the retry gate whether this
   // is a transport-class failure (S3 pool-acquire timeout on write / severed read

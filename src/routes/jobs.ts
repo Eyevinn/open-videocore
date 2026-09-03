@@ -13,17 +13,23 @@ import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository, typ
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
-import type { FailureClass } from '../encore-scaler/retry-policy.js';
+import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
-// Mirrors FailureClass (src/encore-scaler/retry-policy.ts:70). Kept as a local
-// literal enum because FailureClass is a type-only union with no runtime value
-// to import; the two are asserted to stay in sync at build time below.
+// Mirrors MessageFailureClass (src/encore-scaler/retry-policy.ts) — the
+// message-derived subset that can appear on a completed encode attempt. Kept as a
+// local literal enum because MessageFailureClass is a type-only union with no
+// runtime value to import; the two are asserted to stay in sync at build time
+// below. NOTE (#514): the caller-facing classification enum is deliberately the
+// message-derived subset ONLY. The internal 'interrupted_by_scaledown' class is a
+// topology event, never a completed-attempt classification, so it is intentionally
+// absent here (surfacing it to callers is #515's scope, not this issue's).
 const FAILURE_CLASSES = ['transport', 'io-retryable', 'deterministic'] as const;
-// Compile-time guard: fails typecheck if FailureClass and FAILURE_CLASSES drift.
-type _AssertFailureClassInSync = FailureClass extends (typeof FAILURE_CLASSES)[number]
-  ? (typeof FAILURE_CLASSES)[number] extends FailureClass
+// Compile-time guard: fails typecheck if MessageFailureClass and FAILURE_CLASSES
+// drift.
+type _AssertFailureClassInSync = MessageFailureClass extends (typeof FAILURE_CLASSES)[number]
+  ? (typeof FAILURE_CLASSES)[number] extends MessageFailureClass
     ? true
     : never
   : never;

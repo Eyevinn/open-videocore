@@ -19,7 +19,7 @@ import {
   type JobType,
   type UpdateJobInput
 } from './job-repo.js';
-import type { FailureClass } from '../encore-scaler/retry-policy.js';
+import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 
 const RESOURCE_TYPE = 'job';
@@ -128,7 +128,7 @@ export class CouchJobRepository implements JobRepository {
   // retry refetches _rev and re-appends so the append is not lost.
   async appendEncodeAttempt(
     id: string,
-    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined> {
     const couch = this.couchFor();
     let updated: Job | undefined;
@@ -150,7 +150,7 @@ export class CouchJobRepository implements JobRepository {
   // same conflict-retry safety as the other read-modify-write paths.
   async finalizeEncodeAttempt(
     id: string,
-    patch: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined> {
     const couch = this.couchFor();
     let updated: Job | undefined;

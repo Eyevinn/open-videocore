@@ -7,7 +7,7 @@
 // observability for the pull worker — clients poll GET /api/v1/jobs/:id to see
 // status, progress, and any terminal error.
 
-import type { FailureClass } from '../encore-scaler/retry-policy.js';
+import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
 
 // ---------------------------------------------------------------------------
 // Job model + lifecycle
@@ -18,12 +18,16 @@ import type { FailureClass } from '../encore-scaler/retry-policy.js';
 // TTL'd Valkey retry keys (#380). `startedAt` is stamped when the scaler
 // dispatches the attempt; `endedAt`/`classification` are populated on
 // completion by the poller (#381). `classification` reuses the retry policy's
-// FailureClass (src/encore-scaler/retry-policy.ts:70) — do NOT redefine it.
+// MessageFailureClass (src/encore-scaler/retry-policy.ts) — the message-derived
+// subset only. A completed encode attempt always ended with (or without) an Encore
+// failure message; the topology-event class 'interrupted_by_scaledown' (#514) is
+// NEVER a completed-attempt classification, so it is intentionally excluded from
+// this caller-facing field. Do NOT redefine it.
 export type EncodeAttempt = {
   index: number;
   startedAt: string;
   endedAt?: string;
-  classification?: FailureClass;
+  classification?: MessageFailureClass;
 };
 
 // Job lifecycle. A job is created `pending`. Transcode jobs then sit `queued`
@@ -171,7 +175,7 @@ export interface JobRepository {
   // undefined if the job id is unknown.
   appendEncodeAttempt(
     id: string,
-    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined>;
   // Durably close out the latest (open) encode-attempt on completion (ADR-012,
   // #381): stamp its `endedAt` and, for failures, the retry `classification`
@@ -181,7 +185,7 @@ export interface JobRepository {
   // updated job, or undefined if the job id is unknown.
   finalizeEncodeAttempt(
     id: string,
-    patch: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined>;
 }
 
@@ -251,7 +255,7 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
 // actual dispatch. `startedAt` defaults to now when omitted.
 export function appendEncodeAttemptToJob(
   existing: Job,
-  attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass },
+  attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: MessageFailureClass },
   now: string
 ): Job {
   const log = existing.encodeAttemptLog ? [...existing.encodeAttemptLog] : [];
@@ -285,7 +289,7 @@ export function appendEncodeAttemptToJob(
 // field still has a single non-zero reading rather than staying absent.
 export function finalizeLatestEncodeAttemptOnJob(
   existing: Job,
-  patch: { endedAt?: string; classification?: FailureClass },
+  patch: { endedAt?: string; classification?: MessageFailureClass },
   now: string
 ): Job {
   const endedAt = patch.endedAt ?? now;
@@ -382,7 +386,7 @@ export class InMemoryJobRepository implements JobRepository {
 
   async appendEncodeAttempt(
     id: string,
-    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: FailureClass }
+    attempt: { index?: number; startedAt?: string; endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined> {
     const existing = this.store.get(id);
     if (!existing) {
@@ -395,7 +399,7 @@ export class InMemoryJobRepository implements JobRepository {
 
   async finalizeEncodeAttempt(
     id: string,
-    patch: { endedAt?: string; classification?: FailureClass }
+    patch: { endedAt?: string; classification?: MessageFailureClass }
   ): Promise<Job | undefined> {
     const existing = this.store.get(id);
     if (!existing) {

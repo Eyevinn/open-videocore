@@ -13,11 +13,16 @@ import type { Redis } from 'ioredis';
 import {
   classifyEncoreFailure,
   isRetryableFailureClass,
+  isScaleDownInterruption,
   backoffForAttempt,
   MAX_ENCODE_ATTEMPTS,
   BACKOFF_MS
 } from './retry-policy.js';
-import { decideRetry, recordDispatch } from './retry-store.js';
+import {
+  decideRetry,
+  recordDispatch,
+  requeueInterruptedByScaleDown
+} from './retry-store.js';
 import { keys, type QueuedJob } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -67,6 +72,39 @@ describe('classifyEncoreFailure (#295 transport-vs-input rule)', () => {
     expect(backoffForAttempt(1)).toBe(BACKOFF_MS[0]);
     expect(backoffForAttempt(2)).toBe(BACKOFF_MS[1]);
     expect(backoffForAttempt(99)).toBe(BACKOFF_MS[BACKOFF_MS.length - 1]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 1b: scale-down interruption is a DISTINCT, recoverable class (#514)
+// ---------------------------------------------------------------------------
+
+describe('interrupted_by_scaledown classification (#514)', () => {
+  it('is a distinct, clearly-recoverable failure class', () => {
+    expect(isRetryableFailureClass('interrupted_by_scaledown')).toBe(true);
+    expect(isScaleDownInterruption('interrupted_by_scaledown')).toBe(true);
+  });
+
+  it('is distinct from transport / io-retryable / deterministic', () => {
+    expect(isScaleDownInterruption('transport')).toBe(false);
+    expect(isScaleDownInterruption('io-retryable')).toBe(false);
+    expect(isScaleDownInterruption('deterministic')).toBe(false);
+  });
+
+  it('is NEVER inferred from a failure message — a deterministic message stays deterministic', () => {
+    // The whole point of #514: scale-down interruption is a topology event, not a
+    // message signature. classifyEncoreFailure only returns message-derived
+    // classes, so a genuine deterministic (or transport/IO) failure message can
+    // never be reclassified as scale-down interruption.
+    const deterministicMsg =
+      "Profile 'program-x265' requires an audio stream but the input has none";
+    expect(classifyEncoreFailure(deterministicMsg)).toBe('deterministic');
+    expect(classifyEncoreFailure(deterministicMsg)).not.toBe('interrupted_by_scaledown');
+
+    // Even messages that *mention* scaling/draining words are not reclassified —
+    // the class is structural, not lexical.
+    expect(classifyEncoreFailure('instance drained during scale down')).toBe('deterministic');
+    expect(classifyEncoreFailure(undefined)).not.toBe('interrupted_by_scaledown');
   });
 });
 
@@ -236,5 +274,52 @@ describe('decideRetry (#295 re-dispatch gate)', () => {
     expect(decision.action).toBe('settle');
     if (decision.action !== 'settle') throw new Error('unreachable');
     expect(decision.reason).toBe('not-retryable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// requeueInterruptedByScaleDown (#514): a scale-down interruption is re-queued
+// as clearly-recoverable work, NOT surfaced as a generic failure.
+// ---------------------------------------------------------------------------
+
+describe('requeueInterruptedByScaleDown (#514 re-enqueue)', () => {
+  let redis: FakeRedis;
+
+  beforeEach(() => {
+    redis = new FakeRedis();
+  });
+
+  it('re-enqueues the interrupted job with its original payload and keeps it running', async () => {
+    // The job was dispatched (attempt 1) then its worker was scaled away.
+    await recordDispatch(asRedis(redis), EXTERNAL_ID, PAYLOAD, 1);
+    await redis.hset(keys.jobInstance(WS), EXTERNAL_ID, 'inst-gone');
+    await redis.hset(keys.jobStatus(WS), EXTERNAL_ID, 'running');
+
+    const ok = await requeueInterruptedByScaleDown(asRedis(redis), WS, EXTERNAL_ID);
+    expect(ok).toBe(true);
+
+    // Re-queued with the ORIGINAL payload; NO backoff (interrupted, not failing);
+    // the prior attempt count is carried unchanged (a scale-down is not a failed
+    // attempt, so it must not advance toward the bound).
+    const queued = await redis.lrange(keys.queue(WS), 0, -1);
+    expect(queued).toHaveLength(1);
+    const requeued = JSON.parse(queued[0]) as QueuedJob;
+    expect(requeued.jobId).toBe(EXTERNAL_ID);
+    expect(requeued.payload).toEqual(PAYLOAD);
+    expect(requeued.attempts).toBe(1);
+    expect(requeued.notBefore).toBeUndefined();
+
+    // Caller-facing status pinned RUNNING (never observed as failed), and the
+    // stale mapping to the scaled-away instance is dropped.
+    expect(await redis.hget(keys.jobStatus(WS), EXTERNAL_ID)).toBe('RUNNING');
+    expect(await redis.hget(keys.jobInstance(WS), EXTERNAL_ID)).toBeNull();
+  });
+
+  it('returns false and does not re-queue when the original payload is unavailable', async () => {
+    // No recordDispatch: payload key absent (e.g. TTL expired).
+    await redis.hset(keys.jobStatus(WS), EXTERNAL_ID, 'running');
+    const ok = await requeueInterruptedByScaleDown(asRedis(redis), WS, EXTERNAL_ID);
+    expect(ok).toBe(false);
+    expect(await redis.lrange(keys.queue(WS), 0, -1)).toHaveLength(0);
   });
 });
