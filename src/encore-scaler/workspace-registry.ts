@@ -59,6 +59,12 @@ export type WorkspaceEncoreScalerConfig = {
   // main.ts drives each id to a terminal `failed` state via the shared settle
   // path.
   onJobsDropped?: (encoreJobIds: string[]) => Promise<void>;
+  // Forwarded to every per-workspace scaler loop: invoked when a job is
+  // classified 'interrupted_by_scaledown' at the drain boundary (#514) and
+  // re-enqueued for auto-retry (#515). The scaler owns no repos, so main.ts
+  // annotates the caller-facing Job with the recoverable interruption reason
+  // (without changing its status).
+  onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
 };
 
 export class WorkspaceEncoreScalerRegistry implements EncoreClient {
@@ -90,7 +96,8 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       onDispatched: this.config.onDispatched,
       onEncodeDispatched: this.config.onEncodeDispatched,
       reconcileFailedTranscodes: this.config.reconcileFailedTranscodes,
-      onJobsDropped: this.config.onJobsDropped
+      onJobsDropped: this.config.onJobsDropped,
+      onJobInterrupted: this.config.onJobInterrupted
     };
 
     const loop = new EncoreScalerLoop(scalerConfig);

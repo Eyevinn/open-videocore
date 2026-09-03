@@ -14,6 +14,7 @@ import {
   type CreateJobInput,
   type EncodeAttempt,
   type Job,
+  type JobInterruptionReason,
   type JobRepository,
   type JobStatus,
   type JobType,
@@ -184,6 +185,8 @@ function toDoc(job: Job): Record<string, unknown> {
     renditionAssetIds: job.renditionAssetIds,
     encodeAttempts: job.encodeAttempts,
     encodeAttemptLog: job.encodeAttemptLog,
+    interrupted: job.interrupted,
+    interruptionReason: job.interruptionReason,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
   };
@@ -207,6 +210,8 @@ function fromDoc(doc: StoredDoc): Job {
     renditionAssetIds: doc['renditionAssetIds'] as string[] | undefined,
     encodeAttempts: doc['encodeAttempts'] as number | undefined,
     encodeAttemptLog: doc['encodeAttemptLog'] as EncodeAttempt[] | undefined,
+    interrupted: doc['interrupted'] as boolean | undefined,
+    interruptionReason: doc['interruptionReason'] as JobInterruptionReason | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

@@ -111,6 +111,75 @@ describe('GET /api/v1/jobs/:id encode attempts (issue #382)', () => {
     expect(body.type).toBe('transcode');
   });
 
+  // --- #515: recoverable interruption surfacing ---
+
+  it('surfaces a distinguishable, recoverable interrupted reason without leaving `failed`', async () => {
+    // A job interrupted by scale-down is re-enqueued and stays `running`; the
+    // caller-facing record is additively annotated (interrupted + reason) so a
+    // Media Developer can tell the interruption apart from a media failure.
+    const job = await h.jobs.create({ type: 'transcode', assetId: 'asset-i1' });
+    await h.jobs.update(job.id, { status: 'running' });
+    await h.jobs.update(job.id, {
+      interrupted: true,
+      interruptionReason: 'interrupted_by_scaledown'
+    });
+
+    const res = await h.app.inject({ method: 'GET', url: `/api/v1/jobs/${job.id}` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+
+    // Distinguishable + recoverable: not a generic `failed`.
+    expect(body.status).toBe('running');
+    expect(body.status).not.toBe('failed');
+    expect(body.interrupted).toBe(true);
+    expect(body.interruptionReason).toBe('interrupted_by_scaledown');
+  });
+
+  it('keeps interrupted fields absent (not false) on a job that was never interrupted', async () => {
+    // Backward compatibility: the additive fields must be absent — not false /
+    // null — so existing consumers of the current shape are unaffected.
+    const job = await h.jobs.create({ type: 'transcode', assetId: 'asset-i2' });
+    await h.jobs.update(job.id, { status: 'running' });
+
+    const res = await h.app.inject({ method: 'GET', url: `/api/v1/jobs/${job.id}` });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+
+    expect(body.status).toBe('running');
+    expect(body.interrupted).toBeUndefined();
+    expect(body.interruptionReason).toBeUndefined();
+  });
+
+  it('constrains interruptionReason to the documented closed enum (schema shape)', async () => {
+    // The response schema enum is exactly the caller-facing interruption
+    // vocabulary. A documented value serializes cleanly; an off-contract value
+    // is rejected by the response serializer (it is NOT free-form), proving the
+    // field is a closed, documented enum callers can rely on.
+    const ok = await h.jobs.create({ type: 'transcode', assetId: 'asset-i3a' });
+    await h.jobs.update(ok.id, { status: 'running' });
+    await h.jobs.update(ok.id, {
+      interrupted: true,
+      interruptionReason: 'interrupted_by_scaledown'
+    });
+    const okRes = await h.app.inject({ method: 'GET', url: `/api/v1/jobs/${ok.id}` });
+    expect(okRes.statusCode).toBe(200);
+    expect(okRes.json().interruptionReason).toBe('interrupted_by_scaledown');
+
+    // Force an off-contract value past the repo (cast, since the repo type is
+    // the closed enum) to prove the response schema constrains it: the closed
+    // enum rejects it rather than emitting an undocumented value to the caller.
+    const bad = await h.jobs.create({ type: 'transcode', assetId: 'asset-i3b' });
+    await h.jobs.update(bad.id, { status: 'running' });
+    await h.jobs.update(bad.id, {
+      interrupted: true,
+      interruptionReason: 'not_a_real_reason' as unknown as 'interrupted_by_scaledown'
+    });
+    const badRes = await h.app.inject({ method: 'GET', url: `/api/v1/jobs/${bad.id}` });
+    // Serializer rejects the off-contract value: callers never receive an
+    // undocumented interruption reason.
+    expect(badRes.statusCode).toBe(500);
+  });
+
   it('omits encode fields for an ingest job that was never dispatched to Encore', async () => {
     const job = await h.jobs.create({
       type: 'ingest-url',

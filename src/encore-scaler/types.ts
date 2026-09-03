@@ -97,6 +97,16 @@ export type EncoreScalerConfig = {
   // are our externalIds (encoreJobId). Best-effort: failures are swallowed so a
   // repo/settle hiccup never breaks the tick's scaling/dispatch work.
   onJobsDropped?: (encoreJobIds: string[]) => Promise<void>;
+  // Invoked when a job is classified 'interrupted_by_scaledown' at the drain/
+  // teardown boundary (#514) and re-enqueued for auto-retry (#515). The scaler
+  // owns no repositories, so main.ts wires this up to annotate the caller-facing
+  // Job record with the distinguishable, recoverable interruption reason
+  // (interrupted=true, interruptionReason='interrupted_by_scaledown') WITHOUT
+  // changing the job's status — the job stays `running` while it is auto-retried,
+  // so the existing status enum stays backward compatible. `encoreJobId` is our
+  // externalId (same id onDispatched/onJobsDropped resolve by). Best-effort: the
+  // scaler swallows a thrown hook so a repo hiccup never blocks the re-enqueue.
+  onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
 };
 
 export type EncoreInstanceRecord = {

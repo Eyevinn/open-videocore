@@ -10546,6 +10546,17 @@
                               "additionalProperties": false
                             }
                           },
+                          "interrupted": {
+                            "type": "boolean",
+                            "description": "True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` \u2014 it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum."
+                          },
+                          "interruptionReason": {
+                            "type": "string",
+                            "enum": [
+                              "interrupted_by_scaledown"
+                            ],
+                            "description": "Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely."
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -10696,6 +10707,17 @@
                         ],
                         "additionalProperties": false
                       }
+                    },
+                    "interrupted": {
+                      "type": "boolean",
+                      "description": "True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` \u2014 it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum."
+                    },
+                    "interruptionReason": {
+                      "type": "string",
+                      "enum": [
+                        "interrupted_by_scaledown"
+                      ],
+                      "description": "Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely."
                     },
                     "createdAt": {
                       "type": "string"
@@ -10857,6 +10879,17 @@
                         ],
                         "additionalProperties": false
                       }
+                    },
+                    "interrupted": {
+                      "type": "boolean",
+                      "description": "True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` \u2014 it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum."
+                    },
+                    "interruptionReason": {
+                      "type": "string",
+                      "enum": [
+                        "interrupted_by_scaledown"
+                      ],
+                      "description": "Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely."
                     },
                     "createdAt": {
                       "type": "string"

@@ -386,6 +386,25 @@ export class EncoreScalerLoop {
               `instance ${instanceId} (not terminal, not active on Encore); ` +
               `classified interrupted_by_scaledown and re-enqueued`
           );
+          // #515: surface the distinguishable, recoverable reason on the
+          // caller-facing Job record. The scaler owns no repositories, so it
+          // only raises the signal here; main.ts wires onJobInterrupted to
+          // annotate the Job (interrupted=true, reason) WITHOUT changing its
+          // status — it stays `running` while auto-retried. Best-effort: a
+          // thrown hook must never break the tick or the re-enqueue that
+          // already succeeded, so failures are swallowed.
+          if (this.config.onJobInterrupted) {
+            try {
+              await this.config.onJobInterrupted(jobId, 'interrupted_by_scaledown');
+            } catch (hookErr) {
+              console.warn(
+                '[encore-scaler] onJobInterrupted hook failed (workspace=%s, job=%s):',
+                workspaceId,
+                jobId,
+                hookErr
+              );
+            }
+          }
         } else {
           // Payload unavailable (e.g. TTL expired): cannot rebuild the job, so
           // leave it for reconcile()'s generic dropped-job path rather than fake

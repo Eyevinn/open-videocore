@@ -840,6 +840,24 @@ function activateScaler(redisUrl: string): void {
     // first-terminal-write-wins idempotency, so a late SUCCESSFUL callback cannot
     // clobber the settle. Best-effort per id: one job's failure never blocks the
     // rest, and the scaler already swallows a thrown hook.
+    // #515: when the scaler classifies a job 'interrupted_by_scaledown' at the
+    // drain boundary (#514) and re-enqueues it for auto-retry, annotate the
+    // caller-facing Job record with the distinguishable, recoverable reason so a
+    // Media Developer can tell an interruption apart from a genuine media
+    // failure. This is an ADDITIVE annotation ONLY: the job stays `running`
+    // (it is being auto-retried), so the status enum is untouched and existing
+    // consumers are unaffected. The scaler owns no repositories, so we resolve
+    // the job here by its encoreJobId (externalId), exactly as onDispatched does.
+    // Best-effort: the scaler swallows a thrown hook so a repo hiccup never
+    // blocks the re-enqueue that already succeeded.
+    onJobInterrupted: async (encoreJobId: string, reason: 'interrupted_by_scaledown') => {
+      const found = await jobRepository.findByEncoreJobId(encoreJobId);
+      if (!found) return;
+      await jobRepository.update(found.job.id, {
+        interrupted: true,
+        interruptionReason: reason
+      });
+    },
     onJobsDropped: async (encoreJobIds: string[]) => {
       for (const encoreJobId of encoreJobIds) {
         try {

@@ -9,7 +9,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import type { Redis } from 'ioredis';
-import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, type JobRepository, type JobStatus } from '../data/job-repo.js';
+import { InMemoryJobRepository, JOB_STATUSES, JOB_TYPES, JOB_INTERRUPTION_REASONS, type JobRepository, type JobStatus } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
@@ -76,6 +76,36 @@ const jobSchema = z.object({
   // LAST entry and compute `endedAt - startedAt`; this is the single documented
   // read for elapsed-time-excluding-retries.
   encodeAttemptLog: z.array(encodeAttemptSchema).optional(),
+  // --- Recoverable interruption surfacing (#515) ---
+  // True when this job was interrupted by an infrastructure/topology event
+  // (NOT a media failure) and is being auto-retried. This is how a caller
+  // tells a recoverable interruption apart from a genuine `failed` outcome:
+  // an interrupted job is NOT reported as `failed` — its `status` stays
+  // `running` while it is auto-retried, and this additive flag plus
+  // `interruptionReason` carry the distinguishable, recoverable reason.
+  // Additive and OPTIONAL: absent (not false) on jobs never interrupted, so
+  // existing consumers of the `status` enum are unaffected.
+  interrupted: z
+    .boolean()
+    .optional()
+    .describe(
+      'True when the job was interrupted by an infrastructure/topology event ' +
+        '(not a media failure) and is being auto-retried. The job stays ' +
+        '`running` — it is NOT reported as `failed`. Absent on jobs that were ' +
+        'never interrupted. Additive and backward compatible with the existing ' +
+        'status enum.'
+    ),
+  interruptionReason: z
+    .enum(JOB_INTERRUPTION_REASONS)
+    .optional()
+    .describe(
+      'Distinguishable, clearly-recoverable reason the job was interrupted, ' +
+        'present only when `interrupted` is true. `interrupted_by_scaledown`: ' +
+        'the shared worker pool scaled a worker away mid-job, so the work was ' +
+        'lost to a topology event (not a media failure). This is RECOVERABLE ' +
+        'and typically AUTO-RETRIED by the service with no operator ' +
+        'intervention; callers may also retry safely.'
+    ),
   createdAt: z.string(),
   updatedAt: z.string()
 });
