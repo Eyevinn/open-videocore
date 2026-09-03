@@ -24,7 +24,7 @@
 //     PATCH /config body is scalerConfigSchema.partial(), idleTimeoutMs floor
 //     MIN_IDLE_TIMEOUT_MS = 10_000.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
 
@@ -105,9 +105,28 @@ function idleRecord(instanceId: string, idleForMs: number): EncoreInstanceRecord
 }
 
 describe('Encore idle timeout — runtime scale-down (issue #87)', () => {
+  // Scale-down now performs an authoritative real-state check before tearing an
+  // instance down (issue #513, drain-don't-kill): it queries the instance's live
+  // QUEUED + IN_PROGRESS jobs and only destroys when that real count is zero. A
+  // genuinely-idle instance in these tests has no real work, so we stub fetch to
+  // return empty Encore findByStatus pages (totalElements:0) — confirming idle so
+  // the existing runtime-timeout teardown behaviour is preserved.
   beforeEach(() => {
     destroyInstance.mockClear();
     spawnInstance.mockClear();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ _embedded: { encoreJobs: [] }, page: { totalElements: 0 } }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      )
+    );
+  });
+
+  afterAll(() => {
+    vi.unstubAllGlobals();
   });
 
   it('a runtime timeout change takes effect on the next tick', async () => {

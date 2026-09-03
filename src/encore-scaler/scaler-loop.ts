@@ -125,22 +125,85 @@ export class EncoreScalerLoop {
       instances = [...instances, spawned];
     }
 
-    // 4. Scale down idle instances, but never below minInstances.
+    // 4. Scale down idle instances, but never below minInstances — and NEVER an
+    //    instance with a real in-flight job (issue #513, drain-don't-kill).
+    //
+    //    The tracked activeJobs count is a local approximation. On a shared pool
+    //    at minInstances=0 it can lag or diverge from the instance's authoritative
+    //    real IN_PROGRESS state (the periodic reconcile() above skips instances it
+    //    already believes are idle, so a tracked-0-but-really-busy instance is not
+    //    corrected there). Before selecting any teardown victim we therefore
+    //    reconcile the candidate against its real QUEUED+IN_PROGRESS state and
+    //    treat any instance with real in-flight work as INELIGIBLE for removal.
+    //
+    //    An eligible-by-age candidate that still has real work is marked DRAINING
+    //    (stop routing new jobs to it) instead of destroyed, and only torn down on
+    //    a later tick once its real active-job count reaches zero.
     const now = Date.now();
     const survivors: EncoreInstanceRecord[] = [];
     let activeCount = instances.length;
     for (const inst of instances) {
-      if (inst.activeJobs === 0 && now - inst.lastIdleAt > idleTimeoutMs && activeCount > minInstances) {
-        await destroyInstance(inst.instanceId, this.config);
-        activeCount -= 1;
-      } else {
+      const idlePastTimeout = now - inst.lastIdleAt > idleTimeoutMs;
+      // A candidate for teardown is either an instance the tracked count already
+      // considers idle-and-aged, or one already marked draining (which is being
+      // held only until its real work clears — see below).
+      const isTeardownCandidate =
+        (inst.activeJobs === 0 && idlePastTimeout) || inst.draining === true;
+
+      if (!isTeardownCandidate || activeCount <= minInstances) {
         survivors.push(inst);
+        continue;
       }
+
+      // Authoritative check BEFORE any destroy: confirm the instance really has
+      // no in-flight work. If the real state cannot be determined we conservatively
+      // KEEP the instance (never destroy on an unconfirmed count) so an unreachable
+      // instance mid-job is never killed by scale-down.
+      const real = await this.fetchRealActiveState(inst);
+
+      if (real === undefined) {
+        // Could not confirm real state — do not risk killing a live job. Keep it.
+        survivors.push(inst);
+        continue;
+      }
+
+      if (real.count > 0) {
+        // The instance has real in-flight work even though the tracked count (or
+        // the age clock) marked it a teardown candidate. Do NOT destroy it. Mark
+        // it draining so dispatch routes no new jobs to it, and reconcile the
+        // tracked activeJobs up to the real count so the divergence is corrected.
+        // It will be torn down on a later tick once real.count reaches zero.
+        const nextActive = real.count;
+        const drainingRecord: EncoreInstanceRecord = {
+          ...inst,
+          activeJobs: nextActive,
+          draining: true
+        };
+        if (inst.draining !== true || inst.activeJobs !== nextActive) {
+          console.warn(
+            `[encore-scaler] scale-down: instance ${inst.instanceId} has real in-flight ` +
+              `work (tracked=${inst.activeJobs} real=${nextActive}); draining instead of destroying`
+          );
+        }
+        await updateInstance(redis, workspaceId, drainingRecord);
+        survivors.push(drainingRecord);
+        continue;
+      }
+
+      // Confirmed real.count === 0: safe to tear down.
+      await destroyInstance(inst.instanceId, this.config);
+      activeCount -= 1;
     }
     instances = survivors;
 
     // 5. Dispatch pending jobs to instances with spare capacity.
     for (const inst of instances) {
+      // A draining instance (issue #513) is being torn down: it must receive no
+      // new job dispatches. Skip it so its real active-job count can reach zero
+      // and a later tick can safely remove it.
+      if (inst.draining === true) {
+        continue;
+      }
       // Gate first-job dispatch on confirmed outbound TLS trust to the paired
       // callback-listener ingress (issue #463). An instance that has never been
       // probed is NOT eligible for its first job until the probe passes; an
@@ -195,6 +258,72 @@ export class EncoreScalerLoop {
     }
   }
 
+  // Fetch an instance's AUTHORITATIVE real active-job state directly from Encore:
+  // the live QUEUED + IN_PROGRESS job documents. This is the single source of
+  // truth the scaler reconciles its tracked activeJobs against (both the periodic
+  // reconcile() correction and the pre-victim-selection check for issue #513).
+  //
+  // Returns:
+  //   - { count, activeExternalIds } when both status queries succeed. `count`
+  //     is queuedCount + inProgressCount; a freshly-dispatched job sits in QUEUED
+  //     until Encore picks it up, so counting only IN_PROGRESS would make an
+  //     instance look idle immediately after dispatch. `activeExternalIds` are
+  //     the externalIds Encore still reports active (used by the dropped-job diff).
+  //   - undefined when the real state cannot be determined (network error, non-2xx,
+  //     or an unparseable page). Callers MUST treat undefined conservatively: for
+  //     scale-down that means "do not destroy" — we never terminate an instance
+  //     whose real in-flight state we could not confirm is empty.
+  //
+  // Contract: Encore /encoreJobs/search/findByStatus returns Spring HATEOAS pages
+  // { _embedded: { encoreJobs: [{ id, externalId, ... }] }, page: { totalElements } }
+  // (verified in encore-callback-poller.ts:505-508, SVT Encore, 2026-07-07).
+  private async fetchRealActiveState(
+    record: EncoreInstanceRecord
+  ): Promise<{ count: number; activeExternalIds: Set<string> } | undefined> {
+    const { getToken } = this.config;
+    try {
+      const token = await getToken();
+      const base = record.url.replace(/\/$/, '');
+      const [resQ, resP] = await Promise.all([
+        fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=100`, {
+          headers: { authorization: `Bearer ${token}` }
+        }),
+        fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`, {
+          headers: { authorization: `Bearer ${token}` }
+        })
+      ]);
+      if (!resQ.ok || !resP.ok) return undefined;
+
+      type EncoreJobPage = {
+        _embedded?: { encoreJobs?: Array<{ externalId?: string }> };
+        page?: { totalElements?: number };
+      };
+      const [bodyQ, bodyP] = await Promise.all([
+        resQ.json().catch(() => ({})) as Promise<EncoreJobPage>,
+        resP.json().catch(() => ({})) as Promise<EncoreJobPage>
+      ]);
+      const queuedCount = bodyQ.page?.totalElements;
+      const inProgressCount = bodyP.page?.totalElements;
+      if (typeof queuedCount !== 'number' || typeof inProgressCount !== 'number') {
+        return undefined;
+      }
+
+      const activeExternalIds = new Set<string>();
+      for (const j of bodyQ._embedded?.encoreJobs ?? []) {
+        if (j.externalId) activeExternalIds.add(j.externalId);
+      }
+      for (const j of bodyP._embedded?.encoreJobs ?? []) {
+        if (j.externalId) activeExternalIds.add(j.externalId);
+      }
+
+      return { count: queuedCount + inProgressCount, activeExternalIds };
+    } catch {
+      // Any error means we could not confirm the real state — surface undefined
+      // so callers stay conservative (never destroy on an unconfirmed count).
+      return undefined;
+    }
+  }
+
   // Reconcile each instance's tracked activeJobs against its real IN_PROGRESS
   // job count. Corrects drift (e.g. a completion callback that never freed the
   // slot) so the pool can never get permanently stuck thinking every slot is
@@ -202,7 +331,7 @@ export class EncoreScalerLoop {
   // instances already at zero (nothing to correct downward). Each instance is
   // handled in isolation: one unreachable instance never breaks the tick.
   async reconcile(): Promise<void> {
-    const { redis, workspaceId, getToken } = this.config;
+    const { redis, workspaceId } = this.config;
 
     const raw = await redis.hgetall(keys.pool(workspaceId));
     const entries = Object.entries(raw);
@@ -227,41 +356,17 @@ export class EncoreScalerLoop {
         // Nothing to correct downward on an already-idle instance.
         if (record.activeJobs === 0) continue;
 
-        const token = await getToken();
-        const base = record.url.replace(/\/$/, '');
-        // Fetch both QUEUED and IN_PROGRESS job documents (not just counts) — a
+        // Fetch both QUEUED and IN_PROGRESS documents (not just counts) — a
         // freshly dispatched job sits in QUEUED until Encore picks it up, so
         // counting only IN_PROGRESS would make the instance look idle
         // immediately after dispatch and trigger a spurious scale-up on the next
-        // tick. We request the documents (size=100) rather than size=1 so we can
-        // read each active job's externalId and thereby tell WHICH tracked jobs
-        // (if any) have silently vanished — the dropped-job signal for #449.
-        // Contract: Encore /encoreJobs/search/findByStatus returns Spring
-        // HATEOAS pages { _embedded: { encoreJobs: [{ id, externalId, ... }] },
-        // page: { totalElements: N } } (verified in
-        // encore-callback-poller.ts:505-508, SVT Encore, 2026-07-07).
-        const [resQ, resP] = await Promise.all([
-          fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=100`, {
-            headers: { authorization: `Bearer ${token}` }
-          }),
-          fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`, {
-            headers: { authorization: `Bearer ${token}` }
-          })
-        ]);
-        if (!resQ.ok || !resP.ok) continue;
-
-        type EncoreJobPage = {
-          _embedded?: { encoreJobs?: Array<{ externalId?: string }> };
-          page?: { totalElements?: number };
-        };
-        const [bodyQ, bodyP] = await Promise.all([
-          resQ.json().catch(() => ({})) as Promise<EncoreJobPage>,
-          resP.json().catch(() => ({})) as Promise<EncoreJobPage>
-        ]);
-        const queuedCount = bodyQ.page?.totalElements;
-        const inProgressCount = bodyP.page?.totalElements;
-        if (typeof queuedCount !== 'number' || typeof inProgressCount !== 'number') continue;
-        const actualCount = queuedCount + inProgressCount;
+        // tick. fetchRealActiveState reads each active job's externalId so we can
+        // tell WHICH tracked jobs (if any) have silently vanished — the
+        // dropped-job signal for #449.
+        const real = await this.fetchRealActiveState(record);
+        if (!real) continue; // could not confirm — leave the record as-is
+        const actualCount = real.count;
+        const activeExternalIds = real.activeExternalIds;
 
         if (record.activeJobs !== actualCount) {
           // eslint-disable-next-line no-console
@@ -279,14 +384,6 @@ export class EncoreScalerLoop {
           // Encore still reports active. Anything tracked-running for this
           // instance that Encore no longer lists is dropped.
           if (actualCount < record.activeJobs) {
-            const activeExternalIds = new Set<string>();
-            for (const j of bodyQ._embedded?.encoreJobs ?? []) {
-              if (j.externalId) activeExternalIds.add(j.externalId);
-            }
-            for (const j of bodyP._embedded?.encoreJobs ?? []) {
-              if (j.externalId) activeExternalIds.add(j.externalId);
-            }
-
             const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
             const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
             for (const [jobId, mappedInstanceId] of Object.entries(trackedInstances)) {
