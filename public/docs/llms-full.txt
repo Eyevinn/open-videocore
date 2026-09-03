@@ -2975,7 +2975,7 @@ Agentic examples
 
 open-videocore is a plain REST API with a committed openapi.json — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given API access to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: point the agent at the guides or the raw endpoints and describe the outcome you want.
 
-  If your agent is already connected to OSC (for example over the OSC MCP server), you don't need to tell it your instance URL or hand it a token at all — it can look up your open-videocore My App itself and call it with the right credentials. Just name the instance, or skip that too if you only have one.
+  If your agent is already connected to OSC (for example over the OSC MCP server), you don't need to tell it your instance URL or hand it a token at all — it can look up your open-videocore My App itself and dispatch the call through OSC's MCP layer, which authenticates it automatically. The agent never sees or handles a bearer token. Just name the instance, or skip that too if you only have one.
 
   Otherwise, give it your instance URL (https://<your-instance>) and bearer token the same way you'd hand any other API credential to an assistant — as an environment variable, a secret store, or pasted into the conversation.
 

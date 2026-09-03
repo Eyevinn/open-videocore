@@ -983,7 +983,7 @@ const AGENTIC_EXAMPLES_DESCRIPTION =
 const agenticExamplesBody = `
 <p>open-videocore is a plain REST API with a committed <a href="api-reference.html"><code>openapi.json</code></a> — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given API access to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: point the agent at the guides or the raw endpoints and describe the outcome you want.</p>
 <div class="callout">
-  <p style="margin-top:0"><strong>If your agent is already connected to OSC</strong> (for example over the <a href="https://www.osaas.io/mcp" target="_blank" rel="noopener">OSC MCP server</a>), you don't need to tell it your instance URL or hand it a token at all — it can look up your open-videocore My App itself and call it with the right credentials. Just name the instance, or skip that too if you only have one.</p>
+  <p style="margin-top:0"><strong>If your agent is already connected to OSC</strong> (for example over the <a href="https://www.osaas.io/mcp" target="_blank" rel="noopener">OSC MCP server</a>), you don't need to tell it your instance URL or hand it a token at all — it can look up your open-videocore My App itself and dispatch the call through OSC's MCP layer, which authenticates it automatically. The agent never sees or handles a bearer token. Just name the instance, or skip that too if you only have one.</p>
   <p style="margin-bottom:0">Otherwise, give it your instance URL (<code>https://&lt;your-instance&gt;</code>) and <a href="authentication.html">bearer token</a> the same way you'd hand any other API credential to an assistant — as an environment variable, a secret store, or pasted into the conversation.</p>
 </div>
 
