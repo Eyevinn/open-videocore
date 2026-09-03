@@ -128,7 +128,7 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `COUCHDB_ADMIN_PASSWORD` | **Yes** | Admin password used when provisioning CouchDB instances. |
 | `PORT` | No | HTTP port (default `3000`). |
 | `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). |
-| `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances kept warm (default `0`). |
+| `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances the auto-scaler keeps warm per workspace even when idle (default `0` — scale to zero). Set to `1` or more to keep a warm floor for production / latency-sensitive shared pools. See [Auto-scaler warm floor](#auto-scaler-warm-floor-cost-vs-reliability) for the cost-vs-reliability trade-off. |
 | `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`, i.e. 5 minutes). Sets the boot-time default; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`idleTimeoutMs`, minimum `10000`). |
 | `ENCORE_S3_ENDPOINT` | No | MinIO/S3 endpoint URL passed to Encore instances so they can read source media. If unset, Encore instances cannot read from MinIO. |
 | `ENCORE_PROFILES_URL` | No | Default Encore profile index used to seed the profile store on first startup / bootstrap (default: the Eyevinn `encore-test-profiles` index). |
@@ -248,6 +248,49 @@ page }`).
 | `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances` and `idleTimeoutMs`). Returns `scalerActive: false` until a stack is provisioned; the auto-scaler activates against the provisioned stack's Valkey immediately after `POST /api/v1/provision` completes, with no restart. |
 | `GET` | `/api/v1/scaler/config` | Get auto-scaler configuration |
 | `PATCH` | `/api/v1/scaler/config` | Update auto-scaler configuration (`maxInstances`, `minInstances`, `idleTimeoutMs`) at runtime; `idleTimeoutMs` must be at least `10000` ms |
+
+#### Auto-scaler warm floor (cost vs. reliability)
+
+The auto-scaler keeps a per-workspace pool of Encore instances and scales it on
+demand. `ENCORE_MIN_INSTANCES` sets the **warm floor** — the minimum number of
+instances the scaler keeps running even when the pool is idle. It **defaults to
+`0`** (scale to zero), and can also be changed at runtime with `PATCH
+/api/v1/scaler/config` (`minInstances`).
+
+The default of `0` and any value `>= 1` behave differently, and the right choice
+depends on whether you are optimising for idle cost or for responsiveness:
+
+- **`ENCORE_MIN_INSTANCES=0` (default — scale to zero).** When a pool goes idle
+  past `ENCORE_IDLE_TIMEOUT_MS`, the scaler tears down its last instance, so an
+  idle workspace runs **no** Encore instances and reclaims the Encore compute
+  spend entirely. The cost is **scale-up cold-start latency**: the first
+  transcode submitted to a cold pool must wait for the scaler to create an Encore
+  instance and for that instance to become ready before the job is dispatched
+  (instance spawn takes on the order of 60–120 seconds). A scale-to-zero pool
+  also has **no warm headroom** — every burst starts from an empty pool.
+
+- **`ENCORE_MIN_INSTANCES >= 1` (warm floor — recommended for production).** The
+  scaler pre-warms up to this many instances regardless of pending work and never
+  scales the pool **below** the floor on idle teardown. The first job of a burst
+  lands on an already-running instance instead of paying the cold-start wait, and
+  the floor provides standing headroom for latency-sensitive or shared pools. The
+  trade-off is **standing cost**: the floor instances keep consuming Encore
+  compute while idle, so scale-to-zero savings no longer apply to that workspace.
+
+**Recommendation.** For production and any latency-sensitive or shared pool, set
+`ENCORE_MIN_INSTANCES` to at least `1` so the first request never eats a
+cold-start spawn. Leave it at the `0` default for development, bursty batch
+workloads, or cost-sensitive deployments where occasional first-job latency is
+acceptable in exchange for zero idle spend. Tune `ENCORE_MAX_INSTANCES` (default
+`3`) and `ENCORE_IDLE_TIMEOUT_MS` (default 5 minutes) alongside the floor to shape
+the pool's upper bound and how aggressively it scales back down.
+
+> **Warm floor vs. drain on scale-down.** The warm floor governs *how many*
+> instances stay up when idle; it is independent of *how* an instance is removed
+> when the pool does scale down. Whatever the floor, scale-down only ever removes
+> an instance once it reports **zero** active jobs, so raising the floor is a
+> latency/headroom decision, not a fix for in-flight work — it does not change
+> which instances are eligible for teardown, only the floor they stop at.
 
 **Collections**
 
