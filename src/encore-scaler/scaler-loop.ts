@@ -663,7 +663,20 @@ export class EncoreScalerLoop {
       // Capture the Encore-assigned UUID so the packaging step can construct a
       // valid encoreJobs/{uuid} URL. We store it separately (not in our Job table,
       // which is only updated via the callback path) with a 24h TTL.
-      const body = await res.json().catch(() => ({})) as { id?: string; jobId?: string };
+      let parseErr: unknown;
+      const body = await res.json().catch((err) => { parseErr = err; return {}; }) as { id?: string; jobId?: string };
+      if (parseErr) {
+        // #525: log the parse failure itself (not just "missing id") — this is
+        // exactly the class of gap that let the packaging handoff fail silently
+        // before: `body.id ?? body.jobId` swallowing a parse failure into an
+        // equally-empty '' gave no signal that Encore's response shape had
+        // changed versus what dispatch expects.
+        console.warn(
+          '[encore-scaler] dispatch: Encore POST /encoreJobs response body was not valid JSON for %s:',
+          job.jobId,
+          parseErr
+        );
+      }
       const encoreUuid = String(body.id ?? body.jobId ?? '');
       await redis.hset(keys.jobInstance(workspaceId), job.jobId, inst.instanceId);
       await redis.hset(keys.jobStatus(workspaceId), job.jobId, 'running');
@@ -714,10 +727,20 @@ export class EncoreScalerLoop {
         const encoreJobUrl = `${inst.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`;
         await redis.set(keys.jobEncoreUrl(job.jobId), encoreJobUrl, 'EX', 86_400);
       } else {
-        // Encore didn't return a usable UUID in the POST response body — log so
-        // this is diagnosable. The packaging step will fall back to the pool
-        // lookup, which may also fail if the UUID was not captured.
-        console.warn('[encore-scaler] dispatch: Encore POST response missing id — UUID key not stored for', job.jobId);
+        // Encore didn't return a usable UUID in the POST response body. This
+        // used to be fatal for packaging (see #525): if this branch is hit,
+        // jobUuid/uuidToExternalId/jobEncoreUrl are never stored, so any code
+        // path that depends on resolveEncoreJobUrl(externalId, redis) alone
+        // (rather than the `url` already resolved live off the callback
+        // message at completion time) will find nothing. Log the parsed body
+        // so the actual Encore response shape is diagnosable — was `id`
+        // renamed, nested, or genuinely absent — rather than a bare
+        // "missing id".
+        console.warn(
+          '[encore-scaler] dispatch: Encore POST /encoreJobs response missing usable id/jobId — UUID key not stored for %s. Body:',
+          job.jobId,
+          body
+        );
       }
 
       // The job has now actually left the local queue and is running on an

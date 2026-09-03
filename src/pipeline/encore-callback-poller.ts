@@ -532,7 +532,26 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
         steps[tIdx] = { ...steps[tIdx], status: 'done', completedAt: now };
         const nextIdx = steps.findIndex((s) => s.status === 'pending');
         if (nextIdx >= 0 && steps[nextIdx].name === 'package') {
-          const encoreJobUrl = await resolveEncoreJobUrl(externalId, deps.redis);
+          // #525: prefer the `url` already resolved (and proven reachable — we
+          // just fetched this exact job document with it) earlier in this same
+          // function, over re-deriving it from the dispatch-time Redis keys
+          // (jobEncoreUrl / jobUuid+pool). Those keys are written ONLY inside
+          // scaler-loop.ts dispatch()'s `if (encoreUuid && ...)` branch — if
+          // Encore's POST /encoreJobs response omitted `id` (or the pool record
+          // was later wiped by scale-down), none of them exist, yet `url` above
+          // was still resolved successfully via message.url (the callback
+          // listener observes Encore's own webhook independently of our
+          // dispatch-time bookkeeping, and message.url is already in the exact
+          // `${instanceUrl}/encoreJobs/${uuid}` shape the packager needs — see
+          // the module doc comment). Previously this re-derived the URL from
+          // scratch and, on that gap, failed the `package` step with the
+          // misleading "Encore instance no longer available for packaging" —
+          // silently (no log line) — even though the instance was fine and we
+          // had a working URL in hand the whole time. resolveEncoreJobUrl is
+          // now only a defensive fallback for the case (which should not arise
+          // given the `!url` guard earlier in this function) where `url` is
+          // somehow unset.
+          const encoreJobUrl = url ?? (await resolveEncoreJobUrl(externalId, deps.redis));
           if (encoreJobUrl) {
             // On-demand packager provisioning (epic #226, issue #244; #496):
             // ensure the packager is provisioned + wired + ready BEFORE enqueueing,
@@ -577,6 +596,18 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
             // advances this execution's `package` step to `done`.
             await enqueuePackagingJob(deps, found.job.assetId, encoreJobUrl);
           } else {
+            // #525: this branch should now be unreachable in practice, since
+            // `url` is required truthy earlier in this function — but log
+            // loudly rather than failing the step silently, so a future gap
+            // here is diagnosable from the poller's own logs instead of
+            // presenting only as an opaque "no longer available" pipeline
+            // error with nothing between "completing transcode" and "applied
+            // encore completion" to explain it.
+            deps.logger.error({
+              msg: 'encore-callback-poller: no Encore job URL available for packaging handoff — failing package step',
+              assetId: found.job.assetId,
+              externalId
+            });
             steps[nextIdx] = {
               ...steps[nextIdx],
               status: 'failed',
