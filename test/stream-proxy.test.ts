@@ -76,6 +76,18 @@ function makeStorageClient(objects: Map<string, StoredObject>) {
       if (!obj) throw notFound();
       const end = length === undefined ? obj.body.length : offset + length;
       return Readable.from(obj.body.subarray(offset, end));
+    },
+    // The minio listObjectsV2(bucket, prefix, recursive) -> stream of { name }
+    // surface the lazy packaged-prefix resolver (resolvePackagedOutput, issue
+    // #502/#503) uses for assets with no persisted `packagedOutput` prefix. It
+    // lists the packaged bucket under `<assetId>/` to derive the newest job
+    // prefix. Contract verified: src/pipeline/packaging.ts PackagedObjectLister /
+    // src/data/storage.ts:226.
+    listObjectsV2(_bucket: string, prefix: string, _recursive: boolean): Readable {
+      const matched = [...objects.keys()]
+        .filter((k) => k.startsWith(prefix))
+        .map((name) => ({ name }));
+      return Readable.from(matched);
     }
   };
 }
@@ -125,14 +137,15 @@ async function buildApp(opts: {
   return app;
 }
 
-function asset(id: string): Asset {
+function asset(id: string, packagedOutput?: Asset['packagedOutput']): Asset {
   const now = new Date().toISOString();
   return {
     id,
     name: 'clip',
     status: 'ready',
     createdAt: now,
-    updatedAt: now
+    updatedAt: now,
+    ...(packagedOutput ? { packagedOutput } : {})
   } as Asset;
 }
 
@@ -324,5 +337,154 @@ describe('GET /:id/stream/*', () => {
       headers: A
     });
     expect(res.statusCode).toBe(501);
+  });
+});
+
+// Issue #503: the packager writes every object of a package under a JOB-NESTED
+// prefix (`<assetId>/<packagerJobId>/`), persisted as `packagedOutput.prefix`
+// by issue #502 — NOT under the historical flat `packaged/<id>`. Before this
+// fix, `/stream/index.m3u8` mapped to the flat path and 404ed. These tests lock
+// in that the proxy resolves objects (master manifest, child playlists, media
+// segments) under the REAL persisted prefix, and that relative references are
+// rewritten to resolve back through the SAME `/stream/*` route.
+describe('GET /:id/stream/* resolves the packaged prefix (issue #503)', () => {
+  // The real packaged layout for `asset-9`: master HLS references a relative
+  // child playlist (`video-0_3022.m3u8`) which references relative media
+  // (`video-0_3022/init.mp4`, `video-0_3022/1.m4s`) — the exact shape called out
+  // in the issue. All objects live under `<assetId>/<jobId>/`.
+  const ID = 'asset-9';
+  const JOB = '01JOBULIDXXXXXXXXXXXXXXXXX';
+  const PREFIX = `${ID}/${JOB}/`;
+  const packagedOutput = {
+    bucket: 'openvideocore-packaged',
+    prefix: PREFIX,
+    masterHlsKey: `${PREFIX}index.m3u8`,
+    masterDashKey: `${PREFIX}manifest.mpd`
+  };
+  const masterBody = Buffer.from(
+    '#EXTM3U\n' +
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",URI="audio.m3u8"\n' +
+      '#EXT-X-STREAM-INF:BANDWIDTH=3022000,AUDIO="aud"\n' +
+      'video-0_3022.m3u8\n'
+  );
+  const childBody = Buffer.from(
+    '#EXTM3U\n' +
+      '#EXT-X-MAP:URI="video-0_3022/init.mp4"\n' +
+      '#EXTINF:6.0,\n' +
+      'video-0_3022/1.m4s\n'
+  );
+
+  function packagedObjects(): Map<string, StoredObject> {
+    return new Map<string, StoredObject>([
+      [`${PREFIX}index.m3u8`, { body: masterBody }],
+      [`${PREFIX}audio.m3u8`, { body: Buffer.from('#EXTM3U\naudio/seg-1.m4s\n') }],
+      [`${PREFIX}video-0_3022.m3u8`, { body: childBody }],
+      [`${PREFIX}video-0_3022/init.mp4`, { body: Buffer.from([0, 1, 2, 3]) }],
+      [`${PREFIX}video-0_3022/1.m4s`, { body: Buffer.from([9, 8, 7, 6, 5, 4, 3, 2, 1, 0]) }]
+    ]);
+  }
+
+  it('index.m3u8 returns 200 with the real master manifest from the persisted prefix', async () => {
+    const app = await buildApp({
+      assets: new Map([[ID, asset(ID, packagedOutput)]]),
+      objects: packagedObjects()
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${ID}/stream/index.m3u8`,
+      headers: A
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.apple.mpegurl');
+    // The relative child playlist + audio group are rewritten back through the
+    // proxy, so a browser fetches them from `/stream/*` (never the bucket).
+    expect(res.body).toContain(`/api/v1/assets/${ID}/stream/video-0_3022.m3u8`);
+    expect(res.body).toContain(`URI="/api/v1/assets/${ID}/stream/audio.m3u8"`);
+  });
+
+  it('a relatively-referenced child playlist resolves 200 through /stream/*', async () => {
+    const app = await buildApp({
+      assets: new Map([[ID, asset(ID, packagedOutput)]]),
+      objects: packagedObjects()
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${ID}/stream/video-0_3022.m3u8`,
+      headers: A
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.apple.mpegurl');
+    // The child's relative media references resolve back through the proxy.
+    expect(res.body).toContain(`URI="/api/v1/assets/${ID}/stream/video-0_3022/init.mp4"`);
+    expect(res.body).toContain(`/api/v1/assets/${ID}/stream/video-0_3022/1.m4s`);
+  });
+
+  it('a relatively-referenced media segment resolves 200 with the ISO segment type', async () => {
+    const app = await buildApp({
+      assets: new Map([[ID, asset(ID, packagedOutput)]]),
+      objects: packagedObjects()
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${ID}/stream/video-0_3022/1.m4s`,
+      headers: A
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('video/iso.segment');
+    expect(res.headers['accept-ranges']).toBe('bytes');
+  });
+
+  it('honors a Range request on a segment resolved from the persisted prefix', async () => {
+    const app = await buildApp({
+      assets: new Map([[ID, asset(ID, packagedOutput)]]),
+      objects: packagedObjects()
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${ID}/stream/video-0_3022/1.m4s`,
+      headers: { ...A, range: 'bytes=2-5' }
+    });
+    expect(res.statusCode).toBe(206);
+    expect(res.headers['content-range']).toBe('bytes 2-5/10');
+    expect(res.headers['content-length']).toBe('4');
+    expect(res.rawPayload.equals(Buffer.from([7, 6, 5, 4]))).toBe(true);
+  });
+
+  it('the init segment (.mp4) resolves 200 with the MP4 content type', async () => {
+    const app = await buildApp({
+      assets: new Map([[ID, asset(ID, packagedOutput)]]),
+      objects: packagedObjects()
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${ID}/stream/video-0_3022/init.mp4`,
+      headers: A
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('video/mp4');
+  });
+
+  it('lazily resolves the newest job prefix for a pre-#502 asset (no persisted prefix)', async () => {
+    // No `packagedOutput` on the asset — the resolver lists the packaged bucket
+    // under `<assetId>/` and derives the newest job prefix. Two job folders exist;
+    // the lexicographically greatest (`job-b`) is the newest package.
+    const objects = new Map<string, StoredObject>([
+      [`${ID}/job-a/index.m3u8`, { body: Buffer.from('#EXTM3U\nstale\n') }],
+      [`${ID}/job-b/index.m3u8`, { body: masterBody }]
+    ]);
+    const app = await buildApp({
+      assets: new Map([[ID, asset(ID)]]),
+      objects
+    });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${ID}/stream/index.m3u8`,
+      headers: A
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.apple.mpegurl');
+    // Served from the NEWEST job (`job-b`), not the stale one.
+    expect(res.body).toContain('video-0_3022.m3u8');
+    expect(res.body).not.toContain('stale');
   });
 });

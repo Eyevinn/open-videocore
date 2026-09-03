@@ -29,6 +29,7 @@ import {
   type Asset,
   type AssetAudioTrack,
   type AssetRepository,
+  type PackagedOutput,
   type SubtitleTrack
 } from '../data/asset-repo.js';
 // TAMS validation primitives (ADR-008, issue #165). Reused, NOT re-declared, so
@@ -103,7 +104,9 @@ import {
   outputPrefix,
   packagedBucket,
   packagedRelocationOrigin,
-  proxyManifestUrlsFor
+  proxyManifestUrlsFor,
+  resolvePackagedOutput,
+  type PackagedObjectLister
 } from '../pipeline/packaging.js';
 import {
   isManifestPath,
@@ -913,6 +916,42 @@ function streamProxyBaseUrl(requestUrl: string, wildcard: string): string {
   base = base.replace(/\/+$/, '');
   const configured = process.env['PUBLIC_BASE_URL']?.replace(/\/+$/, '');
   return configured ? `${configured}${base}` : base;
+}
+
+// The real packaged-output prefix (bucket-excluded, NO trailing slash) that the
+// `/:id/stream/*` proxy resolves objects under, for issue #503. The packager
+// writes every object of a package under a job-nested prefix
+// `<assetId>/<packagerJobId>/` (persisted as `packagedOutput.prefix` by issue
+// #502), NOT under the historical flat `packaged/<id>` that `outputPrefix`
+// returns. This resolves, in order of preference:
+//   1. the durable `packagedOutput.prefix` persisted on the asset (#502) —
+//      used verbatim (no object-store round-trip);
+//   2. the lazy fallback (`resolvePackagedOutput`) for assets packaged BEFORE
+//      #502 (no persisted prefix): lists the packaged bucket under `<assetId>/`
+//      and derives the newest job prefix. The stack `storageClient` is a
+//      `minio.Client` and satisfies the `PackagedObjectLister` surface
+//      (listObjectsV2) `resolvePackagedOutput` needs (src/pipeline/packaging.ts);
+//   3. the historical flat `outputPrefix(assetId)` (`packaged/<id>`) when the
+//      asset has no packaged objects under `<assetId>/` at all — preserves the
+//      pre-#502/#503 flat-package layout unchanged.
+// `resolvePackagedOutput` returns a trailing-slash prefix; a trailing slash is
+// stripped so the returned value composes as `<prefix>/<relative>` like
+// `outputPrefix`. Lister errors are swallowed to the flat fallback so a listing
+// hiccup degrades to the old behaviour rather than a 500.
+async function resolveStreamPrefix(
+  asset: { id: string; packagedOutput?: PackagedOutput },
+  lister: PackagedObjectLister,
+  bucket: string
+): Promise<string> {
+  try {
+    const resolved = await resolvePackagedOutput(asset, lister, bucket);
+    if (resolved?.prefix) {
+      return resolved.prefix.replace(/\/+$/, '');
+    }
+  } catch {
+    // fall through to the flat prefix below
+  }
+  return outputPrefix(asset.id);
 }
 
 // Content-Type for a packaged object served through the proxy route (issue
@@ -2102,7 +2141,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // rendition handling, which builds a WorkspaceStorage per target bucket).
       const bucket = request.connections?.packagedBucket ?? packagedBucket();
       const packagedStorage = new WorkspaceStorage(storageClient, bucket);
-      const objectKey = `${outputPrefix(asset.id)}/${relative}`;
+      // Resolve the REAL packaged prefix the packager wrote under (issue #503):
+      // the persisted job-nested `<assetId>/<packagerJobId>` (#502), or the lazy
+      // list fallback, or the historical flat `packaged/<id>`. The master
+      // manifests (`index.m3u8`/`manifest.mpd`) and every relatively-referenced
+      // child playlist/segment all live under this prefix, so the SAME prefix is
+      // used both for the object key AND the manifest-rewrite context — keeping
+      // the rewritten child references (which resolve back through this route)
+      // consistent with the objects they map to.
+      const streamPrefix = await resolveStreamPrefix(asset, storageClient, bucket);
+      const objectKey = `${streamPrefix}/${relative}`;
       const contentType = contentTypeForPackagedObject(relative);
 
       // stat first so we can (a) return a clean 404 for a missing object without
@@ -2169,7 +2217,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const rewriteCtx: ManifestRewriteContext = {
           proxyBase,
           manifestRelativePath: relative,
-          packagedPrefix: outputPrefix(asset.id),
+          packagedPrefix: streamPrefix,
           packagedBucket: bucket
         };
         const rewritten = rewriteManifest(relative, manifestBody, rewriteCtx);
