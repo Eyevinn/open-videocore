@@ -2973,17 +2973,27 @@ Agentic examples
 
     Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.
 
-open-videocore is a plain REST API with a committed openapi.json — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given your instance URL and a token to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: give the agent your instance URL, point it at the guides or the raw endpoints, and describe the outcome you want.
+open-videocore is a plain REST API with a committed openapi.json — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given API access to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: point the agent at the guides or the raw endpoints and describe the outcome you want.
 
-Each example below assumes the agent already knows your instance URL (https://<your-instance>) and has your bearer token available — as an environment variable, a secret store, or pasted into the conversation the same way you'd hand it any other API credential.
+  If your agent is already connected to OSC (for example over the OSC MCP server), you don't need to tell it your instance URL or hand it a token at all — it can look up your open-videocore My App itself and call it with the right credentials. Just name the instance, or skip that too if you only have one.
+
+  Otherwise, give it your instance URL (https://<your-instance>) and bearer token the same way you'd hand any other API credential to an assistant — as an environment variable, a secret store, or pasted into the conversation.
 
 Send a large file for review
 
 Scenario: you have a large video file on your own machine and need someone else to review it, without emailing a multi-gigabyte attachment or waiting on a slow file-sharing upload.
 
-Prompt
-I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs to
-review by Friday. Upload it to my open-videocore instance at
+Prompt (OSC-connected agent)
+I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
+to review by Friday. Upload it to my open-videocore instance, wait until
+it's ready, package it for streaming, and give me a playback link I can
+send her.
+
+Without OSC access, the agent needs the instance named explicitly:
+
+Prompt (plain API access)
+I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
+to review by Friday. Upload it to my open-videocore instance at
 https://<your-instance>, wait until it's ready, package it for streaming,
 and give me a playback link I can send her.
 

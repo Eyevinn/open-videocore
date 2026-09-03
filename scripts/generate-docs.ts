@@ -981,13 +981,21 @@ const AGENTIC_EXAMPLES_DESCRIPTION =
   'Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.';
 
 const agenticExamplesBody = `
-<p>open-videocore is a plain REST API with a committed <a href="api-reference.html"><code>openapi.json</code></a> — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given your instance URL and a token to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: give the agent your instance URL, point it at the guides or the raw endpoints, and describe the outcome you want.</p>
-<div class="callout">Each example below assumes the agent already knows your instance URL (<code>https://&lt;your-instance&gt;</code>) and has your <a href="authentication.html">bearer token</a> available — as an environment variable, a secret store, or pasted into the conversation the same way you'd hand it any other API credential.</div>
+<p>open-videocore is a plain REST API with a committed <a href="api-reference.html"><code>openapi.json</code></a> — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given API access to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: point the agent at the guides or the raw endpoints and describe the outcome you want.</p>
+<div class="callout">
+  <p style="margin-top:0"><strong>If your agent is already connected to OSC</strong> (for example over the <a href="https://www.osaas.io/mcp" target="_blank" rel="noopener">OSC MCP server</a>), you don't need to tell it your instance URL or hand it a token at all — it can look up your open-videocore My App itself and call it with the right credentials. Just name the instance, or skip that too if you only have one.</p>
+  <p style="margin-bottom:0">Otherwise, give it your instance URL (<code>https://&lt;your-instance&gt;</code>) and <a href="authentication.html">bearer token</a> the same way you'd hand any other API credential to an assistant — as an environment variable, a secret store, or pasted into the conversation.</p>
+</div>
 
 <h2 id="review-link">Send a large file for review</h2>
 <p><strong>Scenario:</strong> you have a large video file on your own machine and need someone else to review it, without emailing a multi-gigabyte attachment or waiting on a slow file-sharing upload.</p>
-<div class="code-block"><div class="code-label">Prompt</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs to
-review by Friday. Upload it to my open-videocore instance at
+<div class="code-block"><div class="code-label">Prompt (OSC-connected agent)</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
+to review by Friday. Upload it to my open-videocore instance, wait until
+it's ready, package it for streaming, and give me a playback link I can
+send her.</code></pre></div>
+<p>Without OSC access, the agent needs the instance named explicitly:</p>
+<div class="code-block"><div class="code-label">Prompt (plain API access)</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
+to review by Friday. Upload it to my open-videocore instance at
 https://&lt;your-instance&gt;, wait until it's ready, package it for streaming,
 and give me a playback link I can send her.</code></pre></div>
 <p>What the agent does, mapped to the real calls:</p>
