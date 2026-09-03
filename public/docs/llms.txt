@@ -1,0 +1,48 @@
+# open-videocore
+
+> Headless, API-first media asset management middleware for ingesting, transcoding, packaging, searching, and delivering video — running entirely on Open Source Cloud.
+
+## Guides
+
+- [Ingesting media](https://videocore.pages.osaas.io/guide-ingest.html): Get source video into open-videocore: from a URL, direct upload, presigned/multipart upload, or an object storage watch-folder.
+- [Transcoding & packaging](https://videocore.pages.osaas.io/guide-transcode-package.html): Turn source media into an ABR ladder and package it as HLS/DASH — as separate steps, or chained in one pipeline.
+- [Metadata, tags & search](https://videocore.pages.osaas.io/guide-metadata-search.html): Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.
+- [Thumbnails, clips & export](https://videocore.pages.osaas.io/guide-thumbnails-clips-export.html): Extract poster frames, cut a sub-segment into a new asset, and re-wrap into a different container.
+- [Delivery & playback](https://videocore.pages.osaas.io/guide-delivery.html): Get a playable URL for an asset — proxied HLS/DASH manifests or a presigned source download.
+- [Organizing: collections & webhooks](https://videocore.pages.osaas.io/guide-organizing.html): Group related assets into collections, and get HTTP notifications when asset and job state changes.
+- [Operating a workspace](https://videocore.pages.osaas.io/guide-operating.html): Provision a workspace's backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.
+
+## Agentic examples
+
+- [Agentic examples](https://videocore.pages.osaas.io/agentic-examples.html): Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.
+
+## Docs
+
+- [Introduction](https://videocore.pages.osaas.io/introduction.html): What open-videocore is, how it's put together, and the core REST conventions — identifiers, timestamps, sync vs. async — behind its API.
+- [Data model](https://videocore.pages.osaas.io/data-model.html): The core entities open-videocore manages — Asset, Job, Pipeline Execution, Profile, Collection, Webhook, Stack, and more — and how they relate.
+- [Installation](https://videocore.pages.osaas.io/installation.html): Step-by-step instructions for launching an instance of open-videocore on Open Source Cloud (OSC).
+- [Authentication & errors](https://videocore.pages.osaas.io/authentication.html): How to authenticate requests to the open-videocore API with a bearer token, plus its error and status-code conventions.
+
+## API reference
+
+- [Health](https://videocore.pages.osaas.io/ref-health.html): Liveness probes.
+- [Provisioning](https://videocore.pages.osaas.io/ref-provisioning.html): Provision and tear down a workspace's full OSC media stack (object storage, metadata store, queue).
+- [Optional services](https://videocore.pages.osaas.io/ref-optional-services.html): Discover and provision add-on OSC services for a workspace.
+- [Profiles](https://videocore.pages.osaas.io/ref-profiles.html): Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
+- [Assets](https://videocore.pages.osaas.io/ref-assets.html): Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
+- [Jobs](https://videocore.pages.osaas.io/ref-jobs.html): Background job status for asynchronous asset operations.
+- [Pipelines](https://videocore.pages.osaas.io/ref-pipelines.html): Multi-step pipeline execution records.
+- [Transcoder jobs](https://videocore.pages.osaas.io/ref-encore.html): Direct transcoding job submission and status, bypassing the asset pipeline.
+- [Auto-scaler](https://videocore.pages.osaas.io/ref-scaler.html): Runtime configuration and status of the transcoder instance auto-scaler.
+- [Retention](https://videocore.pages.osaas.io/ref-retention.html): Soft-delete / retention window configuration.
+- [Logs](https://videocore.pages.osaas.io/ref-logs.html): Structured application log query.
+- [Search](https://videocore.pages.osaas.io/ref-search.html): Full-text and metadata search across assets.
+- [Webhooks](https://videocore.pages.osaas.io/ref-webhooks.html): HTTP event notification registrations.
+- [Collections](https://videocore.pages.osaas.io/ref-collections.html): Named groups for organising assets.
+- [Storage](https://videocore.pages.osaas.io/ref-storage.html): Object storage bucket and watch-folder management.
+- [Admin](https://videocore.pages.osaas.io/ref-admin.html): Watch-folder poller control.
+- [Internal callbacks](https://videocore.pages.osaas.io/ref-internal.html): Called by the transcoder and packager services — not for direct client use.
+- [Ops UI](https://videocore.pages.osaas.io/ref-ui.html): Built-in browser dashboard.
+- [API reference](https://videocore.pages.osaas.io/api-reference.html): Every open-videocore REST API endpoint (100 across 18 resource groups), generated straight from the committed openapi.json.
+
+[Full text of every page](https://videocore.pages.osaas.io/llms-full.txt)

@@ -1,0 +1,3446 @@
+# Health
+
+URL: https://videocore.pages.osaas.io/ref-health.html
+
+Health
+
+    Liveness probes.
+
+  GET /health
+
+  Liveness probe that also reports service identity.
+
+  Response
+Response 200
+(no body)
+
+  GET /healthz
+
+  Minimal liveness probe.
+
+  Response
+Response 200
+(no body)
+
+---
+
+# Provisioning
+
+URL: https://videocore.pages.osaas.io/ref-provisioning.html
+
+Provisioning
+
+    Provision and tear down a workspace's full OSC media stack (object storage, metadata store, queue).
+
+  GET /api/v1/provision/
+
+  List provisioned stacks.
+
+  Response
+Response 200 (application/json)
+[
+  "string"
+]
+
+  POST /api/v1/provision/
+
+  Provision a full OSC media stack (object storage, metadata store, queue) for a new workspace. Asynchronous — returns an operation to poll.
+
+  Request
+Request body (application/json)
+{
+  "name": "string",
+  "sourceStorage": {
+    "bucket": "string",
+    "accessKeyId": "string",
+    "secretAccessKey": "string",
+    "region": "string",
+    "endpointUrl": "https://example.com/video.mp4",
+    "sessionToken": "string",
+    "publicBaseUrl": "https://example.com/video.mp4"
+  },
+  "packagedStorage": {
+    "bucket": "string",
+    "accessKeyId": "string",
+    "secretAccessKey": "string",
+    "region": "string",
+    "endpointUrl": "https://example.com/video.mp4",
+    "sessionToken": "string",
+    "publicBaseUrl": "https://example.com/video.mp4"
+  },
+  "options": {
+    "autoSubtitles": true,
+    "sceneDetect": true
+  }
+}
+
+  Response
+Response 202 (application/json)
+{
+  "operationId": "string",
+  "name": "string",
+  "status": "pending"
+}
+
+  GET /api/v1/provision/operations
+
+  List provisioning operations.
+
+  Response
+Response 200 (application/json)
+[
+  {
+    "id": "string",
+    "type": "provision",
+    "name": "string",
+    "status": "pending",
+    "startedAt": 0,
+    "completedAt": 0,
+    "result": null,
+    "error": "string"
+  }
+]
+
+  GET /api/v1/provision/operations/{id}
+
+  Get a single provisioning operation's status.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "type": "provision",
+  "name": "string",
+  "status": "pending",
+  "startedAt": 0,
+  "completedAt": 0,
+  "result": null,
+  "error": "string"
+}
+
+  GET /api/v1/provision/{name}
+
+  Get a provisioned stack by name.
+
+  Parameters
+NameInTypeRequired
+namepathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "minioEndpoint": "string",
+  "couchdbUrl": "string",
+  "redisUrl": "string",
+  "sourceBucket": "string",
+  "packagedBucket": "string",
+  "services": [
+    {
+      "serviceId": "string",
+      "instanceName": "string"
+    }
+  ],
+  "status": "provisioning",
+  "reason": {
+    "code": "stack_provisioning",
+    "message": "string",
+    "capability": "storage"
+  },
+  "autoSubtitlesInstanceName": "string",
+  "sceneDetectInstanceName": "string",
+  "options": {
+    "autoSubtitles": true,
+    "sceneDetect": true
+  },
+  "storage": {
+    "source": {
+      "backend": "minio",
+      "bucket": "string",
+      "endpointUrl": "string",
+      "region": "string",
+      "publicBaseUrl": "string"
+    },
+    "packaged": {
+      "backend": "minio",
+      "bucket": "string",
+      "endpointUrl": "string",
+      "region": "string",
+      "publicBaseUrl": "string"
+    }
+  }
+}
+
+  DELETE /api/v1/provision/{name}
+
+  Deprovision (tear down) a stack and its backing OSC service instances.
+
+  Parameters
+NameInTypeRequired
+namepathstringrequired
+
+  Response
+Response 202 (application/json)
+{
+  "operationId": "string",
+  "name": "string",
+  "status": "pending"
+}
+
+---
+
+# Optional services
+
+URL: https://videocore.pages.osaas.io/ref-optional-services.html
+
+Optional services
+
+    Discover and provision add-on OSC services for a workspace.
+
+  GET /api/v1/optional-services/
+
+  List optional add-on services and each one's provisioning state for the workspace.
+
+  Response
+Response 200 (application/json)
+[
+  {
+    "key": "string",
+    "serviceId": "string",
+    "displayName": "string",
+    "instanceNameEnvVar": "string",
+    "state": "not-configured",
+    "instanceName": "string",
+    "url": "string"
+  }
+]
+
+  GET /api/v1/optional-services/{key}
+
+  Get a single optional service's provisioning state.
+
+  Parameters
+NameInTypeRequired
+keypathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "key": "string",
+  "serviceId": "string",
+  "displayName": "string",
+  "instanceNameEnvVar": "string",
+  "state": "not-configured",
+  "instanceName": "string",
+  "url": "string"
+}
+
+  DELETE /api/v1/optional-services/{key}
+
+  Deprovision an optional service.
+
+  Parameters
+NameInTypeRequired
+keypathstringrequired
+
+  Response
+Response 202 (application/json)
+{
+  "operationId": "string",
+  "key": "string",
+  "name": "string",
+  "status": "pending"
+}
+
+  POST /api/v1/optional-services/{key}/provision
+
+  Provision an optional service on demand.
+
+  Parameters
+NameInTypeRequired
+keypathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "name": "string"
+}
+
+  Response
+Response 202 (application/json)
+{
+  "operationId": "string",
+  "key": "string",
+  "name": "string",
+  "status": "pending"
+}
+
+---
+
+# Profiles
+
+URL: https://videocore.pages.osaas.io/ref-profiles.html
+
+Profiles
+
+    Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
+
+  GET /api/v1/profiles/
+
+  List transcoding profiles (names for the picker, plus full items).
+
+  Response
+Response 200 (application/json)
+{
+  "profiles": [
+    "string"
+  ],
+  "items": [
+    {
+      "name": "string",
+      "yaml": "string",
+      "runnable": true,
+      "createdAt": "string",
+      "updatedAt": "string"
+    }
+  ]
+}
+
+  POST /api/v1/profiles/
+
+  Create a transcoding profile from raw transcoder-format YAML.
+
+  Request
+Request body (application/json)
+{
+  "name": "string",
+  "yaml": "string"
+}
+
+  Response
+Response 201 (application/json)
+{
+  "name": "string",
+  "yaml": "string",
+  "runnable": true,
+  "createdAt": "string",
+  "updatedAt": "string"
+}
+
+  POST /api/v1/profiles/bootstrap
+
+  Seed the profile store from the default transcoder test-profiles index. Pass `?force=true` to re-seed over existing profiles.
+
+  Parameters
+NameInTypeRequired
+forcequerybooleanoptional
+
+  Response
+Response 200 (application/json)
+{
+  "seeded": 0,
+  "skipped": true,
+  "builtinSeeded": 0
+}
+
+  GET /api/v1/profiles/index.yml
+
+  Public, unauthenticated profile index consumed by transcoder instances at transcode time.
+
+  Response
+Response 200 (application/json)
+"string"
+
+  GET /api/v1/profiles/{name}
+
+  Get a single profile.
+
+  Parameters
+NameInTypeRequired
+namepathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "name": "string",
+  "yaml": "string",
+  "runnable": true,
+  "createdAt": "string",
+  "updatedAt": "string"
+}
+
+  PUT /api/v1/profiles/{name}
+
+  Replace a profile's YAML.
+
+  Parameters
+NameInTypeRequired
+namepathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "yaml": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "name": "string",
+  "yaml": "string",
+  "runnable": true,
+  "createdAt": "string",
+  "updatedAt": "string"
+}
+
+  DELETE /api/v1/profiles/{name}
+
+  Delete a profile.
+
+  Parameters
+NameInTypeRequired
+namepathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+  GET /api/v1/profiles/{name}/yaml
+
+  Get a profile's raw YAML body.
+
+  Parameters
+NameInTypeRequired
+namepathstringrequired
+
+  Response
+Response 200 (application/json)
+"string"
+
+---
+
+# Assets
+
+URL: https://videocore.pages.osaas.io/ref-assets.html
+
+Assets
+
+    Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
+
+  GET /api/v1/assets/
+
+  List workspace assets.
+
+  Parameters
+NameInTypeRequired
+limitqueryintegeroptional
+offsetqueryintegeroptional
+statusquerystring (uploading, processing, ready, failed, archived)optional
+parentIdquerystringoptional
+
+  Response
+Response 200 (application/json)
+{
+  "items": [
+    {
+      "id": "string",
+      "name": "string",
+      "status": "uploading",
+      "statusHistory": [
+        {
+          "at": null,
+          "from": null,
+          "to": null
+        }
+      ],
+      "createdAt": "string",
+      "updatedAt": "string",
+      "slug": "string",
+      "description": "string",
+      "reviewState": "draft",
+      "parentId": "string",
+      "versionOfAssetId": "string",
+      "versionGroupId": "string"
+    }
+  ],
+  "limit": 0,
+  "offset": 0,
+  "total": 0
+}
+
+  POST /api/v1/assets/
+
+  Create an asset record.
+
+  Request
+Request body (application/json)
+{
+  "name": "string",
+  "slug": "string",
+  "description": "string",
+  "parentId": "string",
+  "objectKey": "string",
+  "metadata": {},
+  "tags": [
+    "string"
+  ]
+}
+
+  Response
+Response 201 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  GET /api/v1/assets/by-tams-address
+
+  Look up an asset by its TAMS flow/timerange address.
+
+  Parameters
+NameInTypeRequired
+tamsFlowIdquerystringrequired
+tamsTimerangequerystringoptional
+
+  Response
+Response 200 (application/json)
+{
+  "items": [
+    {
+      "id": "string",
+      "name": "string",
+      "status": "uploading",
+      "statusHistory": [
+        {
+          "at": null,
+          "from": null,
+          "to": null
+        }
+      ],
+      "createdAt": "string",
+      "updatedAt": "string",
+      "slug": "string",
+      "description": "string",
+      "reviewState": "draft",
+      "parentId": "string",
+      "versionOfAssetId": "string",
+      "versionGroupId": "string"
+    }
+  ],
+  "limit": 0,
+  "offset": 0,
+  "total": 0
+}
+
+  POST /api/v1/assets/ingest-url
+
+  Ingest a video from a public URL into a new asset.
+
+  Request
+Request body (application/json)
+{
+  "sourceUrl": "string",
+  "name": "string",
+  "description": "string",
+  "title": "string",
+  "tags": [
+    "string"
+  ]
+}
+Field notes- name — Legacy alias for `title` (issue #347). The editorial title of the asset. `title` and `name` are two input spellings of the SAME canonical field: both persist to `descriptive.title` and are read back as the `name` property on GET /assets/:id, list, and search responses. Prefer `title`; `title` wins when both are supplied.
+- title — The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to `descriptive.title` and is read back as the `name` property on GET /assets/:id, list, and search responses (there is NO separate top-level `title` field on responses). Accepted as an alias of `name`; `title` wins when both are supplied.
+
+  Response
+Response 202 (application/json)
+{
+  "assetId": "string",
+  "jobId": "string"
+}
+
+  GET /api/v1/assets/search
+
+  Deprecated legacy free-text-only search alias. Use the canonical Search endpoint instead.
+
+  Parameters
+NameInTypeRequired
+qquerystringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "items": [
+    {
+      "id": "string",
+      "name": "string",
+      "status": "uploading",
+      "statusHistory": [
+        {
+          "at": null,
+          "from": null,
+          "to": null
+        }
+      ],
+      "createdAt": "string",
+      "updatedAt": "string",
+      "slug": "string",
+      "description": "string",
+      "reviewState": "draft",
+      "parentId": "string",
+      "versionOfAssetId": "string",
+      "versionGroupId": "string"
+    }
+  ]
+}
+
+  GET /api/v1/assets/{id}
+
+  Get a single asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  PATCH /api/v1/assets/{id}
+
+  Update asset fields.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "name": "string",
+  "description": "string",
+  "objectKey": "string",
+  "status": "uploading",
+  "metadata": {},
+  "tags": [
+    "string"
+  ]
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  DELETE /api/v1/assets/{id}
+
+  Delete an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+  POST /api/v1/assets/{id}/audio-tracks
+
+  Add an audio track to an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "language": "string",
+  "codec": "string",
+  "channels": 0,
+  "label": "string",
+  "default": true
+}
+
+  Response
+Response 201 (application/json)
+{
+  "audioTracks": [
+    {
+      "id": "string",
+      "language": "string",
+      "codec": "string",
+      "channels": 0,
+      "label": "string",
+      "default": true
+    }
+  ]
+}
+
+  DELETE /api/v1/assets/{id}/audio-tracks/{trackId}
+
+  Remove an audio track.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+trackIdpathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+  POST /api/v1/assets/{id}/clip
+
+  Clip a time segment of the asset into a new child asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "startSeconds": 0,
+  "endSeconds": 0,
+  "outputName": "string",
+  "asVersion": true
+}
+
+  Response
+Response 201 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  GET /api/v1/assets/{id}/comments
+
+  List review comments on an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+[
+  {
+    "id": "string",
+    "assetId": "string",
+    "body": "string",
+    "createdAt": "string"
+  }
+]
+
+  POST /api/v1/assets/{id}/comments
+
+  Add a review comment to an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "body": "string"
+}
+
+  Response
+Response 201 (application/json)
+{
+  "id": "string",
+  "assetId": "string",
+  "body": "string",
+  "createdAt": "string"
+}
+
+  GET /api/v1/assets/{id}/delivery
+
+  Get playback URLs for an asset (HLS/DASH manifests and/or presigned source download).
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "assetId": "string",
+  "status": "ready",
+  "urls": {
+    "hls": "string",
+    "dash": "string",
+    "source": "string"
+  },
+  "expiresAt": "string",
+  "resolution": {
+    "packagedBucket": "string",
+    "packagedPrefix": "string",
+    "masterHlsKey": "string",
+    "masterDashKey": "string"
+  }
+}
+
+  POST /api/v1/assets/{id}/execute
+
+  Run a multi-step pipeline execution (e.g. transcode + package) against the asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "pipeline": "transcode",
+  "profile": "string",
+  "customProfile": {
+    "name": "string",
+    "outputs": [
+      {
+        "label": "string",
+        "width": 0,
+        "height": 0,
+        "videoBitrateBps": 0,
+        "audioBitrateBps": 0,
+        "format": "string"
+      }
+    ]
+  },
+  "profileParams": {},
+  "destinationBucket": "string"
+}
+
+  Response
+Response 202 (application/json)
+{
+  "id": "string",
+  "assetId": "string",
+  "pipelineName": "string",
+  "status": "running",
+  "steps": [
+    {
+      "name": "extract-metadata",
+      "status": "pending",
+      "jobId": "string",
+      "encoreJobId": "string",
+      "error": "string",
+      "startedAt": "string",
+      "completedAt": "string",
+      "progress": 0
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "destinationBucket": "string"
+}
+
+  GET /api/v1/assets/{id}/executions
+
+  List pipeline executions for an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+[
+  {
+    "id": "string",
+    "assetId": "string",
+    "pipelineName": "string",
+    "status": "running",
+    "steps": [
+      {
+        "name": "extract-metadata",
+        "status": "pending",
+        "jobId": "string",
+        "encoreJobId": "string",
+        "error": "string",
+        "startedAt": "string",
+        "completedAt": "string",
+        "progress": 0
+      }
+    ],
+    "createdAt": "string",
+    "updatedAt": "string",
+    "destinationBucket": "string"
+  }
+]
+
+  GET /api/v1/assets/{id}/executions/{execId}
+
+  Get a single pipeline execution.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+execIdpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "assetId": "string",
+  "pipelineName": "string",
+  "status": "running",
+  "steps": [
+    {
+      "name": "extract-metadata",
+      "status": "pending",
+      "jobId": "string",
+      "encoreJobId": "string",
+      "error": "string",
+      "startedAt": "string",
+      "completedAt": "string",
+      "progress": 0
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "destinationBucket": "string"
+}
+
+  POST /api/v1/assets/{id}/export
+
+  Re-wrap the asset into a different container format without re-encoding.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "targetFormat": "mp4",
+  "outputName": "string",
+  "asVersion": true
+}
+
+  Response
+Response 201 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  POST /api/v1/assets/{id}/extract-metadata
+
+  Extract technical metadata (codec, resolution, duration, bitrate) from the asset's source file.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "assetId": "string",
+  "status": "string"
+}
+
+  GET /api/v1/assets/{id}/files
+
+  List the source and derived media files stored for an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "files": [
+    {
+      "id": "string",
+      "type": "source",
+      "name": "string",
+      "format": "string",
+      "objectKey": "string",
+      "url": "string",
+      "sizeBytes": 0,
+      "label": "string",
+      "width": 0,
+      "height": 0,
+      "bitrateBps": 0,
+      "codec": "string"
+    }
+  ],
+  "fileGroups": [
+    {
+      "id": "string",
+      "type": "hls-package",
+      "name": "string",
+      "manifestUrl": "string",
+      "objectKeyPrefix": "string",
+      "segmentCount": 0
+    }
+  ]
+}
+
+  PUT /api/v1/assets/{id}/metadata
+
+  Replace an asset's free-form metadata.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  POST /api/v1/assets/{id}/multipart/initiate
+
+  Initiate a multipart upload for large source media.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "uploadId": "string",
+  "objectKey": "string",
+  "expiresInSeconds": 0
+}
+
+  DELETE /api/v1/assets/{id}/multipart/{uploadId}
+
+  Abort a multipart upload.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+uploadIdpathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+  POST /api/v1/assets/{id}/multipart/{uploadId}/complete
+
+  Complete a multipart upload.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+uploadIdpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "parts": [
+    {
+      "partNumber": 0,
+      "etag": "string"
+    }
+  ]
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "status": "string"
+}
+
+  GET /api/v1/assets/{id}/multipart/{uploadId}/part-url
+
+  Get a presigned URL for one multipart upload part.
+
+  Parameters
+NameInTypeRequired
+partNumberqueryintegerrequired
+idpathstringrequired
+uploadIdpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "url": "string",
+  "partNumber": 0,
+  "expiresInSeconds": 0
+}
+
+  POST /api/v1/assets/{id}/package
+
+  Submit an HLS/DASH packaging job for the asset's transcoded renditions.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "encoreJobId": "string"
+}
+
+  Response
+Response 202 (application/json)
+{
+  "ok": true,
+  "jobId": "string",
+  "pipelineMode": true
+}
+
+  GET /api/v1/assets/{id}/pipelines
+
+  List pipeline definitions available to run against the asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+[
+  {
+    "id": "string",
+    "assetId": "string",
+    "pipelineName": "string",
+    "status": "running",
+    "steps": [
+      {
+        "name": "extract-metadata",
+        "status": "pending",
+        "jobId": "string",
+        "encoreJobId": "string",
+        "error": "string",
+        "startedAt": "string",
+        "completedAt": "string",
+        "progress": 0
+      }
+    ],
+    "createdAt": "string",
+    "updatedAt": "string",
+    "destinationBucket": "string"
+  }
+]
+
+  POST /api/v1/assets/{id}/restore
+
+  Restore a soft-deleted asset within its retention window.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  POST /api/v1/assets/{id}/review-state
+
+  Transition an asset's editorial review state (draft / in-review / approved / rejected).
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "reviewState": "draft"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  GET /api/v1/assets/{id}/stream/{*}
+
+  Proxy-stream a packaged HLS/DASH manifest or media segment.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+*pathstringrequired
+
+  Response
+Response 200
+(no body)
+
+  POST /api/v1/assets/{id}/subtitle-tracks
+
+  Add a subtitle track to an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "language": "string",
+  "format": "vtt",
+  "label": "string",
+  "default": true
+}
+
+  Response
+Response 201 (application/json)
+{
+  "track": {
+    "id": "string",
+    "language": "string",
+    "format": "vtt",
+    "objectKey": "string",
+    "label": "string",
+    "default": true
+  },
+  "uploadUrl": "string"
+}
+
+  DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId}
+
+  Remove a subtitle track.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+trackIdpathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+  POST /api/v1/assets/{id}/tags
+
+  Add a tag to an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "tags": [
+    "string"
+  ]
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  DELETE /api/v1/assets/{id}/tags/{tag}
+
+  Remove a tag from an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+tagpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "parentId": "string",
+  "versionOfAssetId": "string",
+  "versionGroupId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  GET /api/v1/assets/{id}/thumbnails
+
+  List extracted thumbnails.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "assetId": "string",
+  "thumbnails": [
+    "string"
+  ]
+}
+
+  POST /api/v1/assets/{id}/thumbnails
+
+  Extract poster frame thumbnails at one or more timecodes.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "timecodes": [
+    0
+  ]
+}
+
+  Response
+Response 200 (application/json)
+{
+  "assetId": "string",
+  "thumbnails": [
+    "string"
+  ]
+}
+
+  GET /api/v1/assets/{id}/thumbnails/{index}
+
+  Get a single extracted thumbnail.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+indexpathstringrequired
+
+  Response
+Response 200
+(no body)
+
+  GET /api/v1/assets/{id}/tracks
+
+  List an asset's audio and subtitle tracks.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "audioTracks": [
+    {
+      "id": "string",
+      "language": "string",
+      "codec": "string",
+      "channels": 0,
+      "label": "string",
+      "default": true
+    }
+  ],
+  "subtitleTracks": [
+    {
+      "id": "string",
+      "language": "string",
+      "format": "vtt",
+      "objectKey": "string",
+      "label": "string",
+      "default": true
+    }
+  ]
+}
+
+  POST /api/v1/assets/{id}/transcode
+
+  Submit an ABR transcoding job for the asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "profile": "string",
+  "customProfile": {
+    "name": "string",
+    "outputs": [
+      {
+        "label": "string",
+        "width": 0,
+        "height": 0,
+        "videoBitrateBps": 0,
+        "audioBitrateBps": 0,
+        "format": "string"
+      }
+    ]
+  },
+  "profileParams": {},
+  "burnIn": {
+    "source": null,
+    "forceStyle": "string"
+  }
+}
+
+  Response
+Response 202 (application/json)
+{
+  "jobId": "string",
+  "encoreJobId": "string",
+  "warning": {
+    "code": "profile_params_unvalidated",
+    "message": "string",
+    "profile": "string",
+    "unvalidatedKeys": [
+      "string"
+    ]
+  }
+}
+Field notes- warning — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (a custom profile not in the store, or the profile store was unreachable). The request was still accepted and the keys were forwarded to Encore unchecked.
+
+  PUT /api/v1/assets/{id}/upload
+
+  Direct upload of source media for an asset.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "status": "string"
+}
+
+  POST /api/v1/assets/{id}/upload-complete
+
+  Finalize a completed direct or presigned upload.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "status": "string"
+}
+
+  POST /api/v1/assets/{id}/upload-url
+
+  Get a presigned single-part upload URL for an asset's source media.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "url": "string",
+  "objectKey": "string",
+  "method": "string",
+  "expiresInSeconds": 0
+}
+
+  GET /api/v1/assets/{id}/versions
+
+  List an asset's version history.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "assetId": "string",
+  "versions": [
+    {
+      "id": "string",
+      "name": "string",
+      "status": "uploading",
+      "statusHistory": [
+        {
+          "at": null,
+          "from": null,
+          "to": null
+        }
+      ],
+      "createdAt": "string",
+      "updatedAt": "string",
+      "slug": "string",
+      "description": "string",
+      "reviewState": "draft",
+      "parentId": "string",
+      "versionOfAssetId": "string",
+      "versionGroupId": "string"
+    }
+  ]
+}
+
+---
+
+# Jobs
+
+URL: https://videocore.pages.osaas.io/ref-jobs.html
+
+Jobs
+
+    Background job status for asynchronous asset operations.
+
+  GET /api/v1/jobs/
+
+  List background jobs.
+
+  Parameters
+NameInTypeRequired
+limitquerynumberoptional
+offsetquerynumberoptional
+
+  Response
+Response 200 (application/json)
+{
+  "items": [
+    {
+      "id": "string",
+      "type": "ingest-url",
+      "status": "pending",
+      "assetId": "string",
+      "sourceUrl": "string",
+      "progress": 0,
+      "bytesTransferred": 0,
+      "attempts": 0,
+      "createdAt": "string",
+      "updatedAt": "string",
+      "totalBytes": 0,
+      "error": "string"
+    }
+  ],
+  "total": 0
+}
+
+  GET /api/v1/jobs/{id}
+
+  Get a job.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "type": "ingest-url",
+  "status": "pending",
+  "assetId": "string",
+  "sourceUrl": "string",
+  "progress": 0,
+  "bytesTransferred": 0,
+  "attempts": 0,
+  "createdAt": "string",
+  "updatedAt": "string",
+  "totalBytes": 0,
+  "error": "string"
+}
+Field notes- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
+- interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
+
+  DELETE /api/v1/jobs/{id}
+
+  Cancel or delete a job.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "type": "ingest-url",
+  "status": "pending",
+  "assetId": "string",
+  "sourceUrl": "string",
+  "progress": 0,
+  "bytesTransferred": 0,
+  "attempts": 0,
+  "createdAt": "string",
+  "updatedAt": "string",
+  "totalBytes": 0,
+  "error": "string"
+}
+Field notes- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
+- interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
+
+---
+
+# Pipelines
+
+URL: https://videocore.pages.osaas.io/ref-pipelines.html
+
+Pipelines
+
+    Multi-step pipeline execution records.
+
+  GET /api/v1/pipelines/
+
+  List pipeline executions across all assets.
+
+  Parameters
+NameInTypeRequired
+statusquerystring (running, done, failed)optional
+limitqueryintegeroptional
+offsetqueryintegeroptional
+
+  Response
+Response 200 (application/json)
+{
+  "items": [
+    {
+      "id": "string",
+      "assetId": "string",
+      "pipelineName": "string",
+      "status": "running",
+      "steps": [
+        {
+          "name": null,
+          "status": null,
+          "jobId": null,
+          "encoreJobId": null,
+          "error": null,
+          "startedAt": null,
+          "completedAt": null,
+          "progress": null
+        }
+      ],
+      "createdAt": "string",
+      "updatedAt": "string",
+      "assetName": "string"
+    }
+  ],
+  "total": 0
+}
+
+  GET /api/v1/pipelines/{executionId}
+
+  Get a pipeline execution.
+
+  Parameters
+NameInTypeRequired
+executionIdpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "assetId": "string",
+  "pipelineName": "string",
+  "status": "running",
+  "steps": [
+    {
+      "name": "extract-metadata",
+      "status": "pending",
+      "jobId": "string",
+      "encoreJobId": "string",
+      "error": "string",
+      "startedAt": "string",
+      "completedAt": "string",
+      "progress": 0
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "assetName": "string"
+}
+
+  DELETE /api/v1/pipelines/{executionId}
+
+  Delete a pipeline execution record.
+
+  Parameters
+NameInTypeRequired
+executionIdpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "assetId": "string",
+  "pipelineName": "string",
+  "status": "running",
+  "steps": [
+    {
+      "name": "extract-metadata",
+      "status": "pending",
+      "jobId": "string",
+      "encoreJobId": "string",
+      "error": "string",
+      "startedAt": "string",
+      "completedAt": "string",
+      "progress": 0
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "assetName": "string"
+}
+
+---
+
+# Transcoder jobs
+
+URL: https://videocore.pages.osaas.io/ref-encore.html
+
+Transcoder jobs
+
+    Direct transcoding job submission and status, bypassing the asset pipeline.
+
+  POST /api/v1/encore/encoreJobs
+
+  Submit a transcoding job directly to the transcoder, bypassing the asset pipeline.
+
+  Request
+Request body (application/json)
+{
+  "inputs": [
+    {
+      "uri": "string",
+      "analyzed": true
+    }
+  ],
+  "outputFolder": "string",
+  "externalId": "string",
+  "profile": {
+    "name": "string"
+  },
+  "profileParams": {},
+  "progressCallbackUri": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "externalId": "string",
+  "status": "string",
+  "message": "string"
+}
+
+  GET /api/v1/encore/encoreJobs/{id}
+
+  Get a transcoder job's status directly from the transcoder.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "externalId": "string",
+  "status": "string",
+  "message": "string"
+}
+
+---
+
+# Auto-scaler
+
+URL: https://videocore.pages.osaas.io/ref-scaler.html
+
+Auto-scaler
+
+    Runtime configuration and status of the transcoder instance auto-scaler.
+
+  GET /api/v1/scaler/config
+
+  Get auto-scaler configuration.
+
+  Response
+Response 200 (application/json)
+{
+  "maxInstances": 0,
+  "minInstances": 0,
+  "idleTimeoutMs": 0
+}
+
+  PATCH /api/v1/scaler/config
+
+  Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).
+
+  Request
+Request body (application/json)
+{
+  "maxInstances": 0,
+  "minInstances": 0,
+  "idleTimeoutMs": 0
+}
+
+  Response
+Response 200 (application/json)
+{
+  "maxInstances": 0,
+  "minInstances": 0,
+  "idleTimeoutMs": 0
+}
+
+  GET /api/v1/scaler/status
+
+  Current transcoder instance pool status (effective `maxInstances`, `idleTimeoutMs`).
+
+  Response
+Response 200 (application/json)
+{
+  "workspaces": [
+    {
+      "workspaceId": "string",
+      "queueDepth": 0,
+      "inflightDepth": 0,
+      "instances": [
+        {
+          "instanceId": null,
+          "url": null,
+          "activeJobs": null,
+          "lastIdleAt": null
+        }
+      ]
+    }
+  ],
+  "maxInstances": 0,
+  "idleTimeoutMs": 0,
+  "scalerActive": true
+}
+
+---
+
+# Retention
+
+URL: https://videocore.pages.osaas.io/ref-retention.html
+
+Retention
+
+    Soft-delete / retention window configuration.
+
+  GET /api/v1/retention/config
+
+  Get the soft-delete retention window configuration.
+
+  Response
+Response 200 (application/json)
+{
+  "retentionMs": 0
+}
+
+  PATCH /api/v1/retention/config
+
+  Update the soft-delete retention window configuration.
+
+  Request
+Request body (application/json)
+{
+  "retentionMs": 0
+}
+
+  Response
+Response 200 (application/json)
+{
+  "retentionMs": 0
+}
+
+---
+
+# Logs
+
+URL: https://videocore.pages.osaas.io/ref-logs.html
+
+Logs
+
+    Structured application log query.
+
+  GET /api/v1/logs/
+
+  Query structured application logs.
+
+  Parameters
+NameInTypeRequired
+limitqueryintegeroptional
+cursorquerystringoptional
+fromquerystringoptional
+toquerystringoptional
+qquerystringoptional
+orderquerystring (asc, desc)optional
+
+  Response
+Response 200 (application/json)
+{
+  "items": [
+    {
+      "seq": 0,
+      "timestamp": "string",
+      "message": "string",
+      "level": "debug",
+      "category": "string"
+    }
+  ],
+  "nextCursor": "string"
+}
+
+---
+
+# Search
+
+URL: https://videocore.pages.osaas.io/ref-search.html
+
+Search
+
+    Full-text and metadata search across assets.
+
+  GET /api/v1/search/
+
+  Full-text and metadata search across assets (canonical). Combines exact filters (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with free-text `q`, all ANDed, paginated.
+
+  Parameters
+NameInTypeRequired
+qquerystringoptional
+tagsquerystringoptional
+mimeTypequerystringoptional
+tamsFlowIdquerystringoptional
+tamsTimerangequerystringoptional
+pagequeryintegeroptional
+pageSizequeryintegeroptional
+
+  Response
+Response 200 (application/json)
+{
+  "assets": [
+    {
+      "id": "string",
+      "name": "string",
+      "status": "string",
+      "statusHistory": [
+        {
+          "at": null,
+          "from": null,
+          "to": null
+        }
+      ],
+      "createdAt": "string",
+      "updatedAt": "string",
+      "description": "string",
+      "parentId": "string",
+      "objectKey": "string",
+      "technicalMetadata": {
+        "codec": "string",
+        "width": 0,
+        "height": 0,
+        "durationSeconds": 0,
+        "bitrateBps": 0,
+        "containerFormat": "string",
+        "audioTracks": [],
+        "extractedAt": "string"
+      },
+      "technicalMetadataError": "string",
+      "manifestUrls": {
+        "hls": "string",
+        "dash": "string"
+      }
+    }
+  ],
+  "total": 0,
+  "page": 0
+}
+
+---
+
+# Webhooks
+
+URL: https://videocore.pages.osaas.io/ref-webhooks.html
+
+Webhooks
+
+    HTTP event notification registrations.
+
+  GET /api/v1/webhooks/
+
+  List webhooks.
+
+  Response
+Response 200 (application/json)
+{
+  "webhooks": [
+    {
+      "id": "string",
+      "url": "string",
+      "events": [
+        "string"
+      ],
+      "createdAt": "string",
+      "secret": "string"
+    }
+  ]
+}
+
+  POST /api/v1/webhooks/
+
+  Register a webhook.
+
+  Request
+Request body (application/json)
+{
+  "url": "https://example.com/video.mp4",
+  "events": [
+    "asset.ready"
+  ],
+  "secret": "string"
+}
+
+  Response
+Response 201 (application/json)
+{
+  "id": "string",
+  "url": "string",
+  "events": [
+    "string"
+  ],
+  "createdAt": "string",
+  "secret": "string"
+}
+
+  DELETE /api/v1/webhooks/{id}
+
+  Delete a webhook.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+---
+
+# Collections
+
+URL: https://videocore.pages.osaas.io/ref-collections.html
+
+Collections
+
+    Named groups for organising assets.
+
+  GET /api/v1/collections/
+
+  List collections.
+
+  Response
+Response 200 (application/json)
+{
+  "collections": [
+    {
+      "id": "string",
+      "name": "string",
+      "assetIds": [
+        "string"
+      ],
+      "createdAt": "string",
+      "updatedAt": "string"
+    }
+  ]
+}
+
+  POST /api/v1/collections/
+
+  Create a collection.
+
+  Request
+Request body (application/json)
+{
+  "name": "string"
+}
+
+  Response
+Response 201 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string"
+}
+
+  GET /api/v1/collections/{id}
+
+  Get a collection.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "assets": [
+    {}
+  ]
+}
+
+  DELETE /api/v1/collections/{id}
+
+  Delete a collection.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+  PUT /api/v1/collections/{id}/assets/{assetId}
+
+  Add an asset to a collection.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+assetIdpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string"
+}
+
+  DELETE /api/v1/collections/{id}/assets/{assetId}
+
+  Remove an asset from a collection.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+assetIdpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string"
+}
+
+---
+
+# Storage
+
+URL: https://videocore.pages.osaas.io/ref-storage.html
+
+Storage
+
+    Object storage bucket and watch-folder management.
+
+  GET /api/v1/storage/buckets
+
+  List object storage buckets.
+
+  Response
+Response 200 (application/json)
+[
+  {
+    "name": "string",
+    "role": "source"
+  }
+]
+
+  POST /api/v1/storage/buckets
+
+  Create a bucket.
+
+  Request
+Request body (application/json)
+{
+  "name": "string"
+}
+
+  Response
+Response 201 (application/json)
+{
+  "name": "string",
+  "role": "custom"
+}
+
+  GET /api/v1/storage/buckets/{bucket}/objects
+
+  List objects in a bucket.
+
+  Parameters
+NameInTypeRequired
+prefixquerystringoptional
+limitqueryintegeroptional
+bucketpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "objects": [
+    {
+      "key": "string",
+      "size": 0,
+      "isPrefix": true,
+      "lastModified": "string"
+    }
+  ],
+  "prefix": "string",
+  "bucket": "string"
+}
+
+  DELETE /api/v1/storage/buckets/{bucket}/objects/{*}
+
+  Delete an object from a bucket.
+
+  Parameters
+NameInTypeRequired
+bucketpathstringrequired
+*pathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
+
+  GET /api/v1/storage/buckets/{bucket}/watch-folder
+
+  Get watch-folder status for a bucket.
+
+  Parameters
+NameInTypeRequired
+bucketpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "enabled": true,
+  "running": true,
+  "bucket": "string"
+}
+
+  POST /api/v1/storage/buckets/{bucket}/watch-folder/toggle
+
+  Toggle watch-folder ingest for a bucket.
+
+  Parameters
+NameInTypeRequired
+bucketpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "enabled": true,
+  "running": true,
+  "bucket": "string"
+}
+
+---
+
+# Admin
+
+URL: https://videocore.pages.osaas.io/ref-admin.html
+
+Admin
+
+    Watch-folder poller control.
+
+  POST /api/v1/admin/watch-folder/start
+
+  Start the watch-folder ingest poller.
+
+  Response
+Response 200 (application/json)
+{
+  "enabled": true,
+  "running": true,
+  "processedCount": 0
+}
+
+  GET /api/v1/admin/watch-folder/status
+
+  Watch-folder poller status.
+
+  Response
+Response 200 (application/json)
+{
+  "enabled": true,
+  "running": true,
+  "processedCount": 0
+}
+
+  POST /api/v1/admin/watch-folder/stop
+
+  Stop the watch-folder ingest poller.
+
+  Response
+Response 200 (application/json)
+{
+  "enabled": true,
+  "running": true,
+  "processedCount": 0
+}
+
+---
+
+# Internal callbacks
+
+URL: https://videocore.pages.osaas.io/ref-internal.html
+
+Internal callbacks
+
+    Called by the transcoder and packager services — not for direct client use.
+
+  POST /api/v1/internal/encore-callback
+
+  Transcoder job progress/completion callback. Invoked by the transcoder, not for direct client use.
+
+  Request
+Request body (application/json)
+{
+  "externalId": "string",
+  "status": "string",
+  "message": "string",
+  "output": [
+    {
+      "file": "string",
+      "type": "string",
+      "videoStreams": [
+        {
+          "width": null,
+          "height": null
+        }
+      ],
+      "overallBitrate": 0
+    }
+  ]
+}
+
+  Response
+Response 200 (application/json)
+{
+  "applied": true,
+  "renditionCount": 0
+}
+
+  POST /api/v1/internal/packagerCallback/failure
+
+  Packager failure callback. Invoked by the packager service, not for direct client use.
+
+  Request
+Request body (application/json)
+{
+  "message": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "ok": true
+}
+
+  POST /api/v1/internal/packagerCallback/success
+
+  Packager success callback. Invoked by the packager service, not for direct client use.
+
+  Request
+Request body (application/json)
+{
+  "url": "string",
+  "jobId": "string",
+  "outputPath": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "ok": true
+}
+
+---
+
+# Ops UI
+
+URL: https://videocore.pages.osaas.io/ref-ui.html
+
+Ops UI
+
+    Built-in browser dashboard.
+
+  GET /ui
+
+  Built-in ops dashboard for managing assets, jobs, profiles, and buckets.
+
+  Response
+Response 200
+(no body)
+
+---
+
+# API reference
+
+URL: https://videocore.pages.osaas.io/api-reference.html
+
+API reference
+
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (100 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+
+Health2
+Liveness probes.
+Provisioning6
+Provision and tear down a workspace's full OSC media stack (object storage, metadata store, queue).
+Optional services4
+Discover and provision add-on OSC services for a workspace.
+Profiles8
+Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
+Assets43
+Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
+Jobs3
+Background job status for asynchronous asset operations.
+Pipelines3
+Multi-step pipeline execution records.
+Transcoder jobs2
+Direct transcoding job submission and status, bypassing the asset pipeline.
+Auto-scaler3
+Runtime configuration and status of the transcoder instance auto-scaler.
+Retention2
+Soft-delete / retention window configuration.
+Logs1
+Structured application log query.
+Search1
+Full-text and metadata search across assets.
+Webhooks3
+HTTP event notification registrations.
+Collections6
+Named groups for organising assets.
+Storage6
+Object storage bucket and watch-folder management.
+Admin3
+Watch-folder poller control.
+Internal callbacks3
+Called by the transcoder and packager services — not for direct client use.
+Ops UI1
+Built-in browser dashboard.
+
+---
+
+# Ingesting media
+
+URL: https://videocore.pages.osaas.io/guide-ingest.html
+
+Ingesting media
+
+    Get source video into open-videocore: from a URL, direct upload, presigned/multipart upload, or an object storage watch-folder.
+
+Every asset starts as a record, then gets its source media attached to it one of four ways. Pick the one that matches where your video already lives.
+
+1. Create the asset record
+
+An asset always starts as a record you create explicitly, or one created for you by the ingest-from-URL shortcut below.
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Keynote recording", "description": "Opening keynote, main stage"}'
+
+See POST /api/v1/assets/ — full field list in the Assets reference.
+
+2. Ingest from a public URL
+
+If the source file is already reachable over HTTP(S), skip the manual create step — this creates the asset and starts the download in one call:
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/ingest-url \
+  -H "Content-Type: application/json" \
+  -d '{"sourceUrl": "https://example.com/video.mp4", "title": "Keynote recording"}'
+
+This returns a Job of type ingest-url. Poll GET /api/v1/jobs/{id} until status is done; the job's assetId is the asset to work with next.
+
+3. Direct upload (small files)
+
+For files you already have locally and that are small enough to send in one request:
+
+Request
+curl -X PUT https://<your-instance>/api/v1/assets/<id>/upload \
+  -H "Content-Type: video/mp4" \
+  --data-binary @video.mp4
+
+4. Presigned upload (browser / large single-part)
+
+To upload directly to object storage from a browser or client without proxying bytes through the API, get a presigned URL first, upload to it, then tell the API the upload finished:
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/upload-url
+# -> { "url": "https://...", ... } — PUT your file bytes to that URL, then:
+curl -X POST https://<your-instance>/api/v1/assets/<id>/upload-complete
+
+5. Multipart upload (large files)
+
+For files too large for a single PUT, initiate a multipart upload, request a presigned URL per part, upload each part directly to storage, then complete:
+
+  - POST /api/v1/assets/{id}/multipart/initiate
+
+  - GET /api/v1/assets/{id}/multipart/{uploadId}/part-url — once per part
+
+  - POST /api/v1/assets/{id}/multipart/{uploadId}/complete
+
+  - If something goes wrong: DELETE /api/v1/assets/{id}/multipart/{uploadId} — abort
+
+6. Watch-folder ingest
+
+Point open-videocore at an object storage bucket and it will pick up new files automatically, without any per-file API call:
+
+Request
+curl -X POST https://<your-instance>/api/v1/storage/buckets/<bucket>/watch-folder/toggle \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+
+See Storage reference for bucket listing and the poller's own start/stop controls in Admin.
+
+Every path above ends at the same place: an Asset with status moving from uploading to processing to ready (or failed). Watch that field, or an asset.ready / asset.failed webhook, rather than polling the job directly once the source file has landed.
+
+---
+
+# Transcoding & packaging
+
+URL: https://videocore.pages.osaas.io/guide-transcode-package.html
+
+Transcoding & packaging
+
+    Turn source media into an ABR ladder and package it as HLS/DASH — as separate steps, or chained in one pipeline.
+
+Once an asset has source media, generating a streamable ABR ladder is a two-stage pipeline: transcode, then package. You can run either stage alone, or chain both in one call.
+
+1. Pick a transcoding profile
+
+Profiles describe the output rendition ladder (resolutions, bitrates, codecs) and are stored per workspace. A fresh workspace has none until you seed the defaults:
+
+Request
+curl -X POST https://<your-instance>/api/v1/profiles/bootstrap
+
+List what's available with GET /api/v1/profiles/, or add your own with POST /api/v1/profiles/ — raw YAML body. See the full shape in the Profiles reference.
+
+2. Submit a transcode job
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/transcode \
+  -H "Content-Type: application/json" \
+  -d '{"profile": "<profile-name>"}'
+
+This returns a Job of type transcode. Poll GET /api/v1/jobs/{id} for status, progress, and — once done — renditionAssetIds, the child assets holding each rendition.
+
+The first transcode submitted to an idle workspace pays a cold-start cost while the auto-scaler spins up a transcoder instance (roughly 60–120s). See Operating a workspace → auto-scaler to trade that off against standing cost with a warm floor.
+
+3. Package into HLS/DASH
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/package
+
+The packager is provisioned lazily on a workspace's first packaging job and reused afterwards — the very first call on a fresh workspace pays a similar cold-start cost to the transcoder's. Once done, manifest URLs are attached to the asset; fetch them with the Delivery guide.
+
+4. Or: run both as one pipeline
+
+To avoid manually sequencing the two calls above and polling each job in turn, run them as a single pipeline execution:
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/execute \
+  -H "Content-Type: application/json" \
+  -d '{"pipeline": "transcode-and-package", "profile": "<profile-name>"}'
+
+Poll GET /api/v1/assets/{id}/executions/{execId} for a single status covering every step. See Pipelines reference for the execution shape, and GET /api/v1/assets/{id}/pipelines to list which pipeline names are available to run.
+
+---
+
+# Metadata, tags & search
+
+URL: https://videocore.pages.osaas.io/guide-metadata-search.html
+
+Metadata, tags & search
+
+    Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.
+
+Assets carry two kinds of metadata — technical (read off the file itself) and free-form (whatever your application wants to attach) — plus tags, and both feed the same search endpoint.
+
+1. Extract technical metadata
+
+Codec, resolution, duration, and bitrate are not known until you ask for them:
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/extract-metadata
+
+Results land on the asset's technicalMetadata field (see the Asset entity).
+
+2. Attach free-form metadata
+
+Request
+curl -X PUT https://<your-instance>/api/v1/assets/<id>/metadata \
+  -H "Content-Type: application/json" \
+  -d '{"key-value": "pairs specific to your application"}'
+
+This is a full replace, not a merge — see PUT /api/v1/assets/{id}/metadata in the Assets reference.
+
+3. Tag assets
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/tags \
+  -H "Content-Type: application/json" \
+  -d '{"tag": "keynote"}'
+
+Remove one with DELETE /api/v1/assets/{id}/tags/{tag}.
+
+4. Search
+
+One endpoint covers both free text and exact filters, ANDed together and paginated:
+
+Request
+curl "https://<your-instance>/api/v1/search?q=keynote&tags=stage-a&page=1&pageSize=20"
+
+Exact-filter fields: tags, mimeType, metadata.<key>, tamsFlowId, tamsTimerange. Free text (q) matches over name and description. Full shape in the Search reference.
+
+GET /api/v1/assets/search is a deprecated, free-text-only alias kept for backward compatibility — new integrations should use /api/v1/search above.
+
+5. Audio and subtitle tracks
+
+List an asset's tracks with GET /api/v1/assets/{id}/tracks; add or remove one with POST /api/v1/assets/{id}/audio-tracks / POST /api/v1/assets/{id}/subtitle-tracks and their DELETE counterparts. See the Assets reference for the full set.
+
+---
+
+# Thumbnails, clips & export
+
+URL: https://videocore.pages.osaas.io/guide-thumbnails-clips-export.html
+
+Thumbnails, clips & export
+
+    Extract poster frames, cut a sub-segment into a new asset, and re-wrap into a different container.
+
+Poster frame thumbnails
+
+Extract one or more poster frames at arbitrary timecodes:
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/thumbnails \
+  -H "Content-Type: application/json" \
+  -d '{"timecodes": ["00:00:05", "00:01:30"]}'
+
+List them with GET /api/v1/assets/{id}/thumbnails, or fetch one by index with GET /api/v1/assets/{id}/thumbnails/{index}.
+
+Clip a segment
+
+Cut a time range out of an asset into a new, independent child asset — the source is untouched:
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/clip \
+  -H "Content-Type: application/json" \
+  -d '{"startTime": "00:02:00", "endTime": "00:02:30"}'
+
+Export / re-wrap
+
+Change container format (e.g. MP4 → MOV) without re-encoding the essence:
+
+Request
+curl -X POST https://<your-instance>/api/v1/assets/<id>/export \
+  -H "Content-Type: application/json" \
+  -d '{"format": "mov"}'
+
+Both clip and export return a job — poll it the same way as a transcode job. Full request/response shapes in the Assets reference.
+
+---
+
+# Delivery & playback
+
+URL: https://videocore.pages.osaas.io/guide-delivery.html
+
+Delivery & playback
+
+    Get a playable URL for an asset — proxied HLS/DASH manifests or a presigned source download.
+
+Once an asset is packaged (or if you just need the source back), one endpoint resolves the right URL for playback.
+
+Get playback URLs
+
+Request
+curl https://<your-instance>/api/v1/assets/<id>/delivery
+
+Depending on the asset's state, this returns HLS/DASH manifest URLs (proxy-streamed through the API), a presigned source download, or both. See ADR-003 in the repository for the full contract this endpoint follows.
+
+Streaming manifests and segments
+
+Manifest URLs returned above point back at:
+
+Path
+GET /api/v1/assets/{id}/stream/*
+
+This proxy-streams the packaged HLS/DASH manifest and its media segments, so player requests never need direct access to the underlying object storage bucket or its credentials.
+
+---
+
+# Organizing: collections & webhooks
+
+URL: https://videocore.pages.osaas.io/guide-organizing.html
+
+Organizing: collections & webhooks
+
+    Group related assets into collections, and get HTTP notifications when asset and job state changes.
+
+Collections
+
+A collection is a named, flat group of assets — useful for shows, campaigns, or any grouping that doesn't belong on the asset record itself.
+
+Request
+curl -X POST https://<your-instance>/api/v1/collections \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Q3 keynotes"}'
+
+Add and remove assets with PUT /api/v1/collections/{id}/assets/{assetId} / DELETE /api/v1/collections/{id}/assets/{assetId}. Full shape in the Collections reference.
+
+Webhooks
+
+Register an HTTP endpoint to be notified as assets and jobs change state, instead of polling:
+
+Request
+curl -X POST https://<your-instance>/api/v1/webhooks \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://your-app.example.com/hooks/videocore", "events": ["asset.ready", "transcode.complete", "package.complete"]}'
+
+Available events: asset.ready, asset.failed, transcode.complete, transcode.failed, package.complete, package.failed. Pass a secret to have deliveries signed. Full shape in the Webhooks reference.
+
+---
+
+# Operating a workspace
+
+URL: https://videocore.pages.osaas.io/guide-operating.html
+
+Operating a workspace
+
+    Provision a workspace's backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.
+
+Day-to-day asset operations don't need any of this — it's for the person standing up and tuning a workspace. For first-time setup, see Installation.
+
+Provision a workspace stack
+
+One call stands up a workspace's object storage, metadata store, and queue. The transcoder and packager are not included — both are provisioned lazily, the first time they're actually needed.
+
+Request
+curl -X POST https://<your-instance>/api/v1/provision \
+  -H "Content-Type: application/json" \
+  -d '{"name": "mystack"}'
+
+This is asynchronous — poll GET /api/v1/provision/operations/{id} for status. Tear a stack down with DELETE /api/v1/provision/{name}. Full shape in the Provisioning reference.
+
+Tune the transcoder auto-scaler
+
+The auto-scaler keeps a per-workspace pool of transcoder instances and scales it on demand. By default it scales to zero when idle, trading standing cost for cold-start latency on the first job of a burst.
+
+Request
+curl -X PATCH https://<your-instance>/api/v1/scaler/config \
+  -H "Content-Type: application/json" \
+  -d '{"minInstances": 1, "maxInstances": 3, "idleTimeoutMs": 300000}'
+
+Set minInstances to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
+
+Optional services
+
+Add-on capabilities beyond the core stack are provisioned per workspace, on demand:
+
+Request
+curl -X POST https://<your-instance>/api/v1/optional-services/<key>/provision
+
+List what's available and each one's state with GET /api/v1/optional-services/. Full shape in the Optional services reference.
+
+Storage buckets
+
+Browse and manage the object storage buckets backing a workspace with GET /api/v1/storage/buckets, list what's inside one with GET /api/v1/storage/buckets/{bucket}/objects, and toggle watch-folder ingest per bucket — see the Ingesting media guide and the Storage reference.
+
+Retention
+
+Deleted assets are soft-deleted and recoverable within a configurable window:
+
+Request
+curl https://<your-instance>/api/v1/retention/config
+
+Restore an asset within that window with POST /api/v1/assets/{id}/restore. Full shape in the Retention reference.
+
+---
+
+# Agentic examples
+
+URL: https://videocore.pages.osaas.io/agentic-examples.html
+
+Agentic examples
+
+    Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.
+
+open-videocore is a plain REST API with a committed openapi.json — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given your instance URL and a token to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: give the agent your instance URL, point it at the guides or the raw endpoints, and describe the outcome you want.
+
+Each example below assumes the agent already knows your instance URL (https://<your-instance>) and has your bearer token available — as an environment variable, a secret store, or pasted into the conversation the same way you'd hand it any other API credential.
+
+Send a large file for review
+
+Scenario: you have a large video file on your own machine and need someone else to review it, without emailing a multi-gigabyte attachment or waiting on a slow file-sharing upload.
+
+Prompt
+I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs to
+review by Friday. Upload it to my open-videocore instance at
+https://<your-instance>, wait until it's ready, package it for streaming,
+and give me a playback link I can send her.
+
+What the agent does, mapped to the real calls:
+
+  - POST /api/v1/assets/ — create the asset record
+
+  - Because the file is large, a multipart upload: POST /api/v1/assets/{id}/multipart/initiate → GET /api/v1/assets/{id}/multipart/{uploadId}/part-url — per part → POST /api/v1/assets/{id}/multipart/{uploadId}/complete
+
+  - Poll GET /api/v1/assets/{id} until status leaves uploading
+
+  - POST /api/v1/assets/{id}/execute — run the transcode-and-package pipeline (see Transcoding & packaging), then poll the execution
+
+  - GET /api/v1/assets/{id}/delivery for the playback URL (see Delivery & playback)
+
+If the agent also has messaging tools connected, the same prompt can end with "...and send Jana a Slack message with the link" — the video handling is exactly the same either way.
+
+Build a highlights collection from tagged clips
+
+Scenario: pull every clip that matches a tag into one collection for an editor, without hand-searching the library.
+
+Prompt
+Find all assets tagged "goal" from this week's match footage on my
+open-videocore instance and put them in a new collection called
+"Matchday highlights" for the editing team.
+
+What the agent does:
+
+  - GET /api/v1/search — filter by tags=goal, see Metadata, tags & search (guide)
+
+  - POST /api/v1/collections/ — create "Matchday highlights"
+
+  - PUT /api/v1/collections/{id}/assets/{assetId} — once per matching asset (see Organizing: collections & webhooks)
+
+Get notified when uploads finish processing
+
+Scenario: stop manually checking whether ingested files have finished processing.
+
+Prompt
+Turn on watch-folder ingest for the "raw-uploads" bucket on my
+open-videocore instance, and register a webhook so we get pinged whenever
+an asset finishes processing or fails.
+
+What the agent does:
+
+  - POST /api/v1/storage/buckets/{bucket}/watch-folder/toggle — {"enabled": true} (see Ingesting media)
+
+  - POST /api/v1/webhooks/ — events: ["asset.ready", "asset.failed"] (see Organizing: collections & webhooks)
+
+---
+
+# Introduction
+
+URL: https://videocore.pages.osaas.io/introduction.html
+
+Introduction
+
+What open-videocore is, how it's put together, and the ideas you need before your first API call.
+
+What open-videocore is
+
+open-videocore is headless, API-first media asset management (MAM) middleware. It doesn't do any media processing itself — it orchestrates OSC services that do (a transcoder, a packager, object storage, a metadata store) behind one small, versioned REST API. You call one API; open-videocore routes the work to the right backing services and tracks the result as an asset.
+
+Each workspace — a named stack you provision once — owns its own object storage, metadata store, and queue. Nothing is shared across workspaces at the data layer; the middleware resolves the right backing services for each request from a parameter store, so there are no static connection strings to manage per workspace.
+
+REST basics
+
+  - Base URL. Every endpoint in this documentation is relative to your instance's public URL: https://<your-instance>.
+
+  - JSON everywhere. Request and response bodies are JSON (Content-Type: application/json), except raw media bytes on upload endpoints and YAML on profile endpoints.
+
+  - Versioning. The entire API is namespaced under /api/v1. There is no separate per-resource version.
+
+  - Collection roots and the trailing slash. A collection root like POST /api/v1/assets is served both with and without a trailing slash — both reach the same handler. This documentation uses whichever form the spec emits internally; either works at runtime.
+
+Identifiers
+
+Every entity — asset, job, collection, webhook, profile, provisioning operation — has an opaque string id (or, for profiles, a unique name) assigned by the server on creation. IDs are not guessable and should be treated as opaque tokens, not parsed.
+
+Timestamps
+
+Entity timestamps (createdAt, updatedAt, and each asset's statusHistory[].at) are ISO 8601 date-time strings in UTC, e.g. 2026-09-03T12:00:00.000Z. Job progress timestamps (startedAt, completedAt on a provisioning operation) are Unix epoch milliseconds — check the field's type in the reference before assuming one or the other.
+
+Synchronous vs. asynchronous work
+
+Reads and small writes (create a collection, add a tag, update metadata) respond immediately. Anything that touches media or infrastructure — ingest, transcode, package, clip, export, provisioning — is asynchronous: the triggering call returns a Job or Provisioning Operation immediately, and you poll its own GET endpoint for completion. See each capability's guide for the exact job type it returns.
+
+Where to go next
+
+  Data model
+The core entities — Asset, Job, Pipeline Execution, Profile, Collection — and how they relate.
+
+  Installation
+Launch an instance on Open Source Cloud.
+
+  Ingesting media
+Your first API calls once an instance is running.
+
+---
+
+# Data model
+
+URL: https://videocore.pages.osaas.io/data-model.html
+
+Data model
+
+The entities open-videocore manages, the fields on each (pulled directly from the response schemas in openapi.json), and how they relate.
+
+Workspace (provisioned Stack)
+ └─ owns object storage + metadata store + queue
+ │
+ ├─ Asset ── created by ingest / upload, the unit everything else hangs off
+ │    ├─ Job(s)            (transcode, ingest-url — async work on this asset)
+ │    ├─ Pipeline Execution (chains multiple steps, e.g. transcode + package)
+ │    ├─ Thumbnails, audio/subtitle tracks, tags, free-form metadata
+ │    └─ child Assets       (renditions from transcode, clips, exports)
+ │
+ ├─ Collection ──── named group of Asset ids
+ ├─ Profile ─────── transcoding rendition ladder, referenced by transcode Jobs
+ ├─ Webhook ─────── HTTP callback subscribed to Asset/Job lifecycle events
+ └─ Optional Service ── add-on OSC service, provisioned per workspace on demand
+
+  Asset
+
+  The central entity. Represents one piece of media through its whole lifecycle — from an empty record through upload, processing, and (optionally) packaging.
+
+    FieldTypeNotes
+
+      idstringOpaque identifier.
+
+      namestringCanonical editorial title. Set on ingest via title (or the legacy name alias); persisted at descriptive.title.
+
+      statusenumuploading · processing · ready · failed · archived
+
+      reviewStateenumdraft · in-review · approved · rejected
+
+      parentId / versionOfAssetId / versionGroupIdstringLinks a clip, rendition, or version back to its source asset.
+
+      statusHistoryarrayEvery status transition, with a timestamp.
+
+      technicalMetadataobjectCodec, resolution, duration, bitrate — populated by extract-metadata.
+
+      manifestUrlsobjectPopulated once packaging completes.
+
+      renditionsarrayReferences to child assets produced by transcoding.
+
+      thumbnails, audioTracks, subtitleTracks, tagsarraySee the thumbnails and metadata guides.
+
+      metadataobjectFree-form, application-defined key-value data.
+
+      createdAt / updatedAtstring (date-time)
+
+  Full request/response shapes: Assets reference.
+
+  Job
+
+  One unit of asynchronous work against an asset — ingest or transcode. Created by the endpoint that starts the work; polled until it settles.
+
+    FieldTypeNotes
+
+      idstring
+
+      typeenumingest-url · transcode
+
+      statusenumpending · queued · running · done · failed · cancelled
+
+      assetIdstringThe asset this job is working on.
+
+      progressnumber
+
+      bytesTransferred / totalBytesnumberIngest download progress.
+
+      renditionAssetIdsarrayChild assets created by a completed transcode job.
+
+      interrupted / interruptionReasonboolean / enumSet when the job was interrupted by an infrastructure event (e.g. auto-scaler scale-down) rather than a media failure, and is being retried.
+
+      createdAt / updatedAtstring (date-time)
+
+  Full shape: Jobs reference.
+
+  Pipeline Execution
+
+  Tracks a multi-step run (for example, transcode then package) against one asset as a single unit, rather than making the caller sequence and poll individual jobs.
+
+    FieldTypeNotes
+
+      idstring
+
+      assetId / assetNamestring
+
+      pipelineNamestringWhich pipeline definition was run.
+
+      statusenumrunning · done · failed
+
+      stepsarrayPer-step status within the execution.
+
+  Full shape: Pipelines reference.
+
+  Profile
+
+  A named transcoding rendition ladder, stored as raw YAML and served to the transcoder via the public index.yml endpoint. Seeded from a default set on bootstrap; extendable per workspace.
+
+    FieldTypeNotes
+
+      namestringPrimary key.
+
+      yamlstringRaw transcoder-format profile definition.
+
+      runnableboolean
+
+  Full shape: Profiles reference.
+
+  Collection
+
+    FieldTypeNotes
+
+      id / namestring
+
+      assetIdsarrayMember asset ids.
+
+      assetsarrayExpanded member asset summaries (on GET).
+
+  Full shape: Collections reference.
+
+  Webhook
+
+    FieldTypeNotes
+
+      idstring
+
+      urlstring (uri)Delivery target.
+
+      eventsarrayasset.ready · asset.failed · transcode.complete · transcode.failed · package.complete · package.failed
+
+      secretstringUsed to sign deliveries, if set.
+
+  Full shape: Webhooks reference.
+
+  Stack (provisioned workspace)
+
+    FieldTypeNotes
+
+      statusenumprovisioning · ready · failed · degraded
+
+      minioEndpoint / couchdbUrl / redisUrlstringBacking service endpoints for this workspace.
+
+      sourceBucket / packagedBucketstring
+
+      servicesarrayBacking OSC service instances that make up this stack.
+
+  Full shape: Provisioning reference.
+
+  Provisioning Operation
+
+    FieldTypeNotes
+
+      idstring
+
+      typeenumprovision · deprovision
+
+      statusenumpending · running · done · failed
+
+      startedAt / completedAtnumberUnix epoch milliseconds — not ISO date-time, unlike most other timestamps.
+
+  Full shape: Provisioning reference.
+
+  Optional Service
+
+    FieldTypeNotes
+
+      key / serviceId / displayNamestring
+
+      stateenumnot-configured · configured · active
+
+      instanceName / urlstringPresent once provisioned.
+
+  Full shape: Optional services reference.
+
+---
+
+# Installation
+
+URL: https://videocore.pages.osaas.io/installation.html
+
+Installation
+
+Launching an instance of open-videocore on Open Source Cloud (OSC). No servers to provision by hand — an MCP-connected agent runs the calls for you.
+
+  -
+    Get an OSC account and access token
+
+    Create an account at osaas.io, then generate a Personal Access Token at app.osaas.io/settings. You'll use this token to authenticate both the deploy agent and, later, the API itself.
+
+  -
+    Connect an agent to OSC over MCP
+
+    OSC exposes an MCP server that provisions and manages every resource open-videocore needs. Connect your agent to it:
+
+    Claude Code / Claude Desktop
+claude mcp add --transport http osc https://mcp.osaas.io/mcp
+
+    For any other MCP-compatible tool, add https://mcp.osaas.io/mcp as a server with your Personal Access Token as the Bearer token. Full setup guides at osaas.io/mcp.
+
+  -
+    Set up a parameter store
+
+    open-videocore tracks the OSC service instances it provisions in a parameter store. Ask your agent:
+
+    Prompt
+Set up an app-config parameter store called `ovcconfig` for my open-videocore deployment.
+
+    The agent provisions the store and returns a config API key — keep it, you'll pass it to the deploy step next.
+
+  -
+    Deploy the instance
+
+    Ask your agent to create the instance, wired to the parameter store from the previous step:
+
+    Prompt
+Create a Personal Access Token for the open-videocore instance, then create an
+open-videocore instance called `ovctest`. Connect it to the parameter store
+named `ovcconfig` using the API key from the previous step. Use the Personal
+Access Token as the OSC access token. Generate strong passwords for
+`MinioRootPassword` and `CouchdbAdminPassword`.
+
+    The agent provisions the instance and returns its public URL — that's https://<your-instance> in every example in this documentation.
+
+  -
+    Provision a workspace stack
+
+    One call stands up the backing infrastructure for a workspace — object storage, metadata store, and queue. The transcoder and packager are provisioned separately, on demand, the first time they're actually used — see Operating a workspace.
+
+    Request
+curl -X POST https://<your-instance>/api/v1/provision \
+  -H "Content-Type: application/json" \
+  -d '{"name": "mystack"}'
+
+    Provisioning is asynchronous. Poll the returned operationId until status reaches "done":
+
+    curl https://<your-instance>/api/v1/provision/operations/<operationId>
+
+    By default the stack provisions its own object storage and buckets — no storage configuration required. To point at an existing S3-compatible bucket instead, pass the optional sourceStorage / packagedStorage blocks — see provision in the reference.
+
+  -
+    Bootstrap transcoding profiles
+
+    Seed the profile store from the default transcoder test profiles:
+
+    curl -X POST https://<your-instance>/api/v1/profiles/bootstrap
+
+    Your instance is live. The ops dashboard is at https://<your-instance>/ui; interactive, always-current API docs are served at https://<your-instance>/api-docs. Continue to Ingesting media to get your first asset in.
+
+Environment variables
+
+Set automatically by the deploy step above, or configurable directly if you're running open-videocore yourself.
+
+  VariableRequiredDescription
+
+    OSC_ACCESS_TOKENYesPersonal Access Token. Injected automatically at deploy time on OSC.
+
+    PARAMETER_STORE_API_KEYYesConfig API key of the connected parameter store.
+
+    PARAMETER_STORE_INSTANCE_NAMEYesName of the parameter store (default ovcconfig).
+
+    MINIO_ROOT_PASSWORDYesAdmin password used when provisioning object storage instances.
+
+    COUCHDB_ADMIN_PASSWORDYesAdmin password used when provisioning the metadata store.
+
+    PORTNoHTTP port (default 3000).
+
+    ENCORE_MAX_INSTANCESNoMax transcoder instances the auto-scaler may run per workspace (default 3).
+
+    ENCORE_MIN_INSTANCESNoWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
+
+    ENCORE_IDLE_TIMEOUT_MSNoIdle time before a transcoder instance is torn down (default 300000).
+
+    PUBLIC_BASE_URLNoPublicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder.
+
+---
+
+# Authentication & errors
+
+URL: https://videocore.pages.osaas.io/authentication.html
+
+Authentication & errors
+
+Authentication
+
+Every request — other than health checks and the internal service callbacks — is authenticated with a bearer token, presented as an Authorization header:
+
+Authorization: Bearer <your-osc-access-token>
+
+In production on OSC, this is enforced by the platform's login wall in front of the instance. The token is your OSC Personal Access Token — the same one used in Installation to deploy the instance.
+
+Errors & conventions
+
+  - Standard HTTP status codes: 2xx success, 4xx client error (bad input, not found), 5xx server/upstream error.
+
+  - Long-running work (transcode, package, provisioning) is asynchronous: the triggering call returns immediately with a job or operation id, which you poll via the corresponding GET endpoint — see Introduction → synchronous vs. asynchronous work.
+
+  - Trailing slash. Each collection root (for example POST /api/v1/assets) is served both with and without a trailing slash — both reach the same handler.
+
+  - Endpoints under Internal callbacks are called by the transcoder and packager services as callbacks and are not part of the public client contract.
+
+---
+
+# open-videocore
+
+URL: https://videocore.pages.osaas.io/
+
+open-videocore
+
+Headless, API-first media asset management middleware that runs entirely on Open Source Cloud. Ingest, transcode, package, search, and deliver video — one REST API per workspace, backed by its own provisioned stack.
+
+  Install on OSC →
+  Read the introduction
+  See agentic examples
+  Browse the API reference
+
+Guides
+
+Task-oriented walkthroughs — what you can do, and how. Each one links to the exact endpoints involved.
+
+Ingesting media
+Get source video into open-videocore: from a URL, direct upload, presigned/multipart upload, or an object storage watch-folder.
+Transcoding & packaging
+Turn source media into an ABR ladder and package it as HLS/DASH — as separate steps, or chained in one pipeline.
+Metadata, tags & search
+Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.
+Thumbnails, clips & export
+Extract poster frames, cut a sub-segment into a new asset, and re-wrap into a different container.
+Delivery & playback
+Get a playable URL for an asset — proxied HLS/DASH manifests or a presigned source download.
+Organizing: collections & webhooks
+Group related assets into collections, and get HTTP notifications when asset and job state changes.
+Operating a workspace
+Provision a workspace's backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.
+
+Agentic examples
+
+Prompts for driving open-videocore from an AI agent, and the real API calls each one makes.
+
+  Agentic examples
+Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.
+
+Reference
+
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 100 endpoints, generated from the committed openapi.json.
+
+  Introduction
+What open-videocore is and how it's put together.
+
+  Data model
+Core entities and how they relate.
+
+  Installation
+Launch an instance on OSC.
+
+  Authentication & errors
+Bearer tokens and API conventions.

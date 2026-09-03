@@ -730,17 +730,37 @@ function renderNav(activeFile: string): string {
 `;
   }).join('');
 
+  const agenticFname = 'agentic-examples.html';
   return `
     <div class="nav-top">${staticItems}</div>
     <div class="nav-section-label">Guides</div>
     <div class="nav-guides">${guideItems}</div>
+    <div class="nav-section-label">Agentic examples</div>
+    <div class="nav-guides"><a href="${agenticFname}" class="nav-guide-link${agenticFname === activeFile ? ' active' : ''}">Agentic examples</a></div>
     <div class="nav-section-label">API reference</div>
     ${groupBlocks}
 `;
 }
 
+// Canonical public URL of the published docs site (see .github/workflows/publish-docs.yml).
+// Used for canonical links, Open Graph/Twitter tags, JSON-LD, sitemap.xml, and llms.txt.
+const SITE_URL = 'https://videocore.pages.osaas.io';
+const SITE_NAME = 'open-videocore documentation';
+const OG_IMAGE_URL = `${SITE_URL}/og-image.png`;
+const SITE_DESCRIPTION =
+  'Headless, API-first media asset management middleware for ingesting, transcoding, packaging, searching, and delivering video — running entirely on Open Source Cloud.';
+
+function canonicalUrl(fname: string): string {
+  return fname === 'index.html' ? `${SITE_URL}/` : `${SITE_URL}/${fname}`;
+}
+
+// Collected while pages are generated, then flushed to sitemap.xml / llms.txt /
+// llms-full.txt once every page has been written (see the bottom of this file).
+const pageIndex: { fname: string; title: string; description: string; section: string; bodyHtml: string }[] = [];
+
 function pageShell(
   title: string,
+  description: string,
   activeFile: string,
   bodyHtml: string,
   prev?: [string, string],
@@ -757,12 +777,46 @@ function pageShell(
       : '<span></span>';
     pager = `<div class="pager">${prevHtml}${nextHtml}</div>`;
   }
+  const url = canonicalUrl(activeFile);
+  const fullTitle = activeFile === 'index.html' ? title : `${title} · open-videocore docs`;
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'WebPage',
+    name: title,
+    description,
+    url,
+    isPartOf: { '@type': 'WebSite', name: SITE_NAME, url: `${SITE_URL}/` },
+    breadcrumb: {
+      '@type': 'BreadcrumbList',
+      itemListElement: [
+        { '@type': 'ListItem', position: 1, name: 'Docs', item: `${SITE_URL}/` },
+        ...(activeFile === 'index.html' ? [] : [{ '@type': 'ListItem', position: 2, name: title, item: url }])
+      ]
+    }
+  };
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)} · open-videocore docs</title>
+<title>${esc(fullTitle)}</title>
+<meta name="description" content="${esc(description)}">
+<link rel="canonical" href="${url}">
+<link rel="icon" href="data:,">
+<meta property="og:type" content="${activeFile === 'index.html' ? 'website' : 'article'}">
+<meta property="og:site_name" content="${esc(SITE_NAME)}">
+<meta property="og:title" content="${esc(title)}">
+<meta property="og:description" content="${esc(description)}">
+<meta property="og:url" content="${url}">
+<meta property="og:image" content="${OG_IMAGE_URL}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="open-videocore — API-first media asset management on Open Source Cloud">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${esc(title)}">
+<meta name="twitter:description" content="${esc(description)}">
+<meta name="twitter:image" content="${OG_IMAGE_URL}">
+<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
 <style>${CSS}</style>
 <script defer src="https://umami-eyevinn.users.osaas.io/script.js" data-website-id="41cc05c2-445c-4fd2-a89c-4ec1b183089f"></script>
 </head>
@@ -788,8 +842,17 @@ function pageShell(
 `;
 }
 
-function write(fname: string, title: string, body: string, prev?: [string, string], next?: [string, string]) {
-  writeFileSync(join(OUT_DIR, fname), pageShell(title, fname, body, prev, next));
+function write(
+  fname: string,
+  title: string,
+  description: string,
+  body: string,
+  prev?: [string, string],
+  next?: [string, string],
+  section = 'Reference'
+) {
+  writeFileSync(join(OUT_DIR, fname), pageShell(title, description, fname, body, prev, next));
+  pageIndex.push({ fname, title, description, section, bodyHtml: body });
 }
 
 // ===========================================================================
@@ -854,7 +917,7 @@ groupOrder.forEach((key, idx) => {
     idx > 0 ? [fileForGroup(groupOrder[idx - 1]), GROUP_META[groupOrder[idx - 1]][0]] : ['api-reference.html', 'API reference'];
   const next: [string, string] | undefined =
     idx < groupOrder.length - 1 ? [fileForGroup(groupOrder[idx + 1]), GROUP_META[groupOrder[idx + 1]][0]] : undefined;
-  write(fileForGroup(key), GROUP_META[key][0], renderGroupPage(key), prev, next);
+  write(fileForGroup(key), GROUP_META[key][0], GROUP_META[key][1], renderGroupPage(key), prev, next, 'API reference');
 });
 
 const totalEndpoints = groupOrder.reduce((sum, k) => sum + (groups.get(k)?.length ?? 0), 0);
@@ -868,15 +931,21 @@ const refCards = groupOrder
   )
   .join('');
 
+const apiReferenceDescription = `Every open-videocore REST API endpoint (${totalEndpoints} across ${groupOrder.length} resource groups), generated straight from the committed openapi.json.`;
+
 write(
   'api-reference.html',
   'API reference',
+  apiReferenceDescription,
   `
 <div class="crumb"><a href="index.html">Docs</a> / API reference</div>
 <h1>API reference</h1>
 <p class="lede">Every endpoint, grouped by resource, generated straight from the committed <code>openapi.json</code> (${totalEndpoints} endpoints across ${groupOrder.length} groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the <a href="index.html#guides">guides</a> instead — each one links back to the relevant endpoints here.</p>
 <div class="card-grid">${refCards}</div>
-`
+`,
+  ['agentic-examples.html', 'Agentic examples'],
+  undefined,
+  'API reference'
 );
 
 // ===========================================================================
@@ -887,15 +956,88 @@ GUIDES.forEach((g, idx) => {
   const fname = g.slug + '.html';
   const prev: [string, string] = idx > 0 ? [GUIDES[idx - 1].slug + '.html', GUIDES[idx - 1].title] : ['data-model.html', 'Data model'];
   const next: [string, string] =
-    idx < GUIDES.length - 1 ? [GUIDES[idx + 1].slug + '.html', GUIDES[idx + 1].title] : ['api-reference.html', 'API reference'];
+    idx < GUIDES.length - 1 ? [GUIDES[idx + 1].slug + '.html', GUIDES[idx + 1].title] : ['agentic-examples.html', 'Agentic examples'];
   const body = `
     <div class="crumb"><a href="index.html">Docs</a> / Guides / ${esc(g.title)}</div>
     <h1>${esc(g.title)}</h1>
     <p class="lede">${esc(g.blurb)}</p>
     ${GUIDE_BODIES[g.slug]}
     `;
-  write(fname, g.title, body, prev, next);
+  write(fname, g.title, g.blurb, body, prev, next, 'Guides');
 });
+
+// ===========================================================================
+// 5b. Agentic examples — example prompts for an AI agent driving OVC
+// ===========================================================================
+// Grounded in the same endpoints documented in the guides above; each
+// example names the real calls an agent would make, not a hypothetical
+// convenience layer. This is also why it's worth a section of its own: the
+// REST API + committed openapi.json contract is enough for a general-purpose
+// coding/assistant agent to drive directly from a plain-language prompt, no
+// bespoke SDK or plugin required — point it at your instance and describe
+// the outcome.
+
+const AGENTIC_EXAMPLES_DESCRIPTION =
+  'Example prompts for driving open-videocore from an AI agent — send a large file for review, build a highlights collection, get notified on completion — with the real API calls each one makes.';
+
+const agenticExamplesBody = `
+<p>open-videocore is a plain REST API with a committed <a href="api-reference.html"><code>openapi.json</code></a> — that's enough for a general-purpose AI coding agent (Claude Code, or any assistant you've given your instance URL and a token to) to drive it directly from a natural-language prompt. No bespoke SDK, plugin, or custom tool required: give the agent your instance URL, point it at the guides or the raw endpoints, and describe the outcome you want.</p>
+<div class="callout">Each example below assumes the agent already knows your instance URL (<code>https://&lt;your-instance&gt;</code>) and has your <a href="authentication.html">bearer token</a> available — as an environment variable, a secret store, or pasted into the conversation the same way you'd hand it any other API credential.</div>
+
+<h2 id="review-link">Send a large file for review</h2>
+<p><strong>Scenario:</strong> you have a large video file on your own machine and need someone else to review it, without emailing a multi-gigabyte attachment or waiting on a slow file-sharing upload.</p>
+<div class="code-block"><div class="code-label">Prompt</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs to
+review by Friday. Upload it to my open-videocore instance at
+https://&lt;your-instance&gt;, wait until it's ready, package it for streaming,
+and give me a playback link I can send her.</code></pre></div>
+<p>What the agent does, mapped to the real calls:</p>
+<ol>
+  <li>${refEx('POST', '/api/v1/assets/', 'create the asset record')}</li>
+  <li>Because the file is large, a <a href="guide-ingest.html#multipart">multipart upload</a>: ${refEx('POST', '/api/v1/assets/{id}/multipart/initiate')} → ${refEx('GET', '/api/v1/assets/{id}/multipart/{uploadId}/part-url', 'per part')} → ${refEx('POST', '/api/v1/assets/{id}/multipart/{uploadId}/complete')}</li>
+  <li>Poll ${refEx('GET', '/api/v1/assets/{id}')} until <code>status</code> leaves <code>uploading</code></li>
+  <li>${refEx('POST', '/api/v1/assets/{id}/execute', "run the transcode-and-package pipeline")} (see <a href="guide-transcode-package.html">Transcoding &amp; packaging</a>), then poll the execution</li>
+  <li>${refEx('GET', '/api/v1/assets/{id}/delivery')} for the playback URL (see <a href="guide-delivery.html">Delivery &amp; playback</a>)</li>
+</ol>
+<p>If the agent also has messaging tools connected, the same prompt can end with "...and send Jana a Slack message with the link" — the video handling is exactly the same either way.</p>
+
+<h2 id="highlights-collection">Build a highlights collection from tagged clips</h2>
+<p><strong>Scenario:</strong> pull every clip that matches a tag into one collection for an editor, without hand-searching the library.</p>
+<div class="code-block"><div class="code-label">Prompt</div><pre><code>Find all assets tagged "goal" from this week's match footage on my
+open-videocore instance and put them in a new collection called
+"Matchday highlights" for the editing team.</code></pre></div>
+<p>What the agent does:</p>
+<ol>
+  <li>${refEx('GET', '/api/v1/search', 'filter by tags=goal, see Metadata, tags & search')} (<a href="guide-metadata-search.html#search">guide</a>)</li>
+  <li>${refEx('POST', '/api/v1/collections/', 'create "Matchday highlights"')}</li>
+  <li>${refEx('PUT', '/api/v1/collections/{id}/assets/{assetId}', 'once per matching asset')} (see <a href="guide-organizing.html#collections">Organizing: collections &amp; webhooks</a>)</li>
+</ol>
+
+<h2 id="notify-on-ready">Get notified when uploads finish processing</h2>
+<p><strong>Scenario:</strong> stop manually checking whether ingested files have finished processing.</p>
+<div class="code-block"><div class="code-label">Prompt</div><pre><code>Turn on watch-folder ingest for the "raw-uploads" bucket on my
+open-videocore instance, and register a webhook so we get pinged whenever
+an asset finishes processing or fails.</code></pre></div>
+<p>What the agent does:</p>
+<ol>
+  <li>${refEx('POST', '/api/v1/storage/buckets/{bucket}/watch-folder/toggle', '{"enabled": true}')} (see <a href="guide-ingest.html#watch-folder">Ingesting media</a>)</li>
+  <li>${refEx('POST', '/api/v1/webhooks/', 'events: ["asset.ready", "asset.failed"]')} (see <a href="guide-organizing.html#webhooks">Organizing: collections &amp; webhooks</a>)</li>
+</ol>
+`;
+
+write(
+  'agentic-examples.html',
+  'Agentic examples',
+  AGENTIC_EXAMPLES_DESCRIPTION,
+  `
+    <div class="crumb"><a href="index.html">Docs</a> / Agentic examples</div>
+    <h1>Agentic examples</h1>
+    <p class="lede">${esc(AGENTIC_EXAMPLES_DESCRIPTION)}</p>
+    ${agenticExamplesBody}
+    `,
+  [GUIDES[GUIDES.length - 1].slug + '.html', GUIDES[GUIDES.length - 1].title],
+  ['api-reference.html', 'API reference'],
+  'Agentic examples'
+);
 
 // ===========================================================================
 // 6. Introduction
@@ -1195,16 +1337,46 @@ const authBody = `
 </ul>
 `;
 
-write('introduction.html', 'Introduction', introductionBody, undefined, ['data-model.html', 'Data model']);
-write('data-model.html', 'Data model', dataModelBody, ['introduction.html', 'Introduction'], ['installation.html', 'Installation']);
-write('installation.html', 'Installation', installationBody, ['data-model.html', 'Data model'], [
+const introductionDescription =
+  "What open-videocore is, how it's put together, and the core REST conventions — identifiers, timestamps, sync vs. async — behind its API.";
+const dataModelDescription =
+  'The core entities open-videocore manages — Asset, Job, Pipeline Execution, Profile, Collection, Webhook, Stack, and more — and how they relate.';
+const installationDescription =
+  'Step-by-step instructions for launching an instance of open-videocore on Open Source Cloud (OSC).';
+const authDescription =
+  "How to authenticate requests to the open-videocore API with a bearer token, plus its error and status-code conventions.";
+
+write('introduction.html', 'Introduction', introductionDescription, introductionBody, undefined, [
+  'data-model.html',
+  'Data model'
+], 'Docs');
+write(
+  'data-model.html',
+  'Data model',
+  dataModelDescription,
+  dataModelBody,
+  ['introduction.html', 'Introduction'],
+  ['installation.html', 'Installation'],
+  'Docs'
+);
+write(
+  'installation.html',
+  'Installation',
+  installationDescription,
+  installationBody,
+  ['data-model.html', 'Data model'],
+  ['authentication.html', 'Authentication & errors'],
+  'Docs'
+);
+write(
   'authentication.html',
-  'Authentication & errors'
-]);
-write('authentication.html', 'Authentication & errors', authBody, ['installation.html', 'Installation'], [
-  GUIDES[0].slug + '.html',
-  GUIDES[0].title
-]);
+  'Authentication & errors',
+  authDescription,
+  authBody,
+  ['installation.html', 'Installation'],
+  [GUIDES[0].slug + '.html', GUIDES[0].title],
+  'Docs'
+);
 
 // ===========================================================================
 // 10. Landing page (index.html)
@@ -1220,12 +1392,19 @@ const indexBody = `
 <div class="hero-links">
   <a href="installation.html">Install on OSC &rarr;</a>
   <a href="introduction.html">Read the introduction</a>
+  <a href="agentic-examples.html">See agentic examples</a>
   <a href="api-reference.html">Browse the API reference</a>
 </div>
 
 <h2 id="guides">Guides</h2>
 <p class="group-blurb">Task-oriented walkthroughs — what you can do, and how. Each one links to the exact endpoints involved.</p>
 <div class="card-grid">${guideCards}</div>
+
+<h2 id="agentic-examples">Agentic examples</h2>
+<p class="group-blurb">Prompts for driving open-videocore from an AI agent, and the real API calls each one makes.</p>
+<div class="card-grid">
+  <a class="card" href="agentic-examples.html"><div class="card-title">Agentic examples</div><div class="card-desc">${esc(AGENTIC_EXAMPLES_DESCRIPTION)}</div></a>
+</div>
 
 <h2 id="reference">Reference</h2>
 <p class="group-blurb">Looking for one endpoint's exact parameters or response shape? The <a href="api-reference.html">API reference</a> covers all ${totalEndpoints} endpoints, generated from the committed <code>openapi.json</code>.</p>
@@ -1237,15 +1416,97 @@ const indexBody = `
 </div>
 `;
 
-write('index.html', 'open-videocore documentation', indexBody);
+write('index.html', 'open-videocore', SITE_DESCRIPTION, indexBody, undefined, undefined, 'Docs');
 
 // ===========================================================================
-// 11. Prune stale output (a resource group or guide that was removed)
+// 11. SEO / AEO artifacts: sitemap.xml, robots.txt, llms.txt, llms-full.txt
+// ===========================================================================
+// llms.txt / llms-full.txt follow the emerging llms.txt convention
+// (https://llmstxt.org/) for making a site's content easy for an LLM or
+// answer-engine crawler to fetch and read directly, without having to
+// render HTML or navigate the sidebar — the same convention already used
+// on Eyevinn's own osaas-landing-app site.
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&mdash;/g, '—')
+    .replace(/&rarr;/g, '→')
+    .replace(/&larr;/g, '←')
+    .replace(/&middot;/g, '·')
+    .replace(/&hellip;/g, '…')
+    .replace(/&rsquo;/g, '’')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+// Rough but effective HTML -> plain text for the llms-full.txt export: this
+// is rendered from our own generated markup (a known, limited tag set), not
+// arbitrary third-party HTML, so a regex stripper is adequate here.
+function htmlToText(html: string): string {
+  let s = html;
+  s = s.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, '');
+  s = s.replace(/<div class="crumb">[\s\S]*?<\/div>/gi, ''); // breadcrumb, redundant in plain text
+  s = s.replace(/<\/(h1|h2|h3|h4|p|li|div|article|section|tr)>/gi, '\n');
+  s = s.replace(/<li[^>]*>/gi, '- ');
+  s = s.replace(/<br\s*\/?>/gi, '\n');
+  s = s.replace(/<[^>]+>/g, '');
+  s = decodeEntities(s);
+  s = s.replace(/[ \t]+\n/g, '\n');
+  s = s.replace(/\n{3,}/g, '\n\n');
+  return s.trim();
+}
+
+// --- sitemap.xml ---
+const sitemapEntries = pageIndex
+  .map((p) => `  <url><loc>${canonicalUrl(p.fname)}</loc></url>`)
+  .join('\n');
+writeFileSync(
+  join(OUT_DIR, 'sitemap.xml'),
+  `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${sitemapEntries}\n</urlset>\n`
+);
+
+// --- robots.txt ---
+writeFileSync(
+  join(OUT_DIR, 'robots.txt'),
+  `User-agent: *\nAllow: /\n\nSitemap: ${SITE_URL}/sitemap.xml\n`
+);
+
+// --- llms.txt (index) ---
+const llmsSections = ['Guides', 'Agentic examples', 'Docs', 'API reference'];
+const llmsBody = llmsSections
+  .map((section) => {
+    const pages = pageIndex.filter((p) => p.section === section && p.fname !== 'index.html');
+    if (!pages.length) return '';
+    const items = pages.map((p) => `- [${p.title}](${canonicalUrl(p.fname)}): ${p.description}`).join('\n');
+    return `## ${section}\n\n${items}\n`;
+  })
+  .filter(Boolean)
+  .join('\n');
+writeFileSync(
+  join(OUT_DIR, 'llms.txt'),
+  `# open-videocore\n\n> ${SITE_DESCRIPTION}\n\n${llmsBody}\n[Full text of every page](${SITE_URL}/llms-full.txt)\n`
+);
+
+// --- llms-full.txt (concatenated plain-text content of every page) ---
+const llmsFullBody = pageIndex
+  .map((p) => `# ${p.title}\n\nURL: ${canonicalUrl(p.fname)}\n\n${htmlToText(p.bodyHtml)}`)
+  .join('\n\n---\n\n');
+writeFileSync(join(OUT_DIR, 'llms-full.txt'), `${llmsFullBody}\n`);
+
+// ===========================================================================
+// 12. Prune stale output (a resource group or guide that was removed)
 // ===========================================================================
 
 const expected = new Set([
   'index.html',
   'api-reference.html',
+  'agentic-examples.html',
   ...STATIC_PAGES.map(([f]) => f),
   ...GUIDES.map((g) => g.slug + '.html'),
   ...groupOrder.map(fileForGroup)
