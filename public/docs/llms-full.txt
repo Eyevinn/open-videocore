@@ -2983,19 +2983,11 @@ Send a large file for review
 
 Scenario: you have a large video file on your own machine and need someone else to review it, without emailing a multi-gigabyte attachment or waiting on a slow file-sharing upload.
 
-Prompt (OSC-connected agent)
+Prompt
 I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
 to review by Friday. Upload it to my open-videocore instance, wait until
 it's ready, package it for streaming, and give me a playback link I can
 send her.
-
-Without OSC access, the agent needs the instance named explicitly:
-
-Prompt (plain API access)
-I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
-to review by Friday. Upload it to my open-videocore instance at
-https://<your-instance>, wait until it's ready, package it for streaming,
-and give me a playback link I can send her.
 
 What the agent does, mapped to the real calls:
 
