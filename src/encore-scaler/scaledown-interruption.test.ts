@@ -50,6 +50,7 @@ class FakeRedis {
   strings = new Map<string, string>();
   hashes = new Map<string, Map<string, string>>();
   lists = new Map<string, string[]>();
+  sets = new Map<string, Set<string>>();
 
   private hash(key: string): Map<string, string> {
     let h = this.hashes.get(key);
@@ -58,6 +59,32 @@ class FakeRedis {
       this.hashes.set(key, h);
     }
     return h;
+  }
+  private set_(key: string): Set<string> {
+    let s = this.sets.get(key);
+    if (!s) {
+      s = new Set();
+      this.sets.set(key, s);
+    }
+    return s;
+  }
+  // Minimal set commands for the #525 pt.2 packaging-pin check the scale-down
+  // teardown path now runs (hasPendingPackaging). No TTL semantics needed —
+  // this suite never exercises expiry, only presence/absence.
+  async sadd(key: string, member: string): Promise<number> {
+    const s = this.set_(key);
+    const isNew = !s.has(member);
+    s.add(member);
+    return isNew ? 1 : 0;
+  }
+  async srem(key: string, member: string): Promise<number> {
+    return this.set_(key).delete(member) ? 1 : 0;
+  }
+  async scard(key: string): Promise<number> {
+    return this.set_(key).size;
+  }
+  async pexpire(_key: string, _ms: number): Promise<number> {
+    return 1;
   }
 
   async set(key: string, val: string): Promise<'OK'> {

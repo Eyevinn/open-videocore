@@ -37,6 +37,7 @@ import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { decideRetry, clearRetryState } from '../encore-scaler/retry-store.js';
+import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
 
 // Resolve the correct Encore job API URL using the reverse UUID mapping stored
@@ -483,6 +484,38 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     { jobs: deps.jobRepository, assets: deps.assetRepository }
   );
 
+  // #525 pt.2: on a successful completion, pin the instance that ran this job
+  // against premature scale-down BEFORE decrementActiveJobs below — that call
+  // is what makes the instance look idle to the scaler's teardown check, so
+  // the pin MUST be in place before it, not after. Resolved via the same
+  // jobInstance mapping decrementActiveJobs itself reads. If we can't resolve
+  // the instance (already gone) there's nothing to pin; the packaging attempt
+  // below will discover that on its own terms. Released (see
+  // releasePendingPackagingPin below) as soon as we determine packaging either
+  // isn't needed or wasn't started, or by the packager's success callback once
+  // packaging genuinely completes; otherwise self-expires via the pin's TTL.
+  let pinnedInstanceId: string | undefined;
+  if (result.applied && success) {
+    const decoded = decodeEncoreJobId(externalId);
+    if (decoded) {
+      try {
+        const instanceId = await deps.redis.hget(keys.jobInstance(decoded.workspaceId), externalId);
+        if (instanceId) {
+          await pinInstanceForPackaging(deps.redis, instanceId, externalId);
+          pinnedInstanceId = instanceId;
+        }
+      } catch (err) {
+        deps.logger.warn({ msg: 'encore-callback-poller: failed to pin instance for packaging handoff', externalId, err });
+      }
+    }
+  }
+  const releasePendingPackagingPin = async (): Promise<void> => {
+    if (!pinnedInstanceId) return;
+    await unpinInstanceForPackaging(deps.redis, pinnedInstanceId, externalId).catch((err) => {
+      deps.logger.warn({ msg: 'encore-callback-poller: failed to release packaging pin', externalId, instanceId: pinnedInstanceId, err });
+    });
+  };
+
   // Free the slot on the Encore instance that ran this job so the scaler can
   // reuse its capacity. Only on a terminal completion that actually applied.
   if (result.applied) {
@@ -507,6 +540,13 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     // eligible for retry): drop the #295 retry bookkeeping so it does not linger.
     await clearRetryState(deps.redis, externalId).catch(() => {});
   }
+
+  // #525 pt.2: tracks whether the pin above was actually handed off to a
+  // genuinely in-flight packaging job (in which case it must stay pinned until
+  // the packager's success callback releases it) versus every other outcome
+  // below (no pipeline, no package step, URL/provisioning failure), which
+  // should release the pin immediately rather than waiting out its TTL.
+  let packagingHandedOff = false;
 
   // Advance the matching PipelineExecution — copied from src/routes/internal.ts
   // (the encore-callback handler). It can't be shared without a refactor.
@@ -584,6 +624,7 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
                 assetId: found.job.assetId,
                 err
               });
+              await releasePendingPackagingPin();
               return;
             }
             steps[nextIdx] = { ...steps[nextIdx], status: 'running', startedAt: now };
@@ -595,6 +636,12 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
             // S3, and POSTs /api/v1/internal/packagerCallback/success — which
             // advances this execution's `package` step to `done`.
             await enqueuePackagingJob(deps, found.job.assetId, encoreJobUrl);
+            // #525 pt.2: packaging is genuinely in flight against the pinned
+            // instance now — leave it pinned. The packager's success callback
+            // (routes/internal.ts /packagerCallback/success) releases it; a
+            // failure (no jobId in that callback — encore-packager contract
+            // gap) relies on the pin's own TTL to self-heal.
+            packagingHandedOff = true;
           } else {
             // #525: this branch should now be unreachable in practice, since
             // `url` is required truthy earlier in this function — but log
@@ -624,6 +671,16 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
         }
       }
     }
+  }
+
+  // #525 pt.2: every path above that did NOT hand this job's pin off to a
+  // genuinely enqueued packaging job — no pipelineRepository, no matching
+  // execution, a failed transcode, a non-package next step, or a resolution/
+  // provisioning failure that already released it once (a second release is a
+  // harmless no-op) — must release the pin here so the instance isn't held
+  // alive for nothing until the TTL expires.
+  if (!packagingHandedOff) {
+    await releasePendingPackagingPin();
   }
 
   deps.logger.info({

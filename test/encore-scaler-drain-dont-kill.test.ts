@@ -118,6 +118,32 @@ class FakeRedis {
     l.splice(idx, 1);
     return 1;
   }
+  // #525 pt.2: scale-down teardown now checks the packaging pin (SCARD). No
+  // test in this file ever pins an instance, so this is always empty.
+  private sets = new Map<string, Set<string>>();
+  private set_(key: string): Set<string> {
+    let s = this.sets.get(key);
+    if (!s) {
+      s = new Set();
+      this.sets.set(key, s);
+    }
+    return s;
+  }
+  async sadd(key: string, member: string): Promise<number> {
+    const s = this.set_(key);
+    const isNew = !s.has(member);
+    s.add(member);
+    return isNew ? 1 : 0;
+  }
+  async srem(key: string, member: string): Promise<number> {
+    return this.set_(key).delete(member) ? 1 : 0;
+  }
+  async scard(key: string): Promise<number> {
+    return this.set_(key).size;
+  }
+  async pexpire(): Promise<number> {
+    return 1;
+  }
 }
 
 const OSC_CONTEXT_STUB = {
@@ -314,6 +340,53 @@ describe('scale-down drain-don\'t-kill (issue #513)', () => {
 
     const config = makeConfig(redis, workspaceId, idleTimeoutMs);
     const loop = new EncoreScalerLoop(config);
+    await loop.tick();
+
+    expect(destroyInstance).toHaveBeenCalledTimes(1);
+    expect(destroyInstance).toHaveBeenCalledWith(record.instanceId, config);
+  });
+
+  // #525 pt.2 regression: an instance whose transcode job just finished looks
+  // completely idle to Encore itself (real.count === 0) the SAME tick the
+  // transcode->package handoff still needs it alive to serve the packager's
+  // GET. With minInstances:0 and a short idleTimeoutMs the OLD code destroyed
+  // it right here, and packaging failed with "Encore instance no longer
+  // available for packaging" even though nothing was actually wrong — a real,
+  // reproducible race distinct from (and not fixed by) the URL-bookkeeping fix
+  // earlier in #525. The packaging-pin (src/encore-scaler/packaging-pin.ts)
+  // must hold the instance draining, not destroyed, while pinned.
+  it('never terminates an instance with a pending packaging pin, even when Encore reports zero real work', async () => {
+    const redis = new FakeRedis();
+    const workspaceId = 'ws-pending-package';
+    const idleTimeoutMs = 10_000;
+
+    // Exactly the old-bug shape: tracked idle past the timeout AND Encore
+    // confirms zero real in-flight work — the pre-#525-pt.2 code tears this
+    // down unconditionally at this point.
+    const record = poolRecord('inst-pending-package', {
+      activeJobs: 0,
+      lastIdleAt: Date.now() - (idleTimeoutMs + 60_000)
+    });
+    await redis.hset(keys.pool(workspaceId), record.instanceId, JSON.stringify(record));
+    stubEncoreFetch({ queued: 0, inProgress: 0 });
+
+    // The transcode->package handoff pinned this instance for a job whose
+    // packaging is still in flight against it.
+    await redis.sadd(keys.pendingPackaging(record.instanceId), 'ws-pending-package__job-1');
+
+    const config = makeConfig(redis, workspaceId, idleTimeoutMs);
+    const loop = new EncoreScalerLoop(config);
+    await loop.tick();
+
+    // Not destroyed — drained instead, exactly like real in-flight work.
+    expect(destroyInstance).not.toHaveBeenCalled();
+    const raw = await redis.hgetall(keys.pool(workspaceId));
+    expect(raw).toHaveProperty(record.instanceId);
+    expect(JSON.parse(raw[record.instanceId]!).draining).toBe(true);
+
+    // Packaging completes (the pin is released, mirroring the packager
+    // success callback in routes/internal.ts) — the NEXT tick tears it down.
+    await redis.srem(keys.pendingPackaging(record.instanceId), 'ws-pending-package__job-1');
     await loop.tick();
 
     expect(destroyInstance).toHaveBeenCalledTimes(1);

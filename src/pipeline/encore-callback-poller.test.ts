@@ -52,6 +52,7 @@ class FakeRedis {
   private strings = new Map<string, string>();
   private hashes = new Map<string, Map<string, string>>();
   private zsets = new Map<string, Map<string, number>>();
+  private sets = new Map<string, Set<string>>();
 
   private hash(key: string): Map<string, string> {
     let h = this.hashes.get(key);
@@ -62,6 +63,28 @@ class FakeRedis {
     let z = this.zsets.get(key);
     if (!z) { z = new Map(); this.zsets.set(key, z); }
     return z;
+  }
+  private set_(key: string): Set<string> {
+    let s = this.sets.get(key);
+    if (!s) { s = new Set(); this.sets.set(key, s); }
+    return s;
+  }
+  // #525 pt.2: handleMessage now pins/unpins the transcode instance for
+  // packaging (packaging-pin.ts) via SADD/SREM/SCARD + a defensive PEXPIRE.
+  async sadd(key: string, member: string): Promise<number> {
+    const s = this.set_(key);
+    const isNew = !s.has(member);
+    s.add(member);
+    return isNew ? 1 : 0;
+  }
+  async srem(key: string, member: string): Promise<number> {
+    return this.set_(key).delete(member) ? 1 : 0;
+  }
+  async scard(key: string): Promise<number> {
+    return this.set_(key).size;
+  }
+  async pexpire(): Promise<number> {
+    return 1;
   }
 
   async get(key: string): Promise<string | null> {
@@ -213,6 +236,11 @@ async function seedScenario(
   // Dispatch-time Redis mappings the poller relies on to resolve the job URL.
   await redis.set(keys.uuidToExternalId(opts.encoreUuid), externalId);
   await redis.set(keys.jobEncoreUrl(externalId), `${BASE_URL}/encoreJobs/${opts.encoreUuid}`);
+  // jobInstance is written unconditionally at dispatch (scaler-loop.ts
+  // dispatch(), outside the `if (encoreUuid && ...)` guard the other two
+  // mappings live in) — the #525 pt.2 packaging pin resolves the instance to
+  // pin/unpin through this same mapping.
+  await redis.hset(keys.jobInstance(WORKSPACE), externalId, INSTANCE_ID);
 
   // Pipeline with a running `transcode` step bound to this Encore job. When
   // withPackageStep is set, a pending `package` step follows so the SUCCESSFUL
@@ -768,6 +796,78 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     const execution = await pipelines.get(pipelineId);
     expect(execution?.status).toBe('running');
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // #525 pt.2: the transcode->package handoff must pin the instance that ran
+  // the job (encore:pending-packaging:{instanceId}) BEFORE the packaging job
+  // is enqueued, and leave it pinned — the scaler must not be able to tear the
+  // instance down while the packager still needs to reach it, and this poller
+  // has no way of knowing when the packager (an external, async OSC service)
+  // actually finishes; that release happens via the packager's success
+  // callback in routes/internal.ts, which this test cannot reach, so the pin
+  // is asserted to still be held once the packaging job is on the queue.
+  it('#525 pt.2: pins the transcode instance for packaging and does not release it once enqueued', async () => {
+    const encoreUuid = 'uuid-handoff-pin';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+
+    const d = baseDeps(successFetch(externalId, encoreUuid), undefined);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(await redis.scard(keys.pendingPackaging(INSTANCE_ID))).toBe(1);
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // #525 pt.2: when packaging is never actually attempted (no package step
+  // follows in this pipeline), any pin taken on the success path must be
+  // released immediately rather than held for its full TTL for nothing.
+  it('#525 pt.2: releases the pin immediately when the pipeline has no package step', async () => {
+    const encoreUuid = 'uuid-handoff-pin-no-package';
+    const { externalId } = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid,
+      withPackageStep: false
+    });
+    await jobs.update(findLocalJobId(externalId), { status: 'running' });
+    const message = JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
+    await redis.zadd(QUEUE_KEY, Date.now(), message);
+
+    const d = baseDeps(successFetch(externalId, encoreUuid), undefined);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(findLocalJobId(externalId)))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    expect(await redis.scard(keys.pendingPackaging(INSTANCE_ID))).toBe(0);
+  });
+
+  // #525 pt.2: a provisioning failure aborts packaging entirely — the pin must
+  // be released here too, not held until its TTL expires.
+  it('#525 pt.2: releases the pin when ensurePackaging throws', async () => {
+    const encoreUuid = 'uuid-handoff-pin-ensure-throws';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+
+    const ensurePackaging = vi.fn(async () => {
+      throw new Error('packager provisioning blew up');
+    });
+    const d = baseDeps(successFetch(externalId, encoreUuid), ensurePackaging);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await pipelines.get(pipelineId))?.status === 'failed');
+    } finally {
+      stop();
+    }
+
+    expect(await redis.scard(keys.pendingPackaging(INSTANCE_ID))).toBe(0);
   });
 });
 
