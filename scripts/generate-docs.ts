@@ -764,6 +764,7 @@ function pageShell(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} · open-videocore docs</title>
 <style>${CSS}</style>
+<script defer src="https://umami-eyevinn.users.osaas.io/script.js" data-website-id="41cc05c2-445c-4fd2-a89c-4ec1b183089f"></script>
 </head>
 <body>
 <div class="layout">
