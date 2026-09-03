@@ -989,15 +989,10 @@ const agenticExamplesBody = `
 
 <h2 id="review-link">Send a large file for review</h2>
 <p><strong>Scenario:</strong> you have a large video file on your own machine and need someone else to review it, without emailing a multi-gigabyte attachment or waiting on a slow file-sharing upload.</p>
-<div class="code-block"><div class="code-label">Prompt (OSC-connected agent)</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
+<div class="code-block"><div class="code-label">Prompt</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
 to review by Friday. Upload it to my open-videocore instance, wait until
 it's ready, package it for streaming, and give me a playback link I can
 send her.</code></pre></div>
-<p>Without OSC access, the agent needs the instance named explicitly:</p>
-<div class="code-block"><div class="code-label">Prompt (plain API access)</div><pre><code>I have a 4.2 GB video file at ~/Desktop/keynote-final.mp4 that Jana needs
-to review by Friday. Upload it to my open-videocore instance at
-https://&lt;your-instance&gt;, wait until it's ready, package it for streaming,
-and give me a playback link I can send her.</code></pre></div>
 <p>What the agent does, mapped to the real calls:</p>
 <ol>
   <li>${refEx('POST', '/api/v1/assets/', 'create the asset record')}</li>
