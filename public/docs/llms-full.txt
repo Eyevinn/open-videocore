@@ -3392,18 +3392,13 @@ Errors & conventions
 
 ---
 
-# open-videocore
+# Documentation
 
-URL: https://videocore.pages.osaas.io/
+URL: https://videocore.pages.osaas.io/docs.html
 
-open-videocore
+Documentation
 
-Headless, API-first media asset management middleware that runs entirely on Open Source Cloud. Ingest, transcode, package, search, and deliver video — one REST API per workspace, backed by its own provisioned stack.
-
-  Install on OSC →
-  Read the introduction
-  See agentic examples
-  Browse the API reference
+Guides, data model, installation, and the full API reference for open-videocore — start here for anything docs-related.
 
 Guides
 
@@ -3446,3 +3441,12 @@ Launch an instance on OSC.
 
   Authentication & errors
 Bearer tokens and API conventions.
+
+---
+
+# open-videocore
+
+URL: https://videocore.pages.osaas.io/
+
+open-videocore
+Give your AI agent a video pipeline. See the docs and agentic examples for details.

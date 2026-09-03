@@ -656,6 +656,69 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 @media (max-width: 900px){ .sidebar{position:static; width:100%; height:auto; flex:none} .layout{flex-direction:column} .main{padding:32px 20px} }
 `;
 
+// Landing page (index.html) only — a marketing shell, not the docs sidebar
+// layout. Loaded as an addition to CSS via renderHead's `extraStyle` param.
+const LANDING_CSS = `
+body.lp{background:var(--bg)}
+.lp-nav{max-width:1120px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; padding:26px 24px}
+.lp-nav .logo{font-size:19px; font-weight:800; letter-spacing:-0.01em; color:var(--text)}
+.lp-nav .logo span{color:var(--accent)}
+.lp-nav-links{display:flex; gap:26px; align-items:center}
+.lp-nav-links a{font-size:14px; font-weight:600; color:var(--text)}
+.lp-nav-links a:hover{color:var(--accent)}
+.lp-nav-cta{background:var(--accent); color:#fff !important; padding:9px 18px; border-radius:8px; font-weight:700}
+.lp-nav-cta:hover{text-decoration:none; filter:brightness(1.1)}
+
+.lp-hero{
+  background:
+    radial-gradient(1200px 700px at 85% -10%, #24409e 0%, transparent 60%),
+    radial-gradient(900px 550px at -5% 110%, #16a34a22 0%, transparent 55%),
+    #0b1220;
+  color:#fff; padding:80px 24px 110px;
+}
+.lp-hero-inner{max-width:880px; margin:0 auto; text-align:center}
+.lp-eyebrow{display:inline-block; font-size:12.5px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:#a9b6ff; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.16); padding:7px 16px; border-radius:999px; margin-bottom:26px}
+.lp-hero h1{font-size:52px; line-height:1.1; font-weight:800; letter-spacing:-0.02em; margin:0 0 22px; color:#fff}
+.lp-hero p.lp-sub{font-size:19px; line-height:1.6; color:#aab4d4; max-width:680px; margin:0 auto 40px}
+.lp-cta-row{display:flex; gap:14px; justify-content:center; flex-wrap:wrap; margin-bottom:20px}
+.lp-cta-primary{background:#fff; color:#0b1220 !important; font-weight:800; font-size:16px; padding:15px 32px; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.lp-cta-secondary{background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.24); color:#fff !important; font-weight:700; font-size:16px; padding:14px 28px; border-radius:10px}
+.lp-cta-primary:hover, .lp-cta-secondary:hover{text-decoration:none; filter:brightness(1.06)}
+.lp-hero-foot{font-size:13.5px; color:#8a96c0}
+.lp-hero-foot a{color:#c2ccf5; font-weight:600}
+
+.lp-section{max-width:1100px; margin:0 auto; padding:84px 24px}
+.lp-section h2{font-size:32px; text-align:center; letter-spacing:-0.01em; margin:0 0 14px}
+.lp-section > p.lp-lede{text-align:center; color:var(--text-dim); font-size:17px; max-width:680px; margin:0 auto 50px; line-height:1.6}
+.lp-section.lp-alt{background:var(--bg-side)}
+
+.lp-grid-3{display:grid; grid-template-columns:repeat(3,1fr); gap:26px}
+@media (max-width:860px){ .lp-grid-3{grid-template-columns:1fr} }
+.lp-card{border:1px solid var(--border); border-radius:14px; padding:28px; background:var(--bg)}
+.lp-card h3{font-size:17.5px; margin:0 0 10px}
+.lp-card p{color:var(--text-dim); font-size:14.5px; line-height:1.6; margin:0}
+
+.lp-examples{display:grid; grid-template-columns:repeat(3,1fr); gap:22px}
+@media (max-width:900px){ .lp-examples{grid-template-columns:1fr} }
+.lp-example{border:1px solid var(--border); border-radius:14px; padding:24px; background:var(--bg)}
+.lp-example h3{margin:0 0 10px; font-size:16.5px}
+.lp-example .lp-prompt{font-family:"SF Mono",Menlo,Consolas,monospace; font-size:12px; background:var(--bg-code); color:var(--code-text); border-radius:8px; padding:12px 14px; margin:0 0 14px; line-height:1.5}
+.lp-example a{font-size:13.5px; font-weight:700}
+.lp-examples-more{text-align:center; margin-top:36px}
+
+.lp-features{display:grid; grid-template-columns:repeat(4,1fr); gap:22px}
+@media (max-width:900px){ .lp-features{grid-template-columns:repeat(2,1fr)} }
+.lp-feature .lp-feature-title{font-weight:700; font-size:14.5px; margin-bottom:6px}
+.lp-feature .lp-feature-desc{color:var(--text-dim); font-size:13px; line-height:1.5}
+
+.lp-cta-band{background:#0b1220; color:#fff; padding:84px 24px; text-align:center}
+.lp-cta-band h2{font-size:30px; margin:0 0 14px; color:#fff}
+.lp-cta-band p{color:#aab4d4; margin:0 0 32px; font-size:16px}
+
+.lp-footer{border-top:1px solid var(--border); padding:32px 24px; text-align:center; color:var(--text-dim); font-size:13px}
+.lp-footer a{color:var(--text-dim); margin:0 10px}
+`;
+
 const JS = `
 document.querySelectorAll('.chevron').forEach(function(btn){
   btn.addEventListener('click', function(e){
@@ -758,6 +821,57 @@ function canonicalUrl(fname: string): string {
 // llms-full.txt once every page has been written (see the bottom of this file).
 const pageIndex: { fname: string; title: string; description: string; section: string; bodyHtml: string }[] = [];
 
+// Shared <head> for every page — landing page included. `activeFile` drives
+// the canonical URL, OG type, and JSON-LD breadcrumb; `index.html` (the
+// product landing page) is the site root and gets no breadcrumb trail,
+// `docs.html` (the docs hub) is the root of the "Docs" trail everything
+// else hangs off.
+function renderHead(title: string, description: string, activeFile: string, extraStyle = ''): string {
+  const url = canonicalUrl(activeFile);
+  const isHome = activeFile === 'index.html';
+  const isDocsHub = activeFile === 'docs.html';
+  const fullTitle = isHome ? title : `${title} · open-videocore docs`;
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'WebPage',
+    name: title,
+    description,
+    url,
+    isPartOf: { '@type': 'WebSite', name: SITE_NAME, url: `${SITE_URL}/` },
+    breadcrumb: isHome
+      ? undefined
+      : {
+          '@type': 'BreadcrumbList',
+          itemListElement: [
+            { '@type': 'ListItem', position: 1, name: 'Docs', item: canonicalUrl('docs.html') },
+            ...(isDocsHub ? [] : [{ '@type': 'ListItem', position: 2, name: title, item: url }])
+          ]
+        }
+  };
+  return `<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(fullTitle)}</title>
+<meta name="description" content="${esc(description)}">
+<link rel="canonical" href="${url}">
+<link rel="icon" href="data:,">
+<meta property="og:type" content="${isHome ? 'website' : 'article'}">
+<meta property="og:site_name" content="${esc(SITE_NAME)}">
+<meta property="og:title" content="${esc(title)}">
+<meta property="og:description" content="${esc(description)}">
+<meta property="og:url" content="${url}">
+<meta property="og:image" content="${OG_IMAGE_URL}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="open-videocore — API-first media asset management on Open Source Cloud">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${esc(title)}">
+<meta name="twitter:description" content="${esc(description)}">
+<meta name="twitter:image" content="${OG_IMAGE_URL}">
+<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+<style>${CSS}${extraStyle}</style>
+<script defer src="https://umami-eyevinn.users.osaas.io/script.js" data-website-id="41cc05c2-445c-4fd2-a89c-4ec1b183089f"></script>`;
+}
+
 function pageShell(
   title: string,
   description: string,
@@ -777,48 +891,10 @@ function pageShell(
       : '<span></span>';
     pager = `<div class="pager">${prevHtml}${nextHtml}</div>`;
   }
-  const url = canonicalUrl(activeFile);
-  const fullTitle = activeFile === 'index.html' ? title : `${title} · open-videocore docs`;
-  const jsonLd = {
-    '@context': 'https://schema.org',
-    '@type': 'WebPage',
-    name: title,
-    description,
-    url,
-    isPartOf: { '@type': 'WebSite', name: SITE_NAME, url: `${SITE_URL}/` },
-    breadcrumb: {
-      '@type': 'BreadcrumbList',
-      itemListElement: [
-        { '@type': 'ListItem', position: 1, name: 'Docs', item: `${SITE_URL}/` },
-        ...(activeFile === 'index.html' ? [] : [{ '@type': 'ListItem', position: 2, name: title, item: url }])
-      ]
-    }
-  };
   return `<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(fullTitle)}</title>
-<meta name="description" content="${esc(description)}">
-<link rel="canonical" href="${url}">
-<link rel="icon" href="data:,">
-<meta property="og:type" content="${activeFile === 'index.html' ? 'website' : 'article'}">
-<meta property="og:site_name" content="${esc(SITE_NAME)}">
-<meta property="og:title" content="${esc(title)}">
-<meta property="og:description" content="${esc(description)}">
-<meta property="og:url" content="${url}">
-<meta property="og:image" content="${OG_IMAGE_URL}">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="open-videocore — API-first media asset management on Open Source Cloud">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="${esc(title)}">
-<meta name="twitter:description" content="${esc(description)}">
-<meta name="twitter:image" content="${OG_IMAGE_URL}">
-<script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
-<style>${CSS}</style>
-<script defer src="https://umami-eyevinn.users.osaas.io/script.js" data-website-id="41cc05c2-445c-4fd2-a89c-4ec1b183089f"></script>
+${renderHead(title, description, activeFile)}
 </head>
 <body>
 <div class="layout">
@@ -938,9 +1014,9 @@ write(
   'API reference',
   apiReferenceDescription,
   `
-<div class="crumb"><a href="index.html">Docs</a> / API reference</div>
+<div class="crumb"><a href="docs.html">Docs</a> / API reference</div>
 <h1>API reference</h1>
-<p class="lede">Every endpoint, grouped by resource, generated straight from the committed <code>openapi.json</code> (${totalEndpoints} endpoints across ${groupOrder.length} groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the <a href="index.html#guides">guides</a> instead — each one links back to the relevant endpoints here.</p>
+<p class="lede">Every endpoint, grouped by resource, generated straight from the committed <code>openapi.json</code> (${totalEndpoints} endpoints across ${groupOrder.length} groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the <a href="docs.html#guides">guides</a> instead — each one links back to the relevant endpoints here.</p>
 <div class="card-grid">${refCards}</div>
 `,
   ['agentic-examples.html', 'Agentic examples'],
@@ -958,7 +1034,7 @@ GUIDES.forEach((g, idx) => {
   const next: [string, string] =
     idx < GUIDES.length - 1 ? [GUIDES[idx + 1].slug + '.html', GUIDES[idx + 1].title] : ['agentic-examples.html', 'Agentic examples'];
   const body = `
-    <div class="crumb"><a href="index.html">Docs</a> / Guides / ${esc(g.title)}</div>
+    <div class="crumb"><a href="docs.html">Docs</a> / Guides / ${esc(g.title)}</div>
     <h1>${esc(g.title)}</h1>
     <p class="lede">${esc(g.blurb)}</p>
     ${GUIDE_BODIES[g.slug]}
@@ -1032,7 +1108,7 @@ write(
   'Agentic examples',
   AGENTIC_EXAMPLES_DESCRIPTION,
   `
-    <div class="crumb"><a href="index.html">Docs</a> / Agentic examples</div>
+    <div class="crumb"><a href="docs.html">Docs</a> / Agentic examples</div>
     <h1>Agentic examples</h1>
     <p class="lede">${esc(AGENTIC_EXAMPLES_DESCRIPTION)}</p>
     ${agenticExamplesBody}
@@ -1047,7 +1123,7 @@ write(
 // ===========================================================================
 
 const introductionBody = `
-<div class="crumb"><a href="index.html">Docs</a> / Introduction</div>
+<div class="crumb"><a href="docs.html">Docs</a> / Introduction</div>
 <h1>Introduction</h1>
 <p class="lede">What open-videocore is, how it's put together, and the ideas you need before your first API call.</p>
 
@@ -1085,7 +1161,7 @@ const introductionBody = `
 // ===========================================================================
 
 const dataModelBody = `
-<div class="crumb"><a href="index.html">Docs</a> / Data model</div>
+<div class="crumb"><a href="docs.html">Docs</a> / Data model</div>
 <h1>Data model</h1>
 <p class="lede">The entities open-videocore manages, the fields on each (pulled directly from the response schemas in <code>openapi.json</code>), and how they relate.</p>
 
@@ -1250,7 +1326,7 @@ const dataModelBody = `
 // ===========================================================================
 
 const installationBody = `
-<div class="crumb"><a href="index.html">Docs</a> / Installation</div>
+<div class="crumb"><a href="docs.html">Docs</a> / Installation</div>
 <h1>Installation</h1>
 <p class="lede">Launching an instance of open-videocore on Open Source Cloud (OSC). No servers to provision by hand — an MCP-connected agent runs the calls for you.</p>
 
@@ -1323,7 +1399,7 @@ Access Token as the OSC access token. Generate strong passwords for
 // ===========================================================================
 
 const authBody = `
-<div class="crumb"><a href="index.html">Docs</a> / Authentication &amp; errors</div>
+<div class="crumb"><a href="docs.html">Docs</a> / Authentication &amp; errors</div>
 <h1>Authentication &amp; errors</h1>
 
 <h2 id="authentication">Authentication</h2>
@@ -1382,22 +1458,21 @@ write(
 );
 
 // ===========================================================================
-// 10. Landing page (index.html)
+// 10. Docs hub (docs.html) — where the "Docs" breadcrumb and the sidebar
+// brand's "back to docs" path both lead. The product landing page
+// (index.html, section 10b below) is the site root instead.
 // ===========================================================================
 
 const guideCards = GUIDES.map(
   (g) => `<a class="card" href="${g.slug}.html"><div class="card-title">${esc(g.title)}</div><div class="card-desc">${esc(g.blurb)}</div></a>`
 ).join('');
 
-const indexBody = `
-<h1>open-videocore</h1>
-<p class="lede">Headless, API-first media asset management middleware that runs entirely on Open Source Cloud. Ingest, transcode, package, search, and deliver video — one REST API per workspace, backed by its own provisioned stack.</p>
-<div class="hero-links">
-  <a href="installation.html">Install on OSC &rarr;</a>
-  <a href="introduction.html">Read the introduction</a>
-  <a href="agentic-examples.html">See agentic examples</a>
-  <a href="api-reference.html">Browse the API reference</a>
-</div>
+const docsHubDescription =
+  'Guides, data model, installation, and the full API reference for open-videocore — start here for anything docs-related.';
+
+const docsHubBody = `
+<h1>Documentation</h1>
+<p class="lede">${esc(docsHubDescription)}</p>
 
 <h2 id="guides">Guides</h2>
 <p class="group-blurb">Task-oriented walkthroughs — what you can do, and how. Each one links to the exact endpoints involved.</p>
@@ -1419,7 +1494,131 @@ const indexBody = `
 </div>
 `;
 
-write('index.html', 'open-videocore', SITE_DESCRIPTION, indexBody, undefined, undefined, 'Docs');
+write('docs.html', 'Documentation', docsHubDescription, docsHubBody, undefined, [GUIDES[0].slug + '.html', GUIDES[0].title], 'Docs');
+
+// ===========================================================================
+// 10b. Product landing page (index.html) — the site root. Marketing shell,
+// not the docs sidebar layout; agentic-use-case focused per the brief:
+// a big CTA into the docs, built around what an AI agent can do with
+// open-videocore rather than an endpoint-by-endpoint pitch.
+// ===========================================================================
+
+function landingShell(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+${renderHead('open-videocore — a video pipeline your AI agent can drive', SITE_DESCRIPTION, 'index.html', LANDING_CSS)}
+</head>
+<body class="lp">
+<nav class="lp-nav">
+  <a class="logo" href="index.html">open<span>videocore</span></a>
+  <div class="lp-nav-links">
+    <a href="agentic-examples.html">Agentic examples</a>
+    <a href="api-reference.html">API reference</a>
+    <a href="https://github.com/Eyevinn/open-videocore" target="_blank" rel="noopener">GitHub</a>
+    <a class="lp-nav-cta" href="docs.html">Read the docs</a>
+  </div>
+</nav>
+
+<header class="lp-hero">
+  <div class="lp-hero-inner">
+    <span class="lp-eyebrow">Media infrastructure for AI agents</span>
+    <h1>Give your AI agent a video pipeline.</h1>
+    <p class="lp-sub">open-videocore is a plain REST API — ingest, transcode, package, search, and deliver video — simple enough for a general-purpose coding agent to drive from a single prompt. No SDK. No plugin. Just describe the outcome.</p>
+    <div class="lp-cta-row">
+      <a class="lp-cta-primary" href="docs.html">Read the docs &rarr;</a>
+      <a class="lp-cta-secondary" href="agentic-examples.html">See agentic examples</a>
+    </div>
+    <p class="lp-hero-foot">Runs entirely on <a href="https://www.osaas.io" target="_blank" rel="noopener">Open Source Cloud</a> — <a href="installation.html">install your own instance</a> in minutes.</p>
+  </div>
+</header>
+
+<section class="lp-section">
+  <h2>Built for agents, not just developers</h2>
+  <p class="lp-lede">A REST API with a committed OpenAPI contract is something a coding agent can already read and call — open-videocore is designed so that's enough.</p>
+  <div class="lp-grid-3">
+    <div class="lp-card">
+      <h3>One contract, no SDK</h3>
+      <p>The full <a href="api-reference.html">API surface</a> is a committed <code>openapi.json</code>. Point any general-purpose agent at it — Claude Code or otherwise — and it can call every endpoint directly, no client library to install.</p>
+    </div>
+    <div class="lp-card">
+      <h3>Auth the agent never touches</h3>
+      <p>Connected over the <a href="https://www.osaas.io/mcp" target="_blank" rel="noopener">OSC MCP server</a>, an agent dispatches calls through OSC's MCP layer, which authenticates them automatically — no instance URL or bearer token to hand it at all.</p>
+    </div>
+    <div class="lp-card">
+      <h3>State an agent can reason about</h3>
+      <p>Assets, Jobs, and Pipeline Executions are simple, pollable resources with predictable status fields — an agent can track a long-running transcode without guesswork. See the <a href="data-model.html">data model</a>.</p>
+    </div>
+  </div>
+</section>
+
+<section class="lp-section lp-alt">
+  <h2>What you can ask it to do</h2>
+  <p class="lp-lede">Three real prompts, and the actual API calls each one makes — see the <a href="agentic-examples.html">full list</a>.</p>
+  <div class="lp-examples">
+    <div class="lp-example">
+      <h3>Send a large file for review</h3>
+      <div class="lp-prompt">"Upload ~/Desktop/keynote-final.mp4 to my open-videocore instance, wait until it's ready, package it for streaming, and give me a playback link."</div>
+      <a href="agentic-examples.html#review-link">See how &rarr;</a>
+    </div>
+    <div class="lp-example">
+      <h3>Build a highlights collection</h3>
+      <div class="lp-prompt">"Find all assets tagged 'goal' from this week's footage and put them in a new collection for the editing team."</div>
+      <a href="agentic-examples.html#highlights-collection">See how &rarr;</a>
+    </div>
+    <div class="lp-example">
+      <h3>Get notified when uploads finish</h3>
+      <div class="lp-prompt">"Turn on watch-folder ingest for my raw-uploads bucket, and ping us whenever an asset finishes processing or fails."</div>
+      <a href="agentic-examples.html#notify-on-ready">See how &rarr;</a>
+    </div>
+  </div>
+  <div class="lp-examples-more"><a class="lp-cta-secondary" href="agentic-examples.html" style="color:var(--text) !important; border-color:var(--border)">Browse all agentic examples &rarr;</a></div>
+</section>
+
+<section class="lp-section">
+  <h2>Everything the pipeline covers</h2>
+  <p class="lp-lede">One workspace, one provisioned stack, one REST API — ${totalEndpoints} endpoints across ${groupOrder.length} resource groups.</p>
+  <div class="lp-features">
+    <div class="lp-feature"><div class="lp-feature-title">Ingest</div><div class="lp-feature-desc">URL pull, direct upload, presigned/multipart upload, or a watch-folder.</div></div>
+    <div class="lp-feature"><div class="lp-feature-title">Transcode</div><div class="lp-feature-desc">ABR ladder generation with an auto-scaling transcoder pool.</div></div>
+    <div class="lp-feature"><div class="lp-feature-title">Package</div><div class="lp-feature-desc">HLS/DASH output, provisioned on demand on first use.</div></div>
+    <div class="lp-feature"><div class="lp-feature-title">Search</div><div class="lp-feature-desc">Full-text and metadata search, filtered by tags and custom fields.</div></div>
+    <div class="lp-feature"><div class="lp-feature-title">Collections</div><div class="lp-feature-desc">Named groups for organising assets across a library.</div></div>
+    <div class="lp-feature"><div class="lp-feature-title">Webhooks</div><div class="lp-feature-desc">HTTP notifications on asset and job lifecycle events.</div></div>
+    <div class="lp-feature"><div class="lp-feature-title">Delivery</div><div class="lp-feature-desc">Proxied playback URLs or a presigned source download.</div></div>
+    <div class="lp-feature"><div class="lp-feature-title">Thumbnails &amp; clips</div><div class="lp-feature-desc">Poster frames at any timecode, and sub-segment clipping.</div></div>
+  </div>
+</section>
+
+<section class="lp-cta-band">
+  <h2>Your agent already knows how to call an API.</h2>
+  <p>Point it at open-videocore and describe the outcome you want.</p>
+  <div class="lp-cta-row">
+    <a class="lp-cta-primary" href="docs.html">Read the docs &rarr;</a>
+    <a class="lp-cta-secondary" href="installation.html">Install on OSC</a>
+  </div>
+</section>
+
+<footer class="lp-footer">
+  <a href="docs.html">Docs</a>&middot;
+  <a href="agentic-examples.html">Agentic examples</a>&middot;
+  <a href="https://github.com/Eyevinn/open-videocore" target="_blank" rel="noopener">GitHub</a>&middot;
+  <a href="https://www.eyevinntechnology.se" target="_blank" rel="noopener">Eyevinn Technology</a>
+</footer>
+<script>${JS}</script>
+</body>
+</html>
+`;
+}
+
+writeFileSync(join(OUT_DIR, 'index.html'), landingShell());
+pageIndex.push({
+  fname: 'index.html',
+  title: 'open-videocore',
+  description: SITE_DESCRIPTION,
+  section: 'Home',
+  bodyHtml: '<h1>open-videocore</h1><p>Give your AI agent a video pipeline. See the docs and agentic examples for details.</p>'
+});
 
 // ===========================================================================
 // 11. SEO / AEO artifacts: sitemap.xml, robots.txt, llms.txt, llms-full.txt
@@ -1508,6 +1707,7 @@ writeFileSync(join(OUT_DIR, 'llms-full.txt'), `${llmsFullBody}\n`);
 
 const expected = new Set([
   'index.html',
+  'docs.html',
   'api-reference.html',
   'agentic-examples.html',
   ...STATIC_PAGES.map(([f]) => f),
