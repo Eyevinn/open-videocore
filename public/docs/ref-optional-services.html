@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>open-videocore documentation · open-videocore docs</title>
+<title>Optional services · open-videocore docs</title>
 <style>
 :root{
   --bg:#ffffff; --bg-side:#f6f7f9; --bg-code:#1e2530; --text:#1c2128; --text-dim:#5b6572;
@@ -139,11 +139,11 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 </div>
 
 <div class="nav-group">
-  <a class="nav-group-title" href="ref-optional-services.html">
+  <a class="nav-group-title active" href="ref-optional-services.html">
     <span>Optional services</span>
     <span class="group-title-right"><span class="count">4</span><button class="chevron" type="button" data-toggle="group-optional-services" aria-label="toggle">&#9662;</button></span>
   </a>
-  <div class="nav-group-items collapsed" id="group-optional-services"><a href="ref-optional-services.html#get-api-v1-optional-services" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/optional-services/</span></a><a href="ref-optional-services.html#get-api-v1-optional-services-key" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/optional-services/{key}</span></a><a href="ref-optional-services.html#delete-api-v1-optional-services-key" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/optional-services/{key}</span></a><a href="ref-optional-services.html#post-api-v1-optional-services-key-provision" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/optional-services/{key}/provision</span></a></div>
+  <div class="nav-group-items" id="group-optional-services"><a href="ref-optional-services.html#get-api-v1-optional-services" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/optional-services/</span></a><a href="ref-optional-services.html#get-api-v1-optional-services-key" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/optional-services/{key}</span></a><a href="ref-optional-services.html#delete-api-v1-optional-services-key" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/optional-services/{key}</span></a><a href="ref-optional-services.html#post-api-v1-optional-services-key-provision" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/optional-services/{key}/provision</span></a></div>
 </div>
 
 <div class="nav-group">
@@ -270,28 +270,74 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   </nav>
   <main class="main">
     
-<h1>open-videocore</h1>
-<p class="lede">Headless, API-first media asset management middleware that runs entirely on Open Source Cloud. Ingest, transcode, package, search, and deliver video — one REST API per workspace, backed by its own provisioned stack.</p>
-<div class="hero-links">
-  <a href="installation.html">Install on OSC &rarr;</a>
-  <a href="introduction.html">Read the introduction</a>
-  <a href="api-reference.html">Browse the API reference</a>
-</div>
+    <div class="crumb"><a href="api-reference.html">API reference</a> / Optional services</div>
+    <h1>Optional services</h1>
+    <p class="lede">Discover and provision add-on OSC services for a workspace.</p>
+    
+<article class="endpoint" id="get-api-v1-optional-services">
+  <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/optional-services/</code></h3>
+  <p class="endpoint-desc">List optional add-on services and each one's provisioning state for the workspace.</p>
+  
+  
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>[
+  {
+    &quot;key&quot;: &quot;string&quot;,
+    &quot;serviceId&quot;: &quot;string&quot;,
+    &quot;displayName&quot;: &quot;string&quot;,
+    &quot;instanceNameEnvVar&quot;: &quot;string&quot;,
+    &quot;state&quot;: &quot;not-configured&quot;,
+    &quot;instanceName&quot;: &quot;string&quot;,
+    &quot;url&quot;: &quot;string&quot;
+  }
+]</code></pre></div>
+</article>
 
-<h2 id="guides">Guides</h2>
-<p class="group-blurb">Task-oriented walkthroughs — what you can do, and how. Each one links to the exact endpoints involved.</p>
-<div class="card-grid"><a class="card" href="guide-ingest.html"><div class="card-title">Ingesting media</div><div class="card-desc">Get source video into open-videocore: from a URL, direct upload, presigned/multipart upload, or an object storage watch-folder.</div></a><a class="card" href="guide-transcode-package.html"><div class="card-title">Transcoding &amp; packaging</div><div class="card-desc">Turn source media into an ABR ladder and package it as HLS/DASH — as separate steps, or chained in one pipeline.</div></a><a class="card" href="guide-metadata-search.html"><div class="card-title">Metadata, tags &amp; search</div><div class="card-desc">Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.</div></a><a class="card" href="guide-thumbnails-clips-export.html"><div class="card-title">Thumbnails, clips &amp; export</div><div class="card-desc">Extract poster frames, cut a sub-segment into a new asset, and re-wrap into a different container.</div></a><a class="card" href="guide-delivery.html"><div class="card-title">Delivery &amp; playback</div><div class="card-desc">Get a playable URL for an asset — proxied HLS/DASH manifests or a presigned source download.</div></a><a class="card" href="guide-organizing.html"><div class="card-title">Organizing: collections &amp; webhooks</div><div class="card-desc">Group related assets into collections, and get HTTP notifications when asset and job state changes.</div></a><a class="card" href="guide-operating.html"><div class="card-title">Operating a workspace</div><div class="card-desc">Provision a workspace's backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.</div></a></div>
+<article class="endpoint" id="get-api-v1-optional-services-key">
+  <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/optional-services/{key}</code></h3>
+  <p class="endpoint-desc">Get a single optional service's provisioning state.</p>
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>key</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
+  
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;key&quot;: &quot;string&quot;,
+  &quot;serviceId&quot;: &quot;string&quot;,
+  &quot;displayName&quot;: &quot;string&quot;,
+  &quot;instanceNameEnvVar&quot;: &quot;string&quot;,
+  &quot;state&quot;: &quot;not-configured&quot;,
+  &quot;instanceName&quot;: &quot;string&quot;,
+  &quot;url&quot;: &quot;string&quot;
+}</code></pre></div>
+</article>
 
-<h2 id="reference">Reference</h2>
-<p class="group-blurb">Looking for one endpoint's exact parameters or response shape? The <a href="api-reference.html">API reference</a> covers all 100 endpoints, generated from the committed <code>openapi.json</code>.</p>
-<div class="card-grid">
-  <a class="card" href="introduction.html"><div class="card-title">Introduction</div><div class="card-desc">What open-videocore is and how it's put together.</div></a>
-  <a class="card" href="data-model.html"><div class="card-title">Data model</div><div class="card-desc">Core entities and how they relate.</div></a>
-  <a class="card" href="installation.html"><div class="card-title">Installation</div><div class="card-desc">Launch an instance on OSC.</div></a>
-  <a class="card" href="authentication.html"><div class="card-title">Authentication &amp; errors</div><div class="card-desc">Bearer tokens and API conventions.</div></a>
-</div>
+<article class="endpoint" id="delete-api-v1-optional-services-key">
+  <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/optional-services/{key}</code></h3>
+  <p class="endpoint-desc">Deprovision an optional service.</p>
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>key</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
+  
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
+  &quot;operationId&quot;: &quot;string&quot;,
+  &quot;key&quot;: &quot;string&quot;,
+  &quot;name&quot;: &quot;string&quot;,
+  &quot;status&quot;: &quot;pending&quot;
+}</code></pre></div>
+</article>
+
+<article class="endpoint" id="post-api-v1-optional-services-key-provision">
+  <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/optional-services/{key}/provision</code></h3>
+  <p class="endpoint-desc">Provision an optional service on demand.</p>
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>key</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
+  <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
+  &quot;name&quot;: &quot;string&quot;
+}</code></pre></div>
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
+  &quot;operationId&quot;: &quot;string&quot;,
+  &quot;key&quot;: &quot;string&quot;,
+  &quot;name&quot;: &quot;string&quot;,
+  &quot;status&quot;: &quot;pending&quot;
+}</code></pre></div>
+</article>
 
     
+    <div class="pager"><a href="ref-provisioning.html"><span class="dir">&larr; Previous</span>Provisioning</a><a href="ref-profiles.html" style="text-align:right"><span class="dir">Next &rarr;</span>Profiles</a></div>
     <footer class="doc-footer">The API reference is generated from <code>openapi.json</code>, committed in the open-videocore repository. Interactive, always-current reference docs are also served at <code>/api-docs</code> on any running instance.</footer>
   </main>
 </div>

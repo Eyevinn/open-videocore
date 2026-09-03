@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>open-videocore documentation · open-videocore docs</title>
+<title>Internal callbacks · open-videocore docs</title>
 <style>
 :root{
   --bg:#ffffff; --bg-side:#f6f7f9; --bg-code:#1e2530; --text:#1c2128; --text-dim:#5b6572;
@@ -251,11 +251,11 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 </div>
 
 <div class="nav-group">
-  <a class="nav-group-title" href="ref-internal.html">
+  <a class="nav-group-title active" href="ref-internal.html">
     <span>Internal callbacks</span>
     <span class="group-title-right"><span class="count">3</span><button class="chevron" type="button" data-toggle="group-internal" aria-label="toggle">&#9662;</button></span>
   </a>
-  <div class="nav-group-items collapsed" id="group-internal"><a href="ref-internal.html#post-api-v1-internal-encore-callback" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/encore-callback</span></a><a href="ref-internal.html#post-api-v1-internal-packagerCallback-failure" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/packagerCallback/failure</span></a><a href="ref-internal.html#post-api-v1-internal-packagerCallback-success" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/packagerCallback/success</span></a></div>
+  <div class="nav-group-items" id="group-internal"><a href="ref-internal.html#post-api-v1-internal-encore-callback" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/encore-callback</span></a><a href="ref-internal.html#post-api-v1-internal-packagerCallback-failure" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/packagerCallback/failure</span></a><a href="ref-internal.html#post-api-v1-internal-packagerCallback-success" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/internal/packagerCallback/success</span></a></div>
 </div>
 
 <div class="nav-group">
@@ -270,28 +270,66 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   </nav>
   <main class="main">
     
-<h1>open-videocore</h1>
-<p class="lede">Headless, API-first media asset management middleware that runs entirely on Open Source Cloud. Ingest, transcode, package, search, and deliver video — one REST API per workspace, backed by its own provisioned stack.</p>
-<div class="hero-links">
-  <a href="installation.html">Install on OSC &rarr;</a>
-  <a href="introduction.html">Read the introduction</a>
-  <a href="api-reference.html">Browse the API reference</a>
-</div>
+    <div class="crumb"><a href="api-reference.html">API reference</a> / Internal callbacks</div>
+    <h1>Internal callbacks</h1>
+    <p class="lede">Called by the transcoder and packager services — not for direct client use.</p>
+    
+<article class="endpoint" id="post-api-v1-internal-encore-callback">
+  <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/internal/encore-callback</code></h3>
+  <p class="endpoint-desc">Transcoder job progress/completion callback. Invoked by the transcoder, not for direct client use.</p>
+  
+  <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
+  &quot;externalId&quot;: &quot;string&quot;,
+  &quot;status&quot;: &quot;string&quot;,
+  &quot;message&quot;: &quot;string&quot;,
+  &quot;output&quot;: [
+    {
+      &quot;file&quot;: &quot;string&quot;,
+      &quot;type&quot;: &quot;string&quot;,
+      &quot;videoStreams&quot;: [
+        {
+          &quot;width&quot;: null,
+          &quot;height&quot;: null
+        }
+      ],
+      &quot;overallBitrate&quot;: 0
+    }
+  ]
+}</code></pre></div>
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;applied&quot;: true,
+  &quot;renditionCount&quot;: 0
+}</code></pre></div>
+</article>
 
-<h2 id="guides">Guides</h2>
-<p class="group-blurb">Task-oriented walkthroughs — what you can do, and how. Each one links to the exact endpoints involved.</p>
-<div class="card-grid"><a class="card" href="guide-ingest.html"><div class="card-title">Ingesting media</div><div class="card-desc">Get source video into open-videocore: from a URL, direct upload, presigned/multipart upload, or an object storage watch-folder.</div></a><a class="card" href="guide-transcode-package.html"><div class="card-title">Transcoding &amp; packaging</div><div class="card-desc">Turn source media into an ABR ladder and package it as HLS/DASH — as separate steps, or chained in one pipeline.</div></a><a class="card" href="guide-metadata-search.html"><div class="card-title">Metadata, tags &amp; search</div><div class="card-desc">Attach descriptive and technical metadata, tag assets, and find them again with full-text and filtered search.</div></a><a class="card" href="guide-thumbnails-clips-export.html"><div class="card-title">Thumbnails, clips &amp; export</div><div class="card-desc">Extract poster frames, cut a sub-segment into a new asset, and re-wrap into a different container.</div></a><a class="card" href="guide-delivery.html"><div class="card-title">Delivery &amp; playback</div><div class="card-desc">Get a playable URL for an asset — proxied HLS/DASH manifests or a presigned source download.</div></a><a class="card" href="guide-organizing.html"><div class="card-title">Organizing: collections &amp; webhooks</div><div class="card-desc">Group related assets into collections, and get HTTP notifications when asset and job state changes.</div></a><a class="card" href="guide-operating.html"><div class="card-title">Operating a workspace</div><div class="card-desc">Provision a workspace's backing stack, tune the transcoder auto-scaler, manage storage buckets, and configure retention.</div></a></div>
+<article class="endpoint" id="post-api-v1-internal-packagerCallback-failure">
+  <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/internal/packagerCallback/failure</code></h3>
+  <p class="endpoint-desc">Packager failure callback. Invoked by the packager service, not for direct client use.</p>
+  
+  <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
+  &quot;message&quot;: &quot;string&quot;
+}</code></pre></div>
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;ok&quot;: true
+}</code></pre></div>
+</article>
 
-<h2 id="reference">Reference</h2>
-<p class="group-blurb">Looking for one endpoint's exact parameters or response shape? The <a href="api-reference.html">API reference</a> covers all 100 endpoints, generated from the committed <code>openapi.json</code>.</p>
-<div class="card-grid">
-  <a class="card" href="introduction.html"><div class="card-title">Introduction</div><div class="card-desc">What open-videocore is and how it's put together.</div></a>
-  <a class="card" href="data-model.html"><div class="card-title">Data model</div><div class="card-desc">Core entities and how they relate.</div></a>
-  <a class="card" href="installation.html"><div class="card-title">Installation</div><div class="card-desc">Launch an instance on OSC.</div></a>
-  <a class="card" href="authentication.html"><div class="card-title">Authentication &amp; errors</div><div class="card-desc">Bearer tokens and API conventions.</div></a>
-</div>
+<article class="endpoint" id="post-api-v1-internal-packagerCallback-success">
+  <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/internal/packagerCallback/success</code></h3>
+  <p class="endpoint-desc">Packager success callback. Invoked by the packager service, not for direct client use.</p>
+  
+  <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
+  &quot;url&quot;: &quot;string&quot;,
+  &quot;jobId&quot;: &quot;string&quot;,
+  &quot;outputPath&quot;: &quot;string&quot;
+}</code></pre></div>
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;ok&quot;: true
+}</code></pre></div>
+</article>
 
     
+    <div class="pager"><a href="ref-admin.html"><span class="dir">&larr; Previous</span>Admin</a><a href="ref-ui.html" style="text-align:right"><span class="dir">Next &rarr;</span>Ops UI</a></div>
     <footer class="doc-footer">The API reference is generated from <code>openapi.json</code>, committed in the open-videocore repository. Interactive, always-current reference docs are also served at <code>/api-docs</code> on any running instance.</footer>
   </main>
 </div>

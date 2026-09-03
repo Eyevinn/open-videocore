@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths-ignore:
       - openapi.json
+      - public/docs/**
 
 concurrency:
   group: update-openapi-${{ github.ref }}
@@ -36,15 +37,23 @@ jobs:
           MINIO_ROOT_PASSWORD: ci-placeholder
           COUCHDB_ADMIN_PASSWORD: ci-placeholder
 
+      # Reads the openapi.json just (re)generated above — no live server
+      # needed. Keeps public/docs/ (guides, data model, and the per-resource
+      # API reference pages) from ever drifting out of sync with the real
+      # contract; see scripts/generate-docs.ts for what's generated vs.
+      # hand-authored.
+      - name: Generate docs (public/docs/)
+        run: pnpm generate:docs
+
       - name: Commit if changed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add openapi.json
+          git add openapi.json public/docs
           if git diff --cached --quiet; then
-            echo "openapi.json unchanged — nothing to commit"
+            echo "openapi.json and public/docs unchanged — nothing to commit"
           else
-            git commit -m "chore(openapi): regenerate openapi.json [skip ci]"
+            git commit -m "chore(openapi): regenerate openapi.json and docs [skip ci]"
             for attempt in 1 2 3; do
               if git push; then
                 break
