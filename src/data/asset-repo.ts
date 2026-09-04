@@ -94,6 +94,106 @@ export type StatusTransition = {
   to: AssetStatus;
 };
 
+// ---------------------------------------------------------------------------
+// Storage tier (ADR-019, issue #556)
+// ---------------------------------------------------------------------------
+
+// The physical byte-location axis of an asset's stored bytes, ORTHOGONAL to the
+// lifecycle `status` above and to `reviewState`. Where `status` tracks the
+// ingest lifecycle and `reviewState` a human approval workflow, `storageTier`
+// tracks WHERE the bytes physically live — not what the asset is. The two are
+// INDEPENDENT: a `ready` (or any) asset may have its bytes on either tier, and
+// moving one axis never moves another (ADR-019 D1, mirroring the
+// `reviewState`-beside-`status` house pattern at src/data/asset-repo.ts:53-57).
+//
+// Vocabulary is deliberately small (ADR-019 D1):
+//   - `hot`     — bytes on a low-latency backend, immediately readable by
+//                 delivery and processing jobs. The default and only tier a
+//                 fresh asset has.
+//   - `archive` — bytes moved to a cheaper, higher-latency archive-class
+//                 backend; not directly readable at playback latency until
+//                 rehydrated (see rehydrate state below).
+//
+// NAMING RULE (normative, ADR-019 D1/D6): the value is `archive`, NEVER
+// `archived`. The `-d` form is the terminal lifecycle `status` (V1) that drives
+// the destructive retention purge; using it here would reintroduce the exact
+// collision the tier/status firewall (ADR-019 D6) exists to prevent. This axis
+// is NEVER written to `status` and never reuses the `-> archived`
+// statusHistory transition (the purge clock).
+export const STORAGE_TIERS = ['hot', 'archive'] as const;
+export type StorageTier = (typeof STORAGE_TIERS)[number];
+
+// The byte classes an asset references, each tracked with its own tier
+// (ADR-019 D3 — tiering is PER BYTE CLASS, not one asset-wide flag, because the
+// classes have different delivery obligations). The names mirror the asset's
+// existing byte-class fields:
+//   - source      — the mezzanine/original (`objectKey`); primary archive
+//                   candidate (not on the playback path).
+//   - renditions  — ABR variants (`renditions[].objectKey`); may be archived
+//                   alongside source once packaged output exists.
+//   - packaged    — CMAF HLS/DASH manifests + segments (`packagedOutput`); on
+//                   the live `/stream/*` playback read path, so it MUST stay
+//                   `hot` for a deliverable asset (ADR-019 D3). Modelled here so
+//                   the record can HONESTLY express "source archived, packaged
+//                   hot"; this slice is representation-only and does NOT enforce
+//                   the pin.
+//   - subtitles   — subtitle track objects (`subtitleTracks[].objectKey`);
+//                   default `hot` (D3).
+//   - thumbnails  — thumbnail object keys (`thumbnails[]`); default `hot` (D3).
+export const STORAGE_BYTE_CLASSES = [
+  'source',
+  'renditions',
+  'packaged',
+  'subtitles',
+  'thumbnails'
+] as const;
+export type StorageByteClass = (typeof STORAGE_BYTE_CLASSES)[number];
+
+// In-flight rehydrate indicator (ADR-019 D4). Rehydrate is the explicit-restore
+// concept that moves a byte class `archive -> hot`; this type models ONLY its
+// in-flight REPRESENTATION so callers can reason about current availability. It
+// carries the byte class being restored and when the restore started. This
+// slice adds NO rehydrate execution, trigger, or relocation — it is a state
+// field the (future, out-of-scope) restore operation would set and clear.
+export type RehydrateState = {
+  // The byte class currently being restored from `archive` back to `hot`.
+  byteClass: StorageByteClass;
+  // ISO timestamp the restore was requested/started (mirrors the asset's
+  // existing ISO timestamp conventions, e.g. `createdAt`/`updatedAt`).
+  startedAt: string;
+};
+
+// The per-asset storage-tiering state (ADR-019 D1/D3/D4). Holds the tier of
+// each byte class plus any in-flight rehydrates. A fresh/existing asset defaults
+// to every class `hot` with no rehydrate in flight (see `defaultStorageTiering`);
+// the field is optional on the flat `Asset` so pre-existing assets/documents
+// without it remain valid and are treated as the all-`hot` default throughout
+// (get/list/document round-trip), exactly like `reviewState` -> `draft`.
+export type StorageTiering = {
+  // Tier per byte class. Absent classes default to `hot`.
+  tiers: Partial<Record<StorageByteClass, StorageTier>>;
+  // Byte classes with a restore currently in flight (ADR-019 D4). Always an
+  // array; empty means no rehydrate is in progress.
+  rehydrating: RehydrateState[];
+};
+
+// The canonical "nothing tiered, nothing rehydrating" default: every byte class
+// `hot`, no rehydrate in flight (ADR-019 — new/existing assets default to `hot`).
+// Returned wherever an asset carries no explicit tiering state so the axis is
+// always concretely present on the API without back-filling persistence.
+export function defaultStorageTiering(): StorageTiering {
+  return {
+    tiers: {
+      source: 'hot',
+      renditions: 'hot',
+      packaged: 'hot',
+      subtitles: 'hot',
+      thumbnails: 'hot'
+    },
+    rehydrating: []
+  };
+}
+
 // Provenance log entry (ADR-005, issue #53). Append-only audit of who/what
 // mutated which namespace.
 export const PROVENANCE_ACTORS = ['user', 'system', 'ai'] as const;
@@ -269,6 +369,15 @@ export type Asset = {
   // pre-existing assets/documents without it remain valid; absent is treated as
   // the initial state `draft` throughout (get/list/document round-trip).
   reviewState?: AssetReviewState;
+  // Storage-tier state (ADR-019, issue #556): the physical byte-location axis
+  // (`hot` | `archive`) per byte class, plus any in-flight rehydrate. INDEPENDENT
+  // of `status` and `reviewState` (mirrors the `reviewState`-beside-`status`
+  // pattern above). Optional so pre-existing assets/documents without it remain
+  // valid; absent is treated as the all-`hot`, nothing-rehydrating default
+  // (`defaultStorageTiering`) throughout (get/list/document round-trip). This is
+  // REPRESENTATION ONLY — no relocation, rehydrate execution, tiering trigger, or
+  // enforcement lives here (ADR-019 D1/D3/D4/D6).
+  storageTiering?: StorageTiering;
   // Source asset id for renditions/children; undefined for top-level sources.
   parentId?: string;
   // Version-chain linkage (issue #118), DISTINCT from `parentId`. Where
