@@ -20,12 +20,27 @@ export type Collection = {
   id: string;
   name: string;
   assetIds: string[];
+  // Descriptive metadata (issue #559), mirroring the asset `descriptive`
+  // namespace (ADR-005: typed-core + open-`custom`) at a smaller scale. All
+  // three are OPTIONAL and additive: a collection created without them behaves
+  // exactly as before, and documents written before #559 (fields absent) still
+  // round-trip. `description` is a free-form string, `tags` a first-class string
+  // label list, and `custom` an open key/value bag (`Record<string, unknown>`).
+  description?: string;
+  tags?: string[];
+  custom?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
 };
 
 export type CreateCollectionInput = {
   name: string;
+  // Optional descriptive metadata accepted at create time (issue #559). Mirrors
+  // the asset `descriptive` namespace fields; all optional so create({ name })
+  // stays valid and unchanged.
+  description?: string;
+  tags?: string[];
+  custom?: Record<string, unknown>;
 };
 
 export interface CollectionRepository {
