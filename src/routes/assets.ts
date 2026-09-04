@@ -23,6 +23,9 @@ import {
   InvalidStateTransitionError,
   MAX_LIMIT,
   ParentNotFoundError,
+  STORAGE_BYTE_CLASSES,
+  STORAGE_TIERS,
+  defaultStorageTiering,
   isUlid,
   normalizeTags,
   SUBTITLE_FORMATS,
@@ -135,6 +138,38 @@ const statusSchema = z.enum(ASSET_STATUSES);
 
 // Editorial review state (issue #134), distinct from lifecycle `status`.
 const reviewStateSchema = z.enum(ASSET_REVIEW_STATES);
+
+// Storage-tier state (ADR-019, issue #556), distinct from lifecycle `status`.
+// The physical byte-location axis (`hot` | `archive`) tracked per byte class,
+// plus any in-flight rehydrate. REPRESENTATION ONLY — no relocation/restore
+// execution here. `archive` is the tier value; the string `archived` is the
+// lifecycle status and is NEVER used as a tier (ADR-019 D1/D6).
+const storageTierSchema = z.enum(STORAGE_TIERS);
+const storageByteClassSchema = z.enum(STORAGE_BYTE_CLASSES);
+const rehydrateStateSchema = z.object({
+  byteClass: storageByteClassSchema.describe('The byte class being restored from archive back to hot.'),
+  startedAt: z.string().describe('ISO timestamp the restore was requested/started.')
+});
+const storageTieringSchema = z.object({
+  // Tier per byte class (ADR-019 D3). Every class is present with a concrete
+  // value; a fresh/existing asset defaults every class to `hot`.
+  tiers: z
+    .record(storageByteClassSchema, storageTierSchema)
+    .describe(
+      'Physical storage tier (`hot` | `archive`) per byte class (source, ' +
+        'renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle ' +
+        '`status`; `archive` is a byte location, never the `archived` status ' +
+        '(ADR-019 D1/D3/D6). Defaults to every class `hot`.'
+    ),
+  // In-flight rehydrate indicator (ADR-019 D4). Empty when no restore is running.
+  rehydrating: z
+    .array(rehydrateStateSchema)
+    .describe(
+      'Byte classes with an archive->hot restore currently in flight, each with ' +
+        'its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). ' +
+        'Representation only — this API does not execute the restore.'
+    )
+});
 
 // A custom Encore profile a caller may supply instead of a named preset. Kept
 // permissive (forwarded to Encore) but bounded so it cannot be abused.
@@ -561,6 +596,15 @@ const assetSchema = z.object({
   // Editorial review state (issue #134), INDEPENDENT of `status`. Optional so
   // pre-existing assets serialized before reviewState existed still validate.
   reviewState: reviewStateSchema.optional(),
+  // Storage-tier state (ADR-019, issue #556), INDEPENDENT of `status` and
+  // `reviewState`: the physical byte-location axis (`hot` | `archive`) per byte
+  // class plus any in-flight rehydrate. Always present on responses: the response
+  // serializer `.default()`s it to every class `hot` with nothing rehydrating for
+  // any asset lacking explicit tier state (new/existing/pre-#556 assets), so the
+  // axis surfaces concretely without back-filling persistence. This is
+  // representation only — the API exposes the state but does not relocate bytes
+  // or run rehydrates.
+  storageTiering: storageTieringSchema.default(() => defaultStorageTiering()),
   parentId: z.string().optional(),
   // Version-chain linkage (issue #118), DISTINCT from `parentId`. Present only
   // on outputs produced by a clip/export/rewrap run with `asVersion`. Absent on
