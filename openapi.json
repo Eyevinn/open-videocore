@@ -3,7 +3,7 @@
   "info": {
     "title": "open-videocore API",
     "description": "OSC-native media asset management \u2014 ingest, transcode, package, search, and deliver video assets.",
-    "version": "1.0.0"
+    "version": "1.4.0"
   },
   "components": {
     "securitySchemes": {
