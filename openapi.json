@@ -14096,6 +14096,396 @@
         }
       }
     },
+    "/api/v1/storage/backends": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "source",
+                      "packaged",
+                      "both"
+                    ],
+                    "default": "both"
+                  },
+                  "bucket": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "accessKeyId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "secretAccessKey": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "region": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "endpointUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "sessionToken": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "publicBaseUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "name",
+                  "bucket",
+                  "accessKeyId",
+                  "secretAccessKey"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "source",
+                        "packaged",
+                        "both"
+                      ]
+                    },
+                    "backend": {
+                      "type": "string",
+                      "enum": [
+                        "external"
+                      ]
+                    },
+                    "bucket": {
+                      "type": "string"
+                    },
+                    "accessKeyId": {
+                      "type": "string"
+                    },
+                    "endpointUrl": {
+                      "type": "string"
+                    },
+                    "region": {
+                      "type": "string"
+                    },
+                    "publicBaseUrl": {
+                      "type": "string"
+                    },
+                    "hasSessionToken": {
+                      "type": "boolean"
+                    },
+                    "deletable": {
+                      "type": "boolean"
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "credentials": {
+                      "type": "object",
+                      "properties": {
+                        "accessKeyId": {
+                          "type": "string"
+                        },
+                        "secretAccessKey": {
+                          "type": "string",
+                          "enum": [
+                            "***redacted***"
+                          ]
+                        },
+                        "sessionToken": {
+                          "type": "string",
+                          "enum": [
+                            "***redacted***"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "accessKeyId",
+                        "secretAccessKey"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "role",
+                    "backend",
+                    "bucket",
+                    "accessKeyId",
+                    "hasSessionToken",
+                    "deletable",
+                    "createdAt",
+                    "credentials"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "backends": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "type": "string",
+                            "enum": [
+                              "source",
+                              "packaged",
+                              "both"
+                            ]
+                          },
+                          "backend": {
+                            "type": "string",
+                            "enum": [
+                              "external"
+                            ]
+                          },
+                          "bucket": {
+                            "type": "string"
+                          },
+                          "accessKeyId": {
+                            "type": "string"
+                          },
+                          "endpointUrl": {
+                            "type": "string"
+                          },
+                          "region": {
+                            "type": "string"
+                          },
+                          "publicBaseUrl": {
+                            "type": "string"
+                          },
+                          "hasSessionToken": {
+                            "type": "boolean"
+                          },
+                          "deletable": {
+                            "type": "boolean"
+                          },
+                          "createdAt": {
+                            "type": "string"
+                          },
+                          "credentials": {
+                            "type": "object",
+                            "properties": {
+                              "accessKeyId": {
+                                "type": "string"
+                              },
+                              "secretAccessKey": {
+                                "type": "string",
+                                "enum": [
+                                  "***redacted***"
+                                ]
+                              },
+                              "sessionToken": {
+                                "type": "string",
+                                "enum": [
+                                  "***redacted***"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "accessKeyId",
+                              "secretAccessKey"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "role",
+                          "backend",
+                          "bucket",
+                          "accessKeyId",
+                          "hasSessionToken",
+                          "deletable",
+                          "createdAt",
+                          "credentials"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "backends"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/storage/backends/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "enum": [
+                    "null"
+                  ],
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/storage/buckets": {
       "get": {
         "responses": {
