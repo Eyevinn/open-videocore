@@ -5,6 +5,7 @@ import fastifyStatic from '@fastify/static';
 import fastifySwagger from '@fastify/swagger';
 import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'url';
+import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { Context, createInstance, getInstance, waitForInstanceReady, getPortsForInstance } from '@osaas/client-core';
 import {
@@ -112,6 +113,22 @@ declare module 'fastify' {
 // the cap so the part-url / complete / abort routes accept real upload IDs.
 const app = Fastify({ logger: true, maxParamLength: 500 });
 
+// Single source of truth for the API version: read package.json's version at
+// startup rather than hardcoding it in the OpenAPI info block (issue #542).
+// The spec served at /api-docs, the /api-docs/json document, and the committed
+// openapi.json (generated from that document by generate-openapi.sh) all flow
+// from info.version below, so pinning it to the package version keeps the docs
+// badge and the live Swagger UI from drifting away from the real release.
+const PACKAGE_VERSION: string = (() => {
+  const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 app.setValidatorCompiler(validatorCompiler);
 app.setSerializerCompiler(serializerCompiler);
 
@@ -145,7 +162,7 @@ await app.register(fastifySwagger, {
     info: {
       title: 'open-videocore API',
       description: 'OSC-native media asset management — ingest, transcode, package, search, and deliver video assets.',
-      version: '1.0.0'
+      version: PACKAGE_VERSION
     },
     tags: [
       { name: 'assets', description: 'Asset lifecycle, metadata, tracks, thumbnails, clip, export' },

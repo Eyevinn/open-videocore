@@ -31,6 +31,22 @@ type Operation = Record<string, any>;
 const spec = JSON.parse(readFileSync(SPEC_PATH, 'utf8'));
 const paths: Record<string, Record<string, Operation>> = spec.paths;
 
+// Version shown in the docs badge. Read package.json's version directly so the
+// badge tracks the real release even if the committed openapi.json's stored
+// info.version has drifted (issue #542). Fall back to the spec's info.version,
+// then to 1.0.0, so the generator never crashes on an unexpected tree.
+const DOCS_VERSION: string = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as {
+      version?: unknown;
+    };
+    if (typeof pkg.version === 'string') return pkg.version;
+  } catch {
+    // fall through to spec-derived version
+  }
+  return (spec.info?.version as string | undefined) ?? '1.0.0';
+})();
+
 function esc(s: unknown): string {
   return String(s)
     .replace(/&/g, '&amp;')
@@ -901,7 +917,7 @@ ${renderHead(title, description, activeFile)}
   <nav class="sidebar">
     <a class="brand" href="index.html">
       <div class="logo">open<span>videocore</span></div>
-      <div class="version">Documentation &middot; v${esc(spec.info?.version ?? '1.0.0')}</div>
+      <div class="version">Documentation &middot; v${esc(DOCS_VERSION)}</div>
     </a>
     <div class="search-box"><input type="search" id="nav-search" placeholder="Filter endpoints&hellip;" autocomplete="off"></div>
     ${nav}
