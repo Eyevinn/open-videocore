@@ -24,6 +24,7 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
 import {
+  CollectionDeleteProtectedError,
   CollectionNotFoundError,
   type CollectionRepository
 } from '../data/collection-repo.js';
@@ -31,12 +32,37 @@ import type { Asset, AssetRepository } from '../data/asset-repo.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
+// Explicit delete-lock (ADR-020 decision 3, issue #568). Field names/types
+// mirror ADR-020 exactly: locked, reason?, lockedAt, lockedBy?.
+const deleteLockSchema = z.object({
+  locked: z.boolean(),
+  reason: z.string().optional(),
+  lockedAt: z.string(),
+  lockedBy: z.string().optional()
+});
+
+// Shared blocked-delete envelope (ADR-020 decision 1, issue #568). EXTENDS the
+// existing `{ error, message? }` shape with the required `reason` enum and
+// `blockedBy` object. For the explicit-lock case reason is `delete_protected`
+// and both id arrays are empty.
+const deleteBlockedSchema = z.object({
+  error: z.literal('delete_blocked'),
+  message: z.string().optional(),
+  reason: z.enum(['referenced_by_job', 'member_of_collection', 'delete_protected']),
+  blockedBy: z.object({
+    jobIds: z.array(z.string()),
+    collectionIds: z.array(z.string())
+  })
+});
+
 const collectionSchema = z.object({
   id: z.string(),
   name: z.string(),
   assetIds: z.array(z.string()),
   createdAt: z.string(),
-  updatedAt: z.string()
+  updatedAt: z.string(),
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent = unlocked.
+  deleteLock: deleteLockSchema.optional()
 });
 
 // GET /:id returns the collection plus the resolved live assets. Assets are
@@ -71,6 +97,16 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     }
     if (err instanceof CollectionNotFoundError) {
       return reply.code(404).send({ error: 'not_found', message: err.message });
+    }
+    // Explicit delete-lock (ADR-020 decision 1, issue #568): the shared
+    // `delete_blocked` envelope, reason `delete_protected`, empty blockedBy.
+    if (err instanceof CollectionDeleteProtectedError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'delete_protected',
+        blockedBy: { jobIds: [], collectionIds: [] }
+      });
     }
     throw err;
   });
@@ -125,17 +161,80 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   app.delete(
     '/:id',
     {
-      
+
       schema: {
         params: z.object({ id: z.string() }),
-        response: { 204: z.null(), 404: errorSchema }
+        response: { 204: z.null(), 404: errorSchema, 409: deleteBlockedSchema }
       }
     },
     async (request, reply) => {
+      // Explicit delete-lock (ADR-020 decisions 1 & 2, issue #568). A locked
+      // collection is a HARD block: this guard is unconditional and runs BEFORE
+      // the delete, so `?force=true` cannot bypass it (force is never consulted
+      // here). Cleared only via DELETE /:id/lock. A locked collection therefore
+      // resolves (not a silent miss), so the 409 is authoritative.
+      const existing = await repo.get(request.params.id);
+      if (existing?.deleteLock?.locked) {
+        throw new CollectionDeleteProtectedError(request.params.id);
+      }
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.
       await repo.delete(request.params.id);
       return reply.code(204).send(null);
+    }
+  );
+
+  // Explicit delete-lock set/clear (ADR-020 decision 3, issue #568). A DEDICATED
+  // system write path for the top-level `deleteLock` flag, chosen as a
+  // `/:id/lock` sub-resource with PUT (set) / DELETE (clear) — consistent with
+  // the collections router's existing PUT/DELETE `/:id/assets/:assetId`
+  // sub-resource convention and the asset router's `/:id/lock`. Kept separate
+  // from create/addAsset/removeAsset so the lock is never set through a general
+  // collection mutation. The lock's `lockedAt`/`lockedBy` are the traceable
+  // administrative record of the change (collections carry no provenance array —
+  // ADR-020 pins the lock's own fields as that record for collections).
+  //   200 — lock set, collection returned (deleteLock present + locked)
+  //   404 — unknown/foreign collection
+  app.put(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: z
+          .object({
+            reason: z.string().max(1024).optional(),
+            lockedBy: z.string().max(256).optional()
+          })
+          .default({}),
+        response: { 200: collectionSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      // setDeleteLock throws CollectionNotFoundError (-> 404) for an unknown id.
+      const collection = await repo.setDeleteLock(request.params.id, {
+        locked: true,
+        reason: request.body.reason,
+        lockedBy: request.body.lockedBy
+      });
+      return reply.code(200).send(collection);
+    }
+  );
+
+  // Clear the explicit delete-lock (ADR-020 decision 3, issue #568). The only
+  // way to lift protection — `?force=true` on DELETE /:id does NOT (decision 2).
+  //   200 — lock cleared, collection returned (deleteLock absent)
+  //   404 — unknown/foreign collection
+  app.delete(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: collectionSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const collection = await repo.setDeleteLock(request.params.id, { locked: false });
+      return reply.code(200).send(collection);
     }
   );
 

@@ -9,10 +9,12 @@
 import {
   CollectionNotFoundError,
   addAssetId,
+  applyCollectionDeleteLock,
   removeAssetId,
   type Collection,
   type CollectionRepository,
-  type CreateCollectionInput
+  type CreateCollectionInput,
+  type SetDeleteLockInput
 } from './collection-repo.js';
 
 export class InMemoryCollectionRepository implements CollectionRepository {
@@ -53,6 +55,24 @@ export class InMemoryCollectionRepository implements CollectionRepository {
 
   async removeAsset(id: string, assetId: string): Promise<Collection> {
     return this.mutate(id, (c) => removeAssetId(c.assetIds, assetId));
+  }
+
+  // Dedicated delete-lock write path (ADR-020 decision 3, issue #568). Separate
+  // from addAsset/removeAsset so the top-level `deleteLock` flag is only ever
+  // set/cleared here. Throws CollectionNotFoundError (-> 404) for an unknown id.
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Collection> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      throw new CollectionNotFoundError(id);
+    }
+    const now = new Date().toISOString();
+    const updated: Collection = {
+      ...existing,
+      deleteLock: applyCollectionDeleteLock(input, now),
+      updatedAt: now
+    };
+    this.store.set(id, updated);
+    return { ...updated, assetIds: [...updated.assetIds] };
   }
 
   async delete(id: string): Promise<void> {

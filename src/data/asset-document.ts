@@ -133,6 +133,20 @@ const StatusTransitionSchema = z.object({
   to: z.string()
 });
 
+// Explicit delete-lock (ADR-020 decision 3, issue #568). An operator-set flag
+// that hard-blocks archive/purge until cleared. Lives in the system-owned
+// `administrative` namespace (see the namespace table above) so a user cannot
+// clear their own protection through the editorial update path. Optional/
+// additive: absent = unlocked, so no schemaVersion bump is required and every
+// pre-#568 document remains a valid v1 document (mirroring the reviewState /
+// packagedOutput optional-field precedent).
+export const DeleteLockSchema = z.object({
+  locked: z.boolean(),
+  reason: z.string().optional(),
+  lockedAt: z.string(),
+  lockedBy: z.string().optional()
+});
+
 // ---------------------------------------------------------------------------
 // TAMS addressing (issue #165, sub-task of the #116 TAMS bridge epic).
 //
@@ -245,7 +259,11 @@ export const AssetDocumentSchema = z.object({
     // `.default('draft')` means documents written before reviewState existed
     // (the field simply absent) deserialize as `draft` — no schemaVersion bump
     // is required, so all v1 documents remain valid.
-    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft')
+    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft'),
+    // Explicit delete-lock (ADR-020 decision 3, issue #568). Optional so
+    // documents written before #568 (field absent) still deserialize as
+    // unlocked — no schemaVersion bump required, all v1 documents remain valid.
+    deleteLock: DeleteLockSchema.optional()
   }),
 
   structural: z
@@ -391,6 +409,17 @@ export function toAssetDocument(
       versionGroupId: asset.versionGroupId ?? null
     }
   };
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Only persisted when
+  // the asset actually carries a lock object, so pre-#568 assets round-trip with
+  // the field absent (back-compat).
+  if (asset.deleteLock) {
+    doc.administrative.deleteLock = {
+      locked: asset.deleteLock.locked,
+      reason: asset.deleteLock.reason,
+      lockedAt: asset.deleteLock.lockedAt,
+      lockedBy: asset.deleteLock.lockedBy
+    };
+  }
   if (opts.rev) {
     doc._rev = opts.rev;
   }
@@ -485,6 +514,16 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     // Editorial review state (issue #134). The schema defaults absent values to
     // `draft`, so legacy documents round-trip to `draft` rather than undefined.
     reviewState: doc.administrative.reviewState as AssetReviewState,
+    // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent maps to
+    // undefined so pre-#568 assets stay clean (treated as unlocked everywhere).
+    deleteLock: doc.administrative.deleteLock
+      ? {
+          locked: doc.administrative.deleteLock.locked,
+          reason: doc.administrative.deleteLock.reason,
+          lockedAt: doc.administrative.deleteLock.lockedAt,
+          lockedBy: doc.administrative.deleteLock.lockedBy
+        }
+      : undefined,
     parentId: derivedFrom ?? undefined,
     versionOfAssetId,
     versionGroupId,

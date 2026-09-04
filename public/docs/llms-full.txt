@@ -461,9 +461,14 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "deleteLock": {
+        "locked": true,
+        "lockedAt": "string",
+        "reason": "string",
+        "lockedBy": "string"
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ],
   "limit": 0,
@@ -507,9 +512,14 @@ Response 201 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -542,9 +552,14 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "deleteLock": {
+        "locked": true,
+        "lockedAt": "string",
+        "reason": "string",
+        "lockedBy": "string"
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ],
   "limit": 0,
@@ -605,9 +620,14 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "deleteLock": {
+        "locked": true,
+        "lockedAt": "string",
+        "reason": "string",
+        "lockedBy": "string"
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ]
 }
@@ -638,9 +658,14 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -683,9 +708,14 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -782,9 +812,14 @@ Response 201 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1012,9 +1047,14 @@ Response 201 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1072,6 +1112,83 @@ Response 200 (application/json)
   ]
 }
 
+  PUT /api/v1/assets/{id}/lock
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "reason": "string",
+  "lockedBy": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
+  "parentId": "string",
+  "versionOfAssetId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
+  DELETE /api/v1/assets/{id}/lock
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
+  "parentId": "string",
+  "versionOfAssetId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
   PUT /api/v1/assets/{id}/metadata
 
   Replace an asset's free-form metadata.
@@ -1102,9 +1219,14 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1264,9 +1386,14 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1302,9 +1429,14 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1399,9 +1531,14 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1432,9 +1569,14 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1650,9 +1792,14 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "deleteLock": {
+        "locked": true,
+        "lockedAt": "string",
+        "reason": "string",
+        "lockedBy": "string"
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ]
 }
@@ -2224,7 +2371,13 @@ Response 200 (application/json)
         "string"
       ],
       "createdAt": "string",
-      "updatedAt": "string"
+      "updatedAt": "string",
+      "deleteLock": {
+        "locked": true,
+        "lockedAt": "string",
+        "reason": "string",
+        "lockedBy": "string"
+      }
     }
   ]
 }
@@ -2248,7 +2401,13 @@ Response 201 (application/json)
     "string"
   ],
   "createdAt": "string",
-  "updatedAt": "string"
+  "updatedAt": "string",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
 }
 
   GET /api/v1/collections/{id}
@@ -2271,7 +2430,13 @@ Response 200 (application/json)
   "updatedAt": "string",
   "assets": [
     {}
-  ]
+  ],
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
 }
 
   DELETE /api/v1/collections/{id}
@@ -2304,7 +2469,13 @@ Response 200 (application/json)
     "string"
   ],
   "createdAt": "string",
-  "updatedAt": "string"
+  "updatedAt": "string",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
 }
 
   DELETE /api/v1/collections/{id}/assets/{assetId}
@@ -2325,7 +2496,68 @@ Response 200 (application/json)
     "string"
   ],
   "createdAt": "string",
-  "updatedAt": "string"
+  "updatedAt": "string",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
+}
+
+  PUT /api/v1/collections/{id}/lock
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "reason": "string",
+  "lockedBy": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
+}
+
+  DELETE /api/v1/collections/{id}/lock
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
 }
 
 ---
@@ -2586,7 +2818,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (100 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (104 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -2596,7 +2828,7 @@ Optional services4
 Discover and provision add-on OSC services for a workspace.
 Profiles8
 Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
-Assets43
+Assets45
 Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
 Jobs3
 Background job status for asynchronous asset operations.
@@ -2614,7 +2846,7 @@ Search1
 Full-text and metadata search across assets.
 Webhooks3
 HTTP event notification registrations.
-Collections6
+Collections8
 Named groups for organising assets.
 Storage6
 Object storage bucket and watch-folder management.
@@ -3428,7 +3660,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 100 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 104 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.

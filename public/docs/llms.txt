@@ -44,6 +44,6 @@
 - [Admin](https://videocore.pages.osaas.io/ref-admin.html): Watch-folder poller control.
 - [Internal callbacks](https://videocore.pages.osaas.io/ref-internal.html): Called by the transcoder and packager services — not for direct client use.
 - [Ops UI](https://videocore.pages.osaas.io/ref-ui.html): Built-in browser dashboard.
-- [API reference](https://videocore.pages.osaas.io/api-reference.html): Every open-videocore REST API endpoint (100 across 18 resource groups), generated straight from the committed openapi.json.
+- [API reference](https://videocore.pages.osaas.io/api-reference.html): Every open-videocore REST API endpoint (104 across 18 resource groups), generated straight from the committed openapi.json.
 
 [Full text of every page](https://videocore.pages.osaas.io/llms-full.txt)

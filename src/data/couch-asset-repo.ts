@@ -29,7 +29,9 @@ import {
   type CreateAssetInput,
   type ListOptions,
   type ListResult,
+  type SetDeleteLockInput,
   type UpdateAssetInput,
+  applyDeleteLock,
   applyMetadata,
   applyRestore,
   applyReviewState,
@@ -312,6 +314,36 @@ export class CouchAssetRepository implements AssetRepository {
     // Carry _rev so CouchDB accepts the update; put() forces the partition.
     await couch.put(id, { ...toDoc(next), _rev: doc._rev });
     return next;
+  }
+
+  // Dedicated delete-lock write path (ADR-020 decision 3, issue #568). Distinct
+  // from update() (the editorial path, which never touches the lock), so the
+  // system-owned `administrative.deleteLock` flag can only be set/cleared here.
+  // Routed through updateWithRetry for the same conflict-retry safety as the
+  // other read-modify-write paths (issues #278/#279/#281); applyDeleteLock is
+  // pure so it re-runs safely per attempt. Appends a `lock`/`unlock` provenance
+  // entry (ADR-005 append-only). Returns undefined when the id is unknown.
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const now = new Date().toISOString();
+      const applied = applyDeleteLock(existing, input, now);
+      const next: Asset = {
+        ...existing,
+        deleteLock: applied.deleteLock,
+        provenance: applied.provenance,
+        updatedAt: now
+      };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
   }
 
   // Workspace-scoped slug existence check (issue #131). Queries the top-level

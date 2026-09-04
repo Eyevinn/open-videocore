@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import {
   ASSET_REVIEW_STATES,
   ASSET_STATUSES,
+  DeleteProtectedError,
   HasChildrenError,
   InMemoryAssetRepository,
   InvalidReviewTransitionError,
@@ -324,6 +325,32 @@ const tamsLookupQuerySchema = z.object({
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
+// Explicit delete-lock (ADR-020 decision 3, issue #568) as surfaced on the API.
+// Field names/types mirror ADR-020 exactly: locked, reason?, lockedAt, lockedBy?.
+const deleteLockSchema = z.object({
+  locked: z.boolean(),
+  reason: z.string().optional(),
+  lockedAt: z.string(),
+  lockedBy: z.string().optional()
+});
+
+// The shared blocked-delete envelope (ADR-020 decision 1, issue #568). EXTENDS
+// the existing `{ error, message? }` shape rather than diverging: adds the
+// required `reason` enum and the required `blockedBy` object. For the explicit
+// -lock case `reason` is `delete_protected` and both id arrays are empty (the
+// block is intrinsic to the document, not a foreign reference). The other two
+// reason members are reserved by ADR-020 for sibling sub-issues (OUT OF SCOPE
+// here) but declared so the response schema is the single shared contract.
+const deleteBlockedSchema = z.object({
+  error: z.literal('delete_blocked'),
+  message: z.string().optional(),
+  reason: z.enum(['referenced_by_job', 'member_of_collection', 'delete_protected']),
+  blockedBy: z.object({
+    jobIds: z.array(z.string()),
+    collectionIds: z.array(z.string())
+  })
+});
+
 // Delivery URL response (issue #14). Closes the pipeline loop: a client asks for
 // playback/download URLs for an asset and gets back whatever delivery surface is
 // available — packaged HLS/DASH manifests (preferred) and/or a presigned source
@@ -561,6 +588,11 @@ const assetSchema = z.object({
   // Editorial review state (issue #134), INDEPENDENT of `status`. Optional so
   // pre-existing assets serialized before reviewState existed still validate.
   reviewState: reviewStateSchema.optional(),
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent = unlocked;
+  // when present with `locked: true` the asset is delete-protected. Set/cleared
+  // only via PUT/DELETE /:id/lock (the dedicated system path), never the
+  // editorial update path.
+  deleteLock: deleteLockSchema.optional(),
   parentId: z.string().optional(),
   // Version-chain linkage (issue #118), DISTINCT from `parentId`. Present only
   // on outputs produced by a clip/export/rewrap run with `asVersion`. Absent on
@@ -1633,6 +1665,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     if (err instanceof HasChildrenError) {
       return reply.code(409).send({ error: 'has_children', message: err.message });
+    }
+    // Explicit delete-lock (ADR-020 decision 1, issue #568): the shared
+    // `delete_blocked` envelope with reason `delete_protected` and EMPTY
+    // blockedBy arrays (the block is intrinsic to the document, not a foreign
+    // reference).
+    if (err instanceof DeleteProtectedError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'delete_protected',
+        blockedBy: { jobIds: [], collectionIds: [] }
+      });
     }
     if (err instanceof SourceValidationError) {
       return reply.code(400).send({ error: 'invalid_source', message: err.message });
@@ -3709,10 +3753,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       schema: {
         params: z.object({ id: z.string() }),
-        response: { 204: z.null(), 404: errorSchema, 409: errorSchema }
+        // 409 covers BOTH the pre-existing `has_children` block (the base
+        // `{ error, message? }` envelope) and the new explicit-lock
+        // `delete_blocked` envelope (ADR-020). A union keeps the has_children
+        // serialization unchanged while adding the richer lock shape.
+        response: { 204: z.null(), 404: errorSchema, 409: z.union([deleteBlockedSchema, errorSchema]) }
       }
     },
     async (request, reply) => {
+      // Explicit delete-lock (ADR-020 decisions 1 & 2, issue #568). A locked
+      // asset is a HARD block: this guard is unconditional and runs BEFORE the
+      // archive, so `?force=true` cannot bypass it (force is never consulted
+      // here). Cleared only via DELETE /:id/lock. Surfaces the shared
+      // `delete_blocked` envelope with reason `delete_protected` (empty
+      // blockedBy) via DeleteProtectedError in the error handler.
+      const existing = await repo.get(request.params.id);
+      if (existing?.deleteLock?.locked) {
+        throw new DeleteProtectedError(request.params.id);
+      }
       // Block deletion while children (renditions) still reference this asset.
       const childCount = await repo.countChildren(request.params.id);
       if (childCount > 0) {
@@ -3724,6 +3782,69 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(204).send(null);
+    }
+  );
+
+  // Explicit delete-lock set/clear (ADR-020 decision 3, issue #568). A DEDICATED
+  // system write path for the `administrative.deleteLock` flag — chosen as a
+  // `/:id/lock` sub-resource with PUT (set) / DELETE (clear), mirroring the
+  // existing action-endpoint conventions in this router (cf. the `/:id/lock`
+  // sibling to `/:id/review-state`, `/:id/restore`, and the PUT/DELETE
+  // `/:id/audio-tracks` pattern). It is INTENTIONALLY separate from the
+  // editorial PATCH `/:id` and PUT `/:id/metadata` paths so the system-owned
+  // lock can never be set/cleared through ordinary metadata edits (ADR-005:
+  // `administrative` is not user-writable). The repo appends a `lock`/`unlock`
+  // provenance entry so the change is traceable.
+  //   200 — lock set, full asset returned (deleteLock present + locked)
+  //   404 — unknown/foreign asset (existence not leaked)
+  app.put(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        // `reason` (operator note) and `lockedBy` (actor) are optional, matching
+        // ADR-020 decision 3's optional sub-fields.
+        body: z
+          .object({
+            reason: z.string().max(1024).optional(),
+            lockedBy: z.string().max(256).optional()
+          })
+          .default({}),
+        response: { 200: assetSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.setDeleteLock(request.params.id, {
+        locked: true,
+        reason: request.body.reason,
+        lockedBy: request.body.lockedBy
+      });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
+    }
+  );
+
+  // Clear the explicit delete-lock (ADR-020 decision 3, issue #568). The ONLY
+  // way to lift protection — `?force=true` on DELETE /:id does NOT (ADR-020
+  // decision 2). Appends an `unlock` provenance entry.
+  //   200 — lock cleared, full asset returned (deleteLock absent)
+  //   404 — unknown/foreign asset
+  app.delete(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: assetSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.setDeleteLock(request.params.id, { locked: false });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
     }
   );
 

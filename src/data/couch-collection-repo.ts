@@ -11,10 +11,13 @@ import type { StoredDoc, StackCouch } from './couchdb.js';
 import {
   CollectionNotFoundError,
   addAssetId,
+  applyCollectionDeleteLock,
   removeAssetId,
   type Collection,
   type CollectionRepository,
-  type CreateCollectionInput
+  type CreateCollectionInput,
+  type DeleteLock,
+  type SetDeleteLockInput
 } from './collection-repo.js';
 
 const RESOURCE_TYPE = 'collection';
@@ -65,6 +68,26 @@ export class CouchCollectionRepository implements CollectionRepository {
     return this.mutate(id, (c) => removeAssetId(c.assetIds, assetId));
   }
 
+  // Dedicated delete-lock write path (ADR-020 decision 3, issue #568). Distinct
+  // from addAsset/removeAsset so the top-level `deleteLock` flag can only be
+  // set/cleared here. Reuses the same read-modify-write + _rev carry as mutate().
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Collection> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      throw new CollectionNotFoundError(id);
+    }
+    const existing = fromDoc(doc);
+    const now = new Date().toISOString();
+    const updated: Collection = {
+      ...existing,
+      deleteLock: applyCollectionDeleteLock(input, now),
+      updatedAt: now
+    };
+    await couch.put(id, { ...toDoc(updated), _rev: doc._rev });
+    return updated;
+  }
+
   async delete(id: string): Promise<void> {
     const couch = this.couchFor();
     const doc = await couch.get(id);
@@ -102,17 +125,24 @@ function toDoc(collection: Collection): Record<string, unknown> {
     name: collection.name,
     assetIds: collection.assetIds,
     createdAt: collection.createdAt,
-    updatedAt: collection.updatedAt
+    updatedAt: collection.updatedAt,
+    // Explicit delete-lock (ADR-020 decision 3, issue #568). Only persisted when
+    // present, so pre-#568 collections round-trip with the field absent.
+    ...(collection.deleteLock ? { deleteLock: collection.deleteLock } : {})
   };
 }
 
 function fromDoc(doc: StoredDoc): Collection {
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent maps to
+  // undefined so pre-#568 collections read as unlocked.
+  const deleteLock = doc['deleteLock'] as DeleteLock | undefined;
   return {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
     name: String(doc['name'] ?? ''),
     assetIds: (doc['assetIds'] as string[] | undefined) ?? [],
     createdAt: String(doc['createdAt'] ?? ''),
-    updatedAt: String(doc['updatedAt'] ?? '')
+    updatedAt: String(doc['updatedAt'] ?? ''),
+    ...(deleteLock ? { deleteLock } : {})
   };
 }
 
