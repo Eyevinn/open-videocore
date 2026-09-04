@@ -54,6 +54,7 @@ import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
+import { registerPrincipal } from './auth/principal.js';
 import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
@@ -327,6 +328,14 @@ app.addHook('preHandler', async (request) => {
     request.connections = null;
   }
 });
+
+// Resolve the caller's principal + role once per request and attach it alongside
+// `request.connections` (ADR-018 decisions 1 & 5, issue #553). This is the
+// RESOLUTION half of the authorisation model: it reads the trusted `X-OVC-Role`
+// header, mirroring the trusted `x-stack-name` read above, and decorates the
+// request observably. It performs NO enforcement — no route is gated and no 403
+// is returned (deferred to #554). No existing endpoint behaviour changes.
+registerPrincipal(app);
 
 const operationStore = new OperationStore();
 
