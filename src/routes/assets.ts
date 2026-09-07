@@ -122,6 +122,7 @@ import { isProfileRunnable } from '../services/profile-runnability.js';
 import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
@@ -359,6 +360,17 @@ const tamsLookupQuerySchema = z.object({
 });
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
+
+// Machine-readable body for a 504 when a required stack dependency (queue/
+// Valkey, Encore, storage) is unreachable or times out on the transcode path
+// (issue #616). Names the failing dependency and its endpoint so a caller can
+// branch on `dependency` without string-matching the message.
+const dependencyUnreachableSchema = z.object({
+  error: z.literal('dependency_unreachable'),
+  dependency: z.enum(['queue', 'encore', 'storage']),
+  endpoint: z.string(),
+  message: z.string()
+});
 
 // Explicit delete-lock (ADR-020 decision 3, issue #568) as surfaced on the API.
 // Field names/types mirror ADR-020 exactly: locked, reason?, lockedAt, lockedBy?.
@@ -2721,7 +2733,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           409: errorSchema,
           422: errorSchema,
           501: errorSchema,
-          502: errorSchema
+          502: errorSchema,
+          504: dependencyUnreachableSchema
         }
       }
     },
@@ -2936,6 +2949,26 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           .code(202)
           .send({ ...result, ...(profileParamsWarning ? { warning: profileParamsWarning } : {}) });
       } catch (err) {
+        // A stack dependency (queue/Valkey, Encore, storage) was unreachable or
+        // did not respond within the bounded deadline (#616). Fail fast with a
+        // 504 that NAMES the dependency + endpoint, and log server-side with
+        // enough detail (stack, dependency, endpoint, cause) to diagnose without
+        // a live repro — never let the connection drop silently.
+        if (isDependencyUnreachableError(err)) {
+          request.log.error(
+            {
+              err,
+              dependency: err.dependency,
+              endpoint: err.endpoint,
+              stackName: err.stackName,
+              operation: err.operation,
+              reason: err.reason,
+              timeoutMs: err.timeoutMs
+            },
+            'transcode submit failed: stack dependency unreachable'
+          );
+          return reply.code(504).send(err.toResponseBody());
+        }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
       }
