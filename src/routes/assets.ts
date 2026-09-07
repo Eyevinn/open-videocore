@@ -103,6 +103,11 @@ import {
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import {
+  backendOutputDestination,
+  DEFAULT_BACKEND_ID,
+  type StorageBackendRegistry
+} from '../services/storage-backend-registry.js';
+import {
   deliveryMode,
   manifestUrlsForLocation,
   outputPrefix,
@@ -791,6 +796,16 @@ type AssetsRouterOptions = {
   // not exercise named profiles), both checks are skipped (permissive) and the
   // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
+  // Registered external storage-backend registry (issue #549, #547, ADR-017).
+  // When present, POST /:id/execute may reference a registered external backend
+  // by id/name (`externalBackend`) to write its transcode/package OUTPUT to that
+  // backend's bucket instead of OSC-managed default storage. The reference is
+  // resolved at JOB TIME to the backend's NON-SECRET coordinates and translated
+  // into the per-execution `destinationBucket` the post-package relocation path
+  // already consumes (ADR-011). Credentials are NEVER read here — they live in
+  // OSC secrets, resolved by the consuming service. When absent, referencing an
+  // external backend responds 501; the default output path is unaffected.
+  storageBackendRegistry?: StorageBackendRegistry;
 };
 
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
@@ -3051,10 +3066,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // Optional per-execution destination override (issue #207). Validated
           // and trailing-slash-normalized at the edge; persisted on the
           // execution record for #208 (packager relocation) / #210 (delivery).
-          destinationBucket: destinationBucketSchema.optional()
+          destinationBucket: destinationBucketSchema.optional(),
+          // Optional reference (id OR name) to a registered external storage
+          // backend (issue #549, ADR-017 D4). When set, this execution's
+          // transcode/package OUTPUT is written to that backend's bucket instead
+          // of OSC-managed default storage, resolved to the backend's NON-SECRET
+          // coordinates at job time (credentials stay in OSC secrets). Mutually
+          // exclusive with `destinationBucket` (both name an output destination).
+          externalBackend: z.string().trim().min(1).max(256).optional()
         }),
         response: {
           202: pipelineExecutionSchema,
+          400: errorSchema,
           404: z.object({ error: z.string() }),
           409: errorSchema,
           422: errorSchema,
@@ -3071,6 +3094,54 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Resolve an optional registered external backend reference (issue #549)
+      // to the per-execution destination the relocation path consumes. Done here
+      // (before startPipelineExecution) so a dangling/unconfigured reference is a
+      // clean synchronous error and the downstream path stays destination-only.
+      let destinationBucket = request.body.destinationBucket;
+      if (request.body.externalBackend !== undefined) {
+        if (destinationBucket !== undefined) {
+          return reply.code(400).send({
+            error: 'invalid_request',
+            message:
+              'externalBackend and destinationBucket are mutually exclusive; specify only one output destination'
+          });
+        }
+        if (!opts.storageBackendRegistry) {
+          return reply.code(501).send({
+            error: 'not_configured',
+            message: 'external storage backends are not configured on this deployment'
+          });
+        }
+        const record = await opts.storageBackendRegistry.resolveForOutput(
+          DEPLOYMENT_CONTEXT,
+          request.body.externalBackend
+        );
+        // Explicitly referencing the implicit OSC-managed default (id 'default')
+        // means "use the default output path" — resolveForOutput returns
+        // undefined for it (ADR-017 D3, it is not an external backend), so we
+        // leave destinationBucket unset and fall through rather than 422. Any
+        // OTHER unresolved reference is a dangling backend -> 422.
+        if (!record) {
+          if (request.body.externalBackend !== DEFAULT_BACKEND_ID) {
+            return reply.code(422).send({
+              error: 'unknown_backend',
+              message: `no registered external storage backend matches "${request.body.externalBackend}"`
+            });
+          }
+          // 'default' -> no override, default output path (field omitted).
+        } else {
+          // A source-only backend cannot receive packaged output (ADR-017 D4:
+          // 'packaged' is the write role; 'source' is read-only for ingest).
+          if (record.role === 'source') {
+            return reply.code(422).send({
+              error: 'backend_role',
+              message: `storage backend "${request.body.externalBackend}" is registered for the source role and cannot receive output; register it with role "packaged" or "both"`
+            });
+          }
+          destinationBucket = backendOutputDestination(record);
+        }
+      }
       const started = await startPipelineExecution(
         asset,
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
@@ -3081,7 +3152,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           customProfile: request.body.customProfile as EncoreProfile | undefined,
           profileParams: request.body.profileParams
         },
-        request.body.destinationBucket
+        destinationBucket
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);

@@ -17,6 +17,7 @@ import {
   DefaultBackendNotDeletableError,
   DEFAULT_BACKEND_ID,
   backendRecordKey,
+  backendOutputDestination,
   type SecretStore,
   type StorageBackendRecord
 } from './storage-backend-registry.js';
@@ -161,5 +162,81 @@ describe('ParamStoreBackendRecordStore — non-secret store discipline', () => {
       secretAccessKey: RAW_SECRET
     } as unknown as StorageBackendRecord;
     await expect(recStore.put('ws1', leaky)).rejects.toThrow(/secret field/i);
+  });
+});
+
+describe('StorageBackendRegistry.resolveForOutput — output wiring (issue #549)', () => {
+  async function seed(role: StorageBackendRecord['role'] = 'packaged') {
+    const records = new InMemoryBackendRecordStore();
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(records, store);
+    const view = await registry.register('ws1', {
+      name: 'our-bucket',
+      role,
+      bucket: 'external-out',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET,
+      endpointUrl: 'https://s3.example.test'
+    });
+    return { registry, view };
+  }
+
+  it('resolves a registered backend by id', async () => {
+    const { registry, view } = await seed();
+    const rec = await registry.resolveForOutput('ws1', view.id);
+    expect(rec?.bucket).toBe('external-out');
+    expect(rec?.endpointUrl).toBe('https://s3.example.test');
+  });
+
+  it('resolves a registered backend by name', async () => {
+    const { registry } = await seed();
+    const rec = await registry.resolveForOutput('ws1', 'our-bucket');
+    expect(rec?.bucket).toBe('external-out');
+  });
+
+  it('never exposes secret material on the resolved record', async () => {
+    const { registry, view } = await seed();
+    const rec = await registry.resolveForOutput('ws1', view.id);
+    const asJson = JSON.stringify(rec);
+    expect(asJson).not.toContain(RAW_SECRET);
+    expect(rec).not.toHaveProperty('secretAccessKey');
+    expect(rec).not.toHaveProperty('sessionToken');
+  });
+
+  it('returns undefined for the implicit OSC-managed default id', async () => {
+    const { registry } = await seed();
+    expect(await registry.resolveForOutput('ws1', DEFAULT_BACKEND_ID)).toBeUndefined();
+  });
+
+  it('returns undefined for an unknown id/name', async () => {
+    const { registry } = await seed();
+    expect(await registry.resolveForOutput('ws1', 'nope')).toBeUndefined();
+  });
+
+  it('does not leak across workspaces', async () => {
+    const { registry, view } = await seed();
+    expect(await registry.resolveForOutput('other-ws', view.id)).toBeUndefined();
+  });
+});
+
+describe('backendOutputDestination — relocation destination form', () => {
+  const rec = (bucket: string): StorageBackendRecord => ({
+    id: 'x',
+    name: 'n',
+    role: 'packaged',
+    backend: 'external',
+    bucket,
+    accessKeyId: 'AKIA',
+    hasSessionToken: false,
+    createdAt: '2026-09-07T00:00:00.000Z'
+  });
+
+  it('emits a trailing-slash s3:// URI so it is treated as an external destination', () => {
+    expect(backendOutputDestination(rec('my-bucket'))).toBe('s3://my-bucket/');
+  });
+
+  it('normalises a bucket already carrying scheme/slashes', () => {
+    expect(backendOutputDestination(rec('s3://my-bucket/'))).toBe('s3://my-bucket/');
+    expect(backendOutputDestination(rec('/my-bucket'))).toBe('s3://my-bucket/');
   });
 });

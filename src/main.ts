@@ -1287,7 +1287,12 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // and for validating a named transcode profile so a GPU-only (NVENC/CUDA)
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
-  profileRepository
+  profileRepository,
+  // External storage-backend registry (issue #549, ADR-017 D4): lets POST
+  // /:id/execute target a registered external backend for its transcode/package
+  // OUTPUT, resolving the backend's non-secret coordinates at job time. The same
+  // registry instance the /storage/backends registration routes use.
+  storageBackendRegistry
 };
 await app.register(assetsRouter, assetRouterOptions);
 
