@@ -367,12 +367,21 @@ app.addHook('preHandler', async (request) => {
 });
 
 // Resolve the caller's principal + role once per request and attach it alongside
-// `request.connections` (ADR-018 decisions 1 & 5, issue #553). This is the
-// RESOLUTION half of the authorisation model: it reads the trusted `X-OVC-Role`
-// header, mirroring the trusted `x-stack-name` read above, and decorates the
-// request observably. It performs NO enforcement — no route is gated and no 403
-// is returned (deferred to #554). No existing endpoint behaviour changes.
-registerPrincipal(app);
+// `request.connections` (ADR-018 decisions 1 & 5, issues #553/#554). This reads
+// the `X-OVC-Role` header, mirroring the trusted `x-stack-name` read above, and
+// decorates request.principal. It is the TRUST BOUNDARY (ADR-018 decision 5):
+// unless the deployment opts into distinct per-caller roles, any client-supplied
+// `X-OVC-Role` is stripped here so it can never be spoofed downstream. Resolution
+// itself returns no 403 — the fail-closed 403 is the router-layer gate's job
+// (src/auth/authorize.ts, ADR-018 decision 2).
+//
+// OVC_TRUST_ROLE_HEADER=true tells the app the fronting layer (a reverse proxy or
+// self-deployed IdP, ADR-018 decision 1) sets the role on the already-gated path.
+// Absent/false ⇒ header stripped ⇒ admin default ⇒ identical to today's
+// authenticated-⇒-full-access behaviour (backwards compatible, decision 5).
+registerPrincipal(app, {
+  trustRoleHeader: process.env['OVC_TRUST_ROLE_HEADER'] === 'true'
+});
 
 const operationStore = new OperationStore();
 
