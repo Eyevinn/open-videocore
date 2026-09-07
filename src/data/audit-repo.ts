@@ -138,6 +138,53 @@ export class CouchAuditRepository {
       .map(fromDoc)
       .sort((a, b) => b.id.localeCompare(a.id));
   }
+
+  // Enumerate one page of audit entries in oldest-first order (ascending ULID),
+  // for the bounded retention sweep (issue #566). Retention purges the OLDEST
+  // aged entries, so ascending order lets the sweep page from the tail forward
+  // and stop as soon as it reaches entries inside the window. Mirrors the paged
+  // `list({ status, limit, offset })` walk the archived-asset sweep drives
+  // (listAllArchived, src/pipeline/archived-asset-purge-sweep.ts:195-215), but
+  // over the audit partition via StackCouch.find (src/data/couchdb.ts:66) with a
+  // skip/limit window. NOT the newest-first read-back `list` above — kept
+  // separate so the read-back surface is untouched.
+  async listOldestPage(opts: { limit: number; offset?: number }): Promise<AuditEntry[]> {
+    const couch = this.couchFor();
+    // CouchDB Mango `find` with no explicit `sort` scans the primary `_id`
+    // index, so pages come back in ascending `_id` order; because every audit
+    // `_id` is a time-sortable ULID (record(), above), that IS oldest-first, and
+    // skip/limit paging is therefore globally consistent across pages. The
+    // per-page sort below is a belt-and-braces normalisation of the returned
+    // page and does not, on its own, guarantee cross-page order — the offset
+    // walk depends on the store's ascending-`_id` scan.
+    const docs = await couch.find(
+      { resourceType: RESOURCE_TYPE },
+      { limit: opts.limit, skip: opts.offset ?? 0 }
+    );
+    return docs
+      .filter((d) => d.resourceType === RESOURCE_TYPE)
+      .map(fromDoc)
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  // Purge (expire) a single audit entry: WHOLE-ENTRY removal of its immutable
+  // document, never an in-place edit. This is the ONLY removal path and exists
+  // solely to enforce the retention window (issue #566) — it upholds
+  // append-only-UNTIL-purge: an entry is either present verbatim or gone, never
+  // rewritten. Delegates to StackCouch.remove (read _rev + destroy,
+  // src/data/couchdb.ts:87-93). Returns true when a live audit entry was
+  // removed, false when nothing matched (already gone / not an audit doc), so
+  // the sweep can count purges exactly like the archived-asset sweep's `purge`
+  // callback contract (purgeExpiredArchivedAssets, purgeOne step 5).
+  async purgeEntry(id: string): Promise<boolean> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return false;
+    }
+    await couch.remove(id);
+    return true;
+  }
 }
 
 // Map an AuditEntry to its persisted document body. Mirrors the

@@ -26,6 +26,7 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import { CouchAuditRepository } from '../data/audit-repo.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { InMemorySearchRepository } from '../data/inmemory-search-repo.js';
@@ -93,6 +94,13 @@ export type WorkspaceConnections = {
   collections: CollectionRepository;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
+  // Append-only audit store (issue #563), used by the audit-retention purge
+  // sweep (issue #566). Present only on CouchDB-backed connection paths (the
+  // audit store is Couch-only, src/data/audit-repo.ts); undefined on the
+  // env-override no-couch and in-memory fallback paths, where the audit-retention
+  // loop skips gracefully (never purges). Built from the SAME per-stack couch
+  // factory (`wc`) as every other Couch repo.
+  audit: CouchAuditRepository | undefined;
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
@@ -186,6 +194,7 @@ function buildConnectionsFromStack(
   const collections = new CouchCollectionRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  const audit = new CouchAuditRepository(wc);
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -218,6 +227,7 @@ function buildConnectionsFromStack(
     collections,
     profiles,
     pipelines,
+    audit,
     storageFor,
     storageClient: minioClient,
     encore,
@@ -253,6 +263,9 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let collections: CollectionRepository;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
+  // Audit store is Couch-only (src/data/audit-repo.ts); undefined on the no-couch
+  // env path so the audit-retention loop skips gracefully.
+  let audit: CouchAuditRepository | undefined;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -265,6 +278,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     collections = new CouchCollectionRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    audit = new CouchAuditRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -303,7 +317,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, profiles, pipelines, audit,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -329,6 +343,7 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const pipelines = new InMemoryPipelineRepository();
   return {
     assets, jobs, search, webhooks, collections, profiles, pipelines,
+    audit: undefined,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
