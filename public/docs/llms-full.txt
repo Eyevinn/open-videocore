@@ -461,9 +461,18 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ],
   "limit": 0,
@@ -507,9 +516,23 @@ Response 201 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -542,9 +565,18 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ],
   "limit": 0,
@@ -605,9 +637,18 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ]
 }
@@ -638,9 +679,23 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -683,9 +738,23 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -782,9 +851,23 @@ Response 201 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1012,9 +1095,23 @@ Response 201 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1102,9 +1199,23 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1264,9 +1375,23 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1302,9 +1427,23 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1399,9 +1538,23 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1432,9 +1585,23 @@ Response 200 (application/json)
   "slug": "string",
   "description": "string",
   "reviewState": "draft",
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
   "parentId": "string",
-  "versionOfAssetId": "string",
-  "versionGroupId": "string"
+  "versionOfAssetId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1650,9 +1817,18 @@ Response 200 (application/json)
       "slug": "string",
       "description": "string",
       "reviewState": "draft",
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
       "parentId": "string",
-      "versionOfAssetId": "string",
-      "versionGroupId": "string"
+      "versionOfAssetId": "string"
     }
   ]
 }
@@ -2224,7 +2400,12 @@ Response 200 (application/json)
         "string"
       ],
       "createdAt": "string",
-      "updatedAt": "string"
+      "updatedAt": "string",
+      "description": "string",
+      "tags": [
+        "string"
+      ],
+      "custom": {}
     }
   ]
 }
@@ -2236,7 +2417,12 @@ Response 200 (application/json)
   Request
 Request body (application/json)
 {
-  "name": "string"
+  "name": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
 }
 
   Response
@@ -2248,7 +2434,12 @@ Response 201 (application/json)
     "string"
   ],
   "createdAt": "string",
-  "updatedAt": "string"
+  "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
 }
 
   GET /api/v1/collections/{id}
@@ -2271,7 +2462,12 @@ Response 200 (application/json)
   "updatedAt": "string",
   "assets": [
     {}
-  ]
+  ],
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
 }
 
   DELETE /api/v1/collections/{id}
@@ -2304,7 +2500,12 @@ Response 200 (application/json)
     "string"
   ],
   "createdAt": "string",
-  "updatedAt": "string"
+  "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
 }
 
   DELETE /api/v1/collections/{id}/assets/{assetId}
@@ -2325,7 +2526,12 @@ Response 200 (application/json)
     "string"
   ],
   "createdAt": "string",
-  "updatedAt": "string"
+  "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
 }
 
 ---

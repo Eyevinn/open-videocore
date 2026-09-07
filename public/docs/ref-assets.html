@@ -317,9 +317,18 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
       &quot;slug&quot;: &quot;string&quot;,
       &quot;description&quot;: &quot;string&quot;,
       &quot;reviewState&quot;: &quot;draft&quot;,
+      &quot;storageTiering&quot;: {
+        &quot;tiers&quot;: {
+          &quot;source&quot;: null,
+          &quot;renditions&quot;: null,
+          &quot;packaged&quot;: null,
+          &quot;subtitles&quot;: null,
+          &quot;thumbnails&quot;: null
+        },
+        &quot;rehydrating&quot;: []
+      },
       &quot;parentId&quot;: &quot;string&quot;,
-      &quot;versionOfAssetId&quot;: &quot;string&quot;,
-      &quot;versionGroupId&quot;: &quot;string&quot;
+      &quot;versionOfAssetId&quot;: &quot;string&quot;
     }
   ],
   &quot;limit&quot;: 0,
@@ -359,9 +368,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -388,9 +411,18 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
       &quot;slug&quot;: &quot;string&quot;,
       &quot;description&quot;: &quot;string&quot;,
       &quot;reviewState&quot;: &quot;draft&quot;,
+      &quot;storageTiering&quot;: {
+        &quot;tiers&quot;: {
+          &quot;source&quot;: null,
+          &quot;renditions&quot;: null,
+          &quot;packaged&quot;: null,
+          &quot;subtitles&quot;: null,
+          &quot;thumbnails&quot;: null
+        },
+        &quot;rehydrating&quot;: []
+      },
       &quot;parentId&quot;: &quot;string&quot;,
-      &quot;versionOfAssetId&quot;: &quot;string&quot;,
-      &quot;versionGroupId&quot;: &quot;string&quot;
+      &quot;versionOfAssetId&quot;: &quot;string&quot;
     }
   ],
   &quot;limit&quot;: 0,
@@ -441,9 +473,18 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
       &quot;slug&quot;: &quot;string&quot;,
       &quot;description&quot;: &quot;string&quot;,
       &quot;reviewState&quot;: &quot;draft&quot;,
+      &quot;storageTiering&quot;: {
+        &quot;tiers&quot;: {
+          &quot;source&quot;: null,
+          &quot;renditions&quot;: null,
+          &quot;packaged&quot;: null,
+          &quot;subtitles&quot;: null,
+          &quot;thumbnails&quot;: null
+        },
+        &quot;rehydrating&quot;: []
+      },
       &quot;parentId&quot;: &quot;string&quot;,
-      &quot;versionOfAssetId&quot;: &quot;string&quot;,
-      &quot;versionGroupId&quot;: &quot;string&quot;
+      &quot;versionOfAssetId&quot;: &quot;string&quot;
     }
   ]
 }</code></pre></div>
@@ -470,9 +511,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -506,9 +561,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -579,9 +648,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -767,9 +850,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -840,9 +937,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -961,9 +1072,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -990,9 +1115,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -1060,9 +1199,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -1087,9 +1240,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;slug&quot;: &quot;string&quot;,
   &quot;description&quot;: &quot;string&quot;,
   &quot;reviewState&quot;: &quot;draft&quot;,
+  &quot;storageTiering&quot;: {
+    &quot;tiers&quot;: {
+      &quot;source&quot;: &quot;hot&quot;,
+      &quot;renditions&quot;: &quot;hot&quot;,
+      &quot;packaged&quot;: &quot;hot&quot;,
+      &quot;subtitles&quot;: &quot;hot&quot;,
+      &quot;thumbnails&quot;: &quot;hot&quot;
+    },
+    &quot;rehydrating&quot;: [
+      {
+        &quot;byteClass&quot;: &quot;source&quot;,
+        &quot;startedAt&quot;: &quot;string&quot;
+      }
+    ]
+  },
   &quot;parentId&quot;: &quot;string&quot;,
-  &quot;versionOfAssetId&quot;: &quot;string&quot;,
-  &quot;versionGroupId&quot;: &quot;string&quot;
+  &quot;versionOfAssetId&quot;: &quot;string&quot;
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
 </article>
 
@@ -1258,9 +1425,18 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
       &quot;slug&quot;: &quot;string&quot;,
       &quot;description&quot;: &quot;string&quot;,
       &quot;reviewState&quot;: &quot;draft&quot;,
+      &quot;storageTiering&quot;: {
+        &quot;tiers&quot;: {
+          &quot;source&quot;: null,
+          &quot;renditions&quot;: null,
+          &quot;packaged&quot;: null,
+          &quot;subtitles&quot;: null,
+          &quot;thumbnails&quot;: null
+        },
+        &quot;rehydrating&quot;: []
+      },
       &quot;parentId&quot;: &quot;string&quot;,
-      &quot;versionOfAssetId&quot;: &quot;string&quot;,
-      &quot;versionGroupId&quot;: &quot;string&quot;
+      &quot;versionOfAssetId&quot;: &quot;string&quot;
     }
   ]
 }</code></pre></div>
