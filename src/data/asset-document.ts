@@ -27,12 +27,18 @@ import {
   ASSET_REVIEW_STATES,
   ASSET_SOURCE_METHODS,
   PROVENANCE_ACTORS,
+  STORAGE_BYTE_CLASSES,
+  STORAGE_TIERS,
   SUBTITLE_FORMATS,
+  defaultStorageTiering,
   type Asset,
   type AssetReviewState,
   type AssetSourceMethod,
   type AssetStatus,
-  type ProvenanceEntry
+  type ProvenanceEntry,
+  type StorageByteClass,
+  type StorageTier,
+  type StorageTiering
 } from './asset-repo.js';
 
 export const ASSET_SCHEMA_VERSION = 1;
@@ -195,6 +201,32 @@ export const TamsAddressingSchema = z.object({
 export type TamsAddressing = z.infer<typeof TamsAddressingSchema>;
 
 // ---------------------------------------------------------------------------
+// Storage tiering (ADR-019, issue #556)
+//
+// The physical byte-location axis of an asset's bytes (`hot` | `archive`) tracked
+// PER BYTE CLASS (ADR-019 D3), plus any in-flight rehydrate (ADR-019 D4). It is
+// machine/pipeline-derived (a property of WHERE bytes live, next to renditions,
+// manifests, packagedOutput), so it lives under the `structural` namespace —
+// NEVER under user-writable `descriptive`, and NEVER on the lifecycle `state`
+// (ADR-019 D6 firewall). Both fields optional/additive: documents written before
+// #556 (block absent) still deserialize as the all-`hot`, nothing-rehydrating
+// default (fromAssetDocument), so no schemaVersion bump is required.
+// ---------------------------------------------------------------------------
+
+const RehydrateStateSchema = z.object({
+  byteClass: z.enum(STORAGE_BYTE_CLASSES),
+  startedAt: z.string()
+});
+
+export const StorageTieringSchema = z.object({
+  // Tier per byte class. Absent classes are treated as `hot` by the mapper.
+  tiers: z.record(z.enum(STORAGE_BYTE_CLASSES), z.enum(STORAGE_TIERS)).default({}),
+  // Byte classes with a restore in flight (ADR-019 D4). Empty means none.
+  rehydrating: z.array(RehydrateStateSchema).default([])
+});
+export type DocStorageTiering = z.infer<typeof StorageTieringSchema>;
+
+// ---------------------------------------------------------------------------
 // Asset document (the four-namespace aggregate root)
 // ---------------------------------------------------------------------------
 
@@ -291,7 +323,13 @@ export const AssetDocumentSchema = z.object({
       // -derived (flow UUIDs + validated TAI timerange grammar, ADR-008), so it
       // lives here under `structural` — NOT under user-writable `descriptive`.
       // Optional so documents written before #165 (field absent) still parse.
-      tams: TamsAddressingSchema.optional()
+      tams: TamsAddressingSchema.optional(),
+      // Storage-tier state (ADR-019, issue #556): per-byte-class `hot`/`archive`
+      // location + in-flight rehydrate. Machine/pipeline-derived, so it lives
+      // here under `structural` — NOT under `descriptive`, and NOT on `state`
+      // (the tier/status firewall, ADR-019 D6). Optional so documents written
+      // before #556 (field absent) still deserialize as the all-`hot` default.
+      storageTiering: StorageTieringSchema.optional()
     })
     .default({ renditions: [], collections: [] })
 });
@@ -459,7 +497,50 @@ export function toAssetDocument(
       doc.structural.tams.timerange = asset.tamsTimerange;
     }
   }
+  // Storage tiering (ADR-019, issue #556). Only persist the block when the asset
+  // actually carries non-default tier state (any class `archive`, or a rehydrate
+  // in flight), so pre-#556 assets and all-`hot` assets round-trip with the field
+  // absent (back-compat) — the mapper below fills the all-`hot` default on read.
+  if (asset.storageTiering && isNonDefaultTiering(asset.storageTiering)) {
+    const tiers: Partial<Record<StorageByteClass, StorageTier>> = {};
+    for (const [cls, tier] of Object.entries(asset.storageTiering.tiers)) {
+      // Persist only the archived classes; `hot` is the implicit default on read.
+      if (tier === 'archive') {
+        tiers[cls as StorageByteClass] = tier;
+      }
+    }
+    doc.structural.storageTiering = {
+      tiers,
+      rehydrating: asset.storageTiering.rehydrating ?? []
+    };
+  }
   return doc;
+}
+
+// True when a tiering state carries anything other than the all-`hot`,
+// nothing-rehydrating default: any byte class on `archive`, or a rehydrate in
+// flight. Used to decide whether the block is worth persisting (back-compat).
+function isNonDefaultTiering(tiering: StorageTiering): boolean {
+  const anyArchived = Object.values(tiering.tiers).some((t) => t === 'archive');
+  const anyRehydrating = (tiering.rehydrating?.length ?? 0) > 0;
+  return anyArchived || anyRehydrating;
+}
+
+// Map a persisted storage-tiering block back to the flat domain `StorageTiering`
+// (ADR-019, issue #556). Starts from the all-`hot`, nothing-rehydrating default
+// and overlays any persisted archived classes / in-flight rehydrates, so an
+// absent block reads as concretely all-`hot` (never undefined) and a partial
+// block (only archived classes persisted) fills the remaining classes as `hot`.
+function storageTieringFromDoc(block: DocStorageTiering | undefined): StorageTiering {
+  const tiering = defaultStorageTiering();
+  if (!block) {
+    return tiering;
+  }
+  for (const [cls, tier] of Object.entries(block.tiers)) {
+    tiering.tiers[cls as StorageByteClass] = tier;
+  }
+  tiering.rehydrating = block.rehydrating ?? [];
+  return tiering;
 }
 
 // Map a persisted four-namespace document back to the flat domain Asset.
@@ -536,6 +617,11 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
         ? doc.structural.tams.flowIds
         : undefined,
     tamsTimerange: doc.structural?.tams?.timerange,
+    // Storage tiering (ADR-019, issue #556). An absent block maps back to the
+    // all-`hot`, nothing-rehydrating default so pre-#556 assets and all-`hot`
+    // assets read as concretely `hot`, never undefined. Persisted archived
+    // classes and in-flight rehydrates are merged over that default.
+    storageTiering: storageTieringFromDoc(doc.structural?.storageTiering),
     sourceMethod: doc.administrative.source.method,
     originUri: doc.administrative.source.originUri,
     provenance: doc.administrative.provenance ?? [],
