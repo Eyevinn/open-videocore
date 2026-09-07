@@ -54,6 +54,16 @@ export class InMemoryCollectionRepository implements CollectionRepository {
     return copy(collection);
   }
 
+  // Non-mutating membership lookup (issue #570). Scans this workspace's
+  // collections and returns the ids of those whose `assetIds` contains the
+  // asset. Read-only — no store mutation.
+  async collectionsContainingAsset(assetId: string): Promise<string[]> {
+    return [...this.store.values()]
+      .filter((c) => c.assetIds.includes(assetId))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((c) => c.id);
+  }
+
   async addAsset(id: string, assetId: string): Promise<Collection> {
     return this.mutate(id, (c) => addAssetId(c.assetIds, assetId));
   }

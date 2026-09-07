@@ -1287,7 +1287,12 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // and for validating a named transcode profile so a GPU-only (NVENC/CUDA)
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
-  profileRepository
+  profileRepository,
+  // Collection membership lookup (issue #570): the asset DELETE route uses it to
+  // block archiving an asset still a member of one or more collections (ADR-020
+  // reason `member_of_collection`). Same repo instance the collections router
+  // uses, so the membership view is consistent.
+  collectionRepository
 };
 await app.register(assetsRouter, assetRouterOptions);
 

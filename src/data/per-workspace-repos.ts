@@ -273,6 +273,9 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
   async get(id: string): Promise<Collection | undefined> {
     return (await this.repo()).get(id);
   }
+  async collectionsContainingAsset(assetId: string): Promise<string[]> {
+    return (await this.repo()).collectionsContainingAsset(assetId);
+  }
   async addAsset(id: string, assetId: string): Promise<Collection> {
     return (await this.repo()).addAsset(id, assetId);
   }
