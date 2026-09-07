@@ -153,14 +153,17 @@ declare module 'fastify' {
 // performs NO enforcement: it never returns 403 and never gates a route
 // (deferred to #554, ADR-018 decision 5). Call once at app setup.
 export function registerPrincipal(app: FastifyInstance): void {
-  // Default decoration so a request always carries a valid principal even before
-  // the preHandler runs (e.g. onRequest-stage errors), mirroring the safe default
-  // `authenticated: false` at src/auth/middleware.ts:31. The default is the
-  // absent-header resolution (single-operator admin, ADR-018 decision 5), kept as
-  // a non-null value so the request field type has no null case for callers.
-  app.decorateRequest<ResolvedPrincipal>('principal', resolvePrincipalRole(undefined));
+  // Fastify v5 forbids a reference-type default value in decorateRequest — a
+  // shared object would leak mutations across requests (FST_ERR_DEC_REFERENCE_TYPE).
+  // Declare the slot as null and populate it per-request in the earliest hook
+  // (onRequest, before any handler or preHandler), so every request still carries
+  // a resolved principal before route code runs — mirroring the safe default
+  // `authenticated: false` at src/auth/middleware.ts:31. The cast keeps the
+  // request-field type non-null for callers (#554); the null placeholder is only
+  // ever observed in the sub-hook window that no handler can reach.
+  app.decorateRequest('principal', null as unknown as ResolvedPrincipal);
 
-  app.addHook('preHandler', async (request: FastifyRequest) => {
+  app.addHook('onRequest', async (request: FastifyRequest) => {
     // Fastify lowercases header keys; read the lowercased ROLE_HEADER exactly as
     // the existing x-stack-name read does (src/main.ts:318). Observability only —
     // no enforcement, so no reply is ever sent here.
