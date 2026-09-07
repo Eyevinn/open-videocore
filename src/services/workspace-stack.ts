@@ -554,6 +554,57 @@ export class WorkspaceStackResolver {
     return connections;
   }
 
+  // Resolve the EFFECTIVE stack identity a request routes to (issue #615).
+  //
+  // This is the single source of truth for "which stack does this request
+  // belong to", used to KEY the transcode/scaler coordinates (Encore pool,
+  // Valkey queue, MinIO S3 endpoint) so they are resolved per request rather
+  // than pinned to whichever stack was provisioned first in the process.
+  //
+  // Resolution mirrors resolve(): an explicit `requestedStackName` (from the
+  // X-Stack-Name header) addresses that stack directly when a config exists for
+  // it; otherwise (no header, or the requested name has no stored config) the
+  // FIRST provisioned stack for the namespace is the workspace default. Returns
+  // `undefined` only when no stack is provisioned at all (or the parameter store
+  // is unconfigured) — callers then fall back to the fixed deployment context.
+  //
+  // CRITICAL (issue #615): a requested name that HAS a stored config is returned
+  // verbatim and is NEVER silently rewritten to the first-listed stack, so two
+  // healthy stacks in one workspace can never share a mis-resolved client.
+  async resolveStackName(requestedStackName?: string): Promise<string | undefined> {
+    const ps = this.paramStore;
+    if (!ps) return undefined;
+    try {
+      if (requestedStackName) {
+        const config = await ps.loadStackConfig(
+          STACK_CONFIG_NAMESPACE,
+          requestedStackName
+        );
+        // A requested name that resolves to a real config wins verbatim; the
+        // request routes to exactly the stack it named regardless of provision
+        // order. Only when the requested name has NO stored config do we fall
+        // through to the workspace default (a stale UI selection must not break
+        // routing), matching resolve()'s fallback semantics.
+        if (config) return requestedStackName;
+      }
+      const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+      return names.length > 0 ? names[0] : undefined;
+    } catch (err) {
+      // A parameter-store read failure is not authority to invent a stack: log
+      // and return undefined so the caller uses the fixed deployment context
+      // (unchanged pre-#615 behaviour) rather than a fabricated name.
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE,
+          requestedStackName: requestedStackName ?? '(workspace default)'
+        },
+        'stack resolver: failed to resolve effective stack name'
+      );
+      return undefined;
+    }
+  }
+
   // Synchronous read of already-resolved connections from cache. Returns
   // undefined when nothing is cached (or the entry expired). The global
   // preHandler hook warms the cache with `resolve()` before any handler runs,

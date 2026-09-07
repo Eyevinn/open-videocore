@@ -792,14 +792,19 @@ function activateScaler(redisUrl: string): void {
       accessKeyId: encoreS3AccessKey,
       secretAccessKey: encoreS3SecretKey
     } : undefined,
-    // Resolve each workspace's MinIO endpoint from the parameter store at loop
-    // creation time so no static ENCORE_S3_ENDPOINT env var is required on OSC.
-    // Mirrors WorkspaceStackResolver: address the stack by workspaceId, falling
-    // back to the first provisioned stack for the namespace.
-    resolveS3Config: async (workspaceId: string) => {
+    // Resolve the MinIO endpoint from the parameter store at loop creation time
+    // so no static ENCORE_S3_ENDPOINT env var is required on OSC. The scaler's
+    // pool key is the EFFECTIVE stack identity the transcode request resolved to
+    // (issue #615 — see assets router transcodeContext), so `stackKey` IS the
+    // named stack: load its config by name directly. Only when that exact stack
+    // has no stored config (e.g. the fixed DEPLOYMENT_CONTEXT of a single-stack
+    // env-override deployment, which is not itself a stack name) do we fall back
+    // to the first provisioned stack — so single-stack behaviour is unchanged
+    // while a named stack is never mis-resolved to the first-provisioned one.
+    resolveS3Config: async (stackKey: string) => {
       if (!paramStore || !encoreS3SecretKey) return undefined;
       try {
-        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, workspaceId);
+        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
         if (!config) {
           const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
           if (names.length > 0) {
@@ -814,7 +819,7 @@ function activateScaler(redisUrl: string): void {
           };
         }
       } catch (err) {
-        app.log.warn({ err, workspaceId }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
+        app.log.warn({ err, stackKey }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
       }
       return undefined;
     },
@@ -1274,6 +1279,14 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   pullDeps,
   probe,
   encore,
+  // Resolve the EFFECTIVE stack identity a transcode request routes to (issue
+  // #615) so the scaler pool / Valkey queue / MinIO endpoint are keyed per
+  // request by the named stack rather than the first-provisioned one. Delegates
+  // to the same per-stack resolver the preHandler uses for storage/DB, reading
+  // the request's X-Stack-Name; undefined (no stack / store unconfigured) makes
+  // the transcode path fall back to the fixed deployment context.
+  resolveStackContext: (requestedStackName?: string) =>
+    stackResolver.resolveStackName(requestedStackName),
   sourceBucket,
   outputBucket,
   thumbnailExtractor,

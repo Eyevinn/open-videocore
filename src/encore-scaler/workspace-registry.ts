@@ -33,11 +33,14 @@ export type WorkspaceEncoreScalerConfig = {
   redisUrl: string;
   tickIntervalMs?: number;
   s3Config?: import('./types.js').EncoreS3Config;
-  // Optional per-workspace S3 config resolver. When supplied, called once at
-  // loop creation time and preferred over the static s3Config field. Allows the
-  // MinIO endpoint to be resolved from the parameter store per workspace rather
-  // than requiring a static ENCORE_S3_ENDPOINT env var.
-  resolveS3Config?: (workspaceId: string) => Promise<import('./types.js').EncoreS3Config | undefined>;
+  // Optional per-stack S3 config resolver. When supplied, called once at loop
+  // creation time and preferred over the static s3Config field. Allows the
+  // MinIO endpoint to be resolved from the parameter store per stack rather than
+  // requiring a static ENCORE_S3_ENDPOINT env var. The argument is the loop key,
+  // which is the EFFECTIVE stack identity the transcode request resolved to
+  // (issue #615 — decoded from the encoreJobId contextId), so the endpoint is
+  // resolved for the named stack, never the first-provisioned one.
+  resolveS3Config?: (stackKey: string) => Promise<import('./types.js').EncoreS3Config | undefined>;
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).
   profilesUrl?: string;
@@ -72,6 +75,11 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
 
   constructor(private readonly config: WorkspaceEncoreScalerConfig) {}
 
+  // `workspaceId` here is the loop key: the EFFECTIVE stack identity the request
+  // resolved to (issue #615), decoded from the encoreJobId contextId. The loop
+  // cache and every per-stack coordinate (Encore pool, Valkey queue keys, MinIO
+  // endpoint via resolveS3Config) are keyed by it, so two stacks in one workspace
+  // never share a mis-resolved client.
   private async getOrCreate(workspaceId: string): Promise<EncoreClient> {
     const existing = this.loops.get(workspaceId);
     if (existing) return existing.client;
