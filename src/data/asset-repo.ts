@@ -106,6 +106,18 @@ export type ProvenanceEntry = {
   detail?: string;
 };
 
+// A namespaced correlation to an upstream system of record (issue #575,
+// ADR-019). `{ namespace, id }` foreign key. Modelled as a SET on the asset
+// (array), not a scalar, so an asset can be correlated with more than one
+// system at once. System-owned mapping data (ADR-005 administrative namespace).
+// The runtime Zod validation lives in asset-document.ts (ExternalIdentifierSchema).
+export type ExternalIdentifier = {
+  // Upstream system label, e.g. `ingest-mam` or `rights-registry`.
+  namespace: string;
+  // Foreign key value in that system (opaque string).
+  id: string;
+};
+
 // How an asset entered the system (ADR-005 administrative.source.method).
 export const ASSET_SOURCE_METHODS = ['upload', 'url-pull', 'watch-folder'] as const;
 export type AssetSourceMethod = (typeof ASSET_SOURCE_METHODS)[number];
@@ -352,6 +364,13 @@ export type Asset = {
   originUri?: string;
   // Append-only provenance log (ADR-005 / issue #53).
   provenance?: ProvenanceEntry[];
+  // Namespaced external identifiers (issue #575, ADR-019): a SET of
+  // { namespace, id } foreign keys correlating this asset with one or more
+  // UPSTREAM systems of record. System-owned mapping data, so it maps onto the
+  // ADR-005 `administrative` namespace (see asset-document.ts), NOT the
+  // editorial `descriptive` one. Optional/additive: absent on assets/documents
+  // written before #575. Lookup (#576) and uniqueness (#577) are out of scope.
+  externalIdentifiers?: ExternalIdentifier[];
   // Collection memberships projected onto the asset (ADR-005 structural).
   collections?: string[];
   // TAMS time-addressable bridge addressing (issue #165, epic #116). Machine/

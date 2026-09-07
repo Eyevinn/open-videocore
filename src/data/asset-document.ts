@@ -32,6 +32,7 @@ import {
   type AssetReviewState,
   type AssetSourceMethod,
   type AssetStatus,
+  type ExternalIdentifier,
   type ProvenanceEntry
 } from './asset-repo.js';
 
@@ -131,6 +132,33 @@ const StatusTransitionSchema = z.object({
   at: z.string(),
   from: z.string().nullable(),
   to: z.string()
+});
+
+// ---------------------------------------------------------------------------
+// External identifiers (issue #575, ADR-019).
+//
+// A namespaced correlation to an UPSTREAM system of record: `{ namespace, id }`.
+// Modelled as a SET (array) — not a single scalar — so one asset can be
+// correlated with more than one system simultaneously (e.g. an ingest MAM plus
+// a rights registry). These are system-owned FOREIGN KEYS, not editorial
+// content, so ADR-019 places the collection under the `administrative`
+// namespace (system-provenance) rather than user-writable `descriptive`,
+// consistent with the ADR-005 writer-provenance rules described in this file's
+// header (lines 5-11) and grounded in ADR-009 lines 95-101.
+//
+// This is scope-limited to the DATA MODEL only: no lookup (#576) or uniqueness
+// (#577) logic lives here. The field is OPTIONAL and additive, so documents
+// written before #575 (field absent) still deserialize — no schemaVersion bump
+// is required, and all v1 documents remain valid.
+export const ExternalIdentifierSchema: z.ZodType<ExternalIdentifier> = z.object({
+  // Upstream system identifier, e.g. `ingest-mam`, `rights-registry`. A short,
+  // opaque namespace label distinguishing which system of record `id` belongs
+  // to. Non-empty so an entry always names its owning system.
+  namespace: z.string().min(1),
+  // The foreign key value in that system. Kept as an opaque string (systems
+  // vary: UUIDs, numeric ids, slugs), non-empty so an entry always carries a
+  // value.
+  id: z.string().min(1)
 });
 
 // ---------------------------------------------------------------------------
@@ -245,7 +273,14 @@ export const AssetDocumentSchema = z.object({
     // `.default('draft')` means documents written before reviewState existed
     // (the field simply absent) deserialize as `draft` — no schemaVersion bump
     // is required, so all v1 documents remain valid.
-    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft')
+    reviewState: z.enum(ASSET_REVIEW_STATES).default('draft'),
+    // Namespaced external identifiers (issue #575, ADR-019): a set of
+    // { namespace, id } foreign keys to upstream systems of record. System-owned
+    // mapping data, so it lives here under `administrative` — NOT under
+    // user-writable `descriptive`. Optional so documents written before #575
+    // (field absent) still deserialize; no schemaVersion bump required. Lookup
+    // (#576) and uniqueness (#577) are intentionally out of scope here.
+    externalIdentifiers: z.array(ExternalIdentifierSchema).optional()
   }),
 
   structural: z
@@ -381,6 +416,8 @@ export function toAssetDocument(
       // asset has never been moved out of draft; persist the default explicitly.
       reviewState: asset.reviewState ?? 'draft'
     },
+    // externalIdentifiers (issue #575) is attached below, only when present, so
+    // pre-#575 assets round-trip with the field absent (back-compat).
     structural: {
       renditions: asset.renditions ?? [],
       collections: asset.collections ?? [],
@@ -393,6 +430,12 @@ export function toAssetDocument(
   };
   if (opts.rev) {
     doc._rev = opts.rev;
+  }
+  // Namespaced external identifiers (issue #575). Only persisted when the asset
+  // actually carries entries, so pre-#575 assets round-trip with the field
+  // absent (back-compat), mirroring the TAMS/packagedOutput pattern.
+  if (asset.externalIdentifiers && asset.externalIdentifiers.length > 0) {
+    doc.administrative.externalIdentifiers = asset.externalIdentifiers;
   }
   if (asset.objectKey) {
     doc.administrative.storage = {
@@ -539,10 +582,16 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     sourceMethod: doc.administrative.source.method,
     originUri: doc.administrative.source.originUri,
     provenance: doc.administrative.provenance ?? [],
+    // Namespaced external identifiers (issue #575). Absent / empty maps back to
+    // undefined so the flat type stays clean for pre-#575 assets.
+    externalIdentifiers:
+      doc.administrative.externalIdentifiers && doc.administrative.externalIdentifiers.length > 0
+        ? doc.administrative.externalIdentifiers
+        : undefined,
     collections: collections && collections.length > 0 ? collections : undefined,
     createdAt: doc.administrative.createdAt,
     updatedAt: doc.administrative.updatedAt
   };
 }
 
-export type { ProvenanceEntry };
+export type { ExternalIdentifier, ProvenanceEntry };
