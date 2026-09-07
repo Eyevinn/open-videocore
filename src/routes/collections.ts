@@ -10,6 +10,7 @@
 //   POST   /api/v1/collections                       — create { name }
 //   GET    /api/v1/collections                       — list this workspace's collections
 //   GET    /api/v1/collections/:id                   — get one, with resolved asset list
+//   PATCH  /api/v1/collections/:id                   — partial update of descriptive metadata (#560)
 //   DELETE /api/v1/collections/:id                   — delete a collection
 //   PUT    /api/v1/collections/:id/assets/:assetId   — add an asset to a collection
 //   DELETE /api/v1/collections/:id/assets/:assetId   — remove an asset from a collection
@@ -93,6 +94,22 @@ const createBodySchema = z.object({
   custom: z.record(z.unknown()).optional()
 });
 
+// PATCH /:id body (issue #560): a PARTIAL update of a collection's descriptive
+// metadata. Only description/tags/custom are editable here; every present key is
+// applied wholesale, an absent key leaves the current value untouched, and an
+// explicit empty value (`''`/`[]`/`{}`) clears the field. Membership (`assetIds`)
+// is deliberately NOT accepted — it stays on PUT/DELETE /:id/assets/:assetId —
+// and neither `name` nor `deleteLock` is editable through this path. `.strict()`
+// rejects any unknown key (including `assetIds`) with a 400 so callers cannot
+// smuggle a membership mutation through the metadata endpoint.
+const updateBodySchema = z
+  .object({
+    description: z.string().optional(),
+    tags: z.array(z.string()).optional(),
+    custom: z.record(z.unknown()).optional()
+  })
+  .strict();
+
 type CollectionsRouterOptions = {
   repository: CollectionRepository;
   // Asset repository, used to (a) validate an asset exists before adding it to a
@@ -172,6 +189,32 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       );
       const liveAssets = resolved.filter((a): a is Asset => a !== undefined);
       return reply.code(200).send({ ...collection, assets: liveAssets });
+    }
+  );
+
+  // Partial update of a collection's descriptive metadata (issue #560). PATCH
+  // (not PUT) so callers send only the fields they intend to change; the body is
+  // `.strict()` so membership (`assetIds`), `name`, and `deleteLock` are all
+  // rejected (400) — membership stays on PUT/DELETE /:id/assets/:assetId. The
+  // CouchDB backend routes this through the `_rev` merge-retry wrapper
+  // (updateWithRetry, ADR-005 / issue #278), the same concurrency model the asset
+  // editorial write uses, so a racing membership add re-bases rather than
+  // clobbers.
+  //   200 — updated collection returned
+  //   404 — unknown/foreign collection (repo throws CollectionNotFoundError)
+  app.patch(
+    '/:id',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: updateBodySchema,
+        response: { 200: collectionSchema, 400: errorSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      // repo.update throws CollectionNotFoundError (-> 404) for an unknown id.
+      const collection = await repo.update(request.params.id, request.body);
+      return reply.code(200).send(collection);
     }
   );
 

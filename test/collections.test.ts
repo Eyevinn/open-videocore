@@ -357,6 +357,87 @@ describe('collections (issue #11)', () => {
       expect(got['assets']).toEqual([]);
     });
 
+    // PATCH /:id partial update of descriptive metadata (issue #560). PATCH
+    // semantics: present keys applied wholesale, absent keys left untouched,
+    // explicit empty value clears; membership is never editable here.
+    it('PATCH /:id updates description/tags/custom, leaving absent fields untouched', async () => {
+      const created = await createCollectionWith({
+        name: 'Docs',
+        description: 'original',
+        tags: ['a', 'b'],
+        custom: { season: 1 }
+      });
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A,
+        payload: { description: 'edited', tags: ['c'] }
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body['description']).toBe('edited');
+      expect(body['tags']).toEqual(['c']);
+      // `custom` was absent from the patch, so it is left untouched.
+      expect(body['custom']).toEqual({ season: 1 });
+      // Membership is unchanged and still present.
+      expect(body['assetIds']).toEqual([]);
+    });
+
+    it('PATCH /:id clears a field via an explicit empty value', async () => {
+      const created = await createCollectionWith({
+        name: 'Docs',
+        description: 'to clear',
+        tags: ['x'],
+        custom: { k: 'v' }
+      });
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A,
+        payload: { description: '', tags: [], custom: {} }
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body['description']).toBe('');
+      expect(body['tags']).toEqual([]);
+      expect(body['custom']).toEqual({});
+    });
+
+    it('PATCH /:id returns 404 for an unknown collection', async () => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/v1/collections/nope',
+        headers: A,
+        payload: { description: 'x' }
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('PATCH /:id rejects an attempt to mutate membership (assetIds) with 400', async () => {
+      const collection = await createCollectionWith({ name: 'Guarded' });
+      const asset = await createAsset(app, { name: 'clip' });
+      // Seed one member so we can prove the patch does not touch membership.
+      await app.inject({
+        method: 'PUT',
+        url: `/api/v1/collections/${collection['id']}/assets/${asset['id']}`,
+        headers: A
+      });
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${collection['id']}`,
+        headers: A,
+        payload: { assetIds: [] }
+      });
+      // `.strict()` body rejects the unknown key -> 400, membership untouched.
+      expect(res.statusCode).toBe(400);
+      const get = await app.inject({
+        method: 'GET',
+        url: `/api/v1/collections/${collection['id']}`,
+        headers: A
+      });
+      expect(get.json()['assetIds']).toEqual([asset['id']]);
+    });
+
     it('leaves membership operations unaffected on a collection carrying metadata', async () => {
       const created = await createCollectionWith({
         name: 'WithMeta',
