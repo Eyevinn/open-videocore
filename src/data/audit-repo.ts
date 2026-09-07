@@ -40,6 +40,13 @@ const RESOURCE_TYPE = 'audit-entry';
 export const AUDIT_TARGET_TYPES = ['asset', 'collection', 'job'] as const;
 export type AuditTargetType = (typeof AUDIT_TARGET_TYPES)[number];
 
+// Re-export the coarse actor-origin enum values (PROVENANCE_ACTORS from
+// asset-repo, ['user','system','ai']) under an audit-scoped name so the read
+// route can build its actor-origin filter from the SAME source of truth the
+// persisted `AuditActor.origin` uses — no re-declared enum. See
+// src/data/asset-repo.ts:99-100.
+export const PROVENANCE_ACTORS_FOR_AUDIT = PROVENANCE_ACTORS;
+
 // Actor, forward-compatible for the real principal identity that lands with
 // #525. Today auth is a presence-only gate with no principal, so `principalId`
 // is a nullable placeholder; `origin` is the pre-existing coarse enum reused
@@ -86,12 +93,88 @@ export type RecordAuditInput = z.infer<typeof RecordAuditInputSchema>;
 
 export type CouchFactory = () => StackCouch;
 
+// Read-only query for the audit read surface (issue #565). All fields optional:
+// an empty query returns every entry, newest-first. Filters are ANDed:
+//   - targetType + targetId : entries about one specific resource. `targetId`
+//     is only meaningful alongside `targetType` (a target is identified by the
+//     pair), so it is accepted only when `targetType` is present.
+//   - origin                : coarse actor origin (PROVENANCE_ACTORS).
+//   - principalId           : exact actor principal id (nullable placeholder
+//     until #525) — matches entries whose actor.principalId equals this value.
+//   - action                : exact action string.
+//   - from / to             : inclusive ISO-8601 bounds on `at`.
+// `limit`/`offset` mirror the asset list surface's offset pagination
+// (src/routes/assets.ts:322-327,681-686): `{ items, limit, offset, total }`.
+export type AuditQuery = {
+  targetType?: AuditTargetType;
+  targetId?: string;
+  origin?: AuditActor['origin'];
+  principalId?: string;
+  action?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+  offset?: number;
+};
+
+// A page of audit entries. Shape mirrors the asset list surface
+// (`{ items, limit, offset, total }`, src/routes/assets.ts:681-686). `total` is
+// the count of entries matching the filters BEFORE limit/offset are applied.
+export type AuditQueryResult = {
+  items: AuditEntry[];
+  limit: number;
+  offset: number;
+  total: number;
+};
+
+// Default page size when the caller omits `limit`. Same default the asset list
+// route effectively uses is per-route; here the audit surface picks 50.
+export const AUDIT_DEFAULT_LIMIT = 50;
+// Upper bound on a single page, mirroring the asset list cap
+// (src/routes/assets.ts:323 `max(200)`).
+export const AUDIT_MAX_LIMIT = 200;
+
+// Pure, read-only filter+sort+paginate over already-materialised entries.
+// Shared by both the Couch and in-memory repos so the two cannot drift. Never
+// mutates its input. Sort is newest-first by ULID id (time-sortable, ADR-005),
+// identical to `list()` above.
+export function applyAuditQuery(all: readonly AuditEntry[], query: AuditQuery): AuditQueryResult {
+  const filtered = all.filter((e) => {
+    if (query.targetType !== undefined && e.targetType !== query.targetType) return false;
+    if (query.targetId !== undefined && e.targetId !== query.targetId) return false;
+    if (query.origin !== undefined && e.actor.origin !== query.origin) return false;
+    if (query.principalId !== undefined && e.actor.principalId !== query.principalId) return false;
+    if (query.action !== undefined && e.action !== query.action) return false;
+    if (query.from !== undefined && e.at < query.from) return false;
+    if (query.to !== undefined && e.at > query.to) return false;
+    return true;
+  });
+  // Newest-first. Primary key is the event instant `at`; `id` (a time-sortable
+  // ULID) is the stable tiebreak for entries sharing an `at`. In production the
+  // two agree (the ULID is minted at record time); ordering on `at` first makes
+  // "newest-first" mean the event time the caller filters on with from/to.
+  filtered.sort((a, b) => (a.at === b.at ? b.id.localeCompare(a.id) : b.at.localeCompare(a.at)));
+  const total = filtered.length;
+  const offset = query.offset ?? 0;
+  const limit = query.limit ?? AUDIT_DEFAULT_LIMIT;
+  const items = filtered.slice(offset, offset + limit);
+  return { items, limit, offset, total };
+}
+
+// Read-only audit query surface (issue #565). Both the Couch and in-memory
+// stores implement this; the HTTP route depends only on the interface.
+// Deliberately read-only: no write/update/delete — the append-only invariant
+// (ADR-005) is preserved (this surface never mutates an entry).
+export interface AuditRepository {
+  query(query: AuditQuery): Promise<AuditQueryResult>;
+}
+
 // Append-only audit store over a dedicated CouchDB partition.
 //
-// Deliberately exposes ONLY `record` (write) and `get`/`list` (read-back). No
-// update, no delete, no _rev carry-forward — consistent with ADR-005 append,
-// never rewrite.
-export class CouchAuditRepository {
+// Deliberately exposes ONLY `record` (write), `get`/`list` (read-back), and
+// `query` (read-only query surface, issue #565). No update, no delete, no _rev
+// carry-forward — consistent with ADR-005 append, never rewrite.
+export class CouchAuditRepository implements AuditRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
   // Write a single audit entry. Validates required fields and rejects a bad
@@ -137,6 +220,53 @@ export class CouchAuditRepository {
       .filter((d) => d.resourceType === RESOURCE_TYPE)
       .map(fromDoc)
       .sort((a, b) => b.id.localeCompare(a.id));
+  }
+
+  // Read-only query surface for the audit read route (issue #565). Filters,
+  // sorts newest-first, and paginates via `applyAuditQuery`. Pulls the audit
+  // partition through `couch.find({ resourceType })` — the same read primitive
+  // `list()` uses — with a bounded fetch cap, then filters/paginates in the
+  // application layer so the wire contract does not leak the Mango selector.
+  // Read-only: never writes, never mutates an entry (append-only, ADR-005).
+  async query(query: AuditQuery): Promise<AuditQueryResult> {
+    const couch = this.couchFor();
+    const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit: AUDIT_FETCH_CAP });
+    const all = docs.filter((d) => d.resourceType === RESOURCE_TYPE).map(fromDoc);
+    return applyAuditQuery(all, query);
+  }
+}
+
+// Upper bound on how many entries the Couch query pulls before filtering. Kept
+// generous but finite so a huge partition cannot produce an unbounded read; the
+// `total` reported reflects entries within this cap. Consistent with the
+// existing `list()` default fetch of 1000.
+const AUDIT_FETCH_CAP = 10_000;
+
+// In-memory audit store for local/dev and tests (mirrors the in-memory variants
+// of the other repos, e.g. InMemoryCollectionRepository). Exposes `record` so
+// tests can write entries directly (per #565 guidance — instrumentation #564 is
+// not a build dependency) and the read-only `query` surface. Append-only: no
+// update/delete path.
+export class InMemoryAuditRepository implements AuditRepository {
+  private readonly entries: AuditEntry[] = [];
+
+  async record(input: RecordAuditInput): Promise<AuditEntry> {
+    const parsed = RecordAuditInputSchema.parse(input);
+    const entry: AuditEntry = {
+      id: ulid(),
+      at: parsed.at ?? new Date().toISOString(),
+      actor: parsed.actor,
+      action: parsed.action,
+      targetType: parsed.targetType,
+      targetId: parsed.targetId,
+      detail: parsed.detail ?? {}
+    };
+    this.entries.push(entry);
+    return entry;
+  }
+
+  async query(query: AuditQuery): Promise<AuditQueryResult> {
+    return applyAuditQuery(this.entries, query);
   }
 }
 

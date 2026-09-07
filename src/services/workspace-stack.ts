@@ -36,6 +36,11 @@ import { InMemoryPipelineRepository, type PipelineRepository } from '../data/pip
 import type { SearchRepository } from '../data/search-repo.js';
 import type { WebhookRepository } from '../data/webhook-repo.js';
 import type { CollectionRepository } from '../data/collection-repo.js';
+import {
+  CouchAuditRepository,
+  InMemoryAuditRepository,
+  type AuditRepository
+} from '../data/audit-repo.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
@@ -91,6 +96,9 @@ export type WorkspaceConnections = {
   search: SearchRepository;
   webhooks: WebhookRepository;
   collections: CollectionRepository;
+  // Read-only audit query surface (issue #565). Backed by CouchAuditRepository
+  // in production and InMemoryAuditRepository on the in-memory/env paths.
+  audit: AuditRepository;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   storageFor: StorageFactory | undefined;
@@ -184,6 +192,7 @@ function buildConnectionsFromStack(
   const search = new CouchSearchRepository(wc);
   const webhooks = new CouchWebhookRepository(wc);
   const collections = new CouchCollectionRepository(wc);
+  const audit = new CouchAuditRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
 
@@ -216,6 +225,7 @@ function buildConnectionsFromStack(
     search,
     webhooks,
     collections,
+    audit,
     profiles,
     pipelines,
     storageFor,
@@ -251,6 +261,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let search: SearchRepository;
   let webhooks: WebhookRepository;
   let collections: CollectionRepository;
+  let audit: AuditRepository;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
 
@@ -263,6 +274,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     search = new CouchSearchRepository(wc);
     webhooks = new CouchWebhookRepository(wc);
     collections = new CouchCollectionRepository(wc);
+    audit = new CouchAuditRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
   } else {
@@ -272,6 +284,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     search = new InMemorySearchRepository(mem);
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
+    audit = new InMemoryAuditRepository();
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
   }
@@ -303,7 +316,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -325,10 +338,11 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const search = new InMemorySearchRepository(assets);
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
+  const audit = new InMemoryAuditRepository();
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
   return {
-    assets, jobs, search, webhooks, collections, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',

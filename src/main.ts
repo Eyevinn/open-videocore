@@ -38,6 +38,7 @@ import { searchRouter } from './routes/search.js';
 import { WebhookDispatcher } from './services/webhook-dispatcher.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { collectionsRouter } from './routes/collections.js';
+import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
@@ -49,6 +50,7 @@ import {
   PerWorkspaceSearchRepository,
   PerWorkspaceWebhookRepository,
   PerWorkspaceCollectionRepository,
+  PerWorkspaceAuditRepository,
   PerWorkspaceProfileRepository
 } from './data/per-workspace-repos.js';
 import type { AssetRepository } from './data/asset-repo.js';
@@ -462,6 +464,7 @@ const jobRepository = new PerWorkspaceJobRepository(stackResolver);
 const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
 const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver);
+const auditRepository = new PerWorkspaceAuditRepository(stackResolver);
 const profileRepository = new PerWorkspaceProfileRepository(stackResolver);
 
 // Synchronous, per-workspace object-storage factory (issue #4). Reads the
@@ -1522,6 +1525,14 @@ await app.register(collectionsRouter, {
   prefix: '/api/v1/collections',
   repository: collectionRepository,
   assetRepository
+});
+
+// Audit read surface (issue #565). Read-only, queryable view over the
+// append-only audit log; behind the same presence gate as the rest of
+// /api/v1. Read-authorization is deferred to #525.
+await app.register(auditRouter, {
+  prefix: '/api/v1/audit',
+  repository: auditRepository
 });
 
 // Bucket / object-storage management. Workspace-scoped; behind `authenticate`.
