@@ -15,6 +15,7 @@ import {
   InMemoryBackendRecordStore,
   ParamStoreBackendRecordStore,
   DefaultBackendNotDeletableError,
+  UnknownSourceBackendError,
   DEFAULT_BACKEND_ID,
   backendRecordKey,
   type SecretStore,
@@ -90,6 +91,77 @@ describe('StorageBackendRegistry.register — persistence split', () => {
       secretAccessKey: RAW_SECRET
     });
     expect(view.credentials.secretAccessKey).toBe('***redacted***');
+  });
+});
+
+describe('StorageBackendRegistry.resolveSourceCredentials — issue #548', () => {
+  it('resolves an ffmpeg-s3 source job body with secret REFERENCES (never literals)', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store);
+    const view = await registry.register('ws1', {
+      name: 'my-bucket',
+      role: 'source',
+      bucket: 'ext-bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET,
+      endpointUrl: 'https://s3.example.com',
+      region: 'eu-west-1',
+      sessionToken: RAW_TOKEN
+    });
+
+    const creds = await registry.resolveSourceCredentials('ws1', view.id);
+    expect(creds.bucket).toBe('ext-bkt');
+    expect(creds.awsAccessKeyId).toBe('AKIA'); // non-secret, literal
+    expect(creds.s3EndpointUrl).toBe('https://s3.example.com');
+    expect(creds.awsRegion).toBe('eu-west-1');
+    // Secret fields are {{secrets.<name>}} references, NOT the raw values.
+    expect(creds.awsSecretAccessKey).toBe(
+      `{{secrets.storagebackend.${view.id}.source.awssecretaccesskey}}`
+    );
+    expect(creds.awsSessionToken).toBe(
+      `{{secrets.storagebackend.${view.id}.source.awssessiontoken}}`
+    );
+    const asJson = JSON.stringify(creds);
+    expect(asJson).not.toContain(RAW_SECRET);
+    expect(asJson).not.toContain(RAW_TOKEN);
+  });
+
+  it('resolves by name as well as by id', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store);
+    await registry.register('ws1', {
+      name: 'named-backend',
+      role: 'both',
+      bucket: 'b',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    const creds = await registry.resolveSourceCredentials('ws1', 'named-backend');
+    expect(creds.bucket).toBe('b');
+    // No token registered -> no session-token reference.
+    expect(creds.awsSessionToken).toBeUndefined();
+  });
+
+  it('rejects an unknown reference', async () => {
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), spySecretStore().store);
+    await expect(registry.resolveSourceCredentials('ws1', 'nope')).rejects.toBeInstanceOf(
+      UnknownSourceBackendError
+    );
+  });
+
+  it('rejects a packaged-only backend for the source role', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store);
+    const view = await registry.register('ws1', {
+      name: 'out-only',
+      role: 'packaged',
+      bucket: 'b',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    await expect(registry.resolveSourceCredentials('ws1', view.id)).rejects.toBeInstanceOf(
+      UnknownSourceBackendError
+    );
   });
 });
 
