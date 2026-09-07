@@ -673,6 +673,23 @@ export class DeleteProtectedError extends Error {
   }
 }
 
+// Raised when a delete is blocked because an IN-FLIGHT (running/pending/queued)
+// job still references the asset (issue #569, ADR-020 decision 1) -> 409. The
+// route maps this to the shared `delete_blocked` envelope with
+// `reason: 'referenced_by_job'` and the referencing job ids in
+// `blockedBy.jobIds`. An active reference is a HARD block: `?force=true` does
+// NOT override it (ADR-020 decision 2 — force is only honoured for settled jobs,
+// which are never detected here).
+export class ReferencedByJobError extends Error {
+  readonly statusCode = 409;
+  readonly jobIds: string[];
+  constructor(id: string, jobIds: string[]) {
+    super(`asset ${id} is referenced by ${jobIds.length} in-flight job(s)`);
+    this.name = 'ReferencedByJobError';
+    this.jobIds = jobIds;
+  }
+}
+
 export const DEFAULT_LIMIT = 50;
 export const MAX_LIMIT = 200;
 

@@ -118,6 +118,9 @@ export class PerWorkspaceJobRepository implements JobRepository {
   async list(opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
     return (await this.repo()).list(opts);
   }
+  async findActiveByAssetId(assetId: string): Promise<Job[]> {
+    return (await this.repo()).findActiveByAssetId(assetId);
+  }
   async update(id: string, patch: UpdateJobInput): Promise<Job | undefined> {
     return (await this.repo()).update(id, patch);
   }
