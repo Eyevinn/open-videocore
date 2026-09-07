@@ -16,7 +16,19 @@ import {
 import { provisionRouter } from './routes/provision.js';
 import { optionalServicesRouter } from './routes/optional-services.js';
 import { OperationStore } from './services/operation-store.js';
-import { ensureParameterStore, paramStoreFromEnv, type StackConfig } from './services/param-store.js';
+import {
+  ensureParameterStore,
+  paramStoreFromEnv,
+  configKvStoreFromEnv,
+  type StackConfig
+} from './services/param-store.js';
+import { saveSecret } from '@osaas/client-core';
+import {
+  StorageBackendRegistry,
+  ParamStoreBackendRecordStore,
+  InMemoryBackendRecordStore,
+  type SecretStore
+} from './services/storage-backend-registry.js';
 import { PACKAGER_SERVICE_ID } from './services/stack.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
@@ -258,6 +270,31 @@ if (!paramStore) {
     log: app.log
   });
 }
+
+// External storage-backend registry (issue #547, ADR-017). Persists NON-SECRET
+// registration records to the config service (or an in-memory fallback when the
+// param store is unconfigured), and fans the access key + secret out to OSC
+// per-serviceId secrets via saveSecret (ADR-017 D1). The SecretStore wraps the
+// verified saveSecret(serviceId, name, value, osc) calling convention
+// (provision.ts:591); when it is present the /backends POST route can honour the
+// credential contract, otherwise it responds 501.
+const backendKvStore = await configKvStoreFromEnv(
+  {
+    getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
+    getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat)
+  },
+  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc')
+);
+const backendRecordStore = backendKvStore
+  ? new ParamStoreBackendRecordStore(backendKvStore)
+  : new InMemoryBackendRecordStore();
+const backendSecretStore: SecretStore = {
+  saveSecret: (serviceId, name, value) => saveSecret(serviceId, name, value, oscContext)
+};
+const storageBackendRegistry = new StorageBackendRegistry(
+  backendRecordStore,
+  backendSecretStore
+);
 
 // Per-workspace backing-service resolver (replaces the global singleton
 // connection config). Each request's connections are resolved at request time
@@ -1482,7 +1519,12 @@ await app.register(collectionsRouter, {
 // Lets an operator browse and prune the objects stored in the workspace's
 // source + packaged buckets. Resolves storage from the request's stack at
 // request time and degrades to 501 when no object storage is configured.
-await app.register(storageRouter, { prefix: '/api/v1/storage', stackResolver, watchFolder });
+await app.register(storageRouter, {
+  prefix: '/api/v1/storage',
+  stackResolver,
+  watchFolder,
+  storageBackendRegistry
+});
 
 // Static file serving for the web UI (issue #frontend). Files are served from
 // the public/ directory at the /ui/ prefix. The directory is intentionally

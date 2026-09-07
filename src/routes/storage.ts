@@ -23,6 +23,11 @@ import type { BucketItem } from 'minio';
 import { z } from 'zod';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
 import type { WatchFolderService } from '../pipeline/watch-folder.js';
+import {
+  DefaultBackendNotDeletableError,
+  type StorageBackendRegistry
+} from '../services/storage-backend-registry.js';
+import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 
 // Hard cap on objects returned by a single listing call. Bounds the response
 // size regardless of how many objects a prefix holds.
@@ -34,6 +39,13 @@ export type StorageRouterOptions = {
   // MinIO is not configured or WATCH_FOLDER_ENABLED is not 'true'; the
   // per-bucket watch-folder routes then report enabled:false / respond 501.
   watchFolder?: WatchFolderService;
+  // External storage-backend registry (issue #547, ADR-017). When present, the
+  // /backends routes register/list/remove external S3-compatible buckets:
+  // non-secret coordinates persist to the parameter store and the access key +
+  // secret go to OSC per-serviceId secrets (ADR-017 D1). When absent (no
+  // registry wired) the /backends routes respond 501, mirroring the /buckets
+  // routes' degradation when object storage is unconfigured.
+  storageBackendRegistry?: StorageBackendRegistry;
 };
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -70,6 +82,58 @@ const watchFolderBucketSchema = z.object({
   bucket: z.string()
 });
 
+// --- External storage-backend registration (issue #547, ADR-017) ---
+
+// Registration request. Captures the minimum the issue requires: endpoint URL,
+// region (where applicable), access key, secret key, bucket name — plus an
+// operator-facing name and the role(s) the backend serves. Mirrors the shipped
+// externalStorageSchema (routes/provision.ts:65-78): secretAccessKey /
+// sessionToken are SECRET (validated here, NEVER echoed, NEVER stored in the
+// document/param store — they go to OSC secrets). endpointUrl is optional for
+// AWS-native S3 and required-shaped for other S3-compatible stores; region is
+// optional (where applicable).
+const registerBackendSchema = z.object({
+  name: z.string().min(1).max(256),
+  role: z.enum(['source', 'packaged', 'both']).default('both'),
+  bucket: z.string().min(1),
+  accessKeyId: z.string().min(1),
+  secretAccessKey: z.string().min(1),
+  region: z.string().min(1).optional(),
+  endpointUrl: z.string().url().optional(),
+  sessionToken: z.string().min(1).optional(),
+  publicBaseUrl: z.string().url().optional()
+});
+
+// The redacted API view of a registered backend. The secret is NEVER present:
+// `credentials.secretAccessKey` is always the fixed redaction marker, and
+// `sessionToken` (when a token is registered) is the same marker. `accessKeyId`
+// is non-secret and echoed so an operator can identify the credential. `default`
+// (id 'default') is the implicit OSC-managed backend and is not deletable.
+const redactedMarker = z.literal('***redacted***');
+const backendViewSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  role: z.enum(['source', 'packaged', 'both']),
+  backend: z.literal('external'),
+  bucket: z.string(),
+  accessKeyId: z.string(),
+  endpointUrl: z.string().optional(),
+  region: z.string().optional(),
+  publicBaseUrl: z.string().optional(),
+  hasSessionToken: z.boolean(),
+  deletable: z.boolean(),
+  createdAt: z.string(),
+  credentials: z.object({
+    accessKeyId: z.string(),
+    secretAccessKey: redactedMarker,
+    sessionToken: redactedMarker.optional()
+  })
+});
+
+const backendListSchema = z.object({
+  backends: z.array(backendViewSchema)
+});
+
 const objectSchema = z.object({
   key: z.string(),
   size: z.number(),
@@ -90,8 +154,101 @@ const listQuerySchema = z.object({
 
 export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { stackResolver, watchFolder } = opts;
+  const { stackResolver, watchFolder, storageBackendRegistry } = opts;
 
+  // The deployment's workspace (tenant) id under which backend records are
+  // namespaced. Matches deriveWorkspaceId / STACK_CONFIG_NAMESPACE
+  // (provision.ts:329-331, workspace-stack.ts:343) so registration and the
+  // per-stack storage slots agree on the tenant boundary (ADR-017 D2 + C5).
+  const workspaceId = STACK_CONFIG_NAMESPACE;
+
+  app.setErrorHandler((err, _request, reply) => {
+    // The OSC-managed default is not deletable (ADR-017 D3) -> 409.
+    if (err instanceof DefaultBackendNotDeletableError) {
+      return reply.code(409).send({ error: 'conflict', message: err.message });
+    }
+    throw err;
+  });
+
+  // Register an external S3-compatible storage backend (issue #547, ADR-017).
+  // Non-secret coordinates + the non-secret access key id persist to the
+  // parameter store; the secret access key (and optional session token) go to
+  // OSC per-serviceId secrets via saveSecret (ADR-017 D1). The response is
+  // ALWAYS redacted — the secret is never echoed back.
+  //   201 — { ...backend, credentials: { secretAccessKey: '***redacted***' } }
+  //   501 — registry / OSC secret storage not configured
+  app.post(
+    '/backends',
+    {
+      schema: {
+        body: registerBackendSchema,
+        response: { 201: backendViewSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      if (!storageBackendRegistry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+      // Without a secret sink we cannot honour the ADR-017 credential contract;
+      // refuse rather than silently drop the access key + secret.
+      if (!storageBackendRegistry.canStoreSecrets) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'OSC secret storage is not configured; cannot store backend credentials'
+        });
+      }
+      const view = await storageBackendRegistry.register(workspaceId, request.body);
+      return reply.code(201).send(view);
+    }
+  );
+
+  // List every registered backend (redacted) plus the implicit OSC-managed
+  // default (ADR-017 D3), which always appears and is marked non-deletable.
+  //   200 — { backends: [ ...redacted views ] }
+  //   501 — registry not configured
+  app.get(
+    '/backends',
+    { schema: { response: { 200: backendListSchema, 501: errorSchema } } },
+    async (_request, reply) => {
+      if (!storageBackendRegistry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+      const backends = await storageBackendRegistry.list(workspaceId);
+      return reply.code(200).send({ backends });
+    }
+  );
+
+  // Remove a registered backend by id. The implicit OSC-managed default (id
+  // 'default') is NOT deletable (ADR-017 D3) -> 409. Removing an unknown id is an
+  // idempotent no-op (mirrors collections DELETE) that still answers 204.
+  //   204 — removed (or already absent)
+  //   409 — attempt to remove the OSC-managed default
+  //   501 — registry not configured
+  app.delete(
+    '/backends/:id',
+    {
+      schema: {
+        params: z.object({ id: z.string().min(1).max(256) }),
+        response: { 204: z.null(), 409: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      if (!storageBackendRegistry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+      await storageBackendRegistry.remove(workspaceId, request.params.id);
+      return reply.code(204).send(null);
+    }
+  );
 
   // List the two configured buckets for the caller's workspace.
   //   200 — [{ name, role }, ...]
