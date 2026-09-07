@@ -102,6 +102,7 @@ import {
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
+import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
   deliveryMode,
   manifestUrlsForLocation,
@@ -1504,20 +1505,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         reply.code(501).send({ error: 'not_configured', message: 'packaging is not configured' });
         return undefined;
       }
-      if (!asset.objectKey) {
-        reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
+    }
+    // Unified source-object resolution (issue #612): every first step below
+    // consumes the asset's source object, so gate them all through the ONE
+    // shared resolver. A source-less asset now fails identically here and in the
+    // single-operation routes (POST /:id/{transcode,package,thumbnails,clip,
+    // export,extract-metadata}) — a consistent 409 no_object.
+    if (
+      firstStep === 'transcode' ||
+      firstStep === 'package' ||
+      firstStep === 'extract-metadata' ||
+      firstStep === 'thumbnail' ||
+      firstStep === 'subtitles' ||
+      firstStep === 'scene-detect'
+    ) {
+      if (!requireSourceObject(asset, reply)) {
         return undefined;
       }
-    }
-    if (
-      (firstStep === 'extract-metadata' ||
-        firstStep === 'thumbnail' ||
-        firstStep === 'subtitles' ||
-        firstStep === 'scene-detect') &&
-      !asset.objectKey
-    ) {
-      reply.code(409).send({ error: 'no_object', message: 'asset has no stored object to process' });
-      return undefined;
     }
 
     void firstStep; // pre-flight above used firstStep; execution drives the loop
@@ -1596,6 +1600,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     const now = () => new Date().toISOString();
     const stepsCopy: StepExecution[] = execution.steps.map((s) => ({ ...s }));
 
+    // Unified source-object resolution (issue #612): every source-consuming step
+    // below reads the SAME resolved location. Pre-flight above already 409'd a
+    // source-less asset whose first step needs the source; resolving once here
+    // means the loop can never diverge from the single-operation routes.
+    const resolvedSource = tryResolveSourceObject(asset);
+    const sourceObjectKey = resolvedSource?.objectKey ?? '';
+
     // Execute steps synchronously until we hit an asynchronous step (transcode/
     // package) which completes via an OSC callback, or run out of steps. The
     // fire-and-forget steps (extract-metadata, thumbnail) settle immediately.
@@ -1603,12 +1614,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       for (let i = 0; i < stepsCopy.length; i++) {
         const step = stepsCopy[i];
         if (step.name === 'extract-metadata') {
-          triggerExtraction(asset.id, asset.objectKey as string);
+          triggerExtraction(asset.id, sourceObjectKey);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
         if (step.name === 'thumbnail') {
-          triggerThumbnail(asset.id, asset.objectKey as string, request);
+          triggerThumbnail(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -1617,7 +1628,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // gracefully when unconfigured) and settle the step immediately. The
           // generator records its own success/failure on the asset and never
           // throws into this loop, so the step never fails the pipeline.
-          triggerSubtitles(asset.id, asset.objectKey as string, request);
+          triggerSubtitles(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -1626,7 +1637,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // skip gracefully when unconfigured) and settle the step immediately. The
           // detector records its own success/failure on the asset and never throws
           // into this loop, so the step never fails the pipeline.
-          triggerSceneDetect(asset.id, asset.objectKey as string, request);
+          triggerSceneDetect(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           continue;
         }
@@ -1635,7 +1646,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             {
               workspaceId: DEPLOYMENT_CONTEXT,
               sourceAssetId: asset.id,
-              sourceObjectKey: asset.objectKey as string,
+              sourceObjectKey,
               sourceBucket: opts.sourceBucket as string,
               outputBucket: opts.outputBucket as string,
               preset: encodeOpts?.profile,
@@ -2668,12 +2679,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to extract metadata from'
-        });
-      }
+      // Unified source-object resolution (issue #612): every source-consuming
+      // operation resolves the source through this ONE code path so a missing
+      // source fails identically (409 no_object) everywhere.
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.probe || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -2685,14 +2695,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset recovered to `ready`.
       const wedged = asset.status === 'processing' && asset.technicalMetadataError !== undefined;
       if (wedged) {
-        await runExtractionSync(asset.id, asset.objectKey);
+        await runExtractionSync(asset.id, source.objectKey);
         const settled = await repo.get(asset.id);
         return reply.code(200).send({
           assetId: asset.id,
           status: settled?.status ?? asset.status
         });
       }
-      triggerExtraction(asset.id, asset.objectKey);
+      triggerExtraction(asset.id, source.objectKey);
       return reply.code(202).send({ assetId: asset.id, status: 'extracting' });
     }
   );
@@ -2730,12 +2740,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to transcode'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.encore || !opts.sourceBucket || !opts.outputBucket) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -2922,7 +2929,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             workspaceId: DEPLOYMENT_CONTEXT,
             sourceAssetId: asset.id,
-            sourceObjectKey: asset.objectKey,
+            sourceObjectKey: source.objectKey,
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
@@ -3229,12 +3236,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to extract thumbnails from'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.thumbnailExtractor || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -3254,7 +3258,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const thumbnails = await thumbnailRunner(
           {
             assetId: asset.id,
-            objectKey: asset.objectKey,
+            objectKey: source.objectKey,
             timecodes: request.body.timecodes
           },
           {
@@ -3305,12 +3309,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to re-wrap'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.rewrapRunner || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -3334,7 +3335,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const child = await rewrapRunner(
           {
             sourceAssetId: asset.id,
-            objectKey: asset.objectKey,
+            objectKey: source.objectKey,
             targetFormat: request.body.targetFormat,
             outputName: request.body.outputName,
             asVersion: request.body.asVersion
@@ -3375,12 +3376,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (!asset.objectKey) {
-        return reply.code(409).send({
-          error: 'no_object',
-          message: 'asset has no stored object to clip'
-        });
-      }
+      // Unified source-object resolution (issue #612).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
       if (!opts.clipRunner || !storageFor) {
         return reply.code(501).send({
           error: 'not_configured',
@@ -3391,7 +3389,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const child = await clipRunnerOrchestrator(
           {
             sourceAssetId: asset.id,
-            objectKey: asset.objectKey,
+            objectKey: source.objectKey,
             startSeconds: request.body.startSeconds,
             endSeconds: request.body.endSeconds,
             outputName: request.body.outputName,
