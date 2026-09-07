@@ -35,6 +35,11 @@ export class CouchCollectionRepository implements CollectionRepository {
       id: localId,
       name: input.name,
       assetIds: [],
+      // Descriptive metadata (issue #559). Optional/additive — omitted keys stay
+      // undefined so a collection created with just { name } is unchanged.
+      description: input.description,
+      tags: input.tags,
+      custom: input.custom,
       createdAt: now,
       updatedAt: now
     };
@@ -119,7 +124,7 @@ export class CouchCollectionRepository implements CollectionRepository {
 }
 
 function toDoc(collection: Collection): Record<string, unknown> {
-  return {
+  const doc: Record<string, unknown> = {
     resourceType: RESOURCE_TYPE,
     localId: collection.id,
     name: collection.name,
@@ -130,13 +135,27 @@ function toDoc(collection: Collection): Record<string, unknown> {
     // present, so pre-#568 collections round-trip with the field absent.
     ...(collection.deleteLock ? { deleteLock: collection.deleteLock } : {})
   };
+  // Descriptive metadata (issue #559), mirroring the asset `descriptive`
+  // namespace (ADR-005 typed-core + open-`custom`). Only persisted when set so
+  // collections created without them round-trip with the fields absent
+  // (back-compat) — no on-disk shape change for legacy documents.
+  if (collection.description !== undefined) {
+    doc['description'] = collection.description;
+  }
+  if (collection.tags !== undefined) {
+    doc['tags'] = collection.tags;
+  }
+  if (collection.custom !== undefined) {
+    doc['custom'] = collection.custom;
+  }
+  return doc;
 }
 
 function fromDoc(doc: StoredDoc): Collection {
   // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent maps to
   // undefined so pre-#568 collections read as unlocked.
   const deleteLock = doc['deleteLock'] as DeleteLock | undefined;
-  return {
+  const collection: Collection = {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
     name: String(doc['name'] ?? ''),
     assetIds: (doc['assetIds'] as string[] | undefined) ?? [],
@@ -144,6 +163,18 @@ function fromDoc(doc: StoredDoc): Collection {
     updatedAt: String(doc['updatedAt'] ?? ''),
     ...(deleteLock ? { deleteLock } : {})
   };
+  // Descriptive metadata (issue #559). Absent fields map back to undefined so
+  // pre-#559 documents stay clean (fields simply not present on the resource).
+  if (doc['description'] !== undefined) {
+    collection.description = String(doc['description']);
+  }
+  if (doc['tags'] !== undefined) {
+    collection.tags = doc['tags'] as string[];
+  }
+  if (doc['custom'] !== undefined) {
+    collection.custom = doc['custom'] as Record<string, unknown>;
+  }
+  return collection;
 }
 
 function stripPartition(id: string): string {

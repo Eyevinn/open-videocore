@@ -1662,6 +1662,104 @@
                       ],
                       "additionalProperties": false
                     },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -2089,6 +2187,104 @@
                               "lockedAt"
                             ],
                             "additionalProperties": false
+                          },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
                           },
                           "parentId": {
                             "type": "string"
@@ -2653,6 +2849,104 @@
                             ],
                             "additionalProperties": false
                           },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
+                          },
                           "parentId": {
                             "type": "string"
                           },
@@ -3066,6 +3360,104 @@
                               "lockedAt"
                             ],
                             "additionalProperties": false
+                          },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
                           },
                           "parentId": {
                             "type": "string"
@@ -3541,6 +3933,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -4023,6 +4513,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -4590,6 +5178,104 @@
                               "lockedAt"
                             ],
                             "additionalProperties": false
+                          },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
                           },
                           "parentId": {
                             "type": "string"
@@ -7121,6 +7807,104 @@
                       ],
                       "additionalProperties": false
                     },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -7654,6 +8438,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -8192,6 +9074,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -9125,6 +10105,104 @@
                       ],
                       "additionalProperties": false
                     },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -9545,6 +10623,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -9982,6 +11158,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -10439,6 +11713,104 @@
                       ],
                       "additionalProperties": false
                     },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -10848,6 +12220,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -11260,6 +12730,104 @@
                         "lockedAt"
                       ],
                       "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -14853,6 +16421,19 @@
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "custom": {
+                    "type": "object",
+                    "additionalProperties": {}
                   }
                 },
                 "required": [
@@ -14882,6 +16463,19 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
                     },
                     "createdAt": {
                       "type": "string"
@@ -14974,6 +16568,19 @@
                               "type": "string"
                             }
                           },
+                          "description": {
+                            "type": "string"
+                          },
+                          "tags": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "custom": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -15056,6 +16663,19 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
                     },
                     "createdAt": {
                       "type": "string"
@@ -15291,6 +16911,19 @@
                         "type": "string"
                       }
                     },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -15386,6 +17019,19 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
                     },
                     "createdAt": {
                       "type": "string"
@@ -15492,6 +17138,19 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
                     },
                     "createdAt": {
                       "type": "string"
@@ -15619,6 +17278,19 @@
                         "type": "string"
                       }
                     },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -15661,6 +17333,396 @@
             }
           },
           "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/storage/backends": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "source",
+                      "packaged",
+                      "both"
+                    ],
+                    "default": "both"
+                  },
+                  "bucket": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "accessKeyId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "secretAccessKey": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "region": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "endpointUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "sessionToken": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "publicBaseUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "name",
+                  "bucket",
+                  "accessKeyId",
+                  "secretAccessKey"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "source",
+                        "packaged",
+                        "both"
+                      ]
+                    },
+                    "backend": {
+                      "type": "string",
+                      "enum": [
+                        "external"
+                      ]
+                    },
+                    "bucket": {
+                      "type": "string"
+                    },
+                    "accessKeyId": {
+                      "type": "string"
+                    },
+                    "endpointUrl": {
+                      "type": "string"
+                    },
+                    "region": {
+                      "type": "string"
+                    },
+                    "publicBaseUrl": {
+                      "type": "string"
+                    },
+                    "hasSessionToken": {
+                      "type": "boolean"
+                    },
+                    "deletable": {
+                      "type": "boolean"
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "credentials": {
+                      "type": "object",
+                      "properties": {
+                        "accessKeyId": {
+                          "type": "string"
+                        },
+                        "secretAccessKey": {
+                          "type": "string",
+                          "enum": [
+                            "***redacted***"
+                          ]
+                        },
+                        "sessionToken": {
+                          "type": "string",
+                          "enum": [
+                            "***redacted***"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "accessKeyId",
+                        "secretAccessKey"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "role",
+                    "backend",
+                    "bucket",
+                    "accessKeyId",
+                    "hasSessionToken",
+                    "deletable",
+                    "createdAt",
+                    "credentials"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "backends": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "type": "string",
+                            "enum": [
+                              "source",
+                              "packaged",
+                              "both"
+                            ]
+                          },
+                          "backend": {
+                            "type": "string",
+                            "enum": [
+                              "external"
+                            ]
+                          },
+                          "bucket": {
+                            "type": "string"
+                          },
+                          "accessKeyId": {
+                            "type": "string"
+                          },
+                          "endpointUrl": {
+                            "type": "string"
+                          },
+                          "region": {
+                            "type": "string"
+                          },
+                          "publicBaseUrl": {
+                            "type": "string"
+                          },
+                          "hasSessionToken": {
+                            "type": "boolean"
+                          },
+                          "deletable": {
+                            "type": "boolean"
+                          },
+                          "createdAt": {
+                            "type": "string"
+                          },
+                          "credentials": {
+                            "type": "object",
+                            "properties": {
+                              "accessKeyId": {
+                                "type": "string"
+                              },
+                              "secretAccessKey": {
+                                "type": "string",
+                                "enum": [
+                                  "***redacted***"
+                                ]
+                              },
+                              "sessionToken": {
+                                "type": "string",
+                                "enum": [
+                                  "***redacted***"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "accessKeyId",
+                              "secretAccessKey"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "role",
+                          "backend",
+                          "bucket",
+                          "accessKeyId",
+                          "hasSessionToken",
+                          "deletable",
+                          "createdAt",
+                          "credentials"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "backends"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/storage/backends/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "enum": [
+                    "null"
+                  ],
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
             "description": "Default Response",
             "content": {
               "application/json": {

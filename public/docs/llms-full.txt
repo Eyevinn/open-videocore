@@ -467,8 +467,17 @@ Response 200 (application/json)
         "reason": "string",
         "lockedBy": "string"
       },
-      "parentId": "string",
-      "versionOfAssetId": "string"
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
+      "parentId": "string"
     }
   ],
   "limit": 0,
@@ -518,8 +527,22 @@ Response 201 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -558,8 +581,17 @@ Response 200 (application/json)
         "reason": "string",
         "lockedBy": "string"
       },
-      "parentId": "string",
-      "versionOfAssetId": "string"
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
+      "parentId": "string"
     }
   ],
   "limit": 0,
@@ -626,8 +658,17 @@ Response 200 (application/json)
         "reason": "string",
         "lockedBy": "string"
       },
-      "parentId": "string",
-      "versionOfAssetId": "string"
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
+      "parentId": "string"
     }
   ]
 }
@@ -664,8 +705,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -714,8 +769,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -818,8 +887,22 @@ Response 201 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1053,8 +1136,22 @@ Response 201 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1149,8 +1246,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1184,8 +1295,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1225,8 +1350,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1392,8 +1531,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1435,8 +1588,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1537,8 +1704,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1575,8 +1756,22 @@ Response 200 (application/json)
     "reason": "string",
     "lockedBy": "string"
   },
-  "parentId": "string",
-  "versionOfAssetId": "string"
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
@@ -1798,8 +1993,17 @@ Response 200 (application/json)
         "reason": "string",
         "lockedBy": "string"
       },
-      "parentId": "string",
-      "versionOfAssetId": "string"
+      "storageTiering": {
+        "tiers": {
+          "source": null,
+          "renditions": null,
+          "packaged": null,
+          "subtitles": null,
+          "thumbnails": null
+        },
+        "rehydrating": []
+      },
+      "parentId": "string"
     }
   ]
 }
@@ -2372,6 +2576,11 @@ Response 200 (application/json)
       ],
       "createdAt": "string",
       "updatedAt": "string",
+      "description": "string",
+      "tags": [
+        "string"
+      ],
+      "custom": {},
       "deleteLock": {
         "locked": true,
         "lockedAt": "string",
@@ -2389,7 +2598,12 @@ Response 200 (application/json)
   Request
 Request body (application/json)
 {
-  "name": "string"
+  "name": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
 }
 
   Response
@@ -2402,6 +2616,11 @@ Response 201 (application/json)
   ],
   "createdAt": "string",
   "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
   "deleteLock": {
     "locked": true,
     "lockedAt": "string",
@@ -2431,6 +2650,11 @@ Response 200 (application/json)
   "assets": [
     {}
   ],
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
   "deleteLock": {
     "locked": true,
     "lockedAt": "string",
@@ -2470,6 +2694,11 @@ Response 200 (application/json)
   ],
   "createdAt": "string",
   "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
   "deleteLock": {
     "locked": true,
     "lockedAt": "string",
@@ -2497,6 +2726,11 @@ Response 200 (application/json)
   ],
   "createdAt": "string",
   "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
   "deleteLock": {
     "locked": true,
     "lockedAt": "string",
@@ -2528,6 +2762,11 @@ Response 200 (application/json)
   ],
   "createdAt": "string",
   "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
   "deleteLock": {
     "locked": true,
     "lockedAt": "string",
@@ -2552,6 +2791,11 @@ Response 200 (application/json)
   ],
   "createdAt": "string",
   "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
   "deleteLock": {
     "locked": true,
     "lockedAt": "string",
@@ -2569,6 +2813,80 @@ URL: https://videocore.pages.osaas.io/ref-storage.html
 Storage
 
     Object storage bucket and watch-folder management.
+
+  GET /api/v1/storage/backends
+
+  Response
+Response 200 (application/json)
+{
+  "backends": [
+    {
+      "id": "string",
+      "name": "string",
+      "role": "source",
+      "backend": "external",
+      "bucket": "string",
+      "accessKeyId": "string",
+      "hasSessionToken": true,
+      "deletable": true,
+      "createdAt": "string",
+      "credentials": {
+        "accessKeyId": "string",
+        "secretAccessKey": "***redacted***",
+        "sessionToken": "***redacted***"
+      },
+      "endpointUrl": "string",
+      "region": "string"
+    }
+  ]
+}
+
+  POST /api/v1/storage/backends
+
+  Request
+Request body (application/json)
+{
+  "name": "string",
+  "bucket": "string",
+  "accessKeyId": "string",
+  "secretAccessKey": "string",
+  "role": "source",
+  "region": "string",
+  "endpointUrl": "https://example.com/video.mp4",
+  "sessionToken": "string",
+  "publicBaseUrl": "https://example.com/video.mp4"
+}
+
+  Response
+Response 201 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "role": "source",
+  "backend": "external",
+  "bucket": "string",
+  "accessKeyId": "string",
+  "hasSessionToken": true,
+  "deletable": true,
+  "createdAt": "string",
+  "credentials": {
+    "accessKeyId": "string",
+    "secretAccessKey": "***redacted***",
+    "sessionToken": "***redacted***"
+  },
+  "endpointUrl": "string",
+  "region": "string"
+}
+
+  DELETE /api/v1/storage/backends/{id}
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 204 (application/json)
+"null"
 
   GET /api/v1/storage/buckets
 
@@ -2818,7 +3136,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (104 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (107 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -2848,7 +3166,7 @@ Webhooks3
 HTTP event notification registrations.
 Collections8
 Named groups for organising assets.
-Storage6
+Storage9
 Object storage bucket and watch-folder management.
 Admin3
 Watch-folder poller control.
@@ -3660,7 +3978,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 104 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 107 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.
