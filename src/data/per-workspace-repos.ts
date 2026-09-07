@@ -17,6 +17,8 @@ import type {
   AssetReviewState,
   CreateAssetInput,
   SetDeleteLockInput,
+  StorageByteClass,
+  StorageTier,
   UpdateAssetInput,
   ListOptions,
   ListResult,
@@ -89,6 +91,12 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   }
   async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined> {
     return (await this.repo()).setDeleteLock(id, input);
+  }
+  async setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined> {
+    return (await this.repo()).setStorageTier(id, overrides);
   }
   async countChildren(id: string): Promise<number> {
     return (await this.repo()).countChildren(id);
