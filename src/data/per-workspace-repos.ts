@@ -16,6 +16,7 @@ import type {
   AssetRepository,
   AssetReviewState,
   CreateAssetInput,
+  SetDeleteLockInput,
   UpdateAssetInput,
   ListOptions,
   ListResult,
@@ -85,6 +86,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   }
   async transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined> {
     return (await this.repo()).transitionReviewState(id, to);
+  }
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined> {
+    return (await this.repo()).setDeleteLock(id, input);
   }
   async countChildren(id: string): Promise<number> {
     return (await this.repo()).countChildren(id);
@@ -274,6 +278,9 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
   }
   async removeAsset(id: string, assetId: string): Promise<Collection> {
     return (await this.repo()).removeAsset(id, assetId);
+  }
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Collection> {
+    return (await this.repo()).setDeleteLock(id, input);
   }
   async delete(id: string): Promise<void> {
     return (await this.repo()).delete(id);

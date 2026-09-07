@@ -354,6 +354,17 @@ export type SubtitleTrack = {
   default?: boolean;
 };
 
+// Explicit delete-lock (ADR-020 decision 3, issue #568). Persisted in the
+// system-owned `administrative` namespace (asset-document.ts). Absent on the
+// flat Asset means unlocked. Field names/types match ADR-020 decision 3 exactly:
+//   locked, reason?, lockedAt, lockedBy?.
+export type DeleteLock = {
+  locked: boolean;
+  reason?: string;
+  lockedAt: string;
+  lockedBy?: string;
+};
+
 export type Asset = {
   id: string;
   name: string;
@@ -369,6 +380,14 @@ export type Asset = {
   // pre-existing assets/documents without it remain valid; absent is treated as
   // the initial state `draft` throughout (get/list/document round-trip).
   reviewState?: AssetReviewState;
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). When present and
+  // `locked === true` the asset is delete-protected: DELETE /:id (archive) is
+  // hard-blocked with 409 `delete_protected` until the lock is cleared, and
+  // `?force=true` does NOT override it. Set/cleared ONLY via the dedicated
+  // system path (PUT/DELETE /:id/lock) — never the editorial update path —
+  // because it lives in the system-owned `administrative` namespace. Optional:
+  // absent = unlocked, so pre-#568 assets remain valid on read/round-trip.
+  deleteLock?: DeleteLock;
   // Storage-tier state (ADR-019, issue #556): the physical byte-location axis
   // (`hot` | `archive`) per byte class, plus any in-flight rehydrate. INDEPENDENT
   // of `status` and `reviewState` (mirrors the `reviewState`-beside-`status`
@@ -641,6 +660,19 @@ export class HasChildrenError extends Error {
   }
 }
 
+// Raised when a delete is blocked by an explicit delete-lock (ADR-020 issue
+// #568) -> 409. The route maps this to the shared `delete_blocked` envelope with
+// `reason: 'delete_protected'` and empty `blockedBy` arrays (the block is
+// intrinsic to the document, not a foreign reference). `?force=true` does NOT
+// override it (ADR-020 decision 2: explicit lock is ALWAYS a hard block).
+export class DeleteProtectedError extends Error {
+  readonly statusCode = 409;
+  constructor(id: string) {
+    super(`asset ${id} is protected from deletion by an explicit lock`);
+    this.name = 'DeleteProtectedError';
+  }
+}
+
 export const DEFAULT_LIMIT = 50;
 export const MAX_LIMIT = 200;
 
@@ -682,6 +714,14 @@ export interface AssetRepository {
   // on an illegal move) and persists the new state. Returns the updated asset,
   // or undefined if the asset does not exist. INDEPENDENT of `status`.
   transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined>;
+  // Set or clear the explicit delete-lock (ADR-020 decision 3, issue #568). This
+  // is the DEDICATED system write path for the `administrative.deleteLock` flag —
+  // distinct from `update()` (the editorial path), which never touches the lock,
+  // so a user cannot clear their own protection editorially. `input.locked`
+  // true = protect, false = clear. Appends a `lock`/`unlock` provenance entry so
+  // the change is traceable (ADR-005 append-only administrative provenance).
+  // Returns the updated asset, or undefined when the id is unknown.
+  setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
   countChildren(id: string): Promise<number>;
   // Enumerate every asset in the version lineage of `id` (issue #118), oldest
@@ -747,6 +787,53 @@ export function initialHistory(now: string): StatusTransition[] {
 // Build the initial provenance log for a freshly created asset (issue #53).
 export function initialProvenance(now: string, method: AssetSourceMethod): ProvenanceEntry[] {
   return [{ at: now, by: 'user', op: 'create', detail: `source=${method}` }];
+}
+
+// Input to the dedicated delete-lock write path (ADR-020, issue #568).
+//   locked  — true to protect, false to clear.
+//   reason  — optional operator note (stored only when locking).
+//   lockedBy — optional provenance actor id (stored only when locking).
+export type SetDeleteLockInput = {
+  locked: boolean;
+  reason?: string;
+  lockedBy?: string;
+};
+
+// Pure computation of the delete-lock write (ADR-020 decision 3, issue #568):
+// given the current asset and the lock input, produce the next `deleteLock`
+// value and the provenance entry to append. NO side effects, so both repos can
+// reuse it and the couch repo can safely re-run it inside updateWithRetry.
+//   - locked=true  -> a fresh lock object { locked, reason?, lockedAt: now,
+//     lockedBy? } and a `lock` provenance entry.
+//   - locked=false -> deleteLock cleared (undefined) and an `unlock` entry.
+// The provenance actor is `user` (an explicit operator action, cf. the `restore`
+// entry which is also `by: 'user'`). ADR-005 append-only: history is never
+// rewritten.
+export function applyDeleteLock(
+  existing: Asset,
+  input: SetDeleteLockInput,
+  now: string
+): { deleteLock: DeleteLock | undefined; provenance: ProvenanceEntry[] } {
+  const provenance = existing.provenance ?? [];
+  if (input.locked) {
+    const lock: DeleteLock = {
+      locked: true,
+      reason: input.reason,
+      lockedAt: now,
+      lockedBy: input.lockedBy
+    };
+    return {
+      deleteLock: lock,
+      provenance: [
+        ...provenance,
+        { at: now, by: 'user', op: 'lock', detail: input.reason }
+      ]
+    };
+  }
+  return {
+    deleteLock: undefined,
+    provenance: [...provenance, { at: now, by: 'user', op: 'unlock' }]
+  };
 }
 
 // Derive the provenance entries a given patch produces (issue #53).
@@ -1189,6 +1276,26 @@ export class InMemoryAssetRepository implements AssetRepository {
     const applied = applyReviewState(existing.reviewState, to);
     const now = new Date().toISOString();
     const next: Asset = { ...existing, reviewState: applied.reviewState, updatedAt: now };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  // Dedicated delete-lock write path (ADR-020 decision 3, issue #568). Bypasses
+  // `update()` (the editorial path) so the system-owned lock is never settable
+  // through ordinary metadata edits. Appends a `lock`/`unlock` provenance entry.
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const applied = applyDeleteLock(existing, input, now);
+    const next: Asset = {
+      ...existing,
+      deleteLock: applied.deleteLock,
+      provenance: applied.provenance,
+      updatedAt: now
+    };
     this.store.set(id, next);
     return { ...next };
   }
