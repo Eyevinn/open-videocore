@@ -31,10 +31,21 @@ import type { Asset, AssetRepository } from '../data/asset-repo.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
+// Descriptive metadata (issue #559), mirroring the asset `descriptive`
+// namespace (ADR-005 typed-core + open-`custom`, see asset-document.ts) at a
+// smaller scale. All three are OPTIONAL so a collection created without them is
+// serialised exactly as before (fields absent):
+//   - description: free-form editorial string.
+//   - tags:        first-class string labels (z.array(z.string())).
+//   - custom:      open key/value bag (z.record(z.unknown())), matching the
+//                  asset descriptive `custom` shape.
 const collectionSchema = z.object({
   id: z.string(),
   name: z.string(),
   assetIds: z.array(z.string()),
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  custom: z.record(z.unknown()).optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -47,7 +58,13 @@ const collectionWithAssetsSchema = collectionSchema.extend({
 });
 
 const createBodySchema = z.object({
-  name: z.string().min(1).max(256)
+  name: z.string().min(1).max(256),
+  // Optional descriptive metadata accepted at create time (issue #559). Mirrors
+  // the asset `descriptive` namespace (typed-core + open-`custom`, ADR-005);
+  // all optional so `POST /collections { name }` is unchanged.
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  custom: z.record(z.unknown()).optional()
 });
 
 type CollectionsRouterOptions = {

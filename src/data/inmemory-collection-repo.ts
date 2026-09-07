@@ -26,17 +26,22 @@ export class InMemoryCollectionRepository implements CollectionRepository {
       id: localId,
       name: input.name,
       assetIds: [],
+      // Descriptive metadata (issue #559). Optional/additive — omitted keys stay
+      // undefined so a collection created with just { name } is unchanged.
+      description: input.description,
+      tags: input.tags,
+      custom: input.custom,
       createdAt: now,
       updatedAt: now
     };
     this.store.set(localId, collection);
-    return { ...collection, assetIds: [...collection.assetIds] };
+    return copy(collection);
   }
 
   async list(): Promise<Collection[]> {
     return [...this.store.values()]
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
-      .map((c) => ({ ...c, assetIds: [...c.assetIds] }));
+      .map(copy);
   }
 
   async get(id: string): Promise<Collection | undefined> {
@@ -44,7 +49,7 @@ export class InMemoryCollectionRepository implements CollectionRepository {
     if (!collection) {
       return undefined;
     }
-    return { ...collection, assetIds: [...collection.assetIds] };
+    return copy(collection);
   }
 
   async addAsset(id: string, assetId: string): Promise<Collection> {
@@ -74,6 +79,18 @@ export class InMemoryCollectionRepository implements CollectionRepository {
       updatedAt: new Date().toISOString()
     };
     this.store.set(key, updated);
-    return { ...updated, assetIds: [...updated.assetIds] };
+    return copy(updated);
   }
+}
+
+// Return a defensive copy of a stored collection so callers never mutate the
+// backing store in place. Arrays and the open `custom` bag (issue #559) are
+// shallow-copied alongside `assetIds`, matching the existing copy discipline.
+function copy(c: Collection): Collection {
+  return {
+    ...c,
+    assetIds: [...c.assetIds],
+    tags: c.tags ? [...c.tags] : undefined,
+    custom: c.custom ? { ...c.custom } : undefined
+  };
 }
