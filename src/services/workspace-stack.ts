@@ -181,9 +181,12 @@ function buildConnectionsFromStack(
 
   const assets = new CouchAssetRepository(wc);
   const jobs = new CouchJobRepository(wc);
-  const search = new CouchSearchRepository(wc);
-  const webhooks = new CouchWebhookRepository(wc);
   const collections = new CouchCollectionRepository(wc);
+  // Search projects both assets and collections (issue #561). The collection
+  // repo is passed so collection hits are reconstructed by the same
+  // authoritative mapping and surfaced distinctly from asset hits.
+  const search = new CouchSearchRepository(wc, collections);
+  const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
 
@@ -260,18 +263,20 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     const wc = () => new StackCouch(server, dbName);
     assets = new CouchAssetRepository(wc);
     jobs = new CouchJobRepository(wc);
-    search = new CouchSearchRepository(wc);
-    webhooks = new CouchWebhookRepository(wc);
     collections = new CouchCollectionRepository(wc);
+    // Search projects assets + collections (issue #561).
+    search = new CouchSearchRepository(wc, collections);
+    webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
     jobs = new InMemoryJobRepository();
-    search = new InMemorySearchRepository(mem);
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
+    // Search projects assets + collections (issue #561).
+    search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
   }
@@ -322,9 +327,10 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
 function buildInMemoryConnections(): WorkspaceConnections {
   const assets = new InMemoryAssetRepository();
   const jobs = new InMemoryJobRepository();
-  const search = new InMemorySearchRepository(assets);
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
+  // Search projects assets + collections (issue #561).
+  const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
   return {
