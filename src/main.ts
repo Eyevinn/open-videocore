@@ -38,6 +38,7 @@ import { searchRouter } from './routes/search.js';
 import { WebhookDispatcher } from './services/webhook-dispatcher.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { collectionsRouter } from './routes/collections.js';
+import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
@@ -49,6 +50,7 @@ import {
   PerWorkspaceSearchRepository,
   PerWorkspaceWebhookRepository,
   PerWorkspaceCollectionRepository,
+  PerWorkspaceAuditRepository,
   PerWorkspaceProfileRepository,
   PerWorkspaceAuditEmitter
 } from './data/per-workspace-repos.js';
@@ -477,6 +479,7 @@ const jobRepository = new PerWorkspaceJobRepository(stackResolver);
 const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
 const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver);
+const auditRepository = new PerWorkspaceAuditRepository(stackResolver);
 const profileRepository = new PerWorkspaceProfileRepository(stackResolver);
 // Best-effort audit emitter (issue #564). Resolves the active stack's audit
 // store per call; no-ops on the in-memory fallback. Wired into the asset,
@@ -1573,6 +1576,14 @@ await app.register(collectionsRouter, {
   assetRepository,
   // Best-effort audit emission for collection mutations (issue #564).
   audit: auditEmitter
+});
+
+// Audit read surface (issue #565). Read-only, queryable view over the
+// append-only audit log; behind the same presence gate as the rest of
+// /api/v1. Read-authorization is deferred to #525.
+await app.register(auditRouter, {
+  prefix: '/api/v1/audit',
+  repository: auditRepository
 });
 
 // Bucket / object-storage management. Workspace-scoped; behind `authenticate`.

@@ -45,6 +45,11 @@ import type {
   Collection
 } from './collection-repo.js';
 import type {
+  AuditRepository,
+  AuditQuery,
+  AuditQueryResult
+} from './audit-repo.js';
+import type {
   ProfileRepository,
   CreateProfileInput,
   Profile
@@ -309,6 +314,18 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
   }
   async delete(id: string): Promise<void> {
     return (await this.repo()).delete(id);
+  }
+}
+
+// Read-only audit query surface (issue #565). Resolves the stack's audit repo
+// at call time and delegates. Read-only: exposes only `query`, never a write.
+export class PerWorkspaceAuditRepository implements AuditRepository {
+  constructor(private readonly resolver: WorkspaceStackResolver) {}
+  private async repo(): Promise<AuditRepository> {
+    return (await this.resolver.resolve()).audit;
+  }
+  async query(query: AuditQuery): Promise<AuditQueryResult> {
+    return (await this.repo()).query(query);
   }
 }
 
