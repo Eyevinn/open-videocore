@@ -56,6 +56,20 @@ export type EncodeAttempt = {
 export const JOB_STATUSES = ['pending', 'queued', 'running', 'done', 'failed', 'cancelled'] as const;
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
+// The IN-FLIGHT (active) job statuses: a job that is still reading from or
+// writing to its referenced asset. Everything else (`done`, `failed`,
+// `cancelled`) is terminal/settled — the job merely records the asset (issue
+// #569, ADR-020 decision 2). Derived from JOB_STATUSES minus the terminal set
+// so it can never drift from the lifecycle: `pending`, `queued`, `running`.
+const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['done', 'failed', 'cancelled'];
+export const ACTIVE_JOB_STATUSES: readonly JobStatus[] = JOB_STATUSES.filter(
+  (s) => !TERMINAL_JOB_STATUSES.includes(s)
+);
+
+export function isActiveJobStatus(status: JobStatus): boolean {
+  return ACTIVE_JOB_STATUSES.includes(status);
+}
+
 // The kind of work a job performs. URL-pull ingest (issue #5) and ABR
 // transcoding (issue #8) share one repository + one observability endpoint
 // (GET /api/v1/jobs/:id), distinguished by `jobType`.
@@ -199,6 +213,14 @@ export interface JobRepository {
   create(input: CreateJobInput): Promise<Job>;
   get(id: string): Promise<Job | undefined>;
   list(opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }>;
+  // Find every IN-FLIGHT job that references the given asset as its source
+  // `assetId` (issue #569). "In-flight" is the non-terminal set
+  // (ACTIVE_JOB_STATUSES: pending/queued/running); settled jobs are excluded
+  // because they only record the asset and are safe to delete around
+  // (ADR-020 decision 2). Used by the asset DELETE handler to block deletion of
+  // an asset an active transcode/ingest job is still processing. Workspace-
+  // scoped like every other repo method, so it never leaks cross-tenant jobs.
+  findActiveByAssetId(assetId: string): Promise<Job[]>;
   update(id: string, patch: UpdateJobInput): Promise<Job | undefined>;
   // Locate a transcode job by Encore's job id. Used by the internal Encore
   // callback endpoint (issue #8): the callback listener is unauthenticated, so
@@ -398,6 +420,13 @@ export class InMemoryJobRepository implements JobRepository {
     const offset = opts?.offset ?? 0;
     const limit = opts?.limit ?? 50;
     return { items: all.slice(offset, offset + limit).map((j) => ({ ...j })), total: all.length };
+  }
+
+  async findActiveByAssetId(assetId: string): Promise<Job[]> {
+    return Array.from(this.store.values())
+      .filter((j) => j.assetId === assetId && isActiveJobStatus(j.status))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((j) => ({ ...j }));
   }
 
   async update(

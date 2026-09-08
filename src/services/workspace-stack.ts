@@ -26,6 +26,7 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { InMemorySearchRepository } from '../data/inmemory-search-repo.js';
@@ -96,9 +97,14 @@ export type WorkspaceConnections = {
   search: SearchRepository;
   webhooks: WebhookRepository;
   collections: CollectionRepository;
-  // Read-only audit query surface (issue #565). Backed by CouchAuditRepository
-  // in production and InMemoryAuditRepository on the in-memory/env paths.
-  audit: AuditRepository;
+  // Audit store for this stack. Backed by CouchAuditRepository in production and
+  // InMemoryAuditRepository on the in-memory/env paths, so it is always present.
+  // Exposes BOTH the read-only query surface (issue #565, consumed by
+  // PerWorkspaceAuditRepository.query) and the append-only `record()` write
+  // primitive (issue #564, consumed by PerWorkspaceAuditEmitter.record). Typed as
+  // the intersection so a single field serves both wrappers; both concrete repos
+  // satisfy it.
+  audit: AuditRepository & AuditEmitter;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   storageFor: StorageFactory | undefined;
@@ -189,12 +195,16 @@ function buildConnectionsFromStack(
 
   const assets = new CouchAssetRepository(wc);
   const jobs = new CouchJobRepository(wc);
-  const search = new CouchSearchRepository(wc);
-  const webhooks = new CouchWebhookRepository(wc);
   const collections = new CouchCollectionRepository(wc);
-  const audit = new CouchAuditRepository(wc);
+  // Search projects both assets and collections (issue #561). The collection
+  // repo is passed so collection hits are reconstructed by the same
+  // authoritative mapping and surfaced distinctly from asset hits.
+  const search = new CouchSearchRepository(wc, collections);
+  const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  // Audit store over the same per-stack CouchDB connection (issue #564).
+  const audit = new CouchAuditRepository(wc);
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -261,7 +271,10 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let search: SearchRepository;
   let webhooks: WebhookRepository;
   let collections: CollectionRepository;
-  let audit: AuditRepository;
+  // Audit store: always present (CouchAuditRepository on the couch env path,
+  // InMemoryAuditRepository otherwise). Exposes both the #565 query surface and
+  // the #564 record() write primitive.
+  let audit: AuditRepository & AuditEmitter;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
 
@@ -271,20 +284,22 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     const wc = () => new StackCouch(server, dbName);
     assets = new CouchAssetRepository(wc);
     jobs = new CouchJobRepository(wc);
-    search = new CouchSearchRepository(wc);
-    webhooks = new CouchWebhookRepository(wc);
     collections = new CouchCollectionRepository(wc);
-    audit = new CouchAuditRepository(wc);
+    // Search projects assets + collections (issue #561).
+    search = new CouchSearchRepository(wc, collections);
+    webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    audit = new CouchAuditRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
     jobs = new InMemoryJobRepository();
-    search = new InMemorySearchRepository(mem);
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
     audit = new InMemoryAuditRepository();
+    // Search projects assets + collections (issue #561).
+    search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
   }
@@ -335,10 +350,11 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
 function buildInMemoryConnections(): WorkspaceConnections {
   const assets = new InMemoryAssetRepository();
   const jobs = new InMemoryJobRepository();
-  const search = new InMemorySearchRepository(assets);
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
   const audit = new InMemoryAuditRepository();
+  // Search projects assets + collections (issue #561).
+  const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
   return {

@@ -180,6 +180,45 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "unsupported": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "field": {
+                            "type": "string"
+                          },
+                          "message": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "field",
+                          "message"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "unsupported"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       },
@@ -6420,6 +6459,45 @@
                   },
                   "required": [
                     "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "dependency_unreachable"
+                      ]
+                    },
+                    "dependency": {
+                      "type": "string",
+                      "enum": [
+                        "queue",
+                        "encore",
+                        "storage"
+                      ]
+                    },
+                    "endpoint": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "dependency",
+                    "endpoint",
+                    "message"
                   ],
                   "additionalProperties": false
                 }
@@ -14274,6 +14352,45 @@
                 }
               }
             }
+          },
+          "504": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "dependency_unreachable"
+                      ]
+                    },
+                    "dependency": {
+                      "type": "string",
+                      "enum": [
+                        "queue",
+                        "encore",
+                        "storage"
+                      ]
+                    },
+                    "endpoint": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "dependency",
+                    "endpoint",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
@@ -15874,11 +15991,11 @@
     },
     "/api/v1/search/": {
       "get": {
-        "summary": "Search assets",
+        "summary": "Search assets and collections",
         "tags": [
           "search"
         ],
-        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset in the workspace. Results are paginated via `page`/`pageSize` and returned as `{ assets, total, page }`.",
+        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`.",
         "parameters": [
           {
             "schema": {
@@ -16142,6 +16259,12 @@
                           },
                           "updatedAt": {
                             "type": "string"
+                          },
+                          "type": {
+                            "type": "string",
+                            "enum": [
+                              "asset"
+                            ]
                           }
                         },
                         "required": [
@@ -16149,6 +16272,54 @@
                           "name",
                           "status",
                           "statusHistory",
+                          "createdAt",
+                          "updatedAt",
+                          "type"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "collections": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "type": {
+                            "type": "string",
+                            "enum": [
+                              "collection"
+                            ]
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "tags": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "custom": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          },
+                          "createdAt": {
+                            "type": "string"
+                          },
+                          "updatedAt": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "id",
+                          "name",
                           "createdAt",
                           "updatedAt"
                         ],
@@ -16158,13 +16329,18 @@
                     "total": {
                       "type": "number"
                     },
+                    "collectionTotal": {
+                      "type": "number"
+                    },
                     "page": {
                       "type": "number"
                     }
                   },
                   "required": [
                     "assets",
+                    "collections",
                     "total",
+                    "collectionTotal",
                     "page"
                   ],
                   "additionalProperties": false
@@ -16720,6 +16896,163 @@
                     "createdAt",
                     "updatedAt",
                     "assets"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "custom": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "assetIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "assetIds",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -17588,7 +17921,8 @@
                     "enum": [
                       "source",
                       "packaged",
-                      "both"
+                      "both",
+                      "archive"
                     ],
                     "default": "both"
                   },
@@ -17651,7 +17985,8 @@
                       "enum": [
                         "source",
                         "packaged",
-                        "both"
+                        "both",
+                        "archive"
                       ]
                     },
                     "backend": {
@@ -17727,6 +18062,49 @@
               }
             }
           },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "backend_validation_failed"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "unreachable",
+                        "unauthorized",
+                        "bucket_not_found",
+                        "forbidden_list",
+                        "forbidden_write",
+                        "forbidden_read",
+                        "probe_cleanup_failed",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "reason",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "501": {
             "description": "Default Response",
             "content": {
@@ -17776,7 +18154,8 @@
                             "enum": [
                               "source",
                               "packaged",
-                              "both"
+                              "both",
+                              "archive"
                             ]
                           },
                           "backend": {

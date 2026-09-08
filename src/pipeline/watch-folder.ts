@@ -61,6 +61,61 @@ export function watchFolderEnabled(): boolean {
   return process.env['WATCH_FOLDER_ENABLED'] === 'true';
 }
 
+// The object-storage connection variable watch-folder ingest depends on. Named
+// as a constant so the fail-loud error message and the config check reference
+// the exact same symbol (no drift between the check and the message).
+export const WATCH_FOLDER_STORAGE_ENV_VAR = 'MINIO_URL';
+
+// The ingest method name surfaced in the fail-loud error (matches
+// AssetSourceMethod 'watch-folder' in data/asset-repo.ts).
+export const WATCH_FOLDER_INGEST_METHOD = 'watch-folder';
+
+// Outcome of validating watch-folder config at startup (issue #642). The three
+// cases are mutually exclusive:
+//   - 'disabled'      — WATCH_FOLDER_ENABLED is not 'true'; the feature is off
+//                       by design, so there is nothing to warn about.
+//   - 'misconfigured' — the operator turned the feature ON (WATCH_FOLDER_ENABLED
+//                       =true) but the required object-storage connection
+//                       variable is ABSENT. This is the silent-no-op trap: the
+//                       feature was requested but cannot run. The caller MUST
+//                       fail loud (log a clear, actionable error naming the
+//                       missing config + affected ingest method) rather than
+//                       silently doing nothing.
+//   - 'ready'         — enabled AND the storage variable is present, so the
+//                       service can be wired and started.
+export type WatchFolderConfigState = 'disabled' | 'misconfigured' | 'ready';
+
+// Classify watch-folder ingest config (issue #642). PURE + exported for unit
+// testing: takes the two inputs explicitly rather than reading the environment,
+// so a test can drive every branch deterministically.
+//   - enabled:        whether WATCH_FOLDER_ENABLED=true (see watchFolderEnabled).
+//   - storagePresent: whether the required object-storage connection is present
+//                     (MINIO_URL set OR a provisioned parameter store — the same
+//                     `storageAvailable` signal main.ts already computes).
+export function classifyWatchFolderConfig(
+  enabled: boolean,
+  storagePresent: boolean
+): WatchFolderConfigState {
+  if (!enabled) return 'disabled';
+  return storagePresent ? 'ready' : 'misconfigured';
+}
+
+// Build the clear, actionable error message for the misconfigured case (issue
+// #642). NAMES the missing configuration variable and the ingest method it
+// affects, per the acceptance criteria, so an operator can act without reading
+// source or guessing. Pure + exported so the message is asserted verbatim in a
+// test and reused by both the log line and any future status surface (#644).
+export function watchFolderMisconfiguredMessage(): string {
+  return (
+    `${WATCH_FOLDER_INGEST_METHOD} ingest is enabled ` +
+    `(WATCH_FOLDER_ENABLED=true) but the required object-storage connection ` +
+    `variable ${WATCH_FOLDER_STORAGE_ENV_VAR} is not set — ${WATCH_FOLDER_INGEST_METHOD} ` +
+    `ingest is UNAVAILABLE and will ingest nothing. Set ${WATCH_FOLDER_STORAGE_ENV_VAR} ` +
+    `to the object-storage endpoint, or unset WATCH_FOLDER_ENABLED to disable ` +
+    `${WATCH_FOLDER_INGEST_METHOD} ingest.`
+  );
+}
+
 // Object keys created by the direct-upload route live under `sources/...`
 // (see routes/asset-upload.sourceObjectKey). Those already have an asset
 // record, so the watch-folder ignores them to avoid duplicating assets for
