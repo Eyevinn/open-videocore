@@ -92,9 +92,33 @@ const assetSchema = z.object({
   updatedAt: z.string()
 });
 
+// A collection projected into the search surface (issue #561). Carries a
+// `type: 'collection'` discriminator so a client can tell collection hits apart
+// from asset hits (asset hits carry `type: 'asset'`), plus the descriptive
+// projection from issue #559 (description/tags/custom). Collections have no
+// technical or TAMS metadata, so only descriptive fields are surfaced.
+const collectionHitSchema = z.object({
+  type: z.literal('collection'),
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  custom: z.record(z.unknown()).optional(),
+  createdAt: z.string(),
+  updatedAt: z.string()
+});
+
 const searchResultSchema = z.object({
-  assets: z.array(assetSchema),
+  // Asset hits, each stamped with `type: 'asset'` so the discriminator is
+  // symmetric with collection hits (issue #561). The rest of the asset shape is
+  // unchanged, so existing clients that ignore `type` keep working.
+  assets: z.array(assetSchema.extend({ type: z.literal('asset') })),
+  // Collection hits, surfaced distinctly from asset hits (issue #561).
+  collections: z.array(collectionHitSchema),
+  // Count of matching ASSETS (unchanged pagination contract).
   total: z.number(),
+  // Count of matching COLLECTIONS (issue #561), reported separately from `total`.
+  collectionTotal: z.number(),
   page: z.number()
 });
 
@@ -181,14 +205,20 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
     {
       schema: {
         tags: ['search'],
-        summary: 'Search assets',
+        summary: 'Search assets and collections',
         description:
           'The single canonical search endpoint. Combines an exact-filter tier ' +
           '(`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a ' +
           'free-text tier (`q`, matched case-insensitively over name and description). ' +
-          'All filters are ANDed; omit them all to list every asset in the workspace. ' +
+          'All filters are ANDed; omit them all to list every asset and collection in ' +
+          'the workspace. Both assets AND collections are searched (issue #561): a ' +
+          "collection matches on its `name`/`description`/`tags` and its open `custom` " +
+          'bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, ' +
+          '`tamsTimerange`) never match a collection. Asset hits and collection hits ' +
+          'are returned in separate arrays and each carries a `type` discriminator ' +
+          "(`'asset'` | `'collection'`) so they are unambiguously distinguishable. " +
           'Results are paginated via `page`/`pageSize` and returned as ' +
-          '`{ assets, total, page }`.',
+          '`{ assets, collections, total, collectionTotal, page }`.',
         querystring: searchQuerySchema,
         response: { 200: searchResultSchema, 400: errorSchema }
       }
@@ -196,7 +226,7 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
     async (request) => {
       const { q, tags, mimeType, tamsFlowId, tamsTimerange, page, pageSize } = request.query;
       const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
-      return repo.search({
+      const result = await repo.search({
         q,
         tags,
         mimeType,
@@ -206,6 +236,13 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
         page,
         pageSize
       });
+      // Stamp the `type: 'asset'` discriminator on each asset hit so the shape is
+      // symmetric with collection hits (issue #561). Collection hits already
+      // carry `type: 'collection'` from the projection (toCollectionHit).
+      return {
+        ...result,
+        assets: result.assets.map((a) => ({ ...a, type: 'asset' as const }))
+      };
     }
   );
 };

@@ -20,7 +20,11 @@ import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import {
   WatchFolderService,
   parseObjectKey,
-  extractKeyFromNotification
+  extractKeyFromNotification,
+  classifyWatchFolderConfig,
+  watchFolderMisconfiguredMessage,
+  WATCH_FOLDER_STORAGE_ENV_VAR,
+  WATCH_FOLDER_INGEST_METHOD
 } from '../src/pipeline/watch-folder.js';
 import { adminRouter } from '../src/routes/admin.js';
 
@@ -45,33 +49,69 @@ function fakeClient(objects: string[], notifier?: EventEmitter & { stop?: () => 
 }
 
 describe('parseObjectKey', () => {
-  it('splits a namespaced key into workspaceId + localKey', () => {
-    expect(parseObjectKey('workspace-a/clips/video.mp4')).toEqual({
-      workspaceId: 'workspace-a',
+  it('returns the object key as the workspace-local key (OSC structural isolation)', () => {
+    // Since the workspaceId-prefix layer was removed (commit 0d65216 — "a stack
+    // is a workspace"), the full bucket key IS the local key.
+    expect(parseObjectKey('clips/video.mp4')).toEqual({
       localKey: 'clips/video.mp4'
     });
+    expect(parseObjectKey('video.mp4')).toEqual({ localKey: 'video.mp4' });
   });
 
-  it('rejects keys without a prefix, with a leading slash, or a trailing slash', () => {
-    expect(parseObjectKey('video.mp4')).toBeUndefined();
+  it('rejects an empty key, a leading slash, or a trailing slash (folder marker)', () => {
+    expect(parseObjectKey('')).toBeUndefined();
     expect(parseObjectKey('/video.mp4')).toBeUndefined();
-    expect(parseObjectKey('workspace-a/')).toBeUndefined();
-  });
-
-  it('rejects an invalid workspaceId', () => {
-    expect(parseObjectKey('bad ws/video.mp4')).toBeUndefined();
+    expect(parseObjectKey('folder/')).toBeUndefined();
   });
 });
 
 describe('extractKeyFromNotification', () => {
   it('reads the key from an S3 event record and decodes it', () => {
-    const record = { s3: { object: { key: 'workspace-a/my+clip.mp4' } } };
-    expect(extractKeyFromNotification(record)).toBe('workspace-a/my clip.mp4');
+    const record = { s3: { object: { key: 'my+clip.mp4' } } };
+    expect(extractKeyFromNotification(record)).toBe('my clip.mp4');
   });
 
   it('returns undefined for a malformed record', () => {
     expect(extractKeyFromNotification({})).toBeUndefined();
     expect(extractKeyFromNotification(null)).toBeUndefined();
+  });
+});
+
+// Fail-loud config validation (issue #642). When watch-folder ingest is enabled
+// but the required object-storage connection variable (MINIO_URL) is absent —
+// the exact Open Source Cloud scenario — the feature must NOT silently no-op:
+// classifyWatchFolderConfig reports 'misconfigured' and
+// watchFolderMisconfiguredMessage names the missing config + affected ingest
+// method so main.ts can log a clear, actionable error.
+describe('classifyWatchFolderConfig (issue #642 fail-loud)', () => {
+  it('is disabled when the feature flag is off, regardless of storage', () => {
+    expect(classifyWatchFolderConfig(false, false)).toBe('disabled');
+    expect(classifyWatchFolderConfig(false, true)).toBe('disabled');
+  });
+
+  it('is misconfigured when enabled but the storage variable is absent', () => {
+    // This is the silent-no-op trap: the operator asked for the feature but the
+    // object-storage endpoint it depends on is not set.
+    expect(classifyWatchFolderConfig(true, false)).toBe('misconfigured');
+  });
+
+  it('is ready when enabled and storage is present', () => {
+    expect(classifyWatchFolderConfig(true, true)).toBe('ready');
+  });
+});
+
+describe('watchFolderMisconfiguredMessage (issue #642)', () => {
+  it('names the missing config variable and the affected ingest method', () => {
+    const msg = watchFolderMisconfiguredMessage();
+    // Acceptance criteria: the error names the missing configuration...
+    expect(msg).toContain(WATCH_FOLDER_STORAGE_ENV_VAR);
+    expect(WATCH_FOLDER_STORAGE_ENV_VAR).toBe('MINIO_URL');
+    // ...and the ingest method it affects.
+    expect(msg).toContain(WATCH_FOLDER_INGEST_METHOD);
+    expect(WATCH_FOLDER_INGEST_METHOD).toBe('watch-folder');
+    // It is actionable (tells the operator what to do), not a bare "disabled".
+    expect(msg).toMatch(/unavailable/i);
+    expect(msg).toContain('WATCH_FOLDER_ENABLED');
   });
 });
 
@@ -83,50 +123,50 @@ describe('WatchFolderService polling', () => {
   });
 
   it('detects a direct-drop object and creates a processing asset', async () => {
-    const stored: Array<[string, string, string]> = [];
+    const stored: Array<[string, string]> = [];
     const svc = new WatchFolderService({
-      client: fakeClient(['workspace-a/drop.mp4']),
+      client: fakeClient(['drop.mp4']),
       bucket: 'src',
       repository: repo,
       log: silentLog,
-      onObjectStored: (ws, id, key) => stored.push([ws, id, key]),
+      onObjectStored: (id, key) => stored.push([id, key]),
       setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
       clearIntervalFn: () => {}
     });
 
     await svc.poll();
 
-    const { items } = await repo.list('workspace-a');
+    const { items } = await repo.list();
     expect(items).toHaveLength(1);
     expect(items[0]?.name).toBe('drop.mp4');
     expect(items[0]?.objectKey).toBe('drop.mp4');
     expect(items[0]?.status).toBe('processing');
-    expect(stored).toEqual([['workspace-a', items[0]!.id, 'drop.mp4']]);
+    expect(stored).toEqual([[items[0]!.id, 'drop.mp4']]);
     expect(svc.processedCount()).toBe(1);
   });
 
   it('is idempotent: a second poll does not re-ingest', async () => {
     const svc = new WatchFolderService({
-      client: fakeClient(['workspace-a/drop.mp4']),
+      client: fakeClient(['drop.mp4']),
       bucket: 'src',
       repository: repo,
       log: silentLog
     });
     await svc.poll();
     await svc.poll();
-    const { items } = await repo.list('workspace-a');
+    const { items } = await repo.list();
     expect(items).toHaveLength(1);
   });
 
   it('ignores API-managed sources/ keys', async () => {
     const svc = new WatchFolderService({
-      client: fakeClient(['workspace-a/sources/asset-1']),
+      client: fakeClient(['sources/asset-1']),
       bucket: 'src',
       repository: repo,
       log: silentLog
     });
     await svc.poll();
-    const { items } = await repo.list('workspace-a');
+    const { items } = await repo.list();
     expect(items).toHaveLength(0);
     // It is still marked processed so it is not re-scanned each poll.
     expect(svc.processedCount()).toBe(1);
@@ -134,13 +174,13 @@ describe('WatchFolderService polling', () => {
 
   it('skips a bad object key without crashing', async () => {
     const svc = new WatchFolderService({
-      client: fakeClient(['no-prefix.mp4', 'workspace-a/good.mp4']),
+      client: fakeClient(['/bad-leading-slash.mp4', 'good.mp4']),
       bucket: 'src',
       repository: repo,
       log: silentLog
     });
     await svc.poll();
-    const { items } = await repo.list('workspace-a');
+    const { items } = await repo.list();
     expect(items).toHaveLength(1);
     expect(items[0]?.name).toBe('good.mp4');
   });
@@ -161,11 +201,11 @@ describe('WatchFolderService notifications', () => {
     });
 
     svc.start();
-    notifier.emit('notification', { s3: { object: { key: 'workspace-b/live.mp4' } } });
+    notifier.emit('notification', { s3: { object: { key: 'live.mp4' } } });
     // Allow the detached ingestKey microtask to settle.
     await new Promise((r) => setImmediate(r));
 
-    const { items } = await repo.list('workspace-b');
+    const { items } = await repo.list();
     expect(items).toHaveLength(1);
     expect(items[0]?.objectKey).toBe('live.mp4');
 
@@ -216,7 +256,7 @@ describe('GET /api/v1/admin/watch-folder/status', () => {
   it('reports enabled + running + processedCount when wired', async () => {
     const repo = new InMemoryAssetRepository();
     const svc = new WatchFolderService({
-      client: fakeClient(['workspace-a/drop.mp4']),
+      client: fakeClient(['drop.mp4']),
       bucket: 'src',
       repository: repo,
       log: silentLog,
