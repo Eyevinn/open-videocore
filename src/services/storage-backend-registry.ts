@@ -53,7 +53,18 @@ export const DEFAULT_BACKEND_ID = 'default' as const;
 // A role a registered backend may serve. Mirrors the two independent per-role
 // slots the data model already carries (StackConfig.storage.{source,packaged},
 // services/param-store.ts:83-92, ADR-017 D4). 'both' populates both slots.
-export type StorageBackendRole = 'source' | 'packaged' | 'both';
+//
+// 'archive' is the additive tiering role (ADR-019 D5 "the one additive change
+// tiering needs is a new role for the archive destination"): a cold destination
+// that is NOT a live source/packaged slot, so it gets its own role value rather
+// than overloading an existing one. It reuses the SAME ADR-017 credential + secret
+// fan-out machinery unchanged — an archive backend is just another registered,
+// externally-owned S3-compatible backend. Because the archived byte classes
+// (source, optionally renditions — ADR-019 D3) are READ by the same source-side
+// consumers when rehydrated/reprocessed (encore + eyevinn-ffmpeg-s3,
+// external-storage-credentials.ts:186-190), the archive secret fans out to those
+// two source-reader serviceIds (see mappingsForRole).
+export type StorageBackendRole = 'source' | 'packaged' | 'both' | 'archive';
 
 // The NON-SECRET registration record persisted to the parameter store. Carries
 // only coordinates and the NON-SECRET access key id — NO secretAccessKey, NO
@@ -192,7 +203,12 @@ function mappingsForRole(
   creds: ExternalStorageCredentials
 ): Array<{ serviceId: string; mapping: ServiceCredentialMapping }> {
   const out: Array<{ serviceId: string; mapping: ServiceCredentialMapping }> = [];
-  const wantSource = role === 'source' || role === 'both';
+  // The archive tier (ADR-019 D5) is a cold destination for source-side byte
+  // classes (source, optionally renditions — ADR-019 D3), READ by the same
+  // source-reader consumers on rehydrate/reprocess. So an 'archive' backend fans
+  // its secret out to the source-reader serviceIds exactly like 'source', reusing
+  // the same per-service mapping unchanged — no parallel credential model.
+  const wantSource = role === 'source' || role === 'both' || role === 'archive';
   const wantPackaged = role === 'packaged' || role === 'both';
   if (wantSource) {
     out.push({

@@ -30,12 +30,15 @@ import {
   type ListOptions,
   type ListResult,
   type SetDeleteLockInput,
+  type StorageByteClass,
+  type StorageTier,
   type UpdateAssetInput,
   applyDeleteLock,
   applyMetadata,
   applyRestore,
   applyReviewState,
   applyStatus,
+  applyStorageTier,
   clampLimit,
   generateUniqueSlug,
   initialHistory,
@@ -338,6 +341,40 @@ export class CouchAssetRepository implements AssetRepository {
         ...existing,
         deleteLock: applied.deleteLock,
         provenance: applied.provenance,
+        updatedAt: now
+      };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
+  // Dedicated storage-tier write path (ADR-019 D1/D3, issue #557). Distinct from
+  // update() (the editorial/pipeline path) so a byte-location flip never rides on
+  // an editorial write and — critically — never touches lifecycle
+  // `status`/`statusHistory` (the ADR-019 D6 tier/status firewall: a cold-tiered
+  // asset keeps a non-`archived` status and stays structurally invisible to the
+  // retention purge). Routed through updateWithRetry for the same conflict-retry
+  // safety as the other read-modify-write paths; applyStorageTier is pure so it
+  // re-runs safely per attempt. Only `storageTiering`/`updatedAt` change; the
+  // metadata document is otherwise untouched and searchable. Returns undefined
+  // when the id is unknown.
+  async setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const now = new Date().toISOString();
+      const next: Asset = {
+        ...existing,
+        storageTiering: applyStorageTier(existing.storageTiering, overrides),
         updatedAt: now
       };
       updated = next;

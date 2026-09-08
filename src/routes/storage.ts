@@ -115,7 +115,10 @@ const watchFolderBucketSchema = z.object({
 // optional (where applicable).
 const registerBackendSchema = z.object({
   name: z.string().min(1).max(256),
-  role: z.enum(['source', 'packaged', 'both']).default('both'),
+  // 'archive' is the ADR-019 D5 tiering role: a cold destination for relocated
+  // source-side bytes, registered through the SAME #547 machinery (no parallel
+  // registry) so its credentials use the identical per-serviceId secret model.
+  role: z.enum(['source', 'packaged', 'both', 'archive']).default('both'),
   bucket: z.string().min(1),
   accessKeyId: z.string().min(1),
   secretAccessKey: z.string().min(1),
@@ -134,7 +137,7 @@ const redactedMarker = z.literal('***redacted***');
 const backendViewSchema = z.object({
   id: z.string(),
   name: z.string(),
-  role: z.enum(['source', 'packaged', 'both']),
+  role: z.enum(['source', 'packaged', 'both', 'archive']),
   backend: z.literal('external'),
   bucket: z.string(),
   accessKeyId: z.string(),
