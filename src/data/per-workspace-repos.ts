@@ -40,6 +40,7 @@ import type {
 import type {
   CollectionRepository,
   CreateCollectionInput,
+  UpdateCollectionInput,
   Collection
 } from './collection-repo.js';
 import type {
@@ -280,6 +281,9 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
   }
   async get(id: string): Promise<Collection | undefined> {
     return (await this.repo()).get(id);
+  }
+  async update(id: string, patch: UpdateCollectionInput): Promise<Collection> {
+    return (await this.repo()).update(id, patch);
   }
   async addAsset(id: string, assetId: string): Promise<Collection> {
     return (await this.repo()).addAsset(id, assetId);
