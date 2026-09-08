@@ -296,6 +296,83 @@ describe('direct client-side upload (issue #4)', () => {
       ]);
     });
 
+    it('persists objectKey on the asset (issue #611)', async () => {
+      // Single-part presigned flow: presign a URL (client uploads directly to
+      // it) then signal completion. The object lives at sourceObjectKey(id);
+      // upload-complete must record that key on the asset so downstream
+      // operations can resolve the source.
+      const id = await createAsset(app);
+      await app.inject({ method: 'POST', url: `/api/v1/assets/${id}/upload-url`, headers: A });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${id}/upload-complete`,
+        headers: A
+      });
+      expect(res.statusCode).toBe(200);
+
+      const read = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
+      expect(read.json().objectKey).toBe(sourceObjectKey(id));
+    });
+
+    it('records objectKey identically to the multipart flow (issue #611)', async () => {
+      // Parity assertion: a single-part-finalized asset and a
+      // multipart-finalized asset must end up with the same objectKey.
+      const singleId = await createAsset(app);
+      await app.inject({ method: 'POST', url: `/api/v1/assets/${singleId}/upload-url`, headers: A });
+      await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${singleId}/upload-complete`,
+        headers: A
+      });
+
+      const multiId = await createAsset(app);
+      const initiate = await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${multiId}/multipart/initiate`,
+        headers: A
+      });
+      const uploadId = initiate.json().uploadId;
+      await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${multiId}/multipart/${uploadId}/complete`,
+        headers: A,
+        payload: { parts: [{ partNumber: 1, etag: 'etag-1' }] }
+      });
+
+      const single = await app.inject({ method: 'GET', url: `/api/v1/assets/${singleId}`, headers: A });
+      const multi = await app.inject({ method: 'GET', url: `/api/v1/assets/${multiId}`, headers: A });
+      expect(single.json().objectKey).toBe(sourceObjectKey(singleId));
+      expect(multi.json().objectKey).toBe(sourceObjectKey(multiId));
+      // Both derive the key from their own id via the same helper.
+      expect(single.json().objectKey.replace(singleId, '<id>')).toBe(
+        multi.json().objectKey.replace(multiId, '<id>')
+      );
+    });
+
+    it('lets transcode resolve the source (no 409 no_object) after single-part complete (issue #611)', async () => {
+      // Acceptance criterion: transcode on a single-part-uploaded asset no
+      // longer returns 409 no_object. This app wires no Encore, so a resolvable
+      // source yields 501 not_configured; the load-bearing check is that it is
+      // NOT the 409 no_object the empty objectKey used to produce.
+      const id = await createAsset(app);
+      await app.inject({ method: 'POST', url: `/api/v1/assets/${id}/upload-url`, headers: A });
+      await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${id}/upload-complete`,
+        headers: A
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${id}/transcode`,
+        headers: A,
+        payload: {}
+      });
+      expect(res.statusCode).not.toBe(409);
+      expect(res.json().error).not.toBe('no_object');
+    });
+
     it('returns 404 for an unknown asset', async () => {
       const res = await app.inject({
         method: 'POST',

@@ -49,7 +49,8 @@ import {
   PerWorkspaceSearchRepository,
   PerWorkspaceWebhookRepository,
   PerWorkspaceCollectionRepository,
-  PerWorkspaceProfileRepository
+  PerWorkspaceProfileRepository,
+  PerWorkspaceAuditEmitter
 } from './data/per-workspace-repos.js';
 import type { AssetRepository } from './data/asset-repo.js';
 import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
@@ -84,7 +85,12 @@ import {
   archivePurgeIntervalMsFromEnv
 } from './pipeline/archived-asset-purge-loop.js';
 import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
-import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
+import {
+  WatchFolderService,
+  watchFolderEnabled,
+  classifyWatchFolderConfig,
+  watchFolderMisconfiguredMessage
+} from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
@@ -292,9 +298,18 @@ const backendRecordStore = backendKvStore
 const backendSecretStore: SecretStore = {
   saveSecret: (serviceId, name, value) => saveSecret(serviceId, name, value, oscContext)
 };
+// Issue #550: run the registration-time reachability + permission probe before
+// persisting a backend, so a misconfigured endpoint / bad credentials /
+// insufficient permissions are caught at registration rather than at ingest or
+// job time. Enabled by default; set STORAGE_BACKEND_VALIDATE=false to opt out
+// (12-factor: config via env). The default probe-client factory reaches the
+// registered bucket directly via the minio client.
+const storageBackendValidateEnabled =
+  (process.env['STORAGE_BACKEND_VALIDATE'] ?? 'true').toLowerCase() !== 'false';
 const storageBackendRegistry = new StorageBackendRegistry(
   backendRecordStore,
-  backendSecretStore
+  backendSecretStore,
+  { enabled: storageBackendValidateEnabled }
 );
 
 // Per-workspace backing-service resolver (replaces the global singleton
@@ -472,6 +487,12 @@ const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
 const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver);
 const profileRepository = new PerWorkspaceProfileRepository(stackResolver);
+// Best-effort audit emitter (issue #564). Resolves the active stack's audit
+// store per call; no-ops on the in-memory fallback. Wired into the asset,
+// collection, and job (transcode/package) mutation paths so each meaningful
+// mutation emits exactly one audit entry — fire-and-forget (a failed write is
+// logged, never propagated).
+const auditEmitter = new PerWorkspaceAuditEmitter(stackResolver);
 
 // Synchronous, per-workspace object-storage factory (issue #4). Reads the
 // connections already warmed into the resolver cache by the global preHandler
@@ -962,7 +983,11 @@ function activateScaler(redisUrl: string): void {
   packaging = new PackagingService({
     assets: assetRepository,
     queue: makeOscPackagerQueue(redis, undefined, app.log),
-    publicBaseUrl: packagingPublicBaseUrl()
+    publicBaseUrl: packagingPublicBaseUrl(),
+    // Best-effort package-job audit emission (issue #564): submit + terminal
+    // (success/failure) callbacks each emit one entry, fire-and-forget.
+    audit: auditEmitter,
+    auditLog: app.log
   });
 
   // On-demand packager provisioning (epic #226, issue #244). The packager is no
@@ -1296,7 +1321,9 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // and for validating a named transcode profile so a GPU-only (NVENC/CUDA)
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
-  profileRepository
+  profileRepository,
+  // Best-effort audit emission for asset mutations (issue #564).
+  audit: auditEmitter
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -1356,7 +1383,9 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
     const conns = await stackResolver.resolve();
     if (!conns.storageClient) return undefined;
     return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
-  }
+  },
+  // Best-effort audit emission for the transcode terminal-state callback (#564).
+  audit: auditEmitter
 };
 await app.register(internalRouter, internalRouterOptions);
 
@@ -1414,8 +1443,25 @@ await app.register(assetUploadRouter, {
 // (single global MinIO). In the provisioned multi-stack model there is no single
 // bucket to watch, so the watch-folder is skipped (the API upload + URL-pull
 // paths still cover ingest).
+// Fail-loud config validation (issue #642). Previously, if an operator turned
+// the feature ON (WATCH_FOLDER_ENABLED=true) but the required object-storage
+// connection variable (MINIO_URL) was absent — the exact situation on Open
+// Source Cloud, where that variable is never set — `envMinioClient` was
+// undefined and `watchFolder` silently became undefined: no ingest, no error.
+// We now CLASSIFY the config and, when the feature is requested but its storage
+// dependency is missing, log a clear, actionable error naming the missing
+// variable and the affected ingest method rather than silently no-op'ing. We do
+// NOT provision the endpoint (that is #643) and do NOT change the status API
+// surface (that is #644) — scope here is fail-loud only.
+const watchFolderConfigState = classifyWatchFolderConfig(
+  watchFolderEnabled(),
+  storageAvailable
+);
+if (watchFolderConfigState === 'misconfigured') {
+  app.log.error({ ingestMethod: 'watch-folder' }, watchFolderMisconfiguredMessage());
+}
 const watchFolder =
-  envMinioClient && watchFolderEnabled()
+  watchFolderConfigState === 'ready' && envMinioClient
     ? new WatchFolderService({
         client: envMinioClient,
         bucket: sourceBucket,
@@ -1530,7 +1576,9 @@ await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: web
 await app.register(collectionsRouter, {
   prefix: '/api/v1/collections',
   repository: collectionRepository,
-  assetRepository
+  assetRepository,
+  // Best-effort audit emission for collection mutations (issue #564).
+  audit: auditEmitter
 });
 
 // Bucket / object-storage management. Workspace-scoped; behind `authenticate`.

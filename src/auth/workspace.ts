@@ -18,6 +18,18 @@
 // nothing to scope. We only require a bearer token to be present so a deployment
 // accidentally exposed without the wall (or an off-OSC deployment behind an
 // equivalent proxy) rejects anonymous traffic rather than serving it.
+//
+// SECURITY BOUNDARY: requireAuth() is a pure presence gate — it passes ANY
+// non-empty bearer string without inspecting it. It therefore provides NO
+// protection against a missing, bypassed, or misconfigured auth wall: an
+// attacker who reaches the process directly can send any placeholder token and
+// pass. It is NOT a fallback or safety net for a wall-bypass scenario, and NOT a
+// substitute for the wall on an off-OSC deployment. The sole security boundary
+// for inbound authentication is the OSC auth wall (or, off-OSC, an equivalent
+// upstream proxy that authenticates the caller before the request reaches this
+// process). The authoritative auth-isolation decision is recorded in issue #59.
+// The presence check exists only to reject accidental anonymous traffic in the
+// normal behind-the-wall case, not to authenticate anyone.
 
 export class AuthError extends Error {
   constructor(message: string) {

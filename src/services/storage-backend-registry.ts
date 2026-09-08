@@ -37,6 +37,12 @@ import {
   type ServiceCredentialMapping
 } from './external-storage-credentials.js';
 import type { ConfigKvStore } from './param-store.js';
+import {
+  validateExternalBackend,
+  type ExternalBackendValidationResult,
+  type ProbeClientFactory,
+  type ValidationFailureReason
+} from './external-backend-validation.js';
 
 // The id of the implicit, OSC-managed default backend. It is not a stored
 // registration record — it is synthesised on list so the default always appears
@@ -47,7 +53,18 @@ export const DEFAULT_BACKEND_ID = 'default' as const;
 // A role a registered backend may serve. Mirrors the two independent per-role
 // slots the data model already carries (StackConfig.storage.{source,packaged},
 // services/param-store.ts:83-92, ADR-017 D4). 'both' populates both slots.
-export type StorageBackendRole = 'source' | 'packaged' | 'both';
+//
+// 'archive' is the additive tiering role (ADR-019 D5 "the one additive change
+// tiering needs is a new role for the archive destination"): a cold destination
+// that is NOT a live source/packaged slot, so it gets its own role value rather
+// than overloading an existing one. It reuses the SAME ADR-017 credential + secret
+// fan-out machinery unchanged — an archive backend is just another registered,
+// externally-owned S3-compatible backend. Because the archived byte classes
+// (source, optionally renditions — ADR-019 D3) are READ by the same source-side
+// consumers when rehydrated/reprocessed (encore + eyevinn-ffmpeg-s3,
+// external-storage-credentials.ts:186-190), the archive secret fans out to those
+// two source-reader serviceIds (see mappingsForRole).
+export type StorageBackendRole = 'source' | 'packaged' | 'both' | 'archive';
 
 // The NON-SECRET registration record persisted to the parameter store. Carries
 // only coordinates and the NON-SECRET access key id — NO secretAccessKey, NO
@@ -186,7 +203,12 @@ function mappingsForRole(
   creds: ExternalStorageCredentials
 ): Array<{ serviceId: string; mapping: ServiceCredentialMapping }> {
   const out: Array<{ serviceId: string; mapping: ServiceCredentialMapping }> = [];
-  const wantSource = role === 'source' || role === 'both';
+  // The archive tier (ADR-019 D5) is a cold destination for source-side byte
+  // classes (source, optionally renditions — ADR-019 D3), READ by the same
+  // source-reader consumers on rehydrate/reprocess. So an 'archive' backend fans
+  // its secret out to the source-reader serviceIds exactly like 'source', reusing
+  // the same per-service mapping unchanged — no parallel credential model.
+  const wantSource = role === 'source' || role === 'both' || role === 'archive';
   const wantPackaged = role === 'packaged' || role === 'both';
   if (wantSource) {
     out.push({
@@ -335,21 +357,82 @@ export class DefaultBackendNotDeletableError extends Error {
   }
 }
 
+// Thrown when registration-time validation (issue #550) rejects a backend as
+// unreachable or unauthorized. Carries the machine-readable reason + the
+// non-secret S3 error code so the router can surface a clear 4xx WITHOUT the
+// backend ever being registered (issue #550: "do not silently register an
+// unreachable or unauthorized backend"). The message and code are guaranteed
+// secret-free by validateExternalBackend.
+export class BackendValidationError extends Error {
+  readonly reason: ValidationFailureReason;
+  readonly code?: string;
+  constructor(result: Extract<ExternalBackendValidationResult, { ok: false }>) {
+    super(result.message);
+    this.name = 'BackendValidationError';
+    this.reason = result.reason;
+    if (result.code) this.code = result.code;
+  }
+}
+
 // The registry: the register/list/remove surface the router calls. It owns the
 // ADR-017 persistence split (non-secret record -> BackendRecordStore; secrets ->
 // SecretStore per consuming serviceId) so the router stays a thin HTTP shell.
+export type StorageBackendRegistryOptions = {
+  // When true (the default when a validate option object is supplied), register
+  // runs the issue #550 reachability + permission probe BEFORE persisting; a
+  // failing probe throws BackendValidationError and NOTHING is persisted. When
+  // false, validation is skipped entirely (opt-out for callers that manage
+  // validation elsewhere or want registration without a live probe).
+  enabled?: boolean;
+  // Injectable probe-client factory so registration is unit-testable without a
+  // live bucket (mirrors the injected FetchLike seam in profiles-reachability).
+  probeClientFactory?: ProbeClientFactory;
+};
+
 export class StorageBackendRegistry {
+  private readonly validateEnabled: boolean;
+  private readonly probeClientFactory?: ProbeClientFactory;
+
   constructor(
     private readonly records: BackendRecordStore,
     // Optional: when no SecretStore is wired (OSC not configured) the registry
     // still stores the non-secret record but reports the secret was NOT
     // persisted, so the router can surface a 501 rather than silently dropping
     // credentials.
-    private readonly secrets?: SecretStore
-  ) {}
+    private readonly secrets?: SecretStore,
+    // Optional registration-time validation config (issue #550). Omit to keep
+    // the pre-#550 behaviour (no probe); pass {} to enable the default live
+    // probe, or { enabled: false } to explicitly opt out.
+    validate?: StorageBackendRegistryOptions
+  ) {
+    this.validateEnabled = validate ? validate.enabled !== false : false;
+    this.probeClientFactory = validate?.probeClientFactory;
+  }
 
   get canStoreSecrets(): boolean {
     return this.secrets !== undefined;
+  }
+
+  get validatesOnRegister(): boolean {
+    return this.validateEnabled;
+  }
+
+  // Run the issue #550 reachability + permission probe against a prospective
+  // backend WITHOUT registering it (supports on-demand re-validation and lets
+  // the router expose a dry-run). Never leaks the secret: the result carries
+  // only a machine-readable reason + the non-secret S3 error code.
+  async validate(input: RegisterBackendInput): Promise<ExternalBackendValidationResult> {
+    return validateExternalBackend(
+      {
+        bucket: input.bucket,
+        accessKeyId: input.accessKeyId,
+        secretAccessKey: input.secretAccessKey,
+        ...(input.region ? { region: input.region } : {}),
+        ...(input.endpointUrl ? { endpointUrl: input.endpointUrl } : {}),
+        ...(input.sessionToken ? { sessionToken: input.sessionToken } : {})
+      },
+      this.probeClientFactory ? { probeClientFactory: this.probeClientFactory } : {}
+    );
   }
 
   // Register a new external backend. Persists ONLY the non-secret record and
@@ -359,6 +442,17 @@ export class StorageBackendRegistry {
     workspaceId: string,
     input: RegisterBackendInput
   ): Promise<RegisteredBackendView> {
+    // Issue #550: validate reachability + permissions BEFORE persisting or
+    // fanning out any secret, so an unreachable or unauthorized backend is
+    // never silently registered. On failure nothing is written and the caller
+    // gets a machine-readable reason (the message/code are secret-free).
+    if (this.validateEnabled) {
+      const result = await this.validate(input);
+      if (!result.ok) {
+        throw new BackendValidationError(result);
+      }
+    }
+
     const id = randomUUID();
     const record: StorageBackendRecord = {
       id,
