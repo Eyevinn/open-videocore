@@ -3890,29 +3890,29 @@ curl -X POST https://<your-instance>/api/v1/provision \
 
 Environment variables
 
-Set automatically by the deploy step above, or configurable directly if you're running open-videocore yourself.
+On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional ENCORE_* tuning knobs. The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The OSC-configurable column below marks which is which.
 
-  VariableRequiredDescription
+  VariableRequiredOSC-configurableDescription
 
-    OSC_ACCESS_TOKENYesPersonal Access Token. Injected automatically at deploy time on OSC.
+    OSC_ACCESS_TOKENYesInjectedPersonal Access Token. Injected automatically at deploy time on OSC.
 
-    PARAMETER_STORE_API_KEYYesConfig API key of the connected parameter store.
+    PARAMETER_STORE_API_KEYYesYesConfig API key of the connected parameter store.
 
-    PARAMETER_STORE_INSTANCE_NAMEYesName of the parameter store (default ovcconfig).
+    PARAMETER_STORE_INSTANCE_NAMEYesYesName of the parameter store (default ovcconfig). On OSC this is the ParameterStore deploy-form field.
 
-    MINIO_ROOT_PASSWORDYesAdmin password used when provisioning object storage instances.
+    MINIO_ROOT_PASSWORDYesYesAdmin password used when provisioning object storage instances.
 
-    COUCHDB_ADMIN_PASSWORDYesAdmin password used when provisioning the metadata store.
+    COUCHDB_ADMIN_PASSWORDYesYesAdmin password used when provisioning the metadata store.
 
-    PORTNoHTTP port (default 3000).
+    PORTNoNoHTTP port (default 3000). Fixed by the platform on OSC; self-hosted only.
 
-    ENCORE_MAX_INSTANCESNoMax transcoder instances the auto-scaler may run per workspace (default 3).
+    ENCORE_MAX_INSTANCESNoYesMax transcoder instances the auto-scaler may run per workspace (default 3).
 
-    ENCORE_MIN_INSTANCESNoWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
+    ENCORE_MIN_INSTANCESNoYesWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
 
-    ENCORE_IDLE_TIMEOUT_MSNoIdle time before a transcoder instance is torn down (default 300000).
+    ENCORE_IDLE_TIMEOUT_MSNoYesIdle time before a transcoder instance is torn down (default 300000).
 
-    PUBLIC_BASE_URLNoPublicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder.
+    PUBLIC_BASE_URLNoNoPublicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
 
 ---
 
