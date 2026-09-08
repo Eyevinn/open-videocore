@@ -42,6 +42,36 @@ Headless, API-first media asset management (MAM) middleware that runs entirely o
 - An [Open Source Cloud](https://www.osaas.io) account and a Personal Access Token
 - Node.js 20 or later (for local development)
 
+## Security and deployment
+
+> **The service must run behind an authenticating boundary. Do not expose it directly.**
+
+Open Videocore has **no in-app authentication fallback**. Its request gate,
+`requireAuth()` in [`src/auth/workspace.ts`](src/auth/workspace.ts), is a
+**presence gate only**: it checks that a bearer token is present on the request
+and rejects anonymous traffic, but it does **not** verify the token's identity,
+validity, or authorisation. Real authentication is performed upstream by the OSC
+auth wall, which authenticates every caller before the request reaches the
+process (see issue #59 for the authoritative decision that removed in-app tenant
+resolution in favour of the wall). The presence gate exists only as a last-ditch
+guard so an accidentally-exposed deployment rejects anonymous requests — it is
+**not** a substitute for the wall.
+
+Because of this, the service **MUST** run in one of the following ways:
+
+- **On OSC** — behind the OSC platform auth wall, which is the default when the
+  service is deployed as an OSC instance. This is the supported configuration.
+- **Off OSC** — behind an equivalent authenticating reverse proxy that
+  authenticates every request before forwarding it, mirroring what the wall does
+  on OSC.
+
+**Publishing the container port directly, or otherwise bypassing the auth wall,
+exposes the full API with no meaningful authentication.** Any caller that
+attaches an arbitrary non-empty bearer token would pass the presence gate and
+reach every endpoint — asset management, provisioning, storage, and
+tear-down included. Do not map the container port to a public interface unless
+an authenticating proxy sits in front of it.
+
 ## Quick start
 
 The easiest way to get Open Videocore running is through an AI agent connected to OSC via MCP. The agent handles provisioning through natural language — no CLI, no copy-pasting resource IDs.
@@ -402,6 +432,6 @@ Contact [sales@eyevinn.se](mailto:sales@eyevinn.se) if you are interested.
 
 # About Eyevinn Technology
 
-[Eyevinn Technology](https://www.eyevinntechnology.se) is an independent consultant firm specialized in video and streaming. Independent in a way that we are not commercially tied to any platform or technology vendor. As our way to innovate and push the industry forward we develop proof-of-concepts and tools. The things we learn and the code we write we share with the industry in [blogs](https://dev.to/video) and by open sourcing the code we have written.
+[Eyevinn Technology](https://www.eyevinn.se) is an independent consultant firm specialized in video and streaming. Independent in a way that we are not commercially tied to any platform or technology vendor. As our way to innovate and push the industry forward we develop proof-of-concepts and tools. The things we learn and the code we write we share with the industry in [blogs](https://dev.to/video) and by open sourcing the code we have written.
 
 Want to know more about Eyevinn and how it is to work here. Contact us at work@eyevinn.se!

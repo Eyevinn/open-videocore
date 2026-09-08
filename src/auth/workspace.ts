@@ -1,6 +1,6 @@
 // Request authentication gate.
 //
-// open-videocore is gated behind the OSC platform auth wall (ADR-003): every
+// open-videocore is gated behind the OSC platform auth wall (issue #59): every
 // inbound request reaches the process only after the platform has authenticated
 // the caller. The auth wall is treated as a PURE GATE — open-videocore does not
 // read a per-request workspace/tenant identifier, because tenant isolation is
@@ -11,10 +11,20 @@
 //
 // Previously this module called the OSC `mysubscriptions` endpoint to resolve a
 // token to a tenant id used as a per-request workspace scope. That resolution is
-// REMOVED (ADR-003 / issue #59): there is no tenant to resolve and nothing to
-// scope. We only require a bearer token to be present so a deployment
-// accidentally exposed without the wall (or an off-OSC deployment behind an
-// equivalent proxy) rejects anonymous traffic rather than serving it.
+// REMOVED (issue #59): there is no tenant to resolve and nothing to scope. We
+// only require a bearer token to be present.
+//
+// SECURITY BOUNDARY: requireAuth() is a pure presence gate — it passes ANY
+// non-empty bearer string without inspecting it. It therefore provides NO
+// protection against a missing, bypassed, or misconfigured auth wall: an
+// attacker who reaches the process directly can send any placeholder token and
+// pass. It is NOT a fallback or safety net for a wall-bypass scenario, and NOT a
+// substitute for the wall on an off-OSC deployment. The sole security boundary
+// for inbound authentication is the OSC auth wall (or, off-OSC, an equivalent
+// upstream proxy that authenticates the caller before the request reaches this
+// process). The authoritative auth-isolation decision is recorded in issue #59.
+// The presence check exists only to reject accidental anonymous traffic in the
+// normal behind-the-wall case, not to authenticate anyone.
 
 export class AuthError extends Error {
   constructor(message: string) {
