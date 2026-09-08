@@ -16,6 +16,7 @@ import type {
   AssetRepository,
   AssetReviewState,
   CreateAssetInput,
+  RehydratePhase,
   SetDeleteLockInput,
   StorageByteClass,
   StorageTier,
@@ -100,6 +101,13 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
     overrides: Partial<Record<StorageByteClass, StorageTier>>
   ): Promise<Asset | undefined> {
     return (await this.repo()).setStorageTier(id, overrides);
+  }
+  async setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
+  ): Promise<Asset | undefined> {
+    return (await this.repo()).setRehydrateState(id, byteClass, phase);
   }
   async countChildren(id: string): Promise<number> {
     return (await this.repo()).countChildren(id);
