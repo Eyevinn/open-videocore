@@ -67,8 +67,14 @@ import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
 import {
   extractTechnicalMetadata,
   type ExtractDeps,
+  type ExternalProbeSource,
   type ProbeRunner
 } from '../pipeline/metadata-extractor.js';
+import {
+  UnknownSourceBackendError,
+  type StorageBackendRegistry
+} from '../services/storage-backend-registry.js';
+import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
@@ -724,6 +730,14 @@ type AssetsRouterOptions = {
   // Defaults to the real fire-and-forget extractor.
   extract?: typeof extractTechnicalMetadata;
   extractDeps?: Partial<ExtractDeps>;
+  // External storage-backend registry (issue #547/#548, ADR-017). When present,
+  // POST /ingest-url may reference a registered external backend by id or name
+  // via `sourceBackend`: the ingest sources bytes from that bucket (the
+  // probe/transcode jobs read `s3://bucket/key` in place using the registered
+  // endpoint + credential references) instead of pulling into OSC-managed
+  // storage. When absent, `sourceBackend` is rejected (registry not configured)
+  // and ingest behaves exactly as before (OSC-managed default source).
+  storageBackendRegistry?: StorageBackendRegistry;
   // Auto-subtitles (issue #114). `subtitleGenerator` calls the OSC
   // eyevinn-auto-subtitles (Whisper) service (a stub in tests). When absent (or
   // no object storage), the OPTIONAL `subtitles` pipeline step skips gracefully —
@@ -928,7 +942,23 @@ const ingestUrlSchema = z
           'on responses). Accepted as an alias of `name`; `title` wins when ' +
           'both are supplied.'
       ),
-    tags: tagsSchema.optional()
+    tags: tagsSchema.optional(),
+    sourceBackend: z
+      .string()
+      .min(1)
+      .max(256)
+      .optional()
+      .describe(
+        'Reference (id or name) to a registered external storage backend ' +
+          '(issue #548, ADR-017) to source the asset bytes from, instead of the ' +
+          'OSC-managed default storage. The backend must be registered (POST ' +
+          '/storage/backends) and serve the `source` (or `both`) role. When set, ' +
+          '`sourceUrl` addresses the object WITHIN that backend as ' +
+          '`s3://<bucket>/<key>` (bucket may be omitted to use the registered ' +
+          "backend's bucket, i.e. `s3:///<key>` or a bare `<key>`). No external " +
+          'credentials are ever supplied inline: the registered endpoint + ' +
+          'credentials are reused server-side. Omit for the default source.'
+      )
   })
   .strict();
 
@@ -936,6 +966,39 @@ const ingestAcceptedSchema = z.object({
   assetId: z.string(),
   jobId: z.string()
 });
+
+// Derive the object key WITHIN a registered external backend's bucket from the
+// ingest `sourceUrl` (issue #548). Three accepted forms, all credential-free:
+//   - `s3://<bucket>/<key>` — the bucket must match the registered backend's
+//     bucket (a mismatch is rejected so a caller cannot redirect a registered
+//     credential at an arbitrary bucket);
+//   - `s3:///<key>` — empty authority, uses the registered bucket;
+//   - a bare `<key>` (no scheme) — uses the registered bucket.
+// Returns the leading-slash-stripped key. Throws SourceValidationError (-> 400)
+// on an empty key or a bucket mismatch.
+export function externalObjectKeyFromSourceUrl(
+  sourceUrl: string,
+  registeredBucket: string
+): string {
+  let raw = sourceUrl.trim();
+  if (/^s3:\/\//i.test(raw)) {
+    const withoutScheme = raw.replace(/^s3:\/\//i, '');
+    const slash = withoutScheme.indexOf('/');
+    const bucket = slash === -1 ? withoutScheme : withoutScheme.slice(0, slash);
+    const key = slash === -1 ? '' : withoutScheme.slice(slash + 1);
+    if (bucket && bucket !== registeredBucket) {
+      throw new SourceValidationError(
+        `s3 bucket "${bucket}" does not match the registered backend bucket`
+      );
+    }
+    raw = key;
+  }
+  const key = raw.replace(/^\/+/, '');
+  if (!key) {
+    throw new SourceValidationError('sourceUrl must address an object key within the backend bucket');
+  }
+  return key;
+}
 
 // Resolve the Encore job URL for packaging by looking up the instance URL from
 // the Redis pool using the encoreJobId → instanceId → EncoreInstanceRecord chain.
@@ -1361,12 +1424,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
   // configured. Returns true when an extraction was actually kicked off.
-  function triggerExtraction(assetId: string, objectKey: string): boolean {
+  function triggerExtraction(
+    assetId: string,
+    objectKey: string,
+    externalSource?: ExternalProbeSource
+  ): boolean {
     if (!opts.probe || !storageFor) {
       return false;
     }
     void extractRunner(
-      { assetId, objectKey },
+      { assetId, objectKey, ...(externalSource ? { externalSource } : {}) },
       {
         assets: repo,
         storage: storageFor(),
@@ -1831,7 +1898,72 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           .code(501)
           .send({ error: 'not_configured', message: 'object storage is not configured' });
       }
-      const { sourceUrl, name, title, description, tags } = request.body;
+      const { sourceUrl, name, title, description, tags, sourceBackend } = request.body;
+
+      // --- External-backend source (issue #548, ADR-017 D4) --------------
+      // When the request references a registered external backend, we source the
+      // bytes FROM that bucket instead of the OSC-managed default. Rather than
+      // pulling into OSC-managed storage (which would need the literal secret the
+      // registry never returns — see osc-feedback/incoming-issue548-…), the
+      // downstream probe/transcode jobs read `s3://<bucket>/<key>` in place using
+      // the registered endpoint + `{{secrets.<name>}}` references (ADR-017 C3).
+      // No external credential is ever placed inline in the request or in the
+      // stored job record (the job's sourceUrl is `s3://bucket/key`, credential-
+      // free) — issue #548 acceptance.
+      if (sourceBackend !== undefined) {
+        if (!opts.storageBackendRegistry) {
+          return reply.code(501).send({
+            error: 'not_configured',
+            message: 'storage-backend registry is not configured'
+          });
+        }
+        let source: ExternalProbeSource;
+        try {
+          const creds = await opts.storageBackendRegistry.resolveSourceCredentials(
+            STACK_CONFIG_NAMESPACE,
+            sourceBackend
+          );
+          const objectKeyInBucket = externalObjectKeyFromSourceUrl(sourceUrl, creds.bucket);
+          source = {
+            bucket: creds.bucket,
+            objectKey: objectKeyInBucket,
+            awsAccessKeyId: creds.awsAccessKeyId,
+            awsSecretAccessKey: creds.awsSecretAccessKey,
+            ...(creds.s3EndpointUrl ? { s3EndpointUrl: creds.s3EndpointUrl } : {}),
+            ...(creds.awsRegion ? { awsRegion: creds.awsRegion } : {}),
+            ...(creds.awsSessionToken ? { awsSessionToken: creds.awsSessionToken } : {})
+          };
+        } catch (err) {
+          if (err instanceof UnknownSourceBackendError) {
+            return reply.code(err.statusCode).send({ error: 'bad_request', message: err.message });
+          }
+          throw err;
+        }
+
+        const extFallbackName =
+          decodeURIComponent(source.objectKey.split('/').filter(Boolean).pop() ?? '') ||
+          source.bucket;
+        const extAsset = await repo.create({
+          name: title ?? name ?? extFallbackName,
+          description,
+          tags
+        });
+        // The recorded source is the credential-free `s3://bucket/key` locator;
+        // the object already lives in the external bucket, so no byte-pull runs
+        // and the asset advances straight to `processing`.
+        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
+        await repo.update(extAsset.id, { objectKey: extObjectKey, status: 'processing' });
+        const extJob = await jobs.create({
+          type: 'ingest-url',
+          assetId: extAsset.id,
+          sourceUrl: extObjectKey
+        });
+        await jobs.update(extJob.id, { status: 'running' });
+        await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Fire-and-forget probe against the external source (job reads in place).
+        triggerExtraction(extAsset.id, extObjectKey, source);
+        return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
+      }
 
       // Validate synchronously so a bad URL is a 400, not a background failure.
       const parsed = parseSource(sourceUrl);

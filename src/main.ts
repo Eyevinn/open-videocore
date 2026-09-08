@@ -1298,6 +1298,9 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   storageFor: storageAvailable ? storageFor : undefined,
   pullDeps,
   probe,
+  // External storage-backend registry (issue #548): lets POST /ingest-url
+  // reference a registered external backend as the source (ADR-017 D4).
+  storageBackendRegistry,
   encore,
   sourceBucket,
   outputBucket,
