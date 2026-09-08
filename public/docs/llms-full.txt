@@ -2458,6 +2458,7 @@ Response 200 (application/json)
       ],
       "createdAt": "string",
       "updatedAt": "string",
+      "type": "asset",
       "description": "string",
       "parentId": "string",
       "objectKey": "string",
@@ -2471,14 +2472,25 @@ Response 200 (application/json)
         "audioTracks": [],
         "extractedAt": "string"
       },
-      "technicalMetadataError": "string",
-      "manifestUrls": {
-        "hls": "string",
-        "dash": "string"
-      }
+      "technicalMetadataError": "string"
+    }
+  ],
+  "collections": [
+    {
+      "type": "collection",
+      "id": "string",
+      "name": "string",
+      "createdAt": "string",
+      "updatedAt": "string",
+      "description": "string",
+      "tags": [
+        "string"
+      ],
+      "custom": {}
     }
   ],
   "total": 0,
+  "collectionTotal": 0,
   "page": 0
 }
 
