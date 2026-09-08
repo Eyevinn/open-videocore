@@ -10,11 +10,13 @@ import {
   CollectionNotFoundError,
   addAssetId,
   applyCollectionDeleteLock,
+  applyCollectionUpdate,
   removeAssetId,
   type Collection,
   type CollectionRepository,
   type CreateCollectionInput,
-  type SetDeleteLockInput
+  type SetDeleteLockInput,
+  type UpdateCollectionInput
 } from './collection-repo.js';
 
 export class InMemoryCollectionRepository implements CollectionRepository {
@@ -62,6 +64,19 @@ export class InMemoryCollectionRepository implements CollectionRepository {
       .filter((c) => c.assetIds.includes(assetId))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
       .map((c) => c.id);
+  }
+
+  // Partial editorial update of descriptive metadata (issue #560). Applies only
+  // the present keys of `patch` (description/tags/custom) wholesale, leaving
+  // membership, name, and the delete-lock untouched.
+  async update(id: string, patch: UpdateCollectionInput): Promise<Collection> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      throw new CollectionNotFoundError(id);
+    }
+    const updated = applyCollectionUpdate(existing, patch, new Date().toISOString());
+    this.store.set(id, updated);
+    return copy(updated);
   }
 
   async addAsset(id: string, assetId: string): Promise<Collection> {

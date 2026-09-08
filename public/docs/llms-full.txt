@@ -2458,6 +2458,7 @@ Response 200 (application/json)
       ],
       "createdAt": "string",
       "updatedAt": "string",
+      "type": "asset",
       "description": "string",
       "parentId": "string",
       "objectKey": "string",
@@ -2471,14 +2472,25 @@ Response 200 (application/json)
         "audioTracks": [],
         "extractedAt": "string"
       },
-      "technicalMetadataError": "string",
-      "manifestUrls": {
-        "hls": "string",
-        "dash": "string"
-      }
+      "technicalMetadataError": "string"
+    }
+  ],
+  "collections": [
+    {
+      "type": "collection",
+      "id": "string",
+      "name": "string",
+      "createdAt": "string",
+      "updatedAt": "string",
+      "description": "string",
+      "tags": [
+        "string"
+      ],
+      "custom": {}
     }
   ],
   "total": 0,
+  "collectionTotal": 0,
   "page": 0
 }
 
@@ -2650,6 +2662,45 @@ Response 200 (application/json)
   "assets": [
     {}
   ],
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
+}
+
+  PATCH /api/v1/collections/{id}
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
   "description": "string",
   "tags": [
     "string"
@@ -3136,7 +3187,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (107 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (108 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3164,7 +3215,7 @@ Search1
 Full-text and metadata search across assets.
 Webhooks3
 HTTP event notification registrations.
-Collections8
+Collections9
 Named groups for organising assets.
 Storage9
 Object storage bucket and watch-folder management.
@@ -3241,14 +3292,33 @@ For files too large for a single PUT, initiate a multipart upload, request a pre
 
 6. Watch-folder ingest
 
-Point open-videocore at an object storage bucket and it will pick up new files automatically, without any per-file API call:
+Point open-videocore at an object storage bucket and it will pick up new files dropped straight into that bucket (via mc, rclone, or another system) automatically, without any per-file API call:
 
 Request
 curl -X POST https://<your-instance>/api/v1/storage/buckets/<bucket>/watch-folder/toggle \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
 
-See Storage reference for bucket listing and the poller's own start/stop controls in Admin.
+Watch-folder ingest is not available on the hosted platform by default. Unlike the other four ingest paths above, it is not supported in the default provisioned (multi-stack) deployment, because there is no single shared source bucket to watch. It requires a deployment configured against one global, directly-reachable object-storage endpoint (see prerequisites below). If you are on the hosted platform and need it, it is pending provisioning work — use URL pull, direct upload, presigned, or multipart ingest in the meantime.
+
+Prerequisites
+
+Watch-folder ingest is only wired up when the deployment is pointed at a single, directly-reachable object-storage endpoint. Two things must both be configured on the API process:
+
+  - A global object-storage endpoint via the MINIO_URL environment variable (with MINIO_ACCESS_KEY / MINIO_SECRET_KEY). Without this the watch-folder service is never started — the API falls back to the per-request upload and URL-pull routes only.
+
+  - The opt-in flag WATCH_FOLDER_ENABLED=true. The service is disabled by default even when object storage is configured.
+
+Optionally, tune the polling fallback cadence with WATCH_FOLDER_POLL_INTERVAL_SECONDS (default 30); it is used when the storage backend does not expose bucket-change notifications.
+
+Verify it is active
+
+Confirm the watch-folder is configured and running before you rely on it:
+
+Request
+curl https://<your-instance>/api/v1/admin/watch-folder/status
+
+A response of {"enabled": true, "running": true, ...} means the service is configured and watching. "enabled": false means the prerequisites above are not met on this deployment (no global object-storage endpoint, or WATCH_FOLDER_ENABLED is not set) and watch-folder ingest is unavailable there. See the Admin reference for the poller's start/stop controls and the Storage reference for per-bucket listing and toggling.
 
 Every path above ends at the same place: an Asset with status moving from uploading to processing to ready (or failed). Watch that field, or an asset.ready / asset.failed webhook, rather than polling the job directly once the source file has landed.
 
@@ -3890,29 +3960,29 @@ curl -X POST https://<your-instance>/api/v1/provision \
 
 Environment variables
 
-Set automatically by the deploy step above, or configurable directly if you're running open-videocore yourself.
+On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional ENCORE_* tuning knobs. The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The OSC-configurable column below marks which is which.
 
-  VariableRequiredDescription
+  VariableRequiredOSC-configurableDescription
 
-    OSC_ACCESS_TOKENYesPersonal Access Token. Injected automatically at deploy time on OSC.
+    OSC_ACCESS_TOKENYesInjectedPersonal Access Token. Injected automatically at deploy time on OSC.
 
-    PARAMETER_STORE_API_KEYYesConfig API key of the connected parameter store.
+    PARAMETER_STORE_API_KEYYesYesConfig API key of the connected parameter store.
 
-    PARAMETER_STORE_INSTANCE_NAMEYesName of the parameter store (default ovcconfig).
+    PARAMETER_STORE_INSTANCE_NAMEYesYesName of the parameter store (default ovcconfig). On OSC this is the ParameterStore deploy-form field.
 
-    MINIO_ROOT_PASSWORDYesAdmin password used when provisioning object storage instances.
+    MINIO_ROOT_PASSWORDYesYesAdmin password used when provisioning object storage instances.
 
-    COUCHDB_ADMIN_PASSWORDYesAdmin password used when provisioning the metadata store.
+    COUCHDB_ADMIN_PASSWORDYesYesAdmin password used when provisioning the metadata store.
 
-    PORTNoHTTP port (default 3000).
+    PORTNoNoHTTP port (default 3000). Fixed by the platform on OSC; self-hosted only.
 
-    ENCORE_MAX_INSTANCESNoMax transcoder instances the auto-scaler may run per workspace (default 3).
+    ENCORE_MAX_INSTANCESNoYesMax transcoder instances the auto-scaler may run per workspace (default 3).
 
-    ENCORE_MIN_INSTANCESNoWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
+    ENCORE_MIN_INSTANCESNoYesWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
 
-    ENCORE_IDLE_TIMEOUT_MSNoIdle time before a transcoder instance is torn down (default 300000).
+    ENCORE_IDLE_TIMEOUT_MSNoYesIdle time before a transcoder instance is torn down (default 300000).
 
-    PUBLIC_BASE_URLNoPublicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder.
+    PUBLIC_BASE_URLNoNoPublicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
 
 ---
 
@@ -3978,7 +4048,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 107 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 108 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.
