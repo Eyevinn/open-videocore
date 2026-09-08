@@ -1636,7 +1636,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               workspaceId: DEPLOYMENT_CONTEXT,
               sourceAssetId: asset.id,
               sourceObjectKey: asset.objectKey as string,
-              sourceBucket: opts.sourceBucket as string,
+              // Read the transcode INPUT from the resolved stack's per-stack
+              // source bucket (StackConfig.sourceBucket, param-store key
+              // `sourceBucket` per ADR-002; carried on WorkspaceConnections.
+              // sourceBucket) rather than the deployment-wide boot default
+              // (opts.sourceBucket from MINIO_SOURCE_BUCKET) — issue #639. The
+              // fallback preserves the env-override / single-stack deployments
+              // where request.connections is absent. Mirrors the existing
+              // per-stack resolution used by the thumbnail/rewrap paths
+              // (request.connections?.sourceBucket ?? …). Output/packaged
+              // resolution is out of scope here (issue #638).
+              sourceBucket: request.connections?.sourceBucket ?? (opts.sourceBucket as string),
               outputBucket: opts.outputBucket as string,
               preset: encodeOpts?.profile,
               customProfile: encodeOpts?.customProfile,
@@ -2927,7 +2937,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
             burnInSubtitlesFilter,
-            sourceBucket: opts.sourceBucket,
+            // Read the transcode INPUT from the resolved stack's per-stack
+            // source bucket (StackConfig.sourceBucket, param-store key
+            // `sourceBucket` per ADR-002; carried on WorkspaceConnections.
+            // sourceBucket) rather than the deployment-wide boot default
+            // (opts.sourceBucket from MINIO_SOURCE_BUCKET) — issue #639. The
+            // fallback preserves the env-override / single-stack deployments
+            // where request.connections is absent. Output/packaged resolution
+            // is out of scope here (issue #638).
+            sourceBucket: request.connections?.sourceBucket ?? opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
           { jobs, assets: repo, encore: opts.encore }
