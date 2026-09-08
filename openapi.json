@@ -20,7 +20,134 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Default Response"
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "service": {
+                      "type": "string"
+                    },
+                    "resolver": {
+                      "type": "object",
+                      "properties": {
+                        "degraded": {
+                          "type": "boolean"
+                        },
+                        "mode": {
+                          "type": "string",
+                          "enum": [
+                            "none",
+                            "no-storage",
+                            "stale-last-known-good"
+                          ]
+                        },
+                        "noStorageFallbackTotal": {
+                          "type": "number"
+                        },
+                        "staleFallbackTotal": {
+                          "type": "number"
+                        },
+                        "lastDegradedAt": {
+                          "type": "number",
+                          "nullable": true
+                        }
+                      },
+                      "required": [
+                        "degraded",
+                        "mode",
+                        "noStorageFallbackTotal",
+                        "staleFallbackTotal",
+                        "lastDegradedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "ingest": {
+                      "type": "object",
+                      "properties": {
+                        "directUpload": {
+                          "type": "object",
+                          "properties": {
+                            "available": {
+                              "type": "boolean"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "enum": [
+                                "no-storage-endpoint",
+                                "not-enabled",
+                                "missing-storage-endpoint"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "available"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "urlPull": {
+                          "type": "object",
+                          "properties": {
+                            "available": {
+                              "type": "boolean"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "enum": [
+                                "no-storage-endpoint",
+                                "not-enabled",
+                                "missing-storage-endpoint"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "available"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "watchFolder": {
+                          "type": "object",
+                          "properties": {
+                            "available": {
+                              "type": "boolean"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "enum": [
+                                "no-storage-endpoint",
+                                "not-enabled",
+                                "missing-storage-endpoint"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "available"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "directUpload",
+                        "urlPull",
+                        "watchFolder"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "service",
+                    "resolver",
+                    "ingest"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
