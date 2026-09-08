@@ -292,9 +292,18 @@ const backendRecordStore = backendKvStore
 const backendSecretStore: SecretStore = {
   saveSecret: (serviceId, name, value) => saveSecret(serviceId, name, value, oscContext)
 };
+// Issue #550: run the registration-time reachability + permission probe before
+// persisting a backend, so a misconfigured endpoint / bad credentials /
+// insufficient permissions are caught at registration rather than at ingest or
+// job time. Enabled by default; set STORAGE_BACKEND_VALIDATE=false to opt out
+// (12-factor: config via env). The default probe-client factory reaches the
+// registered bucket directly via the minio client.
+const storageBackendValidateEnabled =
+  (process.env['STORAGE_BACKEND_VALIDATE'] ?? 'true').toLowerCase() !== 'false';
 const storageBackendRegistry = new StorageBackendRegistry(
   backendRecordStore,
-  backendSecretStore
+  backendSecretStore,
+  { enabled: storageBackendValidateEnabled }
 );
 
 // Per-workspace backing-service resolver (replaces the global singleton

@@ -24,6 +24,7 @@ import { z } from 'zod';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
 import type { WatchFolderService } from '../pipeline/watch-folder.js';
 import {
+  BackendValidationError,
   DefaultBackendNotDeletableError,
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
@@ -49,6 +50,26 @@ export type StorageRouterOptions = {
 };
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
+
+// Registration-time validation failure (issue #550). Carries a machine-readable
+// `reason` a client can branch on and an optional non-secret S3 error `code`.
+// The secret is NEVER present in this payload (guaranteed by
+// validateExternalBackend / BackendValidationError).
+const validationErrorSchema = z.object({
+  error: z.literal('backend_validation_failed'),
+  reason: z.enum([
+    'unreachable',
+    'unauthorized',
+    'bucket_not_found',
+    'forbidden_list',
+    'forbidden_write',
+    'forbidden_read',
+    'probe_cleanup_failed',
+    'unknown'
+  ]),
+  message: z.string(),
+  code: z.string().optional()
+});
 
 const bucketSchema = z.object({
   name: z.string(),
@@ -167,6 +188,17 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
     if (err instanceof DefaultBackendNotDeletableError) {
       return reply.code(409).send({ error: 'conflict', message: err.message });
     }
+    // Registration-time reachability / permission validation failed (issue
+    // #550): the backend was NOT registered. Surface a 422 with a
+    // machine-readable reason + non-secret code (the secret is never present).
+    if (err instanceof BackendValidationError) {
+      return reply.code(422).send({
+        error: 'backend_validation_failed' as const,
+        reason: err.reason,
+        message: err.message,
+        ...(err.code ? { code: err.code } : {})
+      });
+    }
     throw err;
   });
 
@@ -182,7 +214,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
     {
       schema: {
         body: registerBackendSchema,
-        response: { 201: backendViewSchema, 501: errorSchema }
+        response: { 201: backendViewSchema, 422: validationErrorSchema, 501: errorSchema }
       }
     },
     async (request, reply) => {
