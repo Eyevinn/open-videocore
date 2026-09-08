@@ -49,7 +49,8 @@ import {
   PerWorkspaceSearchRepository,
   PerWorkspaceWebhookRepository,
   PerWorkspaceCollectionRepository,
-  PerWorkspaceProfileRepository
+  PerWorkspaceProfileRepository,
+  PerWorkspaceAuditEmitter
 } from './data/per-workspace-repos.js';
 import type { AssetRepository } from './data/asset-repo.js';
 import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
@@ -472,6 +473,12 @@ const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
 const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver);
 const profileRepository = new PerWorkspaceProfileRepository(stackResolver);
+// Best-effort audit emitter (issue #564). Resolves the active stack's audit
+// store per call; no-ops on the in-memory fallback. Wired into the asset,
+// collection, and job (transcode/package) mutation paths so each meaningful
+// mutation emits exactly one audit entry — fire-and-forget (a failed write is
+// logged, never propagated).
+const auditEmitter = new PerWorkspaceAuditEmitter(stackResolver);
 
 // Synchronous, per-workspace object-storage factory (issue #4). Reads the
 // connections already warmed into the resolver cache by the global preHandler
@@ -962,7 +969,11 @@ function activateScaler(redisUrl: string): void {
   packaging = new PackagingService({
     assets: assetRepository,
     queue: makeOscPackagerQueue(redis, undefined, app.log),
-    publicBaseUrl: packagingPublicBaseUrl()
+    publicBaseUrl: packagingPublicBaseUrl(),
+    // Best-effort package-job audit emission (issue #564): submit + terminal
+    // (success/failure) callbacks each emit one entry, fire-and-forget.
+    audit: auditEmitter,
+    auditLog: app.log
   });
 
   // On-demand packager provisioning (epic #226, issue #244). The packager is no
@@ -1296,7 +1307,9 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // and for validating a named transcode profile so a GPU-only (NVENC/CUDA)
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
-  profileRepository
+  profileRepository,
+  // Best-effort audit emission for asset mutations (issue #564).
+  audit: auditEmitter
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -1356,7 +1369,9 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
     const conns = await stackResolver.resolve();
     if (!conns.storageClient) return undefined;
     return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
-  }
+  },
+  // Best-effort audit emission for the transcode terminal-state callback (#564).
+  audit: auditEmitter
 };
 await app.register(internalRouter, internalRouterOptions);
 
@@ -1530,7 +1545,9 @@ await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: web
 await app.register(collectionsRouter, {
   prefix: '/api/v1/collections',
   repository: collectionRepository,
-  assetRepository
+  assetRepository,
+  // Best-effort audit emission for collection mutations (issue #564).
+  audit: auditEmitter
 });
 
 // Bucket / object-storage management. Workspace-scoped; behind `authenticate`.

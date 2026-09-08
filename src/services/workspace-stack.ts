@@ -26,6 +26,8 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import { CouchAuditRepository } from '../data/audit-repo.js';
+import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { InMemorySearchRepository } from '../data/inmemory-search-repo.js';
@@ -115,6 +117,13 @@ export type WorkspaceConnections = {
   // `scene-detect` step skips gracefully — fire-and-forget, never throws.
   subtitleGenerator: SubtitleGenerator | undefined;
   sceneDetector: SceneDetector | undefined;
+  // Best-effort audit-entry writer for this stack (issue #564). Backed by the
+  // append-only audit store's `record()` write primitive (CouchAuditRepository)
+  // over the SAME per-stack CouchDB connection as the other repositories.
+  // Undefined on the in-memory fallback (no durable store to write to) — audit
+  // emission then no-ops. Never on the request hot path directly: the routers
+  // hold a PerWorkspaceAuditEmitter that resolves this lazily per call.
+  audit: AuditEmitter | undefined;
 };
 
 // A cached resolution. `fromReadyStack` records whether `connections` were
@@ -186,6 +195,8 @@ function buildConnectionsFromStack(
   const collections = new CouchCollectionRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  // Audit store over the same per-stack CouchDB connection (issue #564).
+  const audit = new CouchAuditRepository(wc);
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -228,7 +239,8 @@ function buildConnectionsFromStack(
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
     subtitleGenerator,
-    sceneDetector
+    sceneDetector,
+    audit
   };
 }
 
@@ -253,6 +265,9 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let collections: CollectionRepository;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
+  // Audit store (issue #564): present only on the CouchDB env path (durable
+  // store); undefined on the in-memory fallback so emission no-ops.
+  let audit: AuditEmitter | undefined;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -265,6 +280,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     collections = new CouchCollectionRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    audit = new CouchAuditRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -315,7 +331,8 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     // OPTIONAL subtitles/scene-detect steps stay disabled here and skip
     // gracefully, exactly as when the name is absent from a record.
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    audit
   };
 }
 
@@ -336,7 +353,9 @@ function buildInMemoryConnections(): WorkspaceConnections {
     s3Config: undefined,
     storage: undefined,
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    // In-memory fallback has no durable audit store, so emission no-ops.
+    audit: undefined
   };
 }
 

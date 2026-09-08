@@ -30,6 +30,7 @@ import {
   type CollectionRepository
 } from '../data/collection-repo.js';
 import type { Asset, AssetRepository } from '../data/asset-repo.js';
+import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
@@ -115,6 +116,11 @@ type CollectionsRouterOptions = {
   // Asset repository, used to (a) validate an asset exists before adding it to a
   // collection and (b) resolve the membership list to live assets on GET /:id.
   assetRepository: AssetRepository;
+  // Best-effort audit emission (issue #564). Wired to the append-only audit
+  // store's `record()` write primitive. When absent, mutations proceed
+  // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
+  // logged, never propagated — no route becomes newly failable.
+  audit?: AuditEmitter;
 };
 
 export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = async (
@@ -124,6 +130,8 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
   const assets = opts.assetRepository;
+  // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
+  const audit = opts.audit;
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {
@@ -153,6 +161,18 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     },
     async (request, reply) => {
       const collection = await repo.create(request.body);
+      // Audit: collection created (issue #564). One entry, targetId = new id.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'collection.created',
+          targetType: 'collection',
+          targetId: collection.id,
+          detail: { name: collection.name }
+        },
+        request.log
+      );
       return reply.code(201).send(collection);
     }
   );
@@ -240,6 +260,22 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.
       await repo.delete(request.params.id);
+      // Audit: collection deleted (issue #564). Emitted ONLY when a collection
+      // actually existed (resolved above), so an idempotent no-op on an unknown
+      // / foreign id produces no entry — exactly one entry per real deletion.
+      if (existing) {
+        emitAudit(
+          audit,
+          {
+            actor: originActor('user'),
+            action: 'collection.deleted',
+            targetType: 'collection',
+            targetId: existing.id,
+            detail: { name: existing.name }
+          },
+          request.log
+        );
+      }
       return reply.code(204).send(null);
     }
   );
@@ -322,6 +358,19 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       const collection = await repo.addAsset(request.params.id,
         request.params.assetId
       );
+      // Audit: collection membership add (issue #564). One entry; a 422 (asset
+      // missing) or 404 (unknown collection) never reaches here.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'collection.member_added',
+          targetType: 'collection',
+          targetId: collection.id,
+          detail: { assetId: request.params.assetId }
+        },
+        request.log
+      );
       return reply.code(200).send(collection);
     }
   );
@@ -340,6 +389,20 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       // collection id throws CollectionNotFoundError (-> 404).
       const collection = await repo.removeAsset(request.params.id,
         request.params.assetId
+      );
+      // Audit: collection membership remove (issue #564). One entry; a 404
+      // (unknown collection) never reaches here. Removing an absent asset id is a
+      // 200 no-op on the primary op and still records the operator's intent.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'collection.member_removed',
+          targetType: 'collection',
+          targetId: collection.id,
+          detail: { assetId: request.params.assetId }
+        },
+        request.log
       );
       return reply.code(200).send(collection);
     }

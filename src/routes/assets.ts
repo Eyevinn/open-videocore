@@ -51,6 +51,7 @@ import {
 import { WorkspaceAccessError } from '../data/guard.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
+import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
 import {
   SourceTooLargeError,
   WorkspaceStorage,
@@ -791,6 +792,11 @@ type AssetsRouterOptions = {
   // not exercise named profiles), both checks are skipped (permissive) and the
   // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
+  // Best-effort audit emission (issue #564). Wired to the append-only audit
+  // store's `record()` write primitive. When absent, mutations proceed
+  // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
+  // logged, never propagated — no route becomes newly failable.
+  audit?: AuditEmitter;
 };
 
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
@@ -1299,6 +1305,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const rewrapRunner = opts.rewrap ?? rewrap;
   const clipRunnerOrchestrator = opts.clip ?? runClip;
   const storageFor = opts.storageFor;
+  // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
+  const audit = opts.audit;
 
   // Resolve whether a named transcode profile can execute on this platform tier
   // (issue #286). Returns a human message when the profile is a stored GPU-only
@@ -1646,7 +1654,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               // execute behaviour unchanged.
               profileParams: encodeOpts?.profileParams
             },
-            { jobs, assets: repo, encore: opts.encore! }
+            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log }
           );
           stepsCopy[i] = {
             ...step,
@@ -1740,6 +1748,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     { schema: { body: createSchema, response: { 201: assetSchema } } },
     async (request, reply) => {
       const asset = await repo.create(request.body);
+      // Audit: asset created (issue #564). One entry, targetId = new asset id.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.created',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: { name: asset.name, status: asset.status }
+        },
+        request.log
+      );
       return reply.code(201).send(asset);
     }
   );
@@ -2930,7 +2950,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceBucket: opts.sourceBucket,
             outputBucket: opts.outputBucket
           },
-          { jobs, assets: repo, encore: opts.encore }
+          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log }
         );
         return reply
           .code(202)
@@ -3505,6 +3525,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Audit: asset metadata edited (issue #564). Emitted only on a real edit
+      // (the asset resolved); a 404 is not a mutation and produces no entry.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.metadata_updated',
+          targetType: 'asset',
+          targetId: updated.id,
+          detail: { keys: Object.keys(request.body ?? {}) }
+        },
+        request.log
+      );
       return reply.code(200).send(updated);
     }
   );
@@ -3783,9 +3816,37 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     },
     async (request, reply) => {
+      // Capture the pre-patch status so a lifecycle transition can be audited
+      // with an accurate `from` and only when the status actually changed. Read
+      // ONCE here (before the write) so no extra read is added on the hot path
+      // when no status field is present.
+      const priorStatus =
+        request.body.status !== undefined
+          ? (await repo.get(request.params.id))?.status
+          : undefined;
       const updated = await repo.update(request.params.id, request.body);
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
+      }
+      // Audit: lifecycle/status transition (issue #564). Exactly one entry, and
+      // ONLY when the PATCH carried a `status` that moved the asset to a new
+      // lifecycle state (a no-op same-status PATCH is not a transition).
+      if (
+        request.body.status !== undefined &&
+        priorStatus !== undefined &&
+        priorStatus !== updated.status
+      ) {
+        emitAudit(
+          audit,
+          {
+            actor: originActor('user'),
+            action: 'asset.status_changed',
+            targetType: 'asset',
+            targetId: updated.id,
+            detail: { from: priorStatus, to: updated.status }
+          },
+          request.log
+        );
       }
       return reply.code(200).send(updated);
     }
@@ -3825,6 +3886,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!removed) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Audit: asset deleted/archived (issue #564). One entry on a real archive;
+      // a blocked (409) or unknown (404) delete never reaches here, so no entry.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.archived',
+          targetType: 'asset',
+          targetId: removed.id,
+          detail: { status: removed.status }
+        },
+        request.log
+      );
       return reply.code(204).send(null);
     }
   );
