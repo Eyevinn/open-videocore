@@ -26,7 +26,11 @@ import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import {
   WatchFolderService,
   parseObjectKey,
-  extractKeyFromNotification
+  extractKeyFromNotification,
+  classifyWatchFolderConfig,
+  watchFolderMisconfiguredMessage,
+  WATCH_FOLDER_STORAGE_ENV_VAR,
+  WATCH_FOLDER_INGEST_METHOD
 } from '../src/pipeline/watch-folder.js';
 import { adminRouter } from '../src/routes/admin.js';
 
@@ -51,8 +55,12 @@ function fakeClient(objects: string[], notifier?: EventEmitter & { stop?: () => 
 }
 
 describe('parseObjectKey', () => {
-  it('accepts a bare local object key', () => {
-    expect(parseObjectKey('clips/video.mp4')).toEqual({ localKey: 'clips/video.mp4' });
+  it('returns the object key as the workspace-local key (OSC structural isolation)', () => {
+    // Since the workspaceId-prefix layer was removed (commit 0d65216 — "a stack
+    // is a workspace"), the full bucket key IS the local key.
+    expect(parseObjectKey('clips/video.mp4')).toEqual({
+      localKey: 'clips/video.mp4'
+    });
     expect(parseObjectKey('video.mp4')).toEqual({ localKey: 'video.mp4' });
   });
 
@@ -72,6 +80,44 @@ describe('extractKeyFromNotification', () => {
   it('returns undefined for a malformed record', () => {
     expect(extractKeyFromNotification({})).toBeUndefined();
     expect(extractKeyFromNotification(null)).toBeUndefined();
+  });
+});
+
+// Fail-loud config validation (issue #642). When watch-folder ingest is enabled
+// but the required object-storage connection variable (MINIO_URL) is absent —
+// the exact Open Source Cloud scenario — the feature must NOT silently no-op:
+// classifyWatchFolderConfig reports 'misconfigured' and
+// watchFolderMisconfiguredMessage names the missing config + affected ingest
+// method so main.ts can log a clear, actionable error.
+describe('classifyWatchFolderConfig (issue #642 fail-loud)', () => {
+  it('is disabled when the feature flag is off, regardless of storage', () => {
+    expect(classifyWatchFolderConfig(false, false)).toBe('disabled');
+    expect(classifyWatchFolderConfig(false, true)).toBe('disabled');
+  });
+
+  it('is misconfigured when enabled but the storage variable is absent', () => {
+    // This is the silent-no-op trap: the operator asked for the feature but the
+    // object-storage endpoint it depends on is not set.
+    expect(classifyWatchFolderConfig(true, false)).toBe('misconfigured');
+  });
+
+  it('is ready when enabled and storage is present', () => {
+    expect(classifyWatchFolderConfig(true, true)).toBe('ready');
+  });
+});
+
+describe('watchFolderMisconfiguredMessage (issue #642)', () => {
+  it('names the missing config variable and the affected ingest method', () => {
+    const msg = watchFolderMisconfiguredMessage();
+    // Acceptance criteria: the error names the missing configuration...
+    expect(msg).toContain(WATCH_FOLDER_STORAGE_ENV_VAR);
+    expect(WATCH_FOLDER_STORAGE_ENV_VAR).toBe('MINIO_URL');
+    // ...and the ingest method it affects.
+    expect(msg).toContain(WATCH_FOLDER_INGEST_METHOD);
+    expect(WATCH_FOLDER_INGEST_METHOD).toBe('watch-folder');
+    // It is actionable (tells the operator what to do), not a bare "disabled".
+    expect(msg).toMatch(/unavailable/i);
+    expect(msg).toContain('WATCH_FOLDER_ENABLED');
   });
 });
 
@@ -134,7 +180,7 @@ describe('WatchFolderService polling', () => {
 
   it('skips a bad object key without crashing', async () => {
     const svc = new WatchFolderService({
-      client: fakeClient(['/leading-slash.mp4', 'good.mp4']),
+      client: fakeClient(['/bad-leading-slash.mp4', 'good.mp4']),
       bucket: 'src',
       repository: repo,
       log: silentLog

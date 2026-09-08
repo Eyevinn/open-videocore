@@ -26,6 +26,8 @@ import {
   type SecretStore
 } from '../services/storage-backend-registry.js';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
+import type { BucketProbeClient } from '../services/external-backend-validation.js';
+import { Readable } from 'node:stream';
 
 // The router only ever calls stackResolver on the /buckets routes, never on the
 // /backends routes — a stub that throws if touched keeps the test honest.
@@ -60,6 +62,26 @@ async function buildApp(registry?: StorageBackendRegistry) {
 
 function makeRegistry(secrets?: SecretStore): StorageBackendRegistry {
   return new StorageBackendRegistry(new InMemoryBackendRecordStore(), secrets);
+}
+
+// A registry that runs the issue #550 registration-time probe with an injected
+// client that always fails connectivity, so register surfaces a 422 without any
+// live network I/O.
+function makeUnreachableValidatingRegistry(secrets?: SecretStore): StorageBackendRegistry {
+  const unreachable: BucketProbeClient = {
+    bucketExists: async () => {
+      const err = new Error('boom') as Error & { code: string };
+      err.code = 'ECONNREFUSED';
+      throw err;
+    },
+    listObjectsV2: () => new Readable({ read() {} }),
+    putObject: async () => ({}),
+    statObject: async () => ({}),
+    removeObject: async () => {}
+  };
+  return new StorageBackendRegistry(new InMemoryBackendRecordStore(), secrets, {
+    probeClientFactory: () => unreachable
+  });
 }
 
 type BackendView = {
@@ -162,6 +184,28 @@ describe('POST /api/v1/storage/backends — register', () => {
     });
     expect(res.statusCode).toBe(501);
     expect(saveSecret).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('responds 422 with a machine-readable reason when validation fails (issue #550)', async () => {
+    const app = await buildApp(makeUnreachableValidatingRegistry(makeSecretStore()));
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/storage/backends',
+      payload: VALID_BODY
+    });
+    expect(res.statusCode).toBe(422);
+    const body = res.json() as { error: string; reason: string; message: string };
+    expect(body.error).toBe('backend_validation_failed');
+    expect(body.reason).toBe('unreachable');
+    // The unreachable backend was NOT silently registered.
+    const list = await app.inject({ method: 'GET', url: '/api/v1/storage/backends' });
+    const backends = (list.json() as { backends: BackendView[] }).backends;
+    expect(backends.find((b) => b.name === VALID_BODY.name)).toBeUndefined();
+    // No secret material was fanned out for the rejected backend, and the raw
+    // secret never appears in the validation error.
+    expect(saveSecret).not.toHaveBeenCalled();
+    expect(JSON.stringify(body)).not.toContain(RAW_SECRET);
     await app.close();
   });
 

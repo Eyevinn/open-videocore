@@ -38,6 +38,7 @@ import { decodeEncoreJobId } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
+import type { AuditEmitter } from '../data/audit-emit.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
@@ -123,6 +124,10 @@ type InternalRouterOptions = {
   resolveRelocation?: () => Promise<
     { client: RelocationClient; packagedBucket: string } | undefined
   >;
+  // Best-effort audit emission (issue #564). Passed to completeTranscode so the
+  // transcode job's terminal (done/failed) transition emits exactly one audit
+  // entry, fire-and-forget. Absent => transcode completion runs un-audited.
+  audit?: AuditEmitter;
 };
 
 // Are all steps of an execution terminal (done)? Used to close out an execution.
@@ -451,7 +456,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           error: success ? undefined : (message ?? `encore status: ${status}`),
           renditions: success ? normaliseRenditions(output) : []
         },
-        { jobs: jobRepository, assets: repository }
+        { jobs: jobRepository, assets: repository, audit: opts.audit, auditLog: fastify.log }
       );
 
       // #525 pt.2: pin the instance that ran this job against premature

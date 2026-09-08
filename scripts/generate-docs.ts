@@ -438,9 +438,23 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/assets
 </ol>
 
 <h2 id="watch-folder">6. Watch-folder ingest</h2>
-<p>Point open-videocore at an object storage bucket and it will pick up new files automatically, without any per-file API call:</p>
+<p>Point open-videocore at an object storage bucket and it will pick up new files dropped straight into that bucket (via <code>mc</code>, <code>rclone</code>, or another system) automatically, without any per-file API call:</p>
 ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/storage/buckets/<bucket>/watch-folder/toggle \\\n  -H "Content-Type: application/json" \\\n  -d \'{"enabled": true}\'')}
-<p>See <a href="ref-storage.html">Storage reference</a> for bucket listing and the poller's own start/stop controls in <a href="ref-admin.html">Admin</a>.</p>
+
+<div class="callout warn"><strong>Watch-folder ingest is not available on the hosted platform by default.</strong> Unlike the other four ingest paths above, it is <em>not</em> supported in the default provisioned (multi-stack) deployment, because there is no single shared source bucket to watch. It requires a deployment configured against one global, directly-reachable object-storage endpoint (see prerequisites below). If you are on the hosted platform and need it, it is pending provisioning work — use URL pull, direct upload, presigned, or multipart ingest in the meantime.</div>
+
+<h3 id="watch-folder-prereqs">Prerequisites</h3>
+<p>Watch-folder ingest is only wired up when the deployment is pointed at a single, directly-reachable object-storage endpoint. Two things must both be configured on the API process:</p>
+<ol>
+  <li>A global object-storage endpoint via the <code>MINIO_URL</code> environment variable (with <code>MINIO_ACCESS_KEY</code> / <code>MINIO_SECRET_KEY</code>). Without this the watch-folder service is never started — the API falls back to the per-request upload and URL-pull routes only.</li>
+  <li>The opt-in flag <code>WATCH_FOLDER_ENABLED=true</code>. The service is disabled by default even when object storage is configured.</li>
+</ol>
+<p>Optionally, tune the polling fallback cadence with <code>WATCH_FOLDER_POLL_INTERVAL_SECONDS</code> (default <code>30</code>); it is used when the storage backend does not expose bucket-change notifications.</p>
+
+<h3 id="watch-folder-verify">Verify it is active</h3>
+<p>Confirm the watch-folder is configured and running before you rely on it:</p>
+${renderCurlBlock('Request', 'curl https://<your-instance>/api/v1/admin/watch-folder/status')}
+<p>A response of <code>{"enabled": true, "running": true, ...}</code> means the service is configured and watching. <code>"enabled": false</code> means the prerequisites above are not met on this deployment (no global object-storage endpoint, or <code>WATCH_FOLDER_ENABLED</code> is not set) and watch-folder ingest is unavailable there. See the <a href="ref-admin.html">Admin reference</a> for the poller's start/stop controls and the <a href="ref-storage.html">Storage reference</a> for per-bucket listing and toggling.</p>
 
 <div class="callout">Every path above ends at the same place: an <a href="data-model.html#asset">Asset</a> with <code>status</code> moving from <code>uploading</code> to <code>processing</code> to <code>ready</code> (or <code>failed</code>). Watch that field, or an <a href="guide-organizing.html#webhooks">asset.ready / asset.failed webhook</a>, rather than polling the job directly once the source file has landed.</div>
 `,
@@ -1392,20 +1406,20 @@ Access Token as the OSC access token. Generate strong passwords for
 </ol>
 
 <h2 id="env-vars">Environment variables</h2>
-<p class="group-blurb">Set automatically by the deploy step above, or configurable directly if you're running open-videocore yourself.</p>
+<p class="group-blurb">On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional <code>ENCORE_*</code> tuning knobs. The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The <strong>OSC-configurable</strong> column below marks which is which.</p>
 <table class="env">
-  <thead><tr><th>Variable</th><th>Required</th><th>Description</th></tr></thead>
+  <thead><tr><th>Variable</th><th>Required</th><th>OSC-configurable</th><th>Description</th></tr></thead>
   <tbody>
-    <tr><td><code>OSC_ACCESS_TOKEN</code></td><td>Yes</td><td>Personal Access Token. Injected automatically at deploy time on OSC.</td></tr>
-    <tr><td><code>PARAMETER_STORE_API_KEY</code></td><td>Yes</td><td>Config API key of the connected parameter store.</td></tr>
-    <tr><td><code>PARAMETER_STORE_INSTANCE_NAME</code></td><td>Yes</td><td>Name of the parameter store (default <code>ovcconfig</code>).</td></tr>
-    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Admin password used when provisioning object storage instances.</td></tr>
-    <tr><td><code>COUCHDB_ADMIN_PASSWORD</code></td><td>Yes</td><td>Admin password used when provisioning the metadata store.</td></tr>
-    <tr><td><code>PORT</code></td><td>No</td><td>HTTP port (default <code>3000</code>).</td></tr>
-    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>).</td></tr>
-    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
-    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>).</td></tr>
-    <tr><td><code>PUBLIC_BASE_URL</code></td><td>No</td><td>Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder.</td></tr>
+    <tr><td><code>OSC_ACCESS_TOKEN</code></td><td>Yes</td><td>Injected</td><td>Personal Access Token. Injected automatically at deploy time on OSC.</td></tr>
+    <tr><td><code>PARAMETER_STORE_API_KEY</code></td><td>Yes</td><td>Yes</td><td>Config API key of the connected parameter store.</td></tr>
+    <tr><td><code>PARAMETER_STORE_INSTANCE_NAME</code></td><td>Yes</td><td>Yes</td><td>Name of the parameter store (default <code>ovcconfig</code>). On OSC this is the <code>ParameterStore</code> deploy-form field.</td></tr>
+    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning object storage instances.</td></tr>
+    <tr><td><code>COUCHDB_ADMIN_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning the metadata store.</td></tr>
+    <tr><td><code>PORT</code></td><td>No</td><td>No</td><td>HTTP port (default <code>3000</code>). Fixed by the platform on OSC; self-hosted only.</td></tr>
+    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>).</td></tr>
+    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Yes</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Yes</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>).</td></tr>
+    <tr><td><code>PUBLIC_BASE_URL</code></td><td>No</td><td>No</td><td>Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. <strong>Self-hosted only — not configurable on Open Source Cloud</strong> (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.</td></tr>
   </tbody>
 </table>
 `;
@@ -1619,7 +1633,7 @@ ${renderHead('open-videocore — a video pipeline your AI agent can drive', SITE
   <a href="docs.html">Docs</a>&middot;
   <a href="agentic-examples.html">Agentic examples</a>&middot;
   <a href="https://github.com/Eyevinn/open-videocore" target="_blank" rel="noopener">GitHub</a>&middot;
-  <a href="https://www.eyevinntechnology.se" target="_blank" rel="noopener">Eyevinn Technology</a>
+  <a href="https://www.eyevinn.se" target="_blank" rel="noopener">Eyevinn Technology</a>
 </footer>
 <script>${JS}</script>
 </body>
