@@ -40,6 +40,7 @@ import { webhooksRouter } from './routes/webhooks.js';
 import { collectionsRouter } from './routes/collections.js';
 import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
+import { exportDestinationsRouter } from './routes/export-destinations.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
@@ -1594,6 +1595,17 @@ await app.register(storageRouter, {
   prefix: '/api/v1/storage',
   stackResolver,
   watchFolder,
+  storageBackendRegistry
+});
+
+// Named export/delivery destinations (issue #572, ADR-018). A thin VIEW over the
+// SAME storage-backend registry (ADR-018 D1: an export destination is a
+// registered backend in the output role — no new data model, no new secret
+// store). Reuses the identical registry instance so registration records and OSC
+// per-service credentials are shared with /storage/backends. Degrades to 501 when
+// no registry is wired.
+await app.register(exportDestinationsRouter, {
+  prefix: '/api/v1/export-destinations',
   storageBackendRegistry
 });
 

@@ -543,6 +543,21 @@ export class StorageBackendRegistry {
     return [defaultBackendView(), ...views];
   }
 
+  // Resolve a single registered backend by its stable id, redacted. Returns the
+  // implicit OSC-managed default's view for id 'default' (it is synthesised, not
+  // stored — mirrors list()), and undefined for an unknown id. Added for the
+  // named-export-destination lookup (issue #572 / ADR-018 D1: "A destination must
+  // be resolvable by a stable id/name"): a caller — or a later job-reference
+  // sub-issue — resolves a destination by id through the SAME registry records
+  // and the SAME redaction, never echoing the secret.
+  async get(workspaceId: string, id: string): Promise<RegisteredBackendView | undefined> {
+    if (id === DEFAULT_BACKEND_ID) {
+      return defaultBackendView();
+    }
+    const record = await this.records.get(workspaceId, id);
+    return record ? redactBackend(record) : undefined;
+  }
+
   // Look a registered backend up by id OR by name (case-sensitive name match),
   // scoped to the workspace. Returns undefined for the implicit default (which
   // is synthesised, not stored) and for any unknown reference. Used by ingest
