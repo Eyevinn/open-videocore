@@ -163,6 +163,13 @@ export type RehydrateState = {
   startedAt: string;
 };
 
+// The two observable steps of a restore on the tier axis (ADR-019 D4, issue
+// #558). `begin` marks a class in-flight (bytes still `archive`); `complete`
+// flips it to `hot` and clears the in-flight marker. Modelled as a dedicated
+// enum (not a free string) so the single repo write path is type-checked.
+export const REHYDRATE_PHASES = ['begin', 'complete'] as const;
+export type RehydratePhase = (typeof REHYDRATE_PHASES)[number];
+
 // The per-asset storage-tiering state (ADR-019 D1/D3/D4). Holds the tier of
 // each byte class plus any in-flight rehydrates. A fresh/existing asset defaults
 // to every class `hot` with no rehydrate in flight (see `defaultStorageTiering`);
@@ -192,6 +199,48 @@ export function applyStorageTier(
   return {
     tiers: { ...base.tiers, ...overrides },
     rehydrating: base.rehydrating ?? []
+  };
+}
+
+// Mark a byte class as having a restore IN FLIGHT (ADR-019 D4, issue #558):
+// record it in the `rehydrating[]` list WITHOUT touching the `tiers` axis. The
+// byte class stays on `archive` (its bytes are still cold) while the restore
+// runs; only when the copy completes does the tier flip to `hot` (see
+// `completeRehydrate`). PURE so both repos reuse it and the couch repo can
+// re-run it inside updateWithRetry. Idempotent: re-marking a class already in
+// flight refreshes nothing (keeps the original `startedAt`) so a retried
+// request does not reset the operator-facing latency clock. Never touches
+// `status`/`statusHistory` (the ADR-019 D6 tier/status firewall).
+export function beginRehydrate(
+  existing: StorageTiering | undefined,
+  byteClass: StorageByteClass,
+  startedAt: string
+): StorageTiering {
+  const base = existing ?? defaultStorageTiering();
+  const already = (base.rehydrating ?? []).some((r) => r.byteClass === byteClass);
+  return {
+    tiers: { ...base.tiers },
+    rehydrating: already
+      ? [...base.rehydrating]
+      : [...(base.rehydrating ?? []), { byteClass, startedAt }]
+  };
+}
+
+// Complete a restore for a byte class (ADR-019 D4, issue #558): flip its tier
+// `archive -> hot` AND drop it from `rehydrating[]`, atomically, so the asset is
+// never observed as both `hot` and still-rehydrating. PURE and idempotent: a
+// class not currently rehydrating (already hot, or never started) is simply set
+// `hot` and the list is left consistent. Never touches `status`/`statusHistory`
+// (the ADR-019 D6 tier/status firewall) — a rehydrate flips ONLY the byte tier
+// and can never move an asset out of the `archived` lifecycle status.
+export function completeRehydrate(
+  existing: StorageTiering | undefined,
+  byteClass: StorageByteClass
+): StorageTiering {
+  const base = existing ?? defaultStorageTiering();
+  return {
+    tiers: { ...base.tiers, [byteClass]: 'hot' },
+    rehydrating: (base.rehydrating ?? []).filter((r) => r.byteClass !== byteClass)
   };
 }
 
@@ -768,6 +817,25 @@ export interface AssetRepository {
   setStorageTier(
     id: string,
     overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined>;
+  // Dedicated rehydrate-state write path (ADR-019 D4, issue #558). Drives ONE
+  // byte class through the restore lifecycle on the `storageTiering` axis:
+  //   - phase 'begin'    — record the class in `rehydrating[]` (in-flight),
+  //                        leaving its tier on `archive` while the cold->hot copy
+  //                        runs, so callers see the restore is underway and can
+  //                        wait on it.
+  //   - phase 'complete' — flip the class `archive -> hot` AND drop it from
+  //                        `rehydrating[]` atomically, once the bytes are hot.
+  // DISTINCT from `update()` and from `setStorageTier()` so the rehydrate
+  // lifecycle never rides on an editorial or relocation write, and — like every
+  // tier-axis write — NEVER touches lifecycle `status`/`statusHistory` (the
+  // ADR-019 D6 tier/status firewall; D6 rule #4: rehydrate flips only the byte
+  // tier and can never revive an `archived`-status asset). Returns the updated
+  // asset, or undefined when the id is unknown.
+  setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
   ): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
   countChildren(id: string): Promise<number>;
@@ -1365,6 +1433,27 @@ export class InMemoryAssetRepository implements AssetRepository {
       storageTiering: applyStorageTier(existing.storageTiering, overrides),
       updatedAt: now
     };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  // Dedicated rehydrate-state write path (ADR-019 D4, issue #558). Mutates ONLY
+  // `storageTiering` + `updatedAt`; NEVER `status`/`statusHistory` (D6 firewall).
+  async setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
+  ): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const tiering =
+      phase === 'begin'
+        ? beginRehydrate(existing.storageTiering, byteClass, now)
+        : completeRehydrate(existing.storageTiering, byteClass);
+    const next: Asset = { ...existing, storageTiering: tiering, updatedAt: now };
     this.store.set(id, next);
     return { ...next };
   }
