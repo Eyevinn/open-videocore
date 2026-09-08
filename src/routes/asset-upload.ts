@@ -330,7 +330,21 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       if (!existing) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // The single-part presigned flow (POST /:id/upload-url) stores the source
+      // object at sourceObjectKey(asset.id) but never records that key on the
+      // asset — unlike the proxied PUT /:id/upload path (which writes objectKey
+      // at asset-upload.ts:179) and the multipart complete path (which writes it
+      // at asset-upload.ts:288). Without objectKey the downstream processing
+      // operations (transcode/package/thumbnails/clip/export) resolve the source
+      // via asset.objectKey and 409 `no_object` (assets.ts:2733). Persist the
+      // finalized source key here alongside the lifecycle transition so the
+      // single-part finalize path reaches parity with the multipart one. Keep an
+      // already-recorded objectKey (e.g. from PUT /:id/upload) rather than
+      // clobbering it. The `objectKey` field is the write contract verified in
+      // UpdateAssetInput (asset-repo.ts:527, field at :530).
+      const objectKey = existing.objectKey ?? sourceObjectKey(existing.id);
       const updated = await repo.update(request.params.id, {
+        objectKey,
         status: 'processing'
       });
       if (!updated) {
@@ -338,7 +352,6 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       }
       // Trigger technical metadata extraction against the stored object
       // (issue #6). Fire-and-forget; does not affect this response.
-      const objectKey = existing.objectKey ?? sourceObjectKey(updated.id);
       const storage = storageFor();
       opts.onObjectStored?.(updated.id, objectKey, storage);
       return reply.code(200).send({ id: updated.id, status: updated.status });
