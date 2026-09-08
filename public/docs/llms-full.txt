@@ -3241,14 +3241,33 @@ For files too large for a single PUT, initiate a multipart upload, request a pre
 
 6. Watch-folder ingest
 
-Point open-videocore at an object storage bucket and it will pick up new files automatically, without any per-file API call:
+Point open-videocore at an object storage bucket and it will pick up new files dropped straight into that bucket (via mc, rclone, or another system) automatically, without any per-file API call:
 
 Request
 curl -X POST https://<your-instance>/api/v1/storage/buckets/<bucket>/watch-folder/toggle \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
 
-See Storage reference for bucket listing and the poller's own start/stop controls in Admin.
+Watch-folder ingest is not available on the hosted platform by default. Unlike the other four ingest paths above, it is not supported in the default provisioned (multi-stack) deployment, because there is no single shared source bucket to watch. It requires a deployment configured against one global, directly-reachable object-storage endpoint (see prerequisites below). If you are on the hosted platform and need it, it is pending provisioning work — use URL pull, direct upload, presigned, or multipart ingest in the meantime.
+
+Prerequisites
+
+Watch-folder ingest is only wired up when the deployment is pointed at a single, directly-reachable object-storage endpoint. Two things must both be configured on the API process:
+
+  - A global object-storage endpoint via the MINIO_URL environment variable (with MINIO_ACCESS_KEY / MINIO_SECRET_KEY). Without this the watch-folder service is never started — the API falls back to the per-request upload and URL-pull routes only.
+
+  - The opt-in flag WATCH_FOLDER_ENABLED=true. The service is disabled by default even when object storage is configured.
+
+Optionally, tune the polling fallback cadence with WATCH_FOLDER_POLL_INTERVAL_SECONDS (default 30); it is used when the storage backend does not expose bucket-change notifications.
+
+Verify it is active
+
+Confirm the watch-folder is configured and running before you rely on it:
+
+Request
+curl https://<your-instance>/api/v1/admin/watch-folder/status
+
+A response of {"enabled": true, "running": true, ...} means the service is configured and watching. "enabled": false means the prerequisites above are not met on this deployment (no global object-storage endpoint, or WATCH_FOLDER_ENABLED is not set) and watch-folder ingest is unavailable there. See the Admin reference for the poller's start/stop controls and the Storage reference for per-bucket listing and toggling.
 
 Every path above ends at the same place: an Asset with status moving from uploading to processing to ready (or failed). Watch that field, or an asset.ready / asset.failed webhook, rather than polling the job directly once the source file has landed.
 

@@ -332,11 +332,25 @@ curl -X POST https://&lt;your-instance&gt;/api/v1/assets/&lt;id&gt;/upload-compl
 </ol>
 
 <h2 id="watch-folder">6. Watch-folder ingest</h2>
-<p>Point open-videocore at an object storage bucket and it will pick up new files automatically, without any per-file API call:</p>
+<p>Point open-videocore at an object storage bucket and it will pick up new files dropped straight into that bucket (via <code>mc</code>, <code>rclone</code>, or another system) automatically, without any per-file API call:</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X POST https://&lt;your-instance&gt;/api/v1/storage/buckets/&lt;bucket&gt;/watch-folder/toggle \
   -H &quot;Content-Type: application/json&quot; \
   -d '{&quot;enabled&quot;: true}'</code></pre></div>
-<p>See <a href="ref-storage.html">Storage reference</a> for bucket listing and the poller's own start/stop controls in <a href="ref-admin.html">Admin</a>.</p>
+
+<div class="callout warn"><strong>Watch-folder ingest is not available on the hosted platform by default.</strong> Unlike the other four ingest paths above, it is <em>not</em> supported in the default provisioned (multi-stack) deployment, because there is no single shared source bucket to watch. It requires a deployment configured against one global, directly-reachable object-storage endpoint (see prerequisites below). If you are on the hosted platform and need it, it is pending provisioning work — use URL pull, direct upload, presigned, or multipart ingest in the meantime.</div>
+
+<h3 id="watch-folder-prereqs">Prerequisites</h3>
+<p>Watch-folder ingest is only wired up when the deployment is pointed at a single, directly-reachable object-storage endpoint. Two things must both be configured on the API process:</p>
+<ol>
+  <li>A global object-storage endpoint via the <code>MINIO_URL</code> environment variable (with <code>MINIO_ACCESS_KEY</code> / <code>MINIO_SECRET_KEY</code>). Without this the watch-folder service is never started — the API falls back to the per-request upload and URL-pull routes only.</li>
+  <li>The opt-in flag <code>WATCH_FOLDER_ENABLED=true</code>. The service is disabled by default even when object storage is configured.</li>
+</ol>
+<p>Optionally, tune the polling fallback cadence with <code>WATCH_FOLDER_POLL_INTERVAL_SECONDS</code> (default <code>30</code>); it is used when the storage backend does not expose bucket-change notifications.</p>
+
+<h3 id="watch-folder-verify">Verify it is active</h3>
+<p>Confirm the watch-folder is configured and running before you rely on it:</p>
+<div class="code-block"><div class="code-label">Request</div><pre><code>curl https://&lt;your-instance&gt;/api/v1/admin/watch-folder/status</code></pre></div>
+<p>A response of <code>{"enabled": true, "running": true, ...}</code> means the service is configured and watching. <code>"enabled": false</code> means the prerequisites above are not met on this deployment (no global object-storage endpoint, or <code>WATCH_FOLDER_ENABLED</code> is not set) and watch-folder ingest is unavailable there. See the <a href="ref-admin.html">Admin reference</a> for the poller's start/stop controls and the <a href="ref-storage.html">Storage reference</a> for per-bucket listing and toggling.</p>
 
 <div class="callout">Every path above ends at the same place: an <a href="data-model.html#asset">Asset</a> with <code>status</code> moving from <code>uploading</code> to <code>processing</code> to <code>ready</code> (or <code>failed</code>). Watch that field, or an <a href="guide-organizing.html#webhooks">asset.ready / asset.failed webhook</a>, rather than polling the job directly once the source file has landed.</div>
 
