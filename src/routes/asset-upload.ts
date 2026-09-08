@@ -28,6 +28,7 @@ import { z } from 'zod';
 import { InvalidStateTransitionError, type AssetRepository } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { uploadUrlTtlSeconds, SourceTooLargeError, type CompletedPart, type WorkspaceStorage } from '../data/storage.js';
+import { QuotaExceededError, type StorageQuotaGuard } from '../data/storage-quota.js';
 
 // Factory so production wires a real MinIO-backed WorkspaceStorage per request
 // (bound to the caller's workspace) while tests inject a fake. Mirrors the
@@ -51,6 +52,14 @@ export type AssetUploadRouterOptions = {
   // re-resolve it from the cache, which may not have a bare-workspaceId entry
   // when the request came in with an X-Stack-Name header.
   onObjectStored?: (assetId: string, objectKey: string, storage?: WorkspaceStorage) => void;
+  // Operator-configured total storage cap (issue #579, ADR-020). When provided,
+  // direct-upload ingest is admitted through the running-total counter: the
+  // proxied PUT reserves headroom (Content-Length hint) before accepting bytes
+  // and commits the TRUE size on success; the explicit upload-complete finalize
+  // (single-part presigned + multipart) admits post-hoc against the committed
+  // object's real size (statObject). An over-cap ingest is rejected 409
+  // quota_exceeded. Absent => no cap, behaviour unchanged (opt-in).
+  quota?: StorageQuotaGuard;
 };
 
 // Deterministic object key for an asset's source payload. Workspace scoping is
@@ -110,7 +119,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   // Pass any non-JSON body through as a stream so PUT /:id/upload can pipe it
   // to MinIO. Scoped to this plugin — does not affect other routers.
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { repository: repo, storageFor } = opts;
+  const { repository: repo, storageFor, quota } = opts;
 
   // Uniform 501 for storage-backed handlers when no object storage is wired.
   // The routes are always registered (so they appear in the spec, issue #479);
@@ -124,6 +133,10 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     }
     if (err instanceof InvalidStateTransitionError) {
       return reply.code(422).send({ error: 'invalid_state_transition', message: err.message });
+    }
+    // Total storage cap exceeded (issue #579). Machine-readable 409 quota_exceeded.
+    if (err instanceof QuotaExceededError) {
+      return reply.code(err.statusCode).send({ error: err.reason, message: err.message });
     }
     throw err;
   });
@@ -147,7 +160,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     {
       
       bodyLimit: 10 * 1024 * 1024 * 1024, // 10 GiB — body is streamed, not buffered
-      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 413: errorSchema, 501: errorSchema } }
+      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 409: errorSchema, 413: errorSchema, 501: errorSchema } }
     },
     async (request, reply) => {
       if (!storageFor) {
@@ -163,19 +176,31 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
         ? Number(request.headers['content-length'])
         : undefined;
 
+      // Reserve quota headroom BEFORE accepting bytes (issue #579). The
+      // Content-Length hint sizes the reservation; when absent we reserve 0 and
+      // rely on the commit-time true size (+ reconciliation). A reservation that
+      // would breach the cap throws QuotaExceededError -> 409 quota_exceeded
+      // (handled above) before a single byte is written.
+      const reservation = quota ? await quota.admit(contentLength ?? 0) : undefined;
+
       const maxBytes = 10 * 1024 * 1024 * 1024; // 10 GiB cap
+      let bytesTransferred = 0;
       try {
-        await storage.putStream(objectKey, request.body as Readable, {
+        ({ bytesTransferred } = await storage.putStream(objectKey, request.body as Readable, {
           maxBytes,
           totalBytes: contentLength
-        });
+        }));
       } catch (err) {
+        // Release the reservation so an abandoned upload does not hold headroom.
+        await reservation?.release();
         if (err instanceof SourceTooLargeError) {
           return reply.code(413).send({ error: 'payload_too_large', message: err.message });
         }
         throw err;
       }
 
+      // Commit the TRUE transferred size to the running total (issue #579).
+      await reservation?.commit(bytesTransferred);
       await repo.update(asset.id, { objectKey, status: 'processing' });
       opts.onObjectStored?.(asset.id, objectKey, storage);
       return reply.code(200).send({ id: asset.id, status: 'processing' });
@@ -320,7 +345,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/upload-complete',
     {
       
-      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 501: errorSchema } }
+      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 409: errorSchema, 501: errorSchema } }
     },
     async (request, reply) => {
       if (!storageFor) {
@@ -343,6 +368,35 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       // clobbering it. The `objectKey` field is the write contract verified in
       // UpdateAssetInput (asset-repo.ts:527, field at :530).
       const objectKey = existing.objectKey ?? sourceObjectKey(existing.id);
+      const storage = storageFor();
+
+      // Total-storage-cap enforcement at upload COMPLETION (issue #579). The
+      // presigned single-part and multipart flows write bytes straight to MinIO
+      // without transiting this process, so the reservation cannot size them up
+      // front — we admit them post-hoc here, at the one point the object exists
+      // and its TRUE size is knowable (statObject). If admitting the real size
+      // would breach the cap we reject 409 quota_exceeded AND delete the
+      // over-cap object so it never counts against the deployment, leaving the
+      // asset un-finalized (still `uploading`). No cap configured => skip.
+      if (quota) {
+        const stat = await storage.statObject(objectKey);
+        const size = stat?.size ?? 0;
+        let reservation;
+        try {
+          reservation = await quota.admit(size);
+        } catch (err) {
+          if (err instanceof QuotaExceededError) {
+            // The bytes are already in MinIO but were never admitted — delete
+            // the over-cap object so it does not count against the deployment,
+            // then surface the 409 (the asset stays un-finalized / `uploading`).
+            await storage.removeObject(objectKey).catch(() => { /* best-effort */ });
+          }
+          throw err;
+        }
+        // admit() succeeded; commit the real size to the running total.
+        await reservation.commit(size);
+      }
+
       const updated = await repo.update(request.params.id, {
         objectKey,
         status: 'processing'
@@ -352,7 +406,6 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       }
       // Trigger technical metadata extraction against the stored object
       // (issue #6). Fire-and-forget; does not affect this response.
-      const storage = storageFor();
       opts.onObjectStored?.(updated.id, objectKey, storage);
       return reply.code(200).send({ id: updated.id, status: updated.status });
     }

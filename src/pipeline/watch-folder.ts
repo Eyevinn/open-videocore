@@ -35,6 +35,7 @@
 
 import type { Client as MinioClient } from 'minio';
 import type { AssetRepository } from '../data/asset-repo.js';
+import type { StorageQuotaGuard } from '../data/storage-quota.js';
 
 // Logger surface we depend on (subset of Fastify's logger). Injected so the
 // service stays decoupled from Fastify and is trivial to stub in tests.
@@ -142,6 +143,15 @@ export type WatchFolderOptions = {
   // Same callback the upload route fires post-upload (issue #6 ffprobe). When
   // provided, a newly ingested object triggers fire-and-forget extraction.
   onObjectStored?: (assetId: string, objectKey: string) => void;
+  // Operator-configured total storage cap (issue #579, ADR-020). Watch-folder
+  // ingest is an operator/other-system dropping bytes DIRECTLY into the bucket,
+  // bypassing the API — the bytes already exist and there is nothing to reject
+  // at admission. So for this path the cap is maintained by ACCOUNTING: when a
+  // direct-drop object is ingested we record its statObject size as a committed
+  // delta on the running total, so it correctly reduces headroom for subsequent
+  // API ingests (and the reconciliation sweep is the ground-truth backstop).
+  // Absent => no accounting, behaviour unchanged (opt-in).
+  quota?: StorageQuotaGuard;
   // Polling cadence; defaults to the env-derived value.
   pollIntervalMs?: number;
   // Injectable timers for fast, deterministic tests.
@@ -158,6 +168,7 @@ export class WatchFolderService {
     assetId: string,
     objectKey: string
   ) => void;
+  private readonly quota?: StorageQuotaGuard;
   private readonly pollIntervalMs: number;
   private readonly setIntervalFn: (handler: () => void, ms: number) => ReturnType<typeof setInterval>;
   private readonly clearIntervalFn: (handle: ReturnType<typeof setInterval>) => void;
@@ -176,6 +187,7 @@ export class WatchFolderService {
     this.repo = opts.repository;
     this.log = opts.log;
     this.onObjectStored = opts.onObjectStored;
+    this.quota = opts.quota;
     this.pollIntervalMs = opts.pollIntervalMs ?? pollIntervalSeconds() * 1000;
     this.setIntervalFn = opts.setIntervalFn ?? ((h, ms) => setInterval(h, ms));
     this.clearIntervalFn = opts.clearIntervalFn ?? ((handle) => clearInterval(handle));
@@ -345,6 +357,17 @@ export class WatchFolderService {
         name,
         objectKey: parsed.localKey
       });
+      // Account the direct-drop bytes against the running total (issue #579).
+      // Best-effort: a stat failure must not abort ingest (the reconciliation
+      // sweep is the backstop), so it is caught and logged.
+      if (this.quota) {
+        try {
+          const stat = await this.client.statObject(this.bucket, fullKey);
+          await this.quota.recordDelta(stat.size ?? 0);
+        } catch (err) {
+          this.log.warn({ err, key: fullKey }, 'watch-folder: quota accounting failed');
+        }
+      }
       // Advance to processing and fire metadata extraction, mirroring the
       // upload route's post-upload behaviour.
       await this.repo.update(asset.id, { status: 'processing' });

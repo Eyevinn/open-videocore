@@ -220,6 +220,27 @@ export class WorkspaceStorage {
     return { etag: result.etag, bytesTransferred: transferred };
   }
 
+  // Sum the sizes of every object in the bucket (storage-quota reconciliation,
+  // issue #579 / ADR-020 Decision 2). This is the OFF-HOT-PATH ground-truth
+  // sweep: streaming listObjectsV2 and summing `size` over the whole bucket is
+  // O(n-objects), so it is used ONLY by the reconciliation cadence to correct
+  // counter drift / re-establish the total after a crash — NEVER on a write.
+  // The minio BucketItem is a union (node_modules/minio/.../internal/type.d.ts:83)
+  // whose object arm carries `size: number` and whose prefix arm carries
+  // `size: 0`; summing `size` across all items is therefore exact for a
+  // recursive listing (which yields only object items, no prefixes).
+  async sumObjectSizes(): Promise<number> {
+    const stream = this.client.listObjectsV2(this.bucket, '', true);
+    return await new Promise<number>((resolve, reject) => {
+      let total = 0;
+      stream.on('data', (obj) => {
+        total += obj.size ?? 0;
+      });
+      stream.on('end', () => resolve(total));
+      stream.on('error', reject);
+    });
+  }
+
   // List object keys in the bucket.
   async list(): Promise<string[]> {
     const keys: string[] = [];
