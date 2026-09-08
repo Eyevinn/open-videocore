@@ -45,6 +45,7 @@ import {
 import { InMemoryJobRepository, type JobRepository, type JobStatus } from '../data/job-repo.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
+import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { PRESET_NAMES, type PresetName } from '../pipeline/encode-presets.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
@@ -123,6 +124,16 @@ const dependencyUnreachableSchema = z.object({
   message: z.string()
 });
 
+// Machine-readable body for a 429 when the operator-configured job-throughput
+// cap is exceeded (issue #580). Names the configured ceiling and the observed
+// outstanding-job count so a caller can back off and retry.
+const jobThroughputCapSchema = z.object({
+  error: z.literal('job_throughput_cap_exceeded'),
+  cap: z.number(),
+  outstanding: z.number(),
+  message: z.string()
+});
+
 // Map our internal Job.status to the Encore job status vocabulary the caller
 // expects. pending/queued -> QUEUED, running -> IN_PROGRESS, done -> SUCCESSFUL,
 // failed -> FAILED.
@@ -177,6 +188,7 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
         body: encoreJobSchema,
         response: {
           200: encoreJobResponseSchema,
+          429: jobThroughputCapSchema,
           501: errorSchema,
           502: errorSchema,
           504: dependencyUnreachableSchema
@@ -277,6 +289,12 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
             'encore-compat submit failed: stack dependency unreachable'
           );
           return reply.code(504).send(err.toResponseBody());
+        }
+        // Optional operator-configured job-throughput cap exceeded (issue #580):
+        // return the documented machine-readable 429 + reason code rather than
+        // silently queueing unboundedly.
+        if (isJobThroughputCapExceededError(err)) {
+          return reply.code(err.statusCode).send(err.toResponseBody());
         }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });

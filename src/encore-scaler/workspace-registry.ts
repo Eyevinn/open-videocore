@@ -24,6 +24,12 @@ export type WorkspaceEncoreScalerConfig = {
   oscContext: Context;
   maxInstances: number;
   minInstances?: number;
+  // Optional operator-configured job-throughput cap (issue #580): max number of
+  // OUTSTANDING jobs (queued + being dispatched) admitted per deployment before
+  // submission is rejected with a 429. Unset => no cap (opt-in). Forwarded to
+  // every per-workspace scaler client so the submit path enforces it against the
+  // scaler's own Valkey state. See src/encore-scaler/job-throughput-cap.ts.
+  maxQueuedJobs?: number;
   idleTimeoutMs: number;
   // Bounded wait (ms) forwarded to every per-workspace scaler loop for the
   // outbound callback-listener TLS-trust probe that gates first-job dispatch
@@ -85,6 +91,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       workspaceId,
       maxInstances: this.config.maxInstances,
       minInstances: this.config.minInstances,
+      maxQueuedJobs: this.config.maxQueuedJobs,
       idleTimeoutMs: this.config.idleTimeoutMs,
       callbackTrustTimeoutMs: this.config.callbackTrustTimeoutMs,
       oscContext: this.config.oscContext,
