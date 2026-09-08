@@ -84,7 +84,12 @@ import {
   archivePurgeIntervalMsFromEnv
 } from './pipeline/archived-asset-purge-loop.js';
 import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
-import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
+import {
+  WatchFolderService,
+  watchFolderEnabled,
+  classifyWatchFolderConfig,
+  watchFolderMisconfiguredMessage
+} from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
@@ -1405,8 +1410,25 @@ await app.register(assetUploadRouter, {
 // (single global MinIO). In the provisioned multi-stack model there is no single
 // bucket to watch, so the watch-folder is skipped (the API upload + URL-pull
 // paths still cover ingest).
+// Fail-loud config validation (issue #642). Previously, if an operator turned
+// the feature ON (WATCH_FOLDER_ENABLED=true) but the required object-storage
+// connection variable (MINIO_URL) was absent — the exact situation on Open
+// Source Cloud, where that variable is never set — `envMinioClient` was
+// undefined and `watchFolder` silently became undefined: no ingest, no error.
+// We now CLASSIFY the config and, when the feature is requested but its storage
+// dependency is missing, log a clear, actionable error naming the missing
+// variable and the affected ingest method rather than silently no-op'ing. We do
+// NOT provision the endpoint (that is #643) and do NOT change the status API
+// surface (that is #644) — scope here is fail-loud only.
+const watchFolderConfigState = classifyWatchFolderConfig(
+  watchFolderEnabled(),
+  storageAvailable
+);
+if (watchFolderConfigState === 'misconfigured') {
+  app.log.error({ ingestMethod: 'watch-folder' }, watchFolderMisconfiguredMessage());
+}
 const watchFolder =
-  envMinioClient && watchFolderEnabled()
+  watchFolderConfigState === 'ready' && envMinioClient
     ? new WatchFolderService({
         client: envMinioClient,
         bucket: sourceBucket,
