@@ -399,6 +399,13 @@ await app.register(provisionRouter, {
     void reconcileScaler().catch((err) =>
       app.log.warn({ err }, 'encore-scaler: reconcile after stack change failed')
     );
+    // Wire (or rewire) the watch-folder from the just-provisioned stack's
+    // parameter-store-backed object storage (issue #643). On a fresh OSC
+    // deployment the storage endpoint only becomes known here, so this is the
+    // moment watch-folder ingest can first come online — with no restart.
+    void wireWatchFolderFromStack().catch((err) =>
+      app.log.warn({ err }, 'watch-folder: wire after stack change failed')
+    );
   },
   // Late-bound accessor for the scaler registry. scalerRegistry is a
   // module-level binding created lazily by reconcileScaler() only once a stack
@@ -1399,13 +1406,27 @@ await app.register(assetUploadRouter, {
   onObjectStored
 });
 
-// Watch-folder ingest (issue #16). Opt-in via WATCH_FOLDER_ENABLED=true. It is
-// a global background service watching a single source bucket, so it needs a
-// concrete MinIO client up front — only available via the explicit env override
-// (single global MinIO). In the provisioned multi-stack model there is no single
-// bucket to watch, so the watch-folder is skipped (the API upload + URL-pull
-// paths still cover ingest).
-const watchFolder =
+// Watch-folder ingest (issue #16, #643). Opt-in via WATCH_FOLDER_ENABLED=true.
+// It is a background service watching a single source bucket, so it needs a
+// concrete MinIO client + bucket. Two sources, preferred in order:
+//   1. Explicit env override (MINIO_URL) — local dev / ops: the client is known
+//      at boot and never changes.
+//   2. Platform parameter store (Open Source Cloud) — the object-storage
+//      endpoint, access key, and secret are provisioned into the running
+//      instance via the OSC parameter store (ADR-001 Day-1 deploy plan, steps
+//      2-3) and surface on the resolved stack's `storageClient` / `sourceBucket`
+//      (services/workspace-stack.ts:buildConnectionsFromStack). The stack does
+//      NOT exist at boot on a fresh OSC deployment — it is created by
+//      POST /api/v1/provision — so we (re)wire the watch-folder from the
+//      resolved stack both now (if a stack already exists) and again from
+//      onStackChange the moment one is provisioned, mirroring activateScaler.
+//      This closes the gap in issue #643/#636 where the watch-folder was only
+//      ever built from MINIO_URL and therefore silently did nothing on OSC.
+//
+// `watchFolder` is a mutable binding rebindable by wireWatchFolderFromStack();
+// admin + storage routers read it late via getWatchFolder so a post-boot rewire
+// takes effect with no restart.
+let watchFolder: WatchFolderService | undefined =
   envMinioClient && watchFolderEnabled()
     ? new WatchFolderService({
         client: envMinioClient,
@@ -1416,9 +1437,65 @@ const watchFolder =
       })
     : undefined;
 
+// True when the watch-folder is wired from the explicit env override. In that
+// case the client is fixed for the process lifetime and we must NOT let the
+// parameter-store path clobber it (the env override wins for ALL config, see
+// workspace-stack.ts:buildEnvConnections).
+const watchFolderFromEnv = watchFolder !== undefined;
+
+// (Re)build the watch-folder from the resolved stack's parameter-store-backed
+// storage connection (issue #643). No-op unless WATCH_FOLDER_ENABLED=true and
+// we are NOT already wired from the env override. Idempotent: if a running
+// watch-folder is already pointed at the resolved bucket on the same endpoint we
+// leave it running; otherwise we (re)create it against the current storage
+// client + source bucket and start it. Never throws — a resolve failure leaves
+// the watch-folder as-is and is logged.
+async function wireWatchFolderFromStack(): Promise<void> {
+  if (!watchFolderEnabled() || watchFolderFromEnv) return;
+  try {
+    const conns = await stackResolver.resolve();
+    const client = conns.storageClient;
+    if (!client) {
+      // No object storage on the resolved stack yet (no stack provisioned, or a
+      // partial/invalid one). Nothing to watch; leave any prior instance be.
+      return;
+    }
+    const bucket = conns.sourceBucket;
+    // Already wired against this bucket and running: nothing to do. (The stack's
+    // storage endpoint is stack-invariant for a given deployment, so an
+    // unchanged bucket + a live service means the wiring still holds.)
+    if (watchFolder && watchFolder.currentBucket() === bucket && watchFolder.isRunning()) {
+      return;
+    }
+    // Rebuild against the freshly resolved client/bucket. Stop any stale prior
+    // instance first so its notification listener + poll timer are detached.
+    watchFolder?.stop();
+    watchFolder = new WatchFolderService({
+      client,
+      bucket,
+      repository: assetRepository,
+      log: app.log,
+      onObjectStored
+    });
+    watchFolder.start();
+    app.log.info(
+      { bucket, source: 'parameter-store' },
+      'watch-folder ingest wired from provisioned stack storage'
+    );
+  } catch (err) {
+    app.log.warn({ err }, 'watch-folder: failed to wire from provisioned stack storage');
+  }
+}
+
 // Operational status (issue #16). Unauthenticated; reports background service
-// state without exposing workspace data.
-await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
+// state without exposing workspace data. The getWatchFolder accessor (issue
+// #643) lets these routes reach a watch-folder rewired after boot from the
+// parameter store, not just the boot-time env-override instance.
+await app.register(adminRouter, {
+  prefix: '/api/v1/admin',
+  watchFolder,
+  getWatchFolder: () => watchFolder
+});
 
 // Encore auto-scaler status (ADR-006). Unauthenticated read-only introspection
 // of the per-workspace scaler pool for the ops UI. `redis` is undefined when the
@@ -1532,6 +1609,10 @@ await app.register(storageRouter, {
   prefix: '/api/v1/storage',
   stackResolver,
   watchFolder,
+  // Late-bound accessor (issue #643): the per-bucket watch-folder toggle reaches
+  // an instance rewired after boot from the parameter store, not just the
+  // boot-time env-override instance.
+  getWatchFolder: () => watchFolder,
   storageBackendRegistry
 });
 
@@ -1598,6 +1679,18 @@ void checkProfilesIndexReachable({
 }).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router
-// is registered, so a detected object can flow through the full pipeline. The
-// service silently no-ops when not configured/enabled.
+// is registered, so a detected object can flow through the full pipeline.
+//
+// Env-override path (MINIO_URL): the instance was built at boot; start it now.
+// The service silently no-ops when not configured/enabled.
 watchFolder?.start();
+
+// Parameter-store path (Open Source Cloud, issue #643): if a stack was already
+// provisioned in a previous run (self-discovered from the parameter store),
+// wire + start the watch-folder against its object storage now. On a fresh OSC
+// deployment no stack exists yet, so this is a no-op and the watch-folder comes
+// online later from onStackChange the moment the first stack is provisioned.
+// Skipped entirely when the env-override path already owns the watch-folder.
+if (!watchFolderFromEnv) {
+  await wireWatchFolderFromStack();
+}
