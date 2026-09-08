@@ -1619,7 +1619,7 @@ ${renderHead('open-videocore — a video pipeline your AI agent can drive', SITE
   <a href="docs.html">Docs</a>&middot;
   <a href="agentic-examples.html">Agentic examples</a>&middot;
   <a href="https://github.com/Eyevinn/open-videocore" target="_blank" rel="noopener">GitHub</a>&middot;
-  <a href="https://www.eyevinntechnology.se" target="_blank" rel="noopener">Eyevinn Technology</a>
+  <a href="https://www.eyevinn.se" target="_blank" rel="noopener">Eyevinn Technology</a>
 </footer>
 <script>${JS}</script>
 </body>
