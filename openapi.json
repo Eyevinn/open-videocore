@@ -16712,6 +16712,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -16920,6 +16923,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17055,6 +17061,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17076,6 +17085,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17125,6 +17137,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17316,6 +17331,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17424,6 +17442,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17544,6 +17565,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17565,6 +17589,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17682,6 +17709,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
