@@ -11,10 +11,14 @@
 import { type Asset, MAX_LIMIT } from './asset-repo.js';
 import { AssetDocumentSchema, fromAssetDocument } from './asset-document.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
+import type { CollectionRepository } from './collection-repo.js';
 import {
   clampPage,
   clampPageSize,
+  matchesCollectionQuery,
   matchesQuery,
+  toCollectionHit,
+  type CollectionHit,
   type SearchQuery,
   type SearchRepository,
   type SearchResult
@@ -25,7 +29,17 @@ const RESOURCE_TYPE = 'asset';
 export type CouchFactory = () => StackCouch;
 
 export class CouchSearchRepository implements SearchRepository {
-  constructor(private readonly couchFor: CouchFactory) {}
+  constructor(
+    private readonly couchFor: CouchFactory,
+    // Collection projection source (issue #561). Optional so existing callers
+    // that only search assets are unchanged; when absent no collection hits are
+    // produced. Injected as the CollectionRepository (not re-implemented here)
+    // so collections are reconstructed by the SAME authoritative mapping
+    // couch-collection-repo.ts uses — the search and read projections cannot
+    // drift, and the projection stays disposable/rebuildable from the document
+    // store (couch-collection-repo.list()).
+    private readonly collections?: CollectionRepository
+  ) {}
 
   async search(query: SearchQuery): Promise<SearchResult> {
     const couch = this.couchFor();
@@ -42,9 +56,29 @@ export class CouchSearchRepository implements SearchRepository {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 
     const start = (page - 1) * pageSize;
+
+    // Collection projection (issue #561). Reuse the collection repo's list()
+    // (a Mango query over resourceType: 'collection'), then apply the shared
+    // matchesCollectionQuery in-process — mirroring how the asset path filters
+    // the reconstructed Asset with matchesQuery. This keeps the collection
+    // projection derived purely from collection documents (rebuildable) and its
+    // match rules in lockstep with the in-memory backend.
+    let collectionHits: CollectionHit[] = [];
+    let collectionTotal = 0;
+    if (this.collections) {
+      const all = await this.collections.list();
+      const matchedCollections = all
+        .filter((c) => matchesCollectionQuery(c, query))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+      collectionTotal = matchedCollections.length;
+      collectionHits = matchedCollections.slice(start, start + pageSize).map(toCollectionHit);
+    }
+
     return {
       assets: matched.slice(start, start + pageSize),
+      collections: collectionHits,
       total: matched.length,
+      collectionTotal,
       page
     };
   }

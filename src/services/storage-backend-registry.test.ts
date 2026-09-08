@@ -10,10 +10,12 @@
 //   - the OSC-managed default is non-deletable (ADR-017 D3).
 
 import { describe, it, expect, vi } from 'vitest';
+import { Readable } from 'node:stream';
 import {
   StorageBackendRegistry,
   InMemoryBackendRecordStore,
   ParamStoreBackendRecordStore,
+  BackendValidationError,
   DefaultBackendNotDeletableError,
   UnknownSourceBackendError,
   DEFAULT_BACKEND_ID,
@@ -21,6 +23,7 @@ import {
   type SecretStore,
   type StorageBackendRecord
 } from './storage-backend-registry.js';
+import type { BucketProbeClient } from './external-backend-validation.js';
 import type { ConfigKvStore } from './param-store.js';
 
 const RAW_SECRET = 'raw-secret-value';
@@ -162,6 +165,125 @@ describe('StorageBackendRegistry.resolveSourceCredentials — issue #548', () =>
     await expect(registry.resolveSourceCredentials('ws1', view.id)).rejects.toBeInstanceOf(
       UnknownSourceBackendError
     );
+  });
+});
+
+describe('StorageBackendRegistry.register — validation (issue #550)', () => {
+  function okProbeClient(): BucketProbeClient {
+    return {
+      bucketExists: async () => true,
+      listObjectsV2: () => {
+        const s = new Readable({ read() {} });
+        queueMicrotask(() => s.emit('end'));
+        return s;
+      },
+      putObject: async () => ({}),
+      statObject: async () => ({}),
+      removeObject: async () => {}
+    };
+  }
+
+  function unreachableProbeClient(): BucketProbeClient {
+    return {
+      ...okProbeClient(),
+      bucketExists: async () => {
+        const err = new Error('boom') as Error & { code: string };
+        err.code = 'ECONNREFUSED';
+        throw err;
+      }
+    };
+  }
+
+  it('does NOT validate by default (no validate option)', async () => {
+    const records = new InMemoryBackendRecordStore();
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(records, store);
+    expect(registry.validatesOnRegister).toBe(false);
+    // Registers without any probe even though no factory is supplied.
+    await registry.register('ws1', {
+      name: 'b',
+      role: 'both',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    expect(await records.list('ws1')).toHaveLength(1);
+  });
+
+  it('validates and registers when the probe passes', async () => {
+    const records = new InMemoryBackendRecordStore();
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(records, store, {
+      probeClientFactory: () => okProbeClient()
+    });
+    expect(registry.validatesOnRegister).toBe(true);
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'both',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    expect(view.credentials.secretAccessKey).toBe('***redacted***');
+    expect(await records.list('ws1')).toHaveLength(1);
+  });
+
+  it('throws BackendValidationError and persists NOTHING when the probe fails', async () => {
+    const records = new InMemoryBackendRecordStore();
+    const { store, saveSecret } = spySecretStore();
+    const registry = new StorageBackendRegistry(records, store, {
+      probeClientFactory: () => unreachableProbeClient()
+    });
+    await expect(
+      registry.register('ws1', {
+        name: 'b',
+        role: 'both',
+        bucket: 'bkt',
+        accessKeyId: 'AKIA',
+        secretAccessKey: RAW_SECRET
+      })
+    ).rejects.toBeInstanceOf(BackendValidationError);
+    // Not silently registered: no record persisted, no secret fanned out.
+    expect(await records.list('ws1')).toHaveLength(0);
+    expect(saveSecret).not.toHaveBeenCalled();
+  });
+
+  it('BackendValidationError carries a machine-readable reason and no secret', async () => {
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), spySecretStore().store, {
+      probeClientFactory: () => unreachableProbeClient()
+    });
+    try {
+      await registry.register('ws1', {
+        name: 'b',
+        role: 'both',
+        bucket: 'bkt',
+        accessKeyId: 'AKIA',
+        secretAccessKey: RAW_SECRET
+      });
+      expect.unreachable('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(BackendValidationError);
+      const e = err as BackendValidationError;
+      expect(e.reason).toBe('unreachable');
+      expect(JSON.stringify({ m: e.message, c: e.code })).not.toContain(RAW_SECRET);
+    }
+  });
+
+  it('explicit { enabled: false } opts out of validation', async () => {
+    const records = new InMemoryBackendRecordStore();
+    const registry = new StorageBackendRegistry(records, spySecretStore().store, {
+      enabled: false,
+      probeClientFactory: () => unreachableProbeClient()
+    });
+    expect(registry.validatesOnRegister).toBe(false);
+    await registry.register('ws1', {
+      name: 'b',
+      role: 'both',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    expect(await records.list('ws1')).toHaveLength(1);
   });
 });
 

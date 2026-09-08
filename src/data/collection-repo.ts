@@ -60,10 +60,56 @@ export type CreateCollectionInput = {
   custom?: Record<string, unknown>;
 };
 
+// Partial editorial update of a collection's descriptive metadata (issue #560).
+// PATCH semantics: only the keys PRESENT here are written; an ABSENT key leaves
+// the current value untouched. Membership (`assetIds`) is deliberately NOT part
+// of this shape — it stays on the dedicated PUT/DELETE /:id/assets/:assetId
+// endpoints — nor are `name`, `deleteLock`, or timestamps, which have their own
+// paths. `description`, `tags`, and `custom` are each replaced WHOLESALE when
+// present (mirroring the asset editorial PATCH for `tags`/`description`, which
+// replace rather than merge — see UpdateAssetInput in asset-repo.ts). To clear a
+// field, pass an explicit empty value (`''`, `[]`, or `{}`); omit the key to
+// leave it unchanged.
+export type UpdateCollectionInput = {
+  description?: string;
+  tags?: string[];
+  custom?: Record<string, unknown>;
+};
+
+// Pure computation of a descriptive-metadata PATCH (issue #560). Given the
+// current collection and a partial patch, produce the next collection with only
+// the present keys applied (wholesale per field) and `updatedAt` bumped. No side
+// effects, so it is safe to re-run inside the CouchDB conflict-retry loop
+// (updateWithRetry) exactly as the asset editorial write does. Never touches
+// `assetIds`, `name`, or `deleteLock`.
+export function applyCollectionUpdate(
+  existing: Collection,
+  patch: UpdateCollectionInput,
+  now: string
+): Collection {
+  const next: Collection = { ...existing, updatedAt: now };
+  if (patch.description !== undefined) {
+    next.description = patch.description;
+  }
+  if (patch.tags !== undefined) {
+    next.tags = patch.tags;
+  }
+  if (patch.custom !== undefined) {
+    next.custom = patch.custom;
+  }
+  return next;
+}
+
 export interface CollectionRepository {
   create(input: CreateCollectionInput): Promise<Collection>;
   list(): Promise<Collection[]>;
   get(id: string): Promise<Collection | undefined>;
+  // Partial editorial update of descriptive metadata (issue #560). Applies the
+  // present keys of `patch` (description/tags/custom) wholesale and returns the
+  // updated collection. Throws CollectionNotFoundError (-> 404) for an
+  // unknown/foreign id. Deliberately CANNOT mutate membership (`assetIds`) — that
+  // stays on addAsset/removeAsset — nor the delete-lock (setDeleteLock).
+  update(id: string, patch: UpdateCollectionInput): Promise<Collection>;
   addAsset(id: string, assetId: string): Promise<Collection>;
   removeAsset(id: string, assetId: string): Promise<Collection>;
   // Set or clear the explicit delete-lock (ADR-020 decision 3, issue #568). This

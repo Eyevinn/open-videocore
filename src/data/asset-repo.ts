@@ -177,6 +177,24 @@ export type StorageTiering = {
   rehydrating: RehydrateState[];
 };
 
+// Apply a storage-tier write (ADR-019 D1/D3, issue #557): merge the given
+// per-byte-class tier overrides onto the asset's existing tiering, preserving any
+// in-flight rehydrate state. PURE (no side effects) so both repos reuse it and
+// the couch repo can safely re-run it inside updateWithRetry. This is the
+// relocation engine's ONLY mutation of the asset — it writes the byte-location
+// axis and NOTHING else (never `status`/`statusHistory` — the ADR-019 D6
+// tier/status firewall). Absent classes in `overrides` keep their prior tier.
+export function applyStorageTier(
+  existing: StorageTiering | undefined,
+  overrides: Partial<Record<StorageByteClass, StorageTier>>
+): StorageTiering {
+  const base = existing ?? defaultStorageTiering();
+  return {
+    tiers: { ...base.tiers, ...overrides },
+    rehydrating: base.rehydrating ?? []
+  };
+}
+
 // The canonical "nothing tiered, nothing rehydrating" default: every byte class
 // `hot`, no rehydrate in flight (ADR-019 — new/existing assets default to `hot`).
 // Returned wherever an asset carries no explicit tiering state so the axis is
@@ -673,6 +691,23 @@ export class DeleteProtectedError extends Error {
   }
 }
 
+// Raised when a delete is blocked because an IN-FLIGHT (running/pending/queued)
+// job still references the asset (issue #569, ADR-020 decision 1) -> 409. The
+// route maps this to the shared `delete_blocked` envelope with
+// `reason: 'referenced_by_job'` and the referencing job ids in
+// `blockedBy.jobIds`. An active reference is a HARD block: `?force=true` does
+// NOT override it (ADR-020 decision 2 — force is only honoured for settled jobs,
+// which are never detected here).
+export class ReferencedByJobError extends Error {
+  readonly statusCode = 409;
+  readonly jobIds: string[];
+  constructor(id: string, jobIds: string[]) {
+    super(`asset ${id} is referenced by ${jobIds.length} in-flight job(s)`);
+    this.name = 'ReferencedByJobError';
+    this.jobIds = jobIds;
+  }
+}
+
 export const DEFAULT_LIMIT = 50;
 export const MAX_LIMIT = 200;
 
@@ -722,6 +757,18 @@ export interface AssetRepository {
   // the change is traceable (ADR-005 append-only administrative provenance).
   // Returns the updated asset, or undefined when the id is unknown.
   setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined>;
+  // Dedicated storage-tier write path (ADR-019 D1/D3, issue #557). Merges the
+  // given per-byte-class tier overrides onto the asset's `storageTiering` axis
+  // and persists them. DISTINCT from `update()` (the editorial/pipeline patch
+  // path) so a tier flip never rides on an editorial write and — critically —
+  // NEVER touches lifecycle `status`/`statusHistory` (the ADR-019 D6 tier/status
+  // firewall: a byte-location change must be structurally incapable of enqueuing
+  // an asset for the retention purge). Metadata is otherwise left untouched and
+  // searchable. Returns the updated asset, or undefined when the id is unknown.
+  setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined>;
   // Returns the count of direct children of an asset (for delete-blocking).
   countChildren(id: string): Promise<number>;
   // Enumerate every asset in the version lineage of `id` (issue #118), oldest
@@ -1294,6 +1341,28 @@ export class InMemoryAssetRepository implements AssetRepository {
       ...existing,
       deleteLock: applied.deleteLock,
       provenance: applied.provenance,
+      updatedAt: now
+    };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  // Dedicated storage-tier write path (ADR-019 D1/D3, issue #557). Bypasses
+  // `update()` so the byte-location axis is never coupled to an editorial patch,
+  // and touches NEITHER `status` NOR `statusHistory` (ADR-019 D6 firewall). Only
+  // `storageTiering` and `updatedAt` change; the metadata stays searchable.
+  async setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const next: Asset = {
+      ...existing,
+      storageTiering: applyStorageTier(existing.storageTiering, overrides),
       updatedAt: now
     };
     this.store.set(id, next);

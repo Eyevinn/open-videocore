@@ -28,6 +28,7 @@ import {
 import type { EncoreProfile } from './encode-presets.js';
 import type { EncoreClient } from './encore-client.js';
 import { BURN_IN_PROFILE_PARAM_KEY } from './burn-in.js';
+import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
 
@@ -73,7 +74,16 @@ export type SubmitTranscodeResult = {
 // after marking the job failed and reverting the source asset.
 export async function submitTranscode(
   params: SubmitTranscodeParams,
-  deps: { jobs: JobRepository; assets: AssetRepository; encore: EncoreClient }
+  deps: {
+    jobs: JobRepository;
+    assets: AssetRepository;
+    encore: EncoreClient;
+    // Best-effort audit emission (issue #564). Optional so existing callers /
+    // tests that do not assert audit are unaffected; when absent, emission is a
+    // no-op. A failed audit write is logged, never propagated.
+    audit?: AuditEmitter;
+    auditLog?: AuditErrorLog;
+  }
 ): Promise<SubmitTranscodeResult> {
   // Profile name forwarded verbatim to Encore. Falls back to 'program' —
   // the only profile guaranteed to exist in the default Encore test-profiles set.
@@ -85,6 +95,23 @@ export async function submitTranscode(
     assetId: params.sourceAssetId,
     profile: profileName
   });
+
+  // Audit: transcode job submitted (issue #564). One entry, targetId = the new
+  // job id. `system` origin — this is a pipeline-initiated job. Emitted right
+  // after the durable job record exists (the meaningful submission moment) and
+  // BEFORE the fallible Encore enqueue, so the audit trail records the
+  // submission regardless of the downstream Encore result.
+  emitAudit(
+    deps.audit,
+    {
+      actor: originActor('system'),
+      action: 'job.submitted',
+      targetType: 'job',
+      targetId: job.id,
+      detail: { jobType: 'transcode', assetId: params.sourceAssetId, profile: profileName }
+    },
+    deps.auditLog
+  );
 
   const encoreJobId = encodeEncoreJobId(params.workspaceId, job.id);
   // OSC provides structural tenant isolation (ADR-003): the deployment owns a
@@ -164,7 +191,13 @@ export type CompleteTranscodeResult = {
 // list on the SINGLE source asset, then returns it to `ready`.
 export async function completeTranscode(
   params: CompleteTranscodeParams,
-  deps: { jobs: JobRepository; assets: AssetRepository }
+  deps: {
+    jobs: JobRepository;
+    assets: AssetRepository;
+    // Best-effort audit emission (issue #564). Optional; when absent, no-op.
+    audit?: AuditEmitter;
+    auditLog?: AuditErrorLog;
+  }
 ): Promise<CompleteTranscodeResult> {
   const job = await deps.jobs.get(params.jobId);
   if (!job) {
@@ -174,7 +207,8 @@ export async function completeTranscode(
     // Duplicate / late callback, or the job was cancelled by an operator: nothing
     // to do. `cancelled` is terminal (src/data/job-repo.ts:103), so short-circuit
     // here to keep a late Encore callback idempotent — attempting an update would
-    // otherwise throw InvalidJobTransitionError (issue #126).
+    // otherwise throw InvalidJobTransitionError (issue #126). No audit entry: a
+    // no-op / already-terminal callback is not a fresh terminal transition.
     return { applied: false, renditionCount: 0 };
   }
 
@@ -184,6 +218,20 @@ export async function completeTranscode(
       error: params.error ?? 'transcode failed'
     });
     await deps.assets.update(params.sourceAssetId, { status: 'failed' });
+    // Audit: transcode job reached terminal `failed` (issue #564). One entry,
+    // emitted only on the FIRST time the job transitions terminal (guarded by the
+    // idempotency short-circuit above).
+    emitAudit(
+      deps.audit,
+      {
+        actor: originActor('system'),
+        action: 'job.failed',
+        targetType: 'job',
+        targetId: job.id,
+        detail: { jobType: 'transcode', assetId: params.sourceAssetId, error: params.error ?? 'transcode failed' }
+      },
+      deps.auditLog
+    );
     return { applied: true, renditionCount: 0 };
   }
 
@@ -209,6 +257,20 @@ export async function completeTranscode(
     status: 'done',
     progress: 100
   });
+
+  // Audit: transcode job reached terminal `done` (issue #564). One entry per
+  // first terminal transition (duplicate callbacks are short-circuited above).
+  emitAudit(
+    deps.audit,
+    {
+      actor: originActor('system'),
+      action: 'job.completed',
+      targetType: 'job',
+      targetId: job.id,
+      detail: { jobType: 'transcode', assetId: params.sourceAssetId, renditionCount: renditions.length }
+    },
+    deps.auditLog
+  );
 
   return { applied: true, renditionCount: renditions.length };
 }
