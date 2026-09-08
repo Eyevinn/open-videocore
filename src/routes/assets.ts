@@ -1631,13 +1631,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           continue;
         }
         if (step.name === 'transcode') {
+          // Resolve the transcode output bucket from the caller's per-stack
+          // packaged bucket (issue #638). request.connections.packagedBucket is
+          // the stack's persisted `packagedStorage.bucket` (workspace-stack.ts
+          // config.packagedBucket, sourced from the parameter store at provision
+          // time per ADR-002). Fall back to opts.outputBucket — the deployment-
+          // wide MINIO_PACKAGED_BUCKET default — only when no per-stack value
+          // exists (e.g. the env-override path). The output PATH template
+          // (transcode/<assetId>/<jobId>/) is unchanged; only the bucket changes.
+          const resolvedOutputBucket =
+            request.connections?.packagedBucket ?? (opts.outputBucket as string);
           const result = await submitTranscode(
             {
               workspaceId: DEPLOYMENT_CONTEXT,
               sourceAssetId: asset.id,
               sourceObjectKey: asset.objectKey as string,
               sourceBucket: opts.sourceBucket as string,
-              outputBucket: opts.outputBucket as string,
+              outputBucket: resolvedOutputBucket,
               preset: encodeOpts?.profile,
               customProfile: encodeOpts?.customProfile,
               // profileParams (issue #288): forwarded verbatim into the same
@@ -2917,6 +2927,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         }
         burnInSubtitlesFilter = buildSubtitlesFilter(resolved.objectKey, canonicalForceStyle);
       }
+      // Resolve the transcode output bucket from the caller's per-stack packaged
+      // bucket (issue #638). request.connections.packagedBucket is the stack's
+      // persisted `packagedStorage.bucket` (workspace-stack.ts config.packagedBucket,
+      // from the parameter store at provision time per ADR-002); fall back to the
+      // deployment-wide opts.outputBucket (MINIO_PACKAGED_BUCKET) only when no
+      // per-stack value exists. Output PATH template is unchanged.
+      const resolvedOutputBucket =
+        request.connections?.packagedBucket ?? opts.outputBucket;
       try {
         const result = await submitTranscode(
           {
@@ -2928,7 +2946,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             profileParams: request.body.profileParams,
             burnInSubtitlesFilter,
             sourceBucket: opts.sourceBucket,
-            outputBucket: opts.outputBucket
+            outputBucket: resolvedOutputBucket
           },
           { jobs, assets: repo, encore: opts.encore }
         );

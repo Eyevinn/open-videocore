@@ -200,6 +200,14 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
       // drives completion + our own webhooks. A caller-supplied
       // body.progressCallbackUri is not forwarded; polling GET /encoreJobs/:id
       // works today.
+      // Resolve the transcode output bucket from the caller's per-stack packaged
+      // bucket (issue #638). request.connections.packagedBucket is the stack's
+      // persisted `packagedStorage.bucket` (workspace-stack.ts config.packagedBucket,
+      // from the parameter store at provision time per ADR-002); fall back to the
+      // deployment-wide opts.outputBucket (MINIO_PACKAGED_BUCKET) only when no
+      // per-stack value exists. Output PATH template is unchanged.
+      const resolvedOutputBucket =
+        request.connections?.packagedBucket ?? opts.outputBucket;
       try {
         const result = await submitTranscode(
           {
@@ -221,7 +229,7 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
             // from the payload so Encore uses its `{}` default (unchanged).
             profileParams: body.profileParams,
             sourceBucket: opts.sourceBucket,
-            outputBucket: opts.outputBucket
+            outputBucket: resolvedOutputBucket
           },
           {
             jobs,
