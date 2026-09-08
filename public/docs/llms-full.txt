@@ -2663,6 +2663,45 @@ Response 200 (application/json)
   }
 }
 
+  PATCH /api/v1/collections/{id}
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {}
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "assetIds": [
+    "string"
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "description": "string",
+  "tags": [
+    "string"
+  ],
+  "custom": {},
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  }
+}
+
   DELETE /api/v1/collections/{id}
 
   Delete a collection.
@@ -3136,7 +3175,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (107 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (108 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3164,7 +3203,7 @@ Search1
 Full-text and metadata search across assets.
 Webhooks3
 HTTP event notification registrations.
-Collections8
+Collections9
 Named groups for organising assets.
 Storage9
 Object storage bucket and watch-folder management.
@@ -3997,7 +4036,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 107 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 108 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.

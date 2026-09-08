@@ -17533,7 +17533,8 @@
                     "enum": [
                       "source",
                       "packaged",
-                      "both"
+                      "both",
+                      "archive"
                     ],
                     "default": "both"
                   },
@@ -17596,7 +17597,8 @@
                       "enum": [
                         "source",
                         "packaged",
-                        "both"
+                        "both",
+                        "archive"
                       ]
                     },
                     "backend": {
@@ -17764,7 +17766,8 @@
                             "enum": [
                               "source",
                               "packaged",
-                              "both"
+                              "both",
+                              "archive"
                             ]
                           },
                           "backend": {
