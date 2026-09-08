@@ -79,6 +79,70 @@ const externalStorageSchema = z.object({
 
 type ExternalStorage = z.infer<typeof externalStorageSchema>;
 
+// Fail-loud storage-redirection validation (issue #640).
+//
+// A storage block (`sourceStorage`/`packagedStorage`) may only redirect the
+// *bucket name*; the bytes are still read and written against the SAME
+// OSC-hosted object-storage endpoint and credentials the stack already uses
+// (per #638/#639, which honour the per-stack bucket on that endpoint). The
+// transcode/packaging path builds `s3://<bucket>/...` URIs against a single
+// fixed endpoint — the packager receives `S3EndpointUrl: <stack MinIO>` with
+// the stack's own credentials (packager-provisioning.ts:buildPackagerCreateBody),
+// and submitTranscode (pipeline/transcode.ts) forms bucket-only S3 URIs. It has
+// no per-job endpoint or credential override.
+//
+// Therefore a request that asks to redirect to a DIFFERENT (external, non-default)
+// object-storage endpoint via `endpointUrl` cannot be honoured. Historically the
+// route accepted such a block and returned success while jobs silently wrote to
+// the default endpoint — the worst failure mode because it looks like success.
+// We now reject it, naming the offending `<role>.endpointUrl` field, rather than
+// accept-and-ignore. Supporting a real external endpoint + credentials is tracked
+// separately (#641) and will lift this restriction when the pipeline can honour it.
+//
+// `publicBaseUrl` is deliberately NOT rejected: it only overrides the *emitted*
+// delivery/manifest host for objects already written to the honoured bucket
+// (packaging.ts:externalPublicBaseUrl); it does not redirect where bytes land.
+const UNSUPPORTED_REDIRECTION_FIELDS = ['endpointUrl'] as const;
+
+// One unsupported redirection finding: the dotted request path of the offending
+// field and a human-readable reason. Returned to the caller so the message names
+// exactly which field the pipeline cannot honour.
+export type StorageRedirectionError = {
+  field: string;
+  message: string;
+};
+
+// Inspect the supplied storage blocks and return a finding for every requested
+// redirection the pipeline cannot currently honour. An empty array means every
+// requested redirection is supported and the request may proceed unchanged.
+export function validateStorageRedirection(input: {
+  sourceStorage?: ExternalStorage;
+  packagedStorage?: ExternalStorage;
+}): StorageRedirectionError[] {
+  const findings: StorageRedirectionError[] = [];
+  const roles: Array<['sourceStorage' | 'packagedStorage', ExternalStorage | undefined]> = [
+    ['sourceStorage', input.sourceStorage],
+    ['packagedStorage', input.packagedStorage]
+  ];
+  for (const [role, block] of roles) {
+    if (!block) continue;
+    for (const field of UNSUPPORTED_REDIRECTION_FIELDS) {
+      if (block[field] !== undefined) {
+        findings.push({
+          field: `${role}.${field}`,
+          message:
+            `${role}.${field} requests redirection to an external, non-default ` +
+            `object-storage endpoint, which the transcode/packaging pipeline ` +
+            `cannot honour yet (issue #641). Only the bucket name can be ` +
+            `redirected; remove ${role}.${field} to use the stack's object-storage ` +
+            `endpoint, or omit the block for the zero-config default.`
+        });
+      }
+    }
+  }
+  return findings;
+}
+
 const requestSchema = z.object({
   name: z
     .string()
@@ -117,6 +181,19 @@ const errorSchema = z.object({
   error: z.string(),
   failedService: z.string().optional(),
   provisioned: z.array(provisionedEntrySchema)
+});
+
+// 400 body for a rejected storage redirection (issue #640). `unsupported` names
+// every offending `<role>.<field>` so the caller can see exactly which requested
+// redirection the pipeline cannot honour, rather than accept-and-ignore.
+const redirectionErrorSchema = z.object({
+  error: z.string(),
+  unsupported: z.array(
+    z.object({
+      field: z.string(),
+      message: z.string()
+    })
+  )
 });
 
 type ProvisionedEntry = z.infer<typeof provisionedEntrySchema>;
@@ -451,12 +528,32 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       schema: {
         body: requestSchema,
         response: {
-          202: acceptedSchema
+          202: acceptedSchema,
+          400: redirectionErrorSchema
         }
       }
     },
     async (request, reply) => {
       const { name, sourceStorage, packagedStorage, options } = request.body;
+
+      // Fail-loud storage-redirection validation (issue #640). Reject BEFORE any
+      // operation is created if the request asks for a redirection the pipeline
+      // cannot honour (e.g. an external, non-default object-storage endpoint per
+      // #641). Never accept-and-ignore: the caller gets a 400 naming the exact
+      // offending field(s) instead of a silent success that writes to the wrong
+      // place.
+      const redirectionErrors = validateStorageRedirection({
+        sourceStorage,
+        packagedStorage
+      });
+      if (redirectionErrors.length > 0) {
+        return reply.code(400).send({
+          error:
+            'requested storage redirection cannot be honoured: ' +
+            redirectionErrors.map((e) => e.field).join(', '),
+          unsupported: redirectionErrors
+        });
+      }
       // Which optional pipeline services this request opted into (#216). Absent
       // `options` (or absent flags) means opted out — nothing extra is created.
       const wantAutoSubtitles = options?.autoSubtitles ?? false;
