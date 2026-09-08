@@ -3223,12 +3223,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           }
           // 'default' -> no override, default output path (field omitted).
         } else {
-          // A source-only backend cannot receive packaged output (ADR-017 D4:
-          // 'packaged' is the write role; 'source' is read-only for ingest).
-          if (record.role === 'source') {
+          // Only write-capable roles can receive packaged output (ADR-017 D4:
+          // 'packaged'/'both' fan their credential to the packager; 'source' is
+          // read-only for ingest and 'archive' fans only to source-reader
+          // consumers — see mappingsForRole, storage-backend-registry.ts). Any
+          // non-write role is rejected via this allowlist.
+          if (record.role !== 'packaged' && record.role !== 'both') {
             return reply.code(422).send({
               error: 'backend_role',
-              message: `storage backend "${request.body.externalBackend}" is registered for the source role and cannot receive output; register it with role "packaged" or "both"`
+              message: `storage backend "${request.body.externalBackend}" is registered for the "${record.role}" role and cannot receive output; register it with role "packaged" or "both"`
             });
           }
           destinationBucket = backendOutputDestination(record);

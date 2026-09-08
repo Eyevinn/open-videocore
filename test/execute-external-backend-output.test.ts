@@ -105,7 +105,7 @@ async function makeSource(h: Harness, name = 'my-video'): Promise<string> {
 // route resolves against.
 async function register(
   h: Harness,
-  over: Partial<{ name: string; role: 'source' | 'packaged' | 'both'; bucket: string }> = {}
+  over: Partial<{ name: string; role: 'source' | 'packaged' | 'both' | 'archive'; bucket: string }> = {}
 ) {
   return h.registry.register(DEPLOYMENT_CONTEXT, {
     name: over.name ?? 'our-bucket',
@@ -205,6 +205,29 @@ describe('execute external-backend output (issue #549)', () => {
 
     expect(res.statusCode).toBe(422);
     expect(res.json().error).toBe('backend_role');
+  });
+
+  it('rejects an archive-role backend for output with 422', async () => {
+    // 'archive' is a valid StorageBackendRole but is NOT write-capable: its
+    // secret fans only to source-reader consumers (mappingsForRole), never the
+    // packager. ADR-017 D4 admits only 'packaged'/'both' for output, so an
+    // archive backend referenced as the output target must be rejected.
+    const h = await buildApp();
+    const view = await register(h, { role: 'archive' });
+    const sourceId = await makeSource(h);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${sourceId}/execute`,
+      headers: A,
+      payload: { pipeline: 'abr-vod', profile: 'program', externalBackend: view.id }
+    });
+
+    expect(res.statusCode).toBe(422);
+    expect(res.json().error).toBe('backend_role');
+    // The message reflects the actual referenced role, not a hardcoded "source".
+    expect(res.json().message).toContain('"archive"');
+    expect(await h.pipelines.listByAsset(sourceId)).toHaveLength(0);
   });
 
   it('rejects supplying both externalBackend and destinationBucket with 400', async () => {
