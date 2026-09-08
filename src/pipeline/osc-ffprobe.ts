@@ -22,7 +22,12 @@ import {
   type Context
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
-import type { FfprobeResult, FfprobeStream, ProbeRunner } from './metadata-extractor.js';
+import type {
+  ExternalProbeSource,
+  FfprobeResult,
+  FfprobeStream,
+  ProbeRunner
+} from './metadata-extractor.js';
 
 // Subset of the OSC SDK surface this runner needs. Declared structurally so the
 // real SDK functions satisfy it and tests can pass lightweight fakes.
@@ -39,6 +44,14 @@ export type OscJobApi = {
 // avoids an output-file requirement without writing bytes anywhere.
 export function ffprobeCmdLine(presignedUrl: string): string {
   return `-i "${presignedUrl}" -f null -`;
+}
+
+// The `-i` argument for an external-backend source (issue #548): ffmpeg-s3 reads
+// `s3://bucket/key` natively using the credentials passed in the job body, so
+// the source bytes never transit the API process (mirrors the native S3 OUTPUT
+// path in osc-rewrap.ts / osc-thumbnail.ts, run in reverse for input).
+export function ffprobeExternalCmdLine(bucket: string, objectKey: string): string {
+  return `-i "s3://${bucket}/${objectKey}" -f null -`;
 }
 
 // Parse ffmpeg's human-readable stderr output into an FfprobeResult-shaped
@@ -144,13 +157,27 @@ import { pollOscJobUntilDone } from './osc-job-poll.js';
 // getLogsForInstance constructs the URL from the service's apiUrl, which resolves
 // correctly via the SDK. Confirmed against the live API.
 export function makeOscProbeRunner(api: OscJobApi): ProbeRunner {
-  return async (presignedUrl: string): Promise<FfprobeResult> => {
+  return async (source: string | ExternalProbeSource): Promise<FfprobeResult> => {
     const sat = await api.context.getServiceAccessToken(FFPROBE_SERVICE_ID);
     const name = probeJobName();
-    await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {
-      name,
-      cmdLineArgs: ffprobeCmdLine(presignedUrl)
-    });
+    // External-backend source (issue #548): probe `s3://bucket/key` in place and
+    // pass the registered backend's endpoint + credential REFERENCES in the job
+    // body. The secret fields are `{{secrets.<name>}}` references resolved by OSC
+    // at job time; the literal credential never enters this process (issue #548
+    // acceptance). Otherwise probe the presigned GET URL (default path).
+    const jobBody =
+      typeof source === 'string'
+        ? { name, cmdLineArgs: ffprobeCmdLine(source) }
+        : {
+            name,
+            cmdLineArgs: ffprobeExternalCmdLine(source.bucket, source.objectKey),
+            awsAccessKeyId: source.awsAccessKeyId,
+            awsSecretAccessKey: source.awsSecretAccessKey,
+            ...(source.s3EndpointUrl ? { s3EndpointUrl: source.s3EndpointUrl } : {}),
+            ...(source.awsRegion ? { awsRegion: source.awsRegion } : {}),
+            ...(source.awsSessionToken ? { awsSessionToken: source.awsSessionToken } : {})
+          };
+    await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, jobBody);
     try {
       const finalStatus = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
       if (finalStatus === 'Failed' || finalStatus === 'Error') {

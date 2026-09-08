@@ -29,6 +29,7 @@ import {
   type CreateAssetInput,
   type ListOptions,
   type ListResult,
+  type RehydratePhase,
   type SetDeleteLockInput,
   type StorageByteClass,
   type StorageTier,
@@ -39,6 +40,8 @@ import {
   applyReviewState,
   applyStatus,
   applyStorageTier,
+  beginRehydrate,
+  completeRehydrate,
   clampLimit,
   generateUniqueSlug,
   initialHistory,
@@ -377,6 +380,37 @@ export class CouchAssetRepository implements AssetRepository {
         storageTiering: applyStorageTier(existing.storageTiering, overrides),
         updatedAt: now
       };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
+  // Dedicated rehydrate-state write path (ADR-019 D4, issue #558). Routed through
+  // updateWithRetry like setStorageTier so the read-modify-write is conflict-safe;
+  // beginRehydrate/completeRehydrate are pure and re-run safely per attempt. Only
+  // `storageTiering`/`updatedAt` change; lifecycle `status`/`statusHistory` are
+  // NEVER touched (the ADR-019 D6 tier/status firewall). Returns undefined when
+  // the id is unknown.
+  async setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const now = new Date().toISOString();
+      const tiering =
+        phase === 'begin'
+          ? beginRehydrate(existing.storageTiering, byteClass, now)
+          : completeRehydrate(existing.storageTiering, byteClass);
+      const next: Asset = { ...existing, storageTiering: tiering, updatedAt: now };
       updated = next;
       return toDoc(next);
     });

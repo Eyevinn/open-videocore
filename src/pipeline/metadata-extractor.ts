@@ -58,11 +58,36 @@ export type FfprobeResult = {
   format?: FfprobeFormat;
 };
 
-// Calls the OSC ffprobe runner against a presigned source URL and returns the
-// parsed ffprobe JSON. Injected so tests stub it and the OSC specifics stay in
-// one place (osc-ffprobe.ts). Throws on a runner/transport failure; the
-// orchestrator turns that into a recorded error.
-export type ProbeRunner = (presignedUrl: string) => Promise<FfprobeResult>;
+// An external-backend source the probe job reads directly (issue #548): the
+// ffmpeg-s3 job body carries the registered backend's endpoint + credential
+// references and probes `s3://bucket/key` in place, instead of a presigned GET
+// URL against OSC-managed storage. The two secret fields are `{{secrets.<name>}}`
+// REFERENCES (never literals — issue #548 acceptance), resolved by OSC at job
+// time. Shape verified against ffmpegS3CredentialMapping
+// (external-storage-credentials.ts:155-180) and the ffmpeg-s3 job body
+// (osc-thumbnail.ts:69-75 / osc-rewrap.ts:16-18).
+export type ExternalProbeSource = {
+  bucket: string;
+  objectKey: string;
+  awsAccessKeyId: string;
+  awsSecretAccessKey: string; // `{{secrets.<name>}}` reference
+  s3EndpointUrl?: string;
+  awsRegion?: string;
+  awsSessionToken?: string; // `{{secrets.<name>}}` reference
+};
+
+// Calls the OSC ffprobe runner and returns the parsed ffprobe JSON. Injected so
+// tests stub it and the OSC specifics stay in one place (osc-ffprobe.ts). Throws
+// on a runner/transport failure; the orchestrator turns that into a recorded
+// error.
+//
+// Called two ways:
+//   - default (OSC-managed) source: a presigned GET URL string;
+//   - external-backend source (issue #548): an ExternalProbeSource, so the job
+//     reads `s3://bucket/key` in place using the registered credentials.
+export type ProbeRunner = (
+  source: string | ExternalProbeSource
+) => Promise<FfprobeResult>;
 
 function toNumber(value: string | number | undefined): number {
   if (value === undefined || value === null) return 0;
@@ -106,6 +131,12 @@ export function parseFfprobe(result: FfprobeResult, now: string): TechnicalMetad
 export type ExtractParams = {
   assetId: string;
   objectKey: string;
+  // When present (issue #548), the source bytes live in a registered external
+  // backend, NOT OSC-managed storage. The extractor then hands the probe runner
+  // this external source (job reads `s3://bucket/key` in place) instead of
+  // minting a presigned GET URL against WorkspaceStorage. The credentials are
+  // `{{secrets.<name>}}` references — never literals.
+  externalSource?: ExternalProbeSource;
 };
 
 export type ExtractDeps = {
@@ -128,11 +159,20 @@ export async function extractTechnicalMetadata(
   params: ExtractParams,
   deps: ExtractDeps
 ): Promise<void> {
-  const { assetId, objectKey } = params;
+  const { assetId, objectKey, externalSource } = params;
   try {
-    const ttl = deps.ttlSeconds ?? probeUrlTtlSeconds();
-    const presignedUrl = await deps.storage.presignedGet(objectKey, ttl);
-    const result = await deps.probe(presignedUrl);
+    // External-backend source (issue #548): the probe job reads the object in
+    // place from the registered external bucket; no presigned GET against
+    // OSC-managed storage is minted. Otherwise the default path mints a
+    // short-lived presigned GET URL for the OSC-managed object.
+    let result: FfprobeResult;
+    if (externalSource) {
+      result = await deps.probe(externalSource);
+    } else {
+      const ttl = deps.ttlSeconds ?? probeUrlTtlSeconds();
+      const presignedUrl = await deps.storage.presignedGet(objectKey, ttl);
+      result = await deps.probe(presignedUrl);
+    }
     const metadata = parseFfprobe(result, new Date().toISOString());
     // Re-drive recovery (issue #281): if the asset is wedged in `processing`
     // (typically because a prior extraction recorded `technicalMetadataError`

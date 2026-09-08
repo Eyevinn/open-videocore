@@ -612,10 +612,12 @@ Request body (application/json)
   "title": "string",
   "tags": [
     "string"
-  ]
+  ],
+  "sourceBackend": "string"
 }
 Field notes- name — Legacy alias for `title` (issue #347). The editorial title of the asset. `title` and `name` are two input spellings of the SAME canonical field: both persist to `descriptive.title` and are read back as the `name` property on GET /assets/:id, list, and search responses. Prefer `title`; `title` wins when both are supplied.
 - title — The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to `descriptive.title` and is read back as the `name` property on GET /assets/:id, list, and search responses (there is NO separate top-level `title` field on responses). Accepted as an alias of `name`; `title` wins when both are supplied.
+- sourceBackend — Reference (id or name) to a registered external storage backend (issue #548, ADR-017) to source the asset bytes from, instead of the OSC-managed default storage. The backend must be registered (POST /storage/backends) and serve the `source` (or `both`) role. When set, `sourceUrl` addresses the object WITHIN that backend as `s3://<bucket>/<key>` (bucket may be omitted to use the registered backend's bucket, i.e. `s3:///<key>` or a bare `<key>`). No external credentials are ever supplied inline: the registered endpoint + credentials are reused server-side. Omit for the default source.
 
   Response
 Response 202 (application/json)

@@ -26,7 +26,6 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
-import { CouchAuditRepository } from '../data/audit-repo.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -38,6 +37,11 @@ import { InMemoryPipelineRepository, type PipelineRepository } from '../data/pip
 import type { SearchRepository } from '../data/search-repo.js';
 import type { WebhookRepository } from '../data/webhook-repo.js';
 import type { CollectionRepository } from '../data/collection-repo.js';
+import {
+  CouchAuditRepository,
+  InMemoryAuditRepository,
+  type AuditRepository
+} from '../data/audit-repo.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
@@ -93,6 +97,14 @@ export type WorkspaceConnections = {
   search: SearchRepository;
   webhooks: WebhookRepository;
   collections: CollectionRepository;
+  // Audit store for this stack. Backed by CouchAuditRepository in production and
+  // InMemoryAuditRepository on the in-memory/env paths, so it is always present.
+  // Exposes BOTH the read-only query surface (issue #565, consumed by
+  // PerWorkspaceAuditRepository.query) and the append-only `record()` write
+  // primitive (issue #564, consumed by PerWorkspaceAuditEmitter.record). Typed as
+  // the intersection so a single field serves both wrappers; both concrete repos
+  // satisfy it.
+  audit: AuditRepository & AuditEmitter;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   storageFor: StorageFactory | undefined;
@@ -117,13 +129,6 @@ export type WorkspaceConnections = {
   // `scene-detect` step skips gracefully — fire-and-forget, never throws.
   subtitleGenerator: SubtitleGenerator | undefined;
   sceneDetector: SceneDetector | undefined;
-  // Best-effort audit-entry writer for this stack (issue #564). Backed by the
-  // append-only audit store's `record()` write primitive (CouchAuditRepository)
-  // over the SAME per-stack CouchDB connection as the other repositories.
-  // Undefined on the in-memory fallback (no durable store to write to) — audit
-  // emission then no-ops. Never on the request hot path directly: the routers
-  // hold a PerWorkspaceAuditEmitter that resolves this lazily per call.
-  audit: AuditEmitter | undefined;
 };
 
 // A cached resolution. `fromReadyStack` records whether `connections` were
@@ -230,6 +235,7 @@ function buildConnectionsFromStack(
     search,
     webhooks,
     collections,
+    audit,
     profiles,
     pipelines,
     storageFor,
@@ -242,8 +248,7 @@ function buildConnectionsFromStack(
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
     subtitleGenerator,
-    sceneDetector,
-    audit
+    sceneDetector
   };
 }
 
@@ -266,11 +271,12 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let search: SearchRepository;
   let webhooks: WebhookRepository;
   let collections: CollectionRepository;
+  // Audit store: always present (CouchAuditRepository on the couch env path,
+  // InMemoryAuditRepository otherwise). Exposes both the #565 query surface and
+  // the #564 record() write primitive.
+  let audit: AuditRepository & AuditEmitter;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
-  // Audit store (issue #564): present only on the CouchDB env path (durable
-  // store); undefined on the in-memory fallback so emission no-ops.
-  let audit: AuditEmitter | undefined;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -291,6 +297,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     jobs = new InMemoryJobRepository();
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
+    audit = new InMemoryAuditRepository();
     // Search projects assets + collections (issue #561).
     search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
@@ -324,7 +331,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -336,8 +343,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     // OPTIONAL subtitles/scene-detect steps stay disabled here and skip
     // gracefully, exactly as when the name is absent from a record.
     subtitleGenerator: undefined,
-    sceneDetector: undefined,
-    audit
+    sceneDetector: undefined
   };
 }
 
@@ -346,12 +352,13 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const jobs = new InMemoryJobRepository();
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
+  const audit = new InMemoryAuditRepository();
   // Search projects assets + collections (issue #561).
   const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
   return {
-    assets, jobs, search, webhooks, collections, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
@@ -359,9 +366,7 @@ function buildInMemoryConnections(): WorkspaceConnections {
     s3Config: undefined,
     storage: undefined,
     subtitleGenerator: undefined,
-    sceneDetector: undefined,
-    // In-memory fallback has no durable audit store, so emission no-ops.
-    audit: undefined
+    sceneDetector: undefined
   };
 }
 

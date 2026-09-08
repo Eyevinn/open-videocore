@@ -2698,6 +2698,12 @@
                       "maxLength": 128
                     },
                     "maxItems": 128
+                  },
+                  "sourceBackend": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Reference (id or name) to a registered external storage backend (issue #548, ADR-017) to source the asset bytes from, instead of the OSC-managed default storage. The backend must be registered (POST /storage/backends) and serve the `source` (or `both`) role. When set, `sourceUrl` addresses the object WITHIN that backend as `s3://<bucket>/<key>` (bucket may be omitted to use the registered backend's bucket, i.e. `s3:///<key>` or a bare `<key>`). No external credentials are ever supplied inline: the registered endpoint + credentials are reused server-side. Omit for the default source."
                   }
                 },
                 "required": [
@@ -16706,6 +16712,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -16914,6 +16923,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17049,6 +17061,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17070,6 +17085,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17119,6 +17137,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17310,6 +17331,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17418,6 +17442,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17538,6 +17565,9 @@
                     },
                     "message": {
                       "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
                     }
                   },
                   "required": [
@@ -17559,6 +17589,9 @@
                       "type": "string"
                     },
                     "message": {
+                      "type": "string"
+                    },
+                    "reason": {
                       "type": "string"
                     }
                   },
@@ -17666,6 +17699,221 @@
             }
           },
           "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/audit/": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "in": "query",
+            "name": "offset",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asset",
+                "collection",
+                "job"
+              ]
+            },
+            "in": "query",
+            "name": "targetType",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "query",
+            "name": "targetId",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "user",
+                "system",
+                "ai"
+              ]
+            },
+            "in": "query",
+            "name": "origin",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "query",
+            "name": "principalId",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "query",
+            "name": "action",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "query",
+            "name": "from",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "query",
+            "name": "to",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "at": {
+                            "type": "string"
+                          },
+                          "actor": {
+                            "type": "object",
+                            "properties": {
+                              "principalId": {
+                                "type": "string",
+                                "nullable": true
+                              },
+                              "origin": {
+                                "type": "string",
+                                "enum": [
+                                  "user",
+                                  "system",
+                                  "ai"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "principalId",
+                              "origin"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "action": {
+                            "type": "string"
+                          },
+                          "targetType": {
+                            "type": "string",
+                            "enum": [
+                              "asset",
+                              "collection",
+                              "job"
+                            ]
+                          },
+                          "targetId": {
+                            "type": "string"
+                          },
+                          "detail": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "at",
+                          "actor",
+                          "action",
+                          "targetType",
+                          "targetId",
+                          "detail"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "limit": {
+                      "type": "number"
+                    },
+                    "offset": {
+                      "type": "number"
+                    },
+                    "total": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "limit",
+                    "offset",
+                    "total"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
             "description": "Default Response",
             "content": {
               "application/json": {
