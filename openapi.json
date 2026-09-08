@@ -6464,6 +6464,45 @@
                 }
               }
             }
+          },
+          "504": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "dependency_unreachable"
+                      ]
+                    },
+                    "dependency": {
+                      "type": "string",
+                      "enum": [
+                        "queue",
+                        "encore",
+                        "storage"
+                      ]
+                    },
+                    "endpoint": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "dependency",
+                    "endpoint",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
@@ -14308,6 +14347,45 @@
                   },
                   "required": [
                     "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "dependency_unreachable"
+                      ]
+                    },
+                    "dependency": {
+                      "type": "string",
+                      "enum": [
+                        "queue",
+                        "encore",
+                        "storage"
+                      ]
+                    },
+                    "endpoint": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "dependency",
+                    "endpoint",
+                    "message"
                   ],
                   "additionalProperties": false
                 }
