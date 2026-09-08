@@ -110,6 +110,8 @@ import {
 } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
+import { Client as MinioClient } from 'minio';
+import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import {
   createJob,
@@ -421,7 +423,44 @@ await app.register(provisionRouter, {
   // this register() call runs. This getter reads that outer binding on demand
   // so the DELETE route can reach the current registry for teardown (#123)
   // without depending on registration-time ordering.
-  getScalerRegistry: () => scalerRegistry
+  getScalerRegistry: () => scalerRegistry,
+  // Build per-stack reachability probe clients for GET /:name/reachability
+  // (issue #617) from the SAME stored StackConfig coordinates the resolver and
+  // scaler use — never process-global endpoints. The queue probe is a lazily-
+  // connected IORedis on the stack's Valkey URL (config.redisUrl, credential-
+  // free `redis://host:port` — see redisUrlFrom in routes/provision.ts); the
+  // storage probe is a MinioClient on config.minioEndpoint with the deployment
+  // MinIO admin credentials (identical construction to
+  // workspace-stack.ts buildConnectionsFromStack). Probe clients are
+  // short-lived per request: the lazyConnect IORedis is not kept resident.
+  reachabilityProbeFactory: (config): StackReachabilityDeps => {
+    const deps: StackReachabilityDeps = {};
+    if (config.redisUrl && config.redisUrl.length > 0) {
+      deps.queueClient = new IORedis(config.redisUrl, {
+        lazyConnect: true,
+        maxRetriesPerRequest: null
+      });
+    }
+    const minioPassword = process.env['MINIO_ROOT_PASSWORD'];
+    if (config.minioEndpoint && config.minioEndpoint.length > 0 && minioPassword) {
+      try {
+        const url = new URL(config.minioEndpoint);
+        const useSSL = url.protocol === 'https:';
+        deps.storageClient = new MinioClient({
+          endPoint: url.hostname,
+          port: url.port ? Number(url.port) : useSSL ? 443 : 80,
+          useSSL,
+          accessKey: 'admin',
+          secretKey: minioPassword
+        });
+      } catch {
+        // A malformed stored endpoint leaves storageClient unset: the storage
+        // dependency is then reported not_configured rather than crashing the
+        // diagnostics read.
+      }
+    }
+    return deps;
+  }
 });
 
 // Per-optional-service provision/deprovision/status endpoints (issue #195).
