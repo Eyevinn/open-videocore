@@ -17672,6 +17672,49 @@
               }
             }
           },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "backend_validation_failed"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "unreachable",
+                        "unauthorized",
+                        "bucket_not_found",
+                        "forbidden_list",
+                        "forbidden_write",
+                        "forbidden_read",
+                        "probe_cleanup_failed",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "reason",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "501": {
             "description": "Default Response",
             "content": {
