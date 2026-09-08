@@ -30,6 +30,7 @@
 
 import type { AssetRepository, ManifestUrls, PackagedOutput } from '../data/asset-repo.js';
 import type { StorageBackendConfig } from '../services/param-store.js';
+import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
 // in routes/provision.ts and the packager's OutputFolder).
@@ -216,6 +217,11 @@ export type PackagingDeps = {
   publicBaseUrl?: string;
   // Test observability hook fired on a recorded packaging failure.
   onError?: (err: unknown) => void;
+  // Best-effort audit emission (issue #564). Optional so existing callers /
+  // tests are unaffected; when absent, emission is a no-op. A failed audit write
+  // is logged, never propagated — packaging never becomes newly failable.
+  audit?: AuditEmitter;
+  auditLog?: AuditErrorLog;
 };
 
 export function packagingPublicBaseUrl(): string {
@@ -389,6 +395,21 @@ export class PackagingService implements PackagingTrigger {
         url: encoreJobUrl
       };
       await this.deps.queue.enqueue(job);
+      // Audit: package job submitted (issue #564). One entry on a SUCCESSFUL
+      // enqueue only — the catch path below is a failed submission that records
+      // `packagingError` instead. targetId is the packaging correlation id
+      // (= assetId; packaging carries no separate Job record).
+      emitAudit(
+        this.deps.audit,
+        {
+          actor: originActor('system'),
+          action: 'job.submitted',
+          targetType: 'job',
+          targetId: assetId,
+          detail: { jobType: 'package', assetId }
+        },
+        this.deps.auditLog
+      );
     } catch (err) {
       this.deps.onError?.(err);
       const message = err instanceof Error ? err.message : String(err);
@@ -427,6 +448,20 @@ export class PackagingService implements PackagingTrigger {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {})
     });
+    // Audit: package job reached terminal success (issue #564). One entry;
+    // emitted only when the asset resolved (a callback for an unknown asset
+    // returns false above and records nothing).
+    emitAudit(
+      this.deps.audit,
+      {
+        actor: originActor('system'),
+        action: 'job.completed',
+        targetType: 'job',
+        targetId: assetId,
+        detail: { jobType: 'package', assetId }
+      },
+      this.deps.auditLog
+    );
     return true;
   }
 
@@ -435,6 +470,19 @@ export class PackagingService implements PackagingTrigger {
     const asset = await this.deps.assets.get(assetId);
     if (!asset) return false;
     await this.deps.assets.update(assetId, { packagingError: message });
+    // Audit: package job reached terminal failure (issue #564). One entry;
+    // emitted only when the asset resolved (unknown asset returns false above).
+    emitAudit(
+      this.deps.audit,
+      {
+        actor: originActor('system'),
+        action: 'job.failed',
+        targetType: 'job',
+        targetId: assetId,
+        detail: { jobType: 'package', assetId, error: message }
+      },
+      this.deps.auditLog
+    );
     return true;
   }
 }

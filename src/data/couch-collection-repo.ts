@@ -7,17 +7,19 @@
 // resolves to undefined (existence is not leaked) and is never read or mutated
 // cross-workspace.
 
-import type { StoredDoc, StackCouch } from './couchdb.js';
+import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 import {
   CollectionNotFoundError,
   addAssetId,
   applyCollectionDeleteLock,
+  applyCollectionUpdate,
   removeAssetId,
   type Collection,
   type CollectionRepository,
   type CreateCollectionInput,
   type DeleteLock,
-  type SetDeleteLockInput
+  type SetDeleteLockInput,
+  type UpdateCollectionInput
 } from './collection-repo.js';
 
 const RESOURCE_TYPE = 'collection';
@@ -63,6 +65,29 @@ export class CouchCollectionRepository implements CollectionRepository {
       return undefined;
     }
     return fromDoc(doc);
+  }
+
+  // Partial editorial update of descriptive metadata (issue #560). Routed through
+  // the shared conflict-retry wrapper (updateWithRetry) — the same `_rev`
+  // merge-retry the asset editorial write uses (ADR-005 / issue #278, see
+  // couch-asset-repo.ts `update`). A concurrent writer racing the same `_rev`
+  // (e.g. a membership add landing between this read and put) yields a CouchDB
+  // 409 that is retried against the fresh document rather than silently clobbered.
+  // applyCollectionUpdate is pure so it re-runs safely inside the loop.
+  async update(id: string, patch: UpdateCollectionInput): Promise<Collection> {
+    const couch = this.couchFor();
+    let updated: Collection | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      if (current.resourceType !== RESOURCE_TYPE) {
+        throw new CollectionNotFoundError(id);
+      }
+      updated = applyCollectionUpdate(fromDoc(current), patch, new Date().toISOString());
+      return toDoc(updated);
+    });
+    if (!written || !updated) {
+      throw new CollectionNotFoundError(id);
+    }
+    return updated;
   }
 
   async addAsset(id: string, assetId: string): Promise<Collection> {
