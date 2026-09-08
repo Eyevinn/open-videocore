@@ -2698,6 +2698,12 @@
                       "maxLength": 128
                     },
                     "maxItems": 128
+                  },
+                  "sourceBackend": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Reference (id or name) to a registered external storage backend (issue #548, ADR-017) to source the asset bytes from, instead of the OSC-managed default storage. The backend must be registered (POST /storage/backends) and serve the `source` (or `both`) role. When set, `sourceUrl` addresses the object WITHIN that backend as `s3://<bucket>/<key>` (bucket may be omitted to use the registered backend's bucket, i.e. `s3:///<key>` or a bare `<key>`). No external credentials are ever supplied inline: the registered endpoint + credentials are reused server-side. Omit for the default source."
                   }
                 },
                 "required": [
