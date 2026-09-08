@@ -17,6 +17,8 @@ import type {
   AssetReviewState,
   CreateAssetInput,
   SetDeleteLockInput,
+  StorageByteClass,
+  StorageTier,
   UpdateAssetInput,
   ListOptions,
   ListResult,
@@ -38,6 +40,7 @@ import type {
 import type {
   CollectionRepository,
   CreateCollectionInput,
+  UpdateCollectionInput,
   Collection
 } from './collection-repo.js';
 import type {
@@ -57,6 +60,8 @@ import type {
 } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from './job-repo.js';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
+import type { AuditEmitter } from './audit-emit.js';
+import type { RecordAuditInput } from './audit-repo.js';
 
 export class PerWorkspaceAssetRepository implements AssetRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
@@ -90,6 +95,12 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Asset | undefined> {
     return (await this.repo()).setDeleteLock(id, input);
   }
+  async setStorageTier(
+    id: string,
+    overrides: Partial<Record<StorageByteClass, StorageTier>>
+  ): Promise<Asset | undefined> {
+    return (await this.repo()).setStorageTier(id, overrides);
+  }
   async countChildren(id: string): Promise<number> {
     return (await this.repo()).countChildren(id);
   }
@@ -117,6 +128,9 @@ export class PerWorkspaceJobRepository implements JobRepository {
   }
   async list(opts?: { limit?: number; offset?: number }): Promise<{ items: Job[]; total: number }> {
     return (await this.repo()).list(opts);
+  }
+  async findActiveByAssetId(assetId: string): Promise<Job[]> {
+    return (await this.repo()).findActiveByAssetId(assetId);
   }
   async update(id: string, patch: UpdateJobInput): Promise<Job | undefined> {
     return (await this.repo()).update(id, patch);
@@ -273,6 +287,9 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
   async get(id: string): Promise<Collection | undefined> {
     return (await this.repo()).get(id);
   }
+  async update(id: string, patch: UpdateCollectionInput): Promise<Collection> {
+    return (await this.repo()).update(id, patch);
+  }
   async addAsset(id: string, assetId: string): Promise<Collection> {
     return (await this.repo()).addAsset(id, assetId);
   }
@@ -284,5 +301,27 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
   }
   async delete(id: string): Promise<void> {
     return (await this.repo()).delete(id);
+  }
+}
+
+// Stack-delegating audit emitter (issue #564). Holds no connection of its own:
+// on each `record()` it resolves the active stack and delegates to that stack's
+// audit store (CouchAuditRepository), or no-ops when the resolved stack has no
+// durable audit store (in-memory fallback). Mirrors the other PerWorkspace*
+// wrappers so the routers receive a single `AuditEmitter` regardless of backend.
+//
+// Emission is only ever invoked through `emitAudit` (src/data/audit-emit.ts),
+// which is fire-and-forget: a resolve/write failure here is caught and logged by
+// the caller, never propagated into the primary operation.
+export class PerWorkspaceAuditEmitter implements AuditEmitter {
+  constructor(private readonly resolver: WorkspaceStackResolver) {}
+  async record(input: RecordAuditInput): Promise<unknown> {
+    const audit = (await this.resolver.resolve()).audit;
+    if (!audit) {
+      // No durable audit store on this stack (in-memory fallback): silently
+      // skip. The entry is intentionally not persisted rather than erroring.
+      return undefined;
+    }
+    return audit.record(input);
   }
 }

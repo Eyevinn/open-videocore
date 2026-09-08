@@ -66,7 +66,17 @@ function fakeEncore(fail?: Error): { client: EncoreClient; submitted: EncoreSubm
   return { client, submitted };
 }
 
-async function buildApp(opts: { encoreFail?: Error; noEncore?: boolean } = {}): Promise<Harness> {
+async function buildApp(
+  opts: {
+    encoreFail?: Error;
+    noEncore?: boolean;
+    // Per-stack packaged bucket to expose on request.connections (issue #638).
+    // Mirrors the global preHandler in src/main.ts that decorates each request
+    // with the resolved stack's WorkspaceConnections. When set, the transcode
+    // step must resolve the output bucket from THIS value, not opts.outputBucket.
+    stackPackagedBucket?: string;
+  } = {}
+): Promise<Harness> {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
@@ -75,6 +85,20 @@ async function buildApp(opts: { encoreFail?: Error; noEncore?: boolean } = {}): 
   const jobs = new InMemoryJobRepository();
   const profiles = new InMemoryProfileRepository();
   const { client, submitted } = fakeEncore(opts.encoreFail);
+
+  // Decorate + populate request.connections exactly as src/main.ts does, so the
+  // transcode route can resolve the per-stack packagedBucket at request time.
+  app.decorateRequest('connections', null);
+  if (opts.stackPackagedBucket !== undefined) {
+    const packagedBucket = opts.stackPackagedBucket;
+    app.addHook('preHandler', async (request) => {
+      // Only packagedBucket is read by the transcode step under test; the rest
+      // of WorkspaceConnections is irrelevant here, so a partial cast suffices.
+      request.connections = { packagedBucket } as unknown as NonNullable<
+        typeof request.connections
+      >;
+    });
+  }
 
   await app.register(assetsRouter, {
     prefix: '/api/v1/assets',
@@ -135,6 +159,67 @@ describe('transcode job management (issue #8)', () => {
       // which the fake client here does not exercise. So the asset stays `ready`.
       const src = await h.assets.get('workspace-a', sourceId);
       expect(src?.status).toBe('ready');
+    });
+
+    // Issue #638: the transcode output destination must be built from the
+    // stack's persisted per-stack packagedStorage.bucket (surfaced on
+    // request.connections.packagedBucket, sourced from the parameter store at
+    // provision time per ADR-002), NOT the deployment-wide MINIO_PACKAGED_BUCKET
+    // default (opts.outputBucket = 'out-bucket'). The path template
+    // transcode/<assetId>/<jobId>/ is unchanged — only the bucket differs.
+    // Create a transcodable source using the repository's current single-scope
+    // signature (create(input) / update(id, patch)), independent of the shared
+    // makeSource helper whose (workspace, …) calls predate the repo signature
+    // change (the pre-existing workspace-scoping failures). Keeps these #638
+    // tests self-contained and green (mirrors makeTranscodableSource below).
+    async function makeReadySource(h: Harness, name = 'src-638'): Promise<string> {
+      const asset = await h.assets.create({ name, objectKey: `ingest/${name}` });
+      await h.assets.update(asset.id, { status: 'processing' });
+      await h.assets.update(asset.id, { status: 'ready' });
+      return asset.id;
+    }
+
+    it('resolves the output bucket from the per-stack packagedBucket, not the deployment default (issue #638)', async () => {
+      const h = await buildApp({ stackPackagedBucket: 'tenant-i24ly-packaged' });
+      const sourceId = await makeReadySource(h);
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: {}
+      });
+      expect(res.statusCode).toBe(202);
+      const { jobId } = res.json();
+
+      // Destination uses the per-stack bucket, and the path template
+      // (transcode/<assetId>/<jobId>) is unchanged.
+      expect(h.submitted).toHaveLength(1);
+      expect(h.submitted[0].outputUri).toBe(
+        `s3://tenant-i24ly-packaged/transcode/${sourceId}/${jobId}`
+      );
+      // It must NOT fall back to the deployment-wide default bucket.
+      expect(h.submitted[0].outputUri).not.toContain('out-bucket');
+    });
+
+    // Issue #638: when NO per-stack value exists (request.connections absent —
+    // e.g. the env-override path), the transcode step falls back to the
+    // deployment-wide default bucket unchanged.
+    it('falls back to the deployment default bucket when no per-stack value exists (issue #638)', async () => {
+      const h = await buildApp();
+      const sourceId = await makeReadySource(h);
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: {}
+      });
+      expect(res.statusCode).toBe(202);
+      const { jobId } = res.json();
+      expect(h.submitted[0].outputUri).toBe(
+        `s3://out-bucket/transcode/${sourceId}/${jobId}`
+      );
     });
 
     it('honours explicit preset selection (720p, 480p)', async () => {
