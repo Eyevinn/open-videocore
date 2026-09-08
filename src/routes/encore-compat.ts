@@ -44,6 +44,7 @@ import {
 } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository, type JobStatus } from '../data/job-repo.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { PRESET_NAMES, type PresetName } from '../pipeline/encode-presets.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
@@ -111,6 +112,17 @@ const encoreJobResponseSchema = z.object({
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
+// Machine-readable body for a 504 when a required stack dependency (queue/
+// Valkey, Encore, storage) is unreachable or times out on the submit path
+// (issue #616). Names the failing dependency + endpoint so the caller can fail
+// fast instead of waiting for the ~50s socket-drop boundary.
+const dependencyUnreachableSchema = z.object({
+  error: z.literal('dependency_unreachable'),
+  dependency: z.enum(['queue', 'encore', 'storage']),
+  endpoint: z.string(),
+  message: z.string()
+});
+
 // Map our internal Job.status to the Encore job status vocabulary the caller
 // expects. pending/queued -> QUEUED, running -> IN_PROGRESS, done -> SUCCESSFUL,
 // failed -> FAILED.
@@ -163,7 +175,12 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
     {
       schema: {
         body: encoreJobSchema,
-        response: { 200: encoreJobResponseSchema, 501: errorSchema, 502: errorSchema }
+        response: {
+          200: encoreJobResponseSchema,
+          501: errorSchema,
+          502: errorSchema,
+          504: dependencyUnreachableSchema
+        }
       }
     },
     async (request, reply) => {
@@ -235,6 +252,24 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
           status: 'QUEUED'
         });
       } catch (err) {
+        // A stack dependency (queue/Valkey, Encore, storage) was unreachable or
+        // timed out (#616): fail fast with a named 504 and a server-side log,
+        // rather than letting the request hang to the ~50s socket-drop boundary.
+        if (isDependencyUnreachableError(err)) {
+          request.log.error(
+            {
+              err,
+              dependency: err.dependency,
+              endpoint: err.endpoint,
+              stackName: err.stackName,
+              operation: err.operation,
+              reason: err.reason,
+              timeoutMs: err.timeoutMs
+            },
+            'encore-compat submit failed: stack dependency unreachable'
+          );
+          return reply.code(504).send(err.toResponseBody());
+        }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
       }
