@@ -24,6 +24,7 @@ import {
   InvalidStateTransitionError,
   MAX_LIMIT,
   ParentNotFoundError,
+  ReferencedByJobError,
   STORAGE_BYTE_CLASSES,
   STORAGE_TIERS,
   defaultStorageTiering,
@@ -1728,6 +1729,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         message: err.message,
         reason: 'delete_protected',
         blockedBy: { jobIds: [], collectionIds: [] }
+      });
+    }
+    // In-flight job reference (ADR-020 decision 1, issue #569): the same shared
+    // `delete_blocked` envelope, reason `referenced_by_job`, with the
+    // referencing job ids named in `blockedBy.jobIds` so the caller can wait
+    // for or cancel them. An active reference is a hard block (decision 2), so
+    // `?force=true` never reaches this branch as a bypass.
+    if (err instanceof ReferencedByJobError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'referenced_by_job',
+        blockedBy: { jobIds: err.jobIds, collectionIds: [] }
       });
     }
     if (err instanceof SourceValidationError) {
@@ -3875,6 +3889,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const existing = await repo.get(request.params.id);
       if (existing?.deleteLock?.locked) {
         throw new DeleteProtectedError(request.params.id);
+      }
+      // In-flight job reference (ADR-020 decision 1, issue #569). Block deletion
+      // while any active (pending/queued/running) transcode or ingest job still
+      // references this asset as its source `assetId` — deleting it would
+      // corrupt an in-flight pipeline. This is a HARD block: it runs before the
+      // archive and force is never consulted (ADR-020 decision 2 — only settled
+      // jobs are forceable, and those are excluded by findActiveByAssetId). The
+      // richer `delete_blocked` envelope names the blocking job ids so the
+      // caller can wait for or cancel them. Ordered after the explicit lock per
+      // the fixed reason precedence delete_protected > referenced_by_job.
+      const activeJobs = await jobs.findActiveByAssetId(request.params.id);
+      if (activeJobs.length > 0) {
+        throw new ReferencedByJobError(
+          request.params.id,
+          activeJobs.map((j) => j.id)
+        );
       }
       // Block deletion while children (renditions) still reference this asset.
       const childCount = await repo.countChildren(request.params.id);

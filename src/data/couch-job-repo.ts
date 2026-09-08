@@ -7,6 +7,7 @@
 // leaked) and is never mutated cross-workspace.
 
 import {
+  ACTIVE_JOB_STATUSES,
   applyJobPatch,
   appendEncodeAttemptToJob,
   finalizeLatestEncodeAttemptOnJob,
@@ -69,6 +70,25 @@ export class CouchJobRepository implements JobRepository {
     const items = docs.filter((d) => d.resourceType === RESOURCE_TYPE).map(fromDoc);
     items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return { items, total: skip + items.length + (items.length === limit ? 1 : 0) };
+  }
+
+  // Find every in-flight job referencing `assetId` as its source (issue #569).
+  // A Mango selector on the workspace partition: resourceType 'job', the target
+  // assetId, and a non-terminal status (ACTIVE_JOB_STATUSES via $in). Settled
+  // jobs are excluded server-side so the asset DELETE handler blocks only on
+  // truly active references (ADR-020 decision 2). Sorted by createdAt so the
+  // returned ids are deterministic.
+  async findActiveByAssetId(assetId: string): Promise<Job[]> {
+    const couch = this.couchFor();
+    const docs = await couch.find(
+      { resourceType: RESOURCE_TYPE, assetId, status: { $in: [...ACTIVE_JOB_STATUSES] } },
+      { limit: 1000 }
+    );
+    return docs
+      .filter((d) => d.resourceType === RESOURCE_TYPE)
+      .map(fromDoc)
+      .filter((j) => j.assetId === assetId && ACTIVE_JOB_STATUSES.includes(j.status))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   // The internal Encore callback is unauthenticated and carries no workspace.
