@@ -180,6 +180,45 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "unsupported": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "field": {
+                            "type": "string"
+                          },
+                          "message": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "field",
+                          "message"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "unsupported"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       },
@@ -1640,6 +1679,126 @@
                         "rejected"
                       ]
                     },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -2045,6 +2204,126 @@
                               "approved",
                               "rejected"
                             ]
+                          },
+                          "deleteLock": {
+                            "type": "object",
+                            "properties": {
+                              "locked": {
+                                "type": "boolean"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "lockedAt": {
+                                "type": "string"
+                              },
+                              "lockedBy": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "locked",
+                              "lockedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
                           },
                           "parentId": {
                             "type": "string"
@@ -2587,6 +2866,126 @@
                               "rejected"
                             ]
                           },
+                          "deleteLock": {
+                            "type": "object",
+                            "properties": {
+                              "locked": {
+                                "type": "boolean"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "lockedAt": {
+                                "type": "string"
+                              },
+                              "lockedBy": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "locked",
+                              "lockedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
+                          },
                           "parentId": {
                             "type": "string"
                           },
@@ -2978,6 +3377,126 @@
                               "approved",
                               "rejected"
                             ]
+                          },
+                          "deleteLock": {
+                            "type": "object",
+                            "properties": {
+                              "locked": {
+                                "type": "boolean"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "lockedAt": {
+                                "type": "string"
+                              },
+                              "lockedBy": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "locked",
+                              "lockedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
                           },
                           "parentId": {
                             "type": "string"
@@ -3431,6 +3950,126 @@
                         "approved",
                         "rejected"
                       ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -3892,6 +4531,126 @@
                         "rejected"
                       ]
                     },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -4303,19 +5062,73 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "type": "string"
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string",
+                          "enum": [
+                            "delete_blocked"
+                          ]
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": "string",
+                          "enum": [
+                            "referenced_by_job",
+                            "member_of_collection",
+                            "delete_protected"
+                          ]
+                        },
+                        "blockedBy": {
+                          "type": "object",
+                          "properties": {
+                            "jobIds": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "collectionIds": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "required": [
+                            "jobIds",
+                            "collectionIds"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "error",
+                        "reason",
+                        "blockedBy"
+                      ],
+                      "additionalProperties": false
                     },
-                    "message": {
-                      "type": "string"
+                    {
+                      "type": "object",
+                      "properties": {
+                        "error": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "error"
+                      ],
+                      "additionalProperties": false
                     }
-                  },
-                  "required": [
-                    "error"
-                  ],
-                  "additionalProperties": false
+                  ]
                 }
               }
             }
@@ -4382,6 +5195,126 @@
                               "approved",
                               "rejected"
                             ]
+                          },
+                          "deleteLock": {
+                            "type": "object",
+                            "properties": {
+                              "locked": {
+                                "type": "boolean"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "lockedAt": {
+                                "type": "string"
+                              },
+                              "lockedBy": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "locked",
+                              "lockedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "storageTiering": {
+                            "type": "object",
+                            "properties": {
+                              "tiers": {
+                                "type": "object",
+                                "required": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "properties": {
+                                  "source": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "renditions": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "packaged": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "subtitles": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  },
+                                  "thumbnails": {
+                                    "type": "string",
+                                    "enum": [
+                                      "hot",
+                                      "archive"
+                                    ]
+                                  }
+                                },
+                                "additionalProperties": false,
+                                "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                              },
+                              "rehydrating": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "byteClass": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source",
+                                        "renditions",
+                                        "packaged",
+                                        "subtitles",
+                                        "thumbnails"
+                                      ],
+                                      "description": "The byte class being restored from archive back to hot."
+                                    },
+                                    "startedAt": {
+                                      "type": "string",
+                                      "description": "ISO timestamp the restore was requested/started."
+                                    }
+                                  },
+                                  "required": [
+                                    "byteClass",
+                                    "startedAt"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                              }
+                            },
+                            "required": [
+                              "tiers",
+                              "rehydrating"
+                            ],
+                            "additionalProperties": false,
+                            "default": {
+                              "tiers": {
+                                "source": "hot",
+                                "renditions": "hot",
+                                "packaged": "hot",
+                                "subtitles": "hot",
+                                "thumbnails": "hot"
+                              },
+                              "rehydrating": []
+                            }
                           },
                           "parentId": {
                             "type": "string"
@@ -5526,6 +6459,45 @@
                   },
                   "required": [
                     "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "dependency_unreachable"
+                      ]
+                    },
+                    "dependency": {
+                      "type": "string",
+                      "enum": [
+                        "queue",
+                        "encore",
+                        "storage"
+                      ]
+                    },
+                    "endpoint": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "dependency",
+                    "endpoint",
+                    "message"
                   ],
                   "additionalProperties": false
                 }
@@ -6891,6 +7863,126 @@
                         "rejected"
                       ]
                     },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -7402,6 +8494,126 @@
                         "approved",
                         "rejected"
                       ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -7918,6 +9130,126 @@
                         "approved",
                         "rejected"
                       ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -8829,6 +10161,126 @@
                         "rejected"
                       ]
                     },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -9227,6 +10679,126 @@
                         "approved",
                         "rejected"
                       ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -9643,6 +11215,126 @@
                         "rejected"
                       ]
                     },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
                     "parentId": {
                       "type": "string"
                     },
@@ -10003,6 +11695,1046 @@
         }
       }
     },
+    "/api/v1/assets/{id}/lock": {
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 1024
+                  },
+                  "lockedBy": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                },
+                "additionalProperties": false,
+                "default": {}
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
+                    },
+                    "slug": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "uploading",
+                        "processing",
+                        "ready",
+                        "failed",
+                        "archived"
+                      ]
+                    },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
+                    "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
+                      "type": "string"
+                    },
+                    "objectKey": {
+                      "type": "string"
+                    },
+                    "statusHistory": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "at": {
+                            "type": "string"
+                          },
+                          "from": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ],
+                            "nullable": true
+                          },
+                          "to": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "at",
+                          "from",
+                          "to"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "technicalMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "codec": {
+                          "type": "string"
+                        },
+                        "width": {
+                          "type": "number"
+                        },
+                        "height": {
+                          "type": "number"
+                        },
+                        "durationSeconds": {
+                          "type": "number"
+                        },
+                        "bitrateBps": {
+                          "type": "number"
+                        },
+                        "containerFormat": {
+                          "type": "string"
+                        },
+                        "audioTracks": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "index": {
+                                "type": "number"
+                              },
+                              "codec": {
+                                "type": "string"
+                              },
+                              "channels": {
+                                "type": "number"
+                              },
+                              "sampleRateHz": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "index",
+                              "codec",
+                              "channels",
+                              "sampleRateHz"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "extractedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "width",
+                        "height",
+                        "durationSeconds",
+                        "bitrateBps",
+                        "containerFormat",
+                        "audioTracks",
+                        "extractedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
+                      "type": "string"
+                    },
+                    "manifestUrls": {
+                      "type": "object",
+                      "properties": {
+                        "hls": {
+                          "type": "string"
+                        },
+                        "dash": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "packagingError": {
+                      "type": "string"
+                    },
+                    "renditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "label",
+                          "width",
+                          "height",
+                          "objectKey"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "thumbnails": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "audioTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "channels": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "subtitleTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "format": {
+                            "type": "string",
+                            "enum": [
+                              "vtt",
+                              "srt",
+                              "ttml"
+                            ]
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language",
+                          "format"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "status",
+                    "statusHistory",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
+                    },
+                    "slug": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "uploading",
+                        "processing",
+                        "ready",
+                        "failed",
+                        "archived"
+                      ]
+                    },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
+                    "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
+                      "type": "string"
+                    },
+                    "objectKey": {
+                      "type": "string"
+                    },
+                    "statusHistory": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "at": {
+                            "type": "string"
+                          },
+                          "from": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ],
+                            "nullable": true
+                          },
+                          "to": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "at",
+                          "from",
+                          "to"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "technicalMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "codec": {
+                          "type": "string"
+                        },
+                        "width": {
+                          "type": "number"
+                        },
+                        "height": {
+                          "type": "number"
+                        },
+                        "durationSeconds": {
+                          "type": "number"
+                        },
+                        "bitrateBps": {
+                          "type": "number"
+                        },
+                        "containerFormat": {
+                          "type": "string"
+                        },
+                        "audioTracks": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "index": {
+                                "type": "number"
+                              },
+                              "codec": {
+                                "type": "string"
+                              },
+                              "channels": {
+                                "type": "number"
+                              },
+                              "sampleRateHz": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "index",
+                              "codec",
+                              "channels",
+                              "sampleRateHz"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "extractedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "width",
+                        "height",
+                        "durationSeconds",
+                        "bitrateBps",
+                        "containerFormat",
+                        "audioTracks",
+                        "extractedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
+                      "type": "string"
+                    },
+                    "manifestUrls": {
+                      "type": "object",
+                      "properties": {
+                        "hls": {
+                          "type": "string"
+                        },
+                        "dash": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "packagingError": {
+                      "type": "string"
+                    },
+                    "renditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "label",
+                          "width",
+                          "height",
+                          "objectKey"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "thumbnails": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "audioTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "channels": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "subtitleTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "format": {
+                            "type": "string",
+                            "enum": [
+                              "vtt",
+                              "srt",
+                              "ttml"
+                            ]
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language",
+                          "format"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "status",
+                    "statusHistory",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/assets/{id}/restore": {
       "post": {
         "parameters": [
@@ -10054,6 +12786,126 @@
                         "approved",
                         "rejected"
                       ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
                     },
                     "parentId": {
                       "type": "string"
@@ -11495,6 +14347,45 @@
                   },
                   "required": [
                     "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "dependency_unreachable"
+                      ]
+                    },
+                    "dependency": {
+                      "type": "string",
+                      "enum": [
+                        "queue",
+                        "encore",
+                        "storage"
+                      ]
+                    },
+                    "endpoint": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "dependency",
+                    "endpoint",
+                    "message"
                   ],
                   "additionalProperties": false
                 }
@@ -13100,11 +15991,11 @@
     },
     "/api/v1/search/": {
       "get": {
-        "summary": "Search assets",
+        "summary": "Search assets and collections",
         "tags": [
           "search"
         ],
-        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset in the workspace. Results are paginated via `page`/`pageSize` and returned as `{ assets, total, page }`.",
+        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`.",
         "parameters": [
           {
             "schema": {
@@ -13368,6 +16259,12 @@
                           },
                           "updatedAt": {
                             "type": "string"
+                          },
+                          "type": {
+                            "type": "string",
+                            "enum": [
+                              "asset"
+                            ]
                           }
                         },
                         "required": [
@@ -13375,6 +16272,54 @@
                           "name",
                           "status",
                           "statusHistory",
+                          "createdAt",
+                          "updatedAt",
+                          "type"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "collections": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "type": {
+                            "type": "string",
+                            "enum": [
+                              "collection"
+                            ]
+                          },
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "tags": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "custom": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          },
+                          "createdAt": {
+                            "type": "string"
+                          },
+                          "updatedAt": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "id",
+                          "name",
                           "createdAt",
                           "updatedAt"
                         ],
@@ -13384,13 +16329,18 @@
                     "total": {
                       "type": "number"
                     },
+                    "collectionTotal": {
+                      "type": "number"
+                    },
                     "page": {
                       "type": "number"
                     }
                   },
                   "required": [
                     "assets",
+                    "collections",
                     "total",
+                    "collectionTotal",
                     "page"
                   ],
                   "additionalProperties": false
@@ -13647,6 +16597,19 @@
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "custom": {
+                    "type": "object",
+                    "additionalProperties": {}
                   }
                 },
                 "required": [
@@ -13677,11 +16640,46 @@
                         "type": "string"
                       }
                     },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
                     "createdAt": {
                       "type": "string"
                     },
                     "updatedAt": {
                       "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
                     }
                   },
                   "required": [
@@ -13746,11 +16744,46 @@
                               "type": "string"
                             }
                           },
+                          "description": {
+                            "type": "string"
+                          },
+                          "tags": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "custom": {
+                            "type": "object",
+                            "additionalProperties": {}
+                          },
                           "createdAt": {
                             "type": "string"
                           },
                           "updatedAt": {
                             "type": "string"
+                          },
+                          "deleteLock": {
+                            "type": "object",
+                            "properties": {
+                              "locked": {
+                                "type": "boolean"
+                              },
+                              "reason": {
+                                "type": "string"
+                              },
+                              "lockedAt": {
+                                "type": "string"
+                              },
+                              "lockedBy": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "locked",
+                              "lockedAt"
+                            ],
+                            "additionalProperties": false
                           }
                         },
                         "required": [
@@ -13807,11 +16840,46 @@
                         "type": "string"
                       }
                     },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
                     "createdAt": {
                       "type": "string"
                     },
                     "updatedAt": {
                       "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
                     },
                     "assets": {
                       "type": "array",
@@ -13828,6 +16896,163 @@
                     "createdAt",
                     "updatedAt",
                     "assets"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "custom": {
+                    "type": "object",
+                    "additionalProperties": {}
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "assetIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "assetIds",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -13904,6 +17129,305 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "delete_blocked"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "referenced_by_job",
+                        "member_of_collection",
+                        "delete_protected"
+                      ]
+                    },
+                    "blockedBy": {
+                      "type": "object",
+                      "properties": {
+                        "jobIds": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "collectionIds": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "jobIds",
+                        "collectionIds"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "reason",
+                    "blockedBy"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/collections/{id}/lock": {
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 1024
+                  },
+                  "lockedBy": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                },
+                "additionalProperties": false,
+                "default": {}
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "assetIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "assetIds",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "assetIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "assetIds",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
@@ -13948,11 +17472,46 @@
                         "type": "string"
                       }
                     },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
                     "createdAt": {
                       "type": "string"
                     },
                     "updatedAt": {
                       "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
                     }
                   },
                   "required": [
@@ -14052,11 +17611,46 @@
                         "type": "string"
                       }
                     },
+                    "description": {
+                      "type": "string"
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "custom": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
                     "createdAt": {
                       "type": "string"
                     },
                     "updatedAt": {
                       "type": "string"
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
                     }
                   },
                   "required": [
@@ -14072,6 +17666,442 @@
             }
           },
           "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/storage/backends": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "source",
+                      "packaged",
+                      "both",
+                      "archive"
+                    ],
+                    "default": "both"
+                  },
+                  "bucket": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "accessKeyId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "secretAccessKey": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "region": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "endpointUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "sessionToken": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "publicBaseUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "name",
+                  "bucket",
+                  "accessKeyId",
+                  "secretAccessKey"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "source",
+                        "packaged",
+                        "both",
+                        "archive"
+                      ]
+                    },
+                    "backend": {
+                      "type": "string",
+                      "enum": [
+                        "external"
+                      ]
+                    },
+                    "bucket": {
+                      "type": "string"
+                    },
+                    "accessKeyId": {
+                      "type": "string"
+                    },
+                    "endpointUrl": {
+                      "type": "string"
+                    },
+                    "region": {
+                      "type": "string"
+                    },
+                    "publicBaseUrl": {
+                      "type": "string"
+                    },
+                    "hasSessionToken": {
+                      "type": "boolean"
+                    },
+                    "deletable": {
+                      "type": "boolean"
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "credentials": {
+                      "type": "object",
+                      "properties": {
+                        "accessKeyId": {
+                          "type": "string"
+                        },
+                        "secretAccessKey": {
+                          "type": "string",
+                          "enum": [
+                            "***redacted***"
+                          ]
+                        },
+                        "sessionToken": {
+                          "type": "string",
+                          "enum": [
+                            "***redacted***"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "accessKeyId",
+                        "secretAccessKey"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "role",
+                    "backend",
+                    "bucket",
+                    "accessKeyId",
+                    "hasSessionToken",
+                    "deletable",
+                    "createdAt",
+                    "credentials"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "backend_validation_failed"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "unreachable",
+                        "unauthorized",
+                        "bucket_not_found",
+                        "forbidden_list",
+                        "forbidden_write",
+                        "forbidden_read",
+                        "probe_cleanup_failed",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "reason",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "backends": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "type": "string",
+                            "enum": [
+                              "source",
+                              "packaged",
+                              "both",
+                              "archive"
+                            ]
+                          },
+                          "backend": {
+                            "type": "string",
+                            "enum": [
+                              "external"
+                            ]
+                          },
+                          "bucket": {
+                            "type": "string"
+                          },
+                          "accessKeyId": {
+                            "type": "string"
+                          },
+                          "endpointUrl": {
+                            "type": "string"
+                          },
+                          "region": {
+                            "type": "string"
+                          },
+                          "publicBaseUrl": {
+                            "type": "string"
+                          },
+                          "hasSessionToken": {
+                            "type": "boolean"
+                          },
+                          "deletable": {
+                            "type": "boolean"
+                          },
+                          "createdAt": {
+                            "type": "string"
+                          },
+                          "credentials": {
+                            "type": "object",
+                            "properties": {
+                              "accessKeyId": {
+                                "type": "string"
+                              },
+                              "secretAccessKey": {
+                                "type": "string",
+                                "enum": [
+                                  "***redacted***"
+                                ]
+                              },
+                              "sessionToken": {
+                                "type": "string",
+                                "enum": [
+                                  "***redacted***"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "accessKeyId",
+                              "secretAccessKey"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "name",
+                          "role",
+                          "backend",
+                          "bucket",
+                          "accessKeyId",
+                          "hasSessionToken",
+                          "deletable",
+                          "createdAt",
+                          "credentials"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "backends"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/storage/backends/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "enum": [
+                    "null"
+                  ],
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
             "description": "Default Response",
             "content": {
               "application/json": {

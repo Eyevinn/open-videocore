@@ -585,6 +585,119 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
   };
 }
 
+// Generic namespaced key/value view over the SAME eyevinn-app-config-svc HTTP
+// contract makeHttpParamStore uses (issue #547). The storage-backend registry
+// (ADR-017 D1.3: "only the non-secret registration record is persisted to the
+// parameter store") needs to persist arbitrary non-secret JSON records keyed by
+// workspace, distinct from the per-stack StackConfig blobs. This narrow store
+// exposes exactly get/set/delete/list over the config service's REST surface,
+// reusing the verified smoke-tested contract documented on makeHttpParamStore:
+//   POST   /api/v1/config          { key, value }  → 200
+//   GET    /api/v1/config/{key}    → 200 { key, value } | 404
+//   DELETE /api/v1/config/{key}    → 200 | 404
+//   GET    /api/v1/config?limit=N  → 200 { items: [{ key, value }] }
+// SECURITY: callers MUST NOT write secret material here — same discipline as the
+// StackConfig path (assertNoCredentials). The registry writes only non-secret
+// records; the access key + secret go to OSC secrets via saveSecret.
+export interface ConfigKvStore {
+  set(key: string, value: string): Promise<void>;
+  get(key: string): Promise<string | undefined>;
+  delete(key: string): Promise<void>;
+  // List all { key, value } pairs whose key begins with `prefix`.
+  listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>;
+}
+
+// Build a ConfigKvStore over the same HTTP config service. Shares the auth +
+// timeout conventions of makeHttpParamStore; kept as a separate small factory so
+// the widely-used ParamStore interface stays unchanged.
+export function makeHttpConfigKvStore(config: HttpParamStoreConfig): ConfigKvStore {
+  const doFetch = config.fetch ?? globalThis.fetch;
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const base = config.baseUrl.replace(/\/$/, '');
+
+  function configUrl(key?: string): string {
+    const path = key ? `/${encodeURIComponent(key)}` : '';
+    return `${base}/api/v1/config${path}`;
+  }
+
+  async function buildHeaders(): Promise<Record<string, string>> {
+    const sat = await config.getOscToken();
+    return {
+      'content-type': 'application/json',
+      authorization: `Bearer ${sat}`,
+      'x-api-key': config.apiKey
+    };
+  }
+
+  async function withTimeout<T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await run(controller.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  return {
+    async set(key, value) {
+      const h = await buildHeaders();
+      const res = await withTimeout((signal) =>
+        doFetch(configUrl(), {
+          method: 'POST',
+          headers: h,
+          body: JSON.stringify({ key, value }),
+          signal
+        })
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`config kv write failed: ${res.status} ${text}`.trim());
+      }
+    },
+
+    async get(key) {
+      const h = await buildHeaders();
+      const res = await withTimeout((signal) =>
+        doFetch(configUrl(key), { method: 'GET', headers: h, signal })
+      );
+      if (res.status === 404) return undefined;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`config kv read failed: ${res.status} ${text}`.trim());
+      }
+      const body = (await res.json().catch(() => ({}))) as { value?: string };
+      return typeof body.value === 'string' ? body.value : undefined;
+    },
+
+    async delete(key) {
+      const h = await buildHeaders();
+      const res = await withTimeout((signal) =>
+        doFetch(configUrl(key), { method: 'DELETE', headers: h, signal })
+      );
+      // 404 = already gone — idempotent success (mirrors deleteStackConfig).
+      if (res.status === 404 || res.ok) return;
+      const text = await res.text().catch(() => '');
+      throw new Error(`config kv delete failed: ${res.status} ${text}`.trim());
+    },
+
+    async listByPrefix(prefix) {
+      const h = await buildHeaders();
+      const res = await withTimeout((signal) =>
+        doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`config kv list failed: ${res.status} ${text}`.trim());
+      }
+      const body = (await res.json()) as { items?: Array<{ key: string; value?: string }> };
+      return (body.items ?? [])
+        .filter((item) => item.key.startsWith(prefix) && typeof item.value === 'string')
+        .map((item) => ({ key: item.key, value: item.value as string }));
+    }
+  };
+}
+
 export const PARAM_STORE_SERVICE_ID = 'eyevinn-app-config-svc' as const;
 
 // OSC instance name must be alphanumeric-only (OSC constraint).
@@ -648,6 +761,25 @@ export async function paramStoreFromEnv(
   const baseUrl = await resolveParamStoreBaseUrl(resolver, instanceName);
   if (!baseUrl) return undefined;
   return makeHttpParamStore({ baseUrl, apiKey, getOscToken, ...(log ? { log } : {}) });
+}
+
+// Build a generic ConfigKvStore from the environment, resolving the same
+// eyevinn-app-config-svc instance paramStoreFromEnv uses (issue #547). Returns
+// undefined when the store is unconfigured or the instance URL is unresolvable,
+// exactly like paramStoreFromEnv — callers then fall back to the in-memory store
+// (or surface a 501).
+export async function configKvStoreFromEnv(
+  resolver: ParamStoreUrlResolver,
+  getOscToken: () => Promise<string>
+): Promise<ConfigKvStore | undefined> {
+  const apiKey = process.env['PARAMETER_STORE_API_KEY'];
+  if (!apiKey) return undefined;
+  const instanceName =
+    process.env['PARAMETER_STORE_INSTANCE_NAME'] ??
+    DEFAULT_PARAM_STORE_INSTANCE_NAME;
+  const baseUrl = await resolveParamStoreBaseUrl(resolver, instanceName);
+  if (!baseUrl) return undefined;
+  return makeHttpConfigKvStore({ baseUrl, apiKey, getOscToken });
 }
 
 const VALKEY_SERVICE_ID = 'valkey-io-valkey';

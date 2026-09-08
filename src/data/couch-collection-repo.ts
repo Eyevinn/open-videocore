@@ -7,14 +7,19 @@
 // resolves to undefined (existence is not leaked) and is never read or mutated
 // cross-workspace.
 
-import type { StoredDoc, StackCouch } from './couchdb.js';
+import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
 import {
   CollectionNotFoundError,
   addAssetId,
+  applyCollectionDeleteLock,
+  applyCollectionUpdate,
   removeAssetId,
   type Collection,
   type CollectionRepository,
-  type CreateCollectionInput
+  type CreateCollectionInput,
+  type DeleteLock,
+  type SetDeleteLockInput,
+  type UpdateCollectionInput
 } from './collection-repo.js';
 
 const RESOURCE_TYPE = 'collection';
@@ -32,6 +37,11 @@ export class CouchCollectionRepository implements CollectionRepository {
       id: localId,
       name: input.name,
       assetIds: [],
+      // Descriptive metadata (issue #559). Optional/additive — omitted keys stay
+      // undefined so a collection created with just { name } is unchanged.
+      description: input.description,
+      tags: input.tags,
+      custom: input.custom,
       createdAt: now,
       updatedAt: now
     };
@@ -57,12 +67,55 @@ export class CouchCollectionRepository implements CollectionRepository {
     return fromDoc(doc);
   }
 
+  // Partial editorial update of descriptive metadata (issue #560). Routed through
+  // the shared conflict-retry wrapper (updateWithRetry) — the same `_rev`
+  // merge-retry the asset editorial write uses (ADR-005 / issue #278, see
+  // couch-asset-repo.ts `update`). A concurrent writer racing the same `_rev`
+  // (e.g. a membership add landing between this read and put) yields a CouchDB
+  // 409 that is retried against the fresh document rather than silently clobbered.
+  // applyCollectionUpdate is pure so it re-runs safely inside the loop.
+  async update(id: string, patch: UpdateCollectionInput): Promise<Collection> {
+    const couch = this.couchFor();
+    let updated: Collection | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      if (current.resourceType !== RESOURCE_TYPE) {
+        throw new CollectionNotFoundError(id);
+      }
+      updated = applyCollectionUpdate(fromDoc(current), patch, new Date().toISOString());
+      return toDoc(updated);
+    });
+    if (!written || !updated) {
+      throw new CollectionNotFoundError(id);
+    }
+    return updated;
+  }
+
   async addAsset(id: string, assetId: string): Promise<Collection> {
     return this.mutate(id, (c) => addAssetId(c.assetIds, assetId));
   }
 
   async removeAsset(id: string, assetId: string): Promise<Collection> {
     return this.mutate(id, (c) => removeAssetId(c.assetIds, assetId));
+  }
+
+  // Dedicated delete-lock write path (ADR-020 decision 3, issue #568). Distinct
+  // from addAsset/removeAsset so the top-level `deleteLock` flag can only be
+  // set/cleared here. Reuses the same read-modify-write + _rev carry as mutate().
+  async setDeleteLock(id: string, input: SetDeleteLockInput): Promise<Collection> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      throw new CollectionNotFoundError(id);
+    }
+    const existing = fromDoc(doc);
+    const now = new Date().toISOString();
+    const updated: Collection = {
+      ...existing,
+      deleteLock: applyCollectionDeleteLock(input, now),
+      updatedAt: now
+    };
+    await couch.put(id, { ...toDoc(updated), _rev: doc._rev });
+    return updated;
   }
 
   async delete(id: string): Promise<void> {
@@ -96,24 +149,57 @@ export class CouchCollectionRepository implements CollectionRepository {
 }
 
 function toDoc(collection: Collection): Record<string, unknown> {
-  return {
+  const doc: Record<string, unknown> = {
     resourceType: RESOURCE_TYPE,
     localId: collection.id,
     name: collection.name,
     assetIds: collection.assetIds,
     createdAt: collection.createdAt,
-    updatedAt: collection.updatedAt
+    updatedAt: collection.updatedAt,
+    // Explicit delete-lock (ADR-020 decision 3, issue #568). Only persisted when
+    // present, so pre-#568 collections round-trip with the field absent.
+    ...(collection.deleteLock ? { deleteLock: collection.deleteLock } : {})
   };
+  // Descriptive metadata (issue #559), mirroring the asset `descriptive`
+  // namespace (ADR-005 typed-core + open-`custom`). Only persisted when set so
+  // collections created without them round-trip with the fields absent
+  // (back-compat) — no on-disk shape change for legacy documents.
+  if (collection.description !== undefined) {
+    doc['description'] = collection.description;
+  }
+  if (collection.tags !== undefined) {
+    doc['tags'] = collection.tags;
+  }
+  if (collection.custom !== undefined) {
+    doc['custom'] = collection.custom;
+  }
+  return doc;
 }
 
 function fromDoc(doc: StoredDoc): Collection {
-  return {
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent maps to
+  // undefined so pre-#568 collections read as unlocked.
+  const deleteLock = doc['deleteLock'] as DeleteLock | undefined;
+  const collection: Collection = {
     id: String(doc['localId'] ?? stripPartition(doc._id)),
     name: String(doc['name'] ?? ''),
     assetIds: (doc['assetIds'] as string[] | undefined) ?? [],
     createdAt: String(doc['createdAt'] ?? ''),
-    updatedAt: String(doc['updatedAt'] ?? '')
+    updatedAt: String(doc['updatedAt'] ?? ''),
+    ...(deleteLock ? { deleteLock } : {})
   };
+  // Descriptive metadata (issue #559). Absent fields map back to undefined so
+  // pre-#559 documents stay clean (fields simply not present on the resource).
+  if (doc['description'] !== undefined) {
+    collection.description = String(doc['description']);
+  }
+  if (doc['tags'] !== undefined) {
+    collection.tags = doc['tags'] as string[];
+  }
+  if (doc['custom'] !== undefined) {
+    collection.custom = doc['custom'] as Record<string, unknown>;
+  }
+  return collection;
 }
 
 function stripPartition(id: string): string {

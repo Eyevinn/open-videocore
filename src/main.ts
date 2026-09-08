@@ -16,7 +16,19 @@ import {
 import { provisionRouter } from './routes/provision.js';
 import { optionalServicesRouter } from './routes/optional-services.js';
 import { OperationStore } from './services/operation-store.js';
-import { ensureParameterStore, paramStoreFromEnv, type StackConfig } from './services/param-store.js';
+import {
+  ensureParameterStore,
+  paramStoreFromEnv,
+  configKvStoreFromEnv,
+  type StackConfig
+} from './services/param-store.js';
+import { saveSecret } from '@osaas/client-core';
+import {
+  StorageBackendRegistry,
+  ParamStoreBackendRecordStore,
+  InMemoryBackendRecordStore,
+  type SecretStore
+} from './services/storage-backend-registry.js';
 import { PACKAGER_SERVICE_ID } from './services/stack.js';
 import { assetsRouter } from './routes/assets.js';
 import { assetUploadRouter, type StorageFactory } from './routes/asset-upload.js';
@@ -37,7 +49,8 @@ import {
   PerWorkspaceSearchRepository,
   PerWorkspaceWebhookRepository,
   PerWorkspaceCollectionRepository,
-  PerWorkspaceProfileRepository
+  PerWorkspaceProfileRepository,
+  PerWorkspaceAuditEmitter
 } from './data/per-workspace-repos.js';
 import type { AssetRepository } from './data/asset-repo.js';
 import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
@@ -54,6 +67,7 @@ import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
+import { registerPrincipal } from './auth/principal.js';
 import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
@@ -71,7 +85,12 @@ import {
   archivePurgeIntervalMsFromEnv
 } from './pipeline/archived-asset-purge-loop.js';
 import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
-import { WatchFolderService, watchFolderEnabled } from './pipeline/watch-folder.js';
+import {
+  WatchFolderService,
+  watchFolderEnabled,
+  classifyWatchFolderConfig,
+  watchFolderMisconfiguredMessage
+} from './pipeline/watch-folder.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
@@ -259,6 +278,40 @@ if (!paramStore) {
   });
 }
 
+// External storage-backend registry (issue #547, ADR-017). Persists NON-SECRET
+// registration records to the config service (or an in-memory fallback when the
+// param store is unconfigured), and fans the access key + secret out to OSC
+// per-serviceId secrets via saveSecret (ADR-017 D1). The SecretStore wraps the
+// verified saveSecret(serviceId, name, value, osc) calling convention
+// (provision.ts:591); when it is present the /backends POST route can honour the
+// credential contract, otherwise it responds 501.
+const backendKvStore = await configKvStoreFromEnv(
+  {
+    getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
+    getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat)
+  },
+  () => oscContext.getServiceAccessToken('eyevinn-app-config-svc')
+);
+const backendRecordStore = backendKvStore
+  ? new ParamStoreBackendRecordStore(backendKvStore)
+  : new InMemoryBackendRecordStore();
+const backendSecretStore: SecretStore = {
+  saveSecret: (serviceId, name, value) => saveSecret(serviceId, name, value, oscContext)
+};
+// Issue #550: run the registration-time reachability + permission probe before
+// persisting a backend, so a misconfigured endpoint / bad credentials /
+// insufficient permissions are caught at registration rather than at ingest or
+// job time. Enabled by default; set STORAGE_BACKEND_VALIDATE=false to opt out
+// (12-factor: config via env). The default probe-client factory reaches the
+// registered bucket directly via the minio client.
+const storageBackendValidateEnabled =
+  (process.env['STORAGE_BACKEND_VALIDATE'] ?? 'true').toLowerCase() !== 'false';
+const storageBackendRegistry = new StorageBackendRegistry(
+  backendRecordStore,
+  backendSecretStore,
+  { enabled: storageBackendValidateEnabled }
+);
+
 // Per-workspace backing-service resolver (replaces the global singleton
 // connection config). Each request's connections are resolved at request time
 // from the parameter store (or an explicit env-var override for local dev),
@@ -327,6 +380,14 @@ app.addHook('preHandler', async (request) => {
     request.connections = null;
   }
 });
+
+// Resolve the caller's principal + role once per request and attach it alongside
+// `request.connections` (ADR-018 decisions 1 & 5, issue #553). This is the
+// RESOLUTION half of the authorisation model: it reads the trusted `X-OVC-Role`
+// header, mirroring the trusted `x-stack-name` read above, and decorates the
+// request observably. It performs NO enforcement — no route is gated and no 403
+// is returned (deferred to #554). No existing endpoint behaviour changes.
+registerPrincipal(app);
 
 const operationStore = new OperationStore();
 
@@ -417,6 +478,12 @@ const searchRepository = new PerWorkspaceSearchRepository(stackResolver);
 const webhookRepository = new PerWorkspaceWebhookRepository(stackResolver);
 const collectionRepository = new PerWorkspaceCollectionRepository(stackResolver);
 const profileRepository = new PerWorkspaceProfileRepository(stackResolver);
+// Best-effort audit emitter (issue #564). Resolves the active stack's audit
+// store per call; no-ops on the in-memory fallback. Wired into the asset,
+// collection, and job (transcode/package) mutation paths so each meaningful
+// mutation emits exactly one audit entry — fire-and-forget (a failed write is
+// logged, never propagated).
+const auditEmitter = new PerWorkspaceAuditEmitter(stackResolver);
 
 // Synchronous, per-workspace object-storage factory (issue #4). Reads the
 // connections already warmed into the resolver cache by the global preHandler
@@ -907,7 +974,11 @@ function activateScaler(redisUrl: string): void {
   packaging = new PackagingService({
     assets: assetRepository,
     queue: makeOscPackagerQueue(redis, undefined, app.log),
-    publicBaseUrl: packagingPublicBaseUrl()
+    publicBaseUrl: packagingPublicBaseUrl(),
+    // Best-effort package-job audit emission (issue #564): submit + terminal
+    // (success/failure) callbacks each emit one entry, fire-and-forget.
+    audit: auditEmitter,
+    auditLog: app.log
   });
 
   // On-demand packager provisioning (epic #226, issue #244). The packager is no
@@ -1241,7 +1312,9 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // and for validating a named transcode profile so a GPU-only (NVENC/CUDA)
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
-  profileRepository
+  profileRepository,
+  // Best-effort audit emission for asset mutations (issue #564).
+  audit: auditEmitter
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -1301,7 +1374,9 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
     const conns = await stackResolver.resolve();
     if (!conns.storageClient) return undefined;
     return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
-  }
+  },
+  // Best-effort audit emission for the transcode terminal-state callback (#564).
+  audit: auditEmitter
 };
 await app.register(internalRouter, internalRouterOptions);
 
@@ -1359,8 +1434,25 @@ await app.register(assetUploadRouter, {
 // (single global MinIO). In the provisioned multi-stack model there is no single
 // bucket to watch, so the watch-folder is skipped (the API upload + URL-pull
 // paths still cover ingest).
+// Fail-loud config validation (issue #642). Previously, if an operator turned
+// the feature ON (WATCH_FOLDER_ENABLED=true) but the required object-storage
+// connection variable (MINIO_URL) was absent — the exact situation on Open
+// Source Cloud, where that variable is never set — `envMinioClient` was
+// undefined and `watchFolder` silently became undefined: no ingest, no error.
+// We now CLASSIFY the config and, when the feature is requested but its storage
+// dependency is missing, log a clear, actionable error naming the missing
+// variable and the affected ingest method rather than silently no-op'ing. We do
+// NOT provision the endpoint (that is #643) and do NOT change the status API
+// surface (that is #644) — scope here is fail-loud only.
+const watchFolderConfigState = classifyWatchFolderConfig(
+  watchFolderEnabled(),
+  storageAvailable
+);
+if (watchFolderConfigState === 'misconfigured') {
+  app.log.error({ ingestMethod: 'watch-folder' }, watchFolderMisconfiguredMessage());
+}
 const watchFolder =
-  envMinioClient && watchFolderEnabled()
+  watchFolderConfigState === 'ready' && envMinioClient
     ? new WatchFolderService({
         client: envMinioClient,
         bucket: sourceBucket,
@@ -1475,14 +1567,21 @@ await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: web
 await app.register(collectionsRouter, {
   prefix: '/api/v1/collections',
   repository: collectionRepository,
-  assetRepository
+  assetRepository,
+  // Best-effort audit emission for collection mutations (issue #564).
+  audit: auditEmitter
 });
 
 // Bucket / object-storage management. Workspace-scoped; behind `authenticate`.
 // Lets an operator browse and prune the objects stored in the workspace's
 // source + packaged buckets. Resolves storage from the request's stack at
 // request time and degrades to 501 when no object storage is configured.
-await app.register(storageRouter, { prefix: '/api/v1/storage', stackResolver, watchFolder });
+await app.register(storageRouter, {
+  prefix: '/api/v1/storage',
+  stackResolver,
+  watchFolder,
+  storageBackendRegistry
+});
 
 // Static file serving for the web UI (issue #frontend). Files are served from
 // the public/ directory at the /ui/ prefix. The directory is intentionally

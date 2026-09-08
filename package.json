@@ -15,6 +15,7 @@
     "generate:docs": "tsx scripts/generate-docs.ts",
     "check:spec-route-parity": "tsx scripts/check-spec-route-parity.ts",
     "tams:backfill": "tsx scripts/tams-backfill.ts",
+    "objectkey:backfill": "tsx scripts/objectkey-backfill.ts",
     "postversion": "git push && git push --tags"
   },
   "dependencies": {

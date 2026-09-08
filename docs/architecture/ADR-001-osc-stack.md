@@ -141,7 +141,7 @@ OSC My Apps run the customer's own git repo on open-source `web-runner-{node,pyt
 ## Open questions for the customer
 
 1. **Runtime language:** ~~Undecided~~ **RESOLVED 2026-06-01** — Node 22 + Fastify + Zod + pnpm, aligned with open-live org pattern.
-2. **Authentication model for v1:** ~~Open (no auth), API keys, or OIDC?~~ **RESOLVED 2026-06-01** — Gated behind OSC login-wall. `OSC_ACCESS_TOKEN` is the operator's credential; open-videocore calls OSC APIs on their behalf. No additional API key layer needed for v1.
+2. **Authentication model for v1:** ~~Open (no auth), API keys, or OIDC?~~ **RESOLVED 2026-06-01** — Gated behind OSC login-wall. `OSC_ACCESS_TOKEN` is the operator's credential; open-videocore calls OSC APIs on their behalf. No additional API key layer needed for v1. **Authorisation** (roles + per-resource permissions) is decided separately in ADR-018 (`ADR-018-authorisation-model.md`), which is the missing auth/tenancy ADR the planned ADR-002 below was meant to be.
 3. **Search scope for v1:** ~~Dedicated search cluster or PostgreSQL FTS?~~ **RESOLVED 2026-06-01** — PostgreSQL FTS is sufficient for v1. Dedicated search deferred to ADR-004.
 4. **CDN / delivery URLs:** ~~v1 scope or post-v1?~~ **RESOLVED 2026-06-01** — CDN deferred to post-v1 delivery ADR (ADR-003).
 5. **Open source license:** ~~Apache 2.0, MIT, or other?~~ **RESOLVED 2026-06-01** — Apache 2.0.

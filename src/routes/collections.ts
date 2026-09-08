@@ -10,6 +10,7 @@
 //   POST   /api/v1/collections                       — create { name }
 //   GET    /api/v1/collections                       — list this workspace's collections
 //   GET    /api/v1/collections/:id                   — get one, with resolved asset list
+//   PATCH  /api/v1/collections/:id                   — partial update of descriptive metadata (#560)
 //   DELETE /api/v1/collections/:id                   — delete a collection
 //   PUT    /api/v1/collections/:id/assets/:assetId   — add an asset to a collection
 //   DELETE /api/v1/collections/:id/assets/:assetId   — remove an asset from a collection
@@ -24,19 +25,57 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
 import {
+  CollectionDeleteProtectedError,
   CollectionNotFoundError,
   type CollectionRepository
 } from '../data/collection-repo.js';
 import type { Asset, AssetRepository } from '../data/asset-repo.js';
+import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
+// Explicit delete-lock (ADR-020 decision 3, issue #568). Field names/types
+// mirror ADR-020 exactly: locked, reason?, lockedAt, lockedBy?.
+const deleteLockSchema = z.object({
+  locked: z.boolean(),
+  reason: z.string().optional(),
+  lockedAt: z.string(),
+  lockedBy: z.string().optional()
+});
+
+// Shared blocked-delete envelope (ADR-020 decision 1, issue #568). EXTENDS the
+// existing `{ error, message? }` shape with the required `reason` enum and
+// `blockedBy` object. For the explicit-lock case reason is `delete_protected`
+// and both id arrays are empty.
+const deleteBlockedSchema = z.object({
+  error: z.literal('delete_blocked'),
+  message: z.string().optional(),
+  reason: z.enum(['referenced_by_job', 'member_of_collection', 'delete_protected']),
+  blockedBy: z.object({
+    jobIds: z.array(z.string()),
+    collectionIds: z.array(z.string())
+  })
+});
+
+// Descriptive metadata (issue #559), mirroring the asset `descriptive`
+// namespace (ADR-005 typed-core + open-`custom`, see asset-document.ts) at a
+// smaller scale. All three are OPTIONAL so a collection created without them is
+// serialised exactly as before (fields absent):
+//   - description: free-form editorial string.
+//   - tags:        first-class string labels (z.array(z.string())).
+//   - custom:      open key/value bag (z.record(z.unknown())), matching the
+//                  asset descriptive `custom` shape.
 const collectionSchema = z.object({
   id: z.string(),
   name: z.string(),
   assetIds: z.array(z.string()),
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  custom: z.record(z.unknown()).optional(),
   createdAt: z.string(),
-  updatedAt: z.string()
+  updatedAt: z.string(),
+  // Explicit delete-lock (ADR-020 decision 3, issue #568). Absent = unlocked.
+  deleteLock: deleteLockSchema.optional()
 });
 
 // GET /:id returns the collection plus the resolved live assets. Assets are
@@ -47,14 +86,41 @@ const collectionWithAssetsSchema = collectionSchema.extend({
 });
 
 const createBodySchema = z.object({
-  name: z.string().min(1).max(256)
+  name: z.string().min(1).max(256),
+  // Optional descriptive metadata accepted at create time (issue #559). Mirrors
+  // the asset `descriptive` namespace (typed-core + open-`custom`, ADR-005);
+  // all optional so `POST /collections { name }` is unchanged.
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  custom: z.record(z.unknown()).optional()
 });
+
+// PATCH /:id body (issue #560): a PARTIAL update of a collection's descriptive
+// metadata. Only description/tags/custom are editable here; every present key is
+// applied wholesale, an absent key leaves the current value untouched, and an
+// explicit empty value (`''`/`[]`/`{}`) clears the field. Membership (`assetIds`)
+// is deliberately NOT accepted — it stays on PUT/DELETE /:id/assets/:assetId —
+// and neither `name` nor `deleteLock` is editable through this path. `.strict()`
+// rejects any unknown key (including `assetIds`) with a 400 so callers cannot
+// smuggle a membership mutation through the metadata endpoint.
+const updateBodySchema = z
+  .object({
+    description: z.string().optional(),
+    tags: z.array(z.string()).optional(),
+    custom: z.record(z.unknown()).optional()
+  })
+  .strict();
 
 type CollectionsRouterOptions = {
   repository: CollectionRepository;
   // Asset repository, used to (a) validate an asset exists before adding it to a
   // collection and (b) resolve the membership list to live assets on GET /:id.
   assetRepository: AssetRepository;
+  // Best-effort audit emission (issue #564). Wired to the append-only audit
+  // store's `record()` write primitive. When absent, mutations proceed
+  // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
+  // logged, never propagated — no route becomes newly failable.
+  audit?: AuditEmitter;
 };
 
 export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = async (
@@ -64,6 +130,8 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
   const assets = opts.assetRepository;
+  // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
+  const audit = opts.audit;
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {
@@ -71,6 +139,16 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     }
     if (err instanceof CollectionNotFoundError) {
       return reply.code(404).send({ error: 'not_found', message: err.message });
+    }
+    // Explicit delete-lock (ADR-020 decision 1, issue #568): the shared
+    // `delete_blocked` envelope, reason `delete_protected`, empty blockedBy.
+    if (err instanceof CollectionDeleteProtectedError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'delete_protected',
+        blockedBy: { jobIds: [], collectionIds: [] }
+      });
     }
     throw err;
   });
@@ -83,6 +161,18 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     },
     async (request, reply) => {
       const collection = await repo.create(request.body);
+      // Audit: collection created (issue #564). One entry, targetId = new id.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'collection.created',
+          targetType: 'collection',
+          targetId: collection.id,
+          detail: { name: collection.name }
+        },
+        request.log
+      );
       return reply.code(201).send(collection);
     }
   );
@@ -122,20 +212,125 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     }
   );
 
-  app.delete(
+  // Partial update of a collection's descriptive metadata (issue #560). PATCH
+  // (not PUT) so callers send only the fields they intend to change; the body is
+  // `.strict()` so membership (`assetIds`), `name`, and `deleteLock` are all
+  // rejected (400) — membership stays on PUT/DELETE /:id/assets/:assetId. The
+  // CouchDB backend routes this through the `_rev` merge-retry wrapper
+  // (updateWithRetry, ADR-005 / issue #278), the same concurrency model the asset
+  // editorial write uses, so a racing membership add re-bases rather than
+  // clobbers.
+  //   200 — updated collection returned
+  //   404 — unknown/foreign collection (repo throws CollectionNotFoundError)
+  app.patch(
     '/:id',
     {
-      
       schema: {
         params: z.object({ id: z.string() }),
-        response: { 204: z.null(), 404: errorSchema }
+        body: updateBodySchema,
+        response: { 200: collectionSchema, 400: errorSchema, 404: errorSchema }
       }
     },
     async (request, reply) => {
+      // repo.update throws CollectionNotFoundError (-> 404) for an unknown id.
+      const collection = await repo.update(request.params.id, request.body);
+      return reply.code(200).send(collection);
+    }
+  );
+
+  app.delete(
+    '/:id',
+    {
+
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 204: z.null(), 404: errorSchema, 409: deleteBlockedSchema }
+      }
+    },
+    async (request, reply) => {
+      // Explicit delete-lock (ADR-020 decisions 1 & 2, issue #568). A locked
+      // collection is a HARD block: this guard is unconditional and runs BEFORE
+      // the delete, so `?force=true` cannot bypass it (force is never consulted
+      // here). Cleared only via DELETE /:id/lock. A locked collection therefore
+      // resolves (not a silent miss), so the 409 is authoritative.
+      const existing = await repo.get(request.params.id);
+      if (existing?.deleteLock?.locked) {
+        throw new CollectionDeleteProtectedError(request.params.id);
+      }
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.
       await repo.delete(request.params.id);
+      // Audit: collection deleted (issue #564). Emitted ONLY when a collection
+      // actually existed (resolved above), so an idempotent no-op on an unknown
+      // / foreign id produces no entry — exactly one entry per real deletion.
+      if (existing) {
+        emitAudit(
+          audit,
+          {
+            actor: originActor('user'),
+            action: 'collection.deleted',
+            targetType: 'collection',
+            targetId: existing.id,
+            detail: { name: existing.name }
+          },
+          request.log
+        );
+      }
       return reply.code(204).send(null);
+    }
+  );
+
+  // Explicit delete-lock set/clear (ADR-020 decision 3, issue #568). A DEDICATED
+  // system write path for the top-level `deleteLock` flag, chosen as a
+  // `/:id/lock` sub-resource with PUT (set) / DELETE (clear) — consistent with
+  // the collections router's existing PUT/DELETE `/:id/assets/:assetId`
+  // sub-resource convention and the asset router's `/:id/lock`. Kept separate
+  // from create/addAsset/removeAsset so the lock is never set through a general
+  // collection mutation. The lock's `lockedAt`/`lockedBy` are the traceable
+  // administrative record of the change (collections carry no provenance array —
+  // ADR-020 pins the lock's own fields as that record for collections).
+  //   200 — lock set, collection returned (deleteLock present + locked)
+  //   404 — unknown/foreign collection
+  app.put(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: z
+          .object({
+            reason: z.string().max(1024).optional(),
+            lockedBy: z.string().max(256).optional()
+          })
+          .default({}),
+        response: { 200: collectionSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      // setDeleteLock throws CollectionNotFoundError (-> 404) for an unknown id.
+      const collection = await repo.setDeleteLock(request.params.id, {
+        locked: true,
+        reason: request.body.reason,
+        lockedBy: request.body.lockedBy
+      });
+      return reply.code(200).send(collection);
+    }
+  );
+
+  // Clear the explicit delete-lock (ADR-020 decision 3, issue #568). The only
+  // way to lift protection — `?force=true` on DELETE /:id does NOT (decision 2).
+  //   200 — lock cleared, collection returned (deleteLock absent)
+  //   404 — unknown/foreign collection
+  app.delete(
+    '/:id/lock',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: collectionSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const collection = await repo.setDeleteLock(request.params.id, { locked: false });
+      return reply.code(200).send(collection);
     }
   );
 
@@ -163,6 +358,19 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       const collection = await repo.addAsset(request.params.id,
         request.params.assetId
       );
+      // Audit: collection membership add (issue #564). One entry; a 422 (asset
+      // missing) or 404 (unknown collection) never reaches here.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'collection.member_added',
+          targetType: 'collection',
+          targetId: collection.id,
+          detail: { assetId: request.params.assetId }
+        },
+        request.log
+      );
       return reply.code(200).send(collection);
     }
   );
@@ -181,6 +389,20 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       // collection id throws CollectionNotFoundError (-> 404).
       const collection = await repo.removeAsset(request.params.id,
         request.params.assetId
+      );
+      // Audit: collection membership remove (issue #564). One entry; a 404
+      // (unknown collection) never reaches here. Removing an absent asset id is a
+      // 200 no-op on the primary op and still records the operator's intent.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'collection.member_removed',
+          targetType: 'collection',
+          targetId: collection.id,
+          detail: { assetId: request.params.assetId }
+        },
+        request.log
       );
       return reply.code(200).send(collection);
     }
