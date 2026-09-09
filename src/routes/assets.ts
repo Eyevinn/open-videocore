@@ -836,7 +836,6 @@ type AssetsRouterOptions = {
   // not exercise named profiles), both checks are skipped (permissive) and the
   // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
-  // Registered external storage-backend registry (issue #549, #547, ADR-017).
   // Best-effort audit emission (issue #564). Wired to the append-only audit
   // store's `record()` write primitive. When absent, mutations proceed
   // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
