@@ -94,6 +94,7 @@ import {
   classifyWatchFolderConfig,
   watchFolderMisconfiguredMessage
 } from './pipeline/watch-folder.js';
+import { healthRouter } from './routes/health.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
@@ -242,11 +243,20 @@ const resolverHealth = new ResolverHealthSignal();
 // Health endpoints are intentionally unauthenticated for liveness probing. The
 // `resolver` field (issue #422) reports the aggregate degraded-resolution state
 // so a degraded-but-not-crashed instance is alertable from /health alone.
-app.get('/health', async () => ({
-  status: 'ok',
-  service: 'open-videocore-api',
-  resolver: resolverHealth.snapshot()
-}));
+//
+// The `ingest` field (issue #644) reports per-method ingest availability
+// (direct upload, URL pull, watch folder) so operators/integrators can verify
+// configuration state — in particular whether the opt-in watch-folder is
+// actually active — programmatically, without reading server logs. The signals
+// are read at request time (via closures) so the report always reflects the
+// current storage + watch-folder configuration.
+await app.register(healthRouter, {
+  resolverSnapshot: () => resolverHealth.snapshot(),
+  ingestSignals: () => ({
+    storageAvailable,
+    hasEnvMinio: Boolean(process.env['MINIO_URL'])
+  })
+});
 app.get('/healthz', async () => ({ status: 'ok' }));
 
 // OSC parameter store (issue #31, ADR-002). Persists provisioned stack
