@@ -1028,7 +1028,8 @@ Request body (application/json)
     ]
   },
   "profileParams": {},
-  "destinationBucket": "string"
+  "destinationBucket": "string",
+  "externalBackend": "string"
 }
 
   Response
