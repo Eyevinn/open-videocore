@@ -161,6 +161,32 @@ export class CouchAssetRepository implements AssetRepository {
     return fromDoc(doc);
   }
 
+  // Resolve by external identifier (issue #576, ADR-019). The persisted document
+  // carries the correlation set under the four-namespace `administrative`
+  // namespace as `administrative.externalIdentifiers[]`, each entry a
+  // `{ namespace, id }` object (asset-document.ts: toAssetDocument attaches the
+  // block only when present). We push the pair down as a dotted Mango `$elemMatch`
+  // selector so CouchDB filters WITHIN the tenant database — this is the same
+  // index-backed array-push-down the TAMS flow lookup uses
+  // (couch-search-repo.ts: `structural.tams.flowIds` -> `$elemMatch`), NOT a
+  // client-side page walk. `(namespace, id)` uniqueness is out of scope here
+  // (#577), so at most one match is expected; we take the first document.
+  async getByExternalId(namespace: string, id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const matches = await couch.find(
+      {
+        resourceType: RESOURCE_TYPE,
+        'administrative.externalIdentifiers': { $elemMatch: { namespace, id } }
+      },
+      { limit: 1 }
+    );
+    const doc = matches.find((d) => d.resourceType === RESOURCE_TYPE);
+    if (!doc) {
+      return undefined;
+    }
+    return fromDoc(doc);
+  }
+
   async list(opts: ListOptions = {}): Promise<ListResult> {
     const couch = this.couchFor();
     const limit = clampLimit(opts.limit);

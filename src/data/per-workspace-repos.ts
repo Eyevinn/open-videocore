@@ -86,6 +86,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   async getBySlug(slug: string): Promise<Asset | undefined> {
     return (await this.repo()).getBySlug(slug);
   }
+  async getByExternalId(namespace: string, id: string): Promise<Asset | undefined> {
+    return (await this.repo()).getByExternalId(namespace, id);
+  }
   async list(opts?: ListOptions): Promise<ListResult> {
     return (await this.repo()).list(opts);
   }
