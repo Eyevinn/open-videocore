@@ -72,6 +72,7 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import {
   UnknownSourceBackendError,
+  UnknownDestinationBackendError,
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
@@ -1545,6 +1546,71 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       /* thumbnail failures are recorded on the asset by the runner */
     });
     return true;
+  }
+
+  // Resolve a package/publish job's requested output destination into the single
+  // per-execution `destinationBucket` string the ADR-011 relocation path already
+  // consumes (issue #573). Accepts EITHER a named export-destination reference
+  // (`destination`, resolved through the SAME StorageBackendRegistry the
+  // /api/v1/export-destinations surface uses — resolveDestinationBucket) OR an
+  // inline `destinationBucket` override (unchanged ADR-011 ad-hoc path), never
+  // both.
+  //
+  // PRECEDENCE (issue #573): supplying both a named reference and an inline
+  // override on the same job is AMBIGUOUS and rejected with a clear 400 rather
+  // than silently preferring one — the caller must pick exactly one destination
+  // expression.
+  //
+  // Returns:
+  //   { ok: true, destinationBucket } — the resolved override string (or
+  //     undefined when neither was supplied: the job uses the provisioned
+  //     default, fully backwards compatible).
+  //   { ok: false } — an error response has already been sent via `reply`;
+  //     callers must not send again.
+  async function resolveJobDestination(
+    args: { destination?: string; destinationBucket?: string },
+    reply: import('fastify').FastifyReply
+  ): Promise<{ ok: true; destinationBucket?: string } | { ok: false }> {
+    const { destination, destinationBucket } = args;
+    // Precedence: reject an ambiguous request that supplies both a named
+    // reference and an inline override (issue #573 precedence rule).
+    if (destination !== undefined && destinationBucket !== undefined) {
+      reply.code(400).send({
+        error: 'ambiguous_destination',
+        message:
+          'supply either a named "destination" reference or an inline "destinationBucket" override, not both'
+      });
+      return { ok: false };
+    }
+    // Inline override path: unchanged ADR-011 behaviour (already validated +
+    // trailing-slash-normalised at the edge by destinationBucketSchema).
+    if (destination === undefined) {
+      return destinationBucket !== undefined
+        ? { ok: true, destinationBucket }
+        : { ok: true };
+    }
+    // Named-reference path: resolve through the registry to the SAME
+    // `destinationBucket` string the relocation consumes (issue #573).
+    if (!opts.storageBackendRegistry) {
+      reply.code(501).send({
+        error: 'not_configured',
+        message: 'storage-backend registry is not configured'
+      });
+      return { ok: false };
+    }
+    try {
+      const resolved = await opts.storageBackendRegistry.resolveDestinationBucket(
+        STACK_CONFIG_NAMESPACE,
+        destination
+      );
+      return { ok: true, destinationBucket: resolved };
+    } catch (err) {
+      if (err instanceof UnknownDestinationBackendError) {
+        reply.code(err.statusCode).send({ error: 'bad_request', message: err.message });
+        return { ok: false };
+      }
+      throw err;
+    }
   }
 
   // Start a named built-in pipeline against an asset, executing the first step
@@ -3183,9 +3249,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     {
       schema: {
         params: z.object({ id: z.string() }),
-        body: z.object({ encoreJobId: z.string().min(1).optional() }),
+        body: z.object({
+          encoreJobId: z.string().min(1).optional(),
+          // Per-execution destination override (issue #207/#208), pipeline-mode
+          // only (ignored when an explicit encoreJobId is enqueued directly).
+          // Validated + trailing-slash-normalized at the edge.
+          destinationBucket: destinationBucketSchema.optional(),
+          // Named export-destination reference (issue #573): the stable id OR
+          // name of a registered output-role destination. Resolved server-side
+          // to the SAME `destinationBucket` the relocation consumes. Mutually
+          // exclusive with the inline `destinationBucket` override.
+          destination: z.string().min(1).max(256).optional()
+        }),
         response: {
           202: z.object({ ok: z.literal(true), jobId: z.string().optional(), pipelineMode: z.boolean().optional() }),
+          400: z.object({ error: z.string(), message: z.string() }),
           404: z.object({ error: z.string() }),
           409: z.object({ error: z.string(), message: z.string() }),
           501: z.object({ error: z.string(), message: z.string() }),
@@ -3214,7 +3292,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         if (!opts.pipelineRepository) {
           return reply.code(501).send({ error: 'not_configured', message: 'pipeline execution not configured' });
         }
-        const started = await startPipelineExecution(asset, 'abr-vod', request, reply);
+        // Resolve a named export-destination reference OR the inline override
+        // into the single `destinationBucket` string the relocation consumes
+        // (issue #573). Rejects an ambiguous both-supplied request with 400.
+        const resolvedDestination = await resolveJobDestination(
+          { destination: request.body.destination, destinationBucket: request.body.destinationBucket },
+          reply
+        );
+        if (!resolvedDestination.ok) return reply; // error already sent
+        const started = await startPipelineExecution(
+          asset,
+          'abr-vod',
+          request,
+          reply,
+          undefined,
+          resolvedDestination.destinationBucket
+        );
         if (!started) return reply; // startPipelineExecution already sent the error
         return reply.code(202).send({ ok: true, jobId: started.steps.find((s) => s.name === 'transcode')?.jobId, pipelineMode: true });
       }
@@ -3275,10 +3368,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // Optional per-execution destination override (issue #207). Validated
           // and trailing-slash-normalized at the edge; persisted on the
           // execution record for #208 (packager relocation) / #210 (delivery).
-          destinationBucket: destinationBucketSchema.optional()
+          destinationBucket: destinationBucketSchema.optional(),
+          // Optional named export-destination reference (issue #573): the stable
+          // id OR name of a registered output-role destination
+          // (/api/v1/export-destinations). Resolved server-side to the SAME
+          // `destinationBucket` the relocation consumes. Mutually exclusive with
+          // the inline `destinationBucket` override (ambiguous -> 400).
+          destination: z.string().min(1).max(256).optional()
         }),
         response: {
           202: pipelineExecutionSchema,
+          400: errorSchema,
           404: z.object({ error: z.string() }),
           409: errorSchema,
           422: errorSchema,
@@ -3295,6 +3395,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Resolve a named export-destination reference OR the inline override into
+      // the single `destinationBucket` string the relocation consumes (issue
+      // #573). Rejects an ambiguous both-supplied request with 400.
+      const resolvedDestination = await resolveJobDestination(
+        { destination: request.body.destination, destinationBucket: request.body.destinationBucket },
+        reply
+      );
+      if (!resolvedDestination.ok) return reply; // error already sent
       const started = await startPipelineExecution(
         asset,
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
@@ -3305,7 +3413,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           customProfile: request.body.customProfile as EncoreProfile | undefined,
           profileParams: request.body.profileParams
         },
-        request.body.destinationBucket
+        resolvedDestination.destinationBucket
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);
