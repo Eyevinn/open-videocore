@@ -800,6 +800,16 @@ type AssetsRouterOptions = {
   // Encore transcode client (issue #8). When absent, POST /:id/transcode
   // responds 501 (Encore not configured on this deployment).
   encore?: EncoreClient;
+  // Resolve the EFFECTIVE stack identity a transcode request routes to (issue
+  // #615). Given the request's X-Stack-Name header (or undefined for the
+  // workspace default), returns the stack name to KEY the Encore auto-scaler
+  // pool / Valkey queue / MinIO endpoint by, so a request against a healthy
+  // named stack is never routed to whichever stack was provisioned first in the
+  // process. When absent (tests, env-override single-stack deployments) or when
+  // it resolves undefined (no provisioned stack / store unconfigured), the
+  // transcode path falls back to the fixed DEPLOYMENT_CONTEXT — unchanged
+  // pre-#615 behaviour.
+  resolveStackContext?: (requestedStackName?: string) => Promise<string | undefined>;
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
@@ -1437,6 +1447,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
 
+  // Resolve the scaler/Encore context key for a transcode request (issue #615).
+  // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
+  // MinIO S3-endpoint resolution by this context string (encodeEncoreJobId's
+  // contextId — see pipeline/transcode.ts). Pre-#615 this was the fixed
+  // DEPLOYMENT_CONTEXT, so every transcode routed to whichever stack was
+  // provisioned first. We now key by the EFFECTIVE stack identity the per-stack
+  // resolver reports for THIS request's X-Stack-Name, so a request against a
+  // healthy named stack reaches that stack regardless of provisioning order.
+  // Falls back to DEPLOYMENT_CONTEXT when no resolver is wired (tests /
+  // env-override) or when it resolves undefined (no provisioned stack), leaving
+  // single-stack behaviour byte-identical.
+  async function transcodeContext(request: import('fastify').FastifyRequest): Promise<string> {
+    if (!opts.resolveStackContext) return DEPLOYMENT_CONTEXT;
+    const header = request.headers['x-stack-name'];
+    const requested = typeof header === 'string' && header.length > 0 ? header : undefined;
+    const resolved = await opts.resolveStackContext(requested);
+    return resolved ?? DEPLOYMENT_CONTEXT;
+  }
+
   // Resolve whether a named transcode profile can execute on this platform tier
   // (issue #286). Returns a human message when the profile is a stored GPU-only
   // (NVENC/CUDA) profile that cannot run on OSC's CPU-only Encore instances, so
@@ -1794,7 +1823,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             request.connections?.packagedBucket ?? (opts.outputBucket as string);
           const result = await submitTranscode(
             {
-              workspaceId: DEPLOYMENT_CONTEXT,
+              // Key the scaler pool/queue/S3 endpoint by the EFFECTIVE stack
+              // this request routes to (issue #615), not the fixed deployment
+              // context, so a pipeline execution against a healthy named stack
+              // is not pinned to whichever stack was provisioned first.
+              workspaceId: await transcodeContext(request),
               sourceAssetId: asset.id,
               sourceObjectKey,
               // Read the transcode INPUT from the resolved stack's per-stack
@@ -3237,7 +3270,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       try {
         const result = await submitTranscode(
           {
-            workspaceId: DEPLOYMENT_CONTEXT,
+            // Key the scaler pool/queue/S3 endpoint by the EFFECTIVE stack this
+            // request routes to (issue #615), resolved from X-Stack-Name, not
+            // the fixed deployment context — so a transcode against a healthy
+            // named stack reaches that stack regardless of provisioning order.
+            workspaceId: await transcodeContext(request),
             sourceAssetId: asset.id,
             sourceObjectKey: source.objectKey,
             preset: request.body.profile,
