@@ -6554,6 +6554,40 @@
               }
             }
           },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "job_throughput_cap_exceeded"
+                      ]
+                    },
+                    "cap": {
+                      "type": "number"
+                    },
+                    "outstanding": {
+                      "type": "number"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cap",
+                    "outstanding",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "501": {
             "description": "Default Response",
             "content": {
@@ -14436,6 +14470,40 @@
                     "id",
                     "externalId",
                     "status"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "job_throughput_cap_exceeded"
+                      ]
+                    },
+                    "cap": {
+                      "type": "number"
+                    },
+                    "outstanding": {
+                      "type": "number"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cap",
+                    "outstanding",
+                    "message"
                   ],
                   "additionalProperties": false
                 }
