@@ -114,8 +114,7 @@ import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
   backendOutputDestination,
-  DEFAULT_BACKEND_ID,
-  type StorageBackendRegistry
+  DEFAULT_BACKEND_ID
 } from '../services/storage-backend-registry.js';
 import {
   deliveryMode,
@@ -837,16 +836,6 @@ type AssetsRouterOptions = {
   // not exercise named profiles), both checks are skipped (permissive) and the
   // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
-  // Registered external storage-backend registry (issue #549, #547, ADR-017).
-  // When present, POST /:id/execute may reference a registered external backend
-  // by id/name (`externalBackend`) to write its transcode/package OUTPUT to that
-  // backend's bucket instead of OSC-managed default storage. The reference is
-  // resolved at JOB TIME to the backend's NON-SECRET coordinates and translated
-  // into the per-execution `destinationBucket` the post-package relocation path
-  // already consumes (ADR-011). Credentials are NEVER read here — they live in
-  // OSC secrets, resolved by the consuming service. When absent, referencing an
-  // external backend responds 501; the default output path is unaffected.
-  storageBackendRegistry?: StorageBackendRegistry;
   // Best-effort audit emission (issue #564). Wired to the append-only audit
   // store's `record()` write primitive. When absent, mutations proceed
   // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
