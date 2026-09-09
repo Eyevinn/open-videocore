@@ -11,8 +11,32 @@ Health
   Liveness probe that also reports service identity.
 
   Response
-Response 200
-(no body)
+Response 200 (application/json)
+{
+  "status": "string",
+  "service": "string",
+  "resolver": {
+    "degraded": true,
+    "mode": "none",
+    "noStorageFallbackTotal": 0,
+    "staleFallbackTotal": 0,
+    "lastDegradedAt": 0
+  },
+  "ingest": {
+    "directUpload": {
+      "available": true,
+      "reason": "no-storage-endpoint"
+    },
+    "urlPull": {
+      "available": true,
+      "reason": "no-storage-endpoint"
+    },
+    "watchFolder": {
+      "available": true,
+      "reason": "no-storage-endpoint"
+    }
+  }
+}
 
   GET /healthz
 

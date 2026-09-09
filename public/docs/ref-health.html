@@ -299,7 +299,31 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   <p class="endpoint-desc">Liveness probe that also reports service identity.</p>
   
   
-  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200</div><pre><code>(no body)</code></pre></div>
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;status&quot;: &quot;string&quot;,
+  &quot;service&quot;: &quot;string&quot;,
+  &quot;resolver&quot;: {
+    &quot;degraded&quot;: true,
+    &quot;mode&quot;: &quot;none&quot;,
+    &quot;noStorageFallbackTotal&quot;: 0,
+    &quot;staleFallbackTotal&quot;: 0,
+    &quot;lastDegradedAt&quot;: 0
+  },
+  &quot;ingest&quot;: {
+    &quot;directUpload&quot;: {
+      &quot;available&quot;: true,
+      &quot;reason&quot;: &quot;no-storage-endpoint&quot;
+    },
+    &quot;urlPull&quot;: {
+      &quot;available&quot;: true,
+      &quot;reason&quot;: &quot;no-storage-endpoint&quot;
+    },
+    &quot;watchFolder&quot;: {
+      &quot;available&quot;: true,
+      &quot;reason&quot;: &quot;no-storage-endpoint&quot;
+    }
+  }
+}</code></pre></div>
 </article>
 
 <article class="endpoint" id="get-healthz">
