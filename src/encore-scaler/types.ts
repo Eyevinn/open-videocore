@@ -31,6 +31,13 @@ export type EncoreS3Config = {
 export type EncoreScalerConfig = {
   workspaceId: string;
   maxInstances: number;
+  // Optional operator-configured job-throughput cap (issue #580): the maximum
+  // number of OUTSTANDING jobs (pending in the queue + being dispatched) the
+  // deployment will admit at once. Unset => no cap (opt-in; submission behaviour
+  // unchanged). Enforced at submit time against the scaler's own Valkey queue /
+  // inflight state — NOT a second accounting path (ADR-020 Decision 2 applied to
+  // jobs). See src/encore-scaler/job-throughput-cap.ts.
+  maxQueuedJobs?: number;
   // Minimum instances to keep warm even when idle (default 0). When >= 1 the
   // scaler pre-warms up to this many instances regardless of pending work.
   minInstances?: number;

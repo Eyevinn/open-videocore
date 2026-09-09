@@ -115,6 +115,7 @@ import {
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
+import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import {
   createJob,
   getJob,
@@ -629,6 +630,15 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // Requires a Redis connection (resolved from the parameter store after provisioning).
 // When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+// Optional operator-configured job-throughput cap (issue #580, ADR-020). Caps the
+// number of OUTSTANDING transcode/package jobs (pending in the scaler queue +
+// being dispatched) the deployment will admit at once; an over-limit submission
+// is rejected with a 429 `job_throughput_cap_exceeded` rather than growing an
+// unbounded backlog. This is a SUBMISSION-admission guardrail layered on top of
+// the scaler's existing `maxInstances` pool ceiling (which bounds live compute
+// cost) — it reuses the scaler's own Valkey queue state, NOT a second counter.
+// Unset/0/invalid => no cap (opt-in; submission behaviour unchanged).
+const encoreMaxQueuedJobs = resolveJobThroughputCap(process.env);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
 // Bounded wait (issue #463) for the outbound TLS-trust probe to a freshly
 // spawned instance's per-instance callback-listener ingress before that instance
@@ -819,6 +829,10 @@ function activateScaler(redisUrl: string): void {
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
+    // Optional opt-in job-throughput cap (issue #580, ADR-020). Forwarded to
+    // every per-workspace scaler client; the submit path rejects over-limit
+    // submissions with a 429 `job_throughput_cap_exceeded`. Unset => no cap.
+    maxQueuedJobs: encoreMaxQueuedJobs,
     idleTimeoutMs: encoreIdleTimeoutMs,
     // Gate first-job dispatch on confirmed outbound callback-listener TLS trust
     // (issue #463): bounded wait before a freshly spawned instance is eligible.
