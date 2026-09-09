@@ -772,8 +772,43 @@ function activateScaler(redisUrl: string): void {
   };
 
   scalerRegistry = new WorkspaceEncoreScalerRegistry({
+    // Process-global fallback connection (env-override single-stack / tests):
+    // used only when resolveRedisUrl below cannot resolve a per-stack URL.
     redis,
     redisUrl,
+    // Resolve each stack's OWN Valkey URL from the parameter store at loop
+    // creation time (issue #615), mirroring resolveS3Config's per-stack MinIO
+    // resolution below. Each provisioned stack has its own valkey-io-valkey
+    // instance (routes/provision.ts step 3) and its own StackConfig.redisUrl
+    // (services/param-store.ts). `stackKey` is the EFFECTIVE stack identity the
+    // transcode request resolved to (decoded from the encoreJobId contextId), so
+    // we load that stack's config by name directly and return its redisUrl.
+    // Only when that exact stack has no stored config (e.g. the fixed
+    // DEPLOYMENT_CONTEXT of a single-stack env-override deployment, which is not
+    // itself a stack name) do we fall back to the first-provisioned stack — so a
+    // named stack's queue is never mis-routed to the first-provisioned Valkey,
+    // while single-stack behaviour is unchanged. Returns undefined when nothing
+    // resolves, and the registry then reuses the process-global connection.
+    resolveRedisUrl: async (stackKey: string): Promise<string | undefined> => {
+      if (!paramStore) return undefined;
+      try {
+        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
+        if (!config) {
+          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+          }
+        }
+        return config?.redisUrl && config.redisUrl.length > 0 ? config.redisUrl : undefined;
+      } catch (err) {
+        app.log.warn({ err, stackKey }, 'encore-scaler: failed to resolve per-stack Valkey URL from parameter store');
+        return undefined;
+      }
+    },
+    // Open a Valkey connection for a resolved per-stack URL (issue #615). Same
+    // construction as the process-global connection in activateScaler above so
+    // lifecycle semantics (lazyConnect, unbounded per-request retries) match.
+    makeRedis: (url: string) => new IORedis(url, { lazyConnect: true, maxRetriesPerRequest: null }),
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
@@ -1332,6 +1367,13 @@ const encoreCompatRouterOptions: Parameters<typeof encoreCompatRouter>[1] & { pr
   repository: assetRepository,
   jobRepository,
   encore,
+  // Resolve the EFFECTIVE stack a compat submit routes to (issue #615) so this
+  // sibling processing route keys the scaler pool / Valkey queue / MinIO endpoint
+  // per request by the named stack, exactly like POST /assets/:id/transcode —
+  // rather than pinning to the fixed deployment context (first-provisioned
+  // stack). Delegates to the same per-stack resolver reading X-Stack-Name.
+  resolveStackContext: (requestedStackName?: string) =>
+    stackResolver.resolveStackName(requestedStackName),
   sourceBucket,
   outputBucket
 };
