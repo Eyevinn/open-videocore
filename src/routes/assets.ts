@@ -375,6 +375,31 @@ const tamsLookupQuerySchema = z.object({
   )
 });
 
+// External-identifier resolver path params (issue #576, ADR-019). The lookup key
+// is the `{ namespace, id }` pair modelled by #575 and persisted under
+// `administrative.externalIdentifiers[]` (asset-document.ts). Both components are
+// REQUIRED and non-empty, matching the persisted `ExternalIdentifierSchema`
+// grammar (`namespace`/`id` are each `z.string().min(1)`), so the resolver's
+// accepted grammar is 1:1 with the stored grammar. An empty component is
+// rejected at the boundary with 400 before the handler runs. `id` is an opaque
+// upstream foreign key (UUID / numeric / slug), so it stays a free-form string.
+const externalIdParamsSchema = z.object({
+  namespace: z
+    .string()
+    .min(1)
+    .describe(
+      'Upstream system-of-record label the external id belongs to (e.g. ' +
+        '`ingest-mam`, `rights-registry`). Required, non-empty.'
+    ),
+  id: z
+    .string()
+    .min(1)
+    .describe(
+      'Opaque foreign-key value in that system (UUID / numeric id / slug). ' +
+        'Required, non-empty.'
+    )
+});
+
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
 // Machine-readable body for a 504 when a required stack dependency (queue/
@@ -2237,6 +2262,56 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       // Forward-compat paginated envelope even though v1 is single-match.
       return reply.code(200).send({ items: [resolved], limit: MAX_LIMIT, offset: 0, total: 1 });
+    }
+  );
+
+  // External-identifier resolver route (issue #576, ADR-019). Resolves an
+  // upstream `{ namespace, id }` correlation to AT MOST ONE asset, so a Media
+  // Developer round-tripping with an upstream system of record can fetch the
+  // open-videocore asset by their own foreign key.
+  //
+  // A DEDICATED resolver PATH (not a `GET /?externalId=…` query filter on the
+  // list endpoint), mirroring the `/by-tams-address` precedent above: its
+  // single-match, 404-on-unknown semantics differ from list semantics, and the
+  // two-part composite key expresses cleanly as `/{namespace}/{id}` without the
+  // colon-delimited `externalId=ns:id` ambiguity (an upstream id may itself
+  // contain a colon, e.g. a URN). Registered BEFORE the `/:id` param route so the
+  // static `/by-external-id` segment is never shadowed by the param (Fastify's
+  // radix router prefers the static segment; the registration order makes it
+  // explicit).
+  //
+  // Index-backed, NOT a linear scan: the resolution delegates to
+  // AssetRepository.getByExternalId, which the CouchDB backend serves with a
+  // Mango `$elemMatch` push-down over `administrative.externalIdentifiers`
+  // (couch-asset-repo.ts) — the same array-index push-down as the TAMS flow
+  // lookup — so CouchDB filters within the tenant database rather than the route
+  // paging the whole asset set.
+  //
+  // Error -> status mapping:
+  //   - empty `namespace` / `id` -> 400 (enforced by externalIdParamsSchema
+  //     before the handler runs).
+  //   - well-formed pair with no matching asset -> 404 (existence not leaked).
+  app.get(
+    '/by-external-id/:namespace/:id',
+    {
+      schema: {
+        summary: 'Resolve an asset by an upstream external identifier',
+        description:
+          'Resolve a single asset by the `{ namespace, id }` external identifier ' +
+          'correlated to it (ADR-019). `namespace` labels the upstream system of ' +
+          'record; `id` is the opaque foreign key in that system. Returns the asset ' +
+          'when exactly one carries the pair, or 404 when none does.',
+        params: externalIdParamsSchema,
+        response: { 200: assetSchema, 400: errorSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { namespace, id } = request.params;
+      const asset = await repo.getByExternalId(namespace, id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(asset);
     }
   );
 

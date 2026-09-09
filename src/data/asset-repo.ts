@@ -809,6 +809,17 @@ export interface AssetRepository {
   // asset in this workspace carries the slug. Used by the `/:id` route to accept
   // a slug in place of the ULID id.
   getBySlug(slug: string): Promise<Asset | undefined>;
+  // Resolve an asset by an upstream external identifier (issue #576, ADR-019),
+  // scoped to the repository's (structurally isolated) workspace. Matches the
+  // `{ namespace, id }` entry in `administrative.externalIdentifiers` (the set
+  // modelled by #575). Returns undefined when no asset in this workspace carries
+  // the pair. Used by the `/by-external-id/:namespace/:id` resolver route.
+  //
+  // Index-backed, NOT a linear scan: the CouchDB implementation pushes the pair
+  // down as a Mango `$elemMatch` selector over the persisted array (mirroring the
+  // TAMS flow-id push-down in couch-search-repo.ts), so CouchDB filters within
+  // the tenant database rather than the caller paging the whole asset set.
+  getByExternalId(namespace: string, id: string): Promise<Asset | undefined>;
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
@@ -1282,6 +1293,21 @@ export class InMemoryAssetRepository implements AssetRepository {
   async getBySlug(slug: string): Promise<Asset | undefined> {
     for (const a of this.store.values()) {
       if (a.slug === slug) {
+        return { ...a };
+      }
+    }
+    return undefined;
+  }
+
+  // Resolve by external identifier (issue #576, ADR-019). Scans this store, which
+  // holds exactly one tenant's assets, so the lookup is inherently
+  // workspace-scoped — mirroring getBySlug's isolation. The CouchDB backend does
+  // the equivalent match with an indexed Mango `$elemMatch` push-down; here the
+  // in-memory backend walks the (small, dev/test) store and returns the first
+  // asset carrying the `{ namespace, id }` pair.
+  async getByExternalId(namespace: string, id: string): Promise<Asset | undefined> {
+    for (const a of this.store.values()) {
+      if (a.externalIdentifiers?.some((e) => e.namespace === namespace && e.id === id)) {
         return { ...a };
       }
     }
