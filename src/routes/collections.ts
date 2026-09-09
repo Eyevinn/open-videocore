@@ -24,6 +24,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
+import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
 import {
   CollectionDeleteProtectedError,
   CollectionNotFoundError,
@@ -226,6 +227,17 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   const assets = opts.assetRepository;
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
+
+  // Router-layer method→action authorisation gate (ADR-018 decision 2, seam 1;
+  // issue #554). Registered plugin-scoped so it runs on EVERY collection route
+  // (Fastify encapsulation) before the handler: it derives the action from the
+  // HTTP method and calls authorize(role, 'collection'). Per ADR-018 decision 4
+  // there is NO collection→asset cascade — a collection is authorised as a
+  // 'collection' resource against the same workspace role that authorises assets;
+  // membership never widens or narrows access. Denials are a fail-closed 403 with
+  // the stable AUTHZ_FORBIDDEN_ERROR reason code, distinct from the 401 presence
+  // gate (decision 5).
+  app.addHook('preHandler', resourceAuthorizationPreHandler('collection'));
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {

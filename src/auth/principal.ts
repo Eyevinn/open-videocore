@@ -147,12 +147,39 @@ declare module 'fastify' {
   }
 }
 
-// Register the request decoration + a preHandler that resolves the role header
-// once per request and attaches it, alongside the existing `request.authenticated`
-// (src/auth/middleware.ts) and `request.connections` (src/main.ts:316). This
-// performs NO enforcement: it never returns 403 and never gates a route
-// (deferred to #554, ADR-018 decision 5). Call once at app setup.
-export function registerPrincipal(app: FastifyInstance): void {
+// Options controlling the trust boundary (ADR-018 decision 5, issue #554).
+export interface PrincipalOptions {
+  // Whether the fronting auth layer (OSC login-wall + a reverse proxy or a
+  // self-deployed IdP) is trusted to have set `X-OVC-Role` on this request.
+  //
+  // ADR-018 decision 5 requires the enforcement issue to STRIP any client-supplied
+  // `X-OVC-Role` at the trust boundary before honouring the authenticated value,
+  // "exactly as the app already trusts the upstream gate for authentication"
+  // (docs/architecture/ADR-018-authorisation-model.md:213-220). The trust
+  // boundary is THIS onRequest hook — the single, earliest point the header is
+  // read — so stripping here guarantees no downstream code observes a spoofed
+  // value.
+  //
+  //   - false (default): the deployment has NOT opted into distinct per-caller
+  //     roles, so any inbound `X-OVC-Role` is client-supplied and untrusted. We
+  //     DELETE the raw header and resolve as if absent ⇒ admin (single-operator
+  //     default, decision 5), preserving today's authenticated-⇒-full-access
+  //     behaviour and making a spoofed header a no-op.
+  //   - true: the operator has fronted open-videocore with a trusted role-
+  //     injecting layer; the header on the already-gated path is the authenticated
+  //     value and is honoured.
+  trustRoleHeader: boolean;
+}
+
+// Register the request decoration + an onRequest hook that resolves the role
+// header once per request and attaches it, alongside the existing
+// `request.authenticated` (src/auth/middleware.ts) and `request.connections`
+// (src/main.ts:355). The hook is the trust boundary (ADR-018 decision 5): it
+// strips any client-supplied `X-OVC-Role` unless the fronting layer is trusted,
+// then resolves the (possibly-stripped) header. It performs NO enforcement here
+// (no 403, no route gate) — the router-layer gate in src/auth/authorize.ts owns
+// the fail-closed 403 (ADR-018 decision 2). Call once at app setup.
+export function registerPrincipal(app: FastifyInstance, opts: PrincipalOptions): void {
   // Fastify v5 forbids a reference-type default value in decorateRequest — a
   // shared object would leak mutations across requests (FST_ERR_DEC_REFERENCE_TYPE).
   // Declare the slot as null and populate it per-request in the earliest hook
@@ -164,9 +191,17 @@ export function registerPrincipal(app: FastifyInstance): void {
   app.decorateRequest('principal', null as unknown as ResolvedPrincipal);
 
   app.addHook('onRequest', async (request: FastifyRequest) => {
+    // Trust boundary (ADR-018 decision 5): when the fronting layer is NOT trusted
+    // to set the role, strip any client-supplied header so a spoofed value can
+    // never reach the resolver or any downstream seam. Deleting the header makes
+    // resolvePrincipalRole see it as absent ⇒ admin (the single-operator default),
+    // exactly matching today's behaviour for deployments that have not opted in.
+    if (!opts.trustRoleHeader) {
+      delete request.headers[ROLE_HEADER];
+    }
     // Fastify lowercases header keys; read the lowercased ROLE_HEADER exactly as
-    // the existing x-stack-name read does (src/main.ts:318). Observability only —
-    // no enforcement, so no reply is ever sent here.
+    // the existing x-stack-name read does (src/main.ts:356). No reply is ever
+    // sent here — enforcement is the router-layer gate's job (#554).
     request.principal = resolvePrincipalRole(request.headers[ROLE_HEADER]);
   });
 }

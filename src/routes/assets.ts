@@ -50,6 +50,7 @@ import {
   type TamsQueryAddress
 } from '../tams/tams-query-contract.js';
 import { WorkspaceAccessError } from '../data/guard.js';
+import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
@@ -1397,6 +1398,17 @@ function objectKeyFromManifest(manifestUrl: string, bucket: string): string {
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
+
+  // Router-layer method→action authorisation gate (ADR-018 decision 2, seam 1;
+  // issue #554). Registered plugin-scoped so it runs on EVERY asset route
+  // (Fastify encapsulation) before the handler: it derives the action from the
+  // HTTP method (GET/HEAD→read, POST/PUT/PATCH→write, DELETE→delete) and calls
+  // authorize(role, 'asset'). Denials are a fail-closed 403 with the stable
+  // AUTHZ_FORBIDDEN_ERROR reason code, distinct from the 401 presence gate
+  // (decision 5). Per ADR-018 decision 4 each asset is authorised independently
+  // against the caller's workspace role — no cascade from any collection.
+  app.addHook('preHandler', resourceAuthorizationPreHandler('asset'));
+
   const repo = opts.repository ?? new InMemoryAssetRepository();
   const jobs = opts.jobRepository ?? new InMemoryJobRepository();
   const comments = opts.commentRepository ?? new InMemoryCommentRepository();
