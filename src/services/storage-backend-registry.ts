@@ -646,4 +646,58 @@ export class StorageBackendRegistry {
     }
     await this.records.delete(workspaceId, id);
   }
+
+  // Resolve a registered backend by its id OR its human name, for a workspace
+  // (issue #549, output/transcode-package wiring under #524 / ADR-017 D4).
+  // Returns the NON-SECRET record so a caller can read the backend's coordinates
+  // (bucket / endpointUrl / …) at JOB TIME to target its packaged output there.
+  //
+  // The credential the destination write needs was already fanned out to the
+  // consuming serviceIds' OSC secrets at registration time (register(), ADR-017
+  // D1.1); this resolver deliberately exposes ONLY the non-secret record and
+  // NEVER the secret material — the secret is resolved by the consuming service
+  // via its `{{secrets.<name>}}` reference, not read back here.
+  //
+  // The implicit OSC-managed default (id 'default') resolves to undefined: it is
+  // NOT an external backend (defaultBackendView widens its type, backend-registry
+  // line 106-121), so a caller referencing 'default' must fall through to the
+  // unchanged default output path (ADR-017 D3) rather than treat it as an
+  // external destination. An unknown id/name also resolves to undefined so the
+  // caller can 422 a dangling reference before dispatching a job.
+  async resolveForOutput(
+    workspaceId: string,
+    idOrName: string
+  ): Promise<StorageBackendRecord | undefined> {
+    if (idOrName === DEFAULT_BACKEND_ID) {
+      return undefined;
+    }
+    const byId = await this.records.get(workspaceId, idOrName);
+    if (byId) {
+      return byId;
+    }
+    // Fall back to a case-sensitive name match (names are operator-chosen and
+    // not guaranteed unique; the FIRST match wins, mirroring how list() returns
+    // them). id lookup is preferred above because it is unambiguous.
+    const all = await this.records.list(workspaceId);
+    return all.find((r) => r.name === idOrName);
+  }
+}
+
+// Translate a resolved external backend record into the per-execution
+// `destinationBucket` override string the post-package relocation path already
+// consumes (issue #549; ADR-011 relocation mechanism + ADR-017 D4). The
+// relocation edge/parser (output-relocation.ts parseDestination,
+// assets.ts destinationBucketSchema) accepts EITHER a plain `bucket/prefix/`
+// path OR an `s3://bucket/…/` URI, trailing-slash-terminated. We emit the
+// `s3://<bucket>/` form (matching packagerOutputFolder, external-storage-
+// credentials.ts:75-81) so a cross-endpoint external bucket is recognised as an
+// external S3 URI and NOT reachability-probed against the default MinIO client
+// (assets.ts:1561 `isExternalS3Uri`). NEVER embeds credentials — the endpoint
+// and keys live in OSC secrets, resolved by the consuming service.
+export function backendOutputDestination(record: StorageBackendRecord): string {
+  const bare = record.bucket
+    .replace(/^s3:\/\//i, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+  return `s3://${bare}/`;
 }

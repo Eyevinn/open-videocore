@@ -1351,6 +1351,11 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
   profileRepository,
+  // External storage-backend registry (issue #549, ADR-017 D4): lets POST
+  // /:id/execute target a registered external backend for its transcode/package
+  // OUTPUT, resolving the backend's non-secret coordinates at job time. The same
+  // registry instance the /storage/backends registration routes use.
+  storageBackendRegistry,
   // Best-effort audit emission for asset mutations (issue #564).
   audit: auditEmitter
 };
