@@ -50,6 +50,7 @@ import {
   type TamsQueryAddress
 } from '../tams/tams-query-contract.js';
 import { WorkspaceAccessError } from '../data/guard.js';
+import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
@@ -113,6 +114,10 @@ import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/cli
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
+  backendOutputDestination,
+  DEFAULT_BACKEND_ID
+} from '../services/storage-backend-registry.js';
+import {
   deliveryMode,
   manifestUrlsForLocation,
   outputPrefix,
@@ -133,6 +138,7 @@ import { validateProfileColourSignalling } from '../pipeline/profile-colour-guar
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
+import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
@@ -369,6 +375,31 @@ const tamsLookupQuerySchema = z.object({
   )
 });
 
+// External-identifier resolver path params (issue #576, ADR-019). The lookup key
+// is the `{ namespace, id }` pair modelled by #575 and persisted under
+// `administrative.externalIdentifiers[]` (asset-document.ts). Both components are
+// REQUIRED and non-empty, matching the persisted `ExternalIdentifierSchema`
+// grammar (`namespace`/`id` are each `z.string().min(1)`), so the resolver's
+// accepted grammar is 1:1 with the stored grammar. An empty component is
+// rejected at the boundary with 400 before the handler runs. `id` is an opaque
+// upstream foreign key (UUID / numeric / slug), so it stays a free-form string.
+const externalIdParamsSchema = z.object({
+  namespace: z
+    .string()
+    .min(1)
+    .describe(
+      'Upstream system-of-record label the external id belongs to (e.g. ' +
+        '`ingest-mam`, `rights-registry`). Required, non-empty.'
+    ),
+  id: z
+    .string()
+    .min(1)
+    .describe(
+      'Opaque foreign-key value in that system (UUID / numeric id / slug). ' +
+        'Required, non-empty.'
+    )
+});
+
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
 // Machine-readable body for a 504 when a required stack dependency (queue/
@@ -379,6 +410,16 @@ const dependencyUnreachableSchema = z.object({
   error: z.literal('dependency_unreachable'),
   dependency: z.enum(['queue', 'encore', 'storage']),
   endpoint: z.string(),
+  message: z.string()
+});
+
+// Machine-readable body for a 429 when the operator-configured job-throughput
+// cap is exceeded on the transcode submit path (issue #580). Names the configured
+// ceiling and observed outstanding-job count so a caller can back off and retry.
+const jobThroughputCapSchema = z.object({
+  error: z.literal('job_throughput_cap_exceeded'),
+  cap: z.number(),
+  outstanding: z.number(),
   message: z.string()
 });
 
@@ -760,6 +801,16 @@ type AssetsRouterOptions = {
   // Encore transcode client (issue #8). When absent, POST /:id/transcode
   // responds 501 (Encore not configured on this deployment).
   encore?: EncoreClient;
+  // Resolve the EFFECTIVE stack identity a transcode request routes to (issue
+  // #615). Given the request's X-Stack-Name header (or undefined for the
+  // workspace default), returns the stack name to KEY the Encore auto-scaler
+  // pool / Valkey queue / MinIO endpoint by, so a request against a healthy
+  // named stack is never routed to whichever stack was provisioned first in the
+  // process. When absent (tests, env-override single-stack deployments) or when
+  // it resolves undefined (no provisioned stack / store unconfigured), the
+  // transcode path falls back to the fixed DEPLOYMENT_CONTEXT — unchanged
+  // pre-#615 behaviour.
+  resolveStackContext?: (requestedStackName?: string) => Promise<string | undefined>;
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
@@ -1372,6 +1423,17 @@ function objectKeyFromManifest(manifestUrl: string, bucket: string): string {
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
+
+  // Router-layer method→action authorisation gate (ADR-018 decision 2, seam 1;
+  // issue #554). Registered plugin-scoped so it runs on EVERY asset route
+  // (Fastify encapsulation) before the handler: it derives the action from the
+  // HTTP method (GET/HEAD→read, POST/PUT/PATCH→write, DELETE→delete) and calls
+  // authorize(role, 'asset'). Denials are a fail-closed 403 with the stable
+  // AUTHZ_FORBIDDEN_ERROR reason code, distinct from the 401 presence gate
+  // (decision 5). Per ADR-018 decision 4 each asset is authorised independently
+  // against the caller's workspace role — no cascade from any collection.
+  app.addHook('preHandler', resourceAuthorizationPreHandler('asset'));
+
   const repo = opts.repository ?? new InMemoryAssetRepository();
   const jobs = opts.jobRepository ?? new InMemoryJobRepository();
   const comments = opts.commentRepository ?? new InMemoryCommentRepository();
@@ -1385,6 +1447,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const storageFor = opts.storageFor;
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
+
+  // Resolve the scaler/Encore context key for a transcode request (issue #615).
+  // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
+  // MinIO S3-endpoint resolution by this context string (encodeEncoreJobId's
+  // contextId — see pipeline/transcode.ts). Pre-#615 this was the fixed
+  // DEPLOYMENT_CONTEXT, so every transcode routed to whichever stack was
+  // provisioned first. We now key by the EFFECTIVE stack identity the per-stack
+  // resolver reports for THIS request's X-Stack-Name, so a request against a
+  // healthy named stack reaches that stack regardless of provisioning order.
+  // Falls back to DEPLOYMENT_CONTEXT when no resolver is wired (tests /
+  // env-override) or when it resolves undefined (no provisioned stack), leaving
+  // single-stack behaviour byte-identical.
+  async function transcodeContext(request: import('fastify').FastifyRequest): Promise<string> {
+    if (!opts.resolveStackContext) return DEPLOYMENT_CONTEXT;
+    const header = request.headers['x-stack-name'];
+    const requested = typeof header === 'string' && header.length > 0 ? header : undefined;
+    const resolved = await opts.resolveStackContext(requested);
+    return resolved ?? DEPLOYMENT_CONTEXT;
+  }
 
   // Resolve whether a named transcode profile can execute on this platform tier
   // (issue #286). Returns a human message when the profile is a stored GPU-only
@@ -1550,38 +1631,112 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
   // Resolve a package/publish job's requested output destination into the single
   // per-execution `destinationBucket` string the ADR-011 relocation path already
-  // consumes (issue #573). Accepts EITHER a named export-destination reference
-  // (`destination`, resolved through the SAME StorageBackendRegistry the
-  // /api/v1/export-destinations surface uses — resolveDestinationBucket) OR an
-  // inline `destinationBucket` override (unchanged ADR-011 ad-hoc path), never
-  // both.
+  // consumes. Accepts AT MOST ONE of three mutually-exclusive output-destination
+  // expressions, then reduces it to the single bucket string the downstream
+  // pipeline consumes:
+  //   1. `destination` — a named export-destination reference (issue #573), the
+  //      stable id OR name of a registered output-role backend, resolved through
+  //      the SAME StorageBackendRegistry the /api/v1/export-destinations surface
+  //      uses (resolveDestinationBucket).
+  //   2. `externalBackend` — a reference (id OR name) to a registered external
+  //      storage backend (issue #549, ADR-017 D4), resolved through
+  //      resolveForOutput to the backend's NON-SECRET output coordinates
+  //      (credentials stay in OSC secrets).
+  //   3. `destinationBucket` — an inline ad-hoc override (unchanged ADR-011
+  //      path), already validated + trailing-slash-normalised at the edge.
   //
-  // PRECEDENCE (issue #573): supplying both a named reference and an inline
-  // override on the same job is AMBIGUOUS and rejected with a clear 400 rather
-  // than silently preferring one — the caller must pick exactly one destination
-  // expression.
+  // PRECEDENCE / MUTUAL EXCLUSION: supplying more than one of the three on the
+  // same job is AMBIGUOUS and rejected with a clear 400 rather than silently
+  // preferring one — the caller must pick exactly one destination expression.
+  // Each named path preserves its own resolution error semantics: #573's
+  // `destination` yields the registry's 400 (bad_request) / 501 (not_configured);
+  // #549's `externalBackend` yields 501 (not_configured) / 422 (unknown_backend
+  // or backend_role). When none is supplied the job uses the provisioned default
+  // (fully backwards compatible).
   //
   // Returns:
   //   { ok: true, destinationBucket } — the resolved override string (or
-  //     undefined when neither was supplied: the job uses the provisioned
-  //     default, fully backwards compatible).
+  //     undefined when none was supplied: the job uses the provisioned default).
   //   { ok: false } — an error response has already been sent via `reply`;
   //     callers must not send again.
   async function resolveJobDestination(
-    args: { destination?: string; destinationBucket?: string },
+    args: { destination?: string; externalBackend?: string; destinationBucket?: string },
     reply: import('fastify').FastifyReply
   ): Promise<{ ok: true; destinationBucket?: string } | { ok: false }> {
-    const { destination, destinationBucket } = args;
-    // Precedence: reject an ambiguous request that supplies both a named
-    // reference and an inline override (issue #573 precedence rule).
-    if (destination !== undefined && destinationBucket !== undefined) {
-      reply.code(400).send({
-        error: 'ambiguous_destination',
-        message:
-          'supply either a named "destination" reference or an inline "destinationBucket" override, not both'
-      });
+    const { destination, externalBackend, destinationBucket } = args;
+    // Mutual exclusion across all three output-destination expressions: at most
+    // ONE may be supplied. More than one is ambiguous -> 400 (issue #573 / #549).
+    // Each feature keeps its own pre-existing 400 error shape rather than a new
+    // invented code: a collision INVOLVING `externalBackend` uses #549's
+    // `invalid_request` shape; a `destination`/`destinationBucket` collision uses
+    // #573's `ambiguous_destination` shape.
+    const suppliedCount =
+      (destination !== undefined ? 1 : 0) +
+      (externalBackend !== undefined ? 1 : 0) +
+      (destinationBucket !== undefined ? 1 : 0);
+    if (suppliedCount > 1) {
+      if (externalBackend !== undefined) {
+        reply.code(400).send({
+          error: 'invalid_request',
+          message:
+            'externalBackend and destinationBucket are mutually exclusive; specify only one output destination'
+        });
+      } else {
+        reply.code(400).send({
+          error: 'ambiguous_destination',
+          message:
+            'supply either a named "destination" reference or an inline "destinationBucket" override, not both'
+        });
+      }
       return { ok: false };
     }
+
+    // #549 external-backend reference path: resolve through the registry's
+    // output resolver, preserving its 501 (not_configured) / 422 (unknown_backend
+    // / backend_role) semantics.
+    if (externalBackend !== undefined) {
+      if (!opts.storageBackendRegistry) {
+        reply.code(501).send({
+          error: 'not_configured',
+          message: 'external storage backends are not configured on this deployment'
+        });
+        return { ok: false };
+      }
+      const record = await opts.storageBackendRegistry.resolveForOutput(
+        DEPLOYMENT_CONTEXT,
+        externalBackend
+      );
+      // Explicitly referencing the implicit OSC-managed default (id 'default')
+      // means "use the default output path" — resolveForOutput returns undefined
+      // for it (ADR-017 D3, it is not an external backend), so we leave the
+      // destination unset and fall through rather than 422. Any OTHER unresolved
+      // reference is a dangling backend -> 422.
+      if (!record) {
+        if (externalBackend !== DEFAULT_BACKEND_ID) {
+          reply.code(422).send({
+            error: 'unknown_backend',
+            message: `no registered external storage backend matches "${externalBackend}"`
+          });
+          return { ok: false };
+        }
+        // 'default' -> no override, default output path (field omitted).
+        return { ok: true };
+      }
+      // Only write-capable roles can receive packaged output (ADR-017 D4:
+      // 'packaged'/'both' fan their credential to the packager; 'source' is
+      // read-only for ingest and 'archive' fans only to source-reader consumers
+      // — see mappingsForRole, storage-backend-registry.ts). Any non-write role
+      // is rejected via this allowlist.
+      if (record.role !== 'packaged' && record.role !== 'both') {
+        reply.code(422).send({
+          error: 'backend_role',
+          message: `storage backend "${externalBackend}" is registered for the "${record.role}" role and cannot receive output; register it with role "packaged" or "both"`
+        });
+        return { ok: false };
+      }
+      return { ok: true, destinationBucket: backendOutputDestination(record) };
+    }
+
     // Inline override path: unchanged ADR-011 behaviour (already validated +
     // trailing-slash-normalised at the edge by destinationBucketSchema).
     if (destination === undefined) {
@@ -1589,8 +1744,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         ? { ok: true, destinationBucket }
         : { ok: true };
     }
-    // Named-reference path: resolve through the registry to the SAME
-    // `destinationBucket` string the relocation consumes (issue #573).
+    // #573 named-reference path: resolve through the registry to the SAME
+    // `destinationBucket` string the relocation consumes.
     if (!opts.storageBackendRegistry) {
       reply.code(501).send({
         error: 'not_configured',
@@ -1808,10 +1963,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             request.connections?.packagedBucket ?? (opts.outputBucket as string);
           const result = await submitTranscode(
             {
-              workspaceId: DEPLOYMENT_CONTEXT,
+              // Key the scaler pool/queue/S3 endpoint by the EFFECTIVE stack
+              // this request routes to (issue #615), not the fixed deployment
+              // context, so a pipeline execution against a healthy named stack
+              // is not pinned to whichever stack was provisioned first.
+              workspaceId: await transcodeContext(request),
               sourceAssetId: asset.id,
               sourceObjectKey,
-              sourceBucket: opts.sourceBucket as string,
+              // Read the transcode INPUT from the resolved stack's per-stack
+              // source bucket (StackConfig.sourceBucket, param-store key
+              // `sourceBucket` per ADR-002; carried on WorkspaceConnections.
+              // sourceBucket) rather than the deployment-wide boot default
+              // (opts.sourceBucket from MINIO_SOURCE_BUCKET) — issue #639. The
+              // fallback preserves the env-override / single-stack deployments
+              // where request.connections is absent. Mirrors the existing
+              // per-stack resolution used by the thumbnail/rewrap paths
+              // (request.connections?.sourceBucket ?? …). Output/packaged
+              // resolution (resolvedOutputBucket) is issue #638.
+              sourceBucket: request.connections?.sourceBucket ?? (opts.sourceBucket as string),
               outputBucket: resolvedOutputBucket,
               preset: encodeOpts?.profile,
               customProfile: encodeOpts?.customProfile,
@@ -2255,6 +2424,56 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       // Forward-compat paginated envelope even though v1 is single-match.
       return reply.code(200).send({ items: [resolved], limit: MAX_LIMIT, offset: 0, total: 1 });
+    }
+  );
+
+  // External-identifier resolver route (issue #576, ADR-019). Resolves an
+  // upstream `{ namespace, id }` correlation to AT MOST ONE asset, so a Media
+  // Developer round-tripping with an upstream system of record can fetch the
+  // open-videocore asset by their own foreign key.
+  //
+  // A DEDICATED resolver PATH (not a `GET /?externalId=…` query filter on the
+  // list endpoint), mirroring the `/by-tams-address` precedent above: its
+  // single-match, 404-on-unknown semantics differ from list semantics, and the
+  // two-part composite key expresses cleanly as `/{namespace}/{id}` without the
+  // colon-delimited `externalId=ns:id` ambiguity (an upstream id may itself
+  // contain a colon, e.g. a URN). Registered BEFORE the `/:id` param route so the
+  // static `/by-external-id` segment is never shadowed by the param (Fastify's
+  // radix router prefers the static segment; the registration order makes it
+  // explicit).
+  //
+  // Index-backed, NOT a linear scan: the resolution delegates to
+  // AssetRepository.getByExternalId, which the CouchDB backend serves with a
+  // Mango `$elemMatch` push-down over `administrative.externalIdentifiers`
+  // (couch-asset-repo.ts) — the same array-index push-down as the TAMS flow
+  // lookup — so CouchDB filters within the tenant database rather than the route
+  // paging the whole asset set.
+  //
+  // Error -> status mapping:
+  //   - empty `namespace` / `id` -> 400 (enforced by externalIdParamsSchema
+  //     before the handler runs).
+  //   - well-formed pair with no matching asset -> 404 (existence not leaked).
+  app.get(
+    '/by-external-id/:namespace/:id',
+    {
+      schema: {
+        summary: 'Resolve an asset by an upstream external identifier',
+        description:
+          'Resolve a single asset by the `{ namespace, id }` external identifier ' +
+          'correlated to it (ADR-019). `namespace` labels the upstream system of ' +
+          'record; `id` is the opaque foreign key in that system. Returns the asset ' +
+          'when exactly one carries the pair, or 404 when none does.',
+        params: externalIdParamsSchema,
+        response: { 200: assetSchema, 400: errorSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { namespace, id } = request.params;
+      const asset = await repo.getByExternalId(namespace, id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(asset);
     }
   );
 
@@ -2984,6 +3203,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           404: errorSchema,
           409: errorSchema,
           422: errorSchema,
+          429: jobThroughputCapSchema,
           501: errorSchema,
           502: errorSchema,
           504: dependencyUnreachableSchema
@@ -3190,14 +3410,26 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       try {
         const result = await submitTranscode(
           {
-            workspaceId: DEPLOYMENT_CONTEXT,
+            // Key the scaler pool/queue/S3 endpoint by the EFFECTIVE stack this
+            // request routes to (issue #615), resolved from X-Stack-Name, not
+            // the fixed deployment context — so a transcode against a healthy
+            // named stack reaches that stack regardless of provisioning order.
+            workspaceId: await transcodeContext(request),
             sourceAssetId: asset.id,
             sourceObjectKey: source.objectKey,
             preset: request.body.profile,
             customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
             burnInSubtitlesFilter,
-            sourceBucket: opts.sourceBucket,
+            // Read the transcode INPUT from the resolved stack's per-stack
+            // source bucket (StackConfig.sourceBucket, param-store key
+            // `sourceBucket` per ADR-002; carried on WorkspaceConnections.
+            // sourceBucket) rather than the deployment-wide boot default
+            // (opts.sourceBucket from MINIO_SOURCE_BUCKET) — issue #639. The
+            // fallback preserves the env-override / single-stack deployments
+            // where request.connections is absent. Output/packaged resolution
+            // (resolvedOutputBucket) is issue #638.
+            sourceBucket: request.connections?.sourceBucket ?? opts.sourceBucket,
             outputBucket: resolvedOutputBucket
           },
           { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log }
@@ -3225,6 +3457,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             'transcode submit failed: stack dependency unreachable'
           );
           return reply.code(504).send(err.toResponseBody());
+        }
+        // Optional operator-configured job-throughput cap exceeded (issue #580):
+        // accepting this job would push the deployment past its outstanding-job
+        // ceiling. Return the documented machine-readable 429 + reason code so a
+        // client can back off, rather than silently queueing unboundedly.
+        if (isJobThroughputCapExceededError(err)) {
+          return reply.code(err.statusCode).send(err.toResponseBody());
         }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
@@ -3373,8 +3612,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // id OR name of a registered output-role destination
           // (/api/v1/export-destinations). Resolved server-side to the SAME
           // `destinationBucket` the relocation consumes. Mutually exclusive with
-          // the inline `destinationBucket` override (ambiguous -> 400).
-          destination: z.string().min(1).max(256).optional()
+          // both `externalBackend` and the inline `destinationBucket` override
+          // (more than one output destination -> 400).
+          destination: z.string().min(1).max(256).optional(),
+          // Optional reference (id OR name) to a registered external storage
+          // backend (issue #549, ADR-017 D4). When set, this execution's
+          // transcode/package OUTPUT is written to that backend's bucket instead
+          // of OSC-managed default storage, resolved to the backend's NON-SECRET
+          // coordinates at job time (credentials stay in OSC secrets). Mutually
+          // exclusive with `destination` and the inline `destinationBucket`
+          // override (all name an output destination).
+          externalBackend: z.string().trim().min(1).max(256).optional()
         }),
         response: {
           202: pipelineExecutionSchema,
@@ -3395,11 +3643,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      // Resolve a named export-destination reference OR the inline override into
-      // the single `destinationBucket` string the relocation consumes (issue
-      // #573). Rejects an ambiguous both-supplied request with 400.
+      // Resolve the requested output destination (at most one of the named
+      // export-destination reference #573, the external-backend reference #549,
+      // or the inline override) into the single `destinationBucket` string the
+      // relocation consumes. Done here (before startPipelineExecution) so a
+      // dangling/unconfigured/ambiguous reference is a clean synchronous error and
+      // the downstream path stays destination-only. Each path keeps its own error
+      // semantics (#573: 400/501; #549: 400/501/422).
       const resolvedDestination = await resolveJobDestination(
-        { destination: request.body.destination, destinationBucket: request.body.destinationBucket },
+        {
+          destination: request.body.destination,
+          externalBackend: request.body.externalBackend,
+          destinationBucket: request.body.destinationBucket
+        },
         reply
       );
       if (!resolvedDestination.ok) return reply; // error already sent

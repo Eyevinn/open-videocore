@@ -40,6 +40,13 @@ export type StorageRouterOptions = {
   // MinIO is not configured or WATCH_FOLDER_ENABLED is not 'true'; the
   // per-bucket watch-folder routes then report enabled:false / respond 501.
   watchFolder?: WatchFolderService;
+  // Late-bound accessor for the watch-folder service (issue #643). On Open
+  // Source Cloud the object-storage endpoint is resolved from the parameter
+  // store only after a stack is provisioned, so main.ts builds the watch-folder
+  // post-boot and exposes it here. When supplied it takes precedence over the
+  // boot-time `watchFolder` value, letting the per-bucket toggle reach the
+  // current instance with no restart.
+  getWatchFolder?: () => WatchFolderService | undefined;
   // External storage-backend registry (issue #547, ADR-017). When present, the
   // /backends routes register/list/remove external S3-compatible buckets:
   // non-secret coordinates persist to the parameter store and the access key +
@@ -178,7 +185,14 @@ const listQuerySchema = z.object({
 
 export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { stackResolver, watchFolder, storageBackendRegistry } = opts;
+  const { stackResolver, storageBackendRegistry } = opts;
+
+  // Resolve the CURRENT watch-folder service. The late-bound getter (issue #643)
+  // wins when supplied so a stack provisioned after boot is picked up with no
+  // restart; falls back to the boot-time value for callers/tests that pass the
+  // service directly.
+  const currentWatchFolder = (): WatchFolderService | undefined =>
+    opts.getWatchFolder?.() ?? opts.watchFolder;
 
   // The deployment's workspace (tenant) id under which backend records are
   // namespaced. Matches deriveWorkspaceId / STACK_CONFIG_NAMESPACE
@@ -357,6 +371,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
     },
     async (request, reply) => {
       const { bucket } = request.params;
+      const watchFolder = currentWatchFolder();
       const onThisBucket = watchFolder !== undefined && watchFolder.currentBucket() === bucket;
       return reply.code(200).send({
         enabled: onThisBucket,
@@ -381,6 +396,7 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
       }
     },
     async (request, reply) => {
+      const watchFolder = currentWatchFolder();
       if (!watchFolder) {
         return reply
           .code(501)

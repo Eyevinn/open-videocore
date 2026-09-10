@@ -94,6 +94,7 @@ import {
   classifyWatchFolderConfig,
   watchFolderMisconfiguredMessage
 } from './pipeline/watch-folder.js';
+import { healthRouter } from './routes/health.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
@@ -114,6 +115,7 @@ import {
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
+import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import {
   createJob,
   getJob,
@@ -242,11 +244,20 @@ const resolverHealth = new ResolverHealthSignal();
 // Health endpoints are intentionally unauthenticated for liveness probing. The
 // `resolver` field (issue #422) reports the aggregate degraded-resolution state
 // so a degraded-but-not-crashed instance is alertable from /health alone.
-app.get('/health', async () => ({
-  status: 'ok',
-  service: 'open-videocore-api',
-  resolver: resolverHealth.snapshot()
-}));
+//
+// The `ingest` field (issue #644) reports per-method ingest availability
+// (direct upload, URL pull, watch folder) so operators/integrators can verify
+// configuration state — in particular whether the opt-in watch-folder is
+// actually active — programmatically, without reading server logs. The signals
+// are read at request time (via closures) so the report always reflects the
+// current storage + watch-folder configuration.
+await app.register(healthRouter, {
+  resolverSnapshot: () => resolverHealth.snapshot(),
+  ingestSignals: () => ({
+    storageAvailable,
+    hasEnvMinio: Boolean(process.env['MINIO_URL'])
+  })
+});
 app.get('/healthz', async () => ({ status: 'ok' }));
 
 // OSC parameter store (issue #31, ADR-002). Persists provisioned stack
@@ -385,12 +396,21 @@ app.addHook('preHandler', async (request) => {
 });
 
 // Resolve the caller's principal + role once per request and attach it alongside
-// `request.connections` (ADR-018 decisions 1 & 5, issue #553). This is the
-// RESOLUTION half of the authorisation model: it reads the trusted `X-OVC-Role`
-// header, mirroring the trusted `x-stack-name` read above, and decorates the
-// request observably. It performs NO enforcement — no route is gated and no 403
-// is returned (deferred to #554). No existing endpoint behaviour changes.
-registerPrincipal(app);
+// `request.connections` (ADR-018 decisions 1 & 5, issues #553/#554). This reads
+// the `X-OVC-Role` header, mirroring the trusted `x-stack-name` read above, and
+// decorates request.principal. It is the TRUST BOUNDARY (ADR-018 decision 5):
+// unless the deployment opts into distinct per-caller roles, any client-supplied
+// `X-OVC-Role` is stripped here so it can never be spoofed downstream. Resolution
+// itself returns no 403 — the fail-closed 403 is the router-layer gate's job
+// (src/auth/authorize.ts, ADR-018 decision 2).
+//
+// OVC_TRUST_ROLE_HEADER=true tells the app the fronting layer (a reverse proxy or
+// self-deployed IdP, ADR-018 decision 1) sets the role on the already-gated path.
+// Absent/false ⇒ header stripped ⇒ admin default ⇒ identical to today's
+// authenticated-⇒-full-access behaviour (backwards compatible, decision 5).
+registerPrincipal(app, {
+  trustRoleHeader: process.env['OVC_TRUST_ROLE_HEADER'] === 'true'
+});
 
 const operationStore = new OperationStore();
 
@@ -416,6 +436,13 @@ await app.register(provisionRouter, {
     stackResolver.invalidate();
     void reconcileScaler().catch((err) =>
       app.log.warn({ err }, 'encore-scaler: reconcile after stack change failed')
+    );
+    // Wire (or rewire) the watch-folder from the just-provisioned stack's
+    // parameter-store-backed object storage (issue #643). On a fresh OSC
+    // deployment the storage endpoint only becomes known here, so this is the
+    // moment watch-folder ingest can first come online — with no restart.
+    void wireWatchFolderFromStack().catch((err) =>
+      app.log.warn({ err }, 'watch-folder: wire after stack change failed')
     );
   },
   // Late-bound accessor for the scaler registry. scalerRegistry is a
@@ -612,6 +639,15 @@ const clipRunner: ClipRunner | undefined = storageAvailable
 // Requires a Redis connection (resolved from the parameter store after provisioning).
 // When Redis is unavailable transcoding degrades to 501.
 const encoreMaxInstances = parseInt(process.env['ENCORE_MAX_INSTANCES'] || '3', 10);
+// Optional operator-configured job-throughput cap (issue #580, ADR-020). Caps the
+// number of OUTSTANDING transcode/package jobs (pending in the scaler queue +
+// being dispatched) the deployment will admit at once; an over-limit submission
+// is rejected with a 429 `job_throughput_cap_exceeded` rather than growing an
+// unbounded backlog. This is a SUBMISSION-admission guardrail layered on top of
+// the scaler's existing `maxInstances` pool ceiling (which bounds live compute
+// cost) — it reuses the scaler's own Valkey queue state, NOT a second counter.
+// Unset/0/invalid => no cap (opt-in; submission behaviour unchanged).
+const encoreMaxQueuedJobs = resolveJobThroughputCap(process.env);
 const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || String(5 * 60 * 1000), 10);
 // Bounded wait (issue #463) for the outbound TLS-trust probe to a freshly
 // spawned instance's per-instance callback-listener ingress before that instance
@@ -797,11 +833,50 @@ function activateScaler(redisUrl: string): void {
   };
 
   scalerRegistry = new WorkspaceEncoreScalerRegistry({
+    // Process-global fallback connection (env-override single-stack / tests):
+    // used only when resolveRedisUrl below cannot resolve a per-stack URL.
     redis,
     redisUrl,
+    // Resolve each stack's OWN Valkey URL from the parameter store at loop
+    // creation time (issue #615), mirroring resolveS3Config's per-stack MinIO
+    // resolution below. Each provisioned stack has its own valkey-io-valkey
+    // instance (routes/provision.ts step 3) and its own StackConfig.redisUrl
+    // (services/param-store.ts). `stackKey` is the EFFECTIVE stack identity the
+    // transcode request resolved to (decoded from the encoreJobId contextId), so
+    // we load that stack's config by name directly and return its redisUrl.
+    // Only when that exact stack has no stored config (e.g. the fixed
+    // DEPLOYMENT_CONTEXT of a single-stack env-override deployment, which is not
+    // itself a stack name) do we fall back to the first-provisioned stack — so a
+    // named stack's queue is never mis-routed to the first-provisioned Valkey,
+    // while single-stack behaviour is unchanged. Returns undefined when nothing
+    // resolves, and the registry then reuses the process-global connection.
+    resolveRedisUrl: async (stackKey: string): Promise<string | undefined> => {
+      if (!paramStore) return undefined;
+      try {
+        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
+        if (!config) {
+          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+          if (names.length > 0) {
+            config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+          }
+        }
+        return config?.redisUrl && config.redisUrl.length > 0 ? config.redisUrl : undefined;
+      } catch (err) {
+        app.log.warn({ err, stackKey }, 'encore-scaler: failed to resolve per-stack Valkey URL from parameter store');
+        return undefined;
+      }
+    },
+    // Open a Valkey connection for a resolved per-stack URL (issue #615). Same
+    // construction as the process-global connection in activateScaler above so
+    // lifecycle semantics (lazyConnect, unbounded per-request retries) match.
+    makeRedis: (url: string) => new IORedis(url, { lazyConnect: true, maxRetriesPerRequest: null }),
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
+    // Optional opt-in job-throughput cap (issue #580, ADR-020). Forwarded to
+    // every per-workspace scaler client; the submit path rejects over-limit
+    // submissions with a 429 `job_throughput_cap_exceeded`. Unset => no cap.
+    maxQueuedJobs: encoreMaxQueuedJobs,
     idleTimeoutMs: encoreIdleTimeoutMs,
     // Gate first-job dispatch on confirmed outbound callback-listener TLS trust
     // (issue #463): bounded wait before a freshly spawned instance is eligible.
@@ -817,14 +892,19 @@ function activateScaler(redisUrl: string): void {
       accessKeyId: encoreS3AccessKey,
       secretAccessKey: encoreS3SecretKey
     } : undefined,
-    // Resolve each workspace's MinIO endpoint from the parameter store at loop
-    // creation time so no static ENCORE_S3_ENDPOINT env var is required on OSC.
-    // Mirrors WorkspaceStackResolver: address the stack by workspaceId, falling
-    // back to the first provisioned stack for the namespace.
-    resolveS3Config: async (workspaceId: string) => {
+    // Resolve the MinIO endpoint from the parameter store at loop creation time
+    // so no static ENCORE_S3_ENDPOINT env var is required on OSC. The scaler's
+    // pool key is the EFFECTIVE stack identity the transcode request resolved to
+    // (issue #615 — see assets router transcodeContext), so `stackKey` IS the
+    // named stack: load its config by name directly. Only when that exact stack
+    // has no stored config (e.g. the fixed DEPLOYMENT_CONTEXT of a single-stack
+    // env-override deployment, which is not itself a stack name) do we fall back
+    // to the first provisioned stack — so single-stack behaviour is unchanged
+    // while a named stack is never mis-resolved to the first-provisioned one.
+    resolveS3Config: async (stackKey: string) => {
       if (!paramStore || !encoreS3SecretKey) return undefined;
       try {
-        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, workspaceId);
+        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
         if (!config) {
           const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
           if (names.length > 0) {
@@ -839,7 +919,7 @@ function activateScaler(redisUrl: string): void {
           };
         }
       } catch (err) {
-        app.log.warn({ err, workspaceId }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
+        app.log.warn({ err, stackKey }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
       }
       return undefined;
     },
@@ -1306,6 +1386,14 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // reference a registered external backend as the source (ADR-017 D4).
   storageBackendRegistry,
   encore,
+  // Resolve the EFFECTIVE stack identity a transcode request routes to (issue
+  // #615) so the scaler pool / Valkey queue / MinIO endpoint are keyed per
+  // request by the named stack rather than the first-provisioned one. Delegates
+  // to the same per-stack resolver the preHandler uses for storage/DB, reading
+  // the request's X-Stack-Name; undefined (no stack / store unconfigured) makes
+  // the transcode path fall back to the fixed deployment context.
+  resolveStackContext: (requestedStackName?: string) =>
+    stackResolver.resolveStackName(requestedStackName),
   sourceBucket,
   outputBucket,
   thumbnailExtractor,
@@ -1353,6 +1441,13 @@ const encoreCompatRouterOptions: Parameters<typeof encoreCompatRouter>[1] & { pr
   repository: assetRepository,
   jobRepository,
   encore,
+  // Resolve the EFFECTIVE stack a compat submit routes to (issue #615) so this
+  // sibling processing route keys the scaler pool / Valkey queue / MinIO endpoint
+  // per request by the named stack, exactly like POST /assets/:id/transcode —
+  // rather than pinning to the fixed deployment context (first-provisioned
+  // stack). Delegates to the same per-stack resolver reading X-Stack-Name.
+  resolveStackContext: (requestedStackName?: string) =>
+    stackResolver.resolveStackName(requestedStackName),
   sourceBucket,
   outputBucket
 };
@@ -1435,22 +1530,35 @@ await app.register(assetUploadRouter, {
   onObjectStored
 });
 
-// Watch-folder ingest (issue #16). Opt-in via WATCH_FOLDER_ENABLED=true. It is
-// a global background service watching a single source bucket, so it needs a
-// concrete MinIO client up front — only available via the explicit env override
-// (single global MinIO). In the provisioned multi-stack model there is no single
-// bucket to watch, so the watch-folder is skipped (the API upload + URL-pull
-// paths still cover ingest).
-// Fail-loud config validation (issue #642). Previously, if an operator turned
-// the feature ON (WATCH_FOLDER_ENABLED=true) but the required object-storage
-// connection variable (MINIO_URL) was absent — the exact situation on Open
-// Source Cloud, where that variable is never set — `envMinioClient` was
-// undefined and `watchFolder` silently became undefined: no ingest, no error.
-// We now CLASSIFY the config and, when the feature is requested but its storage
-// dependency is missing, log a clear, actionable error naming the missing
-// variable and the affected ingest method rather than silently no-op'ing. We do
-// NOT provision the endpoint (that is #643) and do NOT change the status API
-// surface (that is #644) — scope here is fail-loud only.
+// Watch-folder ingest (issue #16, #642, #643). Opt-in via
+// WATCH_FOLDER_ENABLED=true. It is a background service watching a single source
+// bucket, so it needs a concrete MinIO client + bucket. Two sources, preferred
+// in order:
+//   1. Explicit env override (MINIO_URL) — local dev / ops: the client is known
+//      at boot and never changes.
+//   2. Platform parameter store (Open Source Cloud) — the object-storage
+//      endpoint, access key, and secret are provisioned into the running
+//      instance via the OSC parameter store (ADR-001 Day-1 deploy plan, steps
+//      2-3) and surface on the resolved stack's `storageClient` / `sourceBucket`
+//      (services/workspace-stack.ts:buildConnectionsFromStack). The stack does
+//      NOT exist at boot on a fresh OSC deployment — it is created by
+//      POST /api/v1/provision — so we (re)wire the watch-folder from the
+//      resolved stack both now (if a stack already exists) and again from
+//      onStackChange the moment one is provisioned, mirroring activateScaler.
+//      This closes the gap in issue #643/#636 where the watch-folder was only
+//      ever built from MINIO_URL and therefore silently did nothing on OSC.
+//
+// Fail-loud config validation (issue #642): we CLASSIFY the config first and,
+// when the feature is requested (WATCH_FOLDER_ENABLED=true) but its storage
+// dependency is missing at boot (no env MinIO and no resolvable stack storage),
+// log a clear, actionable error naming the missing variable and the affected
+// ingest method rather than silently no-op'ing. A 'misconfigured' classification
+// does not prevent the parameter-store rewire path below (#643) from later
+// wiring the watch-folder once a stack is provisioned.
+//
+// `watchFolder` is a mutable binding rebindable by wireWatchFolderFromStack();
+// admin + storage routers read it late via getWatchFolder so a post-boot rewire
+// takes effect with no restart.
 const watchFolderConfigState = classifyWatchFolderConfig(
   watchFolderEnabled(),
   storageAvailable
@@ -1458,8 +1566,8 @@ const watchFolderConfigState = classifyWatchFolderConfig(
 if (watchFolderConfigState === 'misconfigured') {
   app.log.error({ ingestMethod: 'watch-folder' }, watchFolderMisconfiguredMessage());
 }
-const watchFolder =
-  watchFolderConfigState === 'ready' && envMinioClient
+let watchFolder: WatchFolderService | undefined =
+  envMinioClient && watchFolderEnabled()
     ? new WatchFolderService({
         client: envMinioClient,
         bucket: sourceBucket,
@@ -1469,9 +1577,65 @@ const watchFolder =
       })
     : undefined;
 
+// True when the watch-folder is wired from the explicit env override. In that
+// case the client is fixed for the process lifetime and we must NOT let the
+// parameter-store path clobber it (the env override wins for ALL config, see
+// workspace-stack.ts:buildEnvConnections).
+const watchFolderFromEnv = watchFolder !== undefined;
+
+// (Re)build the watch-folder from the resolved stack's parameter-store-backed
+// storage connection (issue #643). No-op unless WATCH_FOLDER_ENABLED=true and
+// we are NOT already wired from the env override. Idempotent: if a running
+// watch-folder is already pointed at the resolved bucket on the same endpoint we
+// leave it running; otherwise we (re)create it against the current storage
+// client + source bucket and start it. Never throws — a resolve failure leaves
+// the watch-folder as-is and is logged.
+async function wireWatchFolderFromStack(): Promise<void> {
+  if (!watchFolderEnabled() || watchFolderFromEnv) return;
+  try {
+    const conns = await stackResolver.resolve();
+    const client = conns.storageClient;
+    if (!client) {
+      // No object storage on the resolved stack yet (no stack provisioned, or a
+      // partial/invalid one). Nothing to watch; leave any prior instance be.
+      return;
+    }
+    const bucket = conns.sourceBucket;
+    // Already wired against this bucket and running: nothing to do. (The stack's
+    // storage endpoint is stack-invariant for a given deployment, so an
+    // unchanged bucket + a live service means the wiring still holds.)
+    if (watchFolder && watchFolder.currentBucket() === bucket && watchFolder.isRunning()) {
+      return;
+    }
+    // Rebuild against the freshly resolved client/bucket. Stop any stale prior
+    // instance first so its notification listener + poll timer are detached.
+    watchFolder?.stop();
+    watchFolder = new WatchFolderService({
+      client,
+      bucket,
+      repository: assetRepository,
+      log: app.log,
+      onObjectStored
+    });
+    watchFolder.start();
+    app.log.info(
+      { bucket, source: 'parameter-store' },
+      'watch-folder ingest wired from provisioned stack storage'
+    );
+  } catch (err) {
+    app.log.warn({ err }, 'watch-folder: failed to wire from provisioned stack storage');
+  }
+}
+
 // Operational status (issue #16). Unauthenticated; reports background service
-// state without exposing workspace data.
-await app.register(adminRouter, { prefix: '/api/v1/admin', watchFolder });
+// state without exposing workspace data. The getWatchFolder accessor (issue
+// #643) lets these routes reach a watch-folder rewired after boot from the
+// parameter store, not just the boot-time env-override instance.
+await app.register(adminRouter, {
+  prefix: '/api/v1/admin',
+  watchFolder,
+  getWatchFolder: () => watchFolder
+});
 
 // Encore auto-scaler status (ADR-006). Unauthenticated read-only introspection
 // of the per-workspace scaler pool for the ops UI. `redis` is undefined when the
@@ -1595,6 +1759,10 @@ await app.register(storageRouter, {
   prefix: '/api/v1/storage',
   stackResolver,
   watchFolder,
+  // Late-bound accessor (issue #643): the per-bucket watch-folder toggle reaches
+  // an instance rewired after boot from the parameter store, not just the
+  // boot-time env-override instance.
+  getWatchFolder: () => watchFolder,
   storageBackendRegistry
 });
 
@@ -1672,6 +1840,18 @@ void checkProfilesIndexReachable({
 }).catch((err) => app.log.error({ err }, 'profiles-index reachability check errored unexpectedly'));
 
 // Start watch-folder ingest only after the server is listening and every router
-// is registered, so a detected object can flow through the full pipeline. The
-// service silently no-ops when not configured/enabled.
+// is registered, so a detected object can flow through the full pipeline.
+//
+// Env-override path (MINIO_URL): the instance was built at boot; start it now.
+// The service silently no-ops when not configured/enabled.
 watchFolder?.start();
+
+// Parameter-store path (Open Source Cloud, issue #643): if a stack was already
+// provisioned in a previous run (self-discovered from the parameter store),
+// wire + start the watch-folder against its object storage now. On a fresh OSC
+// deployment no stack exists yet, so this is a no-op and the watch-folder comes
+// online later from onStackChange the moment the first stack is provisioned.
+// Skipped entirely when the env-override path already owns the watch-folder.
+if (!watchFolderFromEnv) {
+  await wireWatchFolderFromStack();
+}

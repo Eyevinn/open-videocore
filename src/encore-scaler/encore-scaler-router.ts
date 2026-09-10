@@ -19,12 +19,20 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import type { Redis } from 'ioredis';
 import { keys, type QueuedJob } from './types.js';
+import {
+  assertUnderJobThroughputCap,
+  isJobThroughputCapExceededError
+} from './job-throughput-cap.js';
 
 export type EncoreScalerRouterOptions = {
   redis: Redis;
   workspaceId: string;
   // Resolves a fresh OSC token for proxied GET/DELETE calls to instances.
   getToken: () => Promise<string>;
+  // Optional operator-configured job-throughput cap (issue #580): max number of
+  // OUTSTANDING jobs (queued + being dispatched) admitted at once. Unset => no
+  // cap (opt-in; behaviour unchanged). See src/encore-scaler/job-throughput-cap.ts.
+  maxQueuedJobs?: number;
 };
 
 // The raw Encore job payload. externalId is our correlation key and is
@@ -50,6 +58,19 @@ export const encoreScalerRouter: FastifyPluginAsync<EncoreScalerRouterOptions> =
     async (request, reply) => {
       const payload = request.body as Record<string, unknown> & { externalId: string };
       const jobId = payload.externalId;
+
+      // Optional operator-configured job-throughput cap (issue #580): reject an
+      // over-limit submission with a machine-readable 429 + reason code rather
+      // than growing an unbounded backlog. Checked against the scaler's own
+      // Valkey queue/inflight state (single source of truth). No-op when unset.
+      try {
+        await assertUnderJobThroughputCap(redis, workspaceId, opts.maxQueuedJobs);
+      } catch (err) {
+        if (isJobThroughputCapExceededError(err)) {
+          return reply.code(err.statusCode).send(err.toResponseBody());
+        }
+        throw err;
+      }
 
       const job: QueuedJob = {
         jobId,

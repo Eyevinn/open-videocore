@@ -249,6 +249,111 @@ describe('profile bootstrap (issue #84)', () => {
     expect(result.builtinSeeded).toBeGreaterThanOrEqual(1);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  // issue #662: a store holding ONLY built-in profiles must NOT report skipped,
+  // because the built-ins are seeded on every run and the old total-count guard
+  // tripped on them forever, permanently suppressing the remote-index seed.
+  it('does not skip when the store holds only built-in profiles (issue #662)', async () => {
+    const repo = new InMemoryProfileRepository();
+    // Pre-seed exactly the built-in profile, as a prior startup would have.
+    await repo.create({ name: LOUDNORM_PROFILE_NAME, yaml: 'name: builtin\n' });
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith('/profiles.yml')) {
+        return new Response('program: program.yml\n', { status: 200 });
+      }
+      if (url.endsWith('/program.yml')) {
+        return new Response('name: program\n', { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await bootstrapProfiles({
+      repository: repo,
+      indexUrl: 'https://example.test/dir/profiles.yml'
+    });
+
+    // The remote index is fetched (guard did not trip) and the remote profile is
+    // seeded; skipped stays false because only built-ins were present.
+    expect(result.skipped).toBe(false);
+    expect(result.seeded).toBe(1);
+    expect(fetchMock).toHaveBeenCalled();
+    const program = await repo.get('program');
+    expect(program?.yaml).toBe('name: program\n');
+  });
+
+  // issue #662 acceptance criterion: fresh store, remote fetch fails, restart ->
+  // the remote index fetch is attempted again (not permanently skipped).
+  it('retries the remote index on the next startup after a failed fetch (issue #662)', async () => {
+    const repo = new InMemoryProfileRepository();
+
+    // First startup: the remote index responds non-OK, so bootstrapProfiles
+    // rejects (as it does on `main`, caught + logged at startup). Built-ins are
+    // still seeded before the failure, leaving a non-empty store.
+    const failingFetch = vi.fn(async () => new Response('down', { status: 503 }));
+    vi.stubGlobal('fetch', failingFetch);
+    await expect(
+      bootstrapProfiles({ repository: repo, indexUrl: 'https://example.test/dir/profiles.yml' })
+    ).rejects.toThrow();
+    expect(failingFetch).toHaveBeenCalled();
+    // The store now holds only built-ins (the failure happened before any remote
+    // profile could be stored).
+    const afterFail = await repo.list();
+    expect(afterFail.every((p) => p.name === LOUDNORM_PROFILE_NAME)).toBe(true);
+    expect(afterFail.length).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+
+    // Second startup (restart): the remote index now succeeds. The guard must NOT
+    // treat the built-ins from the first run as "profiles already exist", so the
+    // fetch is retried and the remote profile is seeded.
+    const okFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith('/profiles.yml')) {
+        return new Response('program: program.yml\n', { status: 200 });
+      }
+      if (url.endsWith('/program.yml')) {
+        return new Response('name: program\n', { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', okFetch);
+
+    const result = await bootstrapProfiles({
+      repository: repo,
+      indexUrl: 'https://example.test/dir/profiles.yml'
+    });
+
+    expect(okFetch).toHaveBeenCalled();
+    expect(result.skipped).toBe(false);
+    expect(result.seeded).toBe(1);
+    expect((await repo.get('program'))?.yaml).toBe('name: program\n');
+  });
+
+  // issue #662: the skip path must emit a log line stating whether the remote
+  // index has ever been ingested (i.e. non-built-in profiles are present).
+  it('logs the skip path with remote-index-ingested state (issue #662)', async () => {
+    const repo = new InMemoryProfileRepository();
+    // A real (non-built-in) profile makes the guard legitimately skip.
+    await repo.create({ name: 'program', yaml: 'name: program\n' });
+    vi.stubGlobal('fetch', vi.fn());
+    const info = vi.fn();
+    const log = { info, warn: vi.fn() };
+
+    const result = await bootstrapProfiles({
+      repository: repo,
+      indexUrl: 'https://example.test/profiles.yml',
+      log
+    });
+
+    expect(result.skipped).toBe(true);
+    const skipLog = info.mock.calls.find(
+      ([, msg]) => typeof msg === 'string' && msg.includes('skipping remote index seed')
+    );
+    expect(skipLog).toBeDefined();
+    expect(skipLog?.[0]).toMatchObject({ remoteIndexIngested: true });
+    expect((skipLog?.[0] as { nonBuiltinProfiles: number }).nonBuiltinProfiles).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe('built-in loudness-normalisation profile (issue #385)', () => {

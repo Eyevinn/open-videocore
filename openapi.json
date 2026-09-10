@@ -20,7 +20,134 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Default Response"
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "service": {
+                      "type": "string"
+                    },
+                    "resolver": {
+                      "type": "object",
+                      "properties": {
+                        "degraded": {
+                          "type": "boolean"
+                        },
+                        "mode": {
+                          "type": "string",
+                          "enum": [
+                            "none",
+                            "no-storage",
+                            "stale-last-known-good"
+                          ]
+                        },
+                        "noStorageFallbackTotal": {
+                          "type": "number"
+                        },
+                        "staleFallbackTotal": {
+                          "type": "number"
+                        },
+                        "lastDegradedAt": {
+                          "type": "number",
+                          "nullable": true
+                        }
+                      },
+                      "required": [
+                        "degraded",
+                        "mode",
+                        "noStorageFallbackTotal",
+                        "staleFallbackTotal",
+                        "lastDegradedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "ingest": {
+                      "type": "object",
+                      "properties": {
+                        "directUpload": {
+                          "type": "object",
+                          "properties": {
+                            "available": {
+                              "type": "boolean"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "enum": [
+                                "no-storage-endpoint",
+                                "not-enabled",
+                                "missing-storage-endpoint"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "available"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "urlPull": {
+                          "type": "object",
+                          "properties": {
+                            "available": {
+                              "type": "boolean"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "enum": [
+                                "no-storage-endpoint",
+                                "not-enabled",
+                                "missing-storage-endpoint"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "available"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "watchFolder": {
+                          "type": "object",
+                          "properties": {
+                            "available": {
+                              "type": "boolean"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "enum": [
+                                "no-storage-endpoint",
+                                "not-enabled",
+                                "missing-storage-endpoint"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "available"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "directUpload",
+                        "urlPull",
+                        "watchFolder"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "service",
+                    "resolver",
+                    "ingest"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
         }
       }
@@ -3905,6 +4032,552 @@
         }
       }
     },
+    "/api/v1/assets/by-external-id/{namespace}/{id}": {
+      "get": {
+        "summary": "Resolve an asset by an upstream external identifier",
+        "description": "Resolve a single asset by the `{ namespace, id }` external identifier correlated to it (ADR-019). `namespace` labels the upstream system of record; `id` is the opaque foreign key in that system. Returns the asset when exactly one carries the pair, or 404 when none does.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "description": "Upstream system-of-record label the external id belongs to (e.g. `ingest-mam`, `rights-registry`). Required, non-empty."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "description": "Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field."
+                    },
+                    "slug": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "uploading",
+                        "processing",
+                        "ready",
+                        "failed",
+                        "archived"
+                      ]
+                    },
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ]
+                    },
+                    "deleteLock": {
+                      "type": "object",
+                      "properties": {
+                        "locked": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "lockedAt": {
+                          "type": "string"
+                        },
+                        "lockedBy": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "locked",
+                        "lockedAt"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "storageTiering": {
+                      "type": "object",
+                      "properties": {
+                        "tiers": {
+                          "type": "object",
+                          "required": [
+                            "source",
+                            "renditions",
+                            "packaged",
+                            "subtitles",
+                            "thumbnails"
+                          ],
+                          "properties": {
+                            "source": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "renditions": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "packaged": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "subtitles": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            },
+                            "thumbnails": {
+                              "type": "string",
+                              "enum": [
+                                "hot",
+                                "archive"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Physical storage tier (`hot` | `archive`) per byte class (source, renditions, packaged, subtitles, thumbnails). Orthogonal to lifecycle `status`; `archive` is a byte location, never the `archived` status (ADR-019 D1/D3/D6). Defaults to every class `hot`."
+                        },
+                        "rehydrating": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "byteClass": {
+                                "type": "string",
+                                "enum": [
+                                  "source",
+                                  "renditions",
+                                  "packaged",
+                                  "subtitles",
+                                  "thumbnails"
+                                ],
+                                "description": "The byte class being restored from archive back to hot."
+                              },
+                              "startedAt": {
+                                "type": "string",
+                                "description": "ISO timestamp the restore was requested/started."
+                              }
+                            },
+                            "required": [
+                              "byteClass",
+                              "startedAt"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "description": "Byte classes with an archive->hot restore currently in flight, each with its started-at timestamp. Empty when nothing is rehydrating (ADR-019 D4). Representation only \u2014 this API does not execute the restore."
+                        }
+                      },
+                      "required": [
+                        "tiers",
+                        "rehydrating"
+                      ],
+                      "additionalProperties": false,
+                      "default": {
+                        "tiers": {
+                          "source": "hot",
+                          "renditions": "hot",
+                          "packaged": "hot",
+                          "subtitles": "hot",
+                          "thumbnails": "hot"
+                        },
+                        "rehydrating": []
+                      }
+                    },
+                    "parentId": {
+                      "type": "string"
+                    },
+                    "versionOfAssetId": {
+                      "type": "string"
+                    },
+                    "versionGroupId": {
+                      "type": "string"
+                    },
+                    "objectKey": {
+                      "type": "string"
+                    },
+                    "statusHistory": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "at": {
+                            "type": "string"
+                          },
+                          "from": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ],
+                            "nullable": true
+                          },
+                          "to": {
+                            "type": "string",
+                            "enum": [
+                              "uploading",
+                              "processing",
+                              "ready",
+                              "failed",
+                              "archived"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "at",
+                          "from",
+                          "to"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "technicalMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "codec": {
+                          "type": "string"
+                        },
+                        "width": {
+                          "type": "number"
+                        },
+                        "height": {
+                          "type": "number"
+                        },
+                        "durationSeconds": {
+                          "type": "number"
+                        },
+                        "bitrateBps": {
+                          "type": "number"
+                        },
+                        "containerFormat": {
+                          "type": "string"
+                        },
+                        "audioTracks": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "index": {
+                                "type": "number"
+                              },
+                              "codec": {
+                                "type": "string"
+                              },
+                              "channels": {
+                                "type": "number"
+                              },
+                              "sampleRateHz": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "index",
+                              "codec",
+                              "channels",
+                              "sampleRateHz"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "extractedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "codec",
+                        "width",
+                        "height",
+                        "durationSeconds",
+                        "bitrateBps",
+                        "containerFormat",
+                        "audioTracks",
+                        "extractedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "technicalMetadataError": {
+                      "type": "string"
+                    },
+                    "sceneMetadata": {
+                      "type": "object",
+                      "properties": {
+                        "boundaries": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "startSeconds": {
+                                "type": "number"
+                              },
+                              "endSeconds": {
+                                "type": "number"
+                              },
+                              "keyframeSeconds": {
+                                "type": "number"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "sceneCount": {
+                          "type": "number"
+                        },
+                        "detectedAt": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "boundaries",
+                        "sceneCount",
+                        "detectedAt"
+                      ],
+                      "additionalProperties": false,
+                      "nullable": true
+                    },
+                    "sceneDetectionError": {
+                      "type": "string"
+                    },
+                    "manifestUrls": {
+                      "type": "object",
+                      "properties": {
+                        "hls": {
+                          "type": "string"
+                        },
+                        "dash": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "packagingError": {
+                      "type": "string"
+                    },
+                    "renditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "label",
+                          "width",
+                          "height",
+                          "objectKey"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "thumbnails": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "additionalProperties": {}
+                    },
+                    "audioTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "channels": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "subtitleTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          },
+                          "format": {
+                            "type": "string",
+                            "enum": [
+                              "vtt",
+                              "srt",
+                              "ttml"
+                            ]
+                          },
+                          "objectKey": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "default": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "language",
+                          "format"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "createdAt": {
+                      "type": "string"
+                    },
+                    "updatedAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "status",
+                    "statusHistory",
+                    "createdAt",
+                    "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/assets/{id}": {
       "get": {
         "parameters": [
@@ -6427,6 +7100,40 @@
               }
             }
           },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "job_throughput_cap_exceeded"
+                      ]
+                    },
+                    "cap": {
+                      "type": "number"
+                    },
+                    "outstanding": {
+                      "type": "number"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cap",
+                    "outstanding",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "501": {
             "description": "Default Response",
             "content": {
@@ -6760,6 +7467,11 @@
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 1024
+                  },
+                  "externalBackend": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
                   }
                 },
                 "required": [
@@ -6874,6 +7586,28 @@
                     "steps",
                     "createdAt",
                     "updatedAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -14309,6 +15043,40 @@
                     "id",
                     "externalId",
                     "status"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "job_throughput_cap_exceeded"
+                      ]
+                    },
+                    "cap": {
+                      "type": "number"
+                    },
+                    "outstanding": {
+                      "type": "number"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cap",
+                    "outstanding",
+                    "message"
                   ],
                   "additionalProperties": false
                 }

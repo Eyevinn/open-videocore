@@ -273,6 +273,18 @@ export type ProvenanceEntry = {
   detail?: string;
 };
 
+// A namespaced correlation to an upstream system of record (issue #575,
+// ADR-019). `{ namespace, id }` foreign key. Modelled as a SET on the asset
+// (array), not a scalar, so an asset can be correlated with more than one
+// system at once. System-owned mapping data (ADR-005 administrative namespace).
+// The runtime Zod validation lives in asset-document.ts (ExternalIdentifierSchema).
+export type ExternalIdentifier = {
+  // Upstream system label, e.g. `ingest-mam` or `rights-registry`.
+  namespace: string;
+  // Foreign key value in that system (opaque string).
+  id: string;
+};
+
 // How an asset entered the system (ADR-005 administrative.source.method).
 export const ASSET_SOURCE_METHODS = ['upload', 'url-pull', 'watch-folder'] as const;
 export type AssetSourceMethod = (typeof ASSET_SOURCE_METHODS)[number];
@@ -547,6 +559,13 @@ export type Asset = {
   originUri?: string;
   // Append-only provenance log (ADR-005 / issue #53).
   provenance?: ProvenanceEntry[];
+  // Namespaced external identifiers (issue #575, ADR-019): a SET of
+  // { namespace, id } foreign keys correlating this asset with one or more
+  // UPSTREAM systems of record. System-owned mapping data, so it maps onto the
+  // ADR-005 `administrative` namespace (see asset-document.ts), NOT the
+  // editorial `descriptive` one. Optional/additive: absent on assets/documents
+  // written before #575. Lookup (#576) and uniqueness (#577) are out of scope.
+  externalIdentifiers?: ExternalIdentifier[];
   // Collection memberships projected onto the asset (ADR-005 structural).
   collections?: string[];
   // TAMS time-addressable bridge addressing (issue #165, epic #116). Machine/
@@ -790,6 +809,17 @@ export interface AssetRepository {
   // asset in this workspace carries the slug. Used by the `/:id` route to accept
   // a slug in place of the ULID id.
   getBySlug(slug: string): Promise<Asset | undefined>;
+  // Resolve an asset by an upstream external identifier (issue #576, ADR-019),
+  // scoped to the repository's (structurally isolated) workspace. Matches the
+  // `{ namespace, id }` entry in `administrative.externalIdentifiers` (the set
+  // modelled by #575). Returns undefined when no asset in this workspace carries
+  // the pair. Used by the `/by-external-id/:namespace/:id` resolver route.
+  //
+  // Index-backed, NOT a linear scan: the CouchDB implementation pushes the pair
+  // down as a Mango `$elemMatch` selector over the persisted array (mirroring the
+  // TAMS flow-id push-down in couch-search-repo.ts), so CouchDB filters within
+  // the tenant database rather than the caller paging the whole asset set.
+  getByExternalId(namespace: string, id: string): Promise<Asset | undefined>;
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
@@ -1263,6 +1293,21 @@ export class InMemoryAssetRepository implements AssetRepository {
   async getBySlug(slug: string): Promise<Asset | undefined> {
     for (const a of this.store.values()) {
       if (a.slug === slug) {
+        return { ...a };
+      }
+    }
+    return undefined;
+  }
+
+  // Resolve by external identifier (issue #576, ADR-019). Scans this store, which
+  // holds exactly one tenant's assets, so the lookup is inherently
+  // workspace-scoped — mirroring getBySlug's isolation. The CouchDB backend does
+  // the equivalent match with an indexed Mango `$elemMatch` push-down; here the
+  // in-memory backend walks the (small, dev/test) store and returns the first
+  // asset carrying the `{ namespace, id }` pair.
+  async getByExternalId(namespace: string, id: string): Promise<Asset | undefined> {
+    for (const a of this.store.values()) {
+      if (a.externalIdentifiers?.some((e) => e.namespace === namespace && e.id === id)) {
         return { ...a };
       }
     }
