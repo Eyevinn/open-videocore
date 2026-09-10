@@ -18,6 +18,7 @@
 import type { AssetRepository } from '../data/asset-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
 import { SourceTooLargeError, type WorkspaceStorage } from '../data/storage.js';
+import { QuotaExceededError, type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
   assertPublicHost,
   openSource,
@@ -57,7 +58,11 @@ function defaultSleep(ms: number): Promise<void> {
 }
 
 function isPermanent(err: unknown): boolean {
-  return err instanceof SourceTooLargeError || err instanceof SourceValidationError;
+  return (
+    err instanceof SourceTooLargeError ||
+    err instanceof SourceValidationError ||
+    err instanceof QuotaExceededError
+  );
 }
 
 export type PullParams = {
@@ -76,6 +81,13 @@ export async function runPull(
     jobs: JobRepository;
     assets: AssetRepository;
     storage: WorkspaceStorage;
+    // Operator-configured total storage cap (issue #579, ADR-020). When
+    // provided, the worker reserves quota headroom once the remote source's
+    // Content-Length is known (openSource().totalBytes) and commits the TRUE
+    // transferred size on success / releases it on failure. An over-cap pull is
+    // a PERMANENT failure (QuotaExceededError), recorded on the job without
+    // retry. Absent => no cap, behaviour unchanged (opt-in).
+    quota?: StorageQuotaGuard;
   } & PullDeps
 ): Promise<void> {
   const { jobId, assetId, objectKey, sourceUrl } = params;
@@ -88,12 +100,20 @@ export async function runPull(
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     await deps.jobs.update(jobId, { attempts: attempt });
+    let reservation;
     try {
       const parsed = parseSource(sourceUrl);
       if (parsed.scheme === 'http' || parsed.scheme === 'https') {
         await assertPublicHost(parsed.url.hostname);
       }
       const opened = await openSource(parsed, deps);
+
+      // Reserve quota headroom sized by the remote Content-Length (when known)
+      // BEFORE streaming bytes into MinIO (issue #579). Over-cap throws
+      // QuotaExceededError, which isPermanent() treats as a non-retryable
+      // terminal failure below. A missing Content-Length reserves 0 and relies
+      // on the commit-time true size + reconciliation.
+      reservation = deps.quota ? await deps.quota.admit(opened.totalBytes ?? 0) : undefined;
 
       let lastWrite = 0;
       const { bytesTransferred } = await deps.storage.putStream(objectKey, opened.stream, {
@@ -112,6 +132,9 @@ export async function runPull(
         }
       });
 
+      // Commit the TRUE transferred size to the running total (issue #579).
+      await reservation?.commit(bytesTransferred);
+
       // Success: finalize job at 100% and advance the asset to processing.
       await deps.jobs.update(jobId, {
         status: 'done',
@@ -122,6 +145,9 @@ export async function runPull(
       await deps.assets.update(assetId, { status: 'processing' });
       return;
     } catch (err) {
+      // Release any reservation taken this attempt so a failed/retried pull
+      // never permanently holds headroom (issue #579).
+      await reservation?.release();
       lastError = err;
       deps.onAttemptError?.(attempt, err);
       if (isPermanent(err) || attempt === MAX_ATTEMPTS) {

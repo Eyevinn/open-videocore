@@ -74,6 +74,7 @@ import {
   PublicManifestBaseUrlError
 } from '../pipeline/packaging.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
+import { type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
   extractTechnicalMetadata,
   type ExtractDeps,
@@ -773,6 +774,12 @@ type AssetsRouterOptions = {
   // the real in-process worker.
   runPull?: typeof runPull;
   pullDeps?: PullDeps;
+  // Operator-configured total storage cap (issue #579, ADR-020). When provided,
+  // URL-pull ingest is admitted through the running-total counter inside the
+  // worker (reserve on remote Content-Length, commit true size on success). An
+  // over-cap pull fails the job with a quota_exceeded error. Absent => no cap,
+  // behaviour unchanged (opt-in).
+  quota?: StorageQuotaGuard;
   // Technical metadata extraction (issue #6). `probe` is the ffprobe runner
   // (eyevinn-ffmpeg-s3 in production, a stub in tests). When `probe` is absent
   // extraction is disabled and POST /:id/extract-metadata responds 501.
@@ -2265,7 +2272,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset actually advanced to `processing` (pull succeeded).
       void runner(
         { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
-        { jobs, assets: repo, storage: storageFor(), ...opts.pullDeps }
+        { jobs, assets: repo, storage: storageFor(), quota: opts.quota, ...opts.pullDeps }
       ).then(async () => {
         const settled = await repo.get(asset.id);
         if (settled?.status === 'processing') {

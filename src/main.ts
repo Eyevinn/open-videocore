@@ -42,6 +42,15 @@ import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
 import { exportDestinationsRouter } from './routes/export-destinations.js';
 import { WorkspaceStorage } from './data/storage.js';
+import { couchServer, StackCouch } from './data/couchdb.js';
+import {
+  StorageQuotaGuard,
+  CouchStorageQuotaStore,
+  InMemoryStorageQuotaStore,
+  storageCapBytesFromEnv,
+  type StorageQuotaStore
+} from './data/storage-quota.js';
+import { StorageQuotaReconciler } from './data/storage-quota-reconcile.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
@@ -545,6 +554,29 @@ const storageFor: StorageFactory = (): WorkspaceStorage => {
 const storageAvailable = Boolean(process.env['MINIO_URL']) || Boolean(paramStore);
 if (!storageAvailable) {
   app.log.warn('no MINIO_URL and no parameter store — upload + URL-pull routes disabled');
+}
+
+// Operator-configured total storage cap (issue #579, ADR-020). Single
+// instance-wide counter keyed by DEPLOYMENT_CONTEXT (ADR-020 Decision 1 —
+// NEVER a per-request tenant dimension). The running total is the source of
+// truth (ADR-020 Decision 2): a CouchDB-backed counter (transactional via
+// updateWithRetry MVCC) when COUCHDB_URL is set, otherwise an in-memory counter
+// for bare local runs. The guard is always constructed; when STORAGE_CAP_BYTES
+// is unset/<=0 the guard is a pass-through and ingest behaviour is unchanged
+// (opt-in). Mirrors the env-read + direct StackCouch construction convention in
+// src/services/workspace-stack.ts:257,277.
+const quotaCouchUrl = process.env['COUCHDB_URL'];
+const quotaStore: StorageQuotaStore = quotaCouchUrl
+  ? new CouchStorageQuotaStore(
+      new StackCouch(couchServer(quotaCouchUrl), process.env['COUCHDB_ASSETS_DB'] ?? 'assets')
+    )
+  : new InMemoryStorageQuotaStore();
+const storageQuota = new StorageQuotaGuard({ store: quotaStore, capBytes: storageCapBytesFromEnv });
+if (storageCapBytesFromEnv() !== undefined) {
+  app.log.info(
+    { capBytes: storageCapBytesFromEnv() },
+    'total storage cap configured (issue #579) — ingest admitted through running-total counter'
+  );
 }
 
 // Webhook event dispatcher (issue #13). Fired from the internal OSC callbacks
@@ -1397,6 +1429,9 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   jobRepository,
   storageFor: storageAvailable ? storageFor : undefined,
   pullDeps,
+  // Total storage cap for URL-pull ingest (issue #579). The worker admits the
+  // pull through this running-total counter.
+  quota: storageQuota,
   probe,
   // External storage-backend registry (issue #548): lets POST /ingest-url
   // reference a registered external backend as the source (ADR-017 D4).
@@ -1548,6 +1583,9 @@ await app.register(assetUploadRouter, {
   prefix: '/api/v1/assets',
   repository: assetRepository,
   storageFor: storageAvailable ? storageFor : undefined,
+  // Total storage cap for direct-upload ingest (issue #579): proxied PUT
+  // reserves + commits, upload-complete admits post-hoc against the real size.
+  quota: storageQuota,
   onObjectStored
 });
 
@@ -1594,6 +1632,8 @@ let watchFolder: WatchFolderService | undefined =
         bucket: sourceBucket,
         repository: assetRepository,
         log: app.log,
+        // Account direct-drop bytes against the running total (issue #579).
+        quota: storageQuota,
         onObjectStored
       })
     : undefined;
@@ -1908,6 +1948,28 @@ void checkProfilesIndexReachable({
 // Env-override path (MINIO_URL): the instance was built at boot; start it now.
 // The service silently no-ops when not configured/enabled.
 watchFolder?.start();
+
+// Start the storage-quota reconciliation sweep (issue #579, ADR-020 Decision 2).
+// Off the write hot path: it periodically streams listObjectsV2 over the source
+// + packaged buckets, sums object sizes, and overwrites the counter's committed
+// total — correcting drift and re-establishing the total after a crash. Only
+// started when a cap is configured AND object storage is reachable; otherwise
+// there is nothing to enforce or sweep. Runs one immediate sweep on boot then on
+// STORAGE_QUOTA_RECONCILE_INTERVAL_MS (default 6h).
+if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
+  const conns = stackResolver.resolveCached();
+  if (conns?.storageClient) {
+    const reconciler = new StorageQuotaReconciler({
+      store: quotaStore,
+      buckets: [
+        new WorkspaceStorage(conns.storageClient, conns.sourceBucket),
+        new WorkspaceStorage(conns.storageClient, conns.packagedBucket)
+      ],
+      onError: (err) => app.log.warn({ err }, 'storage-quota reconciliation sweep failed')
+    });
+    reconciler.start();
+  }
+}
 
 // Parameter-store path (Open Source Cloud, issue #643): if a stack was already
 // provisioned in a previous run (self-discovered from the parameter store),
