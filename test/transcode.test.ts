@@ -415,6 +415,93 @@ describe('transcode job management (issue #8)', () => {
     });
   });
 
+  // Issue #639: the transcode INPUT must be read from the resolved stack's
+  // per-stack source bucket (request.connections.sourceBucket, param-store key
+  // `sourceBucket` per ADR-002) rather than the deployment-wide boot default
+  // (the router's opts.sourceBucket, from MINIO_SOURCE_BUCKET).
+  describe('per-stack source bucket resolution (issue #639)', () => {
+    // Build an app whose request.connections carries a per-stack sourceBucket
+    // that DIFFERS from the router's deployment-default opts.sourceBucket, so a
+    // regression to opts.sourceBucket would produce the wrong input URI.
+    async function buildAppWithStackConnections(perStackSourceBucket: string): Promise<Harness> {
+      const app = Fastify();
+      app.setValidatorCompiler(validatorCompiler);
+      app.setSerializerCompiler(serializerCompiler);
+      registerAuth(app);
+      const assets = new InMemoryAssetRepository();
+      const jobs = new InMemoryJobRepository();
+      const profiles = new InMemoryProfileRepository();
+      const { client, submitted } = fakeEncore();
+
+      app.decorateRequest('connections', null);
+      app.addHook('preHandler', async (request) => {
+        (request as unknown as { connections: unknown }).connections = {
+          sourceBucket: perStackSourceBucket,
+          packagedBucket: 'per-stack-packaged'
+        };
+      });
+
+      await app.register(assetsRouter, {
+        prefix: '/api/v1/assets',
+        repository: assets,
+        jobRepository: jobs,
+        encore: client,
+        // Deployment-wide boot default — MUST NOT be used for the input when a
+        // per-stack connection resolves a different source bucket.
+        sourceBucket: 'deployment-default-source',
+        outputBucket: 'out-bucket',
+        profileRepository: profiles
+      });
+      await app.register(jobsRouter, { prefix: '/api/v1/jobs', repository: jobs });
+      await app.ready();
+      return { app, assets, jobs, submitted, profiles };
+    }
+
+    // Create a transcodable source using the repository's current single-scope
+    // signature (create(input) / update(id, patch)). The shared makeSource
+    // helper's (workspace, …) calls predate that signature change and 409 on the
+    // HTTP happy path (the ~pre-existing workspace-scoping drift documented
+    // above); this local helper keeps the #639 happy-path assertions green.
+    async function makeTranscodableSource(h: Harness, name = 'my-video'): Promise<string> {
+      const asset = await h.assets.create({ name, objectKey: `ingest/${name}` });
+      await h.assets.update(asset.id, { status: 'processing' });
+      await h.assets.update(asset.id, { status: 'ready' });
+      return asset.id;
+    }
+
+    it('POST /:id/transcode reads the input from the per-stack source bucket', async () => {
+      const h = await buildAppWithStackConnections('per-stack-source');
+      const sourceId = await makeTranscodableSource(h);
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: {}
+      });
+      expect(res.statusCode).toBe(202);
+      expect(h.submitted).toHaveLength(1);
+      // The resolved input uses the per-stack value, NOT the deployment default.
+      expect(h.submitted[0].inputUri).toBe('s3://per-stack-source/ingest/my-video');
+      expect(h.submitted[0].inputUri).not.toContain('deployment-default-source');
+    });
+
+    it('falls back to the deployment default source bucket when no stack connection is present', async () => {
+      // Sanity check the fallback: this app has no request.connections wired, so
+      // the input resolves to the router's deployment-default opts.sourceBucket.
+      const h = await buildApp();
+      const sourceId = await makeTranscodableSource(h);
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: {}
+      });
+      expect(res.statusCode).toBe(202);
+      expect(h.submitted[0].inputUri).toBe('s3://src-bucket/ingest/my-video');
+    });
+  });
+
   describe('GET /api/v1/jobs/:id observes transcode jobs', () => {
     it('returns the job with type=transcode', async () => {
       const h = await buildApp();

@@ -29,6 +29,7 @@ import {
   type CreateAssetInput,
   type ListOptions,
   type ListResult,
+  type RehydratePhase,
   type SetDeleteLockInput,
   type StorageByteClass,
   type StorageTier,
@@ -39,6 +40,8 @@ import {
   applyReviewState,
   applyStatus,
   applyStorageTier,
+  beginRehydrate,
+  completeRehydrate,
   clampLimit,
   generateUniqueSlug,
   initialHistory,
@@ -151,6 +154,32 @@ export class CouchAssetRepository implements AssetRepository {
   async getBySlug(slug: string): Promise<Asset | undefined> {
     const couch = this.couchFor();
     const matches = await couch.find({ resourceType: RESOURCE_TYPE, slug }, { limit: 1 });
+    const doc = matches.find((d) => d.resourceType === RESOURCE_TYPE);
+    if (!doc) {
+      return undefined;
+    }
+    return fromDoc(doc);
+  }
+
+  // Resolve by external identifier (issue #576, ADR-019). The persisted document
+  // carries the correlation set under the four-namespace `administrative`
+  // namespace as `administrative.externalIdentifiers[]`, each entry a
+  // `{ namespace, id }` object (asset-document.ts: toAssetDocument attaches the
+  // block only when present). We push the pair down as a dotted Mango `$elemMatch`
+  // selector so CouchDB filters WITHIN the tenant database — this is the same
+  // index-backed array-push-down the TAMS flow lookup uses
+  // (couch-search-repo.ts: `structural.tams.flowIds` -> `$elemMatch`), NOT a
+  // client-side page walk. `(namespace, id)` uniqueness is out of scope here
+  // (#577), so at most one match is expected; we take the first document.
+  async getByExternalId(namespace: string, id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const matches = await couch.find(
+      {
+        resourceType: RESOURCE_TYPE,
+        'administrative.externalIdentifiers': { $elemMatch: { namespace, id } }
+      },
+      { limit: 1 }
+    );
     const doc = matches.find((d) => d.resourceType === RESOURCE_TYPE);
     if (!doc) {
       return undefined;
@@ -377,6 +406,37 @@ export class CouchAssetRepository implements AssetRepository {
         storageTiering: applyStorageTier(existing.storageTiering, overrides),
         updatedAt: now
       };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
+  // Dedicated rehydrate-state write path (ADR-019 D4, issue #558). Routed through
+  // updateWithRetry like setStorageTier so the read-modify-write is conflict-safe;
+  // beginRehydrate/completeRehydrate are pure and re-run safely per attempt. Only
+  // `storageTiering`/`updatedAt` change; lifecycle `status`/`statusHistory` are
+  // NEVER touched (the ADR-019 D6 tier/status firewall). Returns undefined when
+  // the id is unknown.
+  async setRehydrateState(
+    id: string,
+    byteClass: StorageByteClass,
+    phase: RehydratePhase
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const now = new Date().toISOString();
+      const tiering =
+        phase === 'begin'
+          ? beginRehydrate(existing.storageTiering, byteClass, now)
+          : completeRehydrate(existing.storageTiering, byteClass);
+      const next: Asset = { ...existing, storageTiering: tiering, updatedAt: now };
       updated = next;
       return toDoc(next);
     });
