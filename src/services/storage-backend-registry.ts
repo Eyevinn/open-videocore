@@ -386,6 +386,21 @@ export class UnknownSourceBackendError extends Error {
   }
 }
 
+// Thrown when a package/publish job references a named export destination by
+// id/name (issue #573) that is not registered for the workspace, or is
+// registered but does not serve the output/delivery (packaged | both) role — a
+// source/archive-only backend is not a delivery destination
+// (export-destinations.ts:138-140, ADR-018 D1). The router maps it to 400 (bad
+// reference) rather than 404, mirroring UnknownSourceBackendError, so the
+// existence of ids is not leaked and the message names the failing reference.
+export class UnknownDestinationBackendError extends Error {
+  readonly statusCode = 400;
+  constructor(ref: string) {
+    super(`no registered export destination matches "${ref}"`);
+    this.name = 'UnknownDestinationBackendError';
+  }
+}
+
 // Thrown when a caller tries to remove the implicit OSC-managed default backend
 // (ADR-017 D3: the default is not deletable). The router maps it to 409.
 export class DefaultBackendNotDeletableError extends Error {
@@ -632,6 +647,41 @@ export class StorageBackendRegistry {
       else if (secret.field === 'awsSessionToken') out.awsSessionToken = ref2;
     }
     return out;
+  }
+
+  // Resolve a referenced named export destination (issue #573) into the SAME
+  // per-execution `destinationBucket` string form the post-package relocation
+  // path already consumes (output-relocation.ts:57-80 parseDestination ->
+  // { bucket, prefix }). This is a RESOLUTION LAYER, not a new delivery
+  // mechanism (issue #573 scope): it hands the existing ADR-011 relocation the
+  // registered backend's coordinates so a named reference relocates output
+  // identically to the equivalent inline override.
+  //
+  // A destination is an OUTPUT-role backend (role 'packaged' or 'both' —
+  // export-destinations.ts:138-140, ADR-018 D1). A 'source' / 'archive'-only
+  // backend is not a delivery destination and is rejected here, exactly as the
+  // /api/v1/export-destinations view filters it out, so a caller cannot
+  // dereference a non-delivery backend as a job destination.
+  //
+  // The returned string is normalised to a trailing-slash-terminated
+  // `<bucket>/` path (the plain-path form destinationBucketSchema also produces
+  // — assets.ts:889-891), so parseDestination yields the identical
+  // { bucket, prefix: '' } an inline `bucket/` override yields. The registry
+  // record carries no per-destination key prefix (path templating is a separate
+  // #531 sub-issue, out of scope for #573), so only the bucket is resolved.
+  //
+  // Throws UnknownDestinationBackendError (statusCode 400) when the reference
+  // matches no registered backend, or matches one that does not serve the
+  // output role. The implicit OSC-managed default is intentionally NOT resolved
+  // here: a job with no destination reference uses the default relocation path
+  // unchanged, so callers must only pass this an explicit destination reference.
+  async resolveDestinationBucket(workspaceId: string, ref: string): Promise<string> {
+    const record = await this.findByRef(workspaceId, ref);
+    if (!record) throw new UnknownDestinationBackendError(ref);
+    if (record.role !== 'packaged' && record.role !== 'both') {
+      throw new UnknownDestinationBackendError(ref);
+    }
+    return `${record.bucket.replace(/\/+$/, '')}/`;
   }
 
   // Remove a registered backend. The implicit default (id 'default') is NOT

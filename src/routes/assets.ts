@@ -82,6 +82,7 @@ import {
 } from '../pipeline/metadata-extractor.js';
 import {
   UnknownSourceBackendError,
+  UnknownDestinationBackendError,
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
@@ -1642,6 +1643,145 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       /* thumbnail failures are recorded on the asset by the runner */
     });
     return true;
+  }
+
+  // Resolve a package/publish job's requested output destination into the single
+  // per-execution `destinationBucket` string the ADR-011 relocation path already
+  // consumes. Accepts AT MOST ONE of three mutually-exclusive output-destination
+  // expressions, then reduces it to the single bucket string the downstream
+  // pipeline consumes:
+  //   1. `destination` — a named export-destination reference (issue #573), the
+  //      stable id OR name of a registered output-role backend, resolved through
+  //      the SAME StorageBackendRegistry the /api/v1/export-destinations surface
+  //      uses (resolveDestinationBucket).
+  //   2. `externalBackend` — a reference (id OR name) to a registered external
+  //      storage backend (issue #549, ADR-017 D4), resolved through
+  //      resolveForOutput to the backend's NON-SECRET output coordinates
+  //      (credentials stay in OSC secrets).
+  //   3. `destinationBucket` — an inline ad-hoc override (unchanged ADR-011
+  //      path), already validated + trailing-slash-normalised at the edge.
+  //
+  // PRECEDENCE / MUTUAL EXCLUSION: supplying more than one of the three on the
+  // same job is AMBIGUOUS and rejected with a clear 400 rather than silently
+  // preferring one — the caller must pick exactly one destination expression.
+  // Each named path preserves its own resolution error semantics: #573's
+  // `destination` yields the registry's 400 (bad_request) / 501 (not_configured);
+  // #549's `externalBackend` yields 501 (not_configured) / 422 (unknown_backend
+  // or backend_role). When none is supplied the job uses the provisioned default
+  // (fully backwards compatible).
+  //
+  // Returns:
+  //   { ok: true, destinationBucket } — the resolved override string (or
+  //     undefined when none was supplied: the job uses the provisioned default).
+  //   { ok: false } — an error response has already been sent via `reply`;
+  //     callers must not send again.
+  async function resolveJobDestination(
+    args: { destination?: string; externalBackend?: string; destinationBucket?: string },
+    reply: import('fastify').FastifyReply
+  ): Promise<{ ok: true; destinationBucket?: string } | { ok: false }> {
+    const { destination, externalBackend, destinationBucket } = args;
+    // Mutual exclusion across all three output-destination expressions: at most
+    // ONE may be supplied. More than one is ambiguous -> 400 (issue #573 / #549).
+    // Each feature keeps its own pre-existing 400 error shape rather than a new
+    // invented code: a collision INVOLVING `externalBackend` uses #549's
+    // `invalid_request` shape; a `destination`/`destinationBucket` collision uses
+    // #573's `ambiguous_destination` shape.
+    const suppliedCount =
+      (destination !== undefined ? 1 : 0) +
+      (externalBackend !== undefined ? 1 : 0) +
+      (destinationBucket !== undefined ? 1 : 0);
+    if (suppliedCount > 1) {
+      if (externalBackend !== undefined) {
+        reply.code(400).send({
+          error: 'invalid_request',
+          message:
+            'externalBackend and destinationBucket are mutually exclusive; specify only one output destination'
+        });
+      } else {
+        reply.code(400).send({
+          error: 'ambiguous_destination',
+          message:
+            'supply either a named "destination" reference or an inline "destinationBucket" override, not both'
+        });
+      }
+      return { ok: false };
+    }
+
+    // #549 external-backend reference path: resolve through the registry's
+    // output resolver, preserving its 501 (not_configured) / 422 (unknown_backend
+    // / backend_role) semantics.
+    if (externalBackend !== undefined) {
+      if (!opts.storageBackendRegistry) {
+        reply.code(501).send({
+          error: 'not_configured',
+          message: 'external storage backends are not configured on this deployment'
+        });
+        return { ok: false };
+      }
+      const record = await opts.storageBackendRegistry.resolveForOutput(
+        DEPLOYMENT_CONTEXT,
+        externalBackend
+      );
+      // Explicitly referencing the implicit OSC-managed default (id 'default')
+      // means "use the default output path" — resolveForOutput returns undefined
+      // for it (ADR-017 D3, it is not an external backend), so we leave the
+      // destination unset and fall through rather than 422. Any OTHER unresolved
+      // reference is a dangling backend -> 422.
+      if (!record) {
+        if (externalBackend !== DEFAULT_BACKEND_ID) {
+          reply.code(422).send({
+            error: 'unknown_backend',
+            message: `no registered external storage backend matches "${externalBackend}"`
+          });
+          return { ok: false };
+        }
+        // 'default' -> no override, default output path (field omitted).
+        return { ok: true };
+      }
+      // Only write-capable roles can receive packaged output (ADR-017 D4:
+      // 'packaged'/'both' fan their credential to the packager; 'source' is
+      // read-only for ingest and 'archive' fans only to source-reader consumers
+      // — see mappingsForRole, storage-backend-registry.ts). Any non-write role
+      // is rejected via this allowlist.
+      if (record.role !== 'packaged' && record.role !== 'both') {
+        reply.code(422).send({
+          error: 'backend_role',
+          message: `storage backend "${externalBackend}" is registered for the "${record.role}" role and cannot receive output; register it with role "packaged" or "both"`
+        });
+        return { ok: false };
+      }
+      return { ok: true, destinationBucket: backendOutputDestination(record) };
+    }
+
+    // Inline override path: unchanged ADR-011 behaviour (already validated +
+    // trailing-slash-normalised at the edge by destinationBucketSchema).
+    if (destination === undefined) {
+      return destinationBucket !== undefined
+        ? { ok: true, destinationBucket }
+        : { ok: true };
+    }
+    // #573 named-reference path: resolve through the registry to the SAME
+    // `destinationBucket` string the relocation consumes.
+    if (!opts.storageBackendRegistry) {
+      reply.code(501).send({
+        error: 'not_configured',
+        message: 'storage-backend registry is not configured'
+      });
+      return { ok: false };
+    }
+    try {
+      const resolved = await opts.storageBackendRegistry.resolveDestinationBucket(
+        STACK_CONFIG_NAMESPACE,
+        destination
+      );
+      return { ok: true, destinationBucket: resolved };
+    } catch (err) {
+      if (err instanceof UnknownDestinationBackendError) {
+        reply.code(err.statusCode).send({ error: 'bad_request', message: err.message });
+        return { ok: false };
+      }
+      throw err;
+    }
   }
 
   // Start a named built-in pipeline against an asset, executing the first step
@@ -3376,9 +3516,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     {
       schema: {
         params: z.object({ id: z.string() }),
-        body: z.object({ encoreJobId: z.string().min(1).optional() }),
+        body: z.object({
+          encoreJobId: z.string().min(1).optional(),
+          // Per-execution destination override (issue #207/#208), pipeline-mode
+          // only (ignored when an explicit encoreJobId is enqueued directly).
+          // Validated + trailing-slash-normalized at the edge.
+          destinationBucket: destinationBucketSchema.optional(),
+          // Named export-destination reference (issue #573): the stable id OR
+          // name of a registered output-role destination. Resolved server-side
+          // to the SAME `destinationBucket` the relocation consumes. Mutually
+          // exclusive with the inline `destinationBucket` override.
+          destination: z.string().min(1).max(256).optional()
+        }),
         response: {
           202: z.object({ ok: z.literal(true), jobId: z.string().optional(), pipelineMode: z.boolean().optional() }),
+          400: z.object({ error: z.string(), message: z.string() }),
           404: z.object({ error: z.string() }),
           409: z.object({ error: z.string(), message: z.string() }),
           501: z.object({ error: z.string(), message: z.string() }),
@@ -3407,7 +3559,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         if (!opts.pipelineRepository) {
           return reply.code(501).send({ error: 'not_configured', message: 'pipeline execution not configured' });
         }
-        const started = await startPipelineExecution(asset, 'abr-vod', request, reply);
+        // Resolve a named export-destination reference OR the inline override
+        // into the single `destinationBucket` string the relocation consumes
+        // (issue #573). Rejects an ambiguous both-supplied request with 400.
+        const resolvedDestination = await resolveJobDestination(
+          { destination: request.body.destination, destinationBucket: request.body.destinationBucket },
+          reply
+        );
+        if (!resolvedDestination.ok) return reply; // error already sent
+        const started = await startPipelineExecution(
+          asset,
+          'abr-vod',
+          request,
+          reply,
+          undefined,
+          resolvedDestination.destinationBucket
+        );
         if (!started) return reply; // startPipelineExecution already sent the error
         return reply.code(202).send({ ok: true, jobId: started.steps.find((s) => s.name === 'transcode')?.jobId, pipelineMode: true });
       }
@@ -3469,12 +3636,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // and trailing-slash-normalized at the edge; persisted on the
           // execution record for #208 (packager relocation) / #210 (delivery).
           destinationBucket: destinationBucketSchema.optional(),
+          // Optional named export-destination reference (issue #573): the stable
+          // id OR name of a registered output-role destination
+          // (/api/v1/export-destinations). Resolved server-side to the SAME
+          // `destinationBucket` the relocation consumes. Mutually exclusive with
+          // both `externalBackend` and the inline `destinationBucket` override
+          // (more than one output destination -> 400).
+          destination: z.string().min(1).max(256).optional(),
           // Optional reference (id OR name) to a registered external storage
           // backend (issue #549, ADR-017 D4). When set, this execution's
           // transcode/package OUTPUT is written to that backend's bucket instead
           // of OSC-managed default storage, resolved to the backend's NON-SECRET
           // coordinates at job time (credentials stay in OSC secrets). Mutually
-          // exclusive with `destinationBucket` (both name an output destination).
+          // exclusive with `destination` and the inline `destinationBucket`
+          // override (all name an output destination).
           externalBackend: z.string().trim().min(1).max(256).optional()
         }),
         response: {
@@ -3496,57 +3671,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      // Resolve an optional registered external backend reference (issue #549)
-      // to the per-execution destination the relocation path consumes. Done here
-      // (before startPipelineExecution) so a dangling/unconfigured reference is a
-      // clean synchronous error and the downstream path stays destination-only.
-      let destinationBucket = request.body.destinationBucket;
-      if (request.body.externalBackend !== undefined) {
-        if (destinationBucket !== undefined) {
-          return reply.code(400).send({
-            error: 'invalid_request',
-            message:
-              'externalBackend and destinationBucket are mutually exclusive; specify only one output destination'
-          });
-        }
-        if (!opts.storageBackendRegistry) {
-          return reply.code(501).send({
-            error: 'not_configured',
-            message: 'external storage backends are not configured on this deployment'
-          });
-        }
-        const record = await opts.storageBackendRegistry.resolveForOutput(
-          DEPLOYMENT_CONTEXT,
-          request.body.externalBackend
-        );
-        // Explicitly referencing the implicit OSC-managed default (id 'default')
-        // means "use the default output path" — resolveForOutput returns
-        // undefined for it (ADR-017 D3, it is not an external backend), so we
-        // leave destinationBucket unset and fall through rather than 422. Any
-        // OTHER unresolved reference is a dangling backend -> 422.
-        if (!record) {
-          if (request.body.externalBackend !== DEFAULT_BACKEND_ID) {
-            return reply.code(422).send({
-              error: 'unknown_backend',
-              message: `no registered external storage backend matches "${request.body.externalBackend}"`
-            });
-          }
-          // 'default' -> no override, default output path (field omitted).
-        } else {
-          // Only write-capable roles can receive packaged output (ADR-017 D4:
-          // 'packaged'/'both' fan their credential to the packager; 'source' is
-          // read-only for ingest and 'archive' fans only to source-reader
-          // consumers — see mappingsForRole, storage-backend-registry.ts). Any
-          // non-write role is rejected via this allowlist.
-          if (record.role !== 'packaged' && record.role !== 'both') {
-            return reply.code(422).send({
-              error: 'backend_role',
-              message: `storage backend "${request.body.externalBackend}" is registered for the "${record.role}" role and cannot receive output; register it with role "packaged" or "both"`
-            });
-          }
-          destinationBucket = backendOutputDestination(record);
-        }
-      }
+      // Resolve the requested output destination (at most one of the named
+      // export-destination reference #573, the external-backend reference #549,
+      // or the inline override) into the single `destinationBucket` string the
+      // relocation consumes. Done here (before startPipelineExecution) so a
+      // dangling/unconfigured/ambiguous reference is a clean synchronous error and
+      // the downstream path stays destination-only. Each path keeps its own error
+      // semantics (#573: 400/501; #549: 400/501/422).
+      const resolvedDestination = await resolveJobDestination(
+        {
+          destination: request.body.destination,
+          externalBackend: request.body.externalBackend,
+          destinationBucket: request.body.destinationBucket
+        },
+        reply
+      );
+      if (!resolvedDestination.ok) return reply; // error already sent
       const started = await startPipelineExecution(
         asset,
         request.body.pipeline as keyof typeof BUILT_IN_PIPELINES,
@@ -3557,7 +3697,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           customProfile: request.body.customProfile as EncoreProfile | undefined,
           profileParams: request.body.profileParams
         },
-        destinationBucket
+        resolvedDestination.destinationBucket
       );
       if (!started) return reply; // error already sent
       return reply.code(202).send(started);
