@@ -144,6 +144,40 @@ describe('POST /api/v1/export-destinations — register', () => {
     await app.close();
   });
 
+  it('accepts an optional path template and echoes it on the view (issue #574)', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/export-destinations',
+      payload: { ...VALID_BODY, pathTemplate: '{date}/{assetId}' }
+    });
+    expect(res.statusCode).toBe(201);
+    expect((res.json() as DestinationView & { pathTemplate?: string }).pathTemplate).toBe(
+      '{date}/{assetId}'
+    );
+    await app.close();
+  });
+
+  it('rejects an unknown path-template token at registration time (400) and registers nothing', async () => {
+    const registry = makeRegistry(makeSecretStore());
+    const app = await buildApp(registry);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/export-destinations',
+      payload: { ...VALID_BODY, pathTemplate: 'out/{bogus}/x' }
+    });
+    expect(res.statusCode).toBe(400);
+    const body = res.json() as { error: string; message: string; token?: string };
+    expect(body.error).toBe('invalid_path_template');
+    expect(body.token).toBe('bogus');
+    expect(body.message).toContain('{bogus}');
+    // Nothing persisted for a rejected template.
+    const list = await app.inject({ method: 'GET', url: '/api/v1/export-destinations' });
+    const { destinations } = list.json() as { destinations: DestinationView[] };
+    expect(destinations.some((d) => d.name === VALID_BODY.name)).toBe(false);
+    await app.close();
+  });
+
   it('returns 501 when no registry is wired', async () => {
     const app = await buildApp();
     const res = await app.inject({

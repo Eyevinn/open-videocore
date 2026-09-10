@@ -43,6 +43,11 @@ import {
   type ProbeClientFactory,
   type ValidationFailureReason
 } from './external-backend-validation.js';
+import {
+  validatePathTemplate,
+  renderPathTemplate,
+  type PathTemplateContext
+} from './destination-path-template.js';
 
 // The id of the implicit, OSC-managed default backend. It is not a stored
 // registration record — it is synthesised on list so the default always appears
@@ -91,6 +96,15 @@ export type StorageBackendRecord = {
   // signal its presence WITHOUT storing the token itself (the token is a secret
   // and lives only in OSC secrets).
   hasSessionToken: boolean;
+  // OPTIONAL per-destination path template (issue #574). When set, the
+  // post-package relocation keys output UNDER the destination bucket using this
+  // template (rendered at job time — {date}/{assetId}/… — see
+  // destination-path-template.ts). Absent means the pre-#574 static-prefix
+  // behaviour (the bare `<bucket>/` form) is used unchanged; this field is purely
+  // additive over the #573 job-reference resolver. Validated at registration
+  // time (register(): unknown tokens -> InvalidPathTemplateError -> 400) so a
+  // persisted template is always renderable.
+  pathTemplate?: string;
   createdAt: string;
 };
 
@@ -164,6 +178,9 @@ export type RegisterBackendInput = {
   endpointUrl?: string;
   sessionToken?: string;
   publicBaseUrl?: string;
+  // OPTIONAL per-destination path template (issue #574). Validated at register()
+  // time and persisted on the record; absent keeps the static-prefix behaviour.
+  pathTemplate?: string;
 };
 
 // Narrow OSC-secret sink. Mirrors the verified saveSecret calling convention
@@ -506,6 +523,15 @@ export class StorageBackendRegistry {
       }
     }
 
+    // Issue #574: validate an optional path template at REGISTRATION time so an
+    // unknown token / malformed brace is rejected with a clear 400 BEFORE the
+    // destination is persisted — a stored template is therefore always
+    // renderable. Throws InvalidPathTemplateError (statusCode 400). Absent =>
+    // unchanged static-prefix behaviour.
+    if (input.pathTemplate !== undefined) {
+      validatePathTemplate(input.pathTemplate);
+    }
+
     const id = randomUUID();
     const record: StorageBackendRecord = {
       id,
@@ -517,6 +543,7 @@ export class StorageBackendRegistry {
       ...(input.endpointUrl ? { endpointUrl: input.endpointUrl } : {}),
       ...(input.region ? { region: input.region } : {}),
       ...(input.publicBaseUrl ? { publicBaseUrl: input.publicBaseUrl } : {}),
+      ...(input.pathTemplate !== undefined ? { pathTemplate: input.pathTemplate } : {}),
       hasSessionToken: Boolean(input.sessionToken),
       createdAt: new Date().toISOString()
     };
@@ -663,25 +690,41 @@ export class StorageBackendRegistry {
   // /api/v1/export-destinations view filters it out, so a caller cannot
   // dereference a non-delivery backend as a job destination.
   //
-  // The returned string is normalised to a trailing-slash-terminated
-  // `<bucket>/` path (the plain-path form destinationBucketSchema also produces
-  // — assets.ts:889-891), so parseDestination yields the identical
-  // { bucket, prefix: '' } an inline `bucket/` override yields. The registry
-  // record carries no per-destination key prefix (path templating is a separate
-  // #531 sub-issue, out of scope for #573), so only the bucket is resolved.
+  // When the destination carries NO path template (issue #574), the returned
+  // string is the trailing-slash-terminated `<bucket>/` path (the plain-path
+  // form destinationBucketSchema also produces — assets.ts:889-891), so
+  // parseDestination yields the identical { bucket, prefix: '' } an inline
+  // `bucket/` override yields — the pre-#574 behaviour, unchanged.
+  //
+  // When the destination carries a path template (issue #574), the template is
+  // rendered at THIS job's time from the supplied context (asset id + now) into a
+  // key prefix and appended under the bucket, yielding `<bucket>/<prefix>/`. This
+  // is purely additive: a destination with no template is unaffected. A template
+  // token with no value in the context (e.g. {assetId} with no assetId) throws
+  // InvalidPathTemplateError (statusCode 400) so a job never writes to a
+  // mis-keyed empty-segment path.
   //
   // Throws UnknownDestinationBackendError (statusCode 400) when the reference
   // matches no registered backend, or matches one that does not serve the
   // output role. The implicit OSC-managed default is intentionally NOT resolved
   // here: a job with no destination reference uses the default relocation path
   // unchanged, so callers must only pass this an explicit destination reference.
-  async resolveDestinationBucket(workspaceId: string, ref: string): Promise<string> {
+  async resolveDestinationBucket(
+    workspaceId: string,
+    ref: string,
+    context?: PathTemplateContext
+  ): Promise<string> {
     const record = await this.findByRef(workspaceId, ref);
     if (!record) throw new UnknownDestinationBackendError(ref);
     if (record.role !== 'packaged' && record.role !== 'both') {
       throw new UnknownDestinationBackendError(ref);
     }
-    return `${record.bucket.replace(/\/+$/, '')}/`;
+    const bucket = record.bucket.replace(/\/+$/, '');
+    if (record.pathTemplate === undefined) {
+      return `${bucket}/`;
+    }
+    const prefix = renderPathTemplate(record.pathTemplate, context ?? {});
+    return prefix.length > 0 ? `${bucket}/${prefix}/` : `${bucket}/`;
   }
 
   // Remove a registered backend. The implicit default (id 'default') is NOT

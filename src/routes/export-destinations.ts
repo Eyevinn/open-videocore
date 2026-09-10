@@ -28,11 +28,16 @@
 // (credentials.secretAccessKey === '***redacted***'). This is the ADR-018 D1
 // credential rule, inherited unchanged from ADR-017.
 //
-// OUT OF SCOPE (per issue #572): wiring a destination into jobs (the optional
-// reference-resolution extension of the per-execution destinationBucket, ADR-018
-// D2) and per-destination path templating are separate #531 sub-issues. This
-// router does NOT touch the per-execution inline `destinationBucket` override
-// (ADR-011) or ingest storage.
+// PATH TEMPLATING (issue #574): a destination MAY additionally carry an optional
+// `pathTemplate` that keys packaged output UNDER the destination bucket (rendered
+// at job time — {date}/{assetId}/…, see services/destination-path-template.ts).
+// It is validated at registration time here (unknown token / malformed brace ->
+// 400 invalid_path_template) and applied by the SAME job-reference relocation
+// path (StorageBackendRegistry.resolveDestinationBucket). It is purely additive:
+// a destination with no template keeps the pre-#574 static-prefix behaviour.
+//
+// OUT OF SCOPE (per issue #572): this router does NOT touch the per-execution
+// inline `destinationBucket` override (ADR-011) or ingest storage.
 //
 // REACHABILITY (ADR-018 D3): registration-time reachability validation is
 // OPTIONAL and NOT required here; it is inherited from the injected registry's
@@ -48,6 +53,7 @@ import {
   type StorageBackendRole,
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
+import { InvalidPathTemplateError } from '../services/destination-path-template.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 
 export type ExportDestinationsRouterOptions = {
@@ -99,6 +105,11 @@ const destinationViewSchema = z.object({
   // separate record field for a key prefix, so it is surfaced as part of the
   // backend coordinates unchanged — ADR-018 forbids changing the record shape.
   publicBaseUrl: z.string().optional(),
+  // OPTIONAL per-destination path template (issue #574). Echoed back on the view
+  // so an operator can confirm the keying rule captured for this destination.
+  // Absent means the static-prefix behaviour (the bare `<bucket>/`) is used
+  // unchanged. It is non-secret operator config, so it is safe to echo.
+  pathTemplate: z.string().optional(),
   hasSessionToken: z.boolean(),
   deletable: z.boolean(),
   createdAt: z.string(),
@@ -112,6 +123,20 @@ const destinationViewSchema = z.object({
 const destinationListSchema = z.object({
   destinations: z.array(destinationViewSchema)
 });
+
+// Registration-time 400 body. Covers BOTH the issue #574 path-template rejection
+// (`error: 'invalid_path_template'`, optional offending `token`) AND the generic
+// request-validation envelope fastify-type-provider-zod emits for a malformed
+// body (e.g. an out-of-enum role), which carries a `statusCode`/`code`. Kept
+// permissive (passthrough) so the 400 serializer never rejects a validation
+// error it did not mint — a too-strict literal here would turn a 400 into a 500.
+const pathTemplateErrorSchema = z
+  .object({
+    error: z.string(),
+    message: z.string().optional(),
+    token: z.string().optional()
+  })
+  .passthrough();
 
 // Register request. An export destination is an OUTPUT-role backend, so role is
 // fixed to the two output-serving roles (packaged | both) rather than reusing the
@@ -128,7 +153,16 @@ const registerDestinationSchema = z.object({
   region: z.string().min(1).optional(),
   endpointUrl: z.string().url().optional(),
   sessionToken: z.string().min(1).optional(),
-  publicBaseUrl: z.string().url().optional()
+  publicBaseUrl: z.string().url().optional(),
+  // OPTIONAL per-destination path template (issue #574). When supplied, packaged
+  // output is keyed UNDER the destination bucket using this template, rendered at
+  // job time. Supported tokens: {date} (UTC YYYY-MM-DD), {year}, {month}, {day}
+  // (UTC, zero-padded), {assetId}. A literal brace is doubled: {{ -> { and }} ->
+  // }. Any unknown token or malformed brace is REJECTED here at registration time
+  // with a 400 (invalid_path_template). Omit the field to keep the static-prefix
+  // behaviour unchanged. The token set + escaping are the single source of truth
+  // in services/destination-path-template.ts (PATH_TEMPLATE_TOKENS).
+  pathTemplate: z.string().min(1).max(1024).optional()
 });
 
 // A registered backend is an export/delivery DESTINATION when it serves the
@@ -155,6 +189,17 @@ export const exportDestinationsRouter: FastifyPluginAsync<
     // /storage/backends (storage.ts:191-193).
     if (err instanceof DefaultBackendNotDeletableError) {
       return reply.code(409).send({ error: 'conflict', message: err.message });
+    }
+    // Issue #574: the registration carried a path template with an unknown token
+    // or malformed brace. The destination was NOT registered. Surface a clear,
+    // machine-readable 400 naming the offending token (never a secret — a path
+    // template is non-secret operator config).
+    if (err instanceof InvalidPathTemplateError) {
+      return reply.code(400).send({
+        error: 'invalid_path_template' as const,
+        message: err.message,
+        ...(err.token !== undefined ? { token: err.token } : {})
+      });
     }
     // Registration-time reachability / permission validation failed (issue
     // #550): the destination was NOT registered. Same 422 envelope the
@@ -186,7 +231,12 @@ export const exportDestinationsRouter: FastifyPluginAsync<
     {
       schema: {
         body: registerDestinationSchema,
-        response: { 201: destinationViewSchema, 422: validationErrorSchema, 501: errorSchema }
+        response: {
+          201: destinationViewSchema,
+          400: pathTemplateErrorSchema,
+          422: validationErrorSchema,
+          501: errorSchema
+        }
       }
     },
     async (request, reply) => {
