@@ -19928,6 +19928,11 @@
                   "publicBaseUrl": {
                     "type": "string",
                     "format": "uri"
+                  },
+                  "pathTemplate": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
                   }
                 },
                 "required": [
@@ -19985,6 +19990,9 @@
                     "publicBaseUrl": {
                       "type": "string"
                     },
+                    "pathTemplate": {
+                      "type": "string"
+                    },
                     "hasSessionToken": {
                       "type": "boolean"
                     },
@@ -20033,6 +20041,31 @@
                     "credentials"
                   ],
                   "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "token": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": true
                 }
               }
             }
@@ -20152,6 +20185,9 @@
                             "type": "string"
                           },
                           "publicBaseUrl": {
+                            "type": "string"
+                          },
+                          "pathTemplate": {
                             "type": "string"
                           },
                           "hasSessionToken": {
@@ -20294,6 +20330,9 @@
                       "type": "string"
                     },
                     "publicBaseUrl": {
+                      "type": "string"
+                    },
+                    "pathTemplate": {
                       "type": "string"
                     },
                     "hasSessionToken": {
