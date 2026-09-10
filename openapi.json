@@ -5693,6 +5693,14 @@
         "parameters": [
           {
             "schema": {
+              "type": "boolean"
+            },
+            "in": "query",
+            "name": "force",
+            "required": false
+          },
+          {
+            "schema": {
               "type": "string"
             },
             "in": "path",
@@ -17885,6 +17893,14 @@
       },
       "delete": {
         "parameters": [
+          {
+            "schema": {
+              "type": "boolean"
+            },
+            "in": "query",
+            "name": "force",
+            "required": false
+          },
           {
             "schema": {
               "type": "string"

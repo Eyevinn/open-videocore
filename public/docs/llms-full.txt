@@ -870,6 +870,7 @@ Field notes- name — Canonical editorial title of the asset. Set on ingest via 
 
   Parameters
 NameInTypeRequired
+forcequerybooleanoptional
 idpathstringrequired
 
   Response
@@ -2800,6 +2801,7 @@ Response 200 (application/json)
 
   Parameters
 NameInTypeRequired
+forcequerybooleanoptional
 idpathstringrequired
 
   Response
