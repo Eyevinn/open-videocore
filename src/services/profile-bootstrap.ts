@@ -14,11 +14,21 @@
 // or the remote index is unreachable. An operator edit to a built-in profile is
 // preserved: an existing profile of the same name is left untouched.
 //
+// Skip-guard fix (issue #662): the guard used to be `repository.count() > 0`,
+// but built-ins are ensured on EVERY run BEFORE the guard, so after a first
+// startup whose remote index fetch failed the store is non-empty (built-ins
+// only) and the guard trips forever — the remote index is never retried. The
+// guard now counts only NON-built-in profiles, which is what actually signals
+// "the remote index (or an operator) has populated real profiles". With just
+// built-ins present that count is 0, so the remote fetch is retried on the next
+// startup. The skip path is also now logged.
+//
 // Contract sources verified before writing (CLAUDE.md rule 7):
-//   - src/data/profile-repo.ts — ProfileRepository.count/create/get signatures.
+//   - src/data/profile-repo.ts:33-44 — ProfileRepository.list/get/create/update
+//     signatures; list() returns Profile[] each with a `name` field (:19-26).
 //   - src/routes/profiles.ts (pre-change) — the trivial `key: value` index
 //     parser + FETCH_TIMEOUT_MS convention reused here.
-//   - src/services/builtin-profiles.ts — BUILTIN_PROFILES [{ name, yaml }].
+//   - src/services/builtin-profiles.ts:100-102 — BUILTIN_PROFILES [{ name, yaml }].
 
 import type { ProfileRepository } from '../data/profile-repo.js';
 import { BUILTIN_PROFILES } from './builtin-profiles.js';
@@ -33,12 +43,30 @@ export type BootstrapLogger = {
 
 export type BootstrapResult = {
   seeded: number;
-  skipped: boolean; // true when remote-index seeding was a no-op (profiles existed)
+  // true when remote-index seeding was a no-op because non-built-in profiles
+  // already exist (issue #662: a store holding ONLY built-ins does NOT skip, so
+  // a previously-failed remote index is retried on the next startup).
+  skipped: boolean;
   // Count of built-in profiles newly created this run (issue #385). Built-ins are
   // always ensured, independent of the remote-index skip guard, so this can be
   // non-zero even when `skipped` is true.
   builtinSeeded: number;
 };
+
+// Names of the profiles this API ships built-in. Used to exclude built-ins from
+// the skip-guard count so seeding the built-ins themselves cannot trip the guard
+// (issue #662). Built-in names are compared verbatim to stored profile names.
+const BUILTIN_PROFILE_NAMES = new Set(BUILTIN_PROFILES.map((p) => p.name));
+
+// Count profiles in the store that are NOT built-ins. This is the signal the
+// remote index has ever been ingested (or an operator has added real profiles):
+// a store that holds only built-ins returns 0 here, so the remote fetch is
+// retried on the next startup. Uses ProfileRepository.list() (profile-repo.ts:35)
+// rather than count() (:43) because count() cannot distinguish built-ins.
+async function countNonBuiltinProfiles(repository: ProfileRepository): Promise<number> {
+  const all = await repository.list();
+  return all.filter((p) => !BUILTIN_PROFILE_NAMES.has(p.name)).length;
+}
 
 // Ensure every built-in profile (src/services/builtin-profiles.ts) exists in the
 // store. An existing profile of the same name is left untouched so an operator's
@@ -105,10 +133,13 @@ export async function bootstrapProfiles(opts: {
 }): Promise<BootstrapResult> {
   const { repository, indexUrl, force = false, log } = opts;
 
-  // Capture whether the store was empty BEFORE seeding built-ins — otherwise the
-  // built-ins we add below would themselves trip the "profiles already exist"
-  // skip guard on a genuinely fresh store and suppress the remote-index seed.
-  const preExisting = force ? 0 : await repository.count();
+  // Count NON-built-in profiles BEFORE seeding built-ins. This distinguishes a
+  // store that has ever ingested the remote index (or had real profiles added by
+  // an operator) from one that holds only the built-ins we seed ourselves. The
+  // old guard used the total count and so tripped forever once the built-ins had
+  // been seeded, never retrying a failed remote index (issue #662). Built-ins are
+  // excluded here, so seeding them below cannot influence this count.
+  const preExistingRemote = force ? 0 : await countNonBuiltinProfiles(repository);
 
   // Built-in profiles (issue #385) are ALWAYS ensured, independent of the
   // remote-index skip guard below, so they ship as part of the standard served
@@ -116,7 +147,15 @@ export async function bootstrapProfiles(opts: {
   // unreachable.
   const builtinSeeded = await ensureBuiltinProfiles(repository, log);
 
-  if (!force && preExisting > 0) {
+  if (!force && preExistingRemote > 0) {
+    // Skip path is now logged (issue #662): the old code returned silently, so a
+    // skipped seed was invisible in the startup log. State whether the remote
+    // index has ever been ingested (non-built-in profiles present) so an operator
+    // can tell a legitimate skip from a stuck one.
+    log?.info(
+      { nonBuiltinProfiles: preExistingRemote, remoteIndexIngested: true, indexUrl },
+      'profile bootstrap: skipping remote index seed (non-built-in profiles already present)'
+    );
     return { seeded: 0, skipped: true, builtinSeeded };
   }
 

@@ -24,6 +24,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
+import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
 import {
   CollectionDeleteProtectedError,
   CollectionNotFoundError,
@@ -32,7 +33,16 @@ import {
 import type { Asset, AssetRepository } from '../data/asset-repo.js';
 import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
 
-const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
+// Shared error envelope. `reason` is OPTIONAL and machine-readable: cap-breach
+// 400s (issue #562) set it to the specific limit hit, while the framework's own
+// zod request-validation 400 (no `reason`) still serializes against this schema.
+// Kept permissive on purpose — narrowing it to a cap-only shape would make the
+// validation-error body fail response serialization (FST_ERR_FAILED_ERROR_SERIALIZATION).
+const errorSchema = z.object({
+  error: z.string(),
+  message: z.string().optional(),
+  reason: z.string().optional()
+});
 
 // Explicit delete-lock (ADR-020 decision 3, issue #568). Field names/types
 // mirror ADR-020 exactly: locked, reason?, lockedAt, lockedBy?.
@@ -85,11 +95,96 @@ const collectionWithAssetsSchema = collectionSchema.extend({
   assets: z.array(z.record(z.unknown()))
 });
 
+// Descriptive-metadata caps (issue #562). The `custom` bag is an open key/value
+// structure; without bounds a caller can inflate a single collection document
+// unbounded, the ADR-005 concern that open metadata bags must be bounded at the
+// API layer. The per-field caps are aligned with the EXISTING asset-side caps so
+// collection and asset metadata behave consistently:
+//   - description: max 2048 chars   (asset createSchema.description, assets.ts:303)
+//   - tags:        max 128 entries, each 1..128 chars
+//                  (asset tagSchema/tagsSchema, assets.ts:294-295)
+//   - custom:      the asset `metadata`/`custom` bag carries NO serialized cap
+//                  today (assets.ts:290 `z.record(z.unknown())`), so there is no
+//                  asset-side number to mirror. This issue introduces the bound
+//                  the ADR-005 concern calls for: a serialized-size ceiling on the
+//                  `custom` bag, chosen generous enough for real descriptive use
+//                  while bounding document growth.
+export const COLLECTION_DESCRIPTION_MAX_LENGTH = 2048;
+export const COLLECTION_TAGS_MAX_COUNT = 128;
+export const COLLECTION_TAG_MAX_LENGTH = 128;
+export const COLLECTION_CUSTOM_MAX_SERIALIZED_BYTES = 16 * 1024; // 16 KiB
+
+// Machine-readable reasons for a cap breach (issue #562). Each is returned in the
+// 400 body's `reason` field so a client can branch on the specific limit hit
+// rather than parse a human message.
+export type CollectionMetadataCapReason =
+  | 'description_too_long'
+  | 'too_many_tags'
+  | 'tag_too_long'
+  | 'custom_too_large';
+
+export type CollectionMetadataCapViolation = {
+  reason: CollectionMetadataCapReason;
+  message: string;
+};
+
+// Shared cap check, run against the SAME fields on both the create and update
+// paths so the two cannot drift (create and update accept identical descriptive
+// fields). Returns the first violation, or undefined when within every cap. Only
+// present fields are checked: an absent field on PATCH leaves the stored value
+// untouched and is not re-validated here.
+export function checkCollectionMetadataCaps(input: {
+  description?: string;
+  tags?: string[];
+  custom?: Record<string, unknown>;
+}): CollectionMetadataCapViolation | undefined {
+  if (
+    input.description !== undefined &&
+    input.description.length > COLLECTION_DESCRIPTION_MAX_LENGTH
+  ) {
+    return {
+      reason: 'description_too_long',
+      message: `description exceeds the maximum length of ${COLLECTION_DESCRIPTION_MAX_LENGTH} characters`
+    };
+  }
+  if (input.tags !== undefined) {
+    if (input.tags.length > COLLECTION_TAGS_MAX_COUNT) {
+      return {
+        reason: 'too_many_tags',
+        message: `tags exceeds the maximum of ${COLLECTION_TAGS_MAX_COUNT} entries`
+      };
+    }
+    for (const tag of input.tags) {
+      if (tag.length > COLLECTION_TAG_MAX_LENGTH) {
+        return {
+          reason: 'tag_too_long',
+          message: `a tag exceeds the maximum length of ${COLLECTION_TAG_MAX_LENGTH} characters`
+        };
+      }
+    }
+  }
+  if (input.custom !== undefined) {
+    // Bound the bag by its serialized size (UTF-8 bytes), which is what actually
+    // grows the stored document — a single huge value or thousands of small keys
+    // both inflate it. Measuring the serialized form catches both.
+    const serializedBytes = Buffer.byteLength(JSON.stringify(input.custom), 'utf8');
+    if (serializedBytes > COLLECTION_CUSTOM_MAX_SERIALIZED_BYTES) {
+      return {
+        reason: 'custom_too_large',
+        message: `custom exceeds the maximum serialized size of ${COLLECTION_CUSTOM_MAX_SERIALIZED_BYTES} bytes`
+      };
+    }
+  }
+  return undefined;
+}
+
 const createBodySchema = z.object({
   name: z.string().min(1).max(256),
   // Optional descriptive metadata accepted at create time (issue #559). Mirrors
   // the asset `descriptive` namespace (typed-core + open-`custom`, ADR-005);
-  // all optional so `POST /collections { name }` is unchanged.
+  // all optional so `POST /collections { name }` is unchanged. Size/length caps
+  // are enforced in-handler via checkCollectionMetadataCaps (issue #562) so the
+  // 400 carries a machine-readable `reason`.
   description: z.string().optional(),
   tags: z.array(z.string()).optional(),
   custom: z.record(z.unknown()).optional()
@@ -133,6 +228,17 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
 
+  // Router-layer method→action authorisation gate (ADR-018 decision 2, seam 1;
+  // issue #554). Registered plugin-scoped so it runs on EVERY collection route
+  // (Fastify encapsulation) before the handler: it derives the action from the
+  // HTTP method and calls authorize(role, 'collection'). Per ADR-018 decision 4
+  // there is NO collection→asset cascade — a collection is authorised as a
+  // 'collection' resource against the same workspace role that authorises assets;
+  // membership never widens or narrows access. Denials are a fail-closed 403 with
+  // the stable AUTHZ_FORBIDDEN_ERROR reason code, distinct from the 401 presence
+  // gate (decision 5).
+  app.addHook('preHandler', resourceAuthorizationPreHandler('collection'));
+
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {
       return reply.code(err.statusCode).send({ error: 'forbidden', message: err.message });
@@ -157,9 +263,18 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     '/',
     {
       
-      schema: { body: createBodySchema, response: { 201: collectionSchema, 400: errorSchema } }
+      schema: {
+        body: createBodySchema,
+        response: { 201: collectionSchema, 400: errorSchema }
+      }
     },
     async (request, reply) => {
+      // Enforce descriptive-metadata caps before persisting (issue #562) so an
+      // oversized document is rejected rather than stored.
+      const violation = checkCollectionMetadataCaps(request.body);
+      if (violation) {
+        return reply.code(400).send({ error: 'metadata_cap_exceeded', ...violation });
+      }
       const collection = await repo.create(request.body);
       // Audit: collection created (issue #564). One entry, targetId = new id.
       emitAudit(
@@ -232,6 +347,13 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       }
     },
     async (request, reply) => {
+      // Enforce the SAME descriptive-metadata caps on the update path (issue
+      // #562) so a PATCH cannot grow a document past a bound the create path
+      // refuses. Only present fields are checked (an absent field is untouched).
+      const violation = checkCollectionMetadataCaps(request.body);
+      if (violation) {
+        return reply.code(400).send({ error: 'metadata_cap_exceeded', ...violation });
+      }
       // repo.update throws CollectionNotFoundError (-> 404) for an unknown id.
       const collection = await repo.update(request.params.id, request.body);
       return reply.code(200).send(collection);
