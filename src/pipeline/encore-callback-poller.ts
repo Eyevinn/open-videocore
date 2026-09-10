@@ -883,6 +883,46 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   const controller = new AbortController();
   const { signal } = controller;
 
+  // Dedicated connection for the blocking BZPOPMIN call (root cause of a
+  // production incident on stack "ovctest", 2026-09-10 — see
+  // docs/osc-feedback and the eng-open-videocore-agents PR that logged it).
+  //
+  // deps.redis is a SHARED IORedis client: the same connection object backs
+  // every other Valkey call in the process — makeScalingEncoreClient.submit's
+  // lpush/hset, WorkspaceEncoreScalerRegistry status reads, the /scaler/status
+  // route, etc. (src/main.ts wires the one `redis` instance into all of
+  // those). Redis commands on a single connection are answered strictly in
+  // FIFO order, so a BLOCKING command occupies that connection for its full
+  // duration. This loop reissues BZPOPMIN back-to-back with ~zero idle time
+  // (a fresh call is sent the instant the previous one resolves), so the
+  // shared connection is in-flight on a blocking call almost continuously.
+  // Any other command queued behind it (e.g. the transcode submit path's
+  // `hset encore:job-status:<stack>`) must wait for that call to finish —
+  // up to BZPOPMIN_TIMEOUT_SECONDS (5s) — before it is even sent. That
+  // contends directly with withDependencyTimeout's own 5000ms bound
+  // (src/encore-scaler/dependency-timeout.ts, #616/#634), so submit-path
+  // writes routinely lose the race and fail with a DependencyUnreachableError
+  // even though Valkey itself answers in single-digit milliseconds — the
+  // encode had already completed successfully by the time the job was
+  // reported "failed" (see docs/osc-feedback/incoming-redis-status-write-
+  // timeout-permanently-fails-succeeded-job.md in eng-open-videocore-agents).
+  //
+  // ioredis's own guidance is that a connection issuing a blocking command
+  // must be dedicated to it (see ioredis README, "Blocking commands"). Use
+  // .duplicate() to open a second connection with the same options as
+  // deps.redis, reserved for BZPOPMIN only; every other command in this file
+  // keeps using deps.redis unchanged.
+  const blockingRedis = deps.redis.duplicate();
+  // ioredis emits 'error' on connection failures; without a listener Node
+  // treats it as an unhandled 'error' event. deps.redis relies on ioredis's
+  // own internal handling (no explicit listener elsewhere in this codebase),
+  // but that suppression is per-instance, so this duplicated connection needs
+  // its own no-op listener — reconnection is still handled internally by
+  // ioredis's default retryStrategy; we only log for operator visibility.
+  blockingRedis.on('error', (err) => {
+    deps.logger.warn({ msg: 'encore-callback-poller: blocking connection error', err });
+  });
+
   deps.logger.info({ msg: 'encore-callback-poller: starting', queueKey, processingKey });
 
   // Fallback sweep: periodically poll all Encore instances for terminal jobs
@@ -914,8 +954,11 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
       let score: number | undefined;
       try {
         // BZPOPMIN blocks up to the timeout, then returns null so the loop can
-        // check the abort signal and remain cancellable.
-        const popped = await deps.redis.bzpopmin(queueKey, BZPOPMIN_TIMEOUT_SECONDS);
+        // check the abort signal and remain cancellable. Issued on the
+        // dedicated blockingRedis connection (see comment on its
+        // construction above) so it never holds up deps.redis, which every
+        // other command in the process shares.
+        const popped = await blockingRedis.bzpopmin(queueKey, BZPOPMIN_TIMEOUT_SECONDS);
         if (signal.aborted) break;
         if (!popped) continue;
         // bzpopmin returns [key, member, score]; the member is our JSON message.
@@ -949,5 +992,10 @@ export function startEncoreCallbackPoller(deps: PollerDeps): () => void {
   return () => {
     controller.abort();
     clearInterval(sweepTimer);
+    // Release the dedicated blocking connection. The in-flight BZPOPMIN (if
+    // any) will still resolve/timeout server-side, but .disconnect() drops
+    // our end immediately rather than waiting on it — deactivateScaler
+    // callers expect stop() to return promptly (issue #103).
+    blockingRedis.disconnect();
   };
 }

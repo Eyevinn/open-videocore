@@ -160,6 +160,22 @@ class FakeRedis {
   zmembers(key: string): string[] {
     return [...this.zset(key).keys()];
   }
+
+  // startEncoreCallbackPoller opens a dedicated connection for its blocking
+  // BZPOPMIN loop via deps.redis.duplicate(), attaches a no-op 'error'
+  // listener to it, and calls .disconnect() on stop() (see the "Dedicated
+  // connection for the blocking BZPOPMIN call" comment in
+  // encore-callback-poller.ts). Sharing the underlying maps keeps the
+  // duplicate reading/writing the SAME in-memory store the test asserts
+  // against, matching real ioredis semantics where .duplicate() opens a
+  // second connection to the SAME server/dataset.
+  duplicate(): FakeRedis {
+    return this;
+  }
+  on(): this {
+    return this;
+  }
+  disconnect(): void {}
 }
 
 const OSC_CONTEXT_STUB = {
