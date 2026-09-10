@@ -348,6 +348,44 @@ function assertRecordHasNoSecret(record: StorageBackendRecord): void {
   }
 }
 
+// The source-role credential surface the ephemeral eyevinn-ffmpeg-s3 job body
+// takes (ADR-017 C3/D4). It mirrors the ffmpeg-s3 field names verified in
+// external-storage-credentials.ts:155-180 and osc-thumbnail.ts:69-75 /
+// osc-rewrap.ts:16-18: awsAccessKeyId / awsSecretAccessKey / s3EndpointUrl
+// (+ optional awsSessionToken / awsRegion). CRITICAL: the two secret fields
+// carry the `{{secrets.<name>}}` REFERENCE (not the literal), so the resolved
+// value can be spread straight into a createJob body without ever exposing — or
+// persisting — the credential in the API process or in a stored job record
+// (issue #548 acceptance). The literal secret was written once, per consuming
+// serviceId, at register() time and lives only in OSC secrets.
+export type SourceBackendJobCredentials = {
+  bucket: string;
+  awsAccessKeyId: string;
+  awsSecretAccessKey: string; // `{{secrets.<name>}}` reference
+  s3EndpointUrl?: string;
+  awsRegion?: string;
+  awsSessionToken?: string; // `{{secrets.<name>}}` reference (when a token was registered)
+};
+
+// The OSC secret-reference form `{{secrets.<name>}}` the create/job body embeds
+// (verified: secretRef in provision.ts:585-593). Kept identical so a registered
+// backend's secret resolves exactly as a provision-time secret does.
+export function secretReference(name: string): string {
+  return `{{secrets.${name}}}`;
+}
+
+// Thrown when an ingest references an external backend id/name that is not
+// registered for the workspace, or is registered but cannot serve the source
+// role. The router maps it to 400 (bad reference) rather than 404, to avoid
+// leaking which ids exist.
+export class UnknownSourceBackendError extends Error {
+  readonly statusCode = 400;
+  constructor(ref: string) {
+    super(`no registered source backend matches "${ref}"`);
+    this.name = 'UnknownSourceBackendError';
+  }
+}
+
 // Thrown when a caller tries to remove the implicit OSC-managed default backend
 // (ADR-017 D3: the default is not deletable). The router maps it to 409.
 export class DefaultBackendNotDeletableError extends Error {
@@ -505,6 +543,97 @@ export class StorageBackendRegistry {
     return [defaultBackendView(), ...views];
   }
 
+  // Resolve a single registered backend by its stable id, redacted. Returns the
+  // implicit OSC-managed default's view for id 'default' (it is synthesised, not
+  // stored — mirrors list()), and undefined for an unknown id. Added for the
+  // named-export-destination lookup (issue #572 / ADR-018 D1: "A destination must
+  // be resolvable by a stable id/name"): a caller — or a later job-reference
+  // sub-issue — resolves a destination by id through the SAME registry records
+  // and the SAME redaction, never echoing the secret.
+  async get(workspaceId: string, id: string): Promise<RegisteredBackendView | undefined> {
+    if (id === DEFAULT_BACKEND_ID) {
+      return defaultBackendView();
+    }
+    const record = await this.records.get(workspaceId, id);
+    return record ? redactBackend(record) : undefined;
+  }
+
+  // Look a registered backend up by id OR by name (case-sensitive name match),
+  // scoped to the workspace. Returns undefined for the implicit default (which
+  // is synthesised, not stored) and for any unknown reference. Used by ingest
+  // to resolve a caller's `sourceBackend` reference to a stored record.
+  async findByRef(
+    workspaceId: string,
+    ref: string
+  ): Promise<StorageBackendRecord | undefined> {
+    const byId = await this.records.get(workspaceId, ref);
+    if (byId) return byId;
+    const all = await this.records.list(workspaceId);
+    return all.find((r) => r.name === ref);
+  }
+
+  // Resolve a referenced source backend into the eyevinn-ffmpeg-s3 job-body
+  // credential fields (ADR-017 C3/D4). The two secret fields carry the
+  // `{{secrets.<name>}}` REFERENCE, built from the exact per-serviceId secret
+  // names the register() fan-out saved under (backendSecretName +
+  // ffmpegS3CredentialMapping's role-qualified purposes), so a probe/transcode
+  // job reads the source directly from the external bucket while the literal
+  // credential never re-enters the API process or a stored job record (issue
+  // #548 acceptance).
+  //
+  // Throws UnknownSourceBackendError if the reference matches no registered
+  // backend, or matches one that does not serve the source role. The implicit
+  // OSC-managed default is intentionally NOT resolvable here: an ingest with no
+  // sourceBackend uses the default path unchanged (ADR-017 D3), so callers must
+  // only pass this method an explicit external reference.
+  async resolveSourceCredentials(
+    workspaceId: string,
+    ref: string
+  ): Promise<SourceBackendJobCredentials> {
+    const record = await this.findByRef(workspaceId, ref);
+    if (!record) throw new UnknownSourceBackendError(ref);
+    if (record.role !== 'source' && record.role !== 'both') {
+      throw new UnknownSourceBackendError(ref);
+    }
+    // Rebuild the ffmpeg-s3 field-name mapping so the field names and the
+    // role-qualified secret purposes are the SINGLE source of truth (they must
+    // match exactly what register() saved). We pass the non-secret accessKeyId
+    // as the literal (it is not a secret) and a placeholder for the secret value
+    // (never used — we take only the mapping's field names + purposes here).
+    // The credential VALUES here are placeholders: resolveSourceCredentials
+    // reads only the mapping's field NAMES + role-qualified purposes to build
+    // `{{secrets.<name>}}` references — never the value. A non-empty placeholder
+    // is required for the optional session-token field to be emitted (the
+    // mapping gates it on truthiness), which is why we pass a marker rather than
+    // an empty string.
+    const PLACEHOLDER = 'UNUSED_PLACEHOLDER_NOT_A_SECRET';
+    const mapping = ffmpegS3CredentialMapping(
+      {
+        bucket: record.bucket,
+        accessKeyId: record.accessKeyId,
+        secretAccessKey: PLACEHOLDER,
+        ...(record.region ? { region: record.region } : {}),
+        ...(record.endpointUrl ? { endpointUrl: record.endpointUrl } : {}),
+        ...(record.hasSessionToken ? { sessionToken: PLACEHOLDER } : {})
+      },
+      'source'
+    );
+    const out: SourceBackendJobCredentials = {
+      bucket: record.bucket,
+      awsAccessKeyId: record.accessKeyId,
+      // Filled from the mapping's secrets below.
+      awsSecretAccessKey: '',
+      ...(record.endpointUrl ? { s3EndpointUrl: record.endpointUrl } : {}),
+      ...(record.region ? { awsRegion: record.region } : {})
+    };
+    for (const secret of mapping.secrets) {
+      const ref2 = secretReference(backendSecretName(record.id, secret.purpose));
+      if (secret.field === 'awsSecretAccessKey') out.awsSecretAccessKey = ref2;
+      else if (secret.field === 'awsSessionToken') out.awsSessionToken = ref2;
+    }
+    return out;
+  }
+
   // Remove a registered backend. The implicit default (id 'default') is NOT
   // deletable (ADR-017 D3) -> throws DefaultBackendNotDeletableError. Removing an
   // unknown id is an idempotent no-op (mirrors collections DELETE,
@@ -517,4 +646,58 @@ export class StorageBackendRegistry {
     }
     await this.records.delete(workspaceId, id);
   }
+
+  // Resolve a registered backend by its id OR its human name, for a workspace
+  // (issue #549, output/transcode-package wiring under #524 / ADR-017 D4).
+  // Returns the NON-SECRET record so a caller can read the backend's coordinates
+  // (bucket / endpointUrl / …) at JOB TIME to target its packaged output there.
+  //
+  // The credential the destination write needs was already fanned out to the
+  // consuming serviceIds' OSC secrets at registration time (register(), ADR-017
+  // D1.1); this resolver deliberately exposes ONLY the non-secret record and
+  // NEVER the secret material — the secret is resolved by the consuming service
+  // via its `{{secrets.<name>}}` reference, not read back here.
+  //
+  // The implicit OSC-managed default (id 'default') resolves to undefined: it is
+  // NOT an external backend (defaultBackendView widens its type, backend-registry
+  // line 106-121), so a caller referencing 'default' must fall through to the
+  // unchanged default output path (ADR-017 D3) rather than treat it as an
+  // external destination. An unknown id/name also resolves to undefined so the
+  // caller can 422 a dangling reference before dispatching a job.
+  async resolveForOutput(
+    workspaceId: string,
+    idOrName: string
+  ): Promise<StorageBackendRecord | undefined> {
+    if (idOrName === DEFAULT_BACKEND_ID) {
+      return undefined;
+    }
+    const byId = await this.records.get(workspaceId, idOrName);
+    if (byId) {
+      return byId;
+    }
+    // Fall back to a case-sensitive name match (names are operator-chosen and
+    // not guaranteed unique; the FIRST match wins, mirroring how list() returns
+    // them). id lookup is preferred above because it is unambiguous.
+    const all = await this.records.list(workspaceId);
+    return all.find((r) => r.name === idOrName);
+  }
+}
+
+// Translate a resolved external backend record into the per-execution
+// `destinationBucket` override string the post-package relocation path already
+// consumes (issue #549; ADR-011 relocation mechanism + ADR-017 D4). The
+// relocation edge/parser (output-relocation.ts parseDestination,
+// assets.ts destinationBucketSchema) accepts EITHER a plain `bucket/prefix/`
+// path OR an `s3://bucket/…/` URI, trailing-slash-terminated. We emit the
+// `s3://<bucket>/` form (matching packagerOutputFolder, external-storage-
+// credentials.ts:75-81) so a cross-endpoint external bucket is recognised as an
+// external S3 URI and NOT reachability-probed against the default MinIO client
+// (assets.ts:1561 `isExternalS3Uri`). NEVER embeds credentials — the endpoint
+// and keys live in OSC secrets, resolved by the consuming service.
+export function backendOutputDestination(record: StorageBackendRecord): string {
+  const bare = record.bucket
+    .replace(/^s3:\/\//i, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+  return `s3://${bare}/`;
 }

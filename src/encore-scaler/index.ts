@@ -13,6 +13,7 @@ import {
   sanitizeEndpoint,
   withDependencyTimeout
 } from './dependency-timeout.js';
+import { assertUnderJobThroughputCap } from './job-throughput-cap.js';
 
 export { EncoreScalerLoop } from './scaler-loop.js';
 export { encoreScalerRouter } from './encore-scaler-router.js';
@@ -28,6 +29,14 @@ export function makeScalingEncoreClient(config: EncoreScalerConfig): EncoreClien
   const dependencyTimeoutMs = resolveDependencyTimeoutMs();
   return {
     async submit(input) {
+      // Optional operator-configured job-throughput cap (issue #580): reject the
+      // submission up front with a 429 (JobThroughputCapExceededError) when
+      // accepting one more job would exceed the configured ceiling, instead of
+      // silently growing an unbounded backlog. Checked BEFORE the enqueue writes,
+      // against the scaler's own Valkey queue/inflight state (single source of
+      // truth — no parallel counter). No-op when config.maxQueuedJobs is unset.
+      await assertUnderJobThroughputCap(redis, workspaceId, config.maxQueuedJobs);
+
       const payload = toEncorePayload(input);
       const job: QueuedJob = {
         jobId: input.externalId,

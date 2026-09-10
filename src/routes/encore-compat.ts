@@ -27,8 +27,12 @@
 //     { name, sourceMethod?: 'url-pull', originUri? }.
 //   - src/data/job-repo.ts — JobRepository.findByEncoreJobId(id) returns
 //     { job: Job } | undefined; Job.status ∈ 'pending'|'running'|'done'|'failed'.
-//   - src/auth/workspace.ts — DEPLOYMENT_CONTEXT ('default'), the fixed context
-//     token embedded in the encoreJobId (OSC provides structural isolation).
+//   - src/auth/workspace.ts — DEPLOYMENT_CONTEXT ('default'), the fallback
+//     context token embedded in the encoreJobId when no per-stack context
+//     resolves (OSC provides structural isolation). Issue #615: the submit now
+//     resolves the EFFECTIVE stack per request via resolveStackContext (threaded
+//     from X-Stack-Name), at parity with /assets/:id/transcode; DEPLOYMENT_CONTEXT
+//     is only the fallback for the env-override single-stack / test path.
 //   - src/pipeline/encode-presets.ts — PRESET_NAMES = ['1080p','720p','480p'].
 //
 // Auth: unauthenticated by design, matching Encore's own submit API. The OSC
@@ -45,6 +49,7 @@ import {
 import { InMemoryJobRepository, type JobRepository, type JobStatus } from '../data/job-repo.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
+import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { PRESET_NAMES, type PresetName } from '../pipeline/encode-presets.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
@@ -55,6 +60,17 @@ export type EncoreCompatRouterOptions = {
   // Encore transcode client (the auto-scaler pool). When absent, submit
   // responds 501 (transcoding is not configured on this deployment).
   encore?: EncoreClient;
+  // Resolve the EFFECTIVE stack identity a compat submit routes to (issue #615),
+  // at parity with the native POST /assets/:id/transcode route (assets.ts
+  // transcodeContext). Given the request's X-Stack-Name header (or undefined for
+  // the workspace default) it returns the stack name to KEY the Encore
+  // auto-scaler pool / Valkey queue / MinIO endpoint by, so a compat submit
+  // against a healthy named stack is never routed to whichever stack was
+  // provisioned first in the process. When absent (tests, env-override
+  // single-stack deployments) or when it resolves undefined (no provisioned
+  // stack / store unconfigured), the submit falls back to the fixed
+  // DEPLOYMENT_CONTEXT — unchanged pre-#615 behaviour.
+  resolveStackContext?: (requestedStackName?: string) => Promise<string | undefined>;
   // S3 buckets Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
@@ -123,6 +139,16 @@ const dependencyUnreachableSchema = z.object({
   message: z.string()
 });
 
+// Machine-readable body for a 429 when the operator-configured job-throughput
+// cap is exceeded (issue #580). Names the configured ceiling and the observed
+// outstanding-job count so a caller can back off and retry.
+const jobThroughputCapSchema = z.object({
+  error: z.literal('job_throughput_cap_exceeded'),
+  cap: z.number(),
+  outstanding: z.number(),
+  message: z.string()
+});
+
 // Map our internal Job.status to the Encore job status vocabulary the caller
 // expects. pending/queued -> QUEUED, running -> IN_PROGRESS, done -> SUCCESSFUL,
 // failed -> FAILED.
@@ -177,6 +203,7 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
         body: encoreJobSchema,
         response: {
           200: encoreJobResponseSchema,
+          429: jobThroughputCapSchema,
           501: errorSchema,
           502: errorSchema,
           504: dependencyUnreachableSchema
@@ -212,6 +239,19 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
         ? (profileName as PresetName)
         : undefined;
 
+      // Resolve the EFFECTIVE stack this submit routes to (issue #615), at parity
+      // with the native /assets/:id/transcode route: thread the request's
+      // X-Stack-Name header through resolveStackContext so the scaler pool /
+      // Valkey queue / MinIO endpoint are keyed by the named stack rather than
+      // the first-provisioned one. Falls back to the fixed DEPLOYMENT_CONTEXT when
+      // no resolver is wired (tests / env-override) or nothing resolves.
+      const stackHeader = request.headers['x-stack-name'];
+      const requestedStackName =
+        typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
+      const workspaceId = opts.resolveStackContext
+        ? (await opts.resolveStackContext(requestedStackName)) ?? DEPLOYMENT_CONTEXT
+        : DEPLOYMENT_CONTEXT;
+
       // The scaler injects progressCallbackUri at dispatch time, pointing at the
       // callback listener paired with the chosen Encore instance (ADR-006), which
       // drives completion + our own webhooks. A caller-supplied
@@ -228,7 +268,7 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
       try {
         const result = await submitTranscode(
           {
-            workspaceId: DEPLOYMENT_CONTEXT,
+            workspaceId,
             sourceAssetId: asset.id,
             // The source is read from its origin URI by Encore; the object key
             // is the URI so submitTranscode builds an s3:// input against the
@@ -277,6 +317,12 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
             'encore-compat submit failed: stack dependency unreachable'
           );
           return reply.code(504).send(err.toResponseBody());
+        }
+        // Optional operator-configured job-throughput cap exceeded (issue #580):
+        // return the documented machine-readable 429 + reason code rather than
+        // silently queueing unboundedly.
+        if (isJobThroughputCapExceededError(err)) {
+          return reply.code(err.statusCode).send(err.toResponseBody());
         }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });

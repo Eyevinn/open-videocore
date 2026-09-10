@@ -1,10 +1,14 @@
 // Authentication middleware.
 //
 // Extracts the OSC access token from the Authorization header and gates the
-// request on its presence. Tenant isolation is structural (ADR-003): a deployed
-// instance is a single stack, so there is no per-request workspace to resolve —
-// the hook only rejects anonymous traffic (401) before the handler runs. It sets
-// `request.authenticated` so the connection-resolving preHandler can gate on it.
+// request on its presence. Tenant isolation is structural (ADR-018 decision 3 —
+// the authoritative auth/tenancy ADR; the prior "ADR-003" citation was a stale
+// doc gap ADR-018 corrects): a deployed instance is a single stack, so there is
+// no per-request workspace to resolve — the hook only rejects anonymous traffic
+// (401) before the handler runs. It sets `request.authenticated` so the
+// connection-resolving preHandler can gate on it. The 401 presence gate here is
+// DISTINCT from the 403 authorisation failure the role gate returns
+// (src/auth/authorize.ts, ADR-018 decision 5).
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AuthError, requireAuth } from './workspace.js';
