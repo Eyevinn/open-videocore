@@ -2437,7 +2437,8 @@ Retention
   Response
 Response 200 (application/json)
 {
-  "retentionMs": 0
+  "retentionMs": 0,
+  "auditRetentionMs": 0
 }
 
   PATCH /api/v1/retention/config
@@ -2447,13 +2448,15 @@ Response 200 (application/json)
   Request
 Request body (application/json)
 {
-  "retentionMs": 0
+  "retentionMs": 0,
+  "auditRetentionMs": 0
 }
 
   Response
 Response 200 (application/json)
 {
-  "retentionMs": 0
+  "retentionMs": 0,
+  "auditRetentionMs": 0
 }
 
 ---

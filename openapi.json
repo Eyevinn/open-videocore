@@ -16580,10 +16580,15 @@
                     "retentionMs": {
                       "type": "integer",
                       "minimum": 0
+                    },
+                    "auditRetentionMs": {
+                      "type": "integer",
+                      "minimum": 0
                     }
                   },
                   "required": [
-                    "retentionMs"
+                    "retentionMs",
+                    "auditRetentionMs"
                   ],
                   "additionalProperties": false
                 }
@@ -16606,6 +16611,10 @@
                   "retentionMs": {
                     "type": "integer",
                     "minimum": 0
+                  },
+                  "auditRetentionMs": {
+                    "type": "integer",
+                    "minimum": 0
                   }
                 },
                 "additionalProperties": false
@@ -16624,10 +16633,15 @@
                     "retentionMs": {
                       "type": "integer",
                       "minimum": 0
+                    },
+                    "auditRetentionMs": {
+                      "type": "integer",
+                      "minimum": 0
                     }
                   },
                   "required": [
-                    "retentionMs"
+                    "retentionMs",
+                    "auditRetentionMs"
                   ],
                   "additionalProperties": false
                 }
