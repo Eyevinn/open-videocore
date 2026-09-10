@@ -1424,6 +1424,11 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
   profileRepository,
+  // Collection membership lookup (issue #570): the asset DELETE route uses it to
+  // block archiving an asset still a member of one or more collections (ADR-020
+  // reason `member_of_collection`). Same repo instance the collections router
+  // uses, so the membership view is consistent.
+  collectionRepository,
   // Best-effort audit emission for asset mutations (issue #564).
   audit: auditEmitter
 };

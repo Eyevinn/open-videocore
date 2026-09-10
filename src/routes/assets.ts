@@ -37,6 +37,15 @@ import {
   type PackagedOutput,
   type SubtitleTrack
 } from '../data/asset-repo.js';
+// Collection membership (issue #570). The asset DELETE route blocks archiving an
+// asset that is still a member of one or more collections; the collection repo
+// owns the authoritative membership representation (the flat `assetIds` list,
+// collection-repo.ts) and the error shape that maps to the shared ADR-020
+// `delete_blocked` envelope with reason `member_of_collection`.
+import {
+  AssetMemberOfCollectionError,
+  type CollectionRepository
+} from '../data/collection-repo.js';
 // TAMS validation primitives (ADR-008, issue #165). Reused, NOT re-declared, so
 // the lookup query grammar stays 1:1 with the persisted asset-document grammar.
 import { TamsFlowIdSchema, TamsTimerangeSchema } from '../data/asset-document.js';
@@ -871,6 +880,13 @@ type AssetsRouterOptions = {
   // not exercise named profiles), both checks are skipped (permissive) and the
   // profile name is forwarded as before.
   profileRepository?: ProfileRepository;
+  // Collection membership lookup (issue #570). Used ONLY by DELETE /:id to
+  // detect whether the asset is still a member of one or more collections
+  // (ADR-020 reason `member_of_collection`) before archiving it. Read-only from
+  // the route's side (`collectionsContainingAsset`). When absent (e.g. tests
+  // that do not exercise collection membership), the membership check is skipped
+  // and DELETE behaves exactly as before.
+  collectionRepository?: CollectionRepository;
   // Best-effort audit emission (issue #564). Wired to the append-only audit
   // store's `record()` write primitive. When absent, mutations proceed
   // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
@@ -1924,6 +1940,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         message: err.message,
         reason: 'delete_protected',
         blockedBy: { jobIds: [], collectionIds: [] }
+      });
+    }
+    // Member-of-collection block (issue #570): the SAME shared `delete_blocked`
+    // envelope (ADR-020 decision 1), reason `member_of_collection`, with the
+    // blocking collection ids in `blockedBy.collectionIds`. Soft/overridable via
+    // `?force=true` (handled at the route before this throws).
+    if (err instanceof AssetMemberOfCollectionError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'member_of_collection',
+        blockedBy: { jobIds: [], collectionIds: [...err.collectionIds] }
       });
     }
     // In-flight job reference (ADR-020 decision 1, issue #569): the same shared
@@ -4277,6 +4305,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
       schema: {
         params: z.object({ id: z.string() }),
+        // `?force=true` (ADR-020 decision 2) overrides the SOFT
+        // member_of_collection block. It never defeats the HARD explicit lock or
+        // the pre-existing has_children integrity block. `z.coerce.boolean()`
+        // matches the established force convention (cf. profiles.ts POST /seed).
+        querystring: z.object({ force: z.coerce.boolean().optional() }),
         // 409 covers BOTH the pre-existing `has_children` block (the base
         // `{ error, message? }` envelope) and the new explicit-lock
         // `delete_blocked` envelope (ADR-020). A union keeps the has_children
@@ -4315,6 +4348,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const childCount = await repo.countChildren(request.params.id);
       if (childCount > 0) {
         throw new HasChildrenError(request.params.id);
+      }
+      // Member-of-collection block (issue #570). If the asset is still a member
+      // of one or more collections, block the archive with the shared
+      // `delete_blocked` envelope (reason `member_of_collection`) rather than
+      // silently orphaning the collection grouping. This is a SOFT block:
+      // `?force=true` proceeds (ADR-020 decision 2 — membership is a loose,
+      // non-authoritative grouping). Checked LAST (lowest ADR-020 precedence,
+      // below delete_protected and has_children) and only when a collection
+      // repo is wired; membership is queried non-mutatingly via
+      // `collectionsContainingAsset`.
+      if (!request.query.force && opts.collectionRepository) {
+        const collectionIds = await opts.collectionRepository.collectionsContainingAsset(
+          request.params.id
+        );
+        if (collectionIds.length > 0) {
+          throw new AssetMemberOfCollectionError(request.params.id, collectionIds);
+        }
       }
       // Soft delete: archive rather than destroy (see asset-repo / couch-asset-repo).
       const removed = await repo.remove(request.params.id);

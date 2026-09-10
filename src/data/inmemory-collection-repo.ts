@@ -56,6 +56,16 @@ export class InMemoryCollectionRepository implements CollectionRepository {
     return copy(collection);
   }
 
+  // Non-mutating membership lookup (issue #570). Scans this workspace's
+  // collections and returns the ids of those whose `assetIds` contains the
+  // asset. Read-only — no store mutation.
+  async collectionsContainingAsset(assetId: string): Promise<string[]> {
+    return [...this.store.values()]
+      .filter((c) => c.assetIds.includes(assetId))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((c) => c.id);
+  }
+
   // Partial editorial update of descriptive metadata (issue #560). Applies only
   // the present keys of `patch` (description/tags/custom) wholesale, leaving
   // membership, name, and the delete-lock untouched.

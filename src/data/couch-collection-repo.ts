@@ -67,6 +67,21 @@ export class CouchCollectionRepository implements CollectionRepository {
     return fromDoc(doc);
   }
 
+  // Non-mutating membership lookup (issue #570). Enumerates this workspace's
+  // collection documents (same partitioned `find` the `list` path uses) and
+  // returns the ids of those whose `assetIds` contains the asset. Read-only —
+  // it performs no `put`/`remove`.
+  async collectionsContainingAsset(assetId: string): Promise<string[]> {
+    const couch = this.couchFor();
+    const docs = await couch.find({ resourceType: RESOURCE_TYPE }, { limit: 1000 });
+    return docs
+      .filter((d) => d.resourceType === RESOURCE_TYPE)
+      .map(fromDoc)
+      .filter((c) => c.assetIds.includes(assetId))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((c) => c.id);
+  }
+
   // Partial editorial update of descriptive metadata (issue #560). Routed through
   // the shared conflict-retry wrapper (updateWithRetry) — the same `_rev`
   // merge-retry the asset editorial write uses (ADR-005 / issue #278, see

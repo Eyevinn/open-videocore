@@ -104,6 +104,14 @@ export interface CollectionRepository {
   create(input: CreateCollectionInput): Promise<Collection>;
   list(): Promise<Collection[]>;
   get(id: string): Promise<Collection | undefined>;
+  // Non-mutating membership lookup (issue #570): return the ids of every
+  // collection in the caller's workspace whose flat `assetIds` list (the
+  // authoritative membership representation, collection-repo.ts:31) contains
+  // `assetId`. Used by the asset DELETE route to block archiving an asset that
+  // is still a member of one or more collections (ADR-020 reason
+  // `member_of_collection`). Read-only: it never mutates a collection. Returns
+  // `[]` when the asset is a member of no collection.
+  collectionsContainingAsset(assetId: string): Promise<string[]>;
   // Partial editorial update of descriptive metadata (issue #560). Applies the
   // present keys of `patch` (description/tags/custom) wholesale and returns the
   // updated collection. Throws CollectionNotFoundError (-> 404) for an
@@ -131,6 +139,45 @@ export class CollectionDeleteProtectedError extends Error {
   constructor(id: string) {
     super(`collection ${id} is protected from deletion by an explicit lock`);
     this.name = 'CollectionDeleteProtectedError';
+  }
+}
+
+// Raised when deleting a collection that is still IN USE — i.e. it still holds
+// one or more asset ids in its flat `assetIds` membership list (issue #570).
+// The reference check that guards this was previously missing on collection
+// DELETE. The route maps this to the shared `delete_blocked` envelope
+// (ADR-020 decision 1) with reason `member_of_collection` and the collection's
+// own id in `blockedBy.collectionIds` (the reference that blocks). This is a
+// SOFT block: `?force=true` overrides it (ADR-020 decision 2 —
+// member_of_collection is a loose, non-authoritative grouping, so an explicit
+// force may proceed and simply drops the grouping).
+export class CollectionInUseError extends Error {
+  readonly statusCode = 409;
+  constructor(
+    readonly id: string,
+    readonly assetIds: readonly string[]
+  ) {
+    super(`collection ${id} is in use (${assetIds.length} member asset(s))`);
+    this.name = 'CollectionInUseError';
+  }
+}
+
+// Raised when archiving an ASSET is blocked because it is still a member of one
+// or more collections (issue #570) -> 409. Carries the blocking collection ids
+// so the caller can act (remove the membership or retry with `?force=true`).
+// The asset DELETE route maps this to the shared `delete_blocked` envelope
+// (ADR-020 decision 1) with reason `member_of_collection` and
+// `blockedBy.collectionIds` = these ids. SOFT block — `?force=true` overrides
+// it (ADR-020 decision 2). Lives in the collection domain because membership is
+// a collection concept; imported by the asset route.
+export class AssetMemberOfCollectionError extends Error {
+  readonly statusCode = 409;
+  constructor(
+    readonly id: string,
+    readonly collectionIds: readonly string[]
+  ) {
+    super(`asset ${id} is a member of ${collectionIds.length} collection(s)`);
+    this.name = 'AssetMemberOfCollectionError';
   }
 }
 
