@@ -26,6 +26,7 @@ import {
   type AssetRepository,
   type AssetReviewState,
   type AssetStatus,
+  type AttachExternalIdInput,
   type CreateAssetInput,
   type ListOptions,
   type ListResult,
@@ -49,6 +50,7 @@ import {
   normalizeTags,
   provenanceForPatch,
   MAX_LIMIT,
+  ExternalIdConflictError,
   ParentNotFoundError
 } from './asset-repo.js';
 import {
@@ -185,6 +187,74 @@ export class CouchAssetRepository implements AssetRepository {
       return undefined;
     }
     return fromDoc(doc);
+  }
+
+  // Attach or change an external identifier (issue #577, ADR-019). DEDICATED
+  // system write path for `administrative.externalIdentifiers`, distinct from
+  // update() (which never touches external ids) — mirroring the setDeleteLock /
+  // setStorageTier seams. The read-modify-write is routed through updateWithRetry
+  // (src/data/couchdb.ts) for the same concurrent-write safety as the other
+  // dedicated write paths (issues #278/#279/#281): the patch is pure and re-runs
+  // safely per attempt.
+  //
+  // PER-NAMESPACE UNIQUENESS: the conflict is detected against the CANONICAL
+  // CouchDB store via getByExternalId — the Mango `$elemMatch` push-down over
+  // `administrative.externalIdentifiers` — NOT the disposable PostgreSQL search
+  // projection (ADR-005: CouchDB is canonical; the PG projection may lag the
+  // `_changes` feed and must never be the uniqueness authority). The check is
+  // re-run INSIDE the retry closure so a racing attach of the same pair on a
+  // different asset is caught on the refetched attempt rather than slipping
+  // through a stale pre-loop read. In advisory mode (enforceUniqueness falsy) the
+  // check is skipped entirely and a duplicate is allowed, preserving pre-#577
+  // behaviour. Attach is idempotent: a pair the asset already carries is a no-op.
+  async attachExternalId(
+    id: string,
+    input: AttachExternalIdInput
+  ): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    // The patchFn is async and read-only (no write side-effects) so it is safe
+    // for updateWithRetry to re-run per attempt — the canonical-store conflict
+    // check (getByExternalId) and the idempotency check are both re-evaluated on
+    // each retry against the freshly refetched document.
+    const written = await updateWithRetry(couch, id, async (current) => {
+      const existing = fromDoc(current);
+      // Idempotent no-op: the asset already carries this exact pair.
+      const already = existing.externalIdentifiers?.some(
+        (e) => e.namespace === input.namespace && e.id === input.id
+      );
+      if (already) {
+        updated = existing;
+        return toDoc(existing);
+      }
+      // Canonical-store uniqueness gate (only when enforced). A pair resolving to
+      // a DIFFERENT asset is a conflict; a resolve to THIS asset is the
+      // idempotent no-op handled above. Reads the canonical CouchDB store via
+      // getByExternalId, never the PG projection (ADR-005). Throwing aborts the
+      // write and propagates as 409 `external_id_conflict`.
+      if (input.enforceUniqueness) {
+        const owner = await this.getByExternalId(input.namespace, input.id);
+        if (owner && owner.id !== id) {
+          throw new ExternalIdConflictError(input.namespace, input.id, owner.id);
+        }
+      }
+      const now = new Date().toISOString();
+      const next: Asset = {
+        ...existing,
+        externalIdentifiers: [
+          ...(existing.externalIdentifiers ?? []),
+          { namespace: input.namespace, id: input.id }
+        ],
+        updatedAt: now
+      };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
   }
 
   async list(opts: ListOptions = {}): Promise<ListResult> {
