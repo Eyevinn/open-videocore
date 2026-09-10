@@ -42,6 +42,15 @@ import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
 import { exportDestinationsRouter } from './routes/export-destinations.js';
 import { WorkspaceStorage } from './data/storage.js';
+import { couchServer, StackCouch } from './data/couchdb.js';
+import {
+  StorageQuotaGuard,
+  CouchStorageQuotaStore,
+  InMemoryStorageQuotaStore,
+  storageCapBytesFromEnv,
+  type StorageQuotaStore
+} from './data/storage-quota.js';
+import { StorageQuotaReconciler } from './data/storage-quota-reconcile.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
@@ -80,7 +89,11 @@ import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
-import { retentionRouter, archiveRetentionMsFromEnv } from './routes/retention.js';
+import {
+  retentionRouter,
+  archiveRetentionMsFromEnv,
+  auditRetentionMsFromEnv
+} from './routes/retention.js';
 import { logsRouter } from './routes/logs.js';
 import { LogStore } from './services/log-store.js';
 import {
@@ -88,6 +101,10 @@ import {
   archivePurgeIntervalMsFromEnv
 } from './pipeline/archived-asset-purge-loop.js';
 import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
+import {
+  AuditRetentionPurgeLoop,
+  auditPurgeIntervalMsFromEnv
+} from './pipeline/audit-retention-purge-loop.js';
 import {
   WatchFolderService,
   watchFolderEnabled,
@@ -114,6 +131,8 @@ import {
 } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
+import { Client as MinioClient } from 'minio';
+import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import {
@@ -451,7 +470,44 @@ await app.register(provisionRouter, {
   // this register() call runs. This getter reads that outer binding on demand
   // so the DELETE route can reach the current registry for teardown (#123)
   // without depending on registration-time ordering.
-  getScalerRegistry: () => scalerRegistry
+  getScalerRegistry: () => scalerRegistry,
+  // Build per-stack reachability probe clients for GET /:name/reachability
+  // (issue #617) from the SAME stored StackConfig coordinates the resolver and
+  // scaler use — never process-global endpoints. The queue probe is a lazily-
+  // connected IORedis on the stack's Valkey URL (config.redisUrl, credential-
+  // free `redis://host:port` — see redisUrlFrom in routes/provision.ts); the
+  // storage probe is a MinioClient on config.minioEndpoint with the deployment
+  // MinIO admin credentials (identical construction to
+  // workspace-stack.ts buildConnectionsFromStack). Probe clients are
+  // short-lived per request: the lazyConnect IORedis is not kept resident.
+  reachabilityProbeFactory: (config): StackReachabilityDeps => {
+    const deps: StackReachabilityDeps = {};
+    if (config.redisUrl && config.redisUrl.length > 0) {
+      deps.queueClient = new IORedis(config.redisUrl, {
+        lazyConnect: true,
+        maxRetriesPerRequest: null
+      });
+    }
+    const minioPassword = process.env['MINIO_ROOT_PASSWORD'];
+    if (config.minioEndpoint && config.minioEndpoint.length > 0 && minioPassword) {
+      try {
+        const url = new URL(config.minioEndpoint);
+        const useSSL = url.protocol === 'https:';
+        deps.storageClient = new MinioClient({
+          endPoint: url.hostname,
+          port: url.port ? Number(url.port) : useSSL ? 443 : 80,
+          useSSL,
+          accessKey: 'admin',
+          secretKey: minioPassword
+        });
+      } catch {
+        // A malformed stored endpoint leaves storageClient unset: the storage
+        // dependency is then reported not_configured rather than crashing the
+        // diagnostics read.
+      }
+    }
+    return deps;
+  }
 });
 
 // Per-optional-service provision/deprovision/status endpoints (issue #195).
@@ -537,6 +593,29 @@ const storageFor: StorageFactory = (): WorkspaceStorage => {
 const storageAvailable = Boolean(process.env['MINIO_URL']) || Boolean(paramStore);
 if (!storageAvailable) {
   app.log.warn('no MINIO_URL and no parameter store — upload + URL-pull routes disabled');
+}
+
+// Operator-configured total storage cap (issue #579, ADR-020). Single
+// instance-wide counter keyed by DEPLOYMENT_CONTEXT (ADR-020 Decision 1 —
+// NEVER a per-request tenant dimension). The running total is the source of
+// truth (ADR-020 Decision 2): a CouchDB-backed counter (transactional via
+// updateWithRetry MVCC) when COUCHDB_URL is set, otherwise an in-memory counter
+// for bare local runs. The guard is always constructed; when STORAGE_CAP_BYTES
+// is unset/<=0 the guard is a pass-through and ingest behaviour is unchanged
+// (opt-in). Mirrors the env-read + direct StackCouch construction convention in
+// src/services/workspace-stack.ts:257,277.
+const quotaCouchUrl = process.env['COUCHDB_URL'];
+const quotaStore: StorageQuotaStore = quotaCouchUrl
+  ? new CouchStorageQuotaStore(
+      new StackCouch(couchServer(quotaCouchUrl), process.env['COUCHDB_ASSETS_DB'] ?? 'assets')
+    )
+  : new InMemoryStorageQuotaStore();
+const storageQuota = new StorageQuotaGuard({ store: quotaStore, capBytes: storageCapBytesFromEnv });
+if (storageCapBytesFromEnv() !== undefined) {
+  app.log.info(
+    { capBytes: storageCapBytesFromEnv() },
+    'total storage cap configured (issue #579) — ingest admitted through running-total counter'
+  );
 }
 
 // Webhook event dispatcher (issue #13). Fired from the internal OSC callbacks
@@ -676,6 +755,14 @@ const packageStallTimeoutMs = parseInt(process.env['PACKAGE_STALL_TIMEOUT_MS'] |
 // mutable var so PATCH /api/v1/retention/config hot-swaps it with no restart,
 // mirroring how the scaler config PATCH mutates its live vars.
 let archiveRetentionMs = archiveRetentionMsFromEnv();
+
+// Instance-global AUDIT-LOG retention window in ms (issue #566), aligned with
+// the archived-asset purge lifecycle. Read from AUDIT_RETENTION_MS at boot;
+// unset/0 = indefinite retention (never purge), preserving #563's store-only
+// behaviour for every deployment that does not opt in. Held as a live mutable
+// var so PATCH /api/v1/retention/config hot-swaps it with no restart, exactly
+// as archiveRetentionMs is.
+let auditRetentionMs = auditRetentionMsFromEnv();
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -1381,6 +1468,9 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   jobRepository,
   storageFor: storageAvailable ? storageFor : undefined,
   pullDeps,
+  // Total storage cap for URL-pull ingest (issue #579). The worker admits the
+  // pull through this running-total counter.
+  quota: storageQuota,
   probe,
   // External storage-backend registry (issue #548): lets POST /ingest-url
   // reference a registered external backend as the source (ADR-017 D4).
@@ -1408,6 +1498,11 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // profile that cannot run on this platform is rejected 422 before submission
   // (issue #286).
   profileRepository,
+  // Collection membership lookup (issue #570): the asset DELETE route uses it to
+  // block archiving an asset still a member of one or more collections (ADR-020
+  // reason `member_of_collection`). Same repo instance the collections router
+  // uses, so the membership view is consistent.
+  collectionRepository,
   // Best-effort audit emission for asset mutations (issue #564).
   audit: auditEmitter
 };
@@ -1527,6 +1622,9 @@ await app.register(assetUploadRouter, {
   prefix: '/api/v1/assets',
   repository: assetRepository,
   storageFor: storageAvailable ? storageFor : undefined,
+  // Total storage cap for direct-upload ingest (issue #579): proxied PUT
+  // reserves + commits, upload-complete admits post-hoc against the real size.
+  quota: storageQuota,
   onObjectStored
 });
 
@@ -1573,6 +1671,8 @@ let watchFolder: WatchFolderService | undefined =
         bucket: sourceBucket,
         repository: assetRepository,
         log: app.log,
+        // Account direct-drop bytes against the running total (issue #579).
+        quota: storageQuota,
         onObjectStored
       })
     : undefined;
@@ -1666,8 +1766,12 @@ await app.register(scalerRouter, scalerRouterOptions);
 const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/retention',
   retentionMs: archiveRetentionMsFromEnv(),
+  // Boot-time audit-log retention window (issue #566). Exposed on GET
+  // /api/v1/retention/config so an operator can see the effective policy.
+  auditRetentionMs: auditRetentionMsFromEnv(),
   onConfigChange: (cfg) => {
     archiveRetentionMs = cfg.retentionMs;
+    auditRetentionMs = cfg.auditRetentionMs;
   }
 };
 await app.register(retentionRouter, retentionRouterOptions);
@@ -1726,6 +1830,44 @@ const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
   }
 });
 archivedAssetPurgeLoop.start(archivePurgeIntervalMsFromEnv());
+
+// Audit-log retention purge sweep (issue #566), aligned with — and clearly
+// SEPARABLE from — the archived-asset purge sweep above. An INDEPENDENT unref'd,
+// overlap-guarded interval (mirrors ArchivedAssetPurgeLoop, NOT a parallel
+// mechanism) that expires WHOLE audit entries aged past the audit-retention
+// window. It reads the LIVE `auditRetentionMs` each tick, so it honours PATCH
+// /api/v1/retention/config and is skipped entirely while the audit window is
+// unset (0 = indefinite retention). The audit store is ALWAYS present on the
+// resolved connection (issue #565: CouchAuditRepository on Couch-backed stacks,
+// InMemoryAuditRepository on the env-no-couch / in-memory fallback paths), and
+// every concrete store implements the retention surface (listOldestPage /
+// purgeEntry), so each tick resolves the active stack's audit store and drives
+// the sweep directly. On the in-memory fallback the store is empty, so the sweep
+// enumerates nothing and purges nothing — a natural no-op, not a special case.
+const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
+  retentionMs: () => auditRetentionMs,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    // Resolve the active stack's audit store per tick. The sweep drives it via
+    // listOldestPage (enumerate aged tail) + purgeEntry (whole-entry expiry).
+    // `conns.audit` is always present (issue #565), so no null-guard is needed.
+    audit: {
+      listOldestPage: async (opts: { limit: number; offset?: number }) => {
+        const conns = await stackResolver.resolve();
+        return conns.audit.listOldestPage(opts);
+      },
+      purgeEntry: async (id: string) => {
+        const conns = await stackResolver.resolve();
+        return conns.audit.purgeEntry(id);
+      }
+    }
+  }
+});
+auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
@@ -1845,6 +1987,28 @@ void checkProfilesIndexReachable({
 // Env-override path (MINIO_URL): the instance was built at boot; start it now.
 // The service silently no-ops when not configured/enabled.
 watchFolder?.start();
+
+// Start the storage-quota reconciliation sweep (issue #579, ADR-020 Decision 2).
+// Off the write hot path: it periodically streams listObjectsV2 over the source
+// + packaged buckets, sums object sizes, and overwrites the counter's committed
+// total — correcting drift and re-establishing the total after a crash. Only
+// started when a cap is configured AND object storage is reachable; otherwise
+// there is nothing to enforce or sweep. Runs one immediate sweep on boot then on
+// STORAGE_QUOTA_RECONCILE_INTERVAL_MS (default 6h).
+if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
+  const conns = stackResolver.resolveCached();
+  if (conns?.storageClient) {
+    const reconciler = new StorageQuotaReconciler({
+      store: quotaStore,
+      buckets: [
+        new WorkspaceStorage(conns.storageClient, conns.sourceBucket),
+        new WorkspaceStorage(conns.storageClient, conns.packagedBucket)
+      ],
+      onError: (err) => app.log.warn({ err }, 'storage-quota reconciliation sweep failed')
+    });
+    reconciler.start();
+  }
+}
 
 // Parameter-store path (Open Source Cloud, issue #643): if a stack was already
 // provisioned in a previous run (self-discovered from the parameter store),

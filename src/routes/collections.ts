@@ -27,6 +27,7 @@ import { WorkspaceAccessError } from '../data/guard.js';
 import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
 import {
   CollectionDeleteProtectedError,
+  CollectionInUseError,
   CollectionNotFoundError,
   type CollectionRepository
 } from '../data/collection-repo.js';
@@ -256,6 +257,19 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
         blockedBy: { jobIds: [], collectionIds: [] }
       });
     }
+    // Collection-in-use reference check (issue #570): the shared
+    // `delete_blocked` envelope with reason `member_of_collection`. The
+    // blocking reference is the collection's own id (it still holds members),
+    // reported in `blockedBy.collectionIds`. Soft block — overridable by
+    // `?force=true` at the route (ADR-020 decision 2).
+    if (err instanceof CollectionInUseError) {
+      return reply.code(409).send({
+        error: 'delete_blocked',
+        message: err.message,
+        reason: 'member_of_collection',
+        blockedBy: { jobIds: [], collectionIds: [err.id] }
+      });
+    }
     throw err;
   });
 
@@ -366,6 +380,11 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
 
       schema: {
         params: z.object({ id: z.string() }),
+        // `?force=true` (ADR-020 decision 2) overrides the SOFT
+        // member_of_collection in-use block. It never defeats the HARD explicit
+        // lock. `z.coerce.boolean()` matches the established force convention
+        // (cf. profiles.ts POST /seed).
+        querystring: z.object({ force: z.coerce.boolean().optional() }),
         response: { 204: z.null(), 404: errorSchema, 409: deleteBlockedSchema }
       }
     },
@@ -378,6 +397,14 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       const existing = await repo.get(request.params.id);
       if (existing?.deleteLock?.locked) {
         throw new CollectionDeleteProtectedError(request.params.id);
+      }
+      // Reference/usage check (issue #570): a collection still holding member
+      // asset ids is IN USE and must not be silently torn down. This SOFT block
+      // is overridable by `?force=true` (ADR-020 decision 2 — collection
+      // membership is a loose grouping). Runs only when the collection resolves,
+      // so it never leaks existence for an unknown/foreign id.
+      if (!request.query.force && existing && existing.assetIds.length > 0) {
+        throw new CollectionInUseError(request.params.id, existing.assetIds);
       }
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.

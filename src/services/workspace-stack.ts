@@ -40,7 +40,8 @@ import type { CollectionRepository } from '../data/collection-repo.js';
 import {
   CouchAuditRepository,
   InMemoryAuditRepository,
-  type AuditRepository
+  type AuditRepository,
+  type AuditRetentionRepository
 } from '../data/audit-repo.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
@@ -98,13 +99,15 @@ export type WorkspaceConnections = {
   webhooks: WebhookRepository;
   collections: CollectionRepository;
   // Audit store for this stack. Backed by CouchAuditRepository in production and
-  // InMemoryAuditRepository on the in-memory/env paths, so it is always present.
-  // Exposes BOTH the read-only query surface (issue #565, consumed by
-  // PerWorkspaceAuditRepository.query) and the append-only `record()` write
-  // primitive (issue #564, consumed by PerWorkspaceAuditEmitter.record). Typed as
-  // the intersection so a single field serves both wrappers; both concrete repos
-  // satisfy it.
-  audit: AuditRepository & AuditEmitter;
+  // InMemoryAuditRepository on the in-memory/env paths, so it is ALWAYS present
+  // (issue #565 read surface merged this from the older Couch-only-optional
+  // shape). Exposes the read-only query surface (issue #565, consumed by
+  // PerWorkspaceAuditRepository.query), the append-only `record()` write
+  // primitive (issue #564, consumed by PerWorkspaceAuditEmitter.record), AND the
+  // retention surface (issue #566, listOldestPage/purgeEntry) the audit-retention
+  // purge sweep drives per tick. Typed as the intersection so the single field
+  // serves all three consumers; both concrete repos satisfy it.
+  audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   storageFor: StorageFactory | undefined;
@@ -272,9 +275,11 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let webhooks: WebhookRepository;
   let collections: CollectionRepository;
   // Audit store: always present (CouchAuditRepository on the couch env path,
-  // InMemoryAuditRepository otherwise). Exposes both the #565 query surface and
-  // the #564 record() write primitive.
-  let audit: AuditRepository & AuditEmitter;
+  // InMemoryAuditRepository otherwise). Exposes the #565 query surface, the #564
+  // record() write primitive, and the #566 retention surface
+  // (listOldestPage/purgeEntry) — so the retention sweep runs on the in-memory
+  // env path too, not just Couch.
+  let audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
 

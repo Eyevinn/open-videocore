@@ -37,6 +37,11 @@ import {
 } from '../services/packager-provisioning.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
+  checkStackReachability,
+  type StackReachabilityDeps,
+  type StackReachabilityResult
+} from '../services/stack-reachability.js';
+import {
   EXTERNAL_STORAGE_SERVICE_IDS,
   type ExternalStorageCredentials,
   type ServiceCredentialMapping,
@@ -252,6 +257,13 @@ type ProvisionRouterOptions = {
   // services that need them (eyevinn-encore-packager) fall back to their
   // defaults or operate without callbacks.
   publicBaseUrl?: string;
+  // Builds the per-stack reachability probe clients (queue + storage) for a
+  // resolved StackConfig (issue #617). Injected so the diagnostics endpoint can
+  // be exercised without live network I/O (mirrors the injected probe-client
+  // factory in services/external-backend-validation.ts). When omitted, the
+  // reachability diagnostics endpoint responds 501 (not wired), exactly like the
+  // paramStore-not-configured degradation — it never guesses coordinates.
+  reachabilityProbeFactory?: (config: StackConfig) => StackReachabilityDeps;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -264,6 +276,26 @@ const operationSchema = z.object({
   completedAt: z.number().optional(),
   result: z.unknown().optional(),
   error: z.string().optional()
+});
+
+// Per-dependency reachability record for the diagnostics endpoint (issue #617).
+// `dependency` + `reason`/`failure` are machine-readable; `endpoint` is the
+// CHECKED endpoint with credentials stripped (acceptance criterion). Mirrors
+// DependencyReachability in services/stack-reachability.ts.
+const dependencyReachabilitySchema = z.object({
+  dependency: z.enum(['queue', 'encore', 'storage']),
+  endpoint: z.string().optional(),
+  reachable: z.boolean(),
+  reason: z.enum(['unreachable', 'not_configured']).optional(),
+  failure: z.enum(['timeout', 'connect_error']).optional()
+});
+
+// GET /:name/reachability response (issue #617). `healthy` is true only when
+// every CONFIGURED dependency answered.
+const reachabilitySchema = z.object({
+  stackName: z.string().optional(),
+  healthy: z.boolean(),
+  dependencies: z.array(dependencyReachabilitySchema)
 });
 
 // 202 Accepted payload for POST / and DELETE /:name.
@@ -1287,6 +1319,88 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         ...(readiness.reason ? { reason: readiness.reason } : {})
       };
       return reply.code(200).send(withReadiness);
+    }
+  );
+
+  // GET /api/v1/provision/:name/reachability — per-dependency reachability
+  // diagnostics for a named stack (issue #617, parent #602).
+  //
+  // A read-only operator surface: probes each CONFIGURED dependency (queue/
+  // Valkey, storage) of the stack with a short bounded timeout and reports
+  // per-dependency reachable/unreachable + the CHECKED endpoint, so an
+  // unreachable dependency is an up-front, actionable signal instead of a silent
+  // request hang (the recovery operators previously found was delete-and-
+  // recreate). It NEVER mutates the stack and NEVER enqueues work.
+  //
+  // Coordinates come from the SAME stored StackConfig the resolver + scaler read
+  // (redisUrl / minioEndpoint / sourceBucket) — no process-global endpoints. The
+  // probe CLIENTS are built by the injected reachabilityProbeFactory; when it is
+  // not wired this endpoint responds 501 (like the paramStore-not-configured
+  // degradation), never guessing coordinates.
+  //   200 — { healthy, dependencies: [ per-dependency reachable/unreachable ] }
+  //   404 — no stored config for this stack
+  //   501 — parameter store / reachability probe not configured
+  //   502 — the stored coordinates could not be resolved (store unavailable)
+  app.get(
+    '/:name/reachability',
+    {
+      schema: {
+        params: nameParamSchema,
+        response: {
+          200: reachabilitySchema,
+          404: notFoundSchema,
+          501: notConfiguredSchema,
+          502: upstreamFailureSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const { name } = request.params;
+
+      if (!paramStore) {
+        return reply.code(501).send({
+          error:
+            'parameter store not configured (set PARAMETER_STORE_INSTANCE_NAME and PARAMETER_STORE_API_KEY)'
+        });
+      }
+      if (!opts.reachabilityProbeFactory) {
+        return reply.code(501).send({
+          error: 'stack reachability diagnostics are not configured on this deployment'
+        });
+      }
+
+      const workspaceId = await deriveWorkspaceId(osc);
+      let config: StackConfig | undefined;
+      try {
+        config = await paramStore.loadStackConfig(workspaceId, name);
+      } catch (err) {
+        request.log.error(
+          { err, name, workspaceId },
+          'stack reachability resolution failed: parameter store read error'
+        );
+        return reply.code(502).send({
+          error: 'stack_resolution_failed',
+          message:
+            err instanceof NonRetryableParamStoreError
+              ? `could not resolve stored coordinates for stack "${name}" (parameter store returned ${err.status})`
+              : `could not resolve stored coordinates for stack "${name}" (parameter store unavailable)`
+        });
+      }
+      if (!config) {
+        return reply.code(404).send({ error: `no stored config for stack "${name}"` });
+      }
+
+      const deps = opts.reachabilityProbeFactory(config);
+      const result: StackReachabilityResult = await checkStackReachability(
+        {
+          stackName: name,
+          redisUrl: config.redisUrl,
+          minioEndpoint: config.minioEndpoint,
+          bucket: config.sourceBucket
+        },
+        deps
+      );
+      return reply.code(200).send(result);
     }
   );
 

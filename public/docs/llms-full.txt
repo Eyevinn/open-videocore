@@ -214,6 +214,28 @@ Response 202 (application/json)
   "status": "pending"
 }
 
+  GET /api/v1/provision/{name}/reachability
+
+  Parameters
+NameInTypeRequired
+namepathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "healthy": true,
+  "dependencies": [
+    {
+      "dependency": "queue",
+      "reachable": true,
+      "endpoint": "string",
+      "reason": "unreachable",
+      "failure": "timeout"
+    }
+  ],
+  "stackName": "string"
+}
+
 ---
 
 # Optional services
@@ -870,6 +892,7 @@ Field notes- name — Canonical editorial title of the asset. Set on ingest via 
 
   Parameters
 NameInTypeRequired
+forcequerybooleanoptional
 idpathstringrequired
 
   Response
@@ -1079,6 +1102,7 @@ Request body (application/json)
   },
   "profileParams": {},
   "destinationBucket": "string",
+  "destination": "string",
   "externalBackend": "string"
 }
 
@@ -1531,7 +1555,9 @@ idpathstringrequired
   Request
 Request body (application/json)
 {
-  "encoreJobId": "string"
+  "encoreJobId": "string",
+  "destinationBucket": "string",
+  "destination": "string"
 }
 
   Response
@@ -2437,7 +2463,8 @@ Retention
   Response
 Response 200 (application/json)
 {
-  "retentionMs": 0
+  "retentionMs": 0,
+  "auditRetentionMs": 0
 }
 
   PATCH /api/v1/retention/config
@@ -2447,13 +2474,15 @@ Response 200 (application/json)
   Request
 Request body (application/json)
 {
-  "retentionMs": 0
+  "retentionMs": 0,
+  "auditRetentionMs": 0
 }
 
   Response
 Response 200 (application/json)
 {
-  "retentionMs": 0
+  "retentionMs": 0,
+  "auditRetentionMs": 0
 }
 
 ---
@@ -2797,6 +2826,7 @@ Response 200 (application/json)
 
   Parameters
 NameInTypeRequired
+forcequerybooleanoptional
 idpathstringrequired
 
   Response
@@ -3264,11 +3294,11 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (109 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (110 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
-Provisioning6
+Provisioning7
 Provision and tear down a workspace's full OSC media stack (object storage, metadata store, queue).
 Optional services4
 Discover and provision add-on OSC services for a workspace.
@@ -4125,7 +4155,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 109 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 110 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.

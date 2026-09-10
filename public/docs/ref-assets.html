@@ -153,9 +153,9 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <div class="nav-group">
   <a class="nav-group-title" href="ref-provisioning.html">
     <span>Provisioning</span>
-    <span class="group-title-right"><span class="count">6</span><button class="chevron" type="button" data-toggle="group-provisioning" aria-label="toggle">&#9662;</button></span>
+    <span class="group-title-right"><span class="count">7</span><button class="chevron" type="button" data-toggle="group-provisioning" aria-label="toggle">&#9662;</button></span>
   </a>
-  <div class="nav-group-items collapsed" id="group-provisioning"><a href="ref-provisioning.html#get-api-v1-provision" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/</span></a><a href="ref-provisioning.html#post-api-v1-provision" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/provision/</span></a><a href="ref-provisioning.html#get-api-v1-provision-operations" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/operations</span></a><a href="ref-provisioning.html#get-api-v1-provision-operations-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/operations/{id}</span></a><a href="ref-provisioning.html#get-api-v1-provision-name" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/{name}</span></a><a href="ref-provisioning.html#delete-api-v1-provision-name" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/provision/{name}</span></a></div>
+  <div class="nav-group-items collapsed" id="group-provisioning"><a href="ref-provisioning.html#get-api-v1-provision" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/</span></a><a href="ref-provisioning.html#post-api-v1-provision" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/provision/</span></a><a href="ref-provisioning.html#get-api-v1-provision-operations" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/operations</span></a><a href="ref-provisioning.html#get-api-v1-provision-operations-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/operations/{id}</span></a><a href="ref-provisioning.html#get-api-v1-provision-name" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/{name}</span></a><a href="ref-provisioning.html#delete-api-v1-provision-name" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/provision/{name}</span></a><a href="ref-provisioning.html#get-api-v1-provision-name-reachability" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/provision/{name}/reachability</span></a></div>
 </div>
 
 <div class="nav-group">
@@ -661,7 +661,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <article class="endpoint" id="delete-api-v1-assets-id">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}</code></h3>
   <p class="endpoint-desc">Delete an asset.</p>
-  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>force</code></td><td><span class="tag-query">query</span></td><td>boolean</td><td>optional</td></tr><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
 </article>
@@ -825,6 +825,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   },
   &quot;profileParams&quot;: {},
   &quot;destinationBucket&quot;: &quot;string&quot;,
+  &quot;destination&quot;: &quot;string&quot;,
   &quot;externalBackend&quot;: &quot;string&quot;
 }</code></pre></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
@@ -1200,7 +1201,9 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   <p class="endpoint-desc">Submit an HLS/DASH packaging job for the asset's transcoded renditions.</p>
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
-  &quot;encoreJobId&quot;: &quot;string&quot;
+  &quot;encoreJobId&quot;: &quot;string&quot;,
+  &quot;destinationBucket&quot;: &quot;string&quot;,
+  &quot;destination&quot;: &quot;string&quot;
 }</code></pre></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
   &quot;ok&quot;: true,

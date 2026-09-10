@@ -44,19 +44,32 @@ class FakeCouch {
     return d ? { ...d } : undefined;
   }
 
-  async find(selector: Record<string, unknown>): Promise<StoredDoc[]> {
+  async find(
+    selector: Record<string, unknown>,
+    opts: { limit?: number; skip?: number } = {}
+  ): Promise<StoredDoc[]> {
     const rt = selector['resourceType'];
-    return [...this.docs.values()]
+    // CouchDB's default scan (no explicit `sort`) walks the primary `_id` index,
+    // so results come back in ascending `_id` order. The fake reproduces that so
+    // listOldestPage's skip/limit paging yields a globally consistent
+    // oldest-first order across pages (audit `_id` == time-sortable ULID).
+    const all = [...this.docs.values()]
       .filter((d) => rt === undefined || d.resourceType === rt)
-      .map((d) => ({ ...d }));
+      .map((d) => ({ ...d }))
+      .sort((a, b) => a._id.localeCompare(b._id));
+    const skip = opts.skip ?? 0;
+    const limited = opts.limit === undefined ? all.slice(skip) : all.slice(skip, skip + opts.limit);
+    return limited;
   }
 
   async count(): Promise<number> {
     return 0;
   }
 
-  async remove(): Promise<void> {
-    /* unused */
+  // Whole-document delete: read _rev then drop it entirely (mirrors
+  // StackCouch.remove, src/data/couchdb.ts:87-93). Used by purgeEntry.
+  async remove(localId: string): Promise<void> {
+    this.docs.delete(localId);
   }
 
   // Test-only helper: how many documents are held, to assert appends don't
@@ -185,5 +198,63 @@ describe('audit entry model (issue #563)', () => {
 
   it('AUDIT_TARGET_TYPES is the closed asset|collection|job set', () => {
     expect(AUDIT_TARGET_TYPES).toEqual(['asset', 'collection', 'job']);
+  });
+});
+
+describe('audit retention enumerate + whole-entry purge (issue #566)', () => {
+  async function seed(repo: CouchAuditRepository, n: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (let i = 0; i < n; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const e = await repo.record({
+        actor,
+        action: `evt-${i}`,
+        targetType: 'asset',
+        targetId: `asset-${i}`,
+        at: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString()
+      });
+      ids.push(e.id);
+    }
+    return ids;
+  }
+
+  it('listOldestPage returns oldest-first (ascending id) and honours limit/offset', async () => {
+    const { repo } = makeRepo();
+    const ids = await seed(repo, 5);
+    // ULIDs minted within the same millisecond are not guaranteed monotonic, so
+    // compare against the LEXICOGRAPHICALLY ascending id order (what the store
+    // orders by), not raw insertion order.
+    const ascending = [...ids].sort((a, b) => a.localeCompare(b));
+
+    const firstTwo = await repo.listOldestPage({ limit: 2, offset: 0 });
+    expect(firstTwo.map((e) => e.id)).toEqual(ascending.slice(0, 2));
+
+    const nextTwo = await repo.listOldestPage({ limit: 2, offset: 2 });
+    expect(nextTwo.map((e) => e.id)).toEqual(ascending.slice(2, 4));
+
+    // Ascending, i.e. the exact reverse of the newest-first read-back `list`.
+    const newestFirst = (await repo.list()).map((e) => e.id);
+    const oldestFirst = (await repo.listOldestPage({ limit: 10 })).map((e) => e.id);
+    expect(oldestFirst).toEqual([...newestFirst].reverse());
+  });
+
+  it('purgeEntry removes the WHOLE entry (never an in-place edit) and returns true', async () => {
+    const { couch, repo } = makeRepo();
+    const [id0, id1] = await seed(repo, 2);
+
+    expect(couch.rawSize()).toBe(2);
+    // A survivor is byte-for-byte unchanged; purge is whole-entry, not a rewrite.
+    const survivorBefore = await repo.get(id1);
+
+    const removed = await repo.purgeEntry(id0);
+    expect(removed).toBe(true);
+    expect(await repo.get(id0)).toBeUndefined(); // gone entirely
+    expect(couch.rawSize()).toBe(1);
+    expect(await repo.get(id1)).toEqual(survivorBefore); // untouched
+  });
+
+  it('purgeEntry returns false when the entry does not exist / is not an audit doc', async () => {
+    const { repo } = makeRepo();
+    expect(await repo.purgeEntry('01HDOESNOTEXIST')).toBe(false);
   });
 });
