@@ -148,6 +148,10 @@ import { validateProfileColourSignalling } from '../pipeline/profile-colour-guar
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
+import {
+  checkStackReachability,
+  firstUnreachable
+} from '../services/stack-reachability.js';
 import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
 import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
@@ -3443,6 +3447,41 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const resolvedOutputBucket =
         request.connections?.packagedBucket ?? opts.outputBucket;
       try {
+        // FAST reachability preflight (issue #617): before enqueuing work, probe
+        // the stack's dependencies (queue/Valkey via the shared IORedis ping,
+        // storage via the per-stack MinioClient bucketExists) under the SAME
+        // bounded deadline the submit writes use (#616). An unhealthy stack is
+        // rejected promptly with the SAME named-dependency 504 the submit-path
+        // catch below already maps — turning a silent ~50s socket-drop into an
+        // up-front, actionable signal. Coordinates are per-stack (redis client
+        // options + request.connections), never process-global. The guard is
+        // opt-in: a dependency with no wired probe client is reported
+        // not_configured and does NOT trip the guard, so deployments/tests
+        // without a live queue/storage submit exactly as before.
+        const queueEndpoint = opts.packagingRedis
+          ? `redis://${opts.packagingRedis.options.host ?? 'localhost'}:${
+              opts.packagingRedis.options.port ?? 6379
+            }`
+          : undefined;
+        const preflight = await checkStackReachability(
+          {
+            stackName: DEPLOYMENT_CONTEXT,
+            ...(queueEndpoint ? { redisUrl: queueEndpoint } : {}),
+            ...(request.connections?.s3Config
+              ? { minioEndpoint: request.connections.s3Config.endpoint }
+              : {}),
+            bucket: opts.sourceBucket
+          },
+          {
+            ...(opts.packagingRedis ? { queueClient: opts.packagingRedis } : {}),
+            ...(request.connections?.storageClient
+              ? { storageClient: request.connections.storageClient }
+              : {})
+          }
+        );
+        const unreachable = firstUnreachable(preflight);
+        if (unreachable) throw unreachable;
+
         const result = await submitTranscode(
           {
             // Key the scaler pool/queue/S3 endpoint by the EFFECTIVE stack this
