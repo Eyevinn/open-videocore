@@ -86,6 +86,7 @@ import {
   UnknownDestinationBackendError,
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
+import { InvalidPathTemplateError } from '../services/destination-path-template.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
@@ -1687,10 +1688,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //   { ok: false } — an error response has already been sent via `reply`;
   //     callers must not send again.
   async function resolveJobDestination(
-    args: { destination?: string; externalBackend?: string; destinationBucket?: string },
+    args: {
+      destination?: string;
+      externalBackend?: string;
+      destinationBucket?: string;
+      // Job-time context for issue #574 per-destination path templating: the
+      // asset id the job runs against, substituted for {assetId} when the named
+      // `destination` carries a template. Ignored on the inline-override and
+      // externalBackend paths (which are not templated).
+      assetId?: string;
+    },
     reply: import('fastify').FastifyReply
   ): Promise<{ ok: true; destinationBucket?: string } | { ok: false }> {
-    const { destination, externalBackend, destinationBucket } = args;
+    const { destination, externalBackend, destinationBucket, assetId } = args;
     // Mutual exclusion across all three output-destination expressions: at most
     // ONE may be supplied. More than one is ambiguous -> 400 (issue #573 / #549).
     // Each feature keeps its own pre-existing 400 error shape rather than a new
@@ -1783,12 +1793,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     try {
       const resolved = await opts.storageBackendRegistry.resolveDestinationBucket(
         STACK_CONFIG_NAMESPACE,
-        destination
+        destination,
+        // Issue #574: pass the job-time context so a destination carrying a path
+        // template keys output under the bucket (e.g. {date}/{assetId}). A
+        // template-less destination ignores this and yields the bare `<bucket>/`.
+        { ...(assetId !== undefined ? { assetId } : {}) }
       );
       return { ok: true, destinationBucket: resolved };
     } catch (err) {
       if (err instanceof UnknownDestinationBackendError) {
         reply.code(err.statusCode).send({ error: 'bad_request', message: err.message });
+        return { ok: false };
+      }
+      // Issue #574: a persisted template referenced a token with no value in this
+      // job's context (e.g. {assetId} with no asset). Surface a clear 400 rather
+      // than dispatching a job that would write to a mis-keyed path.
+      if (err instanceof InvalidPathTemplateError) {
+        reply
+          .code(err.statusCode)
+          .send({ error: 'invalid_path_template', message: err.message });
         return { ok: false };
       }
       throw err;
@@ -3609,7 +3632,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // into the single `destinationBucket` string the relocation consumes
         // (issue #573). Rejects an ambiguous both-supplied request with 400.
         const resolvedDestination = await resolveJobDestination(
-          { destination: request.body.destination, destinationBucket: request.body.destinationBucket },
+          {
+            destination: request.body.destination,
+            destinationBucket: request.body.destinationBucket,
+            assetId: asset.id
+          },
           reply
         );
         if (!resolvedDestination.ok) return reply; // error already sent
@@ -3728,7 +3755,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         {
           destination: request.body.destination,
           externalBackend: request.body.externalBackend,
-          destinationBucket: request.body.destinationBucket
+          destinationBucket: request.body.destinationBucket,
+          assetId: asset.id
         },
         reply
       );

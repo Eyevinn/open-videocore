@@ -26,6 +26,7 @@ import {
 } from './storage-backend-registry.js';
 import type { BucketProbeClient } from './external-backend-validation.js';
 import type { ConfigKvStore } from './param-store.js';
+import { InvalidPathTemplateError } from './destination-path-template.js';
 
 const RAW_SECRET = 'raw-secret-value';
 const RAW_TOKEN = 'raw-token-value';
@@ -294,6 +295,97 @@ describe('StorageBackendRegistry.remove — default protection', () => {
     await expect(registry.remove('ws1', DEFAULT_BACKEND_ID)).rejects.toBeInstanceOf(
       DefaultBackendNotDeletableError
     );
+  });
+});
+
+describe('StorageBackendRegistry.resolveDestinationBucket — path templating (issue #574)', () => {
+  const FIXED = new Date('2026-09-10T00:00:00.000Z');
+
+  it('yields the bare <bucket>/ form when no template is set (static-prefix, unchanged)', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store);
+    const view = await registry.register('ws1', {
+      name: 'dst',
+      role: 'packaged',
+      bucket: 'delivery-bucket',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    const resolved = await registry.resolveDestinationBucket('ws1', view.id, {
+      assetId: 'asset-1',
+      now: FIXED
+    });
+    // No template -> the context is ignored and the bare bucket form is returned.
+    expect(resolved).toBe('delivery-bucket/');
+  });
+
+  it('keys output under the bucket using the template at job time', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store);
+    const view = await registry.register('ws1', {
+      name: 'dst',
+      role: 'packaged',
+      bucket: 'delivery-bucket',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET,
+      pathTemplate: '{date}/{assetId}'
+    });
+    const resolved = await registry.resolveDestinationBucket('ws1', view.id, {
+      assetId: 'asset-1',
+      now: FIXED
+    });
+    expect(resolved).toBe('delivery-bucket/2026-09-10/asset-1/');
+  });
+
+  it('persists the template on the record and echoes it on the view', async () => {
+    const { store } = spySecretStore();
+    const records = new InMemoryBackendRecordStore();
+    const registry = new StorageBackendRegistry(records, store);
+    const view = await registry.register('ws1', {
+      name: 'dst',
+      role: 'packaged',
+      bucket: 'delivery-bucket',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET,
+      pathTemplate: '{year}/{assetId}'
+    });
+    expect(view.pathTemplate).toBe('{year}/{assetId}');
+    const stored = await records.list('ws1');
+    expect(stored[0].pathTemplate).toBe('{year}/{assetId}');
+  });
+
+  it('rejects an unknown template token at registration time (InvalidPathTemplateError)', async () => {
+    const { store } = spySecretStore();
+    const records = new InMemoryBackendRecordStore();
+    const registry = new StorageBackendRegistry(records, store);
+    await expect(
+      registry.register('ws1', {
+        name: 'dst',
+        role: 'packaged',
+        bucket: 'delivery-bucket',
+        accessKeyId: 'AKIA',
+        secretAccessKey: RAW_SECRET,
+        pathTemplate: '{nope}/x'
+      })
+    ).rejects.toBeInstanceOf(InvalidPathTemplateError);
+    // Nothing persisted for a rejected template.
+    expect(await records.list('ws1')).toHaveLength(0);
+  });
+
+  it('throws when the template needs {assetId} but the job context has none', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store);
+    const view = await registry.register('ws1', {
+      name: 'dst',
+      role: 'packaged',
+      bucket: 'delivery-bucket',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET,
+      pathTemplate: '{assetId}/x'
+    });
+    await expect(
+      registry.resolveDestinationBucket('ws1', view.id, { now: FIXED })
+    ).rejects.toBeInstanceOf(InvalidPathTemplateError);
   });
 });
 

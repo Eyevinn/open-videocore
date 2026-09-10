@@ -117,19 +117,22 @@ async function makeSource(h: Harness, name = 'my-video'): Promise<string> {
   return asset.id;
 }
 
-// Register a named output-role destination and return its id + name.
+// Register a named output-role destination and return its id + name. Accepts an
+// optional per-destination path template (issue #574).
 async function registerDestination(
   h: Harness,
   name: string,
   bucket: string,
-  role: StorageBackendRole = 'packaged'
+  role: StorageBackendRole = 'packaged',
+  pathTemplate?: string
 ): Promise<{ id: string; name: string }> {
   const view = await h.registry.register(STACK_CONFIG_NAMESPACE, {
     name,
     role,
     bucket,
     accessKeyId: 'AKIAEXAMPLE',
-    secretAccessKey: 'shhh'
+    secretAccessKey: 'shhh',
+    ...(pathTemplate !== undefined ? { pathTemplate } : {})
   });
   return { id: view.id, name: view.name };
 }
@@ -333,5 +336,79 @@ describe('job -> named export-destination reference (issue #573)', () => {
 
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toBe('ambiguous_destination');
+  });
+});
+
+describe('per-destination path templating (issue #574)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('keys the persisted destinationBucket by asset id when the destination has a template', async () => {
+    const h = await buildApp();
+    // A destination templated by asset id under the delivery bucket.
+    const named = await registerDestination(
+      h,
+      'templated-out',
+      'delivery-bucket',
+      'packaged',
+      'by-asset/{assetId}'
+    );
+    const assetId = await makeSource(h, 'templated-video');
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${assetId}/execute`,
+      headers: A,
+      payload: { pipeline: 'abr-vod', destination: named.id }
+    });
+
+    expect(res.statusCode).toBe(202);
+    // The relocation destinationBucket is keyed UNDER the bucket by the template,
+    // rendered with THIS job's asset id.
+    expect(await persistedDestinationBucket(h, assetId)).toBe(
+      `delivery-bucket/by-asset/${assetId}/`
+    );
+  });
+
+  it('keys by a UTC date token', async () => {
+    const h = await buildApp();
+    const named = await registerDestination(
+      h,
+      'dated-out',
+      'delivery-bucket',
+      'packaged',
+      '{date}/{assetId}'
+    );
+    const assetId = await makeSource(h, 'dated-video');
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${assetId}/execute`,
+      headers: A,
+      payload: { pipeline: 'abr-vod', destination: named.id }
+    });
+
+    expect(res.statusCode).toBe(202);
+    const persisted = await persistedDestinationBucket(h, assetId);
+    // delivery-bucket/YYYY-MM-DD/<assetId>/
+    expect(persisted).toMatch(
+      new RegExp(`^delivery-bucket/\\d{4}-\\d{2}-\\d{2}/${assetId}/$`)
+    );
+  });
+
+  it('leaves a static-prefix (template-less) destination unaffected', async () => {
+    const h = await buildApp();
+    const named = await registerDestination(h, 'static-out', 'static-bucket');
+    const assetId = await makeSource(h, 'static-video');
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${assetId}/execute`,
+      headers: A,
+      payload: { pipeline: 'abr-vod', destination: named.id }
+    });
+
+    expect(res.statusCode).toBe(202);
+    // No template -> the bare bucket form, identical to the pre-#574 behaviour.
+    expect(await persistedDestinationBucket(h, assetId)).toBe('static-bucket/');
   });
 });
