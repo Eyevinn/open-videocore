@@ -80,7 +80,11 @@ import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
-import { retentionRouter, archiveRetentionMsFromEnv } from './routes/retention.js';
+import {
+  retentionRouter,
+  archiveRetentionMsFromEnv,
+  auditRetentionMsFromEnv
+} from './routes/retention.js';
 import { logsRouter } from './routes/logs.js';
 import { LogStore } from './services/log-store.js';
 import {
@@ -88,6 +92,10 @@ import {
   archivePurgeIntervalMsFromEnv
 } from './pipeline/archived-asset-purge-loop.js';
 import type { PurgeStorage } from './pipeline/archived-asset-purge-sweep.js';
+import {
+  AuditRetentionPurgeLoop,
+  auditPurgeIntervalMsFromEnv
+} from './pipeline/audit-retention-purge-loop.js';
 import {
   WatchFolderService,
   watchFolderEnabled,
@@ -676,6 +684,14 @@ const packageStallTimeoutMs = parseInt(process.env['PACKAGE_STALL_TIMEOUT_MS'] |
 // mutable var so PATCH /api/v1/retention/config hot-swaps it with no restart,
 // mirroring how the scaler config PATCH mutates its live vars.
 let archiveRetentionMs = archiveRetentionMsFromEnv();
+
+// Instance-global AUDIT-LOG retention window in ms (issue #566), aligned with
+// the archived-asset purge lifecycle. Read from AUDIT_RETENTION_MS at boot;
+// unset/0 = indefinite retention (never purge), preserving #563's store-only
+// behaviour for every deployment that does not opt in. Held as a live mutable
+// var so PATCH /api/v1/retention/config hot-swaps it with no restart, exactly
+// as archiveRetentionMs is.
+let auditRetentionMs = auditRetentionMsFromEnv();
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -1666,8 +1682,12 @@ await app.register(scalerRouter, scalerRouterOptions);
 const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/retention',
   retentionMs: archiveRetentionMsFromEnv(),
+  // Boot-time audit-log retention window (issue #566). Exposed on GET
+  // /api/v1/retention/config so an operator can see the effective policy.
+  auditRetentionMs: auditRetentionMsFromEnv(),
   onConfigChange: (cfg) => {
     archiveRetentionMs = cfg.retentionMs;
+    auditRetentionMs = cfg.auditRetentionMs;
   }
 };
 await app.register(retentionRouter, retentionRouterOptions);
@@ -1726,6 +1746,44 @@ const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
   }
 });
 archivedAssetPurgeLoop.start(archivePurgeIntervalMsFromEnv());
+
+// Audit-log retention purge sweep (issue #566), aligned with — and clearly
+// SEPARABLE from — the archived-asset purge sweep above. An INDEPENDENT unref'd,
+// overlap-guarded interval (mirrors ArchivedAssetPurgeLoop, NOT a parallel
+// mechanism) that expires WHOLE audit entries aged past the audit-retention
+// window. It reads the LIVE `auditRetentionMs` each tick, so it honours PATCH
+// /api/v1/retention/config and is skipped entirely while the audit window is
+// unset (0 = indefinite retention). The audit store is ALWAYS present on the
+// resolved connection (issue #565: CouchAuditRepository on Couch-backed stacks,
+// InMemoryAuditRepository on the env-no-couch / in-memory fallback paths), and
+// every concrete store implements the retention surface (listOldestPage /
+// purgeEntry), so each tick resolves the active stack's audit store and drives
+// the sweep directly. On the in-memory fallback the store is empty, so the sweep
+// enumerates nothing and purges nothing — a natural no-op, not a special case.
+const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
+  retentionMs: () => auditRetentionMs,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    // Resolve the active stack's audit store per tick. The sweep drives it via
+    // listOldestPage (enumerate aged tail) + purgeEntry (whole-entry expiry).
+    // `conns.audit` is always present (issue #565), so no null-guard is needed.
+    audit: {
+      listOldestPage: async (opts: { limit: number; offset?: number }) => {
+        const conns = await stackResolver.resolve();
+        return conns.audit.listOldestPage(opts);
+      },
+      purgeEntry: async (id: string) => {
+        const conns = await stackResolver.resolve();
+        return conns.audit.purgeEntry(id);
+      }
+    }
+  }
+});
+auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });

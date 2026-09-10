@@ -169,12 +169,27 @@ export interface AuditRepository {
   query(query: AuditQuery): Promise<AuditQueryResult>;
 }
 
+// Retention surface consumed by the audit-retention purge sweep (issue #566).
+// Kept SEPARATE from the read-only `AuditRepository` query surface so the read
+// route's PerWorkspaceAuditRepository is not forced to expose a removal path:
+// only the retention loop consumes this. Both concrete stores implement it
+// (Couch for production, in-memory for the env-no-couch / dev / test path) so
+// the sweep can drive whichever store the resolved stack surfaces. This is the
+// structural superset of the sweep's injected `AuditRetentionStore`
+// (src/pipeline/audit-retention-purge-sweep.ts).
+export interface AuditRetentionRepository {
+  // Oldest-first page of audit entries (ascending ULID / write order).
+  listOldestPage(opts: { limit: number; offset?: number }): Promise<AuditEntry[]>;
+  // Whole-entry expiry (never an in-place edit). True on a live removal.
+  purgeEntry(id: string): Promise<boolean>;
+}
+
 // Append-only audit store over a dedicated CouchDB partition.
 //
 // Deliberately exposes ONLY `record` (write), `get`/`list` (read-back), and
 // `query` (read-only query surface, issue #565). No update, no delete, no _rev
 // carry-forward — consistent with ADR-005 append, never rewrite.
-export class CouchAuditRepository implements AuditRepository {
+export class CouchAuditRepository implements AuditRepository, AuditRetentionRepository {
   constructor(private readonly couchFor: CouchFactory) {}
 
   // Write a single audit entry. Validates required fields and rejects a bad
@@ -222,6 +237,53 @@ export class CouchAuditRepository implements AuditRepository {
       .sort((a, b) => b.id.localeCompare(a.id));
   }
 
+  // Enumerate one page of audit entries in oldest-first order (ascending ULID),
+  // for the bounded retention sweep (issue #566). Retention purges the OLDEST
+  // aged entries, so ascending order lets the sweep page from the tail forward
+  // and stop as soon as it reaches entries inside the window. Mirrors the paged
+  // `list({ status, limit, offset })` walk the archived-asset sweep drives
+  // (listAllArchived, src/pipeline/archived-asset-purge-sweep.ts:195-215), but
+  // over the audit partition via StackCouch.find (src/data/couchdb.ts:66) with a
+  // skip/limit window. NOT the newest-first read-back `list` above — kept
+  // separate so the read-back surface is untouched.
+  async listOldestPage(opts: { limit: number; offset?: number }): Promise<AuditEntry[]> {
+    const couch = this.couchFor();
+    // CouchDB Mango `find` with no explicit `sort` scans the primary `_id`
+    // index, so pages come back in ascending `_id` order; because every audit
+    // `_id` is a time-sortable ULID (record(), above), that IS oldest-first, and
+    // skip/limit paging is therefore globally consistent across pages. The
+    // per-page sort below is a belt-and-braces normalisation of the returned
+    // page and does not, on its own, guarantee cross-page order — the offset
+    // walk depends on the store's ascending-`_id` scan.
+    const docs = await couch.find(
+      { resourceType: RESOURCE_TYPE },
+      { limit: opts.limit, skip: opts.offset ?? 0 }
+    );
+    return docs
+      .filter((d) => d.resourceType === RESOURCE_TYPE)
+      .map(fromDoc)
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  // Purge (expire) a single audit entry: WHOLE-ENTRY removal of its immutable
+  // document, never an in-place edit. This is the ONLY removal path and exists
+  // solely to enforce the retention window (issue #566) — it upholds
+  // append-only-UNTIL-purge: an entry is either present verbatim or gone, never
+  // rewritten. Delegates to StackCouch.remove (read _rev + destroy,
+  // src/data/couchdb.ts:87-93). Returns true when a live audit entry was
+  // removed, false when nothing matched (already gone / not an audit doc), so
+  // the sweep can count purges exactly like the archived-asset sweep's `purge`
+  // callback contract (purgeExpiredArchivedAssets, purgeOne step 5).
+  async purgeEntry(id: string): Promise<boolean> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return false;
+    }
+    await couch.remove(id);
+    return true;
+  }
+
   // Read-only query surface for the audit read route (issue #565). Filters,
   // sorts newest-first, and paginates via `applyAuditQuery`. Pulls the audit
   // partition through `couch.find({ resourceType })` — the same read primitive
@@ -247,7 +309,7 @@ const AUDIT_FETCH_CAP = 10_000;
 // tests can write entries directly (per #565 guidance — instrumentation #564 is
 // not a build dependency) and the read-only `query` surface. Append-only: no
 // update/delete path.
-export class InMemoryAuditRepository implements AuditRepository {
+export class InMemoryAuditRepository implements AuditRepository, AuditRetentionRepository {
   private readonly entries: AuditEntry[] = [];
 
   async record(input: RecordAuditInput): Promise<AuditEntry> {
@@ -267,6 +329,29 @@ export class InMemoryAuditRepository implements AuditRepository {
 
   async query(query: AuditQuery): Promise<AuditQueryResult> {
     return applyAuditQuery(this.entries, query);
+  }
+
+  // Oldest-first page (ascending ULID / write order) for the retention sweep
+  // (issue #566). Mirrors CouchAuditRepository.listOldestPage so the in-memory
+  // env-no-couch / dev / test path drives the SAME sweep as production. Sorts a
+  // copy — never mutates the backing array — then applies skip/limit.
+  async listOldestPage(opts: { limit: number; offset?: number }): Promise<AuditEntry[]> {
+    const oldestFirst = [...this.entries].sort((a, b) => a.id.localeCompare(b.id));
+    const offset = opts.offset ?? 0;
+    return oldestFirst.slice(offset, offset + opts.limit);
+  }
+
+  // Whole-entry expiry for the retention sweep (issue #566). Removes the single
+  // matching entry outright (never an in-place edit), upholding
+  // append-only-UNTIL-purge. Returns true when a live entry was removed, false
+  // when nothing matched — matching CouchAuditRepository.purgeEntry's contract.
+  async purgeEntry(id: string): Promise<boolean> {
+    const idx = this.entries.findIndex((e) => e.id === id);
+    if (idx < 0) {
+      return false;
+    }
+    this.entries.splice(idx, 1);
+    return true;
   }
 }
 
