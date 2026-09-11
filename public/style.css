@@ -688,6 +688,116 @@ pre.code-block {
   word-break: break-all;
 }
 
+/* Storage-backend list view (issue #680): the consolidated read view of every
+   configured backend. Reuses the shared .badge palette for the status column. */
+.storage-backends-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.storage-backends-table th,
+.storage-backends-table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.storage-backends-table .mono {
+  font-family: var(--mono, monospace);
+  word-break: break-all;
+}
+
+.storage-backend-name {
+  font-weight: 600;
+}
+
+/* Row accent so the platform-provisioned default is scannable at a glance. */
+.storage-backend-row.is-default td:first-child {
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+
+.storage-default-tag {
+  vertical-align: middle;
+}
+
+/* The default backend's controls are disabled, not hidden, to keep alignment. */
+.storage-backend-delete[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Section header with an inline action (Add backend), issue #681. */
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+/* Add/edit storage-backend form (issue #681). */
+.storage-backend-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-alt, rgba(255, 255, 255, 0.02));
+}
+
+.storage-backend-form .form-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Inline, per-field validation message. Hidden (no reserved space) when empty. */
+.storage-backend-form .form-error {
+  font-size: 12px;
+  color: var(--danger);
+  min-height: 0;
+}
+
+.storage-backend-form .form-error:empty {
+  display: none;
+}
+
+.storage-backend-field.has-error input {
+  border-color: var(--danger);
+}
+
+.storage-backend-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Inline test-connection + submit result areas (pass / fail / info). */
+.storage-backend-test-result:empty,
+.storage-backend-form-msg:empty {
+  display: none;
+}
+
+.storage-backend-test-result,
+.storage-backend-form-msg {
+  font-size: 13px;
+}
+
+.storage-backend-test-result.is-success {
+  color: var(--success);
+}
+
+.storage-backend-test-result.is-failure,
+.storage-backend-form-msg.is-failure {
+  color: var(--danger);
+}
+
+.storage-backend-test-result.is-info {
+  color: var(--text-muted);
+}
+
 /* Asset detail — file-group (HLS/DASH package) cards */
 .file-group-cards {
   display: grid;

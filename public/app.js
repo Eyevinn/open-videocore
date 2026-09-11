@@ -43,6 +43,43 @@ function setActiveStack(name) {
   else localStorage.removeItem(STACK_KEY);
 }
 
+// ─── Client role (ADR-018) ─────────────────────────────────────────────────
+//
+// Authorisation is driven server-side by the trusted `X-OVC-Role` header, read
+// by src/auth/principal.ts (ROLE_HEADER = 'x-ovc-role', src/auth/principal.ts:36).
+// There is NO whoami endpoint and no per-user identity (single-operator model,
+// src/auth/principal.ts:11-16), so the ops UI cannot ask the server for its
+// role — it mirrors the server's own semantics:
+//   - the three roles are viewer | editor | admin (src/auth/principal.ts:31);
+//   - an absent role resolves to admin (single-operator default,
+//     src/auth/principal.ts:98-104).
+// getClientRole() therefore reads an operator-chosen role from localStorage and
+// defaults to 'admin' exactly as the server does; apiFetch() forwards it as the
+// X-OVC-Role header so, when the deployment sets OVC_TRUST_ROLE_HEADER=true
+// (src/main.ts:431), the same value gates the API. The issue's "operator/admin"
+// binds to the real editor|admin contract: those two roles may manage storage.
+const ROLE_KEY = 'ovc_role';
+const CLIENT_ROLES = ['viewer', 'editor', 'admin'];
+
+function getClientRole() {
+  const stored = localStorage.getItem(ROLE_KEY);
+  return CLIENT_ROLES.includes(stored) ? stored : 'admin';
+}
+
+function setClientRole(role) {
+  if (CLIENT_ROLES.includes(role)) localStorage.setItem(ROLE_KEY, role);
+  else localStorage.removeItem(ROLE_KEY);
+}
+
+// Whether the current client role may see + manage storage backends. Bound to
+// the real matrix (src/auth/authorize.ts:54-58): editor and admin may write;
+// viewer is read-only and does not get the management surface. This is the
+// "operator/admin" gate from issue #680, expressed in the codebase's roles.
+function canManageStorage() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
 // Window-scoped stack override for detached windows (e.g. detail.html). Unlike
 // setActiveStack, this does NOT touch the shared localStorage key, so popping
 // out a detail for a different stack cannot switch the opener window's active
@@ -102,6 +139,10 @@ async function apiFetch(path, options = {}) {
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
+    // Mirror the server's trusted role header (src/auth/principal.ts:36). Only
+    // honoured server-side when OVC_TRUST_ROLE_HEADER=true (src/main.ts:431);
+    // otherwise it is stripped and ignored, so sending it is always safe.
+    'X-OVC-Role': getClientRole(),
     ...(options.headers || {}),
   };
   const res = await fetch(API_BASE + path, { ...options, headers });
@@ -155,6 +196,382 @@ function badgeClass(status) {
 function renderBadge(status) {
   // status is escaped before insertion
   return '<span class="badge ' + badgeClass(status) + '">' + escHtml(status || 'unknown') + '</span>';
+}
+
+// ─── Storage-backend status badge (issue #680) ───────────────────────────────
+//
+// The GET /api/v1/storage/backends view (src/routes/storage.ts:144-166, mirrored
+// in openapi.json at "/api/v1/storage/backends".get.responses.200) carries NO
+// persisted connection-status field today: the redacted backendViewSchema has
+// id/name/role/backend/bucket/accessKeyId/endpointUrl/region/publicBaseUrl/
+// hasSessionToken/deletable/createdAt/credentials and nothing else. Per the
+// acceptance criterion, when no explicit status is stored the badge shows
+// "Unknown". We therefore read an OPTIONAL, forward-compatible
+// `connectionStatus` off the backend (a later API revision may populate it) and
+// map it to one of the three issue states; anything unrecognised or absent is
+// Unknown. Returns { label, cls } — both fed through escHtml at render time.
+function storageBackendStatus(backend) {
+  const raw = backend && typeof backend.connectionStatus === 'string'
+    ? backend.connectionStatus.toLowerCase()
+    : '';
+  if (raw === 'connected') return { label: 'Connected', cls: 'badge-ready' };
+  if (raw === 'unreachable') return { label: 'Unreachable', cls: 'badge-failed' };
+  return { label: 'Unknown', cls: 'badge-unknown' };
+}
+
+// The OSC-managed default backend (ADR-017 D3) is the one that is not deletable
+// (src/routes/storage.ts:140-142 / registry marks id 'default' deletable:false).
+// It must be visually distinguished and must not expose edit/delete controls.
+function isDefaultStorageBackend(backend) {
+  return !(backend && backend.deletable === true);
+}
+
+// Pure render of the storage-backend list view (issue #680). Framework-free and
+// contract-only: it takes the already-fetched array of redacted backend views
+// and returns a detached DOM element, so it is directly unit-testable without a
+// network call. Every dynamic value is written via textContent / escHtml — no
+// raw external string reaches innerHTML, and the secret (always
+// '***redacted***' in credentials.secretAccessKey) is never rendered.
+function renderStorageBackendsList(backends) {
+  const wrap = document.createElement('div');
+  wrap.className = 'storage-backends-wrap';
+
+  const list = Array.isArray(backends) ? backends : [];
+  if (list.length === 0) {
+    // Defensive: the API always returns at least the default backend
+    // (src/routes/storage.ts:257-273), so an empty array means the registry is
+    // unconfigured/unreachable rather than "no backends".
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No storage backends available.';
+    wrap.appendChild(empty);
+    return wrap;
+  }
+
+  const table = document.createElement('table');
+  table.className = 'storage-backends-table';
+  table.innerHTML =
+    '<thead><tr>' +
+    '<th>Name</th><th>Endpoint</th><th>Bucket</th><th>Region</th>' +
+    '<th>Status</th><th>Actions</th>' +
+    '</tr></thead>';
+  const tbody = document.createElement('tbody');
+  table.appendChild(tbody);
+
+  list.forEach(function(b) {
+    const isDefault = isDefaultStorageBackend(b);
+    const status = storageBackendStatus(b);
+    const tr = document.createElement('tr');
+    tr.className = 'storage-backend-row';
+    if (isDefault) tr.classList.add('is-default');
+    if (b && b.id != null) tr.dataset.backendId = String(b.id);
+
+    // Name cell, with a "Default" label for the platform-provisioned backend.
+    const nameTd = document.createElement('td');
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'storage-backend-name';
+    nameSpan.textContent = (b && b.name) ? String(b.name) : '—';
+    nameTd.appendChild(nameSpan);
+    if (isDefault) {
+      const tag = document.createElement('span');
+      tag.className = 'badge badge-attention storage-default-tag';
+      tag.textContent = 'Default';
+      nameTd.appendChild(document.createTextNode(' '));
+      nameTd.appendChild(tag);
+    }
+    tr.appendChild(nameTd);
+
+    const endpointTd = document.createElement('td');
+    endpointTd.className = 'mono';
+    endpointTd.textContent = (b && b.endpointUrl) ? String(b.endpointUrl) : '—';
+    tr.appendChild(endpointTd);
+
+    const bucketTd = document.createElement('td');
+    bucketTd.className = 'mono';
+    bucketTd.textContent = (b && b.bucket) ? String(b.bucket) : '—';
+    tr.appendChild(bucketTd);
+
+    const regionTd = document.createElement('td');
+    regionTd.textContent = (b && b.region) ? String(b.region) : '—';
+    tr.appendChild(regionTd);
+
+    const statusTd = document.createElement('td');
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + status.cls + ' storage-backend-status';
+    badge.textContent = status.label;
+    statusTd.appendChild(badge);
+    tr.appendChild(statusTd);
+
+    // Actions: edit/delete are ABSENT/disabled for the default backend
+    // (issue #680). We disable rather than omit so the row stays aligned and the
+    // reason is announced to assistive tech.
+    const actionsTd = document.createElement('td');
+    actionsTd.className = 'storage-backend-actions';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn-sm storage-backend-delete';
+    del.textContent = 'Delete';
+    if (isDefault) {
+      del.disabled = true;
+      del.title = 'The platform-provisioned default backend cannot be deleted.';
+      del.setAttribute('aria-disabled', 'true');
+    }
+    actionsTd.appendChild(del);
+    tr.appendChild(actionsTd);
+
+    tbody.appendChild(tr);
+  });
+
+  wrap.appendChild(table);
+  return wrap;
+}
+
+// ─── Add / edit storage-backend form (issue #681) ────────────────────────────
+//
+// Contract (per CLAUDE.md rule 7), verified against the authoritative endpoints
+// added on branch issue-679/storage-backend-api-endpoints:
+//   - POST   /api/v1/storage/backends            create (registerBackendSchema)
+//       src/routes/storage.ts:128-140 (issue-679) — required: name, bucket,
+//       accessKeyId, secretAccessKey; optional: region, endpointUrl.
+//   - PATCH  /api/v1/storage/backends/{id}        update (updateBackendSchema)
+//       src/routes/storage.ts:178-201 (issue-679) — every field optional; a
+//       credential rotation MUST send accessKeyId + secretAccessKey together.
+//   - POST   /api/v1/storage/backends/{id}/test-connection
+//       src/routes/storage.ts:206-213 (issue-679) — body { secretAccessKey },
+//       response { status: 'connected' | 'unreachable', message }.
+//   - Secrets return masked as '***redacted***' (backendViewSchema, storage.ts
+//       :148-166 issue-679); we NEVER echo returned key material into the field.
+//
+// The issue lists these six fields: name, endpoint URL, bucket name, region,
+// access key ID, secret access key. `region` is `.optional()` in the create
+// schema; the issue copy says "all fields required on add", so we require it in
+// the UI (a stricter-than-API client constraint is safe — the API still accepts
+// it). Everything is framework-free so the field/validation logic is directly
+// unit-testable.
+const STORAGE_SECRET_PLACEHOLDER = '••••••••  (unchanged)';
+
+// The six form fields in render order. `secret:true` marks the password input
+// whose value, on edit, is a masked placeholder the operator may leave untouched
+// to keep the stored credential. `type` drives the <input type>.
+const STORAGE_BACKEND_FORM_FIELDS = [
+  { key: 'name', label: 'Name', type: 'text', placeholder: 'e.g. Cold archive' },
+  { key: 'endpointUrl', label: 'Endpoint URL', type: 'url', placeholder: 'https://s3.example.com' },
+  { key: 'bucket', label: 'Bucket name', type: 'text', placeholder: 'my-bucket' },
+  { key: 'region', label: 'Region', type: 'text', placeholder: 'us-east-1' },
+  { key: 'accessKeyId', label: 'Access key ID', type: 'text', placeholder: 'AKIA…' },
+  { key: 'secretAccessKey', label: 'Secret access key', type: 'password', secret: true, placeholder: '' },
+];
+
+// Pure, network-free validation of the raw field values (issue #681). `mode` is
+// 'add' | 'edit'. Returns { valid, errors, patch/body }. Error messages are
+// actionable per the acceptance criteria. On 'edit' an untouched secret (empty
+// string) is omitted so the backend receives no secret update; a typed secret is
+// treated as a credential rotation and paired with accessKeyId (the API refuses
+// one without the other — updateBackendSchema.refine, storage.ts:190-201).
+function validateStorageBackendForm(mode, values) {
+  const v = {};
+  for (const f of STORAGE_BACKEND_FORM_FIELDS) {
+    v[f.key] = typeof values[f.key] === 'string' ? values[f.key].trim() : '';
+  }
+  const errors = {};
+  const isAdd = mode === 'add';
+
+  // Non-secret required fields — required on add; on edit each may be left as
+  // its pre-populated value (never blank, since the form is pre-filled) but we
+  // still reject a field the operator has cleared to empty.
+  for (const key of ['name', 'endpointUrl', 'bucket', 'region', 'accessKeyId']) {
+    if (!v[key]) {
+      const label = STORAGE_BACKEND_FORM_FIELDS.find((f) => f.key === key).label;
+      errors[key] = label + ' is required.';
+    }
+  }
+
+  // URL format — must be an absolute http/https URL (the API's endpointUrl is
+  // z.string().url(), storage.ts:138; we give a friendlier, protocol-specific
+  // message than the server's generic 422).
+  if (v.endpointUrl && !/^https?:\/\/.+/i.test(v.endpointUrl)) {
+    errors.endpointUrl = 'Endpoint URL must start with http:// or https://';
+  } else if (v.endpointUrl && !errors.endpointUrl) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(v.endpointUrl);
+    } catch (_) {
+      errors.endpointUrl = 'Endpoint URL is not a valid URL.';
+    }
+  }
+
+  // Secret. On add it is required. On edit an empty value means "leave the
+  // stored credential unchanged" (issue #681) — no secret is sent.
+  const secretTyped = v.secretAccessKey.length > 0;
+  if (isAdd && !secretTyped) {
+    errors.secretAccessKey = 'Secret access key is required.';
+  }
+
+  const valid = Object.keys(errors).length === 0;
+  if (!valid) return { valid: false, errors: errors };
+
+  if (isAdd) {
+    return {
+      valid: true,
+      errors: {},
+      body: {
+        name: v.name,
+        endpointUrl: v.endpointUrl,
+        bucket: v.bucket,
+        region: v.region,
+        accessKeyId: v.accessKeyId,
+        secretAccessKey: v.secretAccessKey,
+      },
+    };
+  }
+
+  // Edit: build a PATCH body of the non-secret fields, and only include the
+  // credential pair when the operator actually typed a new secret.
+  const body = {
+    name: v.name,
+    endpointUrl: v.endpointUrl,
+    bucket: v.bucket,
+    region: v.region,
+  };
+  if (secretTyped) {
+    body.accessKeyId = v.accessKeyId;
+    body.secretAccessKey = v.secretAccessKey;
+  }
+  return { valid: true, errors: {}, body: body };
+}
+
+// Pure render of the add/edit form (issue #681). Framework-free and network-free
+// so it is directly unit-testable. `mode` is 'add' | 'edit'; `backend` is the
+// redacted view (edit only) used to pre-populate non-secret fields. The secret
+// field is NEVER populated with returned key material: on edit it shows a masked
+// placeholder (the operator leaves it blank to keep the stored credential).
+// Returns the detached <form> element; wiring (submit, test-connection, cancel)
+// is attached by the caller.
+function renderStorageBackendForm(mode, backend) {
+  const isEdit = mode === 'edit';
+  const b = backend || {};
+  const form = document.createElement('form');
+  form.className = 'storage-backend-form';
+  form.setAttribute('novalidate', 'novalidate');
+  form.dataset.mode = mode;
+  if (isEdit && b.id != null) form.dataset.backendId = String(b.id);
+
+  const heading = document.createElement('div');
+  heading.className = 'section-title';
+  heading.textContent = isEdit ? 'Edit storage backend' : 'Add storage backend';
+  form.appendChild(heading);
+
+  STORAGE_BACKEND_FORM_FIELDS.forEach(function(f) {
+    const fieldWrap = document.createElement('div');
+    fieldWrap.className = 'form-field storage-backend-field';
+
+    const inputId = 'sbf-' + f.key;
+    const label = document.createElement('label');
+    label.setAttribute('for', inputId);
+    label.textContent = f.label;
+    fieldWrap.appendChild(label);
+
+    const input = document.createElement('input');
+    input.type = f.type;
+    input.id = inputId;
+    input.name = f.key;
+    input.className = 'storage-backend-input';
+    input.dataset.field = f.key;
+    // Required for keyboard/AT semantics; JS validation still runs (novalidate
+    // on the form suppresses the browser's own bubble so our inline messages win).
+    input.required = !isEdit || !f.secret;
+
+    if (f.secret) {
+      // NEVER seed the secret input with the redacted marker or any returned key
+      // material. On edit, show a masked placeholder the operator can ignore.
+      input.value = '';
+      input.autocomplete = 'new-password';
+      input.placeholder = isEdit ? STORAGE_SECRET_PLACEHOLDER : (f.placeholder || '');
+      if (isEdit) {
+        input.setAttribute('aria-describedby', inputId + '-hint');
+      }
+    } else {
+      // Pre-populate non-secret fields on edit from the redacted view.
+      input.value = isEdit && b[f.key] != null ? String(b[f.key]) : '';
+      input.placeholder = f.placeholder || '';
+    }
+    fieldWrap.appendChild(input);
+
+    if (f.secret && isEdit) {
+      const hint = document.createElement('div');
+      hint.id = inputId + '-hint';
+      hint.className = 'form-hint';
+      hint.textContent = 'Leave blank to keep the current secret. Type a new value to rotate it.';
+      fieldWrap.appendChild(hint);
+    }
+
+    const errEl = document.createElement('div');
+    errEl.className = 'form-error';
+    errEl.dataset.errorFor = f.key;
+    errEl.setAttribute('role', 'alert');
+    fieldWrap.appendChild(errEl);
+
+    form.appendChild(fieldWrap);
+  });
+
+  // Actions row: Save, Test connection, Cancel + inline result/status areas.
+  const actions = document.createElement('div');
+  actions.className = 'form-row storage-backend-form-actions';
+
+  const submitBtn = document.createElement('button');
+  submitBtn.type = 'submit';
+  submitBtn.className = 'storage-backend-submit';
+  submitBtn.textContent = isEdit ? 'Save changes' : 'Add backend';
+  actions.appendChild(submitBtn);
+
+  const testBtn = document.createElement('button');
+  testBtn.type = 'button';
+  testBtn.className = 'btn-sm storage-backend-test';
+  testBtn.textContent = 'Test connection';
+  actions.appendChild(testBtn);
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'btn-sm storage-backend-cancel';
+  cancelBtn.textContent = 'Cancel';
+  actions.appendChild(cancelBtn);
+
+  form.appendChild(actions);
+
+  const testResult = document.createElement('div');
+  testResult.className = 'storage-backend-test-result';
+  testResult.dataset.testResult = '1';
+  testResult.setAttribute('role', 'status');
+  testResult.setAttribute('aria-live', 'polite');
+  form.appendChild(testResult);
+
+  const formMsg = document.createElement('div');
+  formMsg.className = 'storage-backend-form-msg';
+  formMsg.dataset.formMsg = '1';
+  form.appendChild(formMsg);
+
+  return form;
+}
+
+// Apply the { errors } map from validateStorageBackendForm to a rendered form:
+// clears any previous errors, writes each message into its field's error slot,
+// and toggles an `has-error` class for styling. Returns the first field key with
+// an error (for focus management) or null.
+function applyStorageBackendFormErrors(form, errors) {
+  let first = null;
+  form.querySelectorAll('.form-error[data-error-for]').forEach(function(el) {
+    const key = el.dataset.errorFor;
+    const field = el.closest('.storage-backend-field');
+    if (errors && errors[key]) {
+      el.textContent = errors[key];
+      if (field) field.classList.add('has-error');
+      if (first === null) first = key;
+    } else {
+      el.textContent = '';
+      if (field) field.classList.remove('has-error');
+    }
+  });
+  return first;
 }
 
 // ─── Wedged-asset detection (issue #282) ─────────────────────────────────────
@@ -439,8 +856,21 @@ const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
 
+// Tabs whose sidebar entry + view are gated on the caller's role. Storage
+// backend management is an editor/admin surface (issue #680); a viewer must
+// never see the entry nor be able to route to it.
+const ROLE_GATED_TABS = { storage: canManageStorage };
+
+function isTabAllowed(name) {
+  const gate = ROLE_GATED_TABS[name];
+  return typeof gate === 'function' ? gate() : true;
+}
+
 function switchTab(name) {
   if (!TABS.includes(name)) return;
+  // Fail closed: never render a role-gated view for a role that may not see it,
+  // even if an old persisted TAB_KEY or a manual call names it.
+  if (!isTabAllowed(name)) name = 'assets';
   localStorage.setItem(TAB_KEY, name);
   document.querySelectorAll('.tab-btn').forEach(function(b) {
     b.classList.toggle('active', b.dataset.tab === name);
@@ -454,6 +884,14 @@ function switchTab(name) {
 
 function setupTabs() {
   document.querySelectorAll('.tab-btn').forEach(function(btn) {
+    // Hide the sidebar entry for any role-gated tab the current role may not
+    // access. Acceptance criterion #680: the Storage link renders only for
+    // editor/admin. Hidden (not just disabled) so it is absent for viewers.
+    if (!isTabAllowed(btn.dataset.tab)) {
+      btn.style.display = 'none';
+      btn.setAttribute('aria-hidden', 'true');
+      return;
+    }
     btn.addEventListener('click', function() { switchTab(btn.dataset.tab); });
   });
 }
@@ -2226,6 +2664,218 @@ async function renderStorageTab(container) {
   title.textContent = 'Storage';
   container.appendChild(title);
 
+  // ── Storage backends list view (issue #680) ──
+  // Consolidated view of every configured backend before an operator manages
+  // them. Calls GET /api/v1/storage/backends (src/routes/storage.ts:261-274)
+  // and renders each backend's name, endpoint, bucket, region + a status badge.
+  const backendsSection = document.createElement('div');
+  backendsSection.className = 'section';
+  backendsSection.innerHTML =
+    '<div class="section-header">' +
+    '  <div class="section-title">Storage backends</div>' +
+    '  <button type="button" id="storage-add-backend-btn" class="btn-sm">Add backend</button>' +
+    '</div>' +
+    '<div id="storage-backend-form-mount"></div>' +
+    '<div id="storage-backends-mount"></div>';
+  container.appendChild(backendsSection);
+  const backendsMount = backendsSection.querySelector('#storage-backends-mount');
+  const formMount = backendsSection.querySelector('#storage-backend-form-mount');
+  const addBtn = backendsSection.querySelector('#storage-add-backend-btn');
+
+  // Cache of the last-fetched backend views so the edit form can pre-populate
+  // its non-secret fields from the already-redacted list payload (issue #681)
+  // without a second round-trip. The secret is never present here.
+  let backendsById = {};
+
+  // Show the add/edit form as a new mode of the Storage tab (issue #681). The
+  // list stays mounted below; on success we close the form and reload the list
+  // so the new/updated entry is visible (acceptance criterion).
+  function openBackendForm(mode, backend) {
+    formMount.innerHTML = '';
+    addBtn.disabled = true;
+    const form = renderStorageBackendForm(mode, backend);
+    const msgEl = form.querySelector('[data-form-msg]');
+    const testResultEl = form.querySelector('[data-test-result]');
+    const submitBtn = form.querySelector('.storage-backend-submit');
+    const testBtn = form.querySelector('.storage-backend-test');
+    const cancelBtn = form.querySelector('.storage-backend-cancel');
+    const isEdit = mode === 'edit';
+    const backendId = isEdit && backend ? backend.id : null;
+
+    function closeForm() {
+      formMount.innerHTML = '';
+      addBtn.disabled = false;
+      addBtn.focus();
+    }
+
+    // Read the six field values off the rendered inputs.
+    function readValues() {
+      const out = {};
+      form.querySelectorAll('.storage-backend-input').forEach(function(inp) {
+        out[inp.dataset.field] = inp.value;
+      });
+      return out;
+    }
+
+    cancelBtn.addEventListener('click', closeForm);
+
+    // Test connection (issue #681). POST /storage/backends/{id}/test-connection
+    // requires an id + a secret to probe with (storage.ts:206-213, issue-679).
+    // On add the backend has no id yet, so the operator must save first; we say
+    // so inline rather than silently no-op.
+    testBtn.addEventListener('click', async function() {
+      testResultEl.textContent = '';
+      testResultEl.className = 'storage-backend-test-result';
+      const values = readValues();
+      const secret = (values.secretAccessKey || '').trim();
+      if (!backendId) {
+        testResultEl.textContent =
+          'Save the backend first, then use Test connection to probe it.';
+        testResultEl.classList.add('is-info');
+        return;
+      }
+      if (!secret) {
+        testResultEl.textContent =
+          'Enter the secret access key to test the connection.';
+        testResultEl.classList.add('is-info');
+        return;
+      }
+      testBtn.disabled = true;
+      testResultEl.textContent = 'Testing…';
+      try {
+        const result = await apiFetch(
+          '/storage/backends/' + encodeURIComponent(backendId) + '/test-connection',
+          { method: 'POST', body: JSON.stringify({ secretAccessKey: secret }) }
+        );
+        // Response contract: { status: 'connected' | 'unreachable', message }.
+        const ok = result && result.status === 'connected';
+        testResultEl.textContent =
+          (ok ? 'Connected: ' : 'Unreachable: ') +
+          (result && result.message ? result.message : (result && result.status) || 'unknown');
+        testResultEl.classList.add(ok ? 'is-success' : 'is-failure');
+      } catch (err) {
+        testResultEl.textContent = 'Test failed: ' + err.message;
+        testResultEl.classList.add('is-failure');
+      } finally {
+        testBtn.disabled = false;
+      }
+    });
+
+    form.addEventListener('submit', async function(ev) {
+      ev.preventDefault();
+      if (msgEl) msgEl.textContent = '';
+      const values = readValues();
+      const result = validateStorageBackendForm(mode, values);
+      const firstErr = applyStorageBackendFormErrors(form, result.errors);
+      if (!result.valid) {
+        if (firstErr) {
+          const el = form.querySelector('.storage-backend-input[data-field="' + firstErr + '"]');
+          if (el) el.focus();
+        }
+        return;
+      }
+      submitBtn.disabled = true;
+      testBtn.disabled = true;
+      try {
+        if (isEdit) {
+          await apiFetch('/storage/backends/' + encodeURIComponent(backendId), {
+            method: 'PATCH',
+            body: JSON.stringify(result.body),
+          });
+        } else {
+          await apiFetch('/storage/backends', {
+            method: 'POST',
+            body: JSON.stringify(result.body),
+          });
+        }
+        // Success: land back on the list with the new/updated entry visible.
+        closeForm();
+        await loadBackends();
+        showMsg(
+          backendsMount,
+          isEdit ? 'Storage backend updated.' : 'Storage backend added.',
+          'success'
+        );
+      } catch (err) {
+        submitBtn.disabled = false;
+        testBtn.disabled = false;
+        if (msgEl) {
+          msgEl.textContent = 'Error: ' + err.message;
+          msgEl.className = 'storage-backend-form-msg is-failure';
+        }
+      }
+    });
+
+    formMount.appendChild(form);
+    const firstInput = form.querySelector('.storage-backend-input');
+    if (firstInput) firstInput.focus();
+  }
+
+  addBtn.addEventListener('click', function() {
+    openBackendForm('add', null);
+  });
+
+  async function loadBackends() {
+    backendsMount.innerHTML = '';
+    const loader = loadingEl();
+    backendsMount.appendChild(loader);
+    let data;
+    try {
+      data = await apiFetch('/storage/backends');
+    } catch (err) {
+      loader.remove();
+      // 501 = registry not configured; surface non-fatally so the buckets view
+      // below still loads (src/routes/storage.ts:265-270).
+      showMsg(backendsMount, 'Storage backends unavailable: ' + err.message, 'info');
+      return;
+    }
+    loader.remove();
+    backendsById = {};
+    (data && Array.isArray(data.backends) ? data.backends : []).forEach(function(b) {
+      if (b && b.id != null) backendsById[String(b.id)] = b;
+    });
+    const listEl = renderStorageBackendsList(data && data.backends);
+    // Wire delete only for deletable (non-default) backends. The default's
+    // control is already disabled by the pure render (issue #680).
+    listEl.querySelectorAll('.storage-backend-delete').forEach(function(btn) {
+      if (btn.disabled) return;
+      btn.addEventListener('click', async function() {
+        const row = btn.closest('.storage-backend-row');
+        const id = row && row.dataset.backendId;
+        if (!id) return;
+        if (!confirm('Delete storage backend "' + id + '"?')) return;
+        btn.disabled = true;
+        try {
+          await apiFetch('/storage/backends/' + encodeURIComponent(id), { method: 'DELETE' });
+          await loadBackends();
+        } catch (err) {
+          btn.disabled = false;
+          showMsg(backendsMount, 'Error: ' + err.message, 'error');
+        }
+      });
+    });
+    // Inject an Edit control per editable (non-default) row (issue #681). The
+    // default backend is immutable (PATCH returns 403, storage.ts issue-679), so
+    // it gets no Edit button — we detect it via the row's is-default class the
+    // list view already sets.
+    listEl.querySelectorAll('.storage-backend-row').forEach(function(row) {
+      if (row.classList.contains('is-default')) return;
+      const id = row.dataset.backendId;
+      if (!id) return;
+      const actionsTd = row.querySelector('.storage-backend-actions');
+      if (!actionsTd) return;
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.className = 'btn-sm storage-backend-edit';
+      edit.textContent = 'Edit';
+      edit.addEventListener('click', function() {
+        openBackendForm('edit', backendsById[id] || { id: id });
+      });
+      actionsTd.insertBefore(edit, actionsTd.firstChild);
+    });
+    backendsMount.appendChild(listEl);
+  }
+
   // Create-bucket form
   const createSection = document.createElement('div');
   createSection.className = 'section';
@@ -2318,6 +2968,7 @@ async function renderStorageTab(container) {
     }
   });
 
+  await loadBackends();
   await loadBuckets();
 }
 
@@ -3789,6 +4440,23 @@ export {
   setStackOverride,
   getActiveStack,
   DETAIL_POLL_INTERVAL_MS,
+  // Storage-backend list view (issue #680). Exported so a DOM/unit test can
+  // exercise the pure render + role gate without a network call.
+  renderStorageBackendsList,
+  storageBackendStatus,
+  isDefaultStorageBackend,
+  getClientRole,
+  setClientRole,
+  canManageStorage,
+  // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
+  // exercise the pure render + validation without a network call.
+  renderStorageBackendForm,
+  validateStorageBackendForm,
+  applyStorageBackendFormErrors,
+  STORAGE_SECRET_PLACEHOLDER,
+  // Exported so the add -> list -> edit -> list integration test can drive the
+  // real Storage-tab flow against a stubbed fetch (issue #681).
+  renderStorageTab,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
