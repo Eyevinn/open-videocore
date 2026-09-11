@@ -21675,6 +21675,92 @@
           }
         }
       }
+    },
+    "/api/v1/usage": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "storage": {
+                      "type": "object",
+                      "properties": {
+                        "usedBytes": {
+                          "type": "number"
+                        },
+                        "consumedBytes": {
+                          "type": "number"
+                        },
+                        "reservedBytes": {
+                          "type": "number"
+                        },
+                        "configured": {
+                          "type": "boolean"
+                        },
+                        "limitBytes": {
+                          "type": "number",
+                          "nullable": true
+                        },
+                        "availableBytes": {
+                          "type": "number",
+                          "nullable": true
+                        }
+                      },
+                      "required": [
+                        "usedBytes",
+                        "consumedBytes",
+                        "reservedBytes",
+                        "configured",
+                        "limitBytes",
+                        "availableBytes"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "jobs": {
+                      "type": "object",
+                      "properties": {
+                        "outstanding": {
+                          "type": "number"
+                        },
+                        "configured": {
+                          "type": "boolean"
+                        },
+                        "limit": {
+                          "type": "number",
+                          "nullable": true
+                        },
+                        "available": {
+                          "type": "number",
+                          "nullable": true
+                        }
+                      },
+                      "required": [
+                        "outstanding",
+                        "configured",
+                        "limit",
+                        "available"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "storage",
+                    "jobs"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "security": [

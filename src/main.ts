@@ -89,6 +89,7 @@ import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
 import { InMemoryCommentRepository } from './data/comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
+import { usageRouter } from './routes/usage.js';
 import {
   retentionRouter,
   archiveRetentionMsFromEnv,
@@ -1352,6 +1353,7 @@ function activateScaler(redisUrl: string): void {
   internalRouterOptions.packaging = packaging;
   internalRouterOptions.redis = redis;
   scalerRouterOptions.redis = redis;
+  usageRouterOptions.redis = redis;
 
   // Start loops for any workspaces that had pool entries from a previous run.
   // This triggers reconcile() on the first tick, correcting stale activeJobs
@@ -1400,6 +1402,7 @@ async function deactivateScaler(): Promise<void> {
   internalRouterOptions.packaging = undefined;
   internalRouterOptions.redis = undefined;
   scalerRouterOptions.redis = undefined;
+  usageRouterOptions.redis = undefined;
 
   try {
     // The Valkey client is created lazyConnect, so it may never have opened a
@@ -1757,6 +1760,27 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   }
 };
 await app.register(scalerRouter, scalerRouterOptions);
+
+// Usage read surface (issue #581). Unauthenticated read-only report of current
+// consumption vs. the opt-in caps for BOTH governed resources — storage bytes
+// and outstanding jobs — so a Media Developer can see remaining headroom before
+// hitting a limit. Every number is read from the SAME authoritative accounting
+// source enforcement uses (no parallel counter, no drift):
+//   - storage: the running-total counter (quotaStore.read) + guard cap the ingest
+//     admission path enforces against (storageQuota.cap()).
+//   - jobs: the scaler's own Valkey depths (outstandingJobCount, via redis) + the
+//     env-resolved throughput cap the submit path enforces (resolveJobThroughputCap).
+// `redis` is held by reference and flipped by activateScaler/deactivateScaler so
+// outstanding-job numbers appear the moment a stack is provisioned (no restart);
+// while the scaler is off it reports 0 outstanding, exactly like GET /scaler/status.
+const usageRouterOptions: Parameters<typeof usageRouter>[1] & { prefix: string } = {
+  prefix: '/api/v1/usage',
+  readStorageCounter: () => quotaStore.read(),
+  storageCap: () => storageQuota.cap(),
+  jobsCap: () => resolveJobThroughputCap(process.env),
+  redis: sharedRedis
+};
+await app.register(usageRouter, usageRouterOptions);
 
 // Archive retention config (issue #325, foundation for #323). Instance-global,
 // hot-reloadable retention window read from ARCHIVE_RETENTION_MS at boot (unset/0
