@@ -148,12 +148,20 @@ async function apiFetch(path, options = {}) {
   const res = await fetch(API_BASE + path, { ...options, headers });
   if (!res.ok) {
     let msg = 'HTTP ' + res.status;
+    let body;
     try {
-      const body = await res.json();
-      msg = body.error || body.message || msg;
+      body = await res.json();
+      // Prefer the human-readable `message` when present (e.g. the 409
+      // backend_in_use body defines both a machine `error` code and a
+      // human `message` — storage.ts:274-283 on issue-679); fall back to
+      // the machine code, then the status line.
+      msg = body.message || body.error || msg;
     } catch (_) { /* ignore */ }
     const err = new Error(msg);
     err.status = res.status;
+    // Expose the parsed error body so callers can read machine fields
+    // (e.g. the 409 `references` counts) without re-reading the response.
+    err.body = body;
     throw err;
   }
   const ct = res.headers.get('content-type') || '';
@@ -826,6 +834,103 @@ function openModal(title, buildBody) {
   buildBody(body, close);
   document.body.appendChild(backdrop);
   return close;
+}
+
+// ─── Storage-backend remove confirmation (issue #682) ──────────────────────────
+// Format the human-readable in-use error for a 409 body. The authoritative
+// contract (branch issue-679/storage-backend-api-endpoints,
+// src/routes/storage.ts:216-224 inUseErrorSchema + :274-283 handler) is:
+//   { error: 'backend_in_use', message: string,
+//     references: { assetIds: string[], activeJobIds: string[] } }
+// The server always supplies a human `message`; we prefer it verbatim. When it
+// is somehow absent we synthesise one from the reference counts so the operator
+// still learns why removal was blocked.
+function describeBackendInUse(err) {
+  const body = err && err.body;
+  if (body && typeof body.message === 'string' && body.message.trim()) {
+    return body.message;
+  }
+  const refs = (body && body.references) || {};
+  const assets = Array.isArray(refs.assetIds) ? refs.assetIds.length : 0;
+  const jobs = Array.isArray(refs.activeJobIds) ? refs.activeJobIds.length : 0;
+  const n = assets + jobs;
+  return 'This backend is still referenced by ' + n +
+    ' asset' + (n === 1 ? '' : 's') + ' or active job' + (n === 1 ? '' : 's') +
+    ' and cannot be removed.';
+}
+
+// Open a confirmation dialog for removing a storage backend (issue #682). The
+// DELETE (src/routes/storage.ts:517-535 on issue-679, openapi.json
+// /api/v1/storage/backends/{id}.delete) is issued ONLY when the operator clicks
+// Remove inside this dialog. A 409 (BackendInUseError -> backend_in_use) keeps
+// the dialog open and surfaces the human-readable message; on 204 we close and
+// invoke opts.onRemoved so the caller drops the row without a full reload.
+function openStorageBackendRemoveDialog(backend, opts) {
+  const options = opts || {};
+  const id = backend && backend.id != null ? String(backend.id) : '';
+  const name = backend && backend.name ? String(backend.name) : id;
+
+  return openModal('Remove storage backend', function(body, close) {
+    body.classList.add('storage-remove-dialog');
+
+    const prompt = document.createElement('p');
+    prompt.className = 'storage-remove-prompt';
+    // textContent — the backend name is untrusted and must never be parsed as
+    // HTML (mirrors the list view's escaping guarantee).
+    prompt.textContent = 'Remove storage backend "' + name + '"? This cannot be undone.';
+    body.appendChild(prompt);
+
+    const errEl = document.createElement('div');
+    errEl.className = 'storage-remove-error';
+    errEl.setAttribute('role', 'alert');
+    errEl.style.display = 'none';
+    body.appendChild(errEl);
+
+    const actions = document.createElement('div');
+    actions.className = 'modal-actions';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn-sm storage-remove-cancel';
+    cancelBtn.textContent = 'Cancel';
+
+    const confirmBtn = document.createElement('button');
+    confirmBtn.type = 'button';
+    confirmBtn.className = 'btn-sm btn-danger storage-remove-confirm';
+    confirmBtn.textContent = 'Remove';
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(confirmBtn);
+    body.appendChild(actions);
+
+    cancelBtn.addEventListener('click', close);
+
+    confirmBtn.addEventListener('click', async function() {
+      errEl.style.display = 'none';
+      errEl.textContent = '';
+      confirmBtn.disabled = true;
+      cancelBtn.disabled = true;
+      try {
+        await apiFetch('/storage/backends/' + encodeURIComponent(id), { method: 'DELETE' });
+        close();
+        if (typeof options.onRemoved === 'function') options.onRemoved(backend);
+      } catch (err) {
+        // 409 = still referenced by an asset or active job (issue #679). Keep
+        // the dialog open and surface a human-readable reason (acceptance
+        // criterion). Any other failure surfaces its own message likewise.
+        confirmBtn.disabled = false;
+        cancelBtn.disabled = false;
+        errEl.textContent = err && err.status === 409
+          ? describeBackendInUse(err)
+          : 'Error: ' + (err && err.message ? err.message : 'removal failed');
+        errEl.style.display = '';
+        confirmBtn.focus();
+      }
+    });
+
+    // Focus the confirm control so a keyboard user can act immediately.
+    confirmBtn.focus();
+  });
 }
 
 function loadingEl() {
@@ -2835,23 +2940,38 @@ async function renderStorageTab(container) {
       if (b && b.id != null) backendsById[String(b.id)] = b;
     });
     const listEl = renderStorageBackendsList(data && data.backends);
-    // Wire delete only for deletable (non-default) backends. The default's
-    // control is already disabled by the pure render (issue #680).
+    // Wire the Remove control only for deletable (non-default) backends. The
+    // default's control is already disabled by the pure render (issue #680).
+    // Clicking Remove opens a guarded confirmation dialog (issue #682); the
+    // DELETE call is made ONLY on explicit confirmation inside that dialog.
     listEl.querySelectorAll('.storage-backend-delete').forEach(function(btn) {
       if (btn.disabled) return;
-      btn.addEventListener('click', async function() {
+      btn.addEventListener('click', function() {
         const row = btn.closest('.storage-backend-row');
         const id = row && row.dataset.backendId;
         if (!id) return;
-        if (!confirm('Delete storage backend "' + id + '"?')) return;
-        btn.disabled = true;
-        try {
-          await apiFetch('/storage/backends/' + encodeURIComponent(id), { method: 'DELETE' });
-          await loadBackends();
-        } catch (err) {
-          btn.disabled = false;
-          showMsg(backendsMount, 'Error: ' + err.message, 'error');
-        }
+        const backend = backendsById[id] || { id: id };
+        openStorageBackendRemoveDialog(backend, {
+          onRemoved: function() {
+            // Remove the entry from the rendered list immediately, without a
+            // full reload (acceptance criterion). Drop the cache entry too so a
+            // later edit/list stays consistent.
+            if (row && row.parentNode) row.remove();
+            delete backendsById[id];
+            // If that was the last backend row, show the empty state the pure
+            // render would produce for an empty array.
+            if (!listEl.querySelector('.storage-backend-row')) {
+              const table = listEl.querySelector('.storage-backends-table');
+              if (table) table.remove();
+              if (!listEl.querySelector('.empty')) {
+                const empty = document.createElement('div');
+                empty.className = 'empty';
+                empty.textContent = 'No storage backends available.';
+                listEl.appendChild(empty);
+              }
+            }
+          },
+        });
       });
     });
     // Inject an Edit control per editable (non-default) row (issue #681). The
@@ -4454,6 +4574,10 @@ export {
   validateStorageBackendForm,
   applyStorageBackendFormErrors,
   STORAGE_SECRET_PLACEHOLDER,
+  // Remove-with-confirmation flow (issue #682). Exported so a DOM/unit test can
+  // exercise the confirmation dialog + the 409 in-use message formatter.
+  openStorageBackendRemoveDialog,
+  describeBackendInUse,
   // Exported so the add -> list -> edit -> list integration test can drive the
   // real Storage-tab flow against a stubbed fetch (issue #681).
   renderStorageTab,
