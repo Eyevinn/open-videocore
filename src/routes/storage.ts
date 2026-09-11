@@ -25,9 +25,14 @@ import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
 import type { WatchFolderService } from '../pipeline/watch-folder.js';
 import {
   BackendValidationError,
+  BackendInUseError,
   DefaultBackendNotDeletableError,
+  ImmutableDefaultBackendError,
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
+import { InvalidPathTemplateError } from '../services/destination-path-template.js';
+import { authorize, methodToAction, AUTHZ_FORBIDDEN_ERROR } from '../auth/authorize.js';
+import type { PrincipalRole } from '../auth/principal.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 
 // Hard cap on objects returned by a single listing call. Bounds the response
@@ -165,6 +170,59 @@ const backendListSchema = z.object({
   backends: z.array(backendViewSchema)
 });
 
+// PATCH request (issue #679). Every field optional; an omitted field is left
+// unchanged. `secretAccessKey` (with a matching `accessKeyId`) rotates the
+// credential; it is NEVER echoed. `pathTemplate: null` clears a set template.
+// The secret is validated as a non-empty string but never returned.
+const updateBackendSchema = z
+  .object({
+    name: z.string().min(1).max(256).optional(),
+    role: z.enum(['source', 'packaged', 'both', 'archive']).optional(),
+    bucket: z.string().min(1).optional(),
+    accessKeyId: z.string().min(1).optional(),
+    secretAccessKey: z.string().min(1).optional(),
+    region: z.string().min(1).optional(),
+    endpointUrl: z.string().url().optional(),
+    sessionToken: z.string().min(1).optional(),
+    publicBaseUrl: z.string().url().optional(),
+    pathTemplate: z.string().nullable().optional()
+  })
+  // A credential rotation must supply BOTH the access key id and the secret so a
+  // coherent credential is re-fanned; neither alone is a valid rotation.
+  .refine(
+    (b) =>
+      (b.secretAccessKey === undefined && b.accessKeyId === undefined) ||
+      (b.secretAccessKey !== undefined && b.accessKeyId !== undefined),
+    {
+      message:
+        'accessKeyId and secretAccessKey must be supplied together to rotate the credential'
+    }
+  );
+
+// The compact test-connection request + response (issue #679). The literal
+// secret was never persisted (ADR-017 D1), so the caller re-supplies it to probe
+// with; it is NEVER echoed back. The response is exactly the issue's contract:
+// { status: 'connected' | 'unreachable', message }.
+const testConnectionBodySchema = z.object({
+  secretAccessKey: z.string().min(1),
+  sessionToken: z.string().min(1).optional()
+});
+const testConnectionResultSchema = z.object({
+  status: z.enum(['connected', 'unreachable']),
+  message: z.string()
+});
+
+// 409 in-use body (issue #679): a human-readable `message` plus the non-secret
+// reference ids so the ops UI can name what blocks removal.
+const inUseErrorSchema = z.object({
+  error: z.literal('backend_in_use'),
+  message: z.string(),
+  references: z.object({
+    assetIds: z.array(z.string()),
+    activeJobIds: z.array(z.string())
+  })
+});
+
 const objectSchema = z.object({
   key: z.string(),
   size: z.number(),
@@ -201,9 +259,31 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
   const workspaceId = STACK_CONFIG_NAMESPACE;
 
   app.setErrorHandler((err, _request, reply) => {
-    // The OSC-managed default is not deletable (ADR-017 D3) -> 409.
+    // The platform-provisioned default is IMMUTABLE (issue #679): PATCH/DELETE on
+    // it -> 403.
+    if (err instanceof ImmutableDefaultBackendError) {
+      return reply.code(403).send({ error: 'forbidden', message: err.message });
+    }
+    // Pre-#679 delete-only guard kept for compatibility with any caller still
+    // throwing it; mapped to the same 403 immutability semantics.
     if (err instanceof DefaultBackendNotDeletableError) {
-      return reply.code(409).send({ error: 'conflict', message: err.message });
+      return reply.code(403).send({ error: 'forbidden', message: err.message });
+    }
+    // The backend is still referenced by an asset or active job (issue #679) ->
+    // 409 with a human-readable message + the non-secret reference ids.
+    if (err instanceof BackendInUseError) {
+      return reply.code(409).send({
+        error: 'backend_in_use' as const,
+        message: err.message,
+        references: {
+          assetIds: err.references.assetIds,
+          activeJobIds: err.references.activeJobIds
+        }
+      });
+    }
+    // An invalid path template on PATCH (issue #574 machinery) -> 400.
+    if (err instanceof InvalidPathTemplateError) {
+      return reply.code(400).send({ error: 'invalid_path_template', message: err.message });
     }
     // Registration-time reachability / permission validation failed (issue
     // #550): the backend was NOT registered. Surface a 422 with a
@@ -217,6 +297,42 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
       });
     }
     throw err;
+  });
+
+  // Role gate for every /backends* route (issue #679: "all endpoints require
+  // operator or admin role"). This repo's authorisation contract
+  // (src/auth/principal.ts:31) defines the role set as viewer | editor | admin —
+  // there is NO 'operator' role in the model, so we bind the issue's intent to
+  // the actual contract: read is allowed for any recognised role, and write /
+  // delete (register/update/test/remove) require a role the authorize() matrix
+  // grants the action to (editor | admin) — the same matrix the assets/collections
+  // routers enforce (src/auth/authorize.ts). A null role (unrecognised header)
+  // fails closed with the shared 403 envelope.
+  app.addHook('preHandler', async (request, reply) => {
+    // Scope the gate to the backend-registration surface only; the /buckets and
+    // watch-folder routes keep their pre-#679 presence-only behaviour.
+    if (!request.url.includes('/backends')) {
+      return undefined;
+    }
+    const action = methodToAction(request.method);
+    if (action === undefined) {
+      return undefined;
+    }
+    // Absent principal (deployment without the resolver wired) defaults to admin,
+    // exactly as resourceAuthorizationPreHandler does (authorize.ts:145-147).
+    const role: PrincipalRole | null = request.principal ? request.principal.role : 'admin';
+    // The matrix is role×action; storage-backend is an operator resource, so we
+    // reuse the 'asset' row (identical to 'collection' — no cascade).
+    if (!authorize(role, action, 'asset')) {
+      return reply.code(403).send({
+        error: AUTHZ_FORBIDDEN_ERROR,
+        message:
+          role === null
+            ? `role not recognised; ${action} on storage-backend denied`
+            : `role '${role}' may not ${action} a storage-backend`
+      });
+    }
+    return undefined;
   });
 
   // Register an external S3-compatible storage backend (issue #547, ADR-017).
@@ -273,18 +389,137 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
     }
   );
 
-  // Remove a registered backend by id. The implicit OSC-managed default (id
-  // 'default') is NOT deletable (ADR-017 D3) -> 409. Removing an unknown id is an
-  // idempotent no-op (mirrors collections DELETE) that still answers 204.
+  // Read a single registered backend by id, redacted (issue #679). The implicit
+  // OSC-managed default (id 'default') always resolves. The secret is NEVER
+  // present — `credentials.secretAccessKey` is the fixed redaction marker.
+  //   200 — the redacted backend view
+  //   404 — no backend with that id
+  //   501 — registry not configured
+  app.get(
+    '/backends/:id',
+    {
+      schema: {
+        params: z.object({ id: z.string().min(1).max(256) }),
+        response: { 200: backendViewSchema, 404: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      if (!storageBackendRegistry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+      const view = await storageBackendRegistry.get(workspaceId, request.params.id);
+      if (!view) {
+        return reply.code(404).send({ error: 'not_found', message: 'no such storage backend' });
+      }
+      return reply.code(200).send(view);
+    }
+  );
+
+  // Update a registered backend's non-secret fields (issue #679). The
+  // platform-provisioned default is IMMUTABLE -> 403 (error handler). A credential
+  // rotation (accessKeyId + secretAccessKey together) is re-fanned to OSC secrets
+  // and NEVER echoed. The response is the redacted view — the secret is masked.
+  //   200 — the updated redacted backend view
+  //   400 — invalid body / invalid path template
+  //   403 — attempt to update the immutable default
+  //   404 — no backend with that id
+  //   501 — registry not configured
+  app.patch(
+    '/backends/:id',
+    {
+      schema: {
+        params: z.object({ id: z.string().min(1).max(256) }),
+        body: updateBackendSchema,
+        response: {
+          200: backendViewSchema,
+          403: errorSchema,
+          404: errorSchema,
+          501: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      if (!storageBackendRegistry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+      // A rotation requires a secret sink, exactly as register() does.
+      if (request.body.secretAccessKey !== undefined && !storageBackendRegistry.canStoreSecrets) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'OSC secret storage is not configured; cannot rotate backend credentials'
+        });
+      }
+      const view = await storageBackendRegistry.update(
+        workspaceId,
+        request.params.id,
+        request.body
+      );
+      if (!view) {
+        return reply.code(404).send({ error: 'not_found', message: 'no such storage backend' });
+      }
+      return reply.code(200).send(view);
+    }
+  );
+
+  // Probe a registered backend's reachability on demand (issue #679). Performs a
+  // head-bucket / list-bucket probe and returns `{ status, message }` within a
+  // hard 10-second timeout. The literal secret was never persisted (ADR-017 D1),
+  // so the caller re-supplies it to probe with; it is NEVER echoed.
+  //   200 — { status: 'connected' | 'unreachable', message }
+  //   404 — no backend with that id
+  //   501 — registry not configured
+  app.post(
+    '/backends/:id/test-connection',
+    {
+      schema: {
+        params: z.object({ id: z.string().min(1).max(256) }),
+        body: testConnectionBodySchema,
+        response: { 200: testConnectionResultSchema, 404: errorSchema, 501: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      if (!storageBackendRegistry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+      const result = await storageBackendRegistry.testConnection(
+        workspaceId,
+        request.params.id,
+        {
+          secretAccessKey: request.body.secretAccessKey,
+          ...(request.body.sessionToken ? { sessionToken: request.body.sessionToken } : {})
+        }
+      );
+      if (!result) {
+        return reply.code(404).send({ error: 'not_found', message: 'no such storage backend' });
+      }
+      return reply.code(200).send(result);
+    }
+  );
+
+  // Remove a registered backend by id. The platform-provisioned default (id
+  // 'default') is IMMUTABLE -> 403 (issue #679). When the backend is still
+  // referenced by an asset or active job -> 409 with a human-readable message
+  // (issue #679). Removing an unknown id is an idempotent no-op (mirrors
+  // collections DELETE) that still answers 204.
   //   204 — removed (or already absent)
-  //   409 — attempt to remove the OSC-managed default
+  //   403 — attempt to remove the immutable default
+  //   409 — the backend is still referenced by an asset or active job
   //   501 — registry not configured
   app.delete(
     '/backends/:id',
     {
       schema: {
         params: z.object({ id: z.string().min(1).max(256) }),
-        response: { 204: z.null(), 409: errorSchema, 501: errorSchema }
+        response: { 204: z.null(), 403: errorSchema, 409: inUseErrorSchema, 501: errorSchema }
       }
     },
     async (request, reply) => {

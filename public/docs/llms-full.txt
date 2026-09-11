@@ -3036,6 +3036,75 @@ Response 201 (application/json)
   "region": "string"
 }
 
+  GET /api/v1/storage/backends/{id}
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "role": "source",
+  "backend": "external",
+  "bucket": "string",
+  "accessKeyId": "string",
+  "hasSessionToken": true,
+  "deletable": true,
+  "createdAt": "string",
+  "credentials": {
+    "accessKeyId": "string",
+    "secretAccessKey": "***redacted***",
+    "sessionToken": "***redacted***"
+  },
+  "endpointUrl": "string",
+  "region": "string"
+}
+
+  PATCH /api/v1/storage/backends/{id}
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "name": "string",
+  "role": "source",
+  "bucket": "string",
+  "accessKeyId": "string",
+  "secretAccessKey": "string",
+  "region": "string",
+  "endpointUrl": "https://example.com/video.mp4",
+  "sessionToken": "string",
+  "publicBaseUrl": "https://example.com/video.mp4",
+  "pathTemplate": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "role": "source",
+  "backend": "external",
+  "bucket": "string",
+  "accessKeyId": "string",
+  "hasSessionToken": true,
+  "deletable": true,
+  "createdAt": "string",
+  "credentials": {
+    "accessKeyId": "string",
+    "secretAccessKey": "***redacted***",
+    "sessionToken": "***redacted***"
+  },
+  "endpointUrl": "string",
+  "region": "string"
+}
+
   DELETE /api/v1/storage/backends/{id}
 
   Parameters
@@ -3045,6 +3114,26 @@ idpathstringrequired
   Response
 Response 204 (application/json)
 "null"
+
+  POST /api/v1/storage/backends/{id}/test-connection
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "secretAccessKey": "string",
+  "sessionToken": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "status": "connected",
+  "message": "string"
+}
 
   GET /api/v1/storage/buckets
 
@@ -3294,7 +3383,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (110 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (113 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3324,7 +3413,7 @@ Webhooks3
 HTTP event notification registrations.
 Collections9
 Named groups for organising assets.
-Storage9
+Storage12
 Object storage bucket and watch-folder management.
 Admin3
 Watch-folder poller control.
@@ -4155,7 +4244,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 110 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 113 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.

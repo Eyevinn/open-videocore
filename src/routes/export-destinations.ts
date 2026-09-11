@@ -48,7 +48,9 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import {
   BackendValidationError,
+  BackendInUseError,
   DefaultBackendNotDeletableError,
+  ImmutableDefaultBackendError,
   type RegisteredBackendView,
   type StorageBackendRole,
   type StorageBackendRegistry
@@ -185,9 +187,23 @@ export const exportDestinationsRouter: FastifyPluginAsync<
   const workspaceId = STACK_CONFIG_NAMESPACE;
 
   app.setErrorHandler((err, _request, reply) => {
-    // The OSC-managed default is not deletable (ADR-017 D3) -> 409, same as
-    // /storage/backends (storage.ts:191-193).
-    if (err instanceof DefaultBackendNotDeletableError) {
+    // The OSC-managed default is not deletable (ADR-017 D3) -> 409. This surface
+    // keeps its established 409 contract for the default: issue #679 folded the
+    // default's immutability on the /storage/backends surface into a 403, but the
+    // export-destinations contract (and its test) is unchanged here, so we map
+    // BOTH the legacy DefaultBackendNotDeletableError and the new
+    // ImmutableDefaultBackendError (which registry.remove now throws) to the same
+    // 409 this surface has always returned.
+    if (
+      err instanceof DefaultBackendNotDeletableError ||
+      err instanceof ImmutableDefaultBackendError
+    ) {
+      return reply.code(409).send({ error: 'conflict', message: err.message });
+    }
+    // The destination is still referenced by an asset or active job (issue #679)
+    // -> 409 with a human-readable message + the non-secret reference ids. Only
+    // fires when a reference checker is wired on the shared registry.
+    if (err instanceof BackendInUseError) {
       return reply.code(409).send({ error: 'conflict', message: err.message });
     }
     // Issue #574: the registration carried a path template with an unknown token
