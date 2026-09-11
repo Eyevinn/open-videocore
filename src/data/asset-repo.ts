@@ -673,6 +673,22 @@ export type UpdateAssetInput = {
   sceneDetectionError?: string;
 };
 
+// Input to the dedicated attach-external-id write path (issue #577). The
+// `{ namespace, id }` pair is the same foreign key modelled by #575
+// (ExternalIdentifierSchema in asset-document.ts). `enforceUniqueness` carries
+// the operator-configured toggle (EXTERNAL_ID_UNIQUENESS, resolved at the route
+// layer via external-id-uniqueness.ts) down to the repository so the
+// canonical-store conflict check is gated by config, not hard-coded: advisory
+// (default) allows a duplicate; enforced rejects it with ExternalIdConflictError.
+export type AttachExternalIdInput = {
+  namespace: string;
+  id: string;
+  // Whether a duplicate `{ namespace, id }` on a DIFFERENT asset is fatal (409)
+  // vs advisory (allowed). Defaults to false (advisory) so omitting it preserves
+  // the pre-#577 behaviour.
+  enforceUniqueness?: boolean;
+};
+
 export type ListOptions = {
   limit?: number;
   offset?: number;
@@ -743,6 +759,30 @@ export class HasChildrenError extends Error {
   constructor(id: string) {
     super(`asset ${id} has child assets and cannot be deleted`);
     this.name = 'HasChildrenError';
+  }
+}
+
+// Raised when attaching/changing an external identifier would create a duplicate
+// `{ namespace, id }` within the workspace while per-namespace uniqueness is
+// ENFORCED (issue #577, ADR-019) -> 409. The route maps this to a machine-
+// readable envelope with `reason: 'external_id_conflict'`, naming the
+// `conflictingAssetId` (the asset that already carries the pair) so the caller
+// can resolve the collision. Only raised in `enforced` mode; in the advisory
+// default a duplicate is allowed and this is never thrown.
+export class ExternalIdConflictError extends Error {
+  readonly statusCode = 409;
+  readonly namespace: string;
+  readonly externalId: string;
+  readonly conflictingAssetId: string;
+  constructor(namespace: string, externalId: string, conflictingAssetId: string) {
+    super(
+      `external identifier {namespace: ${namespace}, id: ${externalId}} is ` +
+        `already attached to asset ${conflictingAssetId} in this workspace`
+    );
+    this.name = 'ExternalIdConflictError';
+    this.namespace = namespace;
+    this.externalId = externalId;
+    this.conflictingAssetId = conflictingAssetId;
   }
 }
 
@@ -820,6 +860,28 @@ export interface AssetRepository {
   // TAMS flow-id push-down in couch-search-repo.ts), so CouchDB filters within
   // the tenant database rather than the caller paging the whole asset set.
   getByExternalId(namespace: string, id: string): Promise<Asset | undefined>;
+  // Attach or change an upstream external identifier on an asset (issue #577,
+  // ADR-019). This is the DEDICATED system write path for the
+  // `administrative.externalIdentifiers` set — distinct from `update()` (the
+  // editorial patch path, which does not touch external ids), mirroring the
+  // dedicated setDeleteLock / setStorageTier write seams. It adds the
+  // `{ namespace, id }` pair to the asset's set (idempotent: attaching a pair the
+  // asset already carries is a no-op, not a duplicate entry).
+  //
+  // PER-NAMESPACE UNIQUENESS (issue #577): when `input.enforceUniqueness` is true
+  // and the `{ namespace, id }` pair already resolves to a DIFFERENT asset in
+  // this workspace, the write is REJECTED with ExternalIdConflictError (mapped to
+  // 409 `external_id_conflict`). The conflict is detected against the CANONICAL
+  // store via getByExternalId (ADR-005: CouchDB is canonical; the PostgreSQL
+  // projection is disposable and MUST NOT be the uniqueness authority) — the
+  // CouchDB backend routes the read-modify-write through updateWithRetry so the
+  // check-then-write is conflict-safe. When `enforceUniqueness` is false
+  // (advisory default) a duplicate is allowed and this behaves exactly as
+  // pre-#577. Returns the updated asset, or undefined when the id is unknown.
+  attachExternalId(
+    id: string,
+    input: AttachExternalIdInput
+  ): Promise<Asset | undefined>;
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
@@ -1312,6 +1374,45 @@ export class InMemoryAssetRepository implements AssetRepository {
       }
     }
     return undefined;
+  }
+
+  // Attach/change an external identifier (issue #577). Mirrors the CouchDB
+  // backend: the conflict check runs against getByExternalId (this store is the
+  // canonical authority for the in-memory backend), and the attach is idempotent.
+  async attachExternalId(
+    id: string,
+    input: AttachExternalIdInput
+  ): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing || this.tombstones.has(id)) {
+      return undefined;
+    }
+    // Idempotent no-op: the asset already carries this exact pair.
+    const already = existing.externalIdentifiers?.some(
+      (e) => e.namespace === input.namespace && e.id === input.id
+    );
+    if (already) {
+      return { ...existing };
+    }
+    // Canonical-store uniqueness check (only when enforced). A pair resolving to
+    // a DIFFERENT asset is a conflict; a resolve to THIS asset was handled above.
+    if (input.enforceUniqueness) {
+      const owner = await this.getByExternalId(input.namespace, input.id);
+      if (owner && owner.id !== id) {
+        throw new ExternalIdConflictError(input.namespace, input.id, owner.id);
+      }
+    }
+    const now = new Date().toISOString();
+    const next: Asset = {
+      ...existing,
+      externalIdentifiers: [
+        ...(existing.externalIdentifiers ?? []),
+        { namespace: input.namespace, id: input.id }
+      ],
+      updatedAt: now
+    };
+    this.store.set(id, next);
+    return { ...next };
   }
 
   async list(opts: ListOptions = {}): Promise<ListResult> {

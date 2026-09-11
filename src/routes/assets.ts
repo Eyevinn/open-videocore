@@ -18,6 +18,7 @@ import {
   ASSET_REVIEW_STATES,
   ASSET_STATUSES,
   DeleteProtectedError,
+  ExternalIdConflictError,
   HasChildrenError,
   InMemoryAssetRepository,
   InvalidReviewTransitionError,
@@ -59,6 +60,11 @@ import {
   type TamsQueryAddress
 } from '../tams/tams-query-contract.js';
 import { WorkspaceAccessError } from '../data/guard.js';
+// Operator-configurable per-namespace external-id uniqueness toggle (issue #577).
+// The route reads the mode at request time (12-factor config-via-env) and passes
+// `enforceUniqueness` down to the repository, which detects the conflict against
+// the canonical CouchDB store. Advisory is the default; enforced turns on 409s.
+import { externalIdUniquenessEnforced } from '../data/external-id-uniqueness.js';
 import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -413,6 +419,44 @@ const externalIdParamsSchema = z.object({
       'Opaque foreign-key value in that system (UUID / numeric id / slug). ' +
         'Required, non-empty.'
     )
+});
+
+// Attach-external-id request body (issue #577, ADR-019). The `{ namespace, id }`
+// pair is the same grammar as the persisted ExternalIdentifierSchema
+// (asset-document.ts): both components REQUIRED and non-empty, so the accepted
+// grammar is 1:1 with what is stored and with the resolver's params grammar. The
+// bounds mirror a conservative upstream key/namespace length; an empty component
+// is rejected at the boundary with 400 before the handler runs.
+const attachExternalIdBodySchema = z.object({
+  namespace: z
+    .string()
+    .min(1)
+    .max(256)
+    .describe(
+      'Upstream system-of-record label the external id belongs to (e.g. ' +
+        '`ingest-mam`, `rights-registry`). Required, non-empty.'
+    ),
+  id: z
+    .string()
+    .min(1)
+    .max(1024)
+    .describe(
+      'Opaque foreign-key value in that system (UUID / numeric id / slug). ' +
+        'Required, non-empty.'
+    )
+});
+
+// 409 response envelope for a per-namespace external-id uniqueness conflict
+// (issue #577). Machine-readable: `reason` is the stable `external_id_conflict`
+// code and `conflictingAssetId` names the asset already carrying the pair so the
+// caller can resolve the collision. Only returned in enforced mode.
+const externalIdConflictSchema = z.object({
+  error: z.literal('external_id_conflict'),
+  message: z.string().optional(),
+  reason: z.literal('external_id_conflict'),
+  namespace: z.string(),
+  externalId: z.string(),
+  conflictingAssetId: z.string()
 });
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -2104,6 +2148,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     if (err instanceof HasChildrenError) {
       return reply.code(409).send({ error: 'has_children', message: err.message });
     }
+    // Per-namespace external-id uniqueness conflict (issue #577, ADR-019): a
+    // machine-readable 409 with reason `external_id_conflict` naming the
+    // conflicting asset id so the caller can resolve the collision. Only raised
+    // when the operator has enabled enforcement (EXTERNAL_ID_UNIQUENESS=enforced);
+    // the advisory default never reaches this branch.
+    if (err instanceof ExternalIdConflictError) {
+      return reply.code(409).send({
+        error: 'external_id_conflict',
+        message: err.message,
+        reason: 'external_id_conflict',
+        namespace: err.namespace,
+        externalId: err.externalId,
+        conflictingAssetId: err.conflictingAssetId
+      });
+    }
     // Explicit delete-lock (ADR-020 decision 1, issue #568): the shared
     // `delete_blocked` envelope with reason `delete_protected` and EMPTY
     // blockedBy arrays (the block is intrinsic to the document, not a foreign
@@ -2536,6 +2595,65 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send(asset);
+    }
+  );
+
+  // Attach (or change) an upstream external identifier on an asset (issue #577,
+  // ADR-019). The write surface #576's lookup reads from — the dedicated system
+  // write path for `administrative.externalIdentifiers`, distinct from PATCH /:id
+  // (the editorial patch path never touches external ids), so it goes through the
+  // repository's attachExternalId seam.
+  //
+  // PER-NAMESPACE UNIQUENESS: the mode is operator-configurable via the
+  // EXTERNAL_ID_UNIQUENESS env var (advisory default vs enforced). It is read at
+  // REQUEST time — 12-factor config-via-env, matching the watch-folder /
+  // retention env conventions — and threaded down as `enforceUniqueness` so the
+  // repository detects the conflict against the CANONICAL CouchDB store
+  // (getByExternalId's Mango `$elemMatch`), NOT the disposable PG projection
+  // (ADR-005). When enforced and the pair already resolves to a DIFFERENT asset,
+  // the write is rejected with 409 `external_id_conflict` naming the conflicting
+  // asset id; the advisory default allows the duplicate. Attach is idempotent.
+  //
+  // Error -> status mapping:
+  //   - empty/oversized `namespace`/`id` -> 400 (attachExternalIdBodySchema).
+  //   - unknown asset id -> 404.
+  //   - duplicate pair on another asset, enforced mode -> 409 (error handler,
+  //     ExternalIdConflictError).
+  app.post(
+    '/:id/external-ids',
+    {
+      schema: {
+        summary: 'Attach an upstream external identifier to an asset',
+        description:
+          'Attach (or change) an upstream `{ namespace, id }` external identifier ' +
+          'on the asset (ADR-019). When per-namespace uniqueness enforcement is ' +
+          'enabled by the operator (EXTERNAL_ID_UNIQUENESS=enforced) and the pair ' +
+          'already resolves to a different asset, the request is rejected with a ' +
+          '409 `external_id_conflict` naming the conflicting asset id. Attaching a ' +
+          'pair the asset already carries is a no-op.',
+        params: z.object({ id: z.string() }),
+        body: attachExternalIdBodySchema,
+        response: {
+          200: assetSchema,
+          400: errorSchema,
+          404: errorSchema,
+          409: externalIdConflictSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.attachExternalId(request.params.id, {
+        namespace: request.body.namespace,
+        id: request.body.id,
+        // Operator toggle, read per request (12-factor). Advisory default allows
+        // duplicates; enforced surfaces ExternalIdConflictError -> 409 via the
+        // router error handler.
+        enforceUniqueness: externalIdUniquenessEnforced()
+      });
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(200).send(updated);
     }
   );
 
