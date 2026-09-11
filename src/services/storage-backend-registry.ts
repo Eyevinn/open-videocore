@@ -39,6 +39,7 @@ import {
 import type { ConfigKvStore } from './param-store.js';
 import {
   validateExternalBackend,
+  type ExternalBackendProbeTarget,
   type ExternalBackendValidationResult,
   type ProbeClientFactory,
   type ValidationFailureReason
@@ -181,6 +182,25 @@ export type RegisterBackendInput = {
   // OPTIONAL per-destination path template (issue #574). Validated at register()
   // time and persisted on the record; absent keeps the static-prefix behaviour.
   pathTemplate?: string;
+};
+
+// Partial update input for an existing backend (issue #679 PATCH). Every field is
+// OPTIONAL: an omitted field is left unchanged. `secretAccessKey` (with a matching
+// `accessKeyId`) rotates the credential and is re-fanned to the consuming OSC
+// secrets; it is NEVER persisted into the record and NEVER echoed. `pathTemplate`
+// accepts `null` to CLEAR a previously-set template (back to the static-prefix
+// form); a string sets it; `undefined` leaves it unchanged.
+export type UpdateBackendInput = {
+  name?: string;
+  role?: StorageBackendRole;
+  bucket?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  region?: string;
+  endpointUrl?: string;
+  sessionToken?: string;
+  publicBaseUrl?: string;
+  pathTemplate?: string | null;
 };
 
 // Narrow OSC-secret sink. Mirrors the verified saveSecret calling convention
@@ -427,6 +447,74 @@ export class DefaultBackendNotDeletableError extends Error {
   }
 }
 
+// Thrown when a caller tries to MUTATE (update) or DELETE the platform-provisioned
+// default backend (issue #679: "the platform-provisioned default storage backend
+// must be immutable — PUT/PATCH/DELETE must return HTTP 403"). This is distinct
+// from DefaultBackendNotDeletableError (the pre-#679 delete-only 409): the #679
+// contract folds the default's immutability across update AND delete into a single
+// 403, so both the update and remove paths throw THIS. The router maps it to 403.
+export class ImmutableDefaultBackendError extends Error {
+  constructor() {
+    super('the platform-provisioned default storage backend is immutable');
+    this.name = 'ImmutableDefaultBackendError';
+  }
+}
+
+// Thrown when a caller tries to remove a backend that is still referenced by an
+// asset or an active job (issue #679: "DELETE must return HTTP 409 with a
+// human-readable message if any asset or active job references the backend").
+// Carries the non-secret reference summary so the router can surface a clear,
+// human-readable 409. The router maps it to 409.
+export class BackendInUseError extends Error {
+  readonly references: BackendReferences;
+  constructor(references: BackendReferences) {
+    super(backendInUseMessage(references));
+    this.name = 'BackendInUseError';
+    this.references = references;
+  }
+}
+
+// The non-secret summary of what still references a backend, returned by a
+// BackendReferenceChecker. Both fields are id lists so the router can name the
+// blocking resources in a human-readable message without leaking any secret.
+export type BackendReferences = {
+  assetIds: string[];
+  activeJobIds: string[];
+};
+
+// Whether a reference summary indicates the backend is still in use.
+export function hasReferences(refs: BackendReferences): boolean {
+  return refs.assetIds.length > 0 || refs.activeJobIds.length > 0;
+}
+
+// Human-readable, secret-free 409 message naming what blocks removal.
+function backendInUseMessage(refs: BackendReferences): string {
+  const parts: string[] = [];
+  if (refs.assetIds.length > 0) {
+    parts.push(`${refs.assetIds.length} asset(s)`);
+  }
+  if (refs.activeJobIds.length > 0) {
+    parts.push(`${refs.activeJobIds.length} active job(s)`);
+  }
+  const by = parts.length > 0 ? parts.join(' and ') : 'one or more resources';
+  return `the storage backend cannot be removed while it is referenced by ${by}`;
+}
+
+// Injectable seam that reports whether a registered backend is still referenced
+// by any asset or active job (issue #679). This is a SEAM, not a schema field:
+// this repo persists NO asset->backend or job->backend foreign key today (the
+// registry's resolve* methods are not yet wired into ingest/output — verified:
+// no caller of resolveSourceCredentials / resolveForOutput exists in src), so
+// the DELETE-in-use guard is expressed as an injected checker rather than a
+// fabricated column. When no checker is wired the registry treats every backend
+// as unreferenced (removable), preserving the pre-#679 behaviour; a deployment
+// that wires ingest/output through this registry supplies a checker that walks
+// the asset + active-job stores (mirroring JobRepository.findActiveByAssetId,
+// job-repo.ts:223).
+export interface BackendReferenceChecker {
+  referencesFor(workspaceId: string, backendId: string): Promise<BackendReferences>;
+}
+
 // Thrown when registration-time validation (issue #550) rejects a backend as
 // unreachable or unauthorized. Carries the machine-readable reason + the
 // non-secret S3 error code so the router can surface a clear 4xx WITHOUT the
@@ -457,11 +545,31 @@ export type StorageBackendRegistryOptions = {
   // Injectable probe-client factory so registration is unit-testable without a
   // live bucket (mirrors the injected FetchLike seam in profiles-reachability).
   probeClientFactory?: ProbeClientFactory;
+  // Optional reference checker (issue #679). When supplied, remove() consults it
+  // and refuses (BackendInUseError -> 409) while any asset or active job still
+  // references the backend. Omit to keep the pre-#679 behaviour (no in-use
+  // guard); the router then always permits removal of a non-default backend.
+  referenceChecker?: BackendReferenceChecker;
+};
+
+// Hard ceiling on the test-connection probe (issue #679: "returns within 10
+// seconds — hard timeout"). Applied by testConnection() via a racing timer so a
+// hung endpoint can never keep the request open past this bound.
+export const TEST_CONNECTION_TIMEOUT_MS = 10_000;
+
+// The compact result the test-connection endpoint returns (issue #679):
+// `{ status: 'connected' | 'unreachable', message: string }`. Never carries the
+// secret — `message` is the secret-free summary from validateExternalBackend (or
+// the timeout notice).
+export type TestConnectionResult = {
+  status: 'connected' | 'unreachable';
+  message: string;
 };
 
 export class StorageBackendRegistry {
   private readonly validateEnabled: boolean;
   private readonly probeClientFactory?: ProbeClientFactory;
+  private readonly referenceChecker?: BackendReferenceChecker;
 
   constructor(
     private readonly records: BackendRecordStore,
@@ -477,6 +585,7 @@ export class StorageBackendRegistry {
   ) {
     this.validateEnabled = validate ? validate.enabled !== false : false;
     this.probeClientFactory = validate?.probeClientFactory;
+    this.referenceChecker = validate?.referenceChecker;
   }
 
   get canStoreSecrets(): boolean {
@@ -598,6 +707,167 @@ export class StorageBackendRegistry {
     }
     const record = await this.records.get(workspaceId, id);
     return record ? redactBackend(record) : undefined;
+  }
+
+  // Update the NON-SECRET, mutable fields of a registered backend (issue #679).
+  // The platform-provisioned default (id 'default') is IMMUTABLE ->
+  // ImmutableDefaultBackendError (403). An unknown id resolves to undefined so the
+  // router can 404. When a rotated credential is supplied (accessKeyId +
+  // secretAccessKey together) the secret is re-fanned to the consuming serviceIds
+  // exactly as register() does — the raw secret is never persisted into the record
+  // and never echoed. The returned view is redacted.
+  //
+  // Mutable fields: name, role, bucket, region, endpointUrl, publicBaseUrl,
+  // pathTemplate, and (as a rotation) accessKeyId + secretAccessKey (+ optional
+  // sessionToken). The immutable identity `id`/`createdAt`/`backend` are never
+  // changed. secretAccessKey WITHOUT accessKeyId (or vice versa) is a caller error
+  // the router rejects before calling this — here we require them together to
+  // re-fan a coherent credential.
+  async update(
+    workspaceId: string,
+    id: string,
+    patch: UpdateBackendInput
+  ): Promise<RegisteredBackendView | undefined> {
+    if (id === DEFAULT_BACKEND_ID) {
+      throw new ImmutableDefaultBackendError();
+    }
+    const existing = await this.records.get(workspaceId, id);
+    if (!existing) {
+      return undefined;
+    }
+
+    // A path template change is validated BEFORE anything is persisted so a bad
+    // token is rejected (InvalidPathTemplateError -> 400) with the record intact.
+    if (patch.pathTemplate !== undefined && patch.pathTemplate !== null) {
+      validatePathTemplate(patch.pathTemplate);
+    }
+
+    const rotatingSecret = patch.secretAccessKey !== undefined;
+    const nextRole = patch.role ?? existing.role;
+    const nextBucket = patch.bucket ?? existing.bucket;
+    const nextAccessKeyId = patch.accessKeyId ?? existing.accessKeyId;
+    const nextRegion = patch.region ?? existing.region;
+    const nextEndpointUrl = patch.endpointUrl ?? existing.endpointUrl;
+    const nextPublicBaseUrl = patch.publicBaseUrl ?? existing.publicBaseUrl;
+    // pathTemplate: `null` clears it (back to the static-prefix form); undefined
+    // leaves it unchanged; a string sets it.
+    const nextPathTemplate =
+      patch.pathTemplate === null
+        ? undefined
+        : patch.pathTemplate ?? existing.pathTemplate;
+
+    const nextHasSessionToken = rotatingSecret
+      ? Boolean(patch.sessionToken)
+      : existing.hasSessionToken;
+
+    const record: StorageBackendRecord = {
+      id: existing.id,
+      name: patch.name ?? existing.name,
+      role: nextRole,
+      backend: 'external',
+      bucket: nextBucket,
+      accessKeyId: nextAccessKeyId,
+      ...(nextEndpointUrl ? { endpointUrl: nextEndpointUrl } : {}),
+      ...(nextRegion ? { region: nextRegion } : {}),
+      ...(nextPublicBaseUrl ? { publicBaseUrl: nextPublicBaseUrl } : {}),
+      ...(nextPathTemplate !== undefined ? { pathTemplate: nextPathTemplate } : {}),
+      hasSessionToken: nextHasSessionToken,
+      createdAt: existing.createdAt
+    };
+
+    // Re-fan the secret ONLY when a rotation was supplied. We always re-fan for
+    // the NEXT role so a role change repoints the secret at the correct consuming
+    // serviceIds. When no rotation is supplied we leave the previously-fanned
+    // secret in place (the record carries no secret to re-derive).
+    if (rotatingSecret && this.secrets) {
+      const creds: ExternalStorageCredentials = {
+        bucket: nextBucket,
+        accessKeyId: nextAccessKeyId,
+        secretAccessKey: patch.secretAccessKey as string,
+        ...(nextRegion ? { region: nextRegion } : {}),
+        ...(nextEndpointUrl ? { endpointUrl: nextEndpointUrl } : {}),
+        ...(patch.sessionToken ? { sessionToken: patch.sessionToken } : {})
+      };
+      for (const { serviceId, mapping } of mappingsForRole(nextRole, creds)) {
+        for (const secret of mapping.secrets) {
+          await this.secrets.saveSecret(
+            serviceId,
+            backendSecretName(existing.id, secret.purpose),
+            secret.value
+          );
+        }
+      }
+    }
+
+    await this.records.put(workspaceId, record);
+    return redactBackend(record);
+  }
+
+  // Probe a REGISTERED backend's reachability on demand (issue #679
+  // test-connection). Resolves the stored NON-SECRET record and — because the
+  // literal secret was never persisted (ADR-017 D1) — cannot itself re-run the
+  // full read/write permission probe (which needs the secret). Instead it accepts
+  // the secret to probe with from the CALLER (the ops UI re-supplies it), and runs
+  // the SAME validateExternalBackend head-bucket/list probe used at registration,
+  // bounded by a 10-second hard timeout (TEST_CONNECTION_TIMEOUT_MS). Never leaks
+  // the secret: only `{ status, message }` is returned. Returns undefined when the
+  // id is unknown so the router can 404.
+  async testConnection(
+    workspaceId: string,
+    id: string,
+    secret: { secretAccessKey: string; sessionToken?: string }
+  ): Promise<TestConnectionResult | undefined> {
+    if (id === DEFAULT_BACKEND_ID) {
+      // The platform-provisioned default is OSC-managed and always considered
+      // reachable by the deployment; there is no external endpoint to probe.
+      return { status: 'connected', message: 'platform-provisioned default backend' };
+    }
+    const record = await this.records.get(workspaceId, id);
+    if (!record) {
+      return undefined;
+    }
+
+    const target: ExternalBackendProbeTarget = {
+      bucket: record.bucket,
+      accessKeyId: record.accessKeyId,
+      secretAccessKey: secret.secretAccessKey,
+      ...(record.region ? { region: record.region } : {}),
+      ...(record.endpointUrl ? { endpointUrl: record.endpointUrl } : {}),
+      ...(secret.sessionToken ? { sessionToken: secret.sessionToken } : {})
+    };
+
+    const probe = validateExternalBackend(
+      target,
+      this.probeClientFactory ? { probeClientFactory: this.probeClientFactory } : {}
+    );
+    // Hard 10s ceiling (issue #679). A hung endpoint resolves to `unreachable`
+    // rather than keeping the request open indefinitely. The probe promise is
+    // abandoned (never awaited past the timeout) so the handler returns promptly.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<TestConnectionResult>((resolve) => {
+      timer = setTimeout(
+        () =>
+          resolve({
+            status: 'unreachable',
+            message: `connection probe did not complete within ${TEST_CONNECTION_TIMEOUT_MS / 1000} seconds`
+          }),
+        TEST_CONNECTION_TIMEOUT_MS
+      );
+    });
+
+    try {
+      const result = await Promise.race([
+        probe.then<TestConnectionResult>((r) =>
+          r.ok
+            ? { status: 'connected', message: 'the storage backend is reachable' }
+            : { status: 'unreachable', message: r.message }
+        ),
+        timeout
+      ]);
+      return result;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   // Look a registered backend up by id OR by name (case-sensitive name match),
@@ -727,15 +997,21 @@ export class StorageBackendRegistry {
     return prefix.length > 0 ? `${bucket}/${prefix}/` : `${bucket}/`;
   }
 
-  // Remove a registered backend. The implicit default (id 'default') is NOT
-  // deletable (ADR-017 D3) -> throws DefaultBackendNotDeletableError. Removing an
-  // unknown id is an idempotent no-op (mirrors collections DELETE,
-  // collections.ts:135-139) that still resolves. Best-effort removes the fanned
-  // secrets too when a SecretStore that supports removal is wired; the non-secret
-  // record is always removed.
+  // Remove a registered backend. The platform-provisioned default (id 'default')
+  // is IMMUTABLE (issue #679) -> throws ImmutableDefaultBackendError (403). When a
+  // reference checker is wired (issue #679) and the backend is still referenced by
+  // an asset or active job, throws BackendInUseError (409) and removes nothing.
+  // Removing an unknown id is an idempotent no-op (mirrors collections DELETE,
+  // collections.ts:135-139) that still resolves.
   async remove(workspaceId: string, id: string): Promise<void> {
     if (id === DEFAULT_BACKEND_ID) {
-      throw new DefaultBackendNotDeletableError();
+      throw new ImmutableDefaultBackendError();
+    }
+    if (this.referenceChecker) {
+      const refs = await this.referenceChecker.referencesFor(workspaceId, id);
+      if (hasReferences(refs)) {
+        throw new BackendInUseError(refs);
+      }
     }
     await this.records.delete(workspaceId, id);
   }
