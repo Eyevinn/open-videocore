@@ -64,6 +64,33 @@ function makeRegistry(secrets?: SecretStore): StorageBackendRegistry {
   return new StorageBackendRegistry(new InMemoryBackendRecordStore(), secrets);
 }
 
+// A probe client whose bucketExists/list/put/stat/remove all succeed, so
+// test-connection resolves 'connected' without any live network I/O.
+function okProbeClient(): BucketProbeClient {
+  return {
+    bucketExists: async () => true,
+    listObjectsV2: () => {
+      const s = new Readable({ read() {} });
+      queueMicrotask(() => s.emit('end'));
+      return s;
+    },
+    putObject: async () => ({}),
+    statObject: async () => ({}),
+    removeObject: async () => {}
+  };
+}
+
+// A registry that runs the probe with an always-connected client (issue #679
+// test-connection pass path) without registration-time validation, so register
+// still succeeds and test-connection reports 'connected'.
+function makeConnectedProbeRegistry(secrets?: SecretStore): StorageBackendRegistry {
+  return new StorageBackendRegistry(new InMemoryBackendRecordStore(), secrets, {
+    enabled: false,
+    probeClientFactory: () => okProbeClient()
+  });
+}
+
+
 // A registry that runs the issue #550 registration-time probe with an injected
 // client that always fails connectivity, so register surfaces a 422 without any
 // live network I/O.
@@ -293,13 +320,13 @@ describe('DELETE /api/v1/storage/backends/:id — remove', () => {
     await app.close();
   });
 
-  it('refuses to delete the OSC-managed default backend (409)', async () => {
+  it('refuses to delete the platform-provisioned default backend (403, immutable)', async () => {
     const app = await buildApp(makeRegistry(makeSecretStore()));
     const res = await app.inject({
       method: 'DELETE',
       url: `/api/v1/storage/backends/${DEFAULT_BACKEND_ID}`
     });
-    expect(res.statusCode).toBe(409);
+    expect(res.statusCode).toBe(403);
 
     // …and the default still appears in the listing afterwards.
     const listed = (
@@ -317,6 +344,230 @@ describe('DELETE /api/v1/storage/backends/:id — remove', () => {
       url: '/api/v1/storage/backends/does-not-exist'
     });
     expect(res.statusCode).toBe(204);
+    await app.close();
+  });
+
+  it('blocks deletion with 409 and a human-readable message when in use (issue #679)', async () => {
+    // An injected reference checker that reports EVERY id as referenced by an
+    // asset + an active job, so the registered backend is blocked from removal.
+    const registry = new StorageBackendRegistry(
+      new InMemoryBackendRecordStore(),
+      makeSecretStore(),
+      {
+        enabled: false,
+        referenceChecker: {
+          referencesFor: async () => ({ assetIds: ['asset-3'], activeJobIds: ['job-9'] })
+        }
+      }
+    );
+    const app = await buildApp(registry);
+    const created = (
+      await app.inject({ method: 'POST', url: '/api/v1/storage/backends', payload: VALID_BODY })
+    ).json() as BackendView;
+
+    const del = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/storage/backends/${created.id}`
+    });
+    expect(del.statusCode).toBe(409);
+    const body = del.json() as {
+      error: string;
+      message: string;
+      references: { assetIds: string[]; activeJobIds: string[] };
+    };
+    expect(body.error).toBe('backend_in_use');
+    expect(body.message).toMatch(/referenced/i);
+    expect(body.references.assetIds).toContain('asset-3');
+    expect(body.references.activeJobIds).toContain('job-9');
+
+    // Still present after the blocked delete.
+    const listed = (
+      await app.inject({ method: 'GET', url: '/api/v1/storage/backends' })
+    ).json() as { backends: BackendView[] };
+    expect(listed.backends.find((b) => b.id === created.id)).toBeDefined();
+
+    await app.close();
+  });
+});
+
+describe('GET /api/v1/storage/backends/:id — get one (redacted)', () => {
+  it('returns the redacted view with the secret masked (never raw)', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const created = (
+      await app.inject({ method: 'POST', url: '/api/v1/storage/backends', payload: VALID_BODY })
+    ).json() as BackendView;
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/storage/backends/${created.id}`
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as BackendView;
+    expect(body.id).toBe(created.id);
+    expect(body.credentials.secretAccessKey).toBe(REDACTED);
+    expect(JSON.stringify(body)).not.toContain(RAW_SECRET);
+    await app.close();
+  });
+
+  it('404s an unknown id', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/storage/backends/does-not-exist'
+    });
+    expect(res.statusCode).toBe(404);
+    await app.close();
+  });
+});
+
+describe('PATCH /api/v1/storage/backends/:id — update', () => {
+  it('updates a non-secret field and returns the redacted view (secret masked)', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const created = (
+      await app.inject({ method: 'POST', url: '/api/v1/storage/backends', payload: VALID_BODY })
+    ).json() as BackendView;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/storage/backends/${created.id}`,
+      payload: { name: 'renamed-backend' }
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as BackendView;
+    expect(body.name).toBe('renamed-backend');
+    // The secret is still masked and never raw.
+    expect(body.credentials.secretAccessKey).toBe(REDACTED);
+    expect(JSON.stringify(body)).not.toContain(RAW_SECRET);
+    await app.close();
+  });
+
+  it('rotates the credential (accessKeyId + secretAccessKey) without echoing the secret', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const created = (
+      await app.inject({ method: 'POST', url: '/api/v1/storage/backends', payload: VALID_BODY })
+    ).json() as BackendView;
+
+    saveSecret.mockClear();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/storage/backends/${created.id}`,
+      payload: { accessKeyId: 'AKIAROTATED', secretAccessKey: 'a-brand-new-secret' }
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as BackendView;
+    expect(body.accessKeyId).toBe('AKIAROTATED');
+    expect(body.credentials.secretAccessKey).toBe(REDACTED);
+    expect(JSON.stringify(body)).not.toContain('a-brand-new-secret');
+    // The rotated secret reached saveSecret (the only sink), never the response.
+    const saved = saveSecret.mock.calls.map((c) => c[2]);
+    expect(saved).toContain('a-brand-new-secret');
+    await app.close();
+  });
+
+  it('rejects a rotation that supplies only the secret (400)', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const created = (
+      await app.inject({ method: 'POST', url: '/api/v1/storage/backends', payload: VALID_BODY })
+    ).json() as BackendView;
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/storage/backends/${created.id}`,
+      payload: { secretAccessKey: 'lonely-secret' }
+    });
+    expect(res.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it('403s an attempt to update the immutable default backend', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/storage/backends/${DEFAULT_BACKEND_ID}`,
+      payload: { name: 'nope' }
+    });
+    expect(res.statusCode).toBe(403);
+    await app.close();
+  });
+
+  it('404s an unknown id', async () => {
+    const app = await buildApp(makeRegistry(makeSecretStore()));
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/storage/backends/does-not-exist',
+      payload: { name: 'x' }
+    });
+    expect(res.statusCode).toBe(404);
+    await app.close();
+  });
+});
+
+describe('POST /api/v1/storage/backends/:id/test-connection — probe', () => {
+  it('returns { status: connected } when the probe succeeds', async () => {
+    const app = await buildApp(makeConnectedProbeRegistry(makeSecretStore()));
+    const created = (
+      await app.inject({ method: 'POST', url: '/api/v1/storage/backends', payload: VALID_BODY })
+    ).json() as BackendView;
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/storage/backends/${created.id}/test-connection`,
+      payload: { secretAccessKey: RAW_SECRET }
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { status: string; message: string };
+    expect(body.status).toBe('connected');
+    // The re-supplied secret is never echoed back.
+    expect(JSON.stringify(body)).not.toContain(RAW_SECRET);
+    await app.close();
+  });
+
+  it('returns { status: unreachable } when the probe fails', async () => {
+    // A registry that does NOT validate on register (so registration succeeds)
+    // but whose probe client fails connectivity, so test-connection reports
+    // 'unreachable'.
+    const unreachable: BucketProbeClient = {
+      bucketExists: async () => {
+        const err = new Error('boom') as Error & { code: string };
+        err.code = 'ECONNREFUSED';
+        throw err;
+      },
+      listObjectsV2: () => new Readable({ read() {} }),
+      putObject: async () => ({}),
+      statObject: async () => ({}),
+      removeObject: async () => {}
+    };
+    const registry = new StorageBackendRegistry(
+      new InMemoryBackendRecordStore(),
+      makeSecretStore(),
+      { enabled: false, probeClientFactory: () => unreachable }
+    );
+    const app = await buildApp(registry);
+    const created = (
+      await app.inject({ method: 'POST', url: '/api/v1/storage/backends', payload: VALID_BODY })
+    ).json() as BackendView;
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/storage/backends/${created.id}/test-connection`,
+      payload: { secretAccessKey: RAW_SECRET }
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { status: string }).status).toBe('unreachable');
+    await app.close();
+  });
+
+  // The hard-10s-timeout path is covered deterministically at the service level
+  // (storage-backend-registry.test.ts) with fake timers; exercising it through
+  // app.inject would deadlock Fastify's real-timer internals under fake timers,
+  // so the router test asserts only the pass/fail shapes here.
+
+  it('404s an unknown id', async () => {
+    const app = await buildApp(makeConnectedProbeRegistry(makeSecretStore()));
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/storage/backends/does-not-exist/test-connection',
+      payload: { secretAccessKey: RAW_SECRET }
+    });
+    expect(res.statusCode).toBe(404);
     await app.close();
   });
 });
