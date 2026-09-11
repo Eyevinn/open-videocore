@@ -1256,6 +1256,64 @@ Response 201 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
+  POST /api/v1/assets/{id}/external-ids
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Request
+Request body (application/json)
+{
+  "namespace": "string",
+  "id": "string"
+}
+Field notes- namespace — Upstream system-of-record label the external id belongs to (e.g. `ingest-mam`, `rights-registry`). Required, non-empty.
+- id — Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.
+
+  Response
+Response 200 (application/json)
+{
+  "id": "string",
+  "name": "string",
+  "status": "uploading",
+  "statusHistory": [
+    {
+      "at": "string",
+      "from": "uploading",
+      "to": "uploading"
+    }
+  ],
+  "createdAt": "string",
+  "updatedAt": "string",
+  "slug": "string",
+  "description": "string",
+  "reviewState": "draft",
+  "deleteLock": {
+    "locked": true,
+    "lockedAt": "string",
+    "reason": "string",
+    "lockedBy": "string"
+  },
+  "storageTiering": {
+    "tiers": {
+      "source": "hot",
+      "renditions": "hot",
+      "packaged": "hot",
+      "subtitles": "hot",
+      "thumbnails": "hot"
+    },
+    "rehydrating": [
+      {
+        "byteClass": "source",
+        "startedAt": "string"
+      }
+    ]
+  },
+  "parentId": "string"
+}
+Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+
   POST /api/v1/assets/{id}/extract-metadata
 
   Extract technical metadata (codec, resolution, duration, bitrate) from the asset's source file.
@@ -3383,7 +3441,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (113 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (114 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3393,7 +3451,7 @@ Optional services4
 Discover and provision add-on OSC services for a workspace.
 Profiles8
 Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
-Assets46
+Assets47
 Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
 Jobs3
 Background job status for asynchronous asset operations.
@@ -4244,7 +4302,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 113 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 114 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.
