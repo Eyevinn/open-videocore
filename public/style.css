@@ -688,6 +688,45 @@ pre.code-block {
   word-break: break-all;
 }
 
+/* Storage-backend list view (issue #680): the consolidated read view of every
+   configured backend. Reuses the shared .badge palette for the status column. */
+.storage-backends-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.storage-backends-table th,
+.storage-backends-table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.storage-backends-table .mono {
+  font-family: var(--mono, monospace);
+  word-break: break-all;
+}
+
+.storage-backend-name {
+  font-weight: 600;
+}
+
+/* Row accent so the platform-provisioned default is scannable at a glance. */
+.storage-backend-row.is-default td:first-child {
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+
+.storage-default-tag {
+  vertical-align: middle;
+}
+
+/* The default backend's controls are disabled, not hidden, to keep alignment. */
+.storage-backend-delete[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Asset detail — file-group (HLS/DASH package) cards */
 .file-group-cards {
   display: grid;

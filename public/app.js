@@ -43,6 +43,43 @@ function setActiveStack(name) {
   else localStorage.removeItem(STACK_KEY);
 }
 
+// ─── Client role (ADR-018) ─────────────────────────────────────────────────
+//
+// Authorisation is driven server-side by the trusted `X-OVC-Role` header, read
+// by src/auth/principal.ts (ROLE_HEADER = 'x-ovc-role', src/auth/principal.ts:36).
+// There is NO whoami endpoint and no per-user identity (single-operator model,
+// src/auth/principal.ts:11-16), so the ops UI cannot ask the server for its
+// role — it mirrors the server's own semantics:
+//   - the three roles are viewer | editor | admin (src/auth/principal.ts:31);
+//   - an absent role resolves to admin (single-operator default,
+//     src/auth/principal.ts:98-104).
+// getClientRole() therefore reads an operator-chosen role from localStorage and
+// defaults to 'admin' exactly as the server does; apiFetch() forwards it as the
+// X-OVC-Role header so, when the deployment sets OVC_TRUST_ROLE_HEADER=true
+// (src/main.ts:431), the same value gates the API. The issue's "operator/admin"
+// binds to the real editor|admin contract: those two roles may manage storage.
+const ROLE_KEY = 'ovc_role';
+const CLIENT_ROLES = ['viewer', 'editor', 'admin'];
+
+function getClientRole() {
+  const stored = localStorage.getItem(ROLE_KEY);
+  return CLIENT_ROLES.includes(stored) ? stored : 'admin';
+}
+
+function setClientRole(role) {
+  if (CLIENT_ROLES.includes(role)) localStorage.setItem(ROLE_KEY, role);
+  else localStorage.removeItem(ROLE_KEY);
+}
+
+// Whether the current client role may see + manage storage backends. Bound to
+// the real matrix (src/auth/authorize.ts:54-58): editor and admin may write;
+// viewer is read-only and does not get the management surface. This is the
+// "operator/admin" gate from issue #680, expressed in the codebase's roles.
+function canManageStorage() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
 // Window-scoped stack override for detached windows (e.g. detail.html). Unlike
 // setActiveStack, this does NOT touch the shared localStorage key, so popping
 // out a detail for a different stack cannot switch the opener window's active
@@ -102,6 +139,10 @@ async function apiFetch(path, options = {}) {
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
+    // Mirror the server's trusted role header (src/auth/principal.ts:36). Only
+    // honoured server-side when OVC_TRUST_ROLE_HEADER=true (src/main.ts:431);
+    // otherwise it is stripped and ignored, so sending it is always safe.
+    'X-OVC-Role': getClientRole(),
     ...(options.headers || {}),
   };
   const res = await fetch(API_BASE + path, { ...options, headers });
@@ -155,6 +196,134 @@ function badgeClass(status) {
 function renderBadge(status) {
   // status is escaped before insertion
   return '<span class="badge ' + badgeClass(status) + '">' + escHtml(status || 'unknown') + '</span>';
+}
+
+// ─── Storage-backend status badge (issue #680) ───────────────────────────────
+//
+// The GET /api/v1/storage/backends view (src/routes/storage.ts:144-166, mirrored
+// in openapi.json at "/api/v1/storage/backends".get.responses.200) carries NO
+// persisted connection-status field today: the redacted backendViewSchema has
+// id/name/role/backend/bucket/accessKeyId/endpointUrl/region/publicBaseUrl/
+// hasSessionToken/deletable/createdAt/credentials and nothing else. Per the
+// acceptance criterion, when no explicit status is stored the badge shows
+// "Unknown". We therefore read an OPTIONAL, forward-compatible
+// `connectionStatus` off the backend (a later API revision may populate it) and
+// map it to one of the three issue states; anything unrecognised or absent is
+// Unknown. Returns { label, cls } — both fed through escHtml at render time.
+function storageBackendStatus(backend) {
+  const raw = backend && typeof backend.connectionStatus === 'string'
+    ? backend.connectionStatus.toLowerCase()
+    : '';
+  if (raw === 'connected') return { label: 'Connected', cls: 'badge-ready' };
+  if (raw === 'unreachable') return { label: 'Unreachable', cls: 'badge-failed' };
+  return { label: 'Unknown', cls: 'badge-unknown' };
+}
+
+// The OSC-managed default backend (ADR-017 D3) is the one that is not deletable
+// (src/routes/storage.ts:140-142 / registry marks id 'default' deletable:false).
+// It must be visually distinguished and must not expose edit/delete controls.
+function isDefaultStorageBackend(backend) {
+  return !(backend && backend.deletable === true);
+}
+
+// Pure render of the storage-backend list view (issue #680). Framework-free and
+// contract-only: it takes the already-fetched array of redacted backend views
+// and returns a detached DOM element, so it is directly unit-testable without a
+// network call. Every dynamic value is written via textContent / escHtml — no
+// raw external string reaches innerHTML, and the secret (always
+// '***redacted***' in credentials.secretAccessKey) is never rendered.
+function renderStorageBackendsList(backends) {
+  const wrap = document.createElement('div');
+  wrap.className = 'storage-backends-wrap';
+
+  const list = Array.isArray(backends) ? backends : [];
+  if (list.length === 0) {
+    // Defensive: the API always returns at least the default backend
+    // (src/routes/storage.ts:257-273), so an empty array means the registry is
+    // unconfigured/unreachable rather than "no backends".
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No storage backends available.';
+    wrap.appendChild(empty);
+    return wrap;
+  }
+
+  const table = document.createElement('table');
+  table.className = 'storage-backends-table';
+  table.innerHTML =
+    '<thead><tr>' +
+    '<th>Name</th><th>Endpoint</th><th>Bucket</th><th>Region</th>' +
+    '<th>Status</th><th>Actions</th>' +
+    '</tr></thead>';
+  const tbody = document.createElement('tbody');
+  table.appendChild(tbody);
+
+  list.forEach(function(b) {
+    const isDefault = isDefaultStorageBackend(b);
+    const status = storageBackendStatus(b);
+    const tr = document.createElement('tr');
+    tr.className = 'storage-backend-row';
+    if (isDefault) tr.classList.add('is-default');
+    if (b && b.id != null) tr.dataset.backendId = String(b.id);
+
+    // Name cell, with a "Default" label for the platform-provisioned backend.
+    const nameTd = document.createElement('td');
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'storage-backend-name';
+    nameSpan.textContent = (b && b.name) ? String(b.name) : '—';
+    nameTd.appendChild(nameSpan);
+    if (isDefault) {
+      const tag = document.createElement('span');
+      tag.className = 'badge badge-attention storage-default-tag';
+      tag.textContent = 'Default';
+      nameTd.appendChild(document.createTextNode(' '));
+      nameTd.appendChild(tag);
+    }
+    tr.appendChild(nameTd);
+
+    const endpointTd = document.createElement('td');
+    endpointTd.className = 'mono';
+    endpointTd.textContent = (b && b.endpointUrl) ? String(b.endpointUrl) : '—';
+    tr.appendChild(endpointTd);
+
+    const bucketTd = document.createElement('td');
+    bucketTd.className = 'mono';
+    bucketTd.textContent = (b && b.bucket) ? String(b.bucket) : '—';
+    tr.appendChild(bucketTd);
+
+    const regionTd = document.createElement('td');
+    regionTd.textContent = (b && b.region) ? String(b.region) : '—';
+    tr.appendChild(regionTd);
+
+    const statusTd = document.createElement('td');
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + status.cls + ' storage-backend-status';
+    badge.textContent = status.label;
+    statusTd.appendChild(badge);
+    tr.appendChild(statusTd);
+
+    // Actions: edit/delete are ABSENT/disabled for the default backend
+    // (issue #680). We disable rather than omit so the row stays aligned and the
+    // reason is announced to assistive tech.
+    const actionsTd = document.createElement('td');
+    actionsTd.className = 'storage-backend-actions';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn-sm storage-backend-delete';
+    del.textContent = 'Delete';
+    if (isDefault) {
+      del.disabled = true;
+      del.title = 'The platform-provisioned default backend cannot be deleted.';
+      del.setAttribute('aria-disabled', 'true');
+    }
+    actionsTd.appendChild(del);
+    tr.appendChild(actionsTd);
+
+    tbody.appendChild(tr);
+  });
+
+  wrap.appendChild(table);
+  return wrap;
 }
 
 // ─── Wedged-asset detection (issue #282) ─────────────────────────────────────
@@ -439,8 +608,21 @@ const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
 
+// Tabs whose sidebar entry + view are gated on the caller's role. Storage
+// backend management is an editor/admin surface (issue #680); a viewer must
+// never see the entry nor be able to route to it.
+const ROLE_GATED_TABS = { storage: canManageStorage };
+
+function isTabAllowed(name) {
+  const gate = ROLE_GATED_TABS[name];
+  return typeof gate === 'function' ? gate() : true;
+}
+
 function switchTab(name) {
   if (!TABS.includes(name)) return;
+  // Fail closed: never render a role-gated view for a role that may not see it,
+  // even if an old persisted TAB_KEY or a manual call names it.
+  if (!isTabAllowed(name)) name = 'assets';
   localStorage.setItem(TAB_KEY, name);
   document.querySelectorAll('.tab-btn').forEach(function(b) {
     b.classList.toggle('active', b.dataset.tab === name);
@@ -454,6 +636,14 @@ function switchTab(name) {
 
 function setupTabs() {
   document.querySelectorAll('.tab-btn').forEach(function(btn) {
+    // Hide the sidebar entry for any role-gated tab the current role may not
+    // access. Acceptance criterion #680: the Storage link renders only for
+    // editor/admin. Hidden (not just disabled) so it is absent for viewers.
+    if (!isTabAllowed(btn.dataset.tab)) {
+      btn.style.display = 'none';
+      btn.setAttribute('aria-hidden', 'true');
+      return;
+    }
     btn.addEventListener('click', function() { switchTab(btn.dataset.tab); });
   });
 }
@@ -2226,6 +2416,55 @@ async function renderStorageTab(container) {
   title.textContent = 'Storage';
   container.appendChild(title);
 
+  // ── Storage backends list view (issue #680) ──
+  // Consolidated view of every configured backend before an operator manages
+  // them. Calls GET /api/v1/storage/backends (src/routes/storage.ts:261-274)
+  // and renders each backend's name, endpoint, bucket, region + a status badge.
+  const backendsSection = document.createElement('div');
+  backendsSection.className = 'section';
+  backendsSection.innerHTML =
+    '<div class="section-title">Storage backends</div><div id="storage-backends-mount"></div>';
+  container.appendChild(backendsSection);
+  const backendsMount = backendsSection.querySelector('#storage-backends-mount');
+
+  async function loadBackends() {
+    backendsMount.innerHTML = '';
+    const loader = loadingEl();
+    backendsMount.appendChild(loader);
+    let data;
+    try {
+      data = await apiFetch('/storage/backends');
+    } catch (err) {
+      loader.remove();
+      // 501 = registry not configured; surface non-fatally so the buckets view
+      // below still loads (src/routes/storage.ts:265-270).
+      showMsg(backendsMount, 'Storage backends unavailable: ' + err.message, 'info');
+      return;
+    }
+    loader.remove();
+    const listEl = renderStorageBackendsList(data && data.backends);
+    // Wire delete only for deletable (non-default) backends. The default's
+    // control is already disabled by the pure render (issue #680).
+    listEl.querySelectorAll('.storage-backend-delete').forEach(function(btn) {
+      if (btn.disabled) return;
+      btn.addEventListener('click', async function() {
+        const row = btn.closest('.storage-backend-row');
+        const id = row && row.dataset.backendId;
+        if (!id) return;
+        if (!confirm('Delete storage backend "' + id + '"?')) return;
+        btn.disabled = true;
+        try {
+          await apiFetch('/storage/backends/' + encodeURIComponent(id), { method: 'DELETE' });
+          await loadBackends();
+        } catch (err) {
+          btn.disabled = false;
+          showMsg(backendsMount, 'Error: ' + err.message, 'error');
+        }
+      });
+    });
+    backendsMount.appendChild(listEl);
+  }
+
   // Create-bucket form
   const createSection = document.createElement('div');
   createSection.className = 'section';
@@ -2318,6 +2557,7 @@ async function renderStorageTab(container) {
     }
   });
 
+  await loadBackends();
   await loadBuckets();
 }
 
@@ -3789,6 +4029,14 @@ export {
   setStackOverride,
   getActiveStack,
   DETAIL_POLL_INTERVAL_MS,
+  // Storage-backend list view (issue #680). Exported so a DOM/unit test can
+  // exercise the pure render + role gate without a network call.
+  renderStorageBackendsList,
+  storageBackendStatus,
+  isDefaultStorageBackend,
+  getClientRole,
+  setClientRole,
+  canManageStorage,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
