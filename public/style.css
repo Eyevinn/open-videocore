@@ -1153,6 +1153,25 @@ pre.code-block {
   padding: 18px;
 }
 
+/* Storage-backend remove confirmation dialog (issue #682) */
+.storage-remove-dialog .storage-remove-prompt {
+  margin: 0 0 12px;
+}
+.storage-remove-dialog .storage-remove-error {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--danger, #c0392b);
+  color: var(--danger, #c0392b);
+  background: rgba(192, 57, 43, 0.08);
+  font-size: 13px;
+}
+.storage-remove-dialog .modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 /* Utility */
 .mt8 { margin-top: 8px; }
 .mt12 { margin-top: 12px; }
