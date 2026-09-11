@@ -315,6 +315,19 @@ function renderStorageBackendsList(backends) {
     // reason is announced to assistive tech.
     const actionsTd = document.createElement('td');
     actionsTd.className = 'storage-backend-actions';
+
+    // Test connection (issue #683): available for EVERY row, including the
+    // OSC-managed default (the server answers the default `connected` without a
+    // probe, storage-backend-registry.ts:820-826). The whole Storage tab is
+    // already gated on canManageStorage (issue #680 ROLE_GATED_TABS), so the
+    // presence of this control matches the surrounding management controls'
+    // role gate without a second check here. Wiring is attached in loadBackends.
+    const test = document.createElement('button');
+    test.type = 'button';
+    test.className = 'btn-sm storage-backend-test-conn';
+    test.textContent = 'Test connection';
+    actionsTd.appendChild(test);
+
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'btn-sm storage-backend-delete';
@@ -931,6 +944,131 @@ function openStorageBackendRemoveDialog(backend, opts) {
     // Focus the confirm control so a keyboard user can act immediately.
     confirmBtn.focus();
   });
+}
+
+// ─── Storage-backend test-connection (issue #683) ──────────────────────────────
+// Contract (per CLAUDE.md rule 7), verified against the authoritative endpoint
+// on branch issue-679/storage-backend-api-endpoints:
+//   - POST /api/v1/storage/backends/{id}/test-connection
+//       Handler: src/routes/storage.ts:478-501 (issue-679).
+//       Request body (testConnectionBodySchema, storage.ts:206-209):
+//         { secretAccessKey: string(min 1), sessionToken?: string(min 1) }
+//         — secretAccessKey is REQUIRED; the literal secret was never persisted
+//         (ADR-017 D1) so the caller re-supplies it to probe with.
+//       Response (testConnectionResultSchema, storage.ts:210-213 / openapi.json
+//         "/api/v1/storage/backends/{id}/test-connection".post.responses.200):
+//         { status: 'connected' | 'unreachable', message: string }.
+//       404 — no such backend; 501 — registry not configured.
+//   - The server enforces its own 10s hard ceiling
+//       (TEST_CONNECTION_TIMEOUT_MS, storage-backend-registry.ts:558) resolving a
+//       hung probe to `unreachable`. The issue additionally requires the UI to
+//       surface a timeout if the call itself exceeds 10s, so we abort client-side
+//       at the same bound as a defence against a stalled/absent response.
+//   - The OSC-managed default (id 'default', DEFAULT_BACKEND_ID,
+//       storage-backend-registry.ts:57) is answered `connected` by the handler
+//       BEFORE any probe (registry.testConnection short-circuits on the id), so
+//       the required secret value is irrelevant for it — we send a non-empty
+//       placeholder purely to satisfy the schema's minLength(1).
+const STORAGE_TEST_CONNECTION_TIMEOUT_MS = 10_000;
+
+// Placeholder secret sent for the default backend only. The handler never probes
+// with it (see the contract note above); it exists only so the required
+// secretAccessKey field is a non-empty string.
+const STORAGE_TEST_DEFAULT_SECRET = 'platform-default';
+
+// Reusable probe call shared by the add/edit form (issue #681) and the per-row
+// action (issue #683). Sends the redacted-free secret the caller supplies and
+// resolves to the verbatim { status, message } contract, or throws (network /
+// HTTP error, or a client-side timeout when the call exceeds 10s). Kept free of
+// any DOM so it is directly unit-testable.
+async function testStorageBackendConnection(id, secret, extra) {
+  const body = { secretAccessKey: secret };
+  if (extra && extra.sessionToken) body.sessionToken = extra.sessionToken;
+
+  // Client-side 10s abort (issue #683 acceptance): if the request itself does
+  // not settle within the bound, surface a timeout rather than waiting forever.
+  // AbortController is available in browsers and happy-dom; guard defensively.
+  let controller;
+  let timer;
+  const opts = { method: 'POST', body: JSON.stringify(body) };
+  if (typeof AbortController === 'function') {
+    controller = new AbortController();
+    opts.signal = controller.signal;
+  }
+  const timeout = new Promise(function(_, reject) {
+    timer = setTimeout(function() {
+      if (controller) {
+        try { controller.abort(); } catch (_) { /* ignore */ }
+      }
+      const err = new Error(
+        'Test connection timed out after ' +
+        (STORAGE_TEST_CONNECTION_TIMEOUT_MS / 1000) + ' seconds.'
+      );
+      err.isTimeout = true;
+      reject(err);
+    }, STORAGE_TEST_CONNECTION_TIMEOUT_MS);
+  });
+  try {
+    const result = await Promise.race([
+      apiFetch('/storage/backends/' + encodeURIComponent(id) + '/test-connection', opts),
+      timeout,
+    ]);
+    return result;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Pure DOM helper (issue #683): show an in-flight spinner in a row's status cell.
+// Returns the status-badge element so a caller can restore it if needed. The
+// cell is the <td> holding `.storage-backend-status`.
+function setStorageBackendRowProbing(row) {
+  const statusTd = row && row.querySelector('.storage-backend-status')
+    ? row.querySelector('.storage-backend-status').parentNode
+    : null;
+  if (!statusTd) return;
+  statusTd.innerHTML = '';
+  const probing = document.createElement('span');
+  probing.className = 'badge badge-pending storage-backend-status is-probing';
+  probing.setAttribute('role', 'status');
+  probing.setAttribute('aria-live', 'polite');
+  const spinner = document.createElement('span');
+  spinner.className = 'spinner';
+  spinner.setAttribute('aria-hidden', 'true');
+  probing.appendChild(spinner);
+  probing.appendChild(document.createTextNode(' Testing…'));
+  statusTd.appendChild(probing);
+}
+
+// Pure DOM helper (issue #683): render the outcome of a probe inline on the row.
+// Replaces the status badge with Connected (green) / Unreachable (red) and, on
+// failure or timeout, shows the message beneath the badge. `outcome` is either a
+// contract result { status, message } or { status:'unreachable', message } we
+// synthesise from a thrown error. Every dynamic value is set via textContent.
+function applyStorageBackendRowTestResult(row, outcome) {
+  const badge = row && row.querySelector('.storage-backend-status');
+  const statusTd = badge ? badge.parentNode : null;
+  if (!statusTd) return;
+  const connected = outcome && outcome.status === 'connected';
+  statusTd.innerHTML = '';
+
+  const newBadge = document.createElement('span');
+  newBadge.className = 'badge ' + (connected ? 'badge-ready' : 'badge-failed') +
+    ' storage-backend-status';
+  newBadge.textContent = connected ? 'Connected' : 'Unreachable';
+  statusTd.appendChild(newBadge);
+
+  // On failure surface the message inline beneath the badge (acceptance
+  // criterion). On success the message ('reachable' / default note) is
+  // conveyed by the badge itself, so we keep the cell compact.
+  if (!connected) {
+    const msg = outcome && outcome.message ? String(outcome.message) : 'Unreachable.';
+    const msgEl = document.createElement('div');
+    msgEl.className = 'storage-backend-test-error';
+    msgEl.setAttribute('role', 'alert');
+    msgEl.textContent = msg;
+    statusTd.appendChild(msgEl);
+  }
 }
 
 function loadingEl() {
@@ -2848,10 +2986,8 @@ async function renderStorageTab(container) {
       testBtn.disabled = true;
       testResultEl.textContent = 'Testing…';
       try {
-        const result = await apiFetch(
-          '/storage/backends/' + encodeURIComponent(backendId) + '/test-connection',
-          { method: 'POST', body: JSON.stringify({ secretAccessKey: secret }) }
-        );
+        // Shared probe helper (issue #683) — same call the per-row action uses.
+        const result = await testStorageBackendConnection(backendId, secret);
         // Response contract: { status: 'connected' | 'unreachable', message }.
         const ok = result && result.status === 'connected';
         testResultEl.textContent =
@@ -2993,7 +3129,113 @@ async function renderStorageTab(container) {
       });
       actionsTd.insertBefore(edit, actionsTd.firstChild);
     });
+
+    // Wire the per-row Test connection control (issue #683) for EVERY row,
+    // default included. The secret was never persisted (ADR-017 D1), so an
+    // external backend's probe needs the operator to re-supply it; we prompt for
+    // it inline. The default is answered `connected` without a probe (registry
+    // short-circuits on id 'default'), so we send a non-empty placeholder to
+    // satisfy the required-field schema and never ask for a secret.
+    listEl.querySelectorAll('.storage-backend-test-conn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const row = btn.closest('.storage-backend-row');
+        const rowId = row && row.dataset.backendId;
+        if (!rowId) return;
+        const isDefault = row.classList.contains('is-default');
+        if (isDefault) {
+          runRowTest(row, rowId, STORAGE_TEST_DEFAULT_SECRET);
+        } else {
+          openRowTestSecretPrompt(row, rowId);
+        }
+      });
+    });
     backendsMount.appendChild(listEl);
+  }
+
+  // Run a probe against one row and reflect the result inline (issue #683):
+  // spinner while in flight, then Connected / Unreachable (+ message on failure
+  // or timeout). Disables the row's Test button for the duration so a double
+  // click can't launch two probes.
+  async function runRowTest(row, backendId, secret) {
+    const btn = row.querySelector('.storage-backend-test-conn');
+    if (btn) btn.disabled = true;
+    setStorageBackendRowProbing(row);
+    try {
+      const result = await testStorageBackendConnection(backendId, secret);
+      applyStorageBackendRowTestResult(row, result);
+    } catch (err) {
+      // Network / HTTP failure or the client-side 10s timeout: render as an
+      // Unreachable outcome carrying the error message (acceptance criterion).
+      applyStorageBackendRowTestResult(row, {
+        status: 'unreachable',
+        message: err && err.message ? err.message : 'Connection test failed.',
+      });
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // Prompt the operator for the secret to probe an external backend with, then
+  // run the row test (issue #683). The secret is held only in memory for the
+  // duration of the call (CLAUDE.md: never persist tokens) and is never written
+  // back into the redacted list cache.
+  function openRowTestSecretPrompt(row, backendId) {
+    const cached = backendsById[backendId] || {};
+    const name = cached.name ? String(cached.name) : backendId;
+    openModal('Test connection', function(body, close) {
+      body.classList.add('storage-test-dialog');
+
+      const prompt = document.createElement('p');
+      prompt.className = 'storage-test-prompt';
+      prompt.textContent =
+        'Re-enter the secret access key for "' + name +
+        '" to probe its reachability. It is used only for this test and never stored.';
+      body.appendChild(prompt);
+
+      const label = document.createElement('label');
+      label.className = 'form-field';
+      label.textContent = 'Secret access key';
+      const input = document.createElement('input');
+      input.type = 'password';
+      input.className = 'storage-test-secret';
+      input.autocomplete = 'off';
+      label.appendChild(input);
+      body.appendChild(label);
+
+      const errEl = document.createElement('div');
+      errEl.className = 'storage-test-error';
+      errEl.setAttribute('role', 'alert');
+      errEl.style.display = 'none';
+      body.appendChild(errEl);
+
+      const actions = document.createElement('div');
+      actions.className = 'modal-actions';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.className = 'btn-sm storage-test-cancel';
+      cancelBtn.textContent = 'Cancel';
+      const runBtn = document.createElement('button');
+      runBtn.type = 'button';
+      runBtn.className = 'btn-sm storage-test-run';
+      runBtn.textContent = 'Test connection';
+      actions.appendChild(cancelBtn);
+      actions.appendChild(runBtn);
+      body.appendChild(actions);
+
+      cancelBtn.addEventListener('click', close);
+      runBtn.addEventListener('click', function() {
+        const secret = input.value.trim();
+        if (!secret) {
+          errEl.textContent = 'Enter the secret access key to test the connection.';
+          errEl.style.display = '';
+          input.focus();
+          return;
+        }
+        close();
+        runRowTest(row, backendId, secret);
+      });
+      input.focus();
+    });
   }
 
   // Create-bucket form
@@ -4578,6 +4820,14 @@ export {
   // exercise the confirmation dialog + the 409 in-use message formatter.
   openStorageBackendRemoveDialog,
   describeBackendInUse,
+  // Per-row test-connection action (issue #683). Exported so a DOM/unit test can
+  // exercise the shared probe helper + the pure spinner/result row renderers
+  // without a live probe.
+  testStorageBackendConnection,
+  setStorageBackendRowProbing,
+  applyStorageBackendRowTestResult,
+  STORAGE_TEST_CONNECTION_TIMEOUT_MS,
+  STORAGE_TEST_DEFAULT_SECRET,
   // Exported so the add -> list -> edit -> list integration test can drive the
   // real Storage-tab flow against a stubbed fetch (issue #681).
   renderStorageTab,
