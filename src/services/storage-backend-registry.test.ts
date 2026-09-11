@@ -16,7 +16,8 @@ import {
   InMemoryBackendRecordStore,
   ParamStoreBackendRecordStore,
   BackendValidationError,
-  DefaultBackendNotDeletableError,
+  BackendInUseError,
+  ImmutableDefaultBackendError,
   UnknownSourceBackendError,
   DEFAULT_BACKEND_ID,
   backendRecordKey,
@@ -289,12 +290,219 @@ describe('StorageBackendRegistry.register — validation (issue #550)', () => {
   });
 });
 
-describe('StorageBackendRegistry.remove — default protection', () => {
-  it('throws DefaultBackendNotDeletableError for the default id', async () => {
+describe('StorageBackendRegistry.remove — default protection + in-use guard (issue #679)', () => {
+  it('throws ImmutableDefaultBackendError for the default id', async () => {
     const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore());
     await expect(registry.remove('ws1', DEFAULT_BACKEND_ID)).rejects.toBeInstanceOf(
-      DefaultBackendNotDeletableError
+      ImmutableDefaultBackendError
     );
+  });
+
+  it('throws BackendInUseError when a reference checker reports the backend in use', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store, {
+      enabled: false,
+      referenceChecker: {
+        referencesFor: async () => ({ assetIds: ['a1'], activeJobIds: ['j1'] })
+      }
+    });
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'both',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    await expect(registry.remove('ws1', view.id)).rejects.toBeInstanceOf(BackendInUseError);
+  });
+
+  it('removes when the reference checker reports no references', async () => {
+    const { store } = spySecretStore();
+    const records = new InMemoryBackendRecordStore();
+    const registry = new StorageBackendRegistry(records, store, {
+      enabled: false,
+      referenceChecker: {
+        referencesFor: async () => ({ assetIds: [], activeJobIds: [] })
+      }
+    });
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'both',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    await registry.remove('ws1', view.id);
+    expect(await records.list('ws1')).toHaveLength(0);
+  });
+});
+
+describe('StorageBackendRegistry.update — issue #679', () => {
+  it('updates a non-secret field and never carries a secret on the record', async () => {
+    const { store } = spySecretStore();
+    const records = new InMemoryBackendRecordStore();
+    const registry = new StorageBackendRegistry(records, store);
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'source',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    const updated = await registry.update('ws1', view.id, { name: 'renamed', bucket: 'bkt2' });
+    expect(updated?.name).toBe('renamed');
+    expect(updated?.bucket).toBe('bkt2');
+    expect(updated?.credentials.secretAccessKey).toBe('***redacted***');
+    const stored = await records.list('ws1');
+    expect(JSON.stringify(stored[0])).not.toContain(RAW_SECRET);
+  });
+
+  it('re-fans a rotated credential to the OSC secrets, never into the record', async () => {
+    const { store, saveSecret } = spySecretStore();
+    const records = new InMemoryBackendRecordStore();
+    const registry = new StorageBackendRegistry(records, store);
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'source',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    saveSecret.mockClear();
+    await registry.update('ws1', view.id, {
+      accessKeyId: 'AKIA2',
+      secretAccessKey: 'rotated-secret'
+    });
+    const saved = saveSecret.mock.calls.map((c) => c[2]);
+    expect(saved).toContain('rotated-secret');
+    const stored = await records.list('ws1');
+    expect(stored[0].accessKeyId).toBe('AKIA2');
+    expect(JSON.stringify(stored[0])).not.toContain('rotated-secret');
+  });
+
+  it('throws ImmutableDefaultBackendError for the default id', async () => {
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore());
+    await expect(registry.update('ws1', DEFAULT_BACKEND_ID, { name: 'x' })).rejects.toBeInstanceOf(
+      ImmutableDefaultBackendError
+    );
+  });
+
+  it('returns undefined for an unknown id', async () => {
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), spySecretStore().store);
+    expect(await registry.update('ws1', 'nope', { name: 'x' })).toBeUndefined();
+  });
+
+  it('clears a path template with null', async () => {
+    const { store } = spySecretStore();
+    const records = new InMemoryBackendRecordStore();
+    const registry = new StorageBackendRegistry(records, store);
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'packaged',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET,
+      pathTemplate: '{year}/{assetId}'
+    });
+    const updated = await registry.update('ws1', view.id, { pathTemplate: null });
+    expect(updated?.pathTemplate).toBeUndefined();
+    expect((await records.list('ws1'))[0].pathTemplate).toBeUndefined();
+  });
+});
+
+describe('StorageBackendRegistry.testConnection — issue #679', () => {
+  function okProbe(): BucketProbeClient {
+    return {
+      bucketExists: async () => true,
+      listObjectsV2: () => {
+        const s = new Readable({ read() {} });
+        queueMicrotask(() => s.emit('end'));
+        return s;
+      },
+      putObject: async () => ({}),
+      statObject: async () => ({}),
+      removeObject: async () => {}
+    };
+  }
+
+  it("returns { status: 'connected' } when the probe succeeds", async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store, {
+      enabled: false,
+      probeClientFactory: () => okProbe()
+    });
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'source',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    const result = await registry.testConnection('ws1', view.id, { secretAccessKey: RAW_SECRET });
+    expect(result?.status).toBe('connected');
+    expect(JSON.stringify(result)).not.toContain(RAW_SECRET);
+  });
+
+  it("returns { status: 'unreachable' } when the probe fails connectivity", async () => {
+    const { store } = spySecretStore();
+    const unreachable: BucketProbeClient = {
+      ...okProbe(),
+      bucketExists: async () => {
+        const err = new Error('boom') as Error & { code: string };
+        err.code = 'ECONNREFUSED';
+        throw err;
+      }
+    };
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store, {
+      enabled: false,
+      probeClientFactory: () => unreachable
+    });
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'source',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    const result = await registry.testConnection('ws1', view.id, { secretAccessKey: RAW_SECRET });
+    expect(result?.status).toBe('unreachable');
+  });
+
+  it('resolves unreachable via the hard 10s timeout when the probe hangs', async () => {
+    vi.useFakeTimers();
+    const { store } = spySecretStore();
+    const hanging: BucketProbeClient = {
+      bucketExists: () => new Promise<boolean>(() => {}),
+      listObjectsV2: () => new Readable({ read() {} }),
+      putObject: async () => ({}),
+      statObject: async () => ({}),
+      removeObject: async () => {}
+    };
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store, {
+      enabled: false,
+      probeClientFactory: () => hanging
+    });
+    const view = await registry.register('ws1', {
+      name: 'b',
+      role: 'source',
+      bucket: 'bkt',
+      accessKeyId: 'AKIA',
+      secretAccessKey: RAW_SECRET
+    });
+    const pending = registry.testConnection('ws1', view.id, { secretAccessKey: RAW_SECRET });
+    await vi.advanceTimersByTimeAsync(10_001);
+    const result = await pending;
+    expect(result?.status).toBe('unreachable');
+    expect(result?.message).toMatch(/10 seconds/);
+    vi.useRealTimers();
+  });
+
+  it('returns undefined for an unknown id', async () => {
+    const { store } = spySecretStore();
+    const registry = new StorageBackendRegistry(new InMemoryBackendRecordStore(), store);
+    expect(
+      await registry.testConnection('ws1', 'nope', { secretAccessKey: RAW_SECRET })
+    ).toBeUndefined();
   });
 });
 
