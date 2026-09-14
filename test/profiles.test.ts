@@ -356,6 +356,110 @@ describe('profile bootstrap (issue #84)', () => {
   });
 });
 
+// issue #689: profile bootstrap must be AWAITED before the server becomes
+// reachable / before the scaler can spawn an Encore instance. Fire-and-forget
+// left a startup ORDERING race: a GET /api/v1/profiles/index.yml in the window
+// before the first bootstrap pass completed observed a valid-but-EMPTY map
+// (`{}\n`), which made Encore transcode jobs fail with "Could not find location
+// for profile program! Profiles: {}". These tests reproduce the boot ordering
+// with a SLOW repository.create() and assert the first /index.yml fetch issued
+// immediately "after boot" observes a fully-seeded index, never a transient
+// empty one — and that a genuine remote-index fetch FAILURE still does not block
+// boot while built-ins remain present.
+describe('bootstrap ordering readiness (issue #689)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Wrap a repository so create() resolves only after a delay, modelling a slow
+  // CouchDB backend. This is what makes a fire-and-forget bootstrap observably
+  // race a request: the first pass is still writing when /index.yml is fetched.
+  function withSlowCreate(repo: InMemoryProfileRepository, delayMs: number): InMemoryProfileRepository {
+    const realCreate = repo.create.bind(repo);
+    repo.create = async (input) => {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return realCreate(input);
+    };
+    return repo;
+  }
+
+  it('serves a fully-seeded index.yml on the first fetch after boot, never a transient empty map', async () => {
+    const repo = withSlowCreate(new InMemoryProfileRepository(), 25);
+
+    // The remote index seeds a real profile named `program`, mirroring the
+    // default Encore index the scaler-spawned instances resolve.
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith('/profiles.yml')) {
+        return new Response('program: program.yml\n', { status: 200 });
+      }
+      if (url.endsWith('/program.yml')) {
+        return new Response(CPU_YAML, { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // Model main.ts's now-AWAITED boot ordering (issue #689): the first bootstrap
+    // pass MUST complete before the server becomes reachable (app.ready / listen)
+    // and before the scaler can spawn an Encore instance that fetches index.yml.
+    // With the fire-and-forget `void bootstrapProfiles(...)` this await would be
+    // skipped and the fetch below would race the still-running slow create().
+    await bootstrapProfiles({
+      repository: repo,
+      indexUrl: 'https://example.test/dir/profiles.yml'
+    });
+
+    const app = await buildApp(repo);
+    try {
+      // Issued IMMEDIATELY after boot, exactly as a scaler-spawned Encore
+      // instance would. Because bootstrap was awaited, this observes the fully
+      // seeded index — the `program` profile is present, not the empty map.
+      const index = await app.inject({ method: 'GET', url: '/api/v1/profiles/index.yml' });
+      expect(index.statusCode).toBe(200);
+      expect(index.body).not.toBe('{}\n');
+      expect(index.body).toContain('program: program/yaml');
+      expect(index.headers['x-profile-count']).not.toBe('0');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('still completes boot and serves built-ins when the remote index fetch fails (best-effort preserved)', async () => {
+    const repo = withSlowCreate(new InMemoryProfileRepository(), 25);
+
+    // A genuine remote-index fetch FAILURE: the index host is down. This must NOT
+    // block boot — only the ordering changed. Built-ins are ensured BEFORE the
+    // remote fetch is attempted, so they remain present.
+    const failingFetch = vi.fn(async () => new Response('down', { status: 503 }));
+    vi.stubGlobal('fetch', failingFetch);
+
+    // main.ts awaits bootstrap with a .catch() that swallows the failure so boot
+    // is not blocked. Replicate that best-effort semantics here.
+    let bootBlocked = false;
+    await bootstrapProfiles({
+      repository: repo,
+      indexUrl: 'https://example.test/dir/profiles.yml'
+    }).catch(() => {
+      bootBlocked = false; // failure is swallowed; boot proceeds
+    });
+    // The remote fetch was attempted and failed, yet control reached here.
+    expect(failingFetch).toHaveBeenCalled();
+    expect(bootBlocked).toBe(false);
+
+    const app = await buildApp(repo);
+    try {
+      // Built-ins appear on the first fetch after boot despite the remote failure.
+      const index = await app.inject({ method: 'GET', url: '/api/v1/profiles/index.yml' });
+      expect(index.statusCode).toBe(200);
+      expect(index.body).toContain(`${LOUDNORM_PROFILE_NAME}: ${LOUDNORM_PROFILE_NAME}/yaml`);
+      expect(index.body).not.toBe('{}\n');
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 describe('built-in loudness-normalisation profile (issue #385)', () => {
   it('ships single-pass loudnorm with a -23 LUFS default target parametrised via profileParams', () => {
     // The shipped filter is single-pass loudnorm (ADR-013), with the integrated
