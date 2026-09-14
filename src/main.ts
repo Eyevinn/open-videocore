@@ -1448,7 +1448,24 @@ await app.register(profilesRouter, {
 // profiles already exist (survives restarts). Best-effort: a fetch failure
 // (e.g. offline local run) is logged and does not block boot; operators can
 // retry via POST /api/v1/profiles/bootstrap.
-void bootstrapProfiles({
+//
+// AWAITED, not fire-and-forget (issue #689): this must complete its first pass
+// BEFORE the server becomes reachable (app.listen, main.ts) and BEFORE
+// reconcileScaler() (below) can activate the scaler and spawn an Encore instance
+// that fetches /api/v1/profiles/index.yml. Fire-and-forget left a startup
+// ORDERING race: a fetch of /index.yml in the window before the first pass
+// completed returned a valid-but-EMPTY map (`{}\n`), making Encore transcode
+// jobs fail with "Could not find location for profile program! Profiles: {}".
+// This is distinct from #456/#459/#460/#461 (empty store returns valid empty
+// YAML) and #662/#669 (retry-skip guard) — those do not address the race.
+//
+// Best-effort semantics are preserved: the .catch() below swallows a genuine
+// remote-index fetch FAILURE (logged, does not block boot). Built-ins are seeded
+// by bootstrapProfiles BEFORE it attempts the remote fetch, so they are present
+// even when the remote index is unreachable. Only the ORDERING changes here:
+// built-ins + one remote-index attempt (success OR logged failure) complete
+// before any route can be served or the scaler can spawn Encore.
+await bootstrapProfiles({
   repository: profileRepository,
   indexUrl: encoreProfilesUrl,
   log: app.log
