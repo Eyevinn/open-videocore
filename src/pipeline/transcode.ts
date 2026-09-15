@@ -183,6 +183,13 @@ export type CompleteTranscodeResult = {
   applied: boolean;
   // Number of embedded renditions recorded on the source asset (issue #79).
   renditionCount: number;
+  // The embedded renditions recorded on the source asset on a successful apply
+  // (issue #79). Surfaced here so the caller (the internal Encore callback,
+  // src/routes/internal.ts) can derive the encode-completion event's
+  // codec/height/width/bitrateBps companions from the SAME rendition list that
+  // was persisted, rather than re-deriving them from the raw Encore output
+  // (issue #693, ADR-022). Empty on a failure / no-op apply.
+  renditions: Rendition[];
 };
 
 // Apply an Encore completion to the job + source asset. Idempotent: a second
@@ -201,7 +208,7 @@ export async function completeTranscode(
 ): Promise<CompleteTranscodeResult> {
   const job = await deps.jobs.get(params.jobId);
   if (!job) {
-    return { applied: false, renditionCount: 0 };
+    return { applied: false, renditionCount: 0, renditions: [] };
   }
   if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
     // Duplicate / late callback, or the job was cancelled by an operator: nothing
@@ -209,7 +216,7 @@ export async function completeTranscode(
     // here to keep a late Encore callback idempotent — attempting an update would
     // otherwise throw InvalidJobTransitionError (issue #126). No audit entry: a
     // no-op / already-terminal callback is not a fresh terminal transition.
-    return { applied: false, renditionCount: 0 };
+    return { applied: false, renditionCount: 0, renditions: [] };
   }
 
   if (!params.success) {
@@ -232,7 +239,7 @@ export async function completeTranscode(
       },
       deps.auditLog
     );
-    return { applied: true, renditionCount: 0 };
+    return { applied: true, renditionCount: 0, renditions: [] };
   }
 
   // Success: build one self-contained embedded rendition per produced variant.
@@ -272,5 +279,5 @@ export async function completeTranscode(
     deps.auditLog
   );
 
-  return { applied: true, renditionCount: renditions.length };
+  return { applied: true, renditionCount: renditions.length, renditions };
 }
