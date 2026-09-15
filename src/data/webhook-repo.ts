@@ -12,16 +12,27 @@
 // A registration's `secret`, when set, is used to sign each delivery with an
 // HMAC-SHA256 over the JSON body (see services/webhook-dispatcher.ts).
 
+import { ENCODE_COMPLETION_EVENT_TYPE } from '../pipeline/encode-completion-event.js';
+
 // The event types open-videocore emits. A registration subscribes to a
 // non-empty subset of these; an event is delivered only to registrations whose
 // `events` list contains its type.
+//
+// `encode.completed` (issue #693, ADR-022) is the billing-oriented completion
+// event delivered over this same outbound-webhook transport. It references
+// ENCODE_COMPLETION_EVENT_TYPE (the #691 canonical constant) rather than a
+// duplicated literal so the subscribable event name and the emitted event name
+// can never drift — a mismatch would silently drop deliveries because the
+// dispatcher matches on the exact `type` string (ADR-022 Consequences,
+// webhook-dispatcher.ts:80).
 export const WEBHOOK_EVENT_TYPES = [
   'asset.ready',
   'asset.failed',
   'transcode.complete',
   'transcode.failed',
   'package.complete',
-  'package.failed'
+  'package.failed',
+  ENCODE_COMPLETION_EVENT_TYPE
 ] as const;
 
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
