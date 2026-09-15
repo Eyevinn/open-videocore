@@ -18111,7 +18111,8 @@
                         "transcode.complete",
                         "transcode.failed",
                         "package.complete",
-                        "package.failed"
+                        "package.failed",
+                        "encode.completed"
                       ]
                     },
                     "minItems": 1
