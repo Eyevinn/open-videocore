@@ -264,6 +264,21 @@ type ProvisionRouterOptions = {
   // reachability diagnostics endpoint responds 501 (not wired), exactly like the
   // paramStore-not-configured degradation — it never guesses coordinates.
   reachabilityProbeFactory?: (config: StackConfig) => StackReachabilityDeps;
+  // Seed the newly-provisioned stack's profile store (issue #701). Invoked ONCE
+  // after a successful provision persists the stack `status: 'ready'` AND
+  // onStackChange has invalidated the resolver cache — so a profile-repository
+  // resolve now reaches the new stack's real store instead of the pre-provision
+  // no-storage in-memory fallback. Without this the provisioned stack's profile
+  // store is empty by construction (startup bootstrap only ever seeded the
+  // in-memory fallback), so GET /profiles/index.yml serves `{}` and Encore fails
+  // every job with "Could not find location for profile program! Profiles: {}".
+  // Must be idempotent (bootstrapProfiles is: it skips the remote seed when
+  // non-built-in profiles already exist and upserts otherwise), so a retried
+  // provision against the same stack is safe. Best-effort: a failure is logged by
+  // the caller and does NOT fail the provision — the stack is live and an
+  // operator can retry via POST /api/v1/profiles/bootstrap. Optional: when
+  // omitted (e.g. no profile repository wired) seeding is skipped.
+  seedProfiles?: () => Promise<void>;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -495,8 +510,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   opts
 ) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
-  const { osc, paramStore, onStackChange, getScalerRegistry, operationStore: ops, publicBaseUrl } =
-    opts;
+  const {
+    osc,
+    paramStore,
+    onStackChange,
+    getScalerRegistry,
+    operationStore: ops,
+    publicBaseUrl,
+    seedProfiles
+  } = opts;
 
   // Operator-supplied credentials (ADR-002). Read once at registration time so
   // a misconfigured deployment fails fast at startup rather than mid-provision.
@@ -1130,6 +1152,28 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // The new stack is now discoverable: drop any cached connections so
           // the next request resolves it immediately.
           onStackChange?.(workspaceId);
+
+          // Seed the newly-provisioned stack's profile store (issue #701). This
+          // runs AFTER onStackChange has invalidated the resolver cache, so the
+          // profile repository now resolves the just-persisted ready stack's real
+          // store rather than the pre-provision no-storage in-memory fallback the
+          // startup bootstrap seeded. bootstrapProfiles is idempotent, so a
+          // retried provision against the same stack re-runs harmlessly. This is
+          // best-effort: a failure is logged and does NOT fail the provision (the
+          // stack is live and an operator can retry via
+          // POST /api/v1/profiles/bootstrap), mirroring the startup bootstrap's
+          // non-blocking semantics.
+          if (seedProfiles) {
+            try {
+              await seedProfiles();
+            } catch (err) {
+              request.log.warn(
+                { err, name },
+                'profile bootstrap for newly-provisioned stack failed; ' +
+                  'retry via POST /api/v1/profiles/bootstrap'
+              );
+            }
+          }
         } else {
           request.log.warn(
             'parameter store not configured — stack coordinates not persisted'
