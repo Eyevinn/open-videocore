@@ -123,10 +123,14 @@ schema in `src/pipeline/encode-completion-event.ts`):
   "width": 1920,
   "bitrateBps": 5000000,
   "profile": "abr-vod",
-  "renditionCount": 4,
-  "completedAt": "2026-09-16T10:42:07.870Z"
+  "renditionCount": 4
 }
 ```
+
+> The example above shows every field the platform emits today. `completedAt`
+> and `outputFormat` are permitted by the schema but are **not** currently
+> emitted — see the note under the field reference below. Do not build metering
+> logic that expects them.
 
 ### Field reference
 
@@ -141,18 +145,38 @@ schema in `src/pipeline/encode-completion-event.ts`):
 | `resolutionTier` | `sd` \| `hd` \| `fhd` \| `uhd` \| `unknown` | coarse resolution bucket of the produced variant |
 | `occurredAt` | ISO-8601 UTC string | authoritative event time |
 
-**Present when available at completion (optional):**
+**Emitted when derivable at completion (optional, but populated by the emitter today):**
 
 | Field | Type | Meaning |
 |---|---|---|
 | `codec` | string | e.g. `"h264"`, `"hevc"` (free string; no codec enum) |
 | `height` | integer > 0 | produced variant pixel height |
 | `width` | integer > 0 | produced variant pixel width |
-| `outputFormat` | string | container/segment format, e.g. `"mp4"`, `"fmp4"` |
 | `bitrateBps` | integer >= 0 | overall bitrate in **bits per second** |
 | `profile` | string | encode profile name used |
 | `renditionCount` | integer >= 0 | number of renditions this completion produced |
+
+Each of these is set only when its source value is present at completion
+(`buildEncodeCompletionEvent`, `src/routes/internal.ts:255-270`): `codec`,
+`height`, `width`, `bitrateBps` come from the produced variant and `profile`
+from the job; any absent source value is omitted (not defaulted).
+
+**Schema-permitted but NOT currently emitted by the platform today:**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `outputFormat` | string | container/segment format, e.g. `"mp4"`, `"fmp4"` |
 | `completedAt` | ISO-8601 UTC string | job terminal-transition time |
+
+These two fields are declared **optional** in `encodeCompletionEventSchema`
+(`src/pipeline/encode-completion-event.ts:180,198`) so the contract can carry
+them in future, but the only emission path,
+`buildEncodeCompletionEvent(...)` (`src/routes/internal.ts:242-272`), **never
+sets either one** — it derives no `completedAt` and no `outputFormat`. The
+emission integration test asserts exactly the emitted-field set and never these
+two (`src/routes/internal.encode-completion.test.ts:155-174`). **A consumer will
+not receive `outputFormat` or `completedAt` today; do not build metering logic
+that depends on them.** Use `occurredAt` (required) as the completion timestamp.
 
 ### Units — part of the contract, do not misread
 
@@ -160,8 +184,9 @@ schema in `src/pipeline/encode-completion-event.ts`):
   seconds. It is the *excluding-retries* duration (the last successful encode
   attempt's `endedAt - startedAt`, ADR-012 Decision 3).
 - **`bitrateBps` is bits per second.**
-- **All timestamps are ISO-8601 UTC** (`occurredAt`, `completedAt`, and the
-  envelope `timestamp`).
+- **All timestamps are ISO-8601 UTC** (the emitted `occurredAt` and the envelope
+  `timestamp`; the schema-declared-but-not-emitted `completedAt` would also be
+  ISO-8601 UTC if it were ever populated — see the note above).
 
 ### Resolution-tier boundaries (`resolutionTierForHeight`)
 
@@ -184,10 +209,14 @@ for `unknown` explicitly.
    `encodeDurationMs: encodeDurationMs ?? 0` (`src/routes/internal.ts:261`). A
    value of exactly `0` therefore means "duration could not be measured," not "a
    zero-length encode." Treat `0` as unmeasured in your metering logic.
-2. **`occurredAt` vs `completedAt`.** `occurredAt` (required) is the
-   authoritative event time and is what you should key on. `completedAt`
-   (optional) is the job's terminal-transition instant; the two are usually
-   equal but may differ slightly.
+2. **Use `occurredAt` as the completion timestamp — `completedAt` is not
+   emitted.** `occurredAt` (required) is the authoritative event time and is what
+   you should key on. `completedAt` is schema-permitted but the emitter never
+   populates it today (`buildEncodeCompletionEvent`,
+   `src/routes/internal.ts:255-270`), so you will not receive it — do not key
+   any metering logic on it. If a job's exact terminal-transition instant is
+   ever needed and distinct from `occurredAt`, that would be a future emitter
+   change, not something the current contract provides.
 
 ## 3. Auth
 
