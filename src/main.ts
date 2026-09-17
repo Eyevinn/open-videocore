@@ -465,6 +465,25 @@ await app.register(provisionRouter, {
       app.log.warn({ err }, 'watch-folder: wire after stack change failed')
     );
   },
+  // Seed the newly-provisioned stack's profile store (issue #701). The startup
+  // bootstrapProfiles below only ever seeds whatever the resolver returns at
+  // boot; with no stack yet provisioned that is the no-storage in-memory
+  // fallback, NOT the stack a later provision creates — so the provisioned
+  // stack's profile store would otherwise be empty by construction and
+  // GET /profiles/index.yml would serve `{}`, failing every Encore job. This
+  // callback re-runs the SAME idempotent bootstrap against `profileRepository`
+  // after the provision route has invalidated the resolver cache (onStackChange
+  // above), so the repository now resolves the just-provisioned ready stack's
+  // real profile store and seeds it. Idempotent + best-effort (the route logs a
+  // failure and does not fail the provision). Declared below (const
+  // profileRepository / encoreProfilesUrl); this closure is only invoked at
+  // provision-request time, long after those bindings initialise.
+  seedProfiles: () =>
+    bootstrapProfiles({
+      repository: profileRepository,
+      indexUrl: encoreProfilesUrl,
+      log: app.log
+    }).then(() => undefined),
   // Late-bound accessor for the scaler registry. scalerRegistry is a
   // module-level binding created lazily by reconcileScaler() only once a stack
   // exists (and reset to undefined on the last deprovision), which is *after*
