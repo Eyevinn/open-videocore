@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Required status check: typecheck + unit tests + build.
+  # Name this job "ci" so it is easy to wire up as a required status check.
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  # Lightweight test-weakening guard.
+  #
+  # Fails a PR whose diff (base..head) does any of the following WITHOUT an
+  # explicit, human-reviewed justification:
+  #   - deletes a test file (*.test.ts / *.spec.ts)
+  #   - net-removes test(...) / it(...) / describe(...) blocks from a surviving
+  #     test file (also catches commenting-out: re-added lines that are comments
+  #     do not count toward the "added" tally)
+  #   - touches a coverage threshold line in a vitest/vite config (if one exists)
+  #
+  # Exception mechanism (pick either — both are human-reviewed signals):
+  #   1. Add a line to the PR body:   test-exception: <reason>
+  #   2. Add the label:               test-exception-approved
+  # Either one makes this job pass. See CONTRIBUTING.md for details.
+  test-guard:
+    name: test-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so we can diff base..head of the PR.
+          fetch-depth: 0
+
+      - name: Check for test weakening without justification
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Pass untrusted PR content via env (never interpolate into the script
+          # body) to avoid shell injection.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
+        run: |
+          set -euo pipefail
+
+          # --- Exception markers ------------------------------------------------
+          if printf '%s' "$PR_BODY" | grep -qiE '^[[:space:]]*test-exception:[[:space:]]*[^[:space:]]'; then
+            echo "test-exception: marker found in PR body — guard passes."
+            exit 0
+          fi
+          if printf '%s\n' "$PR_LABELS" | grep -qx 'test-exception-approved'; then
+            echo "test-exception-approved label present — guard passes."
+            exit 0
+          fi
+
+          # Make sure both endpoints of the diff are available locally.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true
+
+          violations=0
+
+          # --- 1. Deleted test files -------------------------------------------
+          deleted=$(git diff --diff-filter=D --name-only "$BASE_SHA" "$HEAD_SHA" -- '*.test.ts' '*.spec.ts' || true)
+          if [ -n "$deleted" ]; then
+            echo "::error::Test file(s) deleted:"
+            printf '%s\n' "$deleted" | sed 's/^/  - /'
+            violations=1
+          fi
+
+          # --- 2. Net-removed test blocks from surviving test files ------------
+          # Pattern matches test/it/describe with optional modifiers (.skip/.only/etc).
+          block_re='\b(test|it|describe)(\.(skip|only|todo|fails|each|concurrent|sequential|runIf|skipIf))?[[:space:]]*\('
+
+          changed=$(git diff --diff-filter=M --name-only "$BASE_SHA" "$HEAD_SHA" -- '*.test.ts' '*.spec.ts' || true)
+          for f in $changed; do
+            file_diff=$(git diff "$BASE_SHA" "$HEAD_SHA" -- "$f")
+
+            removed=$(printf '%s\n' "$file_diff" \
+              | grep -E '^-' | grep -vE '^---' \
+              | grep -cE "$block_re" || true)
+
+            # Added blocks that are themselves comments do not offset a removal.
+            added=$(printf '%s\n' "$file_diff" \
+              | grep -E '^\+' | grep -vE '^\+\+\+' \
+              | grep -vE '^\+[[:space:]]*(//|\*|/\*)' \
+              | grep -cE "$block_re" || true)
+
+            if [ "$removed" -gt "$added" ]; then
+              echo "::error::$f net-removes $((removed - added)) test/it/describe block(s)"
+              violations=1
+            fi
+          done
+
+          # --- 3. Coverage threshold changes in vitest/vite config -------------
+          cov_re='(lines|branches|functions|statements|threshold)s?[[:space:]]*:[[:space:]]*[0-9]'
+          covfiles=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- '*vitest.config.*' '*vite.config.*' || true)
+          for f in $covfiles; do
+            if git diff "$BASE_SHA" "$HEAD_SHA" -- "$f" \
+                 | grep -E '^-' | grep -vE '^---' \
+                 | grep -qE "$cov_re"; then
+              echo "::error::$f changes a coverage threshold line — confirm it is not being lowered"
+              violations=1
+            fi
+          done
+
+          # --- Verdict ---------------------------------------------------------
+          if [ "$violations" -ne 0 ]; then
+            echo ""
+            echo "This PR weakens the test suite. If this is intentional and reviewed,"
+            echo "either add a line to the PR body:   test-exception: <reason>"
+            echo "or apply the label:                 test-exception-approved"
+            exit 1
+          fi
+
+          echo "No test weakening detected."
