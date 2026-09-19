@@ -286,13 +286,21 @@ async function resolveEncoreJobUrl(
 async function decrementActiveJobs(
   redis: Redis,
   encoreJobId: string,
-  logger: Logger
+  logger: Logger,
+  // #707: the success path hdel's keys.jobInstance BEFORE this runs (so a later
+  // reconcile tick's drop diff can't re-observe the job), which would leave this
+  // function unable to resolve the instance from that mapping. Callers on that
+  // path pass the instanceId they captured before the delete; when omitted we
+  // resolve it from keys.jobInstance exactly as before (failure/retry paths, which
+  // do not delete the mapping).
+  knownInstanceId?: string
 ): Promise<void> {
   try {
     const decoded = decodeEncoreJobId(encoreJobId);
     if (!decoded) return;
     const { workspaceId } = decoded;
-    const instanceId = await redis.hget(keys.jobInstance(workspaceId), encoreJobId);
+    const instanceId =
+      knownInstanceId ?? (await redis.hget(keys.jobInstance(workspaceId), encoreJobId));
     if (!instanceId) return;
     const instanceJson = await redis.hget(keys.pool(workspaceId), instanceId);
     if (!instanceJson) return;
@@ -389,6 +397,52 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
 
   const upper = status.toUpperCase();
   const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
+
+  // #707: on a SUCCESSFUL (terminal) callback, atomically stamp a TERMINAL value
+  // onto keys.jobStatus AND hdel keys.jobInstance as the FIRST Redis writes on the
+  // success path — before completeTranscode, the retry gate, the pipeline advance,
+  // and the packaging handoff below. This closes a race with ScalerLoop.reconcile():
+  // when Encore completes a job it leaves that instance's live QUEUED/IN_PROGRESS
+  // set, so the next reconcile tick sees tracked activeJobs > actual. Its
+  // drop-detection diff (scaler-loop.ts:505-521) then looks at each job still
+  // mapped to this instance whose keys.jobStatus is still 'running' — guard 2
+  // (scaler-loop.ts:513 `if (st !== 'RUNNING' && st !== 'QUEUED') continue`) is the
+  // only thing that keeps a legitimately-completed job out of droppedJobIds. Until
+  // this write lands, dispatch left that status as 'running' (scaler-loop.ts:699),
+  // so guard 2 was inert and the finished job was raised via onJobsDropped and
+  // settled permanently `failed` with "dropped by Encore: gone from active set with
+  // no completion" (main.ts:1152). Writing 'SUCCESSFUL' here makes guard 2 short-
+  // circuit the completed job on every subsequent reconcile tick. hdel'ing
+  // keys.jobInstance additionally removes the job from the trackedInstances map the
+  // diff iterates (scaler-loop.ts:506-509), so it is no longer even a candidate.
+  // Best-effort: a Valkey hiccup here must never block the completion flow that
+  // follows, so failures are logged and swallowed. The status/instance keys are
+  // scaler-only bookkeeping (a non-scaler deployment has no such keys and this is a
+  // harmless no-op) — the durable terminal state is still owned by completeTranscode.
+  //
+  // We hdel keys.jobInstance here (before completeTranscode), but two later steps
+  // still need the instanceId that mapping held: the packaging pin (scaler-loop
+  // teardown guard, #525 pt.2) and the activeJobs decrement (frees the instance's
+  // slot for reuse). Both previously RE-READ keys.jobInstance downstream; since we
+  // are about to delete it, we resolve the instanceId ONCE here and thread it into
+  // those steps via terminalInstanceId so they no longer depend on the mapping
+  // still existing. Undefined when the job isn't scaler-tracked (non-scaler
+  // deployment, or the mapping was already gone) — the downstream steps fall back
+  // to their own resolution / no-op exactly as before.
+  let terminalInstanceId: string | undefined;
+  if (success) {
+    const decoded = decodeEncoreJobId(externalId);
+    if (decoded) {
+      try {
+        terminalInstanceId =
+          (await deps.redis.hget(keys.jobInstance(decoded.workspaceId), externalId)) ?? undefined;
+        await deps.redis.hset(keys.jobStatus(decoded.workspaceId), externalId, 'SUCCESSFUL');
+        await deps.redis.hdel(keys.jobInstance(decoded.workspaceId), externalId);
+      } catch (err) {
+        deps.logger.warn({ msg: 'encore-callback-poller: failed to stamp terminal jobStatus/hdel jobInstance', externalId, err });
+      }
+    }
+  }
 
   // #381: the retry classification for the attempt being settled terminally.
   // Set from the retry gate's decision on the settle branch below; consumed
@@ -496,17 +550,16 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   // packaging genuinely completes; otherwise self-expires via the pin's TTL.
   let pinnedInstanceId: string | undefined;
   if (result.applied && success) {
-    const decoded = decodeEncoreJobId(externalId);
-    if (decoded) {
-      try {
-        const instanceId = await deps.redis.hget(keys.jobInstance(decoded.workspaceId), externalId);
-        if (instanceId) {
-          await pinInstanceForPackaging(deps.redis, instanceId, externalId);
-          pinnedInstanceId = instanceId;
-        }
-      } catch (err) {
-        deps.logger.warn({ msg: 'encore-callback-poller: failed to pin instance for packaging handoff', externalId, err });
+    // #707: keys.jobInstance was hdel'd above (terminal-stamp), so resolve the
+    // instance from terminalInstanceId captured before that delete rather than
+    // re-reading the now-absent mapping.
+    try {
+      if (terminalInstanceId) {
+        await pinInstanceForPackaging(deps.redis, terminalInstanceId, externalId);
+        pinnedInstanceId = terminalInstanceId;
       }
+    } catch (err) {
+      deps.logger.warn({ msg: 'encore-callback-poller: failed to pin instance for packaging handoff', externalId, err });
     }
   }
   const releasePendingPackagingPin = async (): Promise<void> => {
@@ -519,7 +572,11 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   // Free the slot on the Encore instance that ran this job so the scaler can
   // reuse its capacity. Only on a terminal completion that actually applied.
   if (result.applied) {
-    await decrementActiveJobs(deps.redis, externalId, deps.logger);
+    // #707: on the success path keys.jobInstance was already hdel'd above, so pass
+    // the instanceId captured before that delete. On the settle-failure path
+    // terminalInstanceId is undefined and the mapping still exists, so
+    // decrementActiveJobs resolves it from Redis exactly as before.
+    await decrementActiveJobs(deps.redis, externalId, deps.logger, terminalInstanceId);
     // #381: close out the final (open) encode-attempt on the durable log now
     // that the job has settled terminally. On success the attempt records only
     // endedAt (no failure classification), so the elapsed time of the successful
