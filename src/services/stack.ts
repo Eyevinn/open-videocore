@@ -43,7 +43,14 @@ export const STACK_SERVICES = [
 // string (mirrors the FFPROBE_SERVICE_ID / AUTO_SUBTITLES_SERVICE_ID pattern).
 export const PACKAGER_SERVICE_ID = 'eyevinn-encore-packager' as const;
 
-export type StackService = (typeof STACK_SERVICES)[number];
+// A stack service descriptor: the OSC serviceId plus its human-readable role.
+// This is a structural supertype of the STACK_SERVICES entries (which narrow to
+// literal serviceId/role via `as const`). It is deliberately widened to string
+// so descriptors that are NOT provision-time members can still be modelled —
+// e.g. the teardown-only Encore packager below and the synthetic entries built
+// from the stored config in deprovision.ts (orderStoredServices). Consumers only
+// read serviceId/role as strings, so the widening is safe.
+export type StackService = { serviceId: string; role: string };
 
 // eyevinn-ffmpeg-s3: the ephemeral ffprobe/ffmpeg runner used by the technical
 // metadata extraction pipeline (issue #6). It is NOT part of the long-lived
@@ -89,4 +96,23 @@ export const SCENE_DETECT_SERVICE_ID = 'eyevinn-function-scenes' as const;
 // before the producers they depend on (packager -> queue -> database ->
 // storage). This avoids tearing a producer out from under a still-running
 // consumer.
-export const TEARDOWN_ORDER: readonly StackService[] = [...STACK_SERVICES].reverse();
+//
+// The on-demand Encore packager (PACKAGER_SERVICE_ID) is provisioned LAZILY and
+// so is deliberately absent from STACK_SERVICES (issue #243) — but it MUST still
+// be torn down on deprovision (issue #246), and BEFORE the shared Valkey queue
+// and storage it consumes. It has no corresponding provision-time entry, so we
+// prepend it here as a teardown-only consumer at the head of the order rather
+// than adding it to STACK_SERVICES (which would re-provision it eagerly and make
+// stack-readiness demand a packager instance). Teardown is idempotent — a stack
+// that never ran packaging has no packager instance, and teardownService reports
+// that serviceId as not_found (a success), so this is safe whether or not
+// packaging ever executed. role 'packaging' matches the pre-#243 provision entry.
+const TEARDOWN_ONLY_PACKAGER: StackService = {
+  serviceId: PACKAGER_SERVICE_ID,
+  role: 'packaging'
+};
+
+export const TEARDOWN_ORDER: readonly StackService[] = [
+  TEARDOWN_ONLY_PACKAGER,
+  ...[...STACK_SERVICES].reverse()
+];
