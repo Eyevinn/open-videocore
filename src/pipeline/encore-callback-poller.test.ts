@@ -118,6 +118,15 @@ class FakeRedis {
     this.hash(key).set(field, value);
     return 1;
   }
+  // #707: the success path hdel's keys.jobInstance so a later reconcile tick's
+  // drop diff can't re-observe a completed job. ioredis hdel accepts one or more
+  // fields and returns the count actually removed.
+  async hdel(key: string, ...fields: string[]): Promise<number> {
+    const h = this.hash(key);
+    let removed = 0;
+    for (const f of fields) if (h.delete(f)) removed++;
+    return removed;
+  }
   async zadd(key: string, score: number, member: string): Promise<number> {
     const z = this.zset(key);
     const had = z.has(member);
