@@ -154,8 +154,8 @@ describe('webhook registration CRUD (issue #13)', () => {
 describe('WebhookDispatcher (issue #13)', () => {
   it('delivers only to subscribers of the event type', async () => {
     const repo = new InMemoryWebhookRepository();
-    await repo.create('workspace-a', { url: 'https://hit.example', events: ['asset.ready'] });
-    await repo.create('workspace-a', { url: 'https://miss.example', events: ['asset.failed'] });
+    await repo.create({ url: 'https://hit.example', events: ['asset.ready'] });
+    await repo.create({ url: 'https://miss.example', events: ['asset.failed'] });
 
     const fetchImpl = vi.fn(async () => new Response(null, { status: 200 }));
     const dispatcher = new WebhookDispatcher({
@@ -163,7 +163,7 @@ describe('WebhookDispatcher (issue #13)', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    await dispatcher.dispatch('workspace-a', { type: 'asset.ready', payload: { assetId: 'x' } });
+    await dispatcher.dispatch({ type: 'asset.ready', payload: { assetId: 'x' } });
 
     expect(fetchImpl).toHaveBeenCalledOnce();
     expect(fetchImpl.mock.calls[0][0]).toBe('https://hit.example');
@@ -174,7 +174,7 @@ describe('WebhookDispatcher (issue #13)', () => {
   // cross-workspace delivery boundary to enforce in the dispatcher.
   it.skip('does not deliver to other workspaces', async () => {
     const repo = new InMemoryWebhookRepository();
-    await repo.create('workspace-b', { url: 'https://b.example', events: ['asset.ready'] });
+    await repo.create({ url: 'https://b.example', events: ['asset.ready'] });
 
     const fetchImpl = vi.fn(async () => new Response(null, { status: 200 }));
     const dispatcher = new WebhookDispatcher({
@@ -182,13 +182,13 @@ describe('WebhookDispatcher (issue #13)', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    await dispatcher.dispatch('workspace-a', { type: 'asset.ready', payload: {} });
+    await dispatcher.dispatch({ type: 'asset.ready', payload: {} });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('posts the { event, payload, timestamp } body', async () => {
     const repo = new InMemoryWebhookRepository();
-    await repo.create('workspace-a', { url: 'https://hit.example', events: ['transcode.complete'] });
+    await repo.create({ url: 'https://hit.example', events: ['transcode.complete'] });
 
     let captured: { url: string; init: RequestInit } | undefined;
     const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
@@ -200,7 +200,7 @@ describe('WebhookDispatcher (issue #13)', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    await dispatcher.dispatch('workspace-a', {
+    await dispatcher.dispatch({
       type: 'transcode.complete',
       payload: { assetId: 'asset-1' }
     });
@@ -213,7 +213,7 @@ describe('WebhookDispatcher (issue #13)', () => {
 
   it('signs the body with HMAC-SHA256 when a secret is set', async () => {
     const repo = new InMemoryWebhookRepository();
-    await repo.create('workspace-a', {
+    await repo.create({
       url: 'https://hit.example',
       events: ['asset.ready'],
       secret: 'topsecret'
@@ -231,7 +231,7 @@ describe('WebhookDispatcher (issue #13)', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    await dispatcher.dispatch('workspace-a', { type: 'asset.ready', payload: {} });
+    await dispatcher.dispatch({ type: 'asset.ready', payload: {} });
 
     const expected = `sha256=${createHmac('sha256', 'topsecret').update(body).digest('hex')}`;
     expect(headers['x-webhook-signature']).toBe(expected);
@@ -239,7 +239,7 @@ describe('WebhookDispatcher (issue #13)', () => {
 
   it('omits the signature header when no secret is set', async () => {
     const repo = new InMemoryWebhookRepository();
-    await repo.create('workspace-a', { url: 'https://hit.example', events: ['asset.ready'] });
+    await repo.create({ url: 'https://hit.example', events: ['asset.ready'] });
 
     let headers: Record<string, string> = {};
     const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
@@ -251,13 +251,13 @@ describe('WebhookDispatcher (issue #13)', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    await dispatcher.dispatch('workspace-a', { type: 'asset.ready', payload: {} });
+    await dispatcher.dispatch({ type: 'asset.ready', payload: {} });
     expect(headers['x-webhook-signature']).toBeUndefined();
   });
 
   it('never throws when a delivery fails (best-effort)', async () => {
     const repo = new InMemoryWebhookRepository();
-    await repo.create('workspace-a', { url: 'https://down.example', events: ['asset.ready'] });
+    await repo.create({ url: 'https://down.example', events: ['asset.ready'] });
 
     const onDelivery = vi.fn();
     const dispatcher = new WebhookDispatcher({
@@ -269,7 +269,7 @@ describe('WebhookDispatcher (issue #13)', () => {
     });
 
     await expect(
-      dispatcher.dispatch('workspace-a', { type: 'asset.ready', payload: {} })
+      dispatcher.dispatch({ type: 'asset.ready', payload: {} })
     ).resolves.toBeUndefined();
     expect(onDelivery).toHaveBeenCalledWith(
       expect.objectContaining({ ok: false, url: 'https://down.example' })
@@ -278,7 +278,7 @@ describe('WebhookDispatcher (issue #13)', () => {
 
   it('treats a non-2xx response as a failure but does not throw', async () => {
     const repo = new InMemoryWebhookRepository();
-    await repo.create('workspace-a', { url: 'https://err.example', events: ['asset.ready'] });
+    await repo.create({ url: 'https://err.example', events: ['asset.ready'] });
 
     const onDelivery = vi.fn();
     const dispatcher = new WebhookDispatcher({
@@ -287,7 +287,7 @@ describe('WebhookDispatcher (issue #13)', () => {
       onDelivery
     });
 
-    await dispatcher.dispatch('workspace-a', { type: 'asset.ready', payload: {} });
+    await dispatcher.dispatch({ type: 'asset.ready', payload: {} });
     expect(onDelivery).toHaveBeenCalledWith(expect.objectContaining({ ok: false }));
   });
 });
@@ -327,7 +327,7 @@ describe('internal callbacks fire webhook events (issue #13)', () => {
   it('fires package.complete on a successful packager callback', async () => {
     const { app, assets, webhookRepo, delivered } = await buildCallbackApp();
     const asset = await assets.create('workspace-a', { name: 'clip' });
-    await webhookRepo.create('workspace-a', {
+    await webhookRepo.create({
       url: 'https://hook.example',
       events: ['package.complete']
     });
@@ -346,7 +346,7 @@ describe('internal callbacks fire webhook events (issue #13)', () => {
   it('fires package.failed on a failed packager callback', async () => {
     const { app, assets, webhookRepo, delivered } = await buildCallbackApp();
     const asset = await assets.create('workspace-a', { name: 'clip' });
-    await webhookRepo.create('workspace-a', {
+    await webhookRepo.create({
       url: 'https://hook.example',
       events: ['package.failed']
     });

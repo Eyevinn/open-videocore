@@ -7,10 +7,11 @@
 // (existence is not leaked) and is never read or deleted cross-workspace.
 
 import type { StoredDoc, StackCouch } from './couchdb.js';
-import type {
-  CreateWebhookInput,
-  WebhookRegistration,
-  WebhookRepository
+import {
+  normalizeWebhookEvents,
+  type CreateWebhookInput,
+  type WebhookRegistration,
+  type WebhookRepository
 } from './webhook-repo.js';
 
 const RESOURCE_TYPE = 'webhook';
@@ -27,7 +28,7 @@ export class CouchWebhookRepository implements WebhookRepository {
     const registration: WebhookRegistration = {
       id: localId,
       url: input.url,
-      events: [...input.events],
+      events: normalizeWebhookEvents(input.events),
       secret: input.secret,
       createdAt: now
     };

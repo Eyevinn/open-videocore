@@ -59,3 +59,25 @@ export interface WebhookRepository {
   list(): Promise<WebhookRegistration[]>;
   delete(id: string): Promise<void>;
 }
+
+// Thrown when a repository is handed a CreateWebhookInput whose `events` is not
+// an array. The HTTP boundary already enforces `events: z.array(...).min(1)`
+// (routes/webhooks.ts createBodySchema), so this only fires for a programmatic
+// mis-call — surfacing a clear contract violation instead of a cryptic
+// `TypeError: input.events is not iterable` from a spread on a non-iterable.
+export class InvalidWebhookEventsError extends Error {
+  constructor() {
+    super('webhook `events` must be an array of event-type strings');
+    this.name = 'InvalidWebhookEventsError';
+  }
+}
+
+// Single source of truth for how both repository tiers coerce the subscribed
+// event list, so the in-memory and CouchDB paths handle the identical input
+// shape (acceptance criterion, issue #714). Returns a defensive copy.
+export function normalizeWebhookEvents(events: CreateWebhookInput['events']): string[] {
+  if (!Array.isArray(events)) {
+    throw new InvalidWebhookEventsError();
+  }
+  return [...events];
+}
