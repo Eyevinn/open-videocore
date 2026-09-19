@@ -28,6 +28,19 @@ export type EncoreS3Config = {
   region?: string;      // S3 region string — MinIO ignores it but Encore requires a value
 };
 
+// A job reconcile() observed as silently dropped from an Encore instance's live
+// QUEUED/IN_PROGRESS set with no completion callback (issue #449/#704).
+//   - encoreJobId: our externalId (the id onDispatched/onJobsDropped resolve by).
+//   - reason:      Encore's OWN terminal failure text when reconcile() could
+//                  recover it from the job's FAILED encoreJob document (`message`),
+//                  else undefined — meaning Encore reported no cause (the genuine
+//                  gone-from-active-set case). main.ts surfaces `reason` when set
+//                  and reserves the generic wording only for the undefined case.
+export type DroppedJob = {
+  encoreJobId: string;
+  reason?: string;
+};
+
 export type EncoreScalerConfig = {
   workspaceId: string;
   maxInstances: number;
@@ -100,10 +113,16 @@ export type EncoreScalerConfig = {
   // without ever producing a completion callback (issue #449, ADR-016 Direction
   // 2 — reconcile-driven terminal settle). The scaler owns no repositories, so
   // it only raises the signal; main.ts wires this up to drive each dropped job
-  // to a terminal `failed` state via the shared idempotent settle path. The ids
-  // are our externalIds (encoreJobId). Best-effort: failures are swallowed so a
-  // repo/settle hiccup never breaks the tick's scaling/dispatch work.
-  onJobsDropped?: (encoreJobIds: string[]) => Promise<void>;
+  // to a terminal `failed` state via the shared idempotent settle path. Each
+  // entry carries our externalId (encoreJobId) and, when reconcile() could
+  // recover Encore's OWN terminal failure text for that job (its FAILED
+  // encoreJob document's `message` field — the same field the callback poller
+  // surfaces, src/routes/internal.ts encoreCallbackSchema:95), the `reason`
+  // string (issue #704). `reason` is left undefined for the genuine
+  // gone-from-active-set case (Encore reported no cause), so main.ts can reserve
+  // the generic wording only for that case. Best-effort: failures are swallowed
+  // so a repo/settle hiccup never breaks the tick's scaling/dispatch work.
+  onJobsDropped?: (drops: DroppedJob[]) => Promise<void>;
   // Invoked when a job is classified 'interrupted_by_scaledown' at the drain/
   // teardown boundary (#514) and re-enqueued for auto-retry (#515). The scaler
   // owns no repositories, so main.ts wires this up to annotate the caller-facing

@@ -1133,11 +1133,23 @@ function activateScaler(redisUrl: string): void {
         interruptionReason: reason
       });
     },
-    onJobsDropped: async (encoreJobIds: string[]) => {
-      for (const encoreJobId of encoreJobIds) {
+    onJobsDropped: async (drops) => {
+      for (const { encoreJobId, reason } of drops) {
         try {
           const found = await jobRepository.findByEncoreJobId(encoreJobId);
           if (!found) continue;
+          // #704: when reconcile() recovered Encore's OWN terminal failure text
+          // (the FAILED encoreJob document's `message`, e.g. "Job execution
+          // failed: Could not find location for profile program! Profiles: {}"),
+          // surface THAT as the caller-facing failure so a user can tell a
+          // configuration problem from a platform one. The generic
+          // gone-from-active-set wording is reserved for the genuine
+          // no-reported-cause case (Encore stopped reporting the job without
+          // ever telling us why) — `reason` undefined.
+          const failureText =
+            reason && reason.trim().length > 0
+              ? `dropped by Encore: ${reason}`
+              : 'dropped by Encore: gone from active set with no completion';
           await settleFailedTranscode(
             {
               jobs: jobRepository,
@@ -1149,7 +1161,7 @@ function activateScaler(redisUrl: string): void {
               }
             },
             found.job,
-            'dropped by Encore: gone from active set with no completion'
+            failureText
           );
         } catch (err) {
           app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');

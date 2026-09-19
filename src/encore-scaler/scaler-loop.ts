@@ -20,6 +20,7 @@
 import {
   JOBS_PER_INSTANCE,
   keys,
+  type DroppedJob,
   type EncoreInstanceRecord,
   type EncoreScalerConfig,
   type QueuedJob
@@ -350,6 +351,61 @@ export class EncoreScalerLoop {
     }
   }
 
+  // #704: recover Encore's OWN failure text for jobs that just dropped from the
+  // instance's active set. A dropped job has almost always moved to Encore's
+  // terminal FAILED status (that is why it is no longer QUEUED/IN_PROGRESS) with
+  // no completion callback ever landing; the real cause is on the FAILED
+  // encoreJob document's `message` field. We query the SAME per-instance
+  // findByStatus endpoint fetchRealActiveState uses (verified: sweepTerminalJobs
+  // reconciles status=FAILED the same way, scaler-loop reads externalId per
+  // document, and the `message` field is Encore's error text —
+  // src/routes/internal.ts:73-74, encoreCallbackSchema:95). Returns a map of
+  // externalId -> message for the requested drops that Encore reports FAILED with
+  // a non-empty message. Purely best-effort and additive: any fetch/parse error
+  // returns whatever was recovered so far (possibly nothing), and a dropped job
+  // with no recovered message keeps the generic gone-from-active-set wording in
+  // main.ts — reserving that string for the genuine no-reported-cause case.
+  //
+  // CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+  //   - findByStatus?status=FAILED HATEOAS page + externalId per encoreJob —
+  //     sweepTerminalJobs (encore-callback-poller.ts:791-802) + fetchRealActiveState
+  //     (this file) query and read the identical shape.
+  //   - `message` is Encore's FAILED error text — encoreCallbackSchema.message
+  //     (src/routes/internal.ts:95) and the SMOKE-TEST-confirmed field doc
+  //     (src/routes/internal.ts:73-74).
+  private async fetchDroppedFailureReasons(
+    record: EncoreInstanceRecord,
+    droppedExternalIds: string[]
+  ): Promise<Map<string, string>> {
+    const reasons = new Map<string, string>();
+    if (droppedExternalIds.length === 0) return reasons;
+    const wanted = new Set(droppedExternalIds);
+    try {
+      const token = await this.config.getToken();
+      const base = record.url.replace(/\/$/, '');
+      const res = await fetch(
+        `${base}/encoreJobs/search/findByStatus?status=FAILED&page=0&size=100`,
+        { headers: { authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) return reasons;
+      type EncoreFailedPage = {
+        _embedded?: {
+          encoreJobs?: Array<{ externalId?: string; message?: string }>;
+        };
+      };
+      const body = (await res.json().catch(() => ({}))) as EncoreFailedPage;
+      for (const j of body._embedded?.encoreJobs ?? []) {
+        if (!j.externalId || !wanted.has(j.externalId)) continue;
+        const msg = typeof j.message === 'string' ? j.message.trim() : '';
+        if (msg) reasons.set(j.externalId, msg);
+      }
+    } catch {
+      // Best-effort: any error means we surface the generic wording for these
+      // drops instead — never throw into the reconcile tick.
+    }
+    return reasons;
+  }
+
   // #514: re-enqueue jobs lost to a scale-down of `instanceId`.
   //
   // Called at the drain/teardown boundary (issue #513 defines when a job is "lost
@@ -456,13 +512,15 @@ export class EncoreScalerLoop {
     const entries = Object.entries(raw);
     if (entries.length === 0) return; // empty pool — nothing to reconcile
 
-    // Accumulate the externalIds (our encoreJobId) of jobs this reconcile
-    // observes as silently dropped — tracked as running against an instance but
-    // no longer present in that instance's live QUEUED/IN_PROGRESS set with no
-    // completion callback (issue #449, ADR-016 Direction 2). The scaler owns no
+    // Accumulate the jobs this reconcile observes as silently dropped — tracked
+    // as running against an instance but no longer present in that instance's
+    // live QUEUED/IN_PROGRESS set with no completion callback (issue #449, ADR-016
+    // Direction 2). Each entry also carries Encore's OWN terminal failure text
+    // when we can recover it (issue #704), so main.ts surfaces the real reason
+    // instead of the generic gone-from-active-set wording. The scaler owns no
     // repositories, so it only raises the signal via onJobsDropped; the terminal
     // write is owned by the reconciler/main.ts repo layer.
-    const droppedJobIds: string[] = [];
+    const droppedJobs: DroppedJob[] = [];
 
     for (const [instanceId, instanceJson] of entries) {
       try {
@@ -505,6 +563,9 @@ export class EncoreScalerLoop {
           if (actualCount < record.activeJobs) {
             const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
             const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
+            // externalIds dropped from THIS instance, so we can recover each
+            // one's Encore failure text from THIS instance's FAILED set below.
+            const droppedForInstance: string[] = [];
             for (const [jobId, mappedInstanceId] of Object.entries(trackedInstances)) {
               if (mappedInstanceId !== instanceId) continue;
               // Only jobs still locally marked running are candidates; a job the
@@ -512,12 +573,33 @@ export class EncoreScalerLoop {
               const st = (trackedStatuses[jobId] ?? '').toUpperCase();
               if (st !== 'RUNNING' && st !== 'QUEUED') continue;
               if (activeExternalIds.has(jobId)) continue; // still live on Encore
-              droppedJobIds.push(jobId);
+              droppedForInstance.push(jobId);
               // Overwrite the stale Valkey status (written `running` at dispatch,
               // scaler-loop.ts:291) so a subsequent makeScalingEncoreClient
               // getJobStatus (index.ts:41) agrees with the durable job record and
               // does not re-report `running` (ADR-016 Point 3).
               await redis.hset(keys.jobStatus(workspaceId), jobId, 'FAILED');
+            }
+
+            // #704: a job "vanishing" from the active set is often a genuine
+            // Encore FAILED — Encore moved it to a terminal status (so it left
+            // QUEUED/IN_PROGRESS) but no completion callback ever landed. In that
+            // case Encore's OWN error text lives on the FAILED encoreJob
+            // document's `message` field (the same field the callback poller and
+            // internal route surface — encoreCallbackSchema:95, internal.ts:73-74).
+            // Recover it here so the caller-facing failure carries the real cause
+            // (e.g. "Job execution failed: Could not find location for profile
+            // program! Profiles: {}") rather than a generic wrapper. Best-effort:
+            // if the FAILED document can't be fetched or reports no message, the
+            // job still surfaces as dropped, and main.ts applies the generic
+            // gone-from-active-set wording — reserved for exactly that
+            // no-reported-cause case.
+            const reasons = await this.fetchDroppedFailureReasons(
+              record,
+              droppedForInstance
+            );
+            for (const jobId of droppedForInstance) {
+              droppedJobs.push({ encoreJobId: jobId, reason: reasons.get(jobId) });
             }
           }
 
@@ -546,9 +628,9 @@ export class EncoreScalerLoop {
     // terminal `failed` state through the shared idempotent settle path.
     // Best-effort: a hook failure must never break the tick, exactly as the
     // other repo-bridge hooks are treated (scaler-loop.ts:341-347).
-    if (droppedJobIds.length > 0 && this.config.onJobsDropped) {
+    if (droppedJobs.length > 0 && this.config.onJobsDropped) {
       try {
-        await this.config.onJobsDropped(droppedJobIds);
+        await this.config.onJobsDropped(droppedJobs);
       } catch (err) {
         console.error(
           '[encore-scaler] onJobsDropped error (workspace=%s):',
