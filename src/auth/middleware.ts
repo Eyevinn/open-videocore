@@ -60,3 +60,28 @@ declare module 'fastify' {
     authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
 }
+
+// Plugin-scoped 401 presence gate for protected routers (issue #711). Returns a
+// preHandler that a workspace-scoped router attaches as its FIRST hook so an
+// anonymous request is rejected 401 before any role/action decision runs.
+//
+// The gate resolves `app.authenticate` LAZILY at request time rather than
+// capturing it at registration time, and no-ops when the `authenticate`
+// decoration is absent. This keeps each router self-sufficient: the real app
+// wires registerAuth (src/main.ts) so the gate is active, while unit tests that
+// build a router in isolation to exercise ONLY the role gate — and never wire
+// registerAuth nor send a bearer token — are unaffected (they neither expect nor
+// receive a 401). The gate never reintroduces per-request workspace scoping: it
+// only calls the pure presence gate requireAuth via app.authenticate.
+export function authGate(app: FastifyInstance) {
+  return async function presenceGate(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    if (!app.hasDecorator('authenticate')) {
+      // registerAuth was not called on this instance; nothing to enforce.
+      return;
+    }
+    await app.authenticate(request, reply);
+  };
+}

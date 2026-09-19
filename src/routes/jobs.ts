@@ -14,6 +14,7 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import { keys } from '../encore-scaler/types.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
+import { authGate } from '../auth/middleware.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
@@ -119,6 +120,11 @@ type JobsRouterOptions = {
 export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository ?? new InMemoryJobRepository();
+
+  // 401 presence gate (issue #711): reject anonymous requests to this
+  // workspace-scoped router. Plugin-scoped so it does not affect public routers.
+  // See src/routes/assets.ts for the full rationale.
+  app.addHook('preHandler', authGate(app));
 
   app.get(
     '/',

@@ -25,6 +25,7 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
+import { authGate } from '../auth/middleware.js';
 import {
   CollectionDeleteProtectedError,
   CollectionInUseError,
@@ -238,6 +239,11 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
   // membership never widens or narrows access. Denials are a fail-closed 403 with
   // the stable AUTHZ_FORBIDDEN_ERROR reason code, distinct from the 401 presence
   // gate (decision 5).
+  //
+  // 401 presence gate (issue #711) registered FIRST so anonymous requests are
+  // rejected 401 before any role/action decision. See src/routes/assets.ts for
+  // the full rationale; Fastify runs preHandler hooks in registration order.
+  app.addHook('preHandler', authGate(app));
   app.addHook('preHandler', resourceAuthorizationPreHandler('collection'));
 
   app.setErrorHandler((err, _request, reply) => {
