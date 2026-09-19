@@ -21,7 +21,7 @@ import { EncoreScalerLoop } from './scaler-loop.js';
 import { makeScalingEncoreClient } from './index.js';
 import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance-pool.js';
 import { keys } from './types.js';
-import type { EncoreScalerConfig } from './types.js';
+import type { DroppedJob, EncoreScalerConfig } from './types.js';
 
 export type WorkspaceEncoreScalerConfig = {
   redis: Redis;
@@ -89,8 +89,9 @@ export type WorkspaceEncoreScalerConfig = {
   // detects tracked jobs silently dropped from an Encore instance's active set
   // with no completion callback (issue #449). The scaler owns no repos, so
   // main.ts drives each id to a terminal `failed` state via the shared settle
-  // path.
-  onJobsDropped?: (encoreJobIds: string[]) => Promise<void>;
+  // path. Each drop carries Encore's own failure text when reconcile() could
+  // recover it (issue #704) — see DroppedJob.
+  onJobsDropped?: (drops: DroppedJob[]) => Promise<void>;
   // Forwarded to every per-workspace scaler loop: invoked when a job is
   // classified 'interrupted_by_scaledown' at the drain boundary (#514) and
   // re-enqueued for auto-retry (#515). The scaler owns no repos, so main.ts
