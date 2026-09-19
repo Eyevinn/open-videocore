@@ -6,10 +6,11 @@
 // are confined to the caller's workspace.
 
 // ADR-003/#59: workspace guard removed (structural OSC isolation).
-import type {
-  CreateWebhookInput,
-  WebhookRegistration,
-  WebhookRepository
+import {
+  normalizeWebhookEvents,
+  type CreateWebhookInput,
+  type WebhookRegistration,
+  type WebhookRepository
 } from './webhook-repo.js';
 
 export class InMemoryWebhookRepository implements WebhookRepository {
@@ -22,7 +23,7 @@ export class InMemoryWebhookRepository implements WebhookRepository {
     const registration: WebhookRegistration = {
       id: localId,
       url: input.url,
-      events: [...input.events],
+      events: normalizeWebhookEvents(input.events),
       secret: input.secret,
       createdAt: now
     };
