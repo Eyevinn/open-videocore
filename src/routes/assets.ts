@@ -66,6 +66,7 @@ import { WorkspaceAccessError } from '../data/guard.js';
 // the canonical CouchDB store. Advisory is the default; enforced turns on 409s.
 import { externalIdUniquenessEnforced } from '../data/external-id-uniqueness.js';
 import { resourceAuthorizationPreHandler } from '../auth/authorize.js';
+import { authGate } from '../auth/middleware.js';
 import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
 import { emitAudit, originActor, type AuditEmitter } from '../data/audit-emit.js';
@@ -1495,6 +1496,18 @@ function objectKeyFromManifest(manifestUrl: string, bucket: string): string {
 
 export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
+
+  // 401 presence gate (ADR-018 decision 5, issue #711). Registered plugin-scoped
+  // and BEFORE the authorisation hook so it runs first: an anonymous request is
+  // rejected 401 (missing bearer token) before any role/action decision. This is
+  // the `authenticate` preHandler decorated by registerAuth (src/auth/middleware.ts),
+  // which resolves request.authenticated via the pure presence gate requireAuth
+  // (src/auth/workspace.ts) — it admits ANY bearer token (the OSC auth wall
+  // authenticated it upstream) and does NOT resolve a per-request workspace, so it
+  // does not reintroduce the scoping b9da6f3/#64 removed. Distinct from the 403
+  // role gate below (middleware.ts:44 vs authorize.ts:99). Fastify runs preHandler
+  // hooks in registration order, so this MUST precede the authorisation hook.
+  app.addHook('preHandler', authGate(app));
 
   // Router-layer method→action authorisation gate (ADR-018 decision 2, seam 1;
   // issue #554). Registered plugin-scoped so it runs on EVERY asset route
