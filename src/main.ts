@@ -755,6 +755,14 @@ const encoreIdleTimeoutMs = parseInt(process.env['ENCORE_IDLE_TIMEOUT_MS'] || St
 // first job. On timeout the instance is quarantined from job assignment rather
 // than dispatched to. Defaults to 60s; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
 const encoreCallbackTrustTimeoutMs = parseInt(process.env['ENCORE_CALLBACK_TRUST_TIMEOUT_MS'] || String(60 * 1000), 10);
+// Grace window (issue #708) for the reconcile loop's dropped-job diff. reconcile
+// can diff Encore's active set AFTER Encore drops a finished job but BEFORE the
+// callback poller has decremented the tracked activeJobs count (observed ~4.4s
+// in production). The poller stamps keys.jobCompletionSeen when it accepts a
+// completion; reconcile skips any job seen completing within this window rather
+// than re-raising it as silently dropped. Defaults to 10s; override via
+// ENCORE_RECONCILE_GRACE_MS.
+const encoreReconcileGraceMs = parseInt(process.env['ENCORE_RECONCILE_GRACE_MS'] || String(10 * 1000), 10);
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -988,6 +996,10 @@ function activateScaler(redisUrl: string): void {
     // Gate first-job dispatch on confirmed outbound callback-listener TLS trust
     // (issue #463): bounded wait before a freshly spawned instance is eligible.
     callbackTrustTimeoutMs: encoreCallbackTrustTimeoutMs,
+    // Grace window for reconcile's dropped-job diff (issue #708): skip jobs the
+    // callback poller recorded completing (keys.jobCompletionSeen) within this
+    // window rather than re-raising them as silently dropped.
+    reconcileGraceMs: encoreReconcileGraceMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
@@ -1364,6 +1376,11 @@ function activateScaler(redisUrl: string): void {
     sweepMaxInstances: process.env['ENCORE_SWEEP_MAX_INSTANCES']
       ? parseInt(process.env['ENCORE_SWEEP_MAX_INSTANCES'], 10)
       : undefined,
+    // #708: grace window the poller uses for the keys.jobCompletionSeen PX TTL so
+    // reconcile's dropped-job diff can skip a just-completed job. Uses the SAME
+    // value forwarded to the scaler loop (ENCORE_RECONCILE_GRACE_MS) so the write
+    // side (poller) and read side (reconcile) agree on the window.
+    reconcileGraceMs: encoreReconcileGraceMs,
     // On-demand packager provisioning for the automatic transcode->package handoff
     // (#496). The SAME closure the assets router uses for the manual package-start
     // path — captured directly (not read off assetRouterOptions, which

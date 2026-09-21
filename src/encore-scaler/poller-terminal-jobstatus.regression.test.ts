@@ -276,7 +276,7 @@ describe('encore-callback-poller terminal jobStatus write (#707)', () => {
       oscContext: {} as EncoreScalerConfig['oscContext'],
       redis: redis as unknown as EncoreScalerConfig['redis'],
       getToken: async () => 'test-token',
-      onJobsDropped: async (ids) => { droppedIds.push(...ids); }
+      onJobsDropped: async (ids) => { droppedIds.push(...ids.map((d) => d.encoreJobId)); }
     };
 
     await new EncoreScalerLoop(config).reconcile();

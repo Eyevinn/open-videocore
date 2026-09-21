@@ -39,6 +39,13 @@ import { hasPendingPackaging } from './packaging-pin.js';
 // (issue #463) when EncoreScalerConfig.callbackTrustTimeoutMs is unset.
 export const DEFAULT_CALLBACK_TRUST_TIMEOUT_MS = 60_000;
 
+// #708: default grace window (ms) applied by reconcile()'s dropped-job diff when
+// EncoreScalerConfig.reconcileGraceMs is unset. A job whose completion the
+// callback poller recorded (keys.jobCompletionSeen) within this window is not
+// re-raised as silently dropped, closing the ~4.4s race between Encore dropping
+// the finished job from its active set and the poller decrementing activeJobs.
+export const DEFAULT_RECONCILE_GRACE_MS = 10_000;
+
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
@@ -561,6 +568,17 @@ export class EncoreScalerLoop {
           // Encore still reports active. Anything tracked-running for this
           // instance that Encore no longer lists is dropped.
           if (actualCount < record.activeJobs) {
+            // #708: grace window for jobs the callback poller just saw complete.
+            // reconcile can diff Encore's active set AFTER Encore drops a finished
+            // job but BEFORE the poller has decremented record.activeJobs
+            // (observed ~4.4s in production). Guard 1 above fires on count alone,
+            // so without this a legitimately-completed job would be re-raised as
+            // silently dropped in that window. Any job whose keys.jobCompletionSeen
+            // timestamp is within reconcileGraceMs is skipped here — the poller is
+            // mid-settle and owns the terminal write.
+            const graceMs =
+              this.config.reconcileGraceMs ?? DEFAULT_RECONCILE_GRACE_MS;
+            const now = Date.now();
             const trackedInstances = await redis.hgetall(keys.jobInstance(workspaceId));
             const trackedStatuses = await redis.hgetall(keys.jobStatus(workspaceId));
             // externalIds dropped from THIS instance, so we can recover each
@@ -573,6 +591,23 @@ export class EncoreScalerLoop {
               const st = (trackedStatuses[jobId] ?? '').toUpperCase();
               if (st !== 'RUNNING' && st !== 'QUEUED') continue;
               if (activeExternalIds.has(jobId)) continue; // still live on Encore
+              // #708: skip a job the poller recorded completing within the grace
+              // window — it is settling terminally, not silently dropped. Fail
+              // OPEN: a read error on this one key must never SUPPRESS a genuine
+              // drop, so a failed/absent read falls through to the drop path
+              // exactly as pre-#708 behaviour did.
+              let seenRaw: string | null = null;
+              try {
+                seenRaw = await redis.get(keys.jobCompletionSeen(jobId));
+              } catch {
+                seenRaw = null;
+              }
+              if (seenRaw) {
+                const seenAt = Number(seenRaw);
+                if (Number.isFinite(seenAt) && now - seenAt <= graceMs) {
+                  continue;
+                }
+              }
               droppedForInstance.push(jobId);
               // Overwrite the stale Valkey status (written `running` at dispatch,
               // scaler-loop.ts:291) so a subsequent makeScalingEncoreClient

@@ -39,6 +39,11 @@ export type WorkspaceEncoreScalerConfig = {
   // outbound callback-listener TLS-trust probe that gates first-job dispatch
   // (issue #463). Undefined uses the loop's built-in default.
   callbackTrustTimeoutMs?: number;
+  // Grace window (ms) forwarded to every per-workspace scaler loop for the
+  // reconcile dropped-job diff (issue #708): a job the callback poller recorded
+  // completing within this window is not re-raised as silently dropped.
+  // Undefined uses the loop's built-in default (DEFAULT_RECONCILE_GRACE_MS).
+  reconcileGraceMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   // Optional per-stack Valkey resolver (issue #615). When supplied, called once
@@ -204,6 +209,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       maxQueuedJobs: this.config.maxQueuedJobs,
       idleTimeoutMs: this.config.idleTimeoutMs,
       callbackTrustTimeoutMs: this.config.callbackTrustTimeoutMs,
+      reconcileGraceMs: this.config.reconcileGraceMs,
       oscContext: this.config.oscContext,
       redis,
       redisUrl,
@@ -381,6 +387,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
         maxInstances: this.config.maxInstances,
         minInstances: this.config.minInstances,
         idleTimeoutMs: this.config.idleTimeoutMs,
+        reconcileGraceMs: this.config.reconcileGraceMs,
         oscContext: this.config.oscContext,
         redis,
         redisUrl,

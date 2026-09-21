@@ -36,6 +36,7 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState } from '../encore-scaler/retry-store.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
@@ -105,6 +106,15 @@ type PollerDeps = {
   sweepIntervalMs?: number;
   sweepPageSize?: number;
   sweepMaxInstances?: number;
+  // #708: grace window (ms) for reconcile's dropped-job diff. The poller stamps
+  // keys.jobCompletionSeen the instant it accepts a completion and gives that key
+  // a PX TTL derived from this value, so a reconcile tick that races the
+  // activeJobs decrement (observed ~4.4s in production) sees the completion and
+  // does NOT re-raise the job as silently dropped. Threaded the same way
+  // sweepIntervalMs is (raw value in, default applied at use); main.ts reads it
+  // from ENCORE_RECONCILE_GRACE_MS. Unset => DEFAULT_RECONCILE_GRACE_MS so
+  // behaviour is unchanged when the env var is absent.
+  reconcileGraceMs?: number;
   // On-demand packager provisioning (epic #226, issue #244; #496). The SAME
   // closure the assets router receives as `ensurePackaging` (src/routes/assets.ts
   // opts, called at assets.ts:1484 on the manual package-start path). Threaded in
@@ -572,11 +582,36 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   // Free the slot on the Encore instance that ran this job so the scaler can
   // reuse its capacity. Only on a terminal completion that actually applied.
   if (result.applied) {
+    // #708: stamp keys.jobCompletionSeen (Unix ms) BEFORE decrementActiveJobs.
+    // decrementActiveJobs is the exact read-modify-write reconcile races against:
+    // reconcile may diff Encore's active set (which no longer lists this finished
+    // job) before this decrement lands (observed ~4.4s in production) and would
+    // otherwise re-raise the job as silently dropped. Writing the timestamp first
+    // guarantees reconcile's grace-window check sees the completion for the whole
+    // race window. PX TTL derives from the grace window (with a small margin) so
+    // the key self-expires just after the window even if the delete below is
+    // skipped (e.g. instance already gone). Best-effort: a write hiccup must not
+    // block completion.
+    const graceMs = deps.reconcileGraceMs ?? DEFAULT_RECONCILE_GRACE_MS;
+    try {
+      await deps.redis.set(
+        keys.jobCompletionSeen(externalId),
+        String(Date.now()),
+        'PX',
+        graceMs + 2_000
+      );
+    } catch (err) {
+      deps.logger.warn({ msg: 'encore-callback-poller: failed to record job completion timestamp', externalId, err });
+    }
     // #707: on the success path keys.jobInstance was already hdel'd above, so pass
     // the instanceId captured before that delete. On the settle-failure path
     // terminalInstanceId is undefined and the mapping still exists, so
     // decrementActiveJobs resolves it from Redis exactly as before.
     await decrementActiveJobs(deps.redis, externalId, deps.logger, terminalInstanceId);
+    // #708: the decrement has landed, so reconcile now sees the corrected
+    // activeJobs count and no longer needs the grace-window marker. Delete it
+    // eagerly (the PX TTL is only the safety net for when this delete is skipped).
+    await deps.redis.del(keys.jobCompletionSeen(externalId)).catch(() => {});
     // #381: close out the final (open) encode-attempt on the durable log now
     // that the job has settled terminally. On success the attempt records only
     // endedAt (no failure classification), so the elapsed time of the successful
