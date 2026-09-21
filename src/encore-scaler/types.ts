@@ -64,6 +64,14 @@ export type EncoreScalerConfig = {
   // job. On timeout the instance is quarantined from job assignment rather than
   // dispatched to. Default 60_000; override via ENCORE_CALLBACK_TRUST_TIMEOUT_MS.
   callbackTrustTimeoutMs?: number;
+  // #708: grace window (ms) during which reconcile() will NOT re-raise a job as
+  // silently dropped if the callback poller recorded its completion very
+  // recently (keys.jobCompletionSeen). Closes the narrow race where reconcile
+  // diffs the active set AFTER Encore drops the finished job but BEFORE the
+  // poller has decremented record.activeJobs (observed ~4.4s in production).
+  // Default DEFAULT_RECONCILE_GRACE_MS (10_000); override via
+  // ENCORE_RECONCILE_GRACE_MS.
+  reconcileGraceMs?: number;
   // Redis connection string, passed to each paired callback listener so it can
   // put completion messages on the packaging queue.
   redisUrl: string;
@@ -222,6 +230,16 @@ export const keys = {
   // Starts at 1 on first dispatch and increments on each transport-class
   // re-dispatch. Bounded by MAX_ENCODE_ATTEMPTS. 24h TTL; cleared on settle.
   jobAttempts: (encoreJobId: string) => `encore:job-attempts:${encoreJobId}`,
+  // #708: short-lived timestamp (Unix ms, stored as a string) written by the
+  // callback poller the moment it accepts a job's completion, keyed by our
+  // externalId (encoreJobId, globally unique like jobUuid). reconcile() reads it
+  // to close the ~4.4s race in which it may diff the active-job set AFTER Encore
+  // has dropped the finished job but BEFORE the poller has decremented
+  // record.activeJobs — a job seen completing within the grace window
+  // (reconcileGraceMs) is NOT re-raised as silently dropped. Given a PX TTL just
+  // over the grace window so the key self-expires; the poller also deletes it on
+  // the same completion path once the decrement is durably applied.
+  jobCompletionSeen: (encoreJobId: string) => `encore:job-completion-seen:${encoreJobId}`,
   // #525 pt.2: set of encoreJobIds (externalIds) whose packaging has been
   // handed off but not yet confirmed complete, keyed per Encore instance. The
   // scaler's teardown eligibility check treats a non-empty set here as real
