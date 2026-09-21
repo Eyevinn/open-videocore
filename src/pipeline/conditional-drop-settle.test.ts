@@ -216,6 +216,21 @@ describe('#709 (c) poller resumes a drop-failed pipeline on a corrective SUCCESS
     async pexpire() { return 1; }
     async get(k: string) { return this.strings.get(k) ?? null; }
     async set(k: string, v: string) { this.strings.set(k, v); return 'OK' as const; }
+    // #708: the success path SET keys.jobCompletionSeen then DEL's it once the
+    // activeJobs decrement lands (encore-callback-poller.ts:614). ioredis del
+    // accepts one or more keys and returns the count actually removed across
+    // string/hash/zset spaces. Without this the corrective-callback pass threw a
+    // TypeError before the pipeline re-open block, so the drop-failed execution
+    // never advanced (regressed test (c) after the #708 merge).
+    async del(...ks: string[]) {
+      let removed = 0;
+      for (const k of ks) {
+        if (this.strings.delete(k)) removed++;
+        if (this.hashes.delete(k)) removed++;
+        if (this.zsets.delete(k)) removed++;
+      }
+      return removed;
+    }
     async keys(pattern: string) {
       const re = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
       return [...this.strings.keys(), ...this.hashes.keys(), ...this.zsets.keys()].filter((x) => re.test(x));
@@ -223,6 +238,10 @@ describe('#709 (c) poller resumes a drop-failed pipeline on a corrective SUCCESS
     async hgetall(k: string) { return Object.fromEntries(this.hash(k)); }
     async hget(k: string, f: string) { return this.hash(k).get(f) ?? null; }
     async hset(k: string, f: string, v: string) { this.hash(k).set(f, v); return 1; }
+    // #707: the success path hdel's keys.jobInstance (encore-callback-poller.ts:450)
+    // so a later reconcile drop-diff can't re-observe the completed job. ioredis
+    // hdel accepts one or more fields and returns the count removed.
+    async hdel(k: string, ...fs: string[]) { const h = this.hash(k); let removed = 0; for (const f of fs) if (h.delete(f)) removed++; return removed; }
     async zadd(k: string, score: number, m: string) { const z = this.zset(k); const had = z.has(m); z.set(m, score); return had ? 0 : 1; }
     async zscore(k: string, m: string) { const s = this.zset(k).get(m); return s === undefined ? null : String(s); }
     async zrem(k: string, m: string) { return this.zset(k).delete(m) ? 1 : 0; }
