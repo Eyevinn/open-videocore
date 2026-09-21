@@ -8,7 +8,6 @@ import {
   createInstance,
   getInstance,
   getPortsForInstance,
-  listSubscriptions,
   saveSecret,
   waitForInstanceReady
 } from '@osaas/client-core';
@@ -26,7 +25,10 @@ import {
   isReadyStack,
   stripCredentials
 } from '../services/param-store.js';
-import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+import {
+  STACK_CONFIG_NAMESPACE,
+  deriveWorkspaceId
+} from '../services/workspace-stack.js';
 import {
   AUTO_SUBTITLES_SERVICE_ID,
   PACKAGER_SERVICE_ID,
@@ -447,41 +449,18 @@ async function redisUrlFrom(
   return `redis://${clusterHost}:6379`;
 }
 
-// Derive the deployment's own workspace (tenant) id from the OSC Context.
+// The deployment's own workspace (tenant) id is derived from the OSC Context via
+// the shared deriveWorkspaceId (src/services/workspace-stack.ts). The SAME
+// function backs the runtime resolver's reads, so the namespace a provision
+// route WRITES under provably equals the namespace the resolver READS under for
+// this deployment (issue #712) — read/write can no longer diverge.
 //
 // The provision/deprovision routes are NOT caller-authenticated: the OSC SDK
 // authenticates to OSC with the deployment's own OSC_ACCESS_TOKEN (carried on
 // the `osc` Context), and the parameter store is namespaced by the deployment's
-// own tenant id. That tenant id is read back from OSC via listSubscriptions:
-// every active subscription of a tenant carries the same tenantId
-// (@osaas/client-core admin.d.ts:2-5,42 — Subscription = { serviceId, tenantId }),
-// so the first subscription's tenantId is the deployment's tenant.
-//
-// Namespacing stack configs by the real tenant id — rather than the fixed
-// literal 'default' — keeps parameter-store entries routed to the owning
-// workspace so provision writes and resolver reads agree on where a stack lives
-// (param-store.ts stackConfigKey). This restores the workspace-scoped routing
-// that #64 dropped on these routes while preserving #64's intent elsewhere: the
-// per-REQUEST tenant resolution (auth/workspace.ts) stays removed; this is the
-// deployment's OWN tenant, read from its own Context, not from a caller token.
-//
-// The read is best-effort: if the OSC subscription list is unreachable, empty,
-// or carries no tenantId, we fall back to STACK_CONFIG_NAMESPACE so a single
-// deployment (or a test/offline environment) still resolves a stable namespace
-// and the resolver (workspace-stack.ts) continues to agree with it.
-async function deriveWorkspaceId(osc: Context): Promise<string> {
-  try {
-    const subscriptions = await listSubscriptions(osc);
-    const tenantId = Array.isArray(subscriptions)
-      ? subscriptions.find(
-          (s) => typeof s?.tenantId === 'string' && s.tenantId.length > 0
-        )?.tenantId
-      : undefined;
-    return tenantId ?? STACK_CONFIG_NAMESPACE;
-  } catch {
-    return STACK_CONFIG_NAMESPACE;
-  }
-}
+// own tenant id — this is the deployment's OWN tenant, read from its own
+// Context, not from a caller token (preserving #64's removal of per-REQUEST
+// tenant resolution while restoring workspace-scoped routing here).
 
 // Reliably persist the fully-resolved StackConfig as the FINAL provisioning
 // step (issue #416). Storage-dependent endpoints (e.g. POST
