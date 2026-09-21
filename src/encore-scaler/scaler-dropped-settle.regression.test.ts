@@ -22,8 +22,9 @@
 // Contract sources verified before writing (CLAUDE.md rule 7):
 //   - EncoreScalerLoop.reconcile() + onJobsDropped raise — src/encore-scaler/
 //     scaler-loop.ts:189-329 (dropped diff at :266-291; raise at :318-328).
-//   - onJobsDropped signature (encoreJobIds: string[]) => Promise<void> —
-//     src/encore-scaler/types.ts:90.
+//   - onJobsDropped signature (drops: DroppedJob[]) => Promise<void>, where
+//     DroppedJob = { encoreJobId, reason? } — reason carries Encore's own FAILED
+//     `message` when recoverable (#704) — src/encore-scaler/types.ts DroppedJob.
 //   - Valkey key schema keys.pool / keys.jobInstance / keys.jobStatus —
 //     src/encore-scaler/types.ts:124-128.
 //   - Encore findByStatus HATEOAS page { _embedded: { encoreJobs: [{ externalId
@@ -43,7 +44,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { EncoreScalerLoop } from './scaler-loop.js';
-import { keys, type EncoreScalerConfig, type EncoreInstanceRecord } from './types.js';
+import {
+  keys,
+  type DroppedJob,
+  type EncoreScalerConfig,
+  type EncoreInstanceRecord
+} from './types.js';
 import { InMemoryJobRepository } from '../data/job-repo.js';
 import { InMemoryAssetRepository } from '../data/asset-repo.js';
 import { InMemoryPipelineRepository } from '../data/pipeline-repo.js';
@@ -81,7 +87,7 @@ class FakeRedis {
 
 function makeConfig(
   redis: FakeRedis,
-  onJobsDropped?: (ids: string[]) => Promise<void>
+  onJobsDropped?: (drops: DroppedJob[]) => Promise<void>
 ): EncoreScalerConfig {
   return {
     workspaceId: 'ws1',
@@ -107,12 +113,30 @@ function encorePage(externalIds: string[]): Response {
   } as unknown as Response;
 }
 
-// Route a findByStatus URL to the QUEUED / IN_PROGRESS externalId lists.
-function fetchMock(queued: string[], inProgress: string[]) {
+// Build an Encore FAILED findByStatus page carrying each job's `message` (#704).
+function encoreFailedPage(jobs: Array<{ externalId: string; message?: string }>): Response {
+  return {
+    ok: true,
+    json: async () => ({
+      _embedded: { encoreJobs: jobs },
+      page: { totalElements: jobs.length }
+    })
+  } as unknown as Response;
+}
+
+// Route a findByStatus URL to the QUEUED / IN_PROGRESS externalId lists and the
+// FAILED documents (#704 failure-reason recovery). `failed` defaults to empty —
+// the genuine gone-from-active-set case where Encore reports no cause.
+function fetchMock(
+  queued: string[],
+  inProgress: string[],
+  failed: Array<{ externalId: string; message?: string }> = []
+) {
   return vi.fn(async (input: unknown) => {
     const url = String(input);
     if (url.includes('status=QUEUED')) return encorePage(queued);
     if (url.includes('status=IN_PROGRESS')) return encorePage(inProgress);
+    if (url.includes('status=FAILED')) return encoreFailedPage(failed);
     throw new Error(`unexpected fetch: ${url}`);
   });
 }
@@ -186,19 +210,28 @@ describe('scaler dropped-job end-to-end settle (issue #452)', () => {
     // The stuck flag getJobStatus() would keep reporting `running` for.
     await redis.hset(keys.jobStatus('ws1'), externalId, 'running');
 
-    vi.stubGlobal('fetch', fetchMock([], ['ws1__job-live']));
+    // #704: Encore reports the dropped job FAILED WITH its real error text. The
+    // job vanished from the active (QUEUED/IN_PROGRESS) set but its cause is on
+    // the FAILED encoreJob document's `message`.
+    const realCause =
+      'Job execution failed: Could not find location for profile program! Profiles: {}';
+    vi.stubGlobal(
+      'fetch',
+      fetchMock([], ['ws1__job-live'], [{ externalId, message: realCause }])
+    );
 
     // Wire onJobsDropped exactly as main.ts does: resolve each dropped id to its
-    // Job and route it through the shared idempotent settleFailedTranscode.
-    const config = makeConfig(redis, async (ids) => {
-      for (const id of ids) {
-        const found = await jobs.findByEncoreJobId(id);
+    // Job and route it through the shared idempotent settleFailedTranscode,
+    // surfacing Encore's own reason when present (#704).
+    const config = makeConfig(redis, async (drops) => {
+      for (const { encoreJobId, reason } of drops) {
+        const found = await jobs.findByEncoreJobId(encoreJobId);
         if (!found) continue;
-        await settleFailedTranscode(
-          { jobs, assets, pipeline },
-          found.job,
-          'dropped by Encore: gone from active set with no completion'
-        );
+        const failureText =
+          reason && reason.trim().length > 0
+            ? `dropped by Encore: ${reason}`
+            : 'dropped by Encore: gone from active set with no completion';
+        await settleFailedTranscode({ jobs, assets, pipeline }, found.job, failureText);
       }
     });
 
@@ -208,6 +241,12 @@ describe('scaler dropped-job end-to-end settle (issue #452)', () => {
     const settledJob = await jobs.get(jobId);
     expect(settledJob?.status).toBe('failed');
     expect(settledJob?.error).toBeTruthy();
+    // #704: the durable failure carries Encore's OWN cause, not the generic
+    // wrapper — a user can distinguish a config problem from a platform one.
+    expect(settledJob?.error).toContain(realCause);
+    expect(settledJob?.error).not.toBe(
+      'dropped by Encore: gone from active set with no completion'
+    );
 
     // Source asset moved out of `processing`.
     expect((await assets.get(assetId))?.status).toBe('failed');
@@ -242,22 +281,32 @@ describe('scaler dropped-job end-to-end settle (issue #452)', () => {
     await redis.hset(keys.jobInstance('ws1'), externalId, instanceId);
     await redis.hset(keys.jobStatus('ws1'), externalId, 'running');
 
-    // Encore reports no active jobs at all for this instance (actual=0).
-    vi.stubGlobal('fetch', fetchMock([], []));
+    // Encore reports no active jobs at all for this instance (actual=0) and no
+    // FAILED document either — the genuine gone-from-active-set case (#704): the
+    // whole instance was scaled down mid-flight, so Encore reports no cause.
+    vi.stubGlobal('fetch', fetchMock([], [], []));
 
-    const dropped: string[] = [];
-    const config = makeConfig(redis, async (ids) => {
-      dropped.push(...ids);
-      for (const id of ids) {
-        const found = await jobs.findByEncoreJobId(id);
+    const dropped: DroppedJob[] = [];
+    const config = makeConfig(redis, async (drops) => {
+      dropped.push(...drops);
+      for (const { encoreJobId, reason } of drops) {
+        const found = await jobs.findByEncoreJobId(encoreJobId);
         if (!found) continue;
-        await settleFailedTranscode({ jobs, assets }, found.job, 'instance scaled down');
+        const failureText =
+          reason && reason.trim().length > 0
+            ? `dropped by Encore: ${reason}`
+            : 'dropped by Encore: gone from active set with no completion';
+        await settleFailedTranscode({ jobs, assets }, found.job, failureText);
       }
     });
 
     await new EncoreScalerLoop(config).reconcile();
 
-    expect(dropped).toEqual([externalId]);
+    // #704: no Encore-reported cause -> reason undefined, generic wording reserved.
+    expect(dropped).toEqual([{ encoreJobId: externalId, reason: undefined }]);
+    expect((await jobs.get(jobId))?.error).toBe(
+      'dropped by Encore: gone from active set with no completion'
+    );
     // Stale Valkey flag rewritten so a later getJobStatus() won't say running.
     expect(await redis.hget(keys.jobStatus('ws1'), externalId)).toBe('FAILED');
     // Durable records settled terminal — the job is not left stuck.
