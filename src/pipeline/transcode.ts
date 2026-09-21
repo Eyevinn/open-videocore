@@ -176,6 +176,14 @@ export type CompleteTranscodeParams = {
   success: boolean;
   error?: string;
   renditions: CallbackRendition[];
+  // Reversible drop-detection settle (#709). Set true ONLY by the scaler's
+  // gone-from-active-set drop path (settleFailedTranscode reason
+  // 'gone-from-active-set'). Meaningful only on a failure write (success:false):
+  // it stamps `droppedByScaler` on the job so the resulting `failed` state is
+  // CONDITIONAL — a genuine SUCCESSFUL callback arriving afterwards can still
+  // correct the job to `done`. Absent/false => a normal unconditional terminal
+  // failure (e.g. an Encore-reported error) that is never overridden.
+  conditionalDrop?: boolean;
 };
 
 export type CompleteTranscodeResult = {
@@ -210,7 +218,20 @@ export async function completeTranscode(
   if (!job) {
     return { applied: false, renditionCount: 0, renditions: [] };
   }
-  if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
+  // Reversible drop-detection correction (#709). A job settled `failed` by the
+  // scaler's gone-from-active-set drop path carries `droppedByScaler === true`:
+  // that `failed` state is a CONDITIONAL inference (the job vanished from Encore's
+  // live set with no completion, ADR-016), NOT proof the encode failed. If a
+  // genuine SUCCESSFUL callback then arrives (out of order — e.g. the completion
+  // message was delayed past the reconcile drop window), we allow it to override
+  // the conditional failure and drive the job to `done` so the pipeline resumes
+  // (package / playback URL). This is the ONLY exception to first-terminal-write-
+  // wins: it is gated strictly on `droppedByScaler` AND `success`, so a genuine
+  // Encore-error `failed` (flag absent) is never overridden, and a redelivered
+  // FAILED callback for a dropped job still no-ops.
+  const isConditionalDropFailed =
+    job.status === 'failed' && job.droppedByScaler === true;
+  if (job.status === 'done' || job.status === 'cancelled') {
     // Duplicate / late callback, or the job was cancelled by an operator: nothing
     // to do. `cancelled` is terminal (src/data/job-repo.ts:103), so short-circuit
     // here to keep a late Encore callback idempotent — attempting an update would
@@ -218,11 +239,23 @@ export async function completeTranscode(
     // no-op / already-terminal callback is not a fresh terminal transition.
     return { applied: false, renditionCount: 0, renditions: [] };
   }
+  if (job.status === 'failed' && !(isConditionalDropFailed && params.success)) {
+    // Terminal `failed`: no-op UNLESS this is a SUCCESSFUL callback correcting a
+    // conditional drop-detection failure (handled below). A genuine Encore-error
+    // failure, or a redelivered FAILED callback for a dropped job, stops here so
+    // first-terminal-write-wins is preserved for real failures.
+    return { applied: false, renditionCount: 0, renditions: [] };
+  }
 
   if (!params.success) {
     await deps.jobs.update(params.jobId, {
       status: 'failed',
-      error: params.error ?? 'transcode failed'
+      error: params.error ?? 'transcode failed',
+      // #709: mark a gone-from-active-set drop settle as CONDITIONAL so a later
+      // SUCCESSFUL callback can still correct it. An unconditional (Encore-error)
+      // failure explicitly clears the flag so it can never be mistaken for a
+      // reversible drop even if the same job id is somehow reused.
+      droppedByScaler: params.conditionalDrop === true
     });
     await deps.assets.update(params.sourceAssetId, { status: 'failed' });
     // Audit: transcode job reached terminal `failed` (issue #564). One entry,
@@ -259,10 +292,22 @@ export async function completeTranscode(
   const refreshed = await deps.assets.get(params.sourceAssetId);
   if (refreshed?.status === 'processing') {
     await deps.assets.update(params.sourceAssetId, { status: 'ready' });
+  } else if (refreshed?.status === 'failed') {
+    // #709: a SUCCESSFUL callback is correcting a conditional-drop failure — the
+    // drop settle had moved the source asset to `failed`. Recover it to `ready`
+    // so it is usable again. The asset state machine forbids `failed -> ready`
+    // directly (asset-repo.ts ALLOWED_TRANSITIONS) but allows `failed ->
+    // processing -> ready`, so route through `processing` (the state the asset
+    // legitimately held while its transcode was in flight) to reach `ready`.
+    await deps.assets.update(params.sourceAssetId, { status: 'processing' });
+    await deps.assets.update(params.sourceAssetId, { status: 'ready' });
   }
   await deps.jobs.update(params.jobId, {
     status: 'done',
-    progress: 100
+    progress: 100,
+    // #709: a successful completion is a real terminal outcome — clear the
+    // conditional-drop marker so the job is no longer flagged reversible.
+    droppedByScaler: false
   });
 
   // Audit: transcode job reached terminal `done` (issue #564). One entry per

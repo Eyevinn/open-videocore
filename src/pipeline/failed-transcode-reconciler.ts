@@ -153,6 +153,23 @@ export type SettleFailedDeps = Pick<
   'jobs' | 'assets' | 'pipeline' | 'logger'
 >;
 
+// Why a transcode is being settled `failed` (#709). Drives whether the terminal
+// write is UNCONDITIONAL or CONDITIONAL:
+//   'encore-error'         — Encore reported the job failed, or its record
+//                            vanished past the bounded stall timeout (#273). A
+//                            genuine terminal failure: written unconditionally,
+//                            first-terminal-write-wins, and NEVER overridden by a
+//                            later callback.
+//   'gone-from-active-set' — the scaler's drop detection (ADR-016) observed the
+//                            job vanish from Encore's live QUEUED/IN_PROGRESS set
+//                            with no completion callback. This is an INFERENCE,
+//                            not proof of failure, so the `failed` state is
+//                            CONDITIONAL: the job is stamped `droppedByScaler` so
+//                            a genuine SUCCESSFUL callback arriving afterwards
+//                            (out of order) can still correct it to `done` and
+//                            resume the pipeline (completeTranscode, #709).
+export type SettleReason = 'encore-error' | 'gone-from-active-set';
+
 // Settle a single failed transcode: run completeTranscode({ success: false }) to
 // mark the Job failed and take the source asset out of `processing`, then
 // release the running pipeline lock. Idempotent (first-terminal-write-wins):
@@ -161,10 +178,19 @@ export type SettleFailedDeps = Pick<
 // swallowed (logged) so one job's failure to settle never aborts the caller.
 // Exported so the scaler's reconcile-driven dropped-job path (issue #449) funnels
 // through the identical asset/pipeline side-effects as the #273 sweep.
+//
+// #709: `reason` distinguishes a genuine Encore-error failure ('encore-error',
+// the default so existing callers are unaffected) from the scaler's inferred
+// gone-from-active-set drop ('gone-from-active-set'). For the drop reason the
+// terminal write is CONDITIONAL — the job is stamped `droppedByScaler` so a
+// genuine SUCCESSFUL callback arriving out of order can still correct it to
+// `done` (completeTranscode). An 'encore-error' settle stays unconditional and is
+// never overridden.
 export async function settleFailedTranscode(
   deps: SettleFailedDeps,
   job: Job,
-  error: string
+  error: string,
+  reason: SettleReason = 'encore-error'
 ): Promise<void> {
   try {
     const result = await completeTranscode(
@@ -173,7 +199,8 @@ export async function settleFailedTranscode(
         sourceAssetId: job.assetId,
         success: false,
         error,
-        renditions: []
+        renditions: [],
+        conditionalDrop: reason === 'gone-from-active-set'
       },
       { jobs: deps.jobs, assets: deps.assets }
     );

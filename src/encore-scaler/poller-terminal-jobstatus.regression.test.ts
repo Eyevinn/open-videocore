@@ -25,8 +25,8 @@
 //   - dispatch() writes keys.jobInstance + keys.jobStatus='running' —
 //     scaler-loop.ts:698-699.
 //   - EncoreScalerLoop.reconcile() + onJobsDropped raise — scaler-loop.ts:452-560.
-//   - onJobsDropped signature (encoreJobIds: string[]) => Promise<void> —
-//     types.ts:106.
+//   - onJobsDropped signature (drops: DroppedJob[]) => Promise<void>, where
+//     DroppedJob = { encoreJobId, reason? } (#704) — types.ts:39-42, 125.
 //   - Valkey key schema keys.pool / keys.jobInstance / keys.jobStatus —
 //     types.ts:181-183.
 //   - Encore findByStatus HATEOAS page { _embedded: { encoreJobs: [{ id | externalId
@@ -276,7 +276,10 @@ describe('encore-callback-poller terminal jobStatus write (#707)', () => {
       oscContext: {} as EncoreScalerConfig['oscContext'],
       redis: redis as unknown as EncoreScalerConfig['redis'],
       getToken: async () => 'test-token',
-      onJobsDropped: async (ids) => { droppedIds.push(...ids.map((d) => d.encoreJobId)); }
+      // #704: onJobsDropped now receives DroppedJob[] ({ encoreJobId, reason? })
+      // rather than a bare string[]. Collect the encoreJobId of each drop so the
+      // assertions below (job NOT raised as dropped) keep comparing ids.
+      onJobsDropped: async (drops) => { droppedIds.push(...drops.map((d) => d.encoreJobId)); }
     };
 
     await new EncoreScalerLoop(config).reconcile();

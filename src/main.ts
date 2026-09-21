@@ -1173,7 +1173,16 @@ function activateScaler(redisUrl: string): void {
               }
             },
             found.job,
-            failureText
+            // #704: surface Encore's OWN recovered failure text when reconcile()
+            // captured one, else the generic gone-from-active-set wording.
+            failureText,
+            // #709: a gone-from-active-set drop is an INFERENCE (the job vanished
+            // from Encore's live set with no callback, ADR-016), not proof of
+            // failure. Settle it CONDITIONALLY so a genuine SUCCESSFUL callback
+            // arriving out of order can still correct the job to `done` and resume
+            // the pipeline (package / playback URL), rather than being frozen out
+            // by first-terminal-write-wins.
+            'gone-from-active-set'
           );
         } catch (err) {
           app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');

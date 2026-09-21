@@ -643,10 +643,47 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
   // Advance the matching PipelineExecution — copied from src/routes/internal.ts
   // (the encore-callback handler). It can't be shared without a refactor.
   if (result.applied && deps.pipelineRepository) {
-    const execution = await deps.pipelineRepository.findRunningByAssetAndStep(
+    let execution = await deps.pipelineRepository.findRunningByAssetAndStep(
       found.job.assetId,
       'transcode'
     );
+    // #709: reversible drop-detection recovery. When the scaler's
+    // gone-from-active-set drop settled this job it also FAILED the pipeline's
+    // `transcode` step and moved the execution to `failed` (settleFailedTranscode
+    // -> releasePipelineLock), so findRunningByAssetAndStep above finds nothing.
+    // A genuine SUCCESSFUL callback arriving afterwards has just corrected the Job
+    // to `done` (completeTranscode override, result.applied === true). Re-open the
+    // failed execution's transcode step here so the SAME advancement code below
+    // resumes the pipeline (package / playback URL) instead of leaving it stuck
+    // `failed`. Scoped strictly: only on `success`, and only for a `failed`
+    // execution whose transcode step carries THIS externalId — a genuine
+    // Encore-error failure (job never carried droppedByScaler, so completeTranscode
+    // no-oped and result.applied is false) never reaches here.
+    if (!execution && success) {
+      const failedExecutions = await deps.pipelineRepository.listByAsset(found.job.assetId);
+      const reopenable = failedExecutions.find(
+        (e) =>
+          e.status === 'failed' &&
+          e.steps.some((s) => s.name === 'transcode' && s.encoreJobId === externalId && s.status === 'failed')
+      );
+      if (reopenable) {
+        const now = new Date().toISOString();
+        const steps: StepExecution[] = reopenable.steps.map((s) => ({ ...s }));
+        const tIdx = steps.findIndex((s) => s.name === 'transcode' && s.encoreJobId === externalId);
+        // Re-open the transcode step to `running` and the execution to `running`
+        // so it matches the shape the advancement code below expects; that code
+        // then marks the step `done` and steps into `package`.
+        steps[tIdx] = { ...steps[tIdx], status: 'running', error: undefined, completedAt: undefined };
+        const reopened = await deps.pipelineRepository.update(reopenable.id, { steps, status: 'running' });
+        deps.logger.info({
+          msg: 'encore-callback-poller: re-opened drop-failed pipeline for corrective SUCCESSFUL callback',
+          assetId: found.job.assetId,
+          externalId,
+          executionId: reopenable.id
+        });
+        execution = reopened ?? { ...reopenable, status: 'running', steps };
+      }
+    }
     if (execution && execution.steps.some((s) => s.name === 'transcode' && s.encoreJobId === externalId)) {
       const now = new Date().toISOString();
       const steps: StepExecution[] = execution.steps.map((s) => ({ ...s }));

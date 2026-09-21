@@ -137,6 +137,20 @@ export type Job = {
   // (#515). Present only when `interrupted` is true. Today the only value is
   // 'interrupted_by_scaledown' (worker pool scaled a worker away mid-job).
   interruptionReason?: JobInterruptionReason;
+  // --- Reversible drop-detection settle (#709) ---
+  // True when this job was settled `failed` by the scaler's drop-detection path
+  // (onJobsDropped -> settleFailedTranscode with reason 'gone-from-active-set'),
+  // NOT by a genuine Encore-reported error. A gone-from-active-set drop is an
+  // inference from the job vanishing from Encore's live QUEUED/IN_PROGRESS set
+  // with no completion callback (ADR-016) — it is not proof the encode failed, so
+  // the resulting `failed` state is CONDITIONAL/reversible: if a genuine
+  // SUCCESSFUL callback later arrives (out of order, e.g. the completion message
+  // was delayed past the reconcile drop window), completeTranscode uses this flag
+  // to allow the job to transition failed -> done and resume the pipeline. Absent
+  // (not false) on genuine Encore-error failures, whose terminal state is
+  // unconditional and must never be overridden. Cleared once a job settles to a
+  // real terminal outcome (done, or a re-affirmed failure).
+  droppedByScaler?: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -179,14 +193,28 @@ export type UpdateJobInput = {
   // ONLY; they do NOT drive a status transition (the job stays `running`).
   interrupted?: boolean;
   interruptionReason?: JobInterruptionReason;
+  // Reversible drop-detection settle (#709). Set true when the scaler's
+  // drop-detection path settles the job `failed` via a conditional
+  // (gone-from-active-set) reason; cleared (false) when a later genuine
+  // SUCCESSFUL callback corrects that conditional failure. Additive/optional so
+  // existing callers are unaffected; carried through applyJobPatch unchanged.
+  droppedByScaler?: boolean;
 };
 
+// A conditional-drop `failed` state (#709) is reversible ONLY by a SUCCESSFUL
+// completion — a genuine Encore-error `failed` remains terminal. The transition
+// table permits `failed -> done` / `failed -> running` at the repository level so
+// completeTranscode can re-drive a drop-settled job to `done` (and re-open it if
+// needed); the SEMANTIC guard that a genuine (non-dropped) failure is never
+// overridden lives in completeTranscode, which only performs this correction when
+// the job carries `droppedByScaler === true`. `failed -> failed` (re-affirming a
+// failure) is a same-status no-op handled by isValidJobTransition.
 const ALLOWED_JOB_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
   pending: ['queued', 'running', 'failed', 'cancelled'],
   queued: ['running', 'failed', 'cancelled'],
   running: ['done', 'failed', 'running', 'cancelled'],
   done: [],
-  failed: [],
+  failed: ['done', 'running'],
   cancelled: []
 };
 
@@ -303,6 +331,7 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.encodeAttemptLog !== undefined) next.encodeAttemptLog = patch.encodeAttemptLog;
   if (patch.interrupted !== undefined) next.interrupted = patch.interrupted;
   if (patch.interruptionReason !== undefined) next.interruptionReason = patch.interruptionReason;
+  if (patch.droppedByScaler !== undefined) next.droppedByScaler = patch.droppedByScaler;
   return next;
 }
 

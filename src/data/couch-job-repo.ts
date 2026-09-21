@@ -207,6 +207,7 @@ function toDoc(job: Job): Record<string, unknown> {
     encodeAttemptLog: job.encodeAttemptLog,
     interrupted: job.interrupted,
     interruptionReason: job.interruptionReason,
+    droppedByScaler: job.droppedByScaler,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
   };
@@ -232,6 +233,7 @@ function fromDoc(doc: StoredDoc): Job {
     encodeAttemptLog: doc['encodeAttemptLog'] as EncodeAttempt[] | undefined,
     interrupted: doc['interrupted'] as boolean | undefined,
     interruptionReason: doc['interruptionReason'] as JobInterruptionReason | undefined,
+    droppedByScaler: doc['droppedByScaler'] as boolean | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };
