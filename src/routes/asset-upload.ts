@@ -25,6 +25,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { Readable } from 'node:stream';
 import { z } from 'zod';
+import { authGate } from '../auth/middleware.js';
 import { InvalidStateTransitionError, type AssetRepository } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { uploadUrlTtlSeconds, SourceTooLargeError, type CompletedPart, type WorkspaceStorage } from '../data/storage.js';
@@ -120,6 +121,14 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   // to MinIO. Scoped to this plugin — does not affect other routers.
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const { repository: repo, storageFor, quota } = opts;
+
+  // 401 presence gate (issue #711). Registered FIRST so anonymous requests are
+  // rejected 401 before any handler runs — restoring the pre-f3f971c behaviour
+  // this router's header comment (line 17) documents. Plugin-scoped; mirrors the
+  // six sibling routers (see src/routes/assets.ts:1510). It calls the pure
+  // presence gate authenticate via app.authenticate and does NOT reintroduce
+  // per-request workspace scoping.
+  app.addHook('preHandler', authGate(app));
 
   // Uniform 501 for storage-backed handlers when no object storage is wired.
   // The routes are always registered (so they appear in the spec, issue #479);

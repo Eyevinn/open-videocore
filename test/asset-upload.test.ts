@@ -118,6 +118,23 @@ describe('direct client-side upload (issue #4)', () => {
     delete process.env['UPLOAD_URL_TTL_SECONDS'];
   });
 
+  // 401 presence gate (issue #711). f3f971c dropped the authGate from this
+  // router, admitting anonymous asset-write/upload requests; the gate is
+  // restored as the first preHandler (asset-upload.ts) mirroring the six sibling
+  // routers. Assert an unauthenticated upload route is rejected 401 with the
+  // Bearer challenge — same shape as test/workspace-acl.test.ts:32.
+  describe('auth gate (issue #711)', () => {
+    it('rejects an unauthenticated upload route (401)', async () => {
+      const id = await createAsset(app);
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${id}/upload-url`
+      });
+      expect(res.statusCode).toBe(401);
+      expect(res.headers['www-authenticate']).toBe('Bearer');
+    });
+  });
+
   describe('single-part presign', () => {
     it('returns a presigned PUT URL and object key', async () => {
       const id = await createAsset(app);
