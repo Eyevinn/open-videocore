@@ -25,9 +25,13 @@ import {
   isReadyStack,
   stripCredentials
 } from '../services/param-store.js';
-import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+import {
+  STACK_CONFIG_NAMESPACE,
+  deriveWorkspaceId
+} from '../services/workspace-stack.js';
 import {
   AUTO_SUBTITLES_SERVICE_ID,
+  PACKAGER_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES
 } from '../services/stack.js';
@@ -445,14 +449,18 @@ async function redisUrlFrom(
   return `redis://${clusterHost}:6379`;
 }
 
-// Derive the deployment's own workspace (tenant) id from the OSC Context.
-// The deployment context key used to namespace stacks in the parameter store.
-// Must match STACK_CONFIG_NAMESPACE in workspace-stack.ts so provision and
-// resolver agree on where configs are stored and found.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function deriveWorkspaceId(_osc: Context): Promise<string> {
-  return STACK_CONFIG_NAMESPACE;
-}
+// The deployment's own workspace (tenant) id is derived from the OSC Context via
+// the shared deriveWorkspaceId (src/services/workspace-stack.ts). The SAME
+// function backs the runtime resolver's reads, so the namespace a provision
+// route WRITES under provably equals the namespace the resolver READS under for
+// this deployment (issue #712) — read/write can no longer diverge.
+//
+// The provision/deprovision routes are NOT caller-authenticated: the OSC SDK
+// authenticates to OSC with the deployment's own OSC_ACCESS_TOKEN (carried on
+// the `osc` Context), and the parameter store is namespaced by the deployment's
+// own tenant id — this is the deployment's OWN tenant, read from its own
+// Context, not from a caller token (preserving #64's removal of per-REQUEST
+// tenant resolution while restoring workspace-scoped routing here).
 
 // Reliably persist the fully-resolved StackConfig as the FINAL provisioning
 // step (issue #416). Storage-dependent endpoints (e.g. POST
@@ -1544,24 +1552,36 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
 
           // Tear down any on-demand packager for this stack (epic #226 / issue
-          // #246). The packager is provisioned lazily and is NOT recorded in
-          // config.services[], so deprovisionStackFromConfig below never removes
-          // it — we reconcile against OSC ground truth here (the packager shares
-          // the stack name). It runs BEFORE the queue teardown below so the
-          // consumer is removed before the Valkey it consumes (consumer-before-
-          // producer, mirroring TEARDOWN_ORDER). Safe whether or not packaging
-          // ever ran: not_found when no packager exists. A failure is logged but
-          // must not abort the static-service teardown that follows (same policy
-          // as the scaler teardown above).
-          const packagerTeardown = await teardownOnDemandPackager(
-            packagerOscApiFromContext(osc),
-            name
+          // #246). The packager is provisioned lazily and is normally NOT
+          // recorded in config.services[], so deprovisionStackFromConfig below
+          // never removes it — we reconcile against OSC ground truth here (the
+          // packager shares the stack name). It runs BEFORE the queue teardown
+          // below so the consumer is removed before the Valkey it consumes
+          // (consumer-before-producer, mirroring TEARDOWN_ORDER). Safe whether
+          // or not packaging ever ran: not_found when no packager exists. A
+          // failure is logged but must not abort the static-service teardown
+          // that follows (same policy as the scaler teardown above).
+          //
+          // SKIP this reconciliation when the packager IS already recorded in
+          // config.services[] (e.g. a stack persisted by an older eager path):
+          // deprovisionStackFromConfig removes it from the stored list, so a
+          // second removeInstance here would be a redundant teardown of the
+          // same instance. Teardown must touch each stored service exactly once
+          // (PACKAGER_SERVICE_ID, stack.ts:44 — the packager serviceId).
+          const packagerInStoredServices = config.services.some(
+            (s) => s.serviceId === PACKAGER_SERVICE_ID
           );
-          if (packagerTeardown.status === 'failed') {
-            app.log.error(
-              { packagerTeardown, name, workspaceId },
-              'on-demand packager teardown failed; continuing static teardown'
+          if (!packagerInStoredServices) {
+            const packagerTeardown = await teardownOnDemandPackager(
+              packagerOscApiFromContext(osc),
+              name
             );
+            if (packagerTeardown.status === 'failed') {
+              app.log.error(
+                { packagerTeardown, name, workspaceId },
+                'on-demand packager teardown failed; continuing static teardown'
+              );
+            }
           }
 
           // Teardown order and the instance set come from what was actually

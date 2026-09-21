@@ -48,7 +48,7 @@ import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
 import type { SceneDetector } from '../pipeline/scene-detector.js';
-import type { Context } from '@osaas/client-core';
+import { listSubscriptions, type Context } from '@osaas/client-core';
 import type { ResolverHealthSignal } from './resolver-health.js';
 
 // Builders that turn a stored optional-service instance name (from the stack
@@ -377,6 +377,43 @@ function buildInMemoryConnections(): WorkspaceConnections {
 
 export const STACK_CONFIG_NAMESPACE = "default";
 
+// Derive the deployment's own workspace (tenant) id from the OSC Context.
+//
+// This is the SINGLE source of truth for the parameter-store namespace and is
+// called by BOTH sides of the read/write contract so their keys provably agree:
+//   - the provision/deprovision routes (write side, src/routes/provision.ts)
+//     namespace every storeStackConfig/loadStackConfig/listStackNames by this id;
+//   - the runtime resolver below (read side) resolves the same namespace before
+//     every listStackNames/loadStackConfig.
+// Because both derive from the deployment's OWN authenticated Context via the
+// identical listSubscriptions logic, the resolver read key equals the provision
+// write key for the same deployment — closing the divergence that a fixed
+// literal namespace on the read side would reintroduce (issue #712).
+//
+// The tenant id is read from OSC via listSubscriptions: every active
+// subscription of a tenant carries the same tenantId (@osaas/client-core
+// admin.d.ts:2-5,42 — Subscription = { serviceId: string; tenantId: string };
+// listSubscriptions(context: Context): Promise<Subscription[]>), so the first
+// subscription's tenantId is the deployment's tenant.
+//
+// The read is best-effort: if the OSC subscription list is unreachable, empty,
+// or carries no tenantId, both sides fall back to STACK_CONFIG_NAMESPACE so a
+// single deployment (or a test/offline environment) still resolves a stable,
+// symmetric namespace.
+export async function deriveWorkspaceId(osc: Context): Promise<string> {
+  try {
+    const subscriptions = await listSubscriptions(osc);
+    const tenantId = Array.isArray(subscriptions)
+      ? subscriptions.find(
+          (s) => typeof s?.tenantId === 'string' && s.tenantId.length > 0
+        )?.tenantId
+      : undefined;
+    return tenantId ?? STACK_CONFIG_NAMESPACE;
+  } catch {
+    return STACK_CONFIG_NAMESPACE;
+  }
+}
+
 export class WorkspaceStackResolver {
   private cache = new Map<string, CacheEntry>();
   private paramStore: ParamStore | undefined;
@@ -461,6 +498,13 @@ export class WorkspaceStackResolver {
       return buildInMemoryConnections();
     }
 
+    // Resolve the parameter-store namespace via the SAME deriveWorkspaceId the
+    // provision route writes under (issue #712), so the resolver read key
+    // provably equals the provision write key for this deployment. Falls back to
+    // STACK_CONFIG_NAMESPACE identically on both sides when the OSC subscription
+    // list is unreachable/empty (test/offline environments).
+    const namespace = await deriveWorkspaceId(this.oscContext);
+
     // Resolve the stack config: an explicit stack name addresses that stack
     // directly; otherwise use the first provisioned stack as the workspace
     // default.
@@ -468,26 +512,26 @@ export class WorkspaceStackResolver {
     try {
       if (stackName) {
         // READ-PATH diagnostic (issue #415): the resolver reads by the
-        // X-Stack-Name-derived name under STACK_CONFIG_NAMESPACE. This is the
+        // X-Stack-Name-derived name under the derived namespace. This is the
         // (namespace, name) pair whose derived key must equal the key the
         // provision route wrote; the param-store client logs the concrete key.
         this.log?.info?.(
-          { source: 'x-stack-name', namespace: STACK_CONFIG_NAMESPACE, stackName },
+          { source: 'x-stack-name', namespace, stackName },
           'resolver reading stack config by requested name'
         );
-        config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
+        config = await ps.loadStackConfig(namespace, stackName);
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
         // connections. This prevents stale UI stack selections from breaking
         // all storage/asset operations.
         if (!config) {
-          const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+          const names = await ps.listStackNames(namespace);
           this.log?.info?.(
-            { namespace: STACK_CONFIG_NAMESPACE, requested: stackName, listed: names },
+            { namespace, requested: stackName, listed: names },
             'requested stack not found; falling back to first listed stack'
           );
           if (names.length > 0) {
-            config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
+            config = await ps.loadStackConfig(namespace, names[0]);
           }
         }
       } else {
@@ -495,13 +539,13 @@ export class WorkspaceStackResolver {
         // resolver uses the FIRST listed stack as the default. If the list is
         // empty here but the provision route logged a successful write, the
         // write key and the list prefix disagree — a read-side namespace/key bug.
-        const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+        const names = await ps.listStackNames(namespace);
         this.log?.info?.(
-          { source: 'default', namespace: STACK_CONFIG_NAMESPACE, listed: names },
+          { source: 'default', namespace, listed: names },
           'resolver reading default stack config (no X-Stack-Name)'
         );
         if (names.length > 0) {
-          config = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]);
+          config = await ps.loadStackConfig(namespace, names[0]);
         }
       }
     } catch (err) {
@@ -519,7 +563,7 @@ export class WorkspaceStackResolver {
       this.log.error(
         {
           err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
-          namespace: STACK_CONFIG_NAMESPACE,
+          namespace,
           stackName: stackName ?? '(workspace default)',
           fallback: servingLastKnownGood
             ? 'last-known-good (stale ready-stack resolution)'
@@ -609,10 +653,13 @@ export class WorkspaceStackResolver {
   async resolveStackName(requestedStackName?: string): Promise<string | undefined> {
     const ps = this.paramStore;
     if (!ps) return undefined;
+    // Resolve the namespace via the SAME deriveWorkspaceId the provision route
+    // writes under (issue #712) so this read key equals the provision write key.
+    const namespace = await deriveWorkspaceId(this.oscContext);
     try {
       if (requestedStackName) {
         const config = await ps.loadStackConfig(
-          STACK_CONFIG_NAMESPACE,
+          namespace,
           requestedStackName
         );
         // A requested name that resolves to a real config wins verbatim; the
@@ -622,7 +669,7 @@ export class WorkspaceStackResolver {
         // routing), matching resolve()'s fallback semantics.
         if (config) return requestedStackName;
       }
-      const names = await ps.listStackNames(STACK_CONFIG_NAMESPACE);
+      const names = await ps.listStackNames(namespace);
       return names.length > 0 ? names[0] : undefined;
     } catch (err) {
       // A parameter-store read failure is not authority to invent a stack: log
@@ -631,7 +678,7 @@ export class WorkspaceStackResolver {
       this.log.error(
         {
           err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
-          namespace: STACK_CONFIG_NAMESPACE,
+          namespace,
           requestedStackName: requestedStackName ?? '(workspace default)'
         },
         'stack resolver: failed to resolve effective stack name'
