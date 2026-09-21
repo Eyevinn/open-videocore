@@ -24,7 +24,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { EncoreScalerLoop, DEFAULT_RECONCILE_GRACE_MS } from './scaler-loop.js';
-import { keys, type EncoreScalerConfig, type EncoreInstanceRecord } from './types.js';
+import {
+  keys,
+  type DroppedJob,
+  type EncoreScalerConfig,
+  type EncoreInstanceRecord
+} from './types.js';
 
 // In-memory stand-in for the ioredis subset reconcile() uses: hgetall / hset /
 // hget for the hashes, plus get/set for the per-job jobCompletionSeen string key.
@@ -68,7 +73,7 @@ class FakeRedis {
 
 function makeConfig(
   redis: FakeRedis,
-  onJobsDropped: (ids: string[]) => Promise<void>,
+  onJobsDropped: (drops: DroppedJob[]) => Promise<void>,
   reconcileGraceMs?: number
 ): EncoreScalerConfig {
   return {
@@ -141,7 +146,7 @@ describe('reconcile grace period (issue #708)', () => {
     const dropped: string[] = [];
     await new EncoreScalerLoop(
       makeConfig(redis, async (ids) => {
-        dropped.push(...ids);
+        dropped.push(...ids.map((d) => d.encoreJobId));
       })
     ).reconcile();
 
@@ -174,7 +179,7 @@ describe('reconcile grace period (issue #708)', () => {
     const dropped: string[] = [];
     await new EncoreScalerLoop(
       makeConfig(redis, async (ids) => {
-        dropped.push(...ids);
+        dropped.push(...ids.map((d) => d.encoreJobId));
       })
     ).reconcile();
 
@@ -193,7 +198,7 @@ describe('reconcile grace period (issue #708)', () => {
     const dropped: string[] = [];
     await new EncoreScalerLoop(
       makeConfig(redis, async (ids) => {
-        dropped.push(...ids);
+        dropped.push(...ids.map((d) => d.encoreJobId));
       })
     ).reconcile();
 
@@ -217,7 +222,7 @@ describe('reconcile grace period (issue #708)', () => {
       makeConfig(
         redis,
         async (ids) => {
-          dropped.push(...ids);
+          dropped.push(...ids.map((d) => d.encoreJobId));
         },
         2_000 // 2s custom grace window
       )
