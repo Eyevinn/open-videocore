@@ -32,6 +32,7 @@ import {
 } from '../services/storage-backend-registry.js';
 import { InvalidPathTemplateError } from '../services/destination-path-template.js';
 import { authorize, methodToAction, AUTHZ_FORBIDDEN_ERROR } from '../auth/authorize.js';
+import { authGate } from '../auth/middleware.js';
 import type { PrincipalRole } from '../auth/principal.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 
@@ -298,6 +299,12 @@ export const storageRouter: FastifyPluginAsync<StorageRouterOptions> = async (fa
     }
     throw err;
   });
+
+  // 401 presence gate (issue #711) registered FIRST so anonymous requests are
+  // rejected 401 before the role gate below runs. This restores the presence-only
+  // behaviour the /buckets and watch-folder routes are documented to keep.
+  // Plugin-scoped; see src/routes/assets.ts for the full rationale.
+  app.addHook('preHandler', authGate(app));
 
   // Role gate for every /backends* route (issue #679: "all endpoints require
   // operator or admin role"). This repo's authorisation contract

@@ -23,6 +23,7 @@ import {
   WEBHOOK_EVENT_TYPES,
   type WebhookRepository
 } from '../data/webhook-repo.js';
+import { authGate } from '../auth/middleware.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
@@ -47,6 +48,11 @@ type WebhooksRouterOptions = {
 export const webhooksRouter: FastifyPluginAsync<WebhooksRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
+
+  // 401 presence gate (issue #711): reject anonymous requests to this
+  // workspace-scoped router. Plugin-scoped so it does not affect public routers.
+  // See src/routes/assets.ts for the full rationale.
+  app.addHook('preHandler', authGate(app));
 
   app.setErrorHandler((err, _request, reply) => {
     if (err instanceof WorkspaceAccessError) {

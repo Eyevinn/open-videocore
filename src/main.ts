@@ -80,6 +80,7 @@ import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
 import { registerPrincipal } from './auth/principal.js';
+import { registerAuth } from './auth/middleware.js';
 import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
@@ -397,6 +398,18 @@ const stackResolver = new WorkspaceStackResolver({
   // 501 from the storage routes is traceable.
   log: app.log
 });
+
+// 401 presence gate (ADR-018 decision 5, issue #711). Decorates the
+// `authenticate` preHandler that each protected router attaches plugin-scoped.
+// In production every request first passes the OSC Service Access Token wall
+// (which authenticates the caller upstream); this gate only rejects anonymous
+// traffic that reaches the process WITHOUT a bearer token (e.g. an instance
+// accidentally exposed without the wall), returning 401 + `WWW-Authenticate:
+// Bearer`. It is a PURE presence gate — it admits any bearer token and does NOT
+// resolve a per-request workspace, so it does not reintroduce the scoping #64
+// removed. Must run before the routers register, since they reference
+// app.authenticate at registration time.
+registerAuth(app);
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
 // the app trusts every request that reaches it.
