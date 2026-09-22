@@ -189,7 +189,9 @@ describe('collections (issue #11)', () => {
   it('creates, lists, and gets a collection', async () => {
     const created = await createCollection('Favourites');
     expect(created['name']).toBe('Favourites');
-    expect(created['workspaceId']).toBe('workspace-a');
+    // Post-ADR-003 (#64): the response contract (collectionSchema in
+    // src/routes/collections.ts) no longer carries workspaceId — a deployed
+    // instance is a single tenant, so there is no per-response workspace field.
     expect(created['assetIds']).toEqual([]);
 
     const list = await app.inject({ method: 'GET', url: '/api/v1/collections', headers: A });

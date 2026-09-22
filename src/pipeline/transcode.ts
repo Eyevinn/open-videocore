@@ -20,7 +20,7 @@
 // duplicate renditions.
 
 import { ulid } from 'ulid';
-import type { AssetRepository, Rendition } from '../data/asset-repo.js';
+import { isValidTransition, type AssetRepository, type Rendition } from '../data/asset-repo.js';
 import {
   encodeEncoreJobId,
   type JobRepository
@@ -151,8 +151,21 @@ export async function submitTranscode(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await deps.jobs.update(job.id, { status: 'failed', error: message });
-    // Best-effort revert: the source could not be transcoded.
-    await deps.assets.update(params.sourceAssetId, { status: 'failed' });
+    // Best-effort revert: the source could not be transcoded. Under ADR-006 the
+    // submit only ENQUEUES the job on the scaler's local queue and does NOT move
+    // the source out of `ready` (the scaler's onDispatched advances it to
+    // `processing` at dispatch time). So on a submit-time rejection the asset is
+    // usually still `ready`, and the asset state machine forbids `ready -> failed`
+    // (ALLOWED_TRANSITIONS in src/data/asset-repo.ts:34-40). Only move the asset to
+    // `failed` when that transition is legal from its CURRENT state (i.e. it was
+    // already advanced to `processing`); otherwise the failure belongs solely to
+    // the job just marked `failed` above and the source stays `ready` (reusable /
+    // retryable). Guarding here also prevents the InvalidStateTransitionError from
+    // masking the real Encore error we rethrow below.
+    const source = await deps.assets.get(params.sourceAssetId);
+    if (source && isValidTransition(source.status, 'failed')) {
+      await deps.assets.update(params.sourceAssetId, { status: 'failed' });
+    }
     throw err;
   }
 

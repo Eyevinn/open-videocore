@@ -1,15 +1,22 @@
 // HLS/DASH packaging pipeline tests (issue #9).
 //
-// Covers:
-//   - triggerPackaging enqueues a packaging job (the trigger issue #8's Encore
-//     callback handler invokes on transcode success) with the correct
-//     workspace-partitioned output path
-//   - the packager-callback route stores manifestUrls (HLS + DASH) on the asset
-//   - GET /api/v1/assets/:id returns manifestUrls
-//   - a failed packager callback records packagingError WITHOUT changing status
-//   - an enqueue failure records packagingError and never throws into the caller
-//   - malformed / cross-workspace packagingId resolves to 404 (no leak)
-//   - the callback responds 501 when packaging is not configured
+// Rewritten for the current post-ADR-003 (#64) single-tenant contract and the
+// current packaging surface (verified 2026-09-22 against src/pipeline/packaging.ts
+// and src/routes/internal.ts):
+//   - PackagingService.triggerPackaging(assetId, encoreJobUrl) enqueues a
+//     PackagingJob { jobId, url } (packaging.ts:171-192,388-401) and, on an
+//     enqueue failure, records packagingError on the asset without throwing
+//     (packaging.ts:412-421).
+//   - POST /api/v1/internal/packagerCallback/success with { url, jobId, outputPath? }
+//     stores manifestUrls on the asset (internal.ts:55-59,285-299 ->
+//     PackagingService.handleSuccess, packaging.ts:429-472). 404 for an unknown
+//     asset, 501 when packaging is not configured.
+//   - POST /api/v1/internal/packagerCallback/failure with { message } ONLY —
+//     the packager does not echo a jobId, so the route correlates by pipeline
+//     execution state (any running `package` step) and records the failure on the
+//     execution (internal.ts:61-63,420-476).
+//   - the packagingId / outputPrefix / manifestUrlsFor helpers are single-arg
+//     (assetId) — no workspace partitioning (packaging.ts:46-77).
 
 import { describe, it, expect, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -34,11 +41,12 @@ import { registerAuth } from '../src/auth/middleware.js';
 import { assetsRouter } from '../src/routes/assets.js';
 import { internalRouter } from '../src/routes/internal.js';
 import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
+import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
 import {
   PackagingService,
   packagingId,
   outputPrefix,
-  type EncoreOutput,
+  manifestUrlsFor,
   type PackageQueue,
   type PackagingJob
 } from '../src/pipeline/packaging.js';
@@ -64,6 +72,7 @@ async function buildApp(opts: { withPackaging?: boolean; queue?: PackageQueue } 
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
   const repo = new InMemoryAssetRepository();
+  const pipelines = new InMemoryPipelineRepository();
 
   const packaging =
     opts.withPackaging === false
@@ -75,9 +84,14 @@ async function buildApp(opts: { withPackaging?: boolean; queue?: PackageQueue } 
         });
 
   await app.register(assetsRouter, { prefix: '/api/v1/assets', repository: repo });
-  await app.register(internalRouter, { prefix: '/api/v1/internal', packaging });
+  await app.register(internalRouter, {
+    prefix: '/api/v1/internal',
+    packaging,
+    repository: repo,
+    pipelineRepository: pipelines
+  });
   await app.ready();
-  return { app, repo, packaging };
+  return { app, repo, pipelines, packaging };
 }
 
 async function createAsset(app: FastifyInstance): Promise<string> {
@@ -90,31 +104,52 @@ async function createAsset(app: FastifyInstance): Promise<string> {
   return res.json().id as string;
 }
 
-const OUTPUTS: EncoreOutput[] = [
-  { file: 'transcoded/clip/1080p.mp4', type: 'video' },
-  { file: 'transcoded/clip/720p.mp4', type: 'video' }
-];
+// Seed a pipeline execution stalled on a RUNNING `package` step — the state the
+// packager-failure callback correlates against (src/routes/internal.ts:433-445).
+async function seedRunningPackage(pipelines: InMemoryPipelineRepository, assetId: string) {
+  const exec = await pipelines.create({ assetId, steps: ['package'] });
+  await pipelines.update(exec.id, {
+    steps: exec.steps.map((s) => (s.name === 'package' ? { ...s, status: 'running' } : s))
+  });
+  return exec;
+}
 
 describe('HLS/DASH packaging (issue #9)', () => {
+  describe('packaging id / path helpers', () => {
+    it('packagingId is the assetId (no workspace partitioning, post-#64)', () => {
+      expect(packagingId('asset-7')).toBe('asset-7');
+    });
+
+    it('outputPrefix places the asset under the packaged prefix', () => {
+      expect(outputPrefix('asset-7')).toBe('packaged/asset-7');
+    });
+
+    it('manifestUrlsFor builds HLS + DASH URLs under the deterministic prefix', () => {
+      const urls = manifestUrlsFor('asset-7', 'https://cdn.example/packaged');
+      expect(urls.hls).toBe('https://cdn.example/packaged/packaged/asset-7/index.m3u8');
+      expect(urls.dash).toBe('https://cdn.example/packaged/packaged/asset-7/manifest.mpd');
+    });
+  });
+
   describe('triggerPackaging (called from the Encore callback on transcode success)', () => {
-    it('enqueues a packaging job with workspace-partitioned output path', async () => {
+    it('enqueues a PackagingJob keyed by the assetId and the Encore job URL', async () => {
       const { queue, jobs } = fakeQueue();
       const repo = new InMemoryAssetRepository();
-      const asset = await repo.create('workspace-a', { name: 'clip' });
+      const asset = await repo.create({ name: 'clip' });
       const svc = new PackagingService({ assets: repo, queue });
 
-      await svc.triggerPackaging('workspace-a', asset.id, OUTPUTS);
+      await svc.triggerPackaging(asset.id, 'https://encore.example/job/1');
 
       expect(jobs).toHaveLength(1);
-      expect(jobs[0].packagingId).toBe(packagingId('workspace-a', asset.id));
-      expect(jobs[0].outputPrefix).toBe(outputPrefix('workspace-a', asset.id));
-      expect(jobs[0].outputPrefix.startsWith('workspace-a/')).toBe(true);
-      expect(jobs[0].inputs).toEqual(OUTPUTS);
+      // Current PackagingJob shape is { jobId, url } (packaging.ts:171-174); jobId
+      // === assetId so the success callback can resolve the asset (packaging.ts:433).
+      expect(jobs[0].jobId).toBe(asset.id);
+      expect(jobs[0].url).toBe('https://encore.example/job/1');
     });
 
     it('records packagingError and never throws when the enqueue fails', async () => {
       const repo = new InMemoryAssetRepository();
-      const asset = await repo.create('workspace-a', { name: 'clip' });
+      const asset = await repo.create({ name: 'clip' });
       const onError = vi.fn();
       const queue: PackageQueue = {
         enqueue: vi.fn(async () => {
@@ -124,32 +159,38 @@ describe('HLS/DASH packaging (issue #9)', () => {
       const svc = new PackagingService({ assets: repo, queue, onError });
 
       await expect(
-        svc.triggerPackaging('workspace-a', asset.id, OUTPUTS)
+        svc.triggerPackaging(asset.id, 'https://encore.example/job/1')
       ).resolves.toBeUndefined();
       expect(onError).toHaveBeenCalledOnce();
-      const after = await repo.get('workspace-a', asset.id);
+      const after = await repo.get(asset.id);
       expect(after?.packagingError).toContain('valkey unreachable');
       // Status is untouched by a packaging failure.
       expect(after?.status).toBe('uploading');
     });
   });
 
-  describe('POST /api/v1/internal/packager-callback', () => {
+  describe('POST /api/v1/internal/packagerCallback/success', () => {
     it('stores manifestUrls on success and returns them in the asset GET', async () => {
       const { app, repo } = await buildApp();
       const id = await createAsset(app);
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: packagingId('workspace-a', id), status: 'success' }
+        url: '/api/v1/internal/packagerCallback/success',
+        // jobId === the assetId we enqueued (packaging.ts:433).
+        payload: { url: 'https://encore.example/job/1', jobId: id }
       });
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual({ ok: true });
 
-      const stored = await repo.get('workspace-a', id);
-      expect(stored?.manifestUrls?.hls).toContain(`/workspace-a/packaged/${id}/index.m3u8`);
-      expect(stored?.manifestUrls?.dash).toContain(`/workspace-a/packaged/${id}/manifest.mpd`);
+      const stored = await repo.get(id);
+      // No outputPath reported -> deterministic packaged/<id> manifest names.
+      expect(stored?.manifestUrls?.hls).toBe(
+        `https://cdn.example/packaged/packaged/${id}/index.m3u8`
+      );
+      expect(stored?.manifestUrls?.dash).toBe(
+        `https://cdn.example/packaged/packaged/${id}/manifest.mpd`
+      );
       expect(stored?.packagingError).toBeUndefined();
 
       const get = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
@@ -157,133 +198,110 @@ describe('HLS/DASH packaging (issue #9)', () => {
       expect(get.json().manifestUrls.dash).toBe(stored?.manifestUrls?.dash);
     });
 
-    it('honours explicit manifest paths reported by the packager', async () => {
+    it('honours the packager-reported outputPath directory', async () => {
       const { app, repo } = await buildApp();
       const id = await createAsset(app);
 
       await app.inject({
         method: 'POST',
-        url: '/api/v1/internal/packager-callback',
+        url: '/api/v1/internal/packagerCallback/success',
         payload: {
-          packagingId: packagingId('workspace-a', id),
-          status: 'success',
-          hlsManifest: `workspace-a/packaged/${id}/master.m3u8`,
-          dashManifest: `workspace-a/packaged/${id}/stream.mpd`
+          url: 'https://encore.example/job/1',
+          jobId: id,
+          outputPath: `/rendition_x264_3100/${id}`
         }
       });
-      const stored = await repo.get('workspace-a', id);
+      const stored = await repo.get(id);
+      // outputPath is appended to the public origin with the known manifest names
+      // (outputPathToManifestUrls, packaging.ts:664-678).
       expect(stored?.manifestUrls?.hls).toBe(
-        `https://cdn.example/packaged/workspace-a/packaged/${id}/master.m3u8`
+        `https://cdn.example/packaged/rendition_x264_3100/${id}/index.m3u8`
       );
       expect(stored?.manifestUrls?.dash).toBe(
-        `https://cdn.example/packaged/workspace-a/packaged/${id}/stream.mpd`
+        `https://cdn.example/packaged/rendition_x264_3100/${id}/manifest.mpd`
       );
-    });
-
-    it('records packagingError on failure WITHOUT changing the asset status', async () => {
-      const { app, repo } = await buildApp();
-      const id = await createAsset(app);
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: {
-          packagingId: packagingId('workspace-a', id),
-          status: 'failed',
-          error: 'packager exited non-zero'
-        }
-      });
-      expect(res.statusCode).toBe(200);
-      const stored = await repo.get('workspace-a', id);
-      expect(stored?.packagingError).toBe('packager exited non-zero');
-      expect(stored?.manifestUrls).toBeUndefined();
-      expect(stored?.status).toBe('uploading');
-    });
-
-    it('a later success clears a prior packagingError', async () => {
-      const { app, repo } = await buildApp();
-      const id = await createAsset(app);
-      const pid = packagingId('workspace-a', id);
-
-      await app.inject({
-        method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: pid, status: 'failed', error: 'transient' }
-      });
-      expect((await repo.get('workspace-a', id))?.packagingError).toBe('transient');
-
-      await app.inject({
-        method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: pid, status: 'success' }
-      });
-      const stored = await repo.get('workspace-a', id);
-      expect(stored?.packagingError).toBeUndefined();
-      expect(stored?.manifestUrls?.hls).toBeTruthy();
     });
 
     it('returns 404 for an unknown asset', async () => {
       const { app } = await buildApp();
       const res = await app.inject({
         method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: 'workspace-a:nope', status: 'success' }
+        url: '/api/v1/internal/packagerCallback/success',
+        payload: { url: 'https://encore.example/job/1', jobId: 'nope' }
       });
       expect(res.statusCode).toBe(404);
-    });
-
-    it('returns 404 for a malformed packagingId (no leak / no crash)', async () => {
-      const { app } = await buildApp();
-      const res = await app.inject({
-        method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: 'not-a-valid-id', status: 'success' }
-      });
-      expect(res.statusCode).toBe(404);
-    });
-
-    it.skip('does not cross workspaces: a workspace-b id cannot touch workspace-a', async () => {
-      const { app, repo } = await buildApp();
-      const id = await createAsset(app); // in workspace-a
-      // A callback claiming workspace-b ownership of the same local id resolves
-      // to a different (non-existent) asset -> 404, and never mutates the real one.
-      const res = await app.inject({
-        method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: `workspace-b:${id}`, status: 'success' }
-      });
-      expect(res.statusCode).toBe(404);
-      expect((await repo.get('workspace-a', id))?.manifestUrls).toBeUndefined();
     });
 
     it('returns 501 when packaging is not configured', async () => {
       const { app } = await buildApp({ withPackaging: false });
       const res = await app.inject({
         method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: 'workspace-a:asset-1', status: 'success' }
+        url: '/api/v1/internal/packagerCallback/success',
+        payload: { url: 'https://encore.example/job/1', jobId: 'asset-1' }
       });
       expect(res.statusCode).toBe(501);
       expect(res.json().error).toBe('not_configured');
     });
   });
 
-  describe('end-to-end: transcode-completion trigger -> packager callback', () => {
+  describe('POST /api/v1/internal/packagerCallback/failure', () => {
+    it('records the failure on the running package execution WITHOUT changing asset status', async () => {
+      const { app, repo, pipelines } = await buildApp();
+      const id = await createAsset(app);
+      const exec = await seedRunningPackage(pipelines, id);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/internal/packagerCallback/failure',
+        // The packager does NOT echo a jobId on failure — body is { message } only.
+        payload: { message: 'packager exited non-zero' }
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ ok: true });
+
+      // The correlated execution (its running `package` step) is marked failed and
+      // carries the packager's message.
+      const after = await pipelines.get(exec.id);
+      expect(after?.status).toBe('failed');
+      const pkg = after?.steps.find((s) => s.name === 'package');
+      expect(pkg?.status).toBe('failed');
+      expect(pkg?.error).toContain('packager exited non-zero');
+
+      // The asset's lifecycle status is untouched by a packaging failure.
+      const asset = await repo.get(id);
+      expect(asset?.status).toBe('uploading');
+      expect(asset?.manifestUrls).toBeUndefined();
+    });
+
+    it('acknowledges (200) even when no execution is awaiting packaging', async () => {
+      const { app } = await buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/internal/packagerCallback/failure',
+        payload: { message: 'orphan failure' }
+      });
+      // Best-effort: the callback is always acknowledged (internal.ts:419,475).
+      expect(res.statusCode).toBe(200);
+    });
+  });
+
+  describe('end-to-end: transcode-completion trigger -> packager success callback', () => {
     it('packages automatically after a transcode succeeds and surfaces manifests', async () => {
       const { queue, jobs } = fakeQueue();
-      const { app, repo, packaging } = await buildApp({ queue });
+      const { app, packaging } = await buildApp({ queue });
       const id = await createAsset(app);
 
-      // Simulate issue #8's Encore callback handler invoking the trigger via the
-      // PackagingTrigger interface once transcoding succeeds.
-      await packaging!.triggerPackaging('workspace-a', id, OUTPUTS);
+      // Simulate issue #8's Encore callback handler invoking the trigger once
+      // transcoding succeeds (triggerPackaging(assetId, encoreJobUrl)).
+      await packaging!.triggerPackaging(id, 'https://encore.example/job/1');
       expect(jobs).toHaveLength(1);
+      expect(jobs[0].jobId).toBe(id);
 
-      // The packager finishes and calls back.
+      // The packager finishes and calls back with the echoed jobId.
       await app.inject({
         method: 'POST',
-        url: '/api/v1/internal/packager-callback',
-        payload: { packagingId: jobs[0].packagingId, status: 'success' }
+        url: '/api/v1/internal/packagerCallback/success',
+        payload: { url: jobs[0].url, jobId: jobs[0].jobId }
       });
 
       const get = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });

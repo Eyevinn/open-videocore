@@ -112,7 +112,7 @@ async function createReadyAsset(app: FastifyInstance, repo: InMemoryAssetReposit
   });
   const id = res.json().id as string;
   // Give it a stored object key (as ingest would).
-  await repo.update('workspace-a', id, { objectKey: `sources/${id}` });
+  await repo.update(id, { objectKey: `sources/${id}` });
   return id;
 }
 
@@ -166,7 +166,7 @@ describe('technical metadata extraction (issue #6)', () => {
       expect(res.json()).toEqual({ assetId: id, status: 'extracting' });
 
       await extractionDone();
-      const asset = await repo.get('workspace-a', id);
+      const asset = await repo.get(id);
       expect(probe).toHaveBeenCalledOnce();
       expect(asset?.technicalMetadata?.codec).toBe('h264');
       expect(asset?.technicalMetadata?.audioTracks).toHaveLength(1);
@@ -206,7 +206,7 @@ describe('technical metadata extraction (issue #6)', () => {
       expect(res.statusCode).toBe(202);
       await extractionDone();
 
-      const asset = await repo.get('workspace-a', id);
+      const asset = await repo.get(id);
       // Asset record is intact; only the metadata fields reflect the failure.
       expect(asset?.status).toBe('uploading');
       expect(asset?.technicalMetadata).toBeNull();
@@ -225,11 +225,11 @@ describe('technical metadata extraction (issue #6)', () => {
 
       await app.inject({ method: 'POST', url: `/api/v1/assets/${id}/extract-metadata`, headers: A });
       await extractionDone();
-      expect((await repo.get('workspace-a', id))?.technicalMetadataError).toBe('transient');
+      expect((await repo.get(id))?.technicalMetadataError).toBe('transient');
 
       await app.inject({ method: 'POST', url: `/api/v1/assets/${id}/extract-metadata`, headers: A });
       await extractionDone();
-      const asset = await repo.get('workspace-a', id);
+      const asset = await repo.get(id);
       expect(asset?.technicalMetadata?.codec).toBe('h264');
       expect(asset?.technicalMetadataError).toBeUndefined();
     });
@@ -291,7 +291,7 @@ describe('technical metadata extraction (issue #6)', () => {
   describe('extractTechnicalMetadata is fire-and-forget safe', () => {
     it('never rejects even when the error-recording write also fails', async () => {
       const repo = new InMemoryAssetRepository();
-      const asset = await repo.create('workspace-a', { name: 'x', objectKey: 'sources/x' });
+      const asset = await repo.create({ name: 'x', objectKey: 'sources/x' });
       const onError = vi.fn();
       // probe throws AND the repo update throws -> still resolves.
       const brokenRepo = {
@@ -303,7 +303,7 @@ describe('technical metadata extraction (issue #6)', () => {
 
       await expect(
         extractTechnicalMetadata(
-          { workspaceId: 'workspace-a', assetId: asset.id, objectKey: 'sources/x' },
+          { assetId: asset.id, objectKey: 'sources/x' },
           {
             assets: brokenRepo,
             storage: fakeStorage(),

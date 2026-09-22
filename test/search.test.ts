@@ -38,18 +38,18 @@ async function seed(
   workspaceId: string,
   fields: Record<string, unknown>
 ): Promise<void> {
-  const asset = await repo.create(workspaceId, { name: String(fields['name'] ?? 'asset') });
+  const asset = await repo.create({ name: String(fields['name'] ?? 'asset') });
   if (fields['technicalMetadata']) {
-    await repo.update(workspaceId, asset.id, {
+    await repo.update(asset.id, {
       technicalMetadata: fields['technicalMetadata'] as never
     });
   }
   if (fields['description']) {
-    await repo.update(workspaceId, asset.id, { description: String(fields['description']) });
+    await repo.update(asset.id, { description: String(fields['description']) });
   }
   // tags are not part of the public model; attach them to the stored record.
   if (fields['tags']) {
-    const stored = await repo.get(workspaceId, asset.id);
+    const stored = await repo.get(asset.id);
     (stored as { tags?: unknown }).tags = fields['tags'];
     (repo as unknown as { store: Map<string, unknown> }).store.set(asset.id, stored);
   }

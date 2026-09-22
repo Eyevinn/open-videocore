@@ -77,12 +77,17 @@ async function buildApp(): Promise<{ app: FastifyInstance; storages: Map<string,
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
   const repository = new InMemoryAssetRepository();
+  // Post-ADR-003 (#64): StorageFactory is zero-arg (src/routes/asset-upload.ts:37)
+  // — a deployed instance is a single tenant, so there is no per-request
+  // workspace key. Keep the Map shape the assertions expect, but store the one
+  // storage under a fixed key and hand it back on every (arg-less) call.
+  const STORAGE_KEY = 'default';
   const storages = new Map<string, FakeStorage>();
-  const storageFor = (workspaceId: string) => {
-    let s = storages.get(workspaceId);
+  const storageFor = () => {
+    let s = storages.get(STORAGE_KEY);
     if (!s) {
-      s = new FakeStorage(workspaceId);
-      storages.set(workspaceId, s);
+      s = new FakeStorage(STORAGE_KEY);
+      storages.set(STORAGE_KEY, s);
     }
     return s as unknown as import('../src/data/storage.js').WorkspaceStorage;
   };
@@ -181,7 +186,7 @@ describe('direct client-side upload (issue #4)', () => {
         headers: A
       });
       expect(res.json().expiresInSeconds).toBe(120);
-      const storage = storages.get('workspace-a')!;
+      const storage = storages.get('default')!;
       const call = storage.calls.find((c) => c.method === 'presignedPut')!;
       expect(call.args[1]).toBe(120);
     });
@@ -233,7 +238,7 @@ describe('direct client-side upload (issue #4)', () => {
       });
       expect(complete.statusCode).toBe(200);
 
-      const storage = storages.get('workspace-a')!;
+      const storage = storages.get('default')!;
       const completeCall = storage.calls.find((c) => c.method === 'completeMultipartUpload')!;
       expect(completeCall.args[1]).toBe(uploadId);
       expect(completeCall.args[2]).toHaveLength(2);
@@ -422,7 +427,7 @@ describe('direct client-side upload (issue #4)', () => {
         headers: A
       });
       expect(res.statusCode).toBe(204);
-      const storage = storages.get('workspace-a')!;
+      const storage = storages.get('default')!;
       const abortCall = storage.calls.find((c) => c.method === 'abortMultipartUpload')!;
       expect(abortCall).toBeTruthy();
       expect(abortCall.args[1]).toBe('upload-xyz');
