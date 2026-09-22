@@ -35,8 +35,8 @@ import { webhooksRouter } from '../src/routes/webhooks.js';
 import { internalRouter } from '../src/routes/internal.js';
 import { InMemoryWebhookRepository } from '../src/data/inmemory-webhook-repo.js';
 import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
+import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
 import { WebhookDispatcher } from '../src/services/webhook-dispatcher.js';
-import { packagingId } from '../src/pipeline/packaging.js';
 
 const auth = (token: string) => ({ authorization: `Bearer ${token}` });
 const A = auth('token-a');
@@ -71,7 +71,8 @@ describe('webhook registration CRUD (issue #13)', () => {
     });
     expect(created.statusCode).toBe(201);
     const id = created.json().id as string;
-    expect(created.json().workspaceId).toBe('workspace-a');
+    // Post-ADR-003 (#64): the create response (registrationSchema in
+    // src/routes/webhooks.ts) no longer carries workspaceId.
     expect(created.json().events).toEqual(['asset.ready', 'transcode.complete']);
 
     const list = await app.inject({ method: 'GET', url: '/api/v1/webhooks', headers: A });
@@ -300,6 +301,7 @@ describe('internal callbacks fire webhook events (issue #13)', () => {
     registerAuth(app);
     const webhookRepo = new InMemoryWebhookRepository();
     const assets = new InMemoryAssetRepository();
+    const pipelines = new InMemoryPipelineRepository();
     const delivered: { url: string; ok: boolean }[] = [];
     const dispatcher = new WebhookDispatcher({
       repository: webhookRepo,
@@ -318,24 +320,40 @@ describe('internal callbacks fire webhook events (issue #13)', () => {
       prefix: '/api/v1/internal',
       packaging,
       repository: assets,
+      pipelineRepository: pipelines,
       webhookDispatcher: dispatcher
     });
     await app.ready();
-    return { app, assets, webhookRepo, delivered };
+    return { app, assets, pipelines, webhookRepo, delivered };
+  }
+
+  // Seed a pipeline execution stalled on a RUNNING `package` step — the state the
+  // packager-failure callback correlates against (src/routes/internal.ts:433-445).
+  async function seedRunningPackage(
+    pipelines: InMemoryPipelineRepository,
+    assetId: string
+  ) {
+    const exec = await pipelines.create({ assetId, steps: ['package'] });
+    await pipelines.update(exec.id, {
+      steps: exec.steps.map((s) => (s.name === 'package' ? { ...s, status: 'running' } : s))
+    });
+    return exec;
   }
 
   it('fires package.complete on a successful packager callback', async () => {
     const { app, assets, webhookRepo, delivered } = await buildCallbackApp();
-    const asset = await assets.create('workspace-a', { name: 'clip' });
+    const asset = await assets.create({ name: 'clip' });
     await webhookRepo.create({
       url: 'https://hook.example',
       events: ['package.complete']
     });
 
+    // Current contract: POST /packagerCallback/success with { url, jobId } where
+    // jobId === the assetId we enqueued (src/routes/internal.ts:55-58,395-399).
     const res = await app.inject({
       method: 'POST',
-      url: '/api/v1/internal/packager-callback',
-      payload: { packagingId: packagingId('workspace-a', asset.id), status: 'success' }
+      url: '/api/v1/internal/packagerCallback/success',
+      payload: { url: 'https://encore.example/job/1', jobId: asset.id }
     });
     expect(res.statusCode).toBe(200);
     // Give the fire-and-forget delivery a tick to settle.
@@ -344,22 +362,23 @@ describe('internal callbacks fire webhook events (issue #13)', () => {
   });
 
   it('fires package.failed on a failed packager callback', async () => {
-    const { app, assets, webhookRepo, delivered } = await buildCallbackApp();
-    const asset = await assets.create('workspace-a', { name: 'clip' });
+    const { app, assets, pipelines, webhookRepo, delivered } = await buildCallbackApp();
+    const asset = await assets.create({ name: 'clip' });
+    await seedRunningPackage(pipelines, asset.id);
     await webhookRepo.create({
       url: 'https://hook.example',
       events: ['package.failed']
     });
 
-    await app.inject({
+    // Current contract: POST /packagerCallback/failure with { message } only —
+    // the packager does not echo a jobId, so the handler correlates by the
+    // running `package` execution seeded above (src/routes/internal.ts:420-465).
+    const res = await app.inject({
       method: 'POST',
-      url: '/api/v1/internal/packager-callback',
-      payload: {
-        packagingId: packagingId('workspace-a', asset.id),
-        status: 'failed',
-        error: 'boom'
-      }
+      url: '/api/v1/internal/packagerCallback/failure',
+      payload: { message: 'boom' }
     });
+    expect(res.statusCode).toBe(200);
     await new Promise((r) => setImmediate(r));
     expect(delivered).toContainEqual({ url: 'https://hook.example', ok: true });
   });

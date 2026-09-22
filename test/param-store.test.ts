@@ -410,6 +410,12 @@ describe('ensureParameterStore', () => {
       getServiceAccessToken: vi.fn(async () => 'sat'),
       getInstance: vi.fn(async () => undefined),
       createInstance: vi.fn(async () => ({ name: 'openvideocore-config' })),
+      // #68: ensureParameterStore now provisions a dedicated Valkey before the
+      // config-svc, waits for it to be ready, then resolves its TCP endpoint.
+      waitForInstanceReady: vi.fn(async () => undefined),
+      getPortsForInstance: vi.fn(async () => [
+        { externalIp: '10.0.0.1', externalPort: 6379, internalPort: 6379 }
+      ]),
       ...overrides
     };
   }
@@ -441,7 +447,9 @@ describe('ensureParameterStore', () => {
       'sat',
       // OSC instance names must be alphanumeric-only (no hyphens) — smoke-test
       // finding, mirrored by DEFAULT_PARAM_STORE_INSTANCE_NAME in param-store.ts.
-      { name: 'ovcconfig', ConfigApiKey: 'key123' }
+      // #68: the config-svc is created with a RedisUrl pointing at its dedicated
+      // Valkey (resolved from the mocked getPortsForInstance endpoint).
+      { name: 'ovcconfig', ConfigApiKey: 'key123', RedisUrl: 'redis://10.0.0.1:6379' }
     );
   });
 
@@ -459,7 +467,7 @@ describe('ensureParameterStore', () => {
     expect(osc.createInstance).toHaveBeenCalledWith(
       PARAM_STORE_SERVICE_ID,
       'sat',
-      { name: 'my-config', ConfigApiKey: 'key123' }
+      { name: 'my-config', ConfigApiKey: 'key123', RedisUrl: 'redis://10.0.0.1:6379' }
     );
   });
 

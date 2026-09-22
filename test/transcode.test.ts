@@ -36,6 +36,7 @@ vi.mock('../src/auth/workspace.js', async () => {
 });
 
 import { registerAuth } from '../src/auth/middleware.js';
+import { DEPLOYMENT_CONTEXT } from '../src/auth/workspace.js';
 import { assetsRouter } from '../src/routes/assets.js';
 import { jobsRouter } from '../src/routes/jobs.js';
 import { internalRouter } from '../src/routes/internal.js';
@@ -121,9 +122,9 @@ async function buildApp(
 
 // Create a source asset already carrying a stored object (ready to transcode).
 async function makeSource(h: Harness, name = 'my-video'): Promise<string> {
-  const asset = await h.assets.create('workspace-a', { name, objectKey: `ingest/${name}` });
-  await h.assets.update('workspace-a', asset.id, { status: 'processing' });
-  await h.assets.update('workspace-a', asset.id, { status: 'ready' });
+  const asset = await h.assets.create({ name, objectKey: `ingest/${name}` });
+  await h.assets.update(asset.id, { status: 'processing' });
+  await h.assets.update(asset.id, { status: 'ready' });
   return asset.id;
 }
 
@@ -142,12 +143,19 @@ describe('transcode job management (issue #8)', () => {
       expect(res.statusCode).toBe(202);
       const { jobId, encoreJobId } = res.json();
       expect(jobId).toBeTruthy();
-      expect(encoreJobId).toContain('workspace-a');
+      // Post-ADR-003 (#64): the Encore job id embeds the fixed deployment
+      // context (encodeEncoreJobId in src/data/job-repo.ts:287; the route falls
+      // back to DEPLOYMENT_CONTEXT when no stack resolver is wired), not a
+      // per-request workspace.
+      expect(encoreJobId).toContain(DEPLOYMENT_CONTEXT);
 
-      // Encore received the resolved 1080p ladder + s3 input/output URIs.
+      // Encore received the default named profile + s3 input/output URIs. The
+      // profile is a server-side named-profile STRING (EncoreSubmitInput.profile
+      // in src/pipeline/encore-client.ts:30); no explicit preset defaults to
+      // 'program' (src/pipeline/transcode.ts:90). The output ladder is resolved
+      // server-side by Encore, so it is no longer part of the submit input.
       expect(h.submitted).toHaveLength(1);
-      expect(h.submitted[0].profile.name).toBe('program');
-      expect(h.submitted[0].profile.outputs[0].label).toBe('1080p');
+      expect(h.submitted[0].profile).toBe('program');
       expect(h.submitted[0].inputUri).toBe(`s3://src-bucket/ingest/my-video`);
       expect(h.submitted[0].outputUri).toContain('s3://out-bucket/');
       expect(h.submitted[0].externalId).toBe(encoreJobId);
@@ -157,7 +165,7 @@ describe('transcode job management (issue #8)', () => {
       // The scaler advances the job to `running` and the asset to `processing`
       // via its onDispatched callback once it dispatches to an Encore instance,
       // which the fake client here does not exercise. So the asset stays `ready`.
-      const src = await h.assets.get('workspace-a', sourceId);
+      const src = await h.assets.get(sourceId);
       expect(src?.status).toBe('ready');
     });
 
@@ -226,7 +234,9 @@ describe('transcode job management (issue #8)', () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);
 
-      for (const [preset, name] of [['720p', 'program'], ['480p', 'program']] as const) {
+      // An explicit `profile` is forwarded verbatim as the server-side named
+      // profile string (src/pipeline/transcode.ts:90,137 — preset ?? 'program').
+      for (const preset of ['720p', '480p'] as const) {
         h.submitted.length = 0;
         const res = await h.app.inject({
           method: 'POST',
@@ -235,7 +245,7 @@ describe('transcode job management (issue #8)', () => {
           payload: { profile: preset }
         });
         expect(res.statusCode).toBe(202);
-        expect(h.submitted[0].profile.name).toBe(name);
+        expect(h.submitted[0].profile).toBe(preset);
       }
     });
 
@@ -262,8 +272,10 @@ describe('transcode job management (issue #8)', () => {
         payload: { customProfile }
       });
       expect(res.statusCode).toBe(202);
-      expect(h.submitted[0].profile.name).toBe('my-custom');
-      expect(h.submitted[0].profile.outputs[0].label).toBe('square');
+      // A customProfile is forwarded to Encore by its NAME (a server-side named
+      // profile string); the ladder is resolved server-side, so only the name is
+      // carried in the submit input (src/pipeline/transcode.ts:137).
+      expect(h.submitted[0].profile).toBe('my-custom');
     });
 
     // Note: the 202 happy-path threading of profileParams from
@@ -378,7 +390,7 @@ describe('transcode job management (issue #8)', () => {
       });
       expect(missing.statusCode).toBe(404);
 
-      const noObj = await h.assets.create('workspace-a', { name: 'no-object' });
+      const noObj = await h.assets.create({ name: 'no-object' });
       const res = await h.app.inject({
         method: 'POST',
         url: `/api/v1/assets/${noObj.id}/transcode`,
@@ -400,7 +412,7 @@ describe('transcode job management (issue #8)', () => {
       expect(res.statusCode).toBe(501);
     });
 
-    it('502 when Encore rejects the submission and reverts the source', async () => {
+    it('502 when Encore rejects the submission; the job fails and the source stays ready', async () => {
       const h = await buildApp({ encoreFail: new Error('encore boom') });
       const sourceId = await makeSource(h);
       const res = await h.app.inject({
@@ -410,8 +422,22 @@ describe('transcode job management (issue #8)', () => {
         payload: {}
       });
       expect(res.statusCode).toBe(502);
-      const src = await h.assets.get('workspace-a', sourceId);
-      expect(src?.status).toBe('failed');
+      // Under ADR-006 the submit only enqueues the job on the scaler's local
+      // queue; it does not move the source out of `ready`. So a submit-time Encore
+      // rejection fails the JOB, but the source asset stays `ready` — there is
+      // nothing to revert, and the asset state machine forbids `ready -> failed`
+      // anyway (ALLOWED_TRANSITIONS in src/data/asset-repo.ts:37). The source is
+      // therefore reusable / retryable. submitTranscode guards the revert with
+      // isValidTransition so this rejection surfaces as the real Encore error
+      // (502), not an InvalidStateTransitionError.
+      const src = await h.assets.get(sourceId);
+      expect(src?.status).toBe('ready');
+      // The transcode job carries the failure and the Encore error message.
+      const jobs = h.jobs;
+      const listed = await jobs.list();
+      const failed = listed.items.find((j) => j.assetId === sourceId && j.type === 'transcode');
+      expect(failed?.status).toBe('failed');
+      expect(failed?.error).toContain('encore boom');
     });
   });
 
@@ -525,6 +551,12 @@ describe('transcode job management (issue #8)', () => {
   });
 
   describe('POST /api/v1/internal/encore-callback', () => {
+    // Submit the transcode job AND advance it to `running`, mirroring the Encore
+    // auto-scaler's onDispatched (src/main.ts) which moves a dispatched job
+    // queued->running (ADR-006). completeTranscode only settles a `running` job to
+    // `done`; the job state machine forbids queued->done directly
+    // (ALLOWED_JOB_TRANSITIONS in src/data/job-repo.ts:214). The sibling
+    // encore-callback-poller.test.ts uses the identical setup (line 452-454).
     async function submitJob(h: Harness, sourceId: string): Promise<string> {
       const res = await h.app.inject({
         method: 'POST',
@@ -532,10 +564,16 @@ describe('transcode job management (issue #8)', () => {
         headers: A,
         payload: {}
       });
-      return res.json().encoreJobId;
+      const encoreJobId = res.json().encoreJobId as string;
+      const found = await h.jobs.findByEncoreJobId(encoreJobId);
+      // Scaler dispatch: queued -> running, and the source asset -> processing so
+      // the successful callback can drive it back to `ready`.
+      await h.jobs.update(found!.job.id, { status: 'running' });
+      await h.assets.update(sourceId, { status: 'processing' });
+      return encoreJobId;
     }
 
-    it('creates ready child assets and records renditions on the source', async () => {
+    it('records embedded renditions on the source and returns it to ready (issue #79)', async () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);
       const encoreJobId = await submitJob(h, sourceId);
@@ -556,25 +594,27 @@ describe('transcode job management (issue #8)', () => {
       });
       expect(cb.statusCode).toBe(200);
       const body = cb.json();
+      // Issue #79: renditions are embedded on the source asset — there are no
+      // child assets. The ack surfaces the count (encoreAckSchema in
+      // src/routes/internal.ts:99-102 = { applied, renditionCount }).
       expect(body.applied).toBe(true);
-      expect(body.renditionAssetIds).toHaveLength(2);
-
-      // Children are ready and linked to the source.
-      for (const childId of body.renditionAssetIds) {
-        const child = await h.assets.get('workspace-a', childId);
-        expect(child?.status).toBe('ready');
-        expect(child?.parentId).toBe(sourceId);
-      }
+      expect(body.renditionCount).toBe(2);
 
       // Source carries the renditions array and is ready again.
-      const src = await h.assets.get('workspace-a', sourceId);
+      const src = await h.assets.get(sourceId);
       expect(src?.status).toBe('ready');
       expect(src?.renditions).toHaveLength(2);
+      // Labels/objectKeys derive from the Encore output (normaliseRenditions in
+      // src/routes/internal.ts:203-219: label `rendition-<n>`, objectKey <- file).
       expect(src?.renditions?.map((r) => r.label)).toEqual(['rendition-1', 'rendition-2']);
       expect(src?.renditions?.[0].objectKey).toBe('out/1080.mp4');
+
+      // No child assets were created (embedded-rendition model, issue #79).
+      const children = await h.assets.list({ parentId: sourceId });
+      expect(children.total).toBe(0);
     });
 
-    it('is idempotent for duplicate callbacks (no duplicate children)', async () => {
+    it('is idempotent for duplicate callbacks (renditions recorded once)', async () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);
       const encoreJobId = await submitJob(h, sourceId);
@@ -594,10 +634,12 @@ describe('transcode job management (issue #8)', () => {
         url: '/api/v1/internal/encore-callback',
         payload
       });
+      // The second callback finds the job already terminal (`done`) and no-ops
+      // (completeTranscode idempotency short-circuit, src/pipeline/transcode.ts:234-247).
       expect(second.json().applied).toBe(false);
 
-      const children = await h.assets.list('workspace-a', { parentId: sourceId });
-      expect(children.total).toBe(1);
+      const src = await h.assets.get(sourceId);
+      expect(src?.renditions).toHaveLength(1);
     });
 
     it('marks the job and source failed on a failure callback', async () => {
@@ -610,7 +652,7 @@ describe('transcode job management (issue #8)', () => {
         payload: { externalId: encoreJobId, status: 'FAILED', message: 'bad input' }
       });
       expect(cb.statusCode).toBe(200);
-      const src = await h.assets.get('workspace-a', sourceId);
+      const src = await h.assets.get(sourceId);
       expect(src?.status).toBe('failed');
       const found = await h.jobs.findByEncoreJobId(encoreJobId);
       expect(found?.job.status).toBe('failed');

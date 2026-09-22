@@ -95,7 +95,9 @@ describe('makeOscProbeRunner', () => {
     return {
       context,
       createJob: vi.fn(async () => ({ name: 'x' })),
-      waitForJobToComplete: vi.fn(async () => undefined),
+      // The runner polls getJob until a terminal status (osc-job-poll.ts);
+      // 'SuccessCriteriaMet' is eyevinn-ffmpeg-s3's terminal success value.
+      getJob: vi.fn(async () => ({ status: 'SuccessCriteriaMet' })),
       getLogsForInstance: vi.fn(async () => log),
       removeJob: vi.fn(async () => undefined)
     } as unknown as OscJobApi;
@@ -106,7 +108,7 @@ describe('makeOscProbeRunner', () => {
     const result = await makeOscProbeRunner(api)('https://minio/obj?sig=a');
     expect(result.format?.format_name).toContain('mov');
     expect(api.createJob).toHaveBeenCalledOnce();
-    expect(api.waitForJobToComplete).toHaveBeenCalledOnce();
+    expect(api.getJob).toHaveBeenCalledOnce();
     expect(api.removeJob).toHaveBeenCalledOnce();
   });
 

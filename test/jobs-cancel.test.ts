@@ -158,7 +158,7 @@ describe('cancel handler (issue #126)', () => {
       { jobs: h.jobs, assets: h.assets }
     );
 
-    expect(result).toEqual({ applied: false, renditionCount: 0 });
+    expect(result).toEqual({ applied: false, renditionCount: 0, renditions: [] });
 
     // Job is still cancelled — the late callback did not corrupt state.
     const job = await h.jobs.get(jobId);

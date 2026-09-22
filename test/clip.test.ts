@@ -72,7 +72,7 @@ async function createAssetWithObject(app: FastifyInstance, repo: InMemoryAssetRe
     payload: { name: 'source' }
   });
   const id = res.json().id as string;
-  await repo.update('workspace-a', id, { objectKey: `ingest/${id}` });
+  await repo.update(id, { objectKey: `ingest/${id}` });
   return id;
 }
 
@@ -85,12 +85,11 @@ describe('clip object key naming', () => {
 describe('clip orchestration', () => {
   it('creates a ready child asset pointing at the source', async () => {
     const repo = new InMemoryAssetRepository();
-    const source = await repo.create('workspace-a', { name: 'src', objectKey: 'ingest/src' });
+    const source = await repo.create({ name: 'src', objectKey: 'ingest/src' });
     const runner: ClipRunner = vi.fn(async () => undefined);
 
     const child = await clip(
       {
-        workspaceId: 'workspace-a',
         sourceAssetId: source.id,
         objectKey: 'ingest/src',
         startSeconds: 5,
@@ -103,16 +102,15 @@ describe('clip orchestration', () => {
     expect(child.status).toBe('ready');
     expect(child.objectKey).toBe(clipObjectKey(child.id));
     expect(runner).toHaveBeenCalledOnce();
-    const stored = await repo.get('workspace-a', child.id);
+    const stored = await repo.get(child.id);
     expect(stored?.status).toBe('ready');
   });
 
   it('uses outputName for the child asset name when given', async () => {
     const repo = new InMemoryAssetRepository();
-    const source = await repo.create('workspace-a', { name: 'src', objectKey: 'ingest/src' });
+    const source = await repo.create({ name: 'src', objectKey: 'ingest/src' });
     const child = await clip(
       {
-        workspaceId: 'workspace-a',
         sourceAssetId: source.id,
         objectKey: 'ingest/src',
         startSeconds: 0,
@@ -126,7 +124,7 @@ describe('clip orchestration', () => {
 
   it('marks the child failed and rethrows when the runner fails', async () => {
     const repo = new InMemoryAssetRepository();
-    const source = await repo.create('workspace-a', { name: 'src', objectKey: 'ingest/src' });
+    const source = await repo.create({ name: 'src', objectKey: 'ingest/src' });
     const runner: ClipRunner = vi.fn(async () => {
       throw new Error('ffmpeg exited 1');
     });
@@ -134,7 +132,6 @@ describe('clip orchestration', () => {
     await expect(
       clip(
         {
-          workspaceId: 'workspace-a',
           sourceAssetId: source.id,
           objectKey: 'ingest/src',
           startSeconds: 1,
@@ -145,7 +142,7 @@ describe('clip orchestration', () => {
     ).rejects.toThrow('ffmpeg exited 1');
 
     // The child exists and is recorded as failed.
-    const children = await repo.list('workspace-a', { parentId: source.id });
+    const children = await repo.list({ parentId: source.id });
     expect(children.items).toHaveLength(1);
     expect(children.items[0]?.status).toBe('failed');
   });
@@ -170,7 +167,9 @@ describe('makeOscClipRunner', () => {
     return {
       context,
       createJob: vi.fn(async () => ({ name: 'x' })),
-      waitForJobToComplete: vi.fn(async () => undefined),
+      // The runner polls getJob until a terminal status (osc-job-poll.ts);
+      // 'SuccessCriteriaMet' is eyevinn-ffmpeg-s3's terminal success value.
+      getJob: vi.fn(async () => ({ status: 'SuccessCriteriaMet' })),
       getLogsForInstance: vi.fn(async () => ''),
       removeJob: vi.fn(async () => undefined)
     } as unknown as OscJobApi;
@@ -180,13 +179,13 @@ describe('makeOscClipRunner', () => {
     const api = fakeApi();
     await makeOscClipRunner(api)('https://minio/src', 'https://minio/dst', 1, 4);
     expect(api.createJob).toHaveBeenCalledOnce();
-    expect(api.waitForJobToComplete).toHaveBeenCalledOnce();
+    expect(api.getJob).toHaveBeenCalledOnce();
     expect(api.removeJob).toHaveBeenCalledOnce();
   });
 
   it('still cleans up the job when the wait fails', async () => {
     const api = fakeApi();
-    (api.waitForJobToComplete as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
+    (api.getJob as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
     await expect(
       makeOscClipRunner(api)('https://minio/src', 'https://minio/dst', 1, 4)
     ).rejects.toThrow('boom');

@@ -18,7 +18,7 @@ const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 describe('ADR-005 asset document model', () => {
   it('mints a ULID _id, type discriminator, schemaVersion=1, four-namespace shape', async () => {
     const repo = new InMemoryAssetRepository();
-    const asset = await repo.create('workspace-a', { name: 'Clip', tags: ['news'] });
+    const asset = await repo.create({ name: 'Clip', tags: ['news'] });
     expect(asset.id).toMatch(ULID_RE);
     const parsed = AssetDocumentSchema.parse(toAssetDocument(asset));
     expect(parsed.type).toBe('asset');
@@ -34,9 +34,9 @@ describe('ADR-005 asset document model', () => {
 
   it('round-trips technical / structural / descriptive namespaces through the mappers', async () => {
     const repo = new InMemoryAssetRepository();
-    const created = await repo.create('workspace-a', { name: 'Source' });
-    await repo.update('workspace-a', created.id, { objectKey: 'sources/x' });
-    await repo.update('workspace-a', created.id, {
+    const created = await repo.create({ name: 'Source' });
+    await repo.update(created.id, { objectKey: 'sources/x' });
+    await repo.update(created.id, {
       technicalMetadata: {
         codec: 'h264', width: 1920, height: 1080, durationSeconds: 12.5,
         bitrateBps: 5_000_000, containerFormat: 'matroska',
@@ -47,7 +47,7 @@ describe('ADR-005 asset document model', () => {
         extractedAt: new Date().toISOString()
       }
     });
-    const asset = await repo.update('workspace-a', created.id, {
+    const asset = await repo.update(created.id, {
       manifestUrls: { hls: 'https://x/master.m3u8' }, thumbnails: ['thumbs/0.jpg']
     });
     const parsed = AssetDocumentSchema.parse(
@@ -63,7 +63,7 @@ describe('ADR-005 asset document model', () => {
     expect(parsed.structural.manifests?.hls).toBe('https://x/master.m3u8');
     expect(parsed.structural.thumbnails?.[0]?.objectKey).toBe('thumbs/0.jpg');
 
-    const back = fromAssetDocument(parsed, 'workspace-a');
+    const back = fromAssetDocument(parsed);
     expect(back.technicalMetadata?.codec).toBe('h264');
     expect(back.technicalMetadata?.containerFormat).toBe('matroska');
     expect(back.technicalMetadata?.audioTracks).toHaveLength(2);
@@ -74,13 +74,13 @@ describe('ADR-005 asset document model', () => {
 
   it('records creation provenance and grows the log per namespace write (issue #53)', async () => {
     const repo = new InMemoryAssetRepository();
-    const created = await repo.create('workspace-a', { name: 'A', sourceMethod: 'url-pull' });
+    const created = await repo.create({ name: 'A', sourceMethod: 'url-pull' });
     expect(created.provenance?.[0]).toMatchObject({ by: 'user', op: 'create' });
-    const afterState = await repo.update('workspace-a', created.id, { status: 'processing' });
+    const afterState = await repo.update(created.id, { status: 'processing' });
     const ops = (afterState!.provenance ?? []).map((p) => p.op);
     expect(ops).toContain('create');
     expect(ops).toContain('state');
-    const afterTech = await repo.update('workspace-a', created.id, { technicalMetadataError: 'boom' });
+    const afterTech = await repo.update(created.id, { technicalMetadataError: 'boom' });
     expect((afterTech!.provenance ?? []).some((p) => p.op === 'technical' && p.by === 'system')).toBe(true);
   });
 

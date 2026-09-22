@@ -141,7 +141,7 @@ describe('URL-pull ingest (issue #5)', () => {
       expect(job.progress).toBe(100);
       expect(job.bytesTransferred).toBe(payload.length);
 
-      const asset = await assets.get('workspace-a', assetId as string);
+      const asset = await assets.get(assetId as string);
       expect(asset?.status).toBe('processing');
       expect(asset?.objectKey).toBe(`ingest/${assetId}`);
     });
@@ -274,7 +274,7 @@ describe('URL-pull ingest (issue #5)', () => {
       expect(String(job.error)).toContain('maximum allowed size');
       // Size errors are permanent — exactly one attempt.
       expect(job.attempts).toBe(1);
-      const asset = await assets.get('workspace-a', res.json().assetId);
+      const asset = await assets.get(res.json().assetId);
       expect(asset?.status).toBe('failed');
     });
   });
@@ -319,7 +319,7 @@ describe('URL-pull ingest (issue #5)', () => {
       expect(job.status).toBe('failed');
       expect(String(job.error)).toContain('persistent network failure');
       expect(job.attempts).toBe(3);
-      const asset = await assets.get('workspace-a', res.json().assetId);
+      const asset = await assets.get(res.json().assetId);
       expect(asset?.status).toBe('failed');
     });
   });
