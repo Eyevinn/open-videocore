@@ -130,6 +130,41 @@ async function initStackSelector() {
 // jobs-table poll and by the standalone detached detail windows (detail.js).
 const DETAIL_POLL_INTERVAL_MS = 5000;
 
+// ─── UI-scoped access token (issue #740) ─────────────────────────────────────
+//
+// Every workspace-scoped router now attaches the 401 presence gate as its first
+// preHandler (authGate, src/auth/middleware.ts:76 → app.authenticate →
+// requireAuth, src/auth/workspace.ts:52), so a request without an
+// `Authorization: Bearer` header is rejected 401 "missing access token"
+// (src/auth/workspace.ts:54). The OSC auth wall authenticates the operator's
+// browser session before /ui loads, but it does NOT inject that bearer header
+// onto the page's own fetch()/XHR calls, so every gated call from the UI failed.
+//
+// requireAuth is a PURE PRESENCE gate: it admits ANY non-empty bearer string and
+// never inspects it for identity (src/auth/workspace.ts:22-32) — the sole inbound
+// security boundary is the OSC auth wall the request has already crossed. So the
+// UI only has to present a non-empty, UI-scoped token to satisfy the gate, and it
+// must NOT be handed the real OSC access token (that would leak a wall-crossing
+// credential into the browser). We mint an opaque, per-page token and hold it
+// ONLY in memory for the lifetime of the page — never localStorage/sessionStorage,
+// per CLAUDE.md's never-persist-tokens rule (mirrors the storage-secret handling
+// at app.js:3178-3181). An anonymous request from OUTSIDE the UI still carries no
+// token and still gets 401, so this does not weaken the gate (#711 intact).
+const UI_ACCESS_TOKEN = (function mintUiAccessToken() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return 'ui-' + crypto.randomUUID();
+    }
+  } catch (_) { /* fall through to a non-crypto fallback */ }
+  return 'ui-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+})();
+
+// The Authorization header the UI presents on gated requests. Held only in the
+// module realm for the page's lifetime; never persisted.
+function uiAuthHeader() {
+  return { 'Authorization': 'Bearer ' + UI_ACCESS_TOKEN };
+}
+
 // ─── API fetch helper ────────────────────────────────────────────────────────
 
 const API_BASE = window.location.origin + '/api/v1';
@@ -139,6 +174,9 @@ async function apiFetch(path, options = {}) {
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
+    // Satisfy the 401 presence gate on every gated router (issue #740). See the
+    // UI-scoped access token note above.
+    ...uiAuthHeader(),
     // Mirror the server's trusted role header (src/auth/principal.ts:36). Only
     // honoured server-side when OVC_TRUST_ROLE_HEADER=true (src/main.ts:431);
     // otherwise it is stripped and ignored, so sending it is always safe.
@@ -1257,7 +1295,11 @@ async function renderAssetsTab(container) {
             headers: {
               'Content-Type': file.type || 'application/octet-stream',
               'Content-Length': String(file.size),
-              'X-Stack-Name': getActiveStack()
+              'X-Stack-Name': getActiveStack(),
+              // asset-upload is gated by the 401 presence gate too
+              // (src/routes/asset-upload.ts:131); this raw streaming PUT bypasses
+              // apiFetch, so present the same UI-scoped bearer (issue #740).
+              ...uiAuthHeader()
             }
           });
           if (!uploadRes.ok) {
