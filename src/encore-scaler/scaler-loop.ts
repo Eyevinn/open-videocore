@@ -630,6 +630,15 @@ export class EncoreScalerLoop {
     // write is owned by the reconciler/main.ts repo layer.
     const droppedJobs: DroppedJob[] = [];
 
+    // #768 (diagnostic-only): index of instanceId -> the externalIds Encore
+    // actually reports active on that instance, accumulated as this pass fetches
+    // each instance's real state below. Used solely to log, at each
+    // drop-classification, whether a job flagged as dropped off ITS
+    // keys.jobInstance-mapped instance is in fact still active on a DIFFERENT
+    // pool instance — the signature of the stale-mapping hypothesis. It does not
+    // feed any decision; the classification logic below is unchanged.
+    const poolActiveByInstance = new Map<string, Set<string>>();
+
     for (const [instanceId, instanceJson] of entries) {
       try {
         let record: EncoreInstanceRecord;
@@ -652,6 +661,10 @@ export class EncoreScalerLoop {
         if (!real) continue; // could not confirm — leave the record as-is
         const actualCount = real.count;
         const activeExternalIds = real.activeExternalIds;
+        // #768 (diagnostic-only): record what Encore reports active on THIS
+        // instance so a later drop-classification in this same pass can report
+        // where else in the pool a "dropped" externalId is in fact still live.
+        poolActiveByInstance.set(instanceId, activeExternalIds);
 
         if (record.activeJobs !== actualCount) {
           // eslint-disable-next-line no-console
@@ -710,6 +723,47 @@ export class EncoreScalerLoop {
                 }
               }
               droppedForInstance.push(jobId);
+
+              // #768 (diagnostic-only): capture enough state at the exact
+              // drop-classification site to confirm or refute the hypothesis
+              // that a stale keys.jobInstance mapping (a single value overwritten
+              // on each re-dispatch, scaler-loop.ts dispatch:
+              // redis.hset(keys.jobInstance, jobId, instanceId)) causes a false
+              // drop. For this job we record: the instance keys.jobInstance maps
+              // it to (mappedInstanceId — equals instanceId here precisely
+              // BECAUSE we filtered mismatches out above, so logging it documents
+              // what the mapping claimed), the pool instances whose real active
+              // set we checked this pass, the instance(s) where the externalId is
+              // ACTUALLY still active (if any — a non-empty list on a job we are
+              // about to flag dropped is the stale-mapping signature), and
+              // whether the job had already been re-dispatched (attempts > 1).
+              // This changes no decision; droppedForInstance already holds jobId.
+              const foundActiveOn: string[] = [];
+              for (const [otherInstanceId, otherActive] of poolActiveByInstance) {
+                if (otherActive.has(jobId)) foundActiveOn.push(otherInstanceId);
+              }
+              let reDispatched: boolean | 'unknown' = 'unknown';
+              try {
+                const attemptsRaw = await redis.get(keys.jobAttempts(jobId));
+                reDispatched = (Number(attemptsRaw ?? '0') || 0) > 1;
+              } catch {
+                // Best-effort: a read failure must never affect the drop path.
+                reDispatched = 'unknown';
+              }
+              // eslint-disable-next-line no-console
+              console.warn(
+                '[encore-scaler] drop-diagnostic (#768): classifying job %s as ' +
+                  'dropped — keys.jobInstance=%s reconciledInstance=%s ' +
+                  'foundActiveOnPoolInstances=%s poolInstancesCheckedThisPass=%s ' +
+                  'reDispatched=%s',
+                jobId,
+                mappedInstanceId,
+                instanceId,
+                foundActiveOn.length ? foundActiveOn.join(',') : '(none)',
+                [...poolActiveByInstance.keys()].join(',') || '(none)',
+                String(reDispatched)
+              );
+
               // Overwrite the stale Valkey status (written `running` at dispatch,
               // scaler-loop.ts:291) so a subsequent makeScalingEncoreClient
               // getJobStatus (index.ts:41) agrees with the durable job record and
