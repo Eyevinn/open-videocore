@@ -1150,6 +1150,57 @@ function setupTabs() {
 // and row actions can trigger a reload.
 let assetsTable = null;
 
+// Map a proxied-upload failure to a cause-identifying message (issue #749).
+// The proxied PUT /:id/upload path returns a JSON error envelope { error,
+// message? } for failures it raises itself (verified in src/routes/asset-upload.ts):
+//   - 403 { error:'forbidden', message }            asset-upload.ts:141
+//   - 422 { error:'invalid_state_transition', message } asset-upload.ts:144
+//   - 409 { error:'quota_exceeded', message }        asset-upload.ts:148
+//         (reason = 'quota_exceeded', src/data/storage-quota.ts:50)
+//   - 404 { error:'not_found' }  (NO message field)  asset-upload.ts:180
+//   - 413 { error:'payload_too_large', message }     asset-upload.ts:206
+//         (SourceTooLargeError, src/data/storage.ts:12)
+//   - 501 { error:'not_configured', message }        asset-upload.ts:176
+// When the app raises the error itself it supplies a human `message`, which we
+// prefer verbatim. But a body-size rejection at a reverse proxy (e.g. nginx
+// client_max_body_size) never reaches the app: it returns a bare 413 whose body
+// is non-JSON (HTML or empty), so no message/error is present — the exact case
+// the issue calls out ("Upload failed: HTTP 413" with no indication of the
+// limit). We therefore fall back to a status-derived cause so the operator always
+// learns WHY the upload failed, not just the raw status number. `body` is the
+// parsed JSON envelope or null when the response had no JSON body.
+function describeUploadFailure(status, body) {
+  if (body && typeof body.message === 'string' && body.message.trim()) {
+    return body.message;
+  }
+  const code = body && typeof body.error === 'string' ? body.error : '';
+  switch (status) {
+    case 413:
+      return 'The file is too large to upload. It exceeded the maximum request ' +
+        'size allowed by the server or an upstream proxy (body-size limit).';
+    case 409:
+      return code === 'quota_exceeded'
+        ? 'Upload rejected: the deployment has run out of storage quota.'
+        : 'Upload rejected: the asset is not in a state that accepts an upload.';
+    case 422:
+      return 'Upload rejected: the asset is not in a state that accepts an upload ' +
+        '(it may already be processing or archived).';
+    case 401:
+    case 403:
+      return 'Not authorised to upload to this asset. Check your role or credentials.';
+    case 404:
+      return 'The asset no longer exists — it may have been removed. Try creating it again.';
+    case 501:
+      return 'Object storage is not configured on this deployment, so uploads are unavailable.';
+    default:
+      if (status >= 500) {
+        return 'The server or storage backend failed while receiving the upload. ' +
+          'Please try again.';
+      }
+      return 'Upload failed (HTTP ' + status + ').';
+  }
+}
+
 async function renderAssetsTab(container) {
   // Layout: full-height table on the left, detail side panel on the right (hidden initially).
   const layout = document.createElement('div');
@@ -1251,18 +1302,31 @@ async function renderAssetsTab(container) {
           const assetId = asset.id;
           showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
           // Stream the file through the API (avoids CORS on MinIO presigned URLs).
-          const uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
-            method: 'PUT',
-            body: file,
-            headers: {
-              'Content-Type': file.type || 'application/octet-stream',
-              'Content-Length': String(file.size),
-              'X-Stack-Name': getActiveStack()
-            }
-          });
+          let uploadRes;
+          try {
+            uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
+              method: 'PUT',
+              body: file,
+              headers: {
+                'Content-Type': file.type || 'application/octet-stream',
+                'Content-Length': String(file.size),
+                'X-Stack-Name': getActiveStack()
+              }
+            });
+          } catch (_) {
+            // fetch() itself rejected — no HTTP response was received at all
+            // (connection refused, DNS failure, offline, request aborted). Name
+            // this cause explicitly so it is never confused with a server-side
+            // rejection carrying a status code (issue #749).
+            throw new Error('Network error: could not reach the server to upload the ' +
+              'file. Check your connection and try again.');
+          }
           if (!uploadRes.ok) {
-            const err = await uploadRes.json().catch(() => ({}));
-            throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
+            // Parse the JSON error envelope when present; a proxy-level rejection
+            // (e.g. 413 from nginx) has a non-JSON body, so fall back to null and
+            // let describeUploadFailure derive the cause from the status code.
+            const body = await uploadRes.json().catch(() => null);
+            throw new Error(describeUploadFailure(uploadRes.status, body));
           }
           close();
           if (assetsTable) assetsTable.reload();
