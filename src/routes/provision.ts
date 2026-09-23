@@ -973,7 +973,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // starting up — retry with backoff the same way we do for MinIO.
         const couchAdminUrl = couchdbUrl
           .replace(/\/$/, '')
-          .replace(/^(https?:\/\/)/, `$1admin:${couchdbAdminPassword}@`);
+          .replace(
+            /^(https?:\/\/)/,
+            `$1admin:${encodeURIComponent(couchdbAdminPassword)}@`
+          );
         const couchServer = nano(couchAdminUrl);
         const couchDbs = process.env['COUCHDB_ASSETS_DB']
           ? [process.env['COUCHDB_ASSETS_DB']]
