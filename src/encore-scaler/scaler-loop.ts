@@ -373,6 +373,22 @@ export class EncoreScalerLoop {
   // with no recovered message keeps the generic gone-from-active-set wording in
   // main.ts — reserving that string for the genuine no-reported-cause case.
   //
+  // #728: an empty result used to be SILENT — every one of the four ways this can
+  // legitimately recover no reason returned an empty map with no logging, so a
+  // live drop that surfaced the generic wording could not be attributed to a
+  // cause. It now warns, naming which case occurred (with the instance + job ids):
+  //   A. fetch not ok           — logs the HTTP status code.
+  //   B. fetch threw            — logs the error (after one transport retry).
+  //   C. job absent from page   — job not in the first FAILED page.
+  //   D. job present, empty msg  — FAILED document exists but `message` is empty.
+  // De-race (#728): this fetch runs INSIDE reconcile(), which is tick() step 0 —
+  // BEFORE the tick's scale-down step (step 4) can select the instance for
+  // teardown. The dropped-job reason for an instance is therefore always resolved
+  // (or definitively failed and logged) within the same reconcile pass that
+  // observed the drop, so an instance is never torn down between the drop diff and
+  // its reason fetch. A short transport retry (proposal 3) further shrinks the
+  // window against a teardown the drop itself triggered.
+  //
   // CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
   //   - findByStatus?status=FAILED HATEOAS page + externalId per encoreJob —
   //     sweepTerminalJobs (encore-callback-poller.ts:791-802) + fetchRealActiveState
@@ -387,29 +403,114 @@ export class EncoreScalerLoop {
     const reasons = new Map<string, string>();
     if (droppedExternalIds.length === 0) return reasons;
     const wanted = new Set(droppedExternalIds);
-    try {
+    const instanceId = record.instanceId;
+    const workspaceId = this.config.workspaceId;
+
+    type EncoreFailedPage = {
+      _embedded?: {
+        encoreJobs?: Array<{ externalId?: string; message?: string }>;
+      };
+    };
+
+    // #728: perform the FAILED-page fetch with a single retry on a transport-class
+    // error (fetch threw). The recovery window is short — the instance is torn down
+    // precisely because the drop just took activeJobs to 0 — so one immediate retry
+    // materially improves the odds of recovering the reason before teardown without
+    // blocking the reconcile pass. A non-ok HTTP response is NOT retried (it is a
+    // definite answer from a reachable instance); only a thrown fetch is.
+    const doFetch = async (): Promise<Response> => {
       const token = await this.config.getToken();
       const base = record.url.replace(/\/$/, '');
-      const res = await fetch(
+      return fetch(
         `${base}/encoreJobs/search/findByStatus?status=FAILED&page=0&size=100`,
         { headers: { authorization: `Bearer ${token}` } }
       );
-      if (!res.ok) return reasons;
-      type EncoreFailedPage = {
-        _embedded?: {
-          encoreJobs?: Array<{ externalId?: string; message?: string }>;
-        };
-      };
-      const body = (await res.json().catch(() => ({}))) as EncoreFailedPage;
-      for (const j of body._embedded?.encoreJobs ?? []) {
-        if (!j.externalId || !wanted.has(j.externalId)) continue;
-        const msg = typeof j.message === 'string' ? j.message.trim() : '';
-        if (msg) reasons.set(j.externalId, msg);
+    };
+
+    let res: Response;
+    try {
+      try {
+        res = await doFetch();
+      } catch (firstErr) {
+        // Transport-class error: retry once before giving up (#728 proposal 3).
+        try {
+          res = await doFetch();
+        } catch {
+          throw firstErr;
+        }
       }
-    } catch {
-      // Best-effort: any error means we surface the generic wording for these
-      // drops instead — never throw into the reconcile tick.
+    } catch (err) {
+      // #728 case B — fetch threw (even after one retry). Surface the generic
+      // wording for these drops, but no longer SILENTLY: name the case, the
+      // instance, and the affected job ids so the empty result is diagnosable.
+      console.warn(
+        '[encore-scaler] drop-reason recovery: FAILED-status fetch threw for ' +
+          `instance ${instanceId} (workspace=${workspaceId}); cannot recover ` +
+          `Encore's failure text for jobs [${droppedExternalIds.join(', ')}] — ` +
+          'these will surface the generic gone-from-active-set wording:',
+        err
+      );
+      return reasons;
     }
+
+    if (!res.ok) {
+      // #728 case A — fetch not ok. Include the status code so a race with the
+      // instance teardown (the instance may have become unreachable between the
+      // drop diff and this follow-up fetch) is distinguishable from an Encore-side
+      // error.
+      console.warn(
+        '[encore-scaler] drop-reason recovery: FAILED-status fetch not ok ' +
+          `(status ${res.status}) for instance ${instanceId} (workspace=${workspaceId}); ` +
+          `cannot recover Encore's failure text for jobs ` +
+          `[${droppedExternalIds.join(', ')}] — these will surface the generic ` +
+          'gone-from-active-set wording'
+      );
+      return reasons;
+    }
+
+    let body: EncoreFailedPage;
+    try {
+      body = (await res.json().catch(() => ({}))) as EncoreFailedPage;
+    } catch {
+      body = {};
+    }
+
+    // Index the FAILED page's documents by externalId so we can distinguish, per
+    // requested job, "not present on the page" from "present but empty message".
+    const present = new Map<string, string>();
+    for (const j of body._embedded?.encoreJobs ?? []) {
+      if (!j.externalId || !wanted.has(j.externalId)) continue;
+      const msg = typeof j.message === 'string' ? j.message.trim() : '';
+      present.set(j.externalId, msg);
+    }
+
+    for (const externalId of droppedExternalIds) {
+      if (!present.has(externalId)) {
+        // #728 case C — the job was not in the FAILED page at all (outside the
+        // first page, or Encore had not yet moved it to FAILED at fetch time).
+        console.warn(
+          '[encore-scaler] drop-reason recovery: dropped job ' +
+            `${externalId} absent from Encore's FAILED page for instance ` +
+            `${instanceId} (workspace=${workspaceId}); no reason recovered — ` +
+            'surfacing the generic gone-from-active-set wording'
+        );
+        continue;
+      }
+      const msg = present.get(externalId) ?? '';
+      if (!msg) {
+        // #728 case D — the job's FAILED document exists but carries no `message`
+        // yet (Encore may not have populated it at fetch time, ~7s after failure).
+        console.warn(
+          '[encore-scaler] drop-reason recovery: dropped job ' +
+            `${externalId} is FAILED on instance ${instanceId} ` +
+            `(workspace=${workspaceId}) but its message is empty; no reason ` +
+            'recovered — surfacing the generic gone-from-active-set wording'
+        );
+        continue;
+      }
+      reasons.set(externalId, msg);
+    }
+
     return reasons;
   }
 
