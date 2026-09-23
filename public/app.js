@@ -171,6 +171,26 @@ async function apiFetch(path, options = {}) {
   return null;
 }
 
+// Abort an in-progress multipart upload and clean up its server-side state
+// (issue #748). On a failed or cancelled multipart upload the client MUST hit
+// the documented abort route so the staged parts are reclaimed AND the asset is
+// not left stranded in `uploading`. Contract: DELETE
+// /assets/:id/multipart/:uploadId -> 204 (src/routes/asset-upload.ts:328, params
+// { id, uploadId } at asset-upload.ts:76); the server also transitions the asset
+// out of `uploading` (asset-upload.ts abort handler). Best-effort: swallows its
+// own errors so cleanup never masks the original upload failure being reported.
+async function abortMultipartUpload(assetId, uploadId) {
+  if (!assetId || !uploadId) return;
+  try {
+    await apiFetch(
+      '/assets/' + encodeURIComponent(assetId) + '/multipart/' + encodeURIComponent(uploadId),
+      { method: 'DELETE' }
+    );
+  } catch (_) {
+    /* best-effort cleanup — do not mask the original upload failure */
+  }
+}
+
 // ─── Utility helpers ─────────────────────────────────────────────────────────
 
 function fmtDate(val) {
@@ -1243,12 +1263,20 @@ async function renderAssetsTab(container) {
         if (!file) { showMsg(uploadProgress, 'Select a file first.', 'error'); return; }
         uploadBtn.disabled = true;
         uploadBtn.textContent = 'Uploading…';
+        // Track the asset and any multipart session so a failure or cancel can
+        // clean up rather than strand the asset in `uploading` (issue #748).
+        // `multipartUploadId` is set by the multipart transfer path (initiate ->
+        // part-urls -> complete, wired by the UI multipart routing in #747); the
+        // proxied PUT path below leaves it null. Whenever it is set, a thrown
+        // error triggers the documented abort route via abortMultipartUpload().
+        let assetId = null;
+        let multipartUploadId = null;
         try {
           const asset = await apiFetch('/assets', {
             method: 'POST',
             body: JSON.stringify({ name: file.name })
           });
-          const assetId = asset.id;
+          assetId = asset.id;
           showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
           // Stream the file through the API (avoids CORS on MinIO presigned URLs).
           const uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
@@ -1267,6 +1295,14 @@ async function renderAssetsTab(container) {
           close();
           if (assetsTable) assetsTable.reload();
         } catch (err) {
+          // Abort/cleanup on failure or cancel so no orphan is left behind
+          // (issue #748). If a multipart session was open, hit its abort route;
+          // the server reclaims the staged parts and moves the asset out of
+          // `uploading`. Best-effort, so it never masks the error shown below.
+          if (multipartUploadId) {
+            await abortMultipartUpload(assetId, multipartUploadId);
+            if (assetsTable) assetsTable.reload();
+          }
           showMsg(uploadProgress, 'Error: ' + err.message, 'error');
           uploadBtn.disabled = false;
           uploadBtn.textContent = 'Upload';
