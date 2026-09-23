@@ -620,35 +620,76 @@ export class EncoreScalerLoop {
     const entries = Object.entries(raw);
     if (entries.length === 0) return; // empty pool — nothing to reconcile
 
-    // Accumulate the jobs this reconcile observes as silently dropped — tracked
-    // as running against an instance but no longer present in that instance's
-    // live QUEUED/IN_PROGRESS set with no completion callback (issue #449, ADR-016
-    // Direction 2). Each entry also carries Encore's OWN terminal failure text
-    // when we can recover it (issue #704), so main.ts surfaces the real reason
-    // instead of the generic gone-from-active-set wording. The scaler owns no
-    // repositories, so it only raises the signal via onJobsDropped; the terminal
-    // write is owned by the reconciler/main.ts repo layer.
-    const droppedJobs: DroppedJob[] = [];
-
+    // Parse every pool record up front. A corrupt entry is skipped exactly as
+    // before (left for the loop to skip elsewhere).
+    const records: Array<{ instanceId: string; record: EncoreInstanceRecord }> = [];
     for (const [instanceId, instanceJson] of entries) {
       try {
-        let record: EncoreInstanceRecord;
-        try {
-          record = JSON.parse(instanceJson) as EncoreInstanceRecord;
-        } catch {
-          continue; // corrupt entry — leave it for the loop to skip elsewhere
+        records.push({
+          instanceId,
+          record: JSON.parse(instanceJson) as EncoreInstanceRecord
+        });
+      } catch {
+        continue; // corrupt entry — leave it for the loop to skip elsewhere
+      }
+    }
+
+    // #744: resolve a dropped job's liveness against the WHOLE instance pool, not
+    // just the single instance keys.jobInstance currently maps it to. That
+    // mapping is one value overwritten on every dispatch (dispatch(): hset
+    // keys.jobInstance = inst.instanceId, scaler-loop.ts:916 — contract verified
+    // in this file), so after a re-dispatch it can point at an instance the job
+    // has already left. Diffing a job's liveness against only that one instance's
+    // active set then misjudges a job that is genuinely QUEUED/IN_PROGRESS
+    // elsewhere in the pool as silently dropped and drives it to terminal FAILED.
+    //
+    // We therefore fetch every instance's live QUEUED/IN_PROGRESS externalIds
+    // FIRST and union them into a pool-wide active set. A tracked job is treated
+    // as dropped only when it is absent from that pool-wide set. fetchRealActiveState
+    // is a network call, so we run it once per instance here and REUSE the result
+    // for the per-instance count-correction below (no double fetch). An instance
+    // whose real state cannot be confirmed (undefined) contributes nothing to the
+    // pool-wide set — fail-safe, so an unreachable instance never masks a genuine
+    // drop, matching how the count-correction path already leaves such records
+    // as-is.
+    const realByInstance = new Map<
+      string,
+      { count: number; activeExternalIds: Set<string> } | undefined
+    >();
+    const poolActiveExternalIds = new Set<string>();
+    for (const { instanceId, record } of records) {
+      const real = await this.fetchRealActiveState(record);
+      realByInstance.set(instanceId, real);
+      if (real) {
+        for (const externalId of real.activeExternalIds) {
+          poolActiveExternalIds.add(externalId);
         }
+      }
+    }
+
+    // Accumulate the jobs this reconcile observes as silently dropped — tracked
+    // as running against an instance but no longer present ANYWHERE in the pool's
+    // live QUEUED/IN_PROGRESS set with no completion callback (issue #449/#744,
+    // ADR-016 Direction 2). Each entry also carries Encore's OWN terminal failure
+    // text when we can recover it (issue #704), so main.ts surfaces the real
+    // reason instead of the generic gone-from-active-set wording. The scaler owns
+    // no repositories, so it only raises the signal via onJobsDropped; the
+    // terminal write is owned by the reconciler/main.ts repo layer.
+    const droppedJobs: DroppedJob[] = [];
+
+    for (const { instanceId, record } of records) {
+      try {
         // Nothing to correct downward on an already-idle instance.
         if (record.activeJobs === 0) continue;
 
-        // Fetch both QUEUED and IN_PROGRESS documents (not just counts) — a
-        // freshly dispatched job sits in QUEUED until Encore picks it up, so
-        // counting only IN_PROGRESS would make the instance look idle
-        // immediately after dispatch and trigger a spurious scale-up on the next
-        // tick. fetchRealActiveState reads each active job's externalId so we can
-        // tell WHICH tracked jobs (if any) have silently vanished — the
+        // Reuse the QUEUED + IN_PROGRESS documents fetched in the pool-wide pass
+        // above (not just counts) — a freshly dispatched job sits in QUEUED until
+        // Encore picks it up, so counting only IN_PROGRESS would make the instance
+        // look idle immediately after dispatch and trigger a spurious scale-up on
+        // the next tick. fetchRealActiveState read each active job's externalId so
+        // we can tell WHICH tracked jobs (if any) have silently vanished — the
         // dropped-job signal for #449.
-        const real = await this.fetchRealActiveState(record);
+        const real = realByInstance.get(instanceId);
         if (!real) continue; // could not confirm — leave the record as-is
         const actualCount = real.count;
         const activeExternalIds = real.activeExternalIds;
@@ -665,9 +706,10 @@ export class EncoreScalerLoop {
           // Resolve exactly which of our jobs vanished by diffing the jobs we
           // track against this instance (jobInstance hash, written at dispatch,
           // scaler-loop.ts:290) — restricted to those still marked `running`
-          // (jobStatus hash, scaler-loop.ts:291) — against the externalIds
-          // Encore still reports active. Anything tracked-running for this
-          // instance that Encore no longer lists is dropped.
+          // (jobStatus hash, scaler-loop.ts:291) — against the POOL-WIDE set of
+          // externalIds Encore still reports active (#744). Anything
+          // tracked-running for this instance that Encore no longer lists on ANY
+          // instance in the pool is dropped.
           if (actualCount < record.activeJobs) {
             // #708: grace window for jobs the callback poller just saw complete.
             // reconcile can diff Encore's active set AFTER Encore drops a finished
@@ -691,7 +733,27 @@ export class EncoreScalerLoop {
               // callback poller / cancel already settled has a terminal status.
               const st = (trackedStatuses[jobId] ?? '').toUpperCase();
               if (st !== 'RUNNING' && st !== 'QUEUED') continue;
-              if (activeExternalIds.has(jobId)) continue; // still live on Encore
+              // #744: liveness is judged against the WHOLE pool, not just this
+              // instance. A job re-dispatched after keys.jobInstance was written
+              // can be live on another instance while still mapped here; the
+              // pool-wide union catches that so it is NOT misjudged as dropped.
+              if (poolActiveExternalIds.has(jobId)) {
+                // Instrumentation to CONFIRM the #744 root-cause hypothesis
+                // before merging (per the issue): the job is live somewhere in
+                // the pool but NOT on the instance keys.jobInstance maps it to.
+                // The pre-#744 single-instance check would have classified this
+                // exact job as dropped and driven it terminal. Logging it makes
+                // the stale-mapping race observable in production.
+                if (!activeExternalIds.has(jobId)) {
+                  console.warn(
+                    `[encore-scaler] reconcile: job ${jobId} is mapped to instance ` +
+                      `${instanceId} but is live (QUEUED/IN_PROGRESS) on a DIFFERENT ` +
+                      `instance in the pool (workspace=${workspaceId}); NOT classifying ` +
+                      'as dropped (#744 stale jobInstance mapping after re-dispatch)'
+                  );
+                }
+                continue; // still live somewhere in the pool
+              }
               // #708: skip a job the poller recorded completing within the grace
               // window — it is settling terminally, not silently dropped. Fail
               // OPEN: a read error on this one key must never SUPPRESS a genuine
