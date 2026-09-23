@@ -137,7 +137,7 @@ import { Client as MinioClient } from 'minio';
 import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
-import { decideRetry, clearRetryState } from './encore-scaler/retry-store.js';
+import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
 import {
   createJob,
@@ -1222,7 +1222,13 @@ function activateScaler(redisUrl: string): void {
                 redis,
                 decoded.workspaceId,
                 encoreJobId,
-                failureText
+                failureText,
+                // #745: a reconcile-detected "drop" can be a FALSE POSITIVE (the
+                // job is still IN_PROGRESS on its instance). Cancel that prior
+                // attempt before re-dispatching so the same externalId is never
+                // active on two instances at once. Encore's serviceId is 'encore'
+                // (src/encore-scaler/types.ts:16).
+                makePriorAttemptCanceler(() => oscContext.getServiceAccessToken('encore'))
               );
             } catch (err) {
               // If the retry gate itself errors, fall through to the normal
