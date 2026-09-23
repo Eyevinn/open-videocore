@@ -108,6 +108,11 @@ import {
   auditPurgeIntervalMsFromEnv
 } from './pipeline/audit-retention-purge-loop.js';
 import {
+  AbandonedUploadSweepLoop,
+  abandonedUploadIntervalMsFromEnv,
+  abandonedUploadThresholdMsFromEnv
+} from './pipeline/abandoned-upload-loop.js';
+import {
   WatchFolderService,
   watchFolderEnabled,
   classifyWatchFolderConfig,
@@ -2076,6 +2081,30 @@ const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
   }
 });
 auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
+
+// Abandoned-upload settle sweep (issue #726). An INDEPENDENT unref'd, overlap-
+// guarded interval (mirrors ArchivedAssetPurgeLoop, NOT a parallel mechanism)
+// that settles assets wedged in `uploading` past the liveness threshold to
+// `failed`, so a failed or interrupted upload no longer leaves a permanent orphan
+// in the asset list. No object is written and no quota headroom is held for an
+// abandoned upload (the reservation is already released — src/data/storage-quota.ts:32,
+// src/routes/asset-upload.ts:203), so storage/quota accounting is unaffected. It
+// reads the LIVE threshold each tick and is skipped entirely while it is
+// 0/disabled. `assetRepository` exposes both list() (enumerate `uploading`) and
+// update() (transition to `failed`) directly, so — unlike the archived purge —
+// no concrete-repo callback is needed.
+const abandonedUploadSweepLoop = new AbandonedUploadSweepLoop({
+  thresholdMs: abandonedUploadThresholdMsFromEnv,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    assets: assetRepository
+  }
+});
+abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
