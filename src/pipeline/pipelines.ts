@@ -22,9 +22,20 @@
 export const PIPELINE_STEPS = ['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package'] as const;
 export type PipelineStepName = (typeof PIPELINE_STEPS)[number];
 
+// `package` (issue #739) is a PACKAGE-ONLY pipeline: it packages an asset's
+// EXISTING transcoded renditions to HLS/DASH without re-encoding. Unlike
+// `abr-vod` (transcode + package) it dispatches no Encore transcode job, so
+// packaging an already-transcoded asset costs the packaging step alone rather
+// than a full re-encode. Because `package` is the FIRST (and only) step, the
+// execute path pre-flights that the asset actually has renditions to package
+// and fails clearly when it does not (see startPipelineExecution in
+// src/routes/assets.ts) — a package-only run has no transcode step to produce
+// output from. It is also the UI-reachable route to resume a pipeline whose
+// `transcode` succeeded but whose `package` failed.
 export const BUILT_IN_PIPELINES: Record<string, PipelineStepName[]> = {
   transcode: ['transcode'],
   'abr-vod': ['transcode', 'package'],
+  package: ['package'],
   ingest: ['extract-metadata', 'thumbnail'],
   subtitles: ['subtitles'],
   'scene-detect': ['scene-detect'],
@@ -34,6 +45,7 @@ export const BUILT_IN_PIPELINES: Record<string, PipelineStepName[]> = {
 export const PIPELINE_DESCRIPTIONS: Record<string, string> = {
   transcode: 'Transcode the source file using the selected profile. Profile is chosen at execution time.',
   'abr-vod': 'Transcode then package to HLS/DASH for streaming. Profile is chosen at execution time.',
+  package: 'Package an already-transcoded asset to HLS/DASH from its existing renditions, without re-encoding. Requires transcoded renditions to exist.',
   ingest: 'Extract technical metadata and generate thumbnail frames.',
   subtitles: 'Auto-generate a subtitle track from the audio using Whisper transcription and attach it to the asset.',
   'scene-detect': 'Detect scene/shot boundaries and keyframes and attach them to the asset for clip and trim workflows.',

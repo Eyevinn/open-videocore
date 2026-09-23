@@ -4542,6 +4542,12 @@ var PIPELINE_CATALOG = [
     steps: ['transcode', 'package']
   },
   {
+    name: 'package',
+    label: 'Package',
+    description: 'Package an already-transcoded asset to HLS/DASH from its existing renditions, without re-encoding. Requires transcoded renditions to exist.',
+    steps: ['package']
+  },
+  {
     name: 'ingest',
     label: 'Ingest',
     description: 'Extract technical metadata and generate thumbnail frames.',

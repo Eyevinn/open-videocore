@@ -2025,6 +2025,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return undefined;
       }
     }
+    // Package-only pipeline (issue #739): packaging consumes the asset's EXISTING
+    // transcoded renditions, so a package-first pipeline with nothing to package
+    // has no source of output. Fail clearly up front rather than dispatching a
+    // packager job that would settle empty/partial. This gate only fires when
+    // `package` is the FIRST step (the package-only pipeline); in `abr-vod`/`full`
+    // the preceding `transcode` step produces the renditions, so their absence
+    // here is legitimate and must not block. `asset.renditions` is the embedded
+    // ABR-variant array populated on transcode completion (see the renditionSchema
+    // on the asset response contract, assets.ts, and the transcode callback in
+    // src/routes/internal.ts which records renditions on the source asset).
+    if (firstStep === 'package' && (asset.renditions ?? []).length === 0) {
+      reply.code(409).send({
+        error: 'no_renditions',
+        message: 'asset has no transcoded renditions to package; transcode the asset before running the package pipeline'
+      });
+      return undefined;
+    }
     // Unified source-object resolution (issue #612): every first step below
     // consumes the asset's source object, so gate them all through the ONE
     // shared resolver. A source-less asset now fails identically here and in the
