@@ -28,7 +28,7 @@ import { z } from 'zod';
 import { authGate } from '../auth/middleware.js';
 import { InvalidStateTransitionError, type AssetRepository } from '../data/asset-repo.js';
 import { WorkspaceAccessError } from '../data/guard.js';
-import { uploadUrlTtlSeconds, SourceTooLargeError, type CompletedPart, type WorkspaceStorage } from '../data/storage.js';
+import { uploadUrlTtlSeconds, uploadLivenessIntervalMs, SourceTooLargeError, type CompletedPart, type WorkspaceStorage } from '../data/storage.js';
 import { QuotaExceededError, type StorageQuotaGuard } from '../data/storage-quota.js';
 
 // Factory so production wires a real MinIO-backed WorkspaceStorage per request
@@ -194,12 +194,29 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
 
       const maxBytes = 10 * 1024 * 1024 * 1024; // 10 GiB cap
       let bytesTransferred = 0;
+      // Upload-liveness heartbeat (issue #731, unblocks #726). This single HTTP
+      // request can stream for hours; without a periodic touch the asset's
+      // `updatedAt` stays frozen at creation for the whole transfer, so #726's
+      // stuck-upload sweep cannot tell a live slow upload from an abandoned one.
+      // Refresh the liveness clock on a fixed cadence while the body drains, and
+      // stop as soon as it settles. Best-effort: touchUploadProgress is a no-op
+      // once the asset leaves `uploading`, and a failed touch never disturbs the
+      // transfer. The timer is unref'd so it can never keep the process alive.
+      const heartbeat = setInterval(() => {
+        void repo.touchUploadProgress(asset.id).catch(() => {
+          /* best-effort: liveness refresh must never break the upload */
+        });
+      }, uploadLivenessIntervalMs());
+      if (typeof heartbeat.unref === 'function') {
+        heartbeat.unref();
+      }
       try {
         ({ bytesTransferred } = await storage.putStream(objectKey, request.body as Readable, {
           maxBytes,
           totalBytes: contentLength
         }));
       } catch (err) {
+        clearInterval(heartbeat);
         // Release the reservation so an abandoned upload does not hold headroom.
         await reservation?.release();
         if (err instanceof SourceTooLargeError) {
@@ -207,6 +224,9 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
         }
         throw err;
       }
+      // Stream drained successfully — stop the liveness heartbeat before the
+      // terminal uploading -> processing transition below.
+      clearInterval(heartbeat);
 
       // Commit the TRUE transferred size to the running total (issue #579).
       await reservation?.commit(bytesTransferred);
@@ -279,6 +299,17 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Upload-liveness heartbeat (issue #731, unblocks #726). A multipart upload
+      // transfers bytes DIRECTLY to object storage via these presigned part URLs,
+      // never transiting the API, so the asset record would otherwise stay frozen
+      // at `updatedAt == createdAt` for the whole (possibly multi-hour) upload.
+      // Each part-url request is a liveness beat: refresh the clock so #726's
+      // sweep can tell a live slow upload from an abandoned one. Best-effort and
+      // a no-op once the asset leaves `uploading`; a failed touch must not fail
+      // the part-url handshake.
+      await repo.touchUploadProgress(asset.id).catch(() => {
+        /* best-effort: liveness refresh must never break the upload */
+      });
       const ttl = uploadUrlTtlSeconds();
       const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
