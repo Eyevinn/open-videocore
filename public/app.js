@@ -18,6 +18,10 @@ import { createAssetsTable } from './assets-table.js';
 // (#368/#373) against the verified GET /api/v1/logs/ contract. See
 // public/logs-table.js.
 import { createLogsTable } from './logs-table.js';
+// Size-based upload routing (issue #747): stream small files through the proxy,
+// but push medium/large files straight to MinIO via the presigned single-part
+// and multipart routes so they never hit the proxy's request-body limit.
+import { uploadAssetFile } from './upload.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -1249,21 +1253,27 @@ async function renderAssetsTab(container) {
             body: JSON.stringify({ name: file.name })
           });
           const assetId = asset.id;
-          showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
-          // Stream the file through the API (avoids CORS on MinIO presigned URLs).
-          const uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
-            method: 'PUT',
-            body: file,
-            headers: {
-              'Content-Type': file.type || 'application/octet-stream',
-              'Content-Length': String(file.size),
-              'X-Stack-Name': getActiveStack()
-            }
+          const totalMb = Math.round(file.size / 1024 / 1024 * 10) / 10;
+          showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + totalMb + ' MB)…', 'info');
+          // Route the transport by file size (issue #747). Small files stream
+          // through the proxied PUT /assets/:id/upload as before; medium/large
+          // files PUT straight to MinIO via the presigned single-part or
+          // multipart routes so no single request carries the whole payload
+          // through the proxy (which enforces a body limit well below the
+          // route's 10 GiB bodyLimit and 413s large files otherwise).
+          await uploadAssetFile(assetId, file, {
+            apiFetch: apiFetch,
+            apiBase: API_BASE,
+            stackName: stackOverride || getActiveStack(),
+            onProgress: function (loaded, total) {
+              const pct = total ? Math.floor((loaded / total) * 100) : 0;
+              showMsg(
+                uploadProgress,
+                'Uploading ' + file.name + ' — ' + pct + '% (' + totalMb + ' MB)…',
+                'info'
+              );
+            },
           });
-          if (!uploadRes.ok) {
-            const err = await uploadRes.json().catch(() => ({}));
-            throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
-          }
           close();
           if (assetsTable) assetsTable.reload();
         } catch (err) {
