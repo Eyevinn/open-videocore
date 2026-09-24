@@ -1200,6 +1200,43 @@ export class WorkspaceStackResolver {
     }
   }
 
+  // Resolve the RAW StackConfig a consumer routes to (issue #780).
+  //
+  // resolve() builds live connections and resolveStackName() returns an
+  // identity; neither exposes the stored record itself, so a consumer that
+  // needs a plain field off the config (the scaler needs `redisUrl`) had no
+  // namespace-aware way to read it and open-coded
+  // `loadStackConfig(STACK_CONFIG_NAMESPACE, ...)` — the literal `default` —
+  // which resolves nothing on any deployment whose derived namespace is a real
+  // tenant id (issue #712), silently disabling the scaler.
+  //
+  // Resolution is IDENTICAL to resolveStackName() above — the same
+  // deriveWorkspaceId namespace and the same one-shot legacy fallback helpers
+  // (loadStackConfigWithLegacyFallback / listStackNamesWithLegacyFallback,
+  // issue #733) — so the two paths cannot drift apart again: an explicit
+  // `stackName` addresses that stack, otherwise the first provisioned stack for
+  // the namespace is the workspace default.
+  //
+  // Returns undefined when no parameter store is configured or no stack is
+  // provisioned. A parameter-store failure THROWS (unlike resolveStackName,
+  // which degrades to the fixed deployment context) so the caller can tell
+  // "read failed" apart from "no stack provisioned" and log accordingly.
+  async resolveStackConfig(stackName?: string): Promise<StackConfig | undefined> {
+    const ps = this.paramStore;
+    if (!ps) return undefined;
+    const namespace = await deriveWorkspaceId(this.oscContext);
+    if (stackName) {
+      const requested = await this.loadStackConfigWithLegacyFallback(ps, namespace, stackName);
+      // A requested name that has a stored config wins verbatim; only a name
+      // with no config at all falls through to the workspace default, matching
+      // resolve()/resolveStackName() semantics.
+      if (requested) return requested;
+    }
+    const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
+    if (names.length === 0) return undefined;
+    return this.loadStackConfigWithLegacyFallback(ps, namespace, names[0]!);
+  }
+
   // Synchronous read of already-resolved connections from cache. Returns
   // undefined when nothing is cached (or the entry expired). The global
   // preHandler hook warms the cache with `resolve()` before any handler runs,

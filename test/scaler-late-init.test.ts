@@ -101,6 +101,18 @@ describe('scaler late-init after provisioning (#103)', () => {
     expect(res.json()).toMatchObject({ scalerActive: false, workspaces: [] });
   });
 
+  // Issue #780: while inactive, /status used to hardcode `maxInstances: 0`,
+  // which reads like an instance cap of zero (a misconfiguration) rather than
+  // an inactive scaler, and sent operators looking in the wrong place. The
+  // configured value is reported instead; `scalerActive:false` is the field
+  // that says the scaler is off.
+  it('reports the CONFIGURED maxInstances while inactive, not a hardcoded 0 (#780)', async () => {
+    const res = await app.inject({ method: 'GET', url: '/scaler/status' });
+    expect(res.statusCode).toBe(200);
+    // options.maxInstances is 3 (see beforeEach) and no stack is provisioned.
+    expect(res.json()).toMatchObject({ scalerActive: false, maxInstances: 3 });
+  });
+
   it('flips to scalerActive:true immediately when redis is set post-registration (no restart)', async () => {
     // Before: disabled.
     const before = await app.inject({ method: 'GET', url: '/scaler/status' });

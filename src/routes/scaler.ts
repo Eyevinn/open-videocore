@@ -105,7 +105,17 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     async () => {
       const redis = opts.redis;
       if (!redis) {
-        return { workspaces: [], maxInstances: 0, idleTimeoutMs: liveIdleTimeoutMs, scalerActive: false };
+        // Scaler off (no stack provisioned yet, or the stack's Valkey URL could
+        // not be resolved). Report the CONFIGURED maxInstances, not a literal 0
+        // (issue #780): a hardcoded 0 read like a misconfigured instance cap and
+        // sent operators looking at scaler config instead of at activation.
+        // `scalerActive:false` is the field that says the scaler is off.
+        return {
+          workspaces: [],
+          maxInstances: liveMaxInstances,
+          idleTimeoutMs: liveIdleTimeoutMs,
+          scalerActive: false
+        };
       }
 
       const workspaceIds = await scanWorkspaceIds(redis);

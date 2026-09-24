@@ -55,6 +55,11 @@ import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
+  resolveStackRedisUrl,
+  logScalerNotActivated,
+  type StackRedisResolution
+} from './services/scaler-redis-url.js';
+import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
   PerWorkspaceSearchRepository,
@@ -918,20 +923,19 @@ const pipelineRepository = new PerWorkspacePipelineRepository(stackResolver);
 // Shared with the assets router, which owns POST/GET /:id/comments.
 const commentRepository = new InMemoryCommentRepository();
 
-// Read the first provisioned stack's Valkey URL from the parameter store, or
-// undefined when no stack is provisioned yet. Self-discovered: there is no
+// Read the first provisioned stack's Valkey URL from the parameter store, or a
+// classified reason why none could be resolved. Self-discovered: there is no
 // REDIS_URL env var — the URL only exists once POST /api/v1/provision has run.
-async function resolveStackRedisUrl(): Promise<string | undefined> {
-  if (!paramStore) return undefined;
-  try {
-    const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-    if (names.length === 0) return undefined;
-    const stackCfg = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
-    return stackCfg?.redisUrl && stackCfg.redisUrl.length > 0 ? stackCfg.redisUrl : undefined;
-  } catch (err) {
-    app.log.warn({ err }, 'encore-scaler: failed to resolve Redis URL from parameter store');
-    return undefined;
-  }
+//
+// Issue #780: this used to read the LITERAL `default` namespace
+// (STACK_CONFIG_NAMESPACE) and bypass the #733/#751 legacy fallback, so on any
+// deployment whose derived namespace is a real tenant id it resolved nothing
+// and the scaler silently never activated. It now goes through
+// stackResolver.resolveStackConfig() — the same derived namespace + legacy
+// fallback every other consumer uses — so the two paths cannot diverge again.
+// See services/scaler-redis-url.ts.
+async function resolveStackRedis(): Promise<StackRedisResolution> {
+  return resolveStackRedisUrl(stackResolver);
 }
 
 // Bring the scaler, packaging service, and callback poller up against a stack's
@@ -1626,12 +1630,21 @@ async function deactivateScaler(): Promise<void> {
 // provision/teardown via onStackChange.
 async function reconcileScaler(): Promise<void> {
   if (!storageAvailable) return;
-  const redisUrl = await resolveStackRedisUrl();
-  if (redisUrl && !sharedRedis) {
-    activateScaler(redisUrl);
-  } else if (!redisUrl && sharedRedis) {
-    await deactivateScaler();
+  const resolution = await resolveStackRedis();
+  if (resolution.outcome === 'resolved') {
+    if (!sharedRedis) activateScaler(resolution.redisUrl);
+    return;
   }
+  if (sharedRedis) {
+    // Unchanged pre-#780 semantics: anything that does not resolve to a URL
+    // (including a failed parameter-store read) tears the active scaler down.
+    await deactivateScaler();
+    return;
+  }
+  // Not active and nothing to activate against. Previously a completely silent
+  // branch (issue #780): the deployment looked healthy while no transcode could
+  // ever be dispatched. Always say why.
+  logScalerNotActivated(app.log, resolution);
 }
 
 // Encore transcoding profile catalogue + management (issue #84). Profiles are
