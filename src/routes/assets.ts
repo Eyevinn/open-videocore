@@ -74,6 +74,7 @@ import {
   SourceTooLargeError,
   WorkspaceStorage,
   deliveryUrlTtlSeconds,
+  thumbnailUrlTtlSeconds,
 } from '../data/storage.js';
 import { parseSource, assertPublicHost, SourceValidationError } from '../pipeline/source.js';
 import {
@@ -595,6 +596,24 @@ const thumbnailsBodySchema = z.object({
 const thumbnailsResultSchema = z.object({
   assetId: z.string(),
   thumbnails: z.array(z.string())
+});
+
+// Presigned thumbnail URL response (issue #800). The API hands back a
+// short-lived signed GET URL for the thumbnail object instead of the image
+// bytes, so a browser can render it with a plain `<img src=...>` — an <img>
+// GET carries no Authorization header and therefore cannot satisfy the bearer
+// gate on the byte-streaming route. `expiresAt` is the ISO instant the
+// signature stops working; `expiresInSeconds` is the same window as a duration
+// so a caller can schedule a refresh without clock-skew arithmetic. The
+// underlying bucket stays private: only a valid, unexpired signature grants
+// access.
+const thumbnailUrlSchema = z.object({
+  assetId: z.string(),
+  index: z.number(),
+  objectKey: z.string(),
+  url: z.string(),
+  expiresAt: z.string(),
+  expiresInSeconds: z.number()
 });
 
 // Export / re-wrap request (issue #19): the target container format and an
@@ -4283,6 +4302,92 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         .header('Content-Type', 'image/jpeg')
         .header('Cache-Control', 'public, max-age=86400')
         .send(stream);
+    }
+  );
+
+  // Issue a short-lived presigned GET URL for a single thumbnail (issue #800).
+  //
+  // Why a sibling route rather than changing the byte-streaming route above:
+  // the proxy route serves image/jpeg to server-to-server callers that already
+  // send a bearer token, and it remains the only option where anonymous GETs
+  // against object storage are blocked (the #113 constraint that motivated the
+  // proxy). What it CANNOT serve is a browser `<img src=...>`, because an <img>
+  // GET carries no Authorization header and so cannot pass the bearer gate on
+  // this router. This route closes that gap without changing an existing
+  // response shape, and follows the router convention already established for
+  // presigned uploads — a byte-transfer route plus a URL-issuing sibling
+  // (`POST /:id/upload-url`, `GET /:id/multipart/:uploadId/part-url`,
+  // src/routes/asset-upload.ts).
+  //
+  // Issuing the URL still requires a valid bearer token (the router-level
+  // `authGate` preHandler); only the returned URL is unauthenticated, and it is
+  // signed, scoped to one object and expires after THUMBNAIL_URL_TTL_SECONDS
+  // (default 5 minutes). The bucket itself stays private — an unsigned or
+  // expired request to the same object is refused by object storage.
+  //   200 — { url, expiresAt, ... }
+  //   404 — unknown/foreign asset or out-of-range index (existence not leaked)
+  //   501 — object storage is not configured on this deployment
+  //   502 — object storage failed to sign the URL
+  app.get(
+    '/:id/thumbnails/:index/url',
+    {
+      schema: {
+        params: z.object({ id: z.string(), index: z.string() }),
+        response: {
+          200: thumbnailUrlSchema,
+          404: errorSchema,
+          501: errorSchema,
+          502: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      if (!storageFor) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured'
+        });
+      }
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      const keys = asset.thumbnails ?? [];
+      const idx = Number.parseInt(request.params.index, 10);
+      const objectKey = Number.isNaN(idx) ? undefined : keys[idx];
+      if (idx < 0 || objectKey === undefined) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      const ttl = thumbnailUrlTtlSeconds();
+      // Signing can still reach the store (region lookup) and fails on bad
+      // credentials, so it is an external call like any other: bounded by the
+      // storage client's own timeouts and reported as a 502 rather than a 500.
+      let url: string;
+      try {
+        url = await storageFor().presignedGet(objectKey, ttl);
+      } catch (err) {
+        request.log.error(
+          { err, assetId: asset.id, index: idx },
+          'failed to sign thumbnail URL'
+        );
+        return reply.code(502).send({
+          error: 'storage_error',
+          message: 'object storage failed to sign the thumbnail URL'
+        });
+      }
+
+      // Derived from the same TTL that was signed into the URL, so the caller
+      // never has to guess when to re-request it.
+      const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+      return reply.code(200).send({
+        assetId: asset.id,
+        index: idx,
+        objectKey,
+        url,
+        expiresAt,
+        expiresInSeconds: ttl
+      });
     }
   );
 
