@@ -543,10 +543,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   } = opts;
 
   // Memoised namespace for this process. Only a DETERMINISTIC resolution (env /
-  // pinned / derived-and-pinned) is memoised — those cannot change without a
-  // redeploy. The `default` fallback taken when OSC could not tell us the tenant
-  // and nothing is pinned yet is deliberately NOT memoised, so the next call
-  // re-resolves and picks up the pin the moment one exists.
+  // pinned / seeded-or-derived AND successfully pinned) is memoised — those
+  // cannot change without a redeploy. The `default` fallback, and any resolution
+  // whose pin write threw, are deliberately NOT memoised, so the next call
+  // re-resolves and picks up the pin the moment one actually exists.
   let memoisedWorkspaceId: string | undefined;
 
   // The parameter-store namespace this route WRITES under (issue #712/#776).

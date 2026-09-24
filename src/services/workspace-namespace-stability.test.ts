@@ -168,6 +168,60 @@ function makePinStore(): WorkspaceIdStore & {
   };
 }
 
+// A single fake config-service instance: ONE key/value map serving both the
+// ParamStore view (stack configs under `openvideocore/<ns>/<name>`, param-store.ts
+// :131-133/:446) and the WorkspaceIdStore view (get/set/listByPrefix, the
+// ConfigKvStore surface at param-store.ts:602-608). This is how the real
+// deployment is wired — main.ts hands the SAME eyevinn-app-config-svc instance to
+// the param store and to the pin store — so the seed step can see the stack
+// configs a previous release wrote.
+function makeConfigService(): {
+  paramStore: ParamStore;
+  pinStore: WorkspaceIdStore;
+  namespacesRead: string[];
+  writes: string[];
+  raw: Map<string, string>;
+} {
+  const kv = new Map<string, string>();
+  const namespacesRead: string[] = [];
+  const writes: string[] = [];
+  const paramStore: ParamStore = {
+    async storeStackConfig(ws, name, config) {
+      kv.set(stackConfigKey(ws, name), JSON.stringify(config));
+    },
+    async loadStackConfig(ws, name) {
+      namespacesRead.push(ws);
+      const raw = kv.get(stackConfigKey(ws, name));
+      return raw ? (JSON.parse(raw) as StackConfig) : undefined;
+    },
+    async deleteStackConfig(ws, name) {
+      kv.delete(stackConfigKey(ws, name));
+    },
+    async listStackNames(ws) {
+      namespacesRead.push(ws);
+      const prefix = stackConfigKey(ws, '');
+      return [...kv.keys()]
+        .filter((k) => k.startsWith(prefix))
+        .map((k) => k.slice(prefix.length));
+    }
+  };
+  const pinStore: WorkspaceIdStore = {
+    async get(key) {
+      return kv.get(key);
+    },
+    async set(key, value) {
+      writes.push(value);
+      kv.set(key, value);
+    },
+    async listByPrefix(prefix) {
+      return [...kv.entries()]
+        .filter(([k]) => k.startsWith(prefix))
+        .map(([key, value]) => ({ key, value }));
+    }
+  };
+  return { paramStore, pinStore, namespacesRead, writes, raw: kv };
+}
+
 function makeLog(): StackResolverLogger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
@@ -386,6 +440,176 @@ describe('deterministic workspace namespace (issue #776)', () => {
     // The SAME long-running resolver must pick the pinned namespace up rather
     // than stay stuck on the `default` it resolved before the pin existed.
     expect(await resolver.resolveStackName(undefined)).toBe('fresh');
+  });
+
+  // The live listSubscriptions payload (read-only introspection against a real
+  // account, 2026-09-24) does NOT match the declared type: 10 of 13 entries
+  // carried no `tenantId` at all despite admin.d.ts:2-5 declaring it
+  // `tenantId: string`, and the 3 that did split across TWO distinct values that
+  // look like the PUBLISHER of the subscribed service. These tests use that shape
+  // verbatim.
+  const LIVE_SHAPED_SUBSCRIPTIONS = [
+    { serviceId: 'minio-minio' },
+    { serviceId: 'apache-couchdb' },
+    { serviceId: 'valkey-io-valkey' },
+    { serviceId: 'eyevinn-encore', tenantId: 'publisher-two' },
+    { serviceId: 'eyevinn-app-config-svc', tenantId: 'publisher-two' },
+    { serviceId: 'birme-scenechange', tenantId: 'publisher-one' }
+  ] as unknown as Array<{ serviceId: string; tenantId: string }>;
+
+  it('seeds the pin from this deployment\'s OWN existing stack configs instead of blind-deriving (upgrade path)', async () => {
+    const { paramStore, pinStore, namespacesRead, writes } = makeConfigService();
+
+    // A deployment already running post-#712: its stack config sits under the
+    // namespace a PREVIOUS release resolved (TENANT_A). Nothing is pinned yet,
+    // because the pin did not exist in that release.
+    await paramStore.storeStackConfig(TENANT_A, 'mystack', readyConfig('mystack'));
+
+    // First boot after upgrading. OSC now reports the live-shaped payload, whose
+    // smallest tenantId ('publisher-one') is NOT this deployment's namespace.
+    // Blind-deriving and pinning that value would make the stack permanently
+    // unresolvable — the regression this step exists to prevent.
+    mockedListSubscriptions.mockImplementation(async () => LIVE_SHAPED_SUBSCRIPTIONS);
+
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(resolution.workspaceId).toBe(TENANT_A);
+    expect(resolution.source).toBe('seeded');
+    expect(resolution.deterministic).toBe(true);
+    expect(writes).toEqual([TENANT_A]);
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBe(TENANT_A);
+
+    // The read side resolves the existing stack on this boot and on the next one,
+    // where the pin (not the derivation) answers.
+    namespacesRead.length = 0;
+    expect(await boot(paramStore, pinStore).resolveStackName(undefined)).toBe('mystack');
+    expect(await boot(paramStore, pinStore).resolveStackName(undefined)).toBe('mystack');
+    expect(new Set(namespacesRead)).toEqual(new Set([TENANT_A]));
+    expect(namespacesRead).not.toContain('publisher-one');
+  });
+
+  it('keeps the namespace stable across a MEMBERSHIP change that moves the derived value', async () => {
+    const { paramStore, pinStore, writes } = makeConfigService();
+
+    // Boot 1: fresh deployment, nothing stored. The id is derived from OSC (the
+    // only source available) and pinned.
+    mockedListSubscriptions.mockImplementation(async () => LIVE_SHAPED_SUBSCRIPTIONS);
+    const first = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(first.workspaceId).toBe('publisher-one');
+    expect(first.source).toBe('derived');
+    expect(first.deterministic).toBe(true);
+    await paramStore.storeStackConfig(first.workspaceId, 'mystack', readyConfig('mystack'));
+
+    // Between boots the operator subscribes to another service, published by an
+    // alphabetically EARLIER tenant. The derivation would now return
+    // 'aaa-publisher'; the PIN must hold the namespace instead.
+    mockedListSubscriptions.mockImplementation(async () => [
+      { serviceId: 'aaa-some-service', tenantId: 'aaa-publisher' },
+      ...LIVE_SHAPED_SUBSCRIPTIONS
+    ] as unknown as Array<{ serviceId: string; tenantId: string }>);
+
+    const second = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(second.workspaceId).toBe('publisher-one');
+    expect(second.source).toBe('pinned');
+    expect(second.deterministic).toBe(true);
+    // Written exactly once, on boot 1.
+    expect(writes).toEqual(['publisher-one']);
+
+    // And the stack still resolves after the membership change.
+    expect(await boot(paramStore, pinStore).resolveStackName(undefined)).toBe('mystack');
+  });
+
+  it('reports deterministic=false when the pin WRITE fails, and does not memoise the unpersisted value', async () => {
+    const { paramStore, namespacesRead } = makeConfigService();
+    // A store whose write always throws (parameter store down / read-only key).
+    const failing: WorkspaceIdStore = {
+      async get() {
+        return undefined;
+      },
+      async set() {
+        throw new Error('config kv write failed: 503');
+      },
+      async listByPrefix() {
+        return [];
+      }
+    };
+
+    const resolution = await resolveWorkspaceId(oscContext, { store: failing });
+    // The derived value is still served for this resolve...
+    expect(resolution.workspaceId).toBe(TENANT_A);
+    expect(resolution.source).toBe('derived');
+    // ...but nothing was persisted, so it must NOT be advertised as stable.
+    expect(resolution.deterministic).toBe(false);
+
+    // A resolver over the same failing store must therefore re-resolve rather
+    // than memoise: the next boot has nothing pinned.
+    mockedListSubscriptions.mockClear();
+    const resolver = boot(paramStore, failing);
+    await resolver.resolveStackName(undefined);
+    const afterFirst = mockedListSubscriptions.mock.calls.length;
+    await resolver.resolveStackName(undefined);
+    expect(mockedListSubscriptions.mock.calls.length).toBeGreaterThan(afterFirst);
+    // Every read still went to the derived namespace (plus the #751 `default`
+    // compatibility read); no third namespace was consulted.
+    for (const ns of namespacesRead) {
+      expect([TENANT_A, STACK_CONFIG_NAMESPACE]).toContain(ns);
+    }
+  });
+
+  it('refuses to pin when the store holds stack configs under SEVERAL namespaces', async () => {
+    const { paramStore, pinStore, writes } = makeConfigService();
+    await paramStore.storeStackConfig(TENANT_A, 'one', readyConfig('one'));
+    await paramStore.storeStackConfig(TENANT_B, 'two', readyConfig('two'));
+
+    const log = makeLog();
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore, log });
+    // Ambiguous history: serve the derived value for this resolve, pin nothing,
+    // and tell the operator how to settle it.
+    expect(resolution.source).toBe('derived');
+    expect(resolution.deterministic).toBe(false);
+    expect(writes).toEqual([]);
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBeUndefined();
+    expect(log.warn).toHaveBeenCalled();
+  });
+
+  it('seeds `default` for a pre-#712 store whose stacks all live under the literal namespace', async () => {
+    const { paramStore, pinStore, writes } = makeConfigService();
+    await paramStore.storeStackConfig(STACK_CONFIG_NAMESPACE, 'legacy', readyConfig('legacy'));
+
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(resolution.workspaceId).toBe(STACK_CONFIG_NAMESPACE);
+    expect(resolution.source).toBe('seeded');
+    expect(writes).toEqual([STACK_CONFIG_NAMESPACE]);
+
+    // A tenant-scoped namespace alongside the legacy one WINS: `default` entries
+    // are either pre-#712 writes or the copy the #751 read fallback makes.
+    await paramStore.storeStackConfig(TENANT_A, 'legacy', readyConfig('legacy'));
+    const fresh = makeConfigService();
+    for (const entry of await pinStore.listByPrefix!('openvideocore/')) {
+      if (entry.key !== WORKSPACE_ID_PIN_KEY) fresh.raw.set(entry.key, entry.value);
+    }
+    const seeded = await resolveWorkspaceId(oscContext, { store: fresh.pinStore });
+    expect(seeded.workspaceId).toBe(TENANT_A);
+    expect(seeded.source).toBe('seeded');
+  });
+
+  it('ignores non-stack-config records that share the `openvideocore/` prefix', async () => {
+    const { pinStore, writes, raw } = makeConfigService();
+    // Storage-backend registry records (storage-backend-registry.ts:321) are
+    // keyed `openvideocore/storagebackends/<workspaceId>/<id>` — a different
+    // shape whose second segment must never be read as a namespace.
+    raw.set(
+      'openvideocore/storagebackends/some-other-workspace/backend-1',
+      JSON.stringify({ id: 'backend-1', bucket: 'b' })
+    );
+    // And an unrelated two-segment record whose value is not a StackConfig.
+    raw.set('openvideocore/not-a-namespace/whatever', JSON.stringify({ hello: 'world' }));
+
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore });
+    // No stack-config evidence at all: this is treated as a fresh deployment, so
+    // the OSC-derived id is used and pinned.
+    expect(resolution.workspaceId).toBe(TENANT_A);
+    expect(resolution.source).toBe('derived');
+    expect(writes).toEqual([TENANT_A]);
   });
 
   it('is independent of subscription-list ORDER when several tenant ids are present', async () => {
