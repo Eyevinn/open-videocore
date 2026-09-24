@@ -210,7 +210,6 @@ Key endpoints:
 | `POST` | `/api/v1/assets/:id/multipart/:uploadId/complete` | Complete a multipart upload |
 | `DELETE` | `/api/v1/assets/:id/multipart/:uploadId` | Abort a multipart upload |
 | `POST` | `/api/v1/assets/:id/upload-complete` | Finalize a completed upload |
-
 | `POST` | `/api/v1/assets/:id/transcode` | Submit an ABR transcoding job |
 | `POST` | `/api/v1/assets/:id/package` | Submit an HLS/DASH packaging job |
 | `POST` | `/api/v1/assets/:id/execute` | Run a pipeline execution |

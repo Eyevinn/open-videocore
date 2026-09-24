@@ -27,6 +27,18 @@
 // backend failure without parsing prose. The enum, status mapping and classifier
 // live in ./upload-failure-cause.ts; the UI-facing write-up (what each code means
 // and how to react) is docs/guides/upload-failure-causes.md.
+//
+// "Every" is literal: the router's setErrorHandler is terminal. It classifies
+// the domain errors, THEN Fastify's own framework rejections (schema validation
+// -> 400 invalid_request, an unparseable content type -> 415
+// unsupported_media_type, an oversized buffered body -> 413), and finally maps
+// anything still unrecognised to 500 `unknown` rather than rethrowing into
+// Fastify's default (cause-less) envelope. Each of those statuses is declared
+// with the shared error schema on the routes below so it also reaches
+// openapi.json. The ONE error a caller can get from these paths without a
+// `cause` is the app-wide 401 presence gate (src/auth/middleware.ts
+// registerAuth), which replies before this router's handler ever runs and whose
+// envelope is shared with every other router.
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -38,9 +50,12 @@ import { WorkspaceAccessError } from '../data/guard.js';
 import { uploadUrlTtlSeconds, uploadLivenessIntervalMs, type CompletedPart, type WorkspaceStorage } from '../data/storage.js';
 import { QuotaExceededError, type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
+  classifyFrameworkError,
   classifyUploadFailure,
   isUploadFailureError,
   uploadErrorSchema,
+  UPLOAD_FAILURE_ERROR_CODE,
+  UPLOAD_FAILURE_STATUS,
   viaStorage
 } from './upload-failure-cause.js';
 
@@ -125,6 +140,33 @@ const partUrlResponse = z.object({
 // status on each route below so it lands in the generated OpenAPI document.
 const errorSchema = uploadErrorSchema;
 
+// The statuses EVERY route on this router can answer with, whatever it does:
+//   400 invalid_request       — schema validation (framework rejection)
+//   403 not_authorized        — WorkspaceAccessError
+//   404 asset_not_found       — unknown asset / other workspace
+//   500 unknown               — reserved fallback for an unclassified fault
+//   501 storage_not_configured — no object storage wired on this deployment
+//   502 network_error / storage_backend_error — the storage boundary failed
+// Declared as a spread so no route can silently omit one and leave a status
+// undocumented in openapi.json.
+const commonErrorResponses = {
+  400: errorSchema,
+  403: errorSchema,
+  404: errorSchema,
+  500: errorSchema,
+  501: errorSchema,
+  502: errorSchema
+} as const;
+
+// Additional statuses only a body-bearing route can answer with:
+//   413 body_size_limit_exceeded — the framework `bodyLimit` on a buffered body
+//   415 unsupported_media_type   — no content-type parser for the body
+// GET routes carry no body, so Fastify never runs a parser for them.
+const bodyErrorResponses = {
+  413: errorSchema,
+  415: errorSchema
+} as const;
+
 const assetStatusResponse = z.object({
   id: z.string(),
   status: z.string()
@@ -189,7 +231,35 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
         .code(err.statusCode)
         .send({ error: err.reason, cause: 'quota_exceeded' as const, message: err.message });
     }
-    throw err;
+    // Framework-level rejections — schema validation (400), an unparseable
+    // content type (415), an oversized buffered JSON body (413). Fastify raises
+    // these before (or instead of) the handler, so they never pass through
+    // viaStorage(). Left to Fastify's default handler they would come back in a
+    // DIFFERENT envelope carrying no `cause` at all, which is exactly the hole
+    // #771 set out to close — so classify them into the same envelope here.
+    // Codes verified in node_modules/fastify/lib/errors.js; see
+    // ./upload-failure-cause.ts `FRAMEWORK_ERROR_CAUSES`.
+    const framework = classifyFrameworkError(err);
+    if (framework) {
+      request.log.info(
+        { err, uploadFailureCause: framework.failureCause, uploadFailureCode: framework.detailCode },
+        'upload request rejected'
+      );
+      return reply.code(framework.statusCode).send(framework.toResponseBody());
+    }
+    // Anything left is a fault in our own code, not a recognised upload failure.
+    // It must STILL carry a cause — the published contract is that every error
+    // body from this router has one — so it becomes the reserved `unknown`
+    // fallback at 500 rather than being rethrown into Fastify's cause-less
+    // default envelope. `unknown` (not storage_backend_error) keeps the
+    // distinction upload-failure-cause.ts draws: a bug in our own code is never
+    // mislabelled as a storage failure. The underlying error stays server-side.
+    request.log.error({ err }, 'unclassified upload error');
+    return reply.code(UPLOAD_FAILURE_STATUS.unknown).send({
+      error: UPLOAD_FAILURE_ERROR_CODE.unknown,
+      cause: 'unknown' as const,
+      message: 'the upload failed for an unexpected reason'
+    });
   });
 
   // The 501 degradation body every storage-backed handler returns when no object
@@ -223,7 +293,16 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     {
       
       bodyLimit: 10 * 1024 * 1024 * 1024, // 10 GiB — body is streamed, not buffered
-      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 409: errorSchema, 413: errorSchema, 422: errorSchema, 501: errorSchema, 502: errorSchema } }
+      schema: {
+        params: idParams,
+        response: {
+          200: assetStatusResponse,
+          ...commonErrorResponses,
+          ...bodyErrorResponses,
+          409: errorSchema,
+          422: errorSchema
+        }
+      }
     },
     async (request, reply) => {
       if (!storageFor) {
@@ -247,7 +326,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       const reservation = quota ? await quota.admit(contentLength ?? 0) : undefined;
 
       const maxBytes = 10 * 1024 * 1024 * 1024; // 10 GiB cap
-      let bytesTransferred = 0;
+      let result: Awaited<ReturnType<WorkspaceStorage['putStream']>>;
       // Upload-liveness heartbeat (issue #731, unblocks #726). This single HTTP
       // request can stream for hours; without a periodic touch the asset's
       // `updatedAt` stays frozen at creation for the whole transfer, so #726's
@@ -265,10 +344,16 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
         heartbeat.unref();
       }
       try {
-        ({ bytesTransferred } = await storage.putStream(objectKey, request.body as Readable, {
+        // ONLY the storage call is inside the try. Destructuring the result is
+        // deliberately left outside it: a return-shape bug (a missing
+        // `bytesTransferred`) is a fault in our own code and must surface as
+        // such, not be swallowed by classifyUploadFailure and mislabelled
+        // `storage_backend_error` — which would contradict the contract
+        // upload-failure-cause.ts `viaStorage` states.
+        result = await storage.putStream(objectKey, request.body as Readable, {
           maxBytes,
           totalBytes: contentLength
-        }));
+        });
       } catch (err) {
         clearInterval(heartbeat);
         // Release the reservation so an abandoned upload does not hold headroom.
@@ -285,6 +370,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       // Stream drained successfully — stop the liveness heartbeat before the
       // terminal uploading -> processing transition below.
       clearInterval(heartbeat);
+      const { bytesTransferred } = result;
 
       // Commit the TRUE transferred size to the running total (issue #579).
       await reservation?.commit(bytesTransferred);
@@ -297,7 +383,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
   // --- Single-part: presigned PUT URL (kept for server-to-server use) ----
   app.post(
     '/:id/upload-url',
-    {  schema: { params: idParams, response: { 200: urlResponse, 404: errorSchema, 501: errorSchema, 502: errorSchema } } },
+    {
+      schema: {
+        params: idParams,
+        response: { 200: urlResponse, ...commonErrorResponses, ...bodyErrorResponses }
+      }
+    },
     async (request, reply) => {
       if (!storageFor) {
         return reply.code(501).send(notConfiguredBody);
@@ -321,7 +412,10 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/multipart/initiate',
     {
       
-      schema: { params: idParams, response: { 200: initiateResponse, 404: errorSchema, 501: errorSchema, 502: errorSchema } }
+      schema: {
+        params: idParams,
+        response: { 200: initiateResponse, ...commonErrorResponses, ...bodyErrorResponses }
+      }
     },
     async (request, reply) => {
       if (!storageFor) {
@@ -350,7 +444,9 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: {
         params: multipartParams,
         querystring: z.object({ partNumber: partNumberSchema }),
-        response: { 200: partUrlResponse, 404: errorSchema, 501: errorSchema, 502: errorSchema }
+        // No bodyErrorResponses: a GET carries no body, so neither the
+        // framework bodyLimit nor a content-type parser can reject it.
+        response: { 200: partUrlResponse, ...commonErrorResponses }
       }
     },
     async (request, reply) => {
@@ -392,7 +488,7 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       schema: {
         params: multipartParams,
         body: completeBody,
-        response: { 200: assetStatusResponse, 404: errorSchema, 501: errorSchema, 502: errorSchema }
+        response: { 200: assetStatusResponse, ...commonErrorResponses, ...bodyErrorResponses }
       }
     },
     async (request, reply) => {
@@ -425,7 +521,10 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/multipart/:uploadId',
     {
       
-      schema: { params: multipartParams, response: { 204: z.null(), 404: errorSchema, 501: errorSchema, 502: errorSchema } }
+      schema: {
+        params: multipartParams,
+        response: { 204: z.null(), ...commonErrorResponses, ...bodyErrorResponses }
+      }
     },
     async (request, reply) => {
       if (!storageFor) {
@@ -466,7 +565,16 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
     '/:id/upload-complete',
     {
       
-      schema: { params: idParams, response: { 200: assetStatusResponse, 404: errorSchema, 409: errorSchema, 422: errorSchema, 501: errorSchema, 502: errorSchema } }
+      schema: {
+        params: idParams,
+        response: {
+          200: assetStatusResponse,
+          ...commonErrorResponses,
+          ...bodyErrorResponses,
+          409: errorSchema,
+          422: errorSchema
+        }
+      }
     },
     async (request, reply) => {
       if (!storageFor) {

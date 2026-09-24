@@ -37,6 +37,7 @@ import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod
 
 import { assetUploadRouter } from '../src/routes/asset-upload.js';
 import {
+  classifyFrameworkError,
   classifyUploadFailure,
   isConnectionError,
   uploadErrorSchema,
@@ -124,6 +125,28 @@ describe('classifyUploadFailure (issue #771)', () => {
     expect(failure.failureCause).toBe('body_size_limit_exceeded');
     expect(failure.statusCode).toBe(413);
     expect(failure.detailCode).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+  });
+
+  it.each([
+    ['FST_ERR_VALIDATION', 'invalid_request', 400],
+    ['FST_ERR_CTP_EMPTY_JSON_BODY', 'invalid_request', 400],
+    ['FST_ERR_CTP_INVALID_JSON_BODY', 'invalid_request', 400],
+    ['FST_ERR_CTP_INVALID_CONTENT_LENGTH', 'invalid_request', 400],
+    ['FST_ERR_CTP_INVALID_MEDIA_TYPE', 'unsupported_media_type', 415],
+    ['FST_ERR_CTP_BODY_TOO_LARGE', 'body_size_limit_exceeded', 413]
+  ] as const)(
+    'classifyFrameworkError maps %s to %s / %d',
+    (code, cause, status) => {
+      const failure = classifyFrameworkError(codedError('framework said no', code));
+      expect(failure?.failureCause).toBe(cause);
+      expect(failure?.statusCode).toBe(status);
+      expect(failure?.detailCode).toBe(code);
+    }
+  );
+
+  it('classifyFrameworkError returns undefined for a non-framework error', () => {
+    expect(classifyFrameworkError(codedError('s3 said no', 'AccessDenied'))).toBeUndefined();
+    expect(classifyFrameworkError(new Error('plain'))).toBeUndefined();
   });
 
   it.each([
@@ -347,6 +370,101 @@ describe('upload routes return a structured cause (issue #771)', () => {
       expect(body.cause, route.url).toBe('asset_not_found');
       expect(body.error, route.url).toBe('not_found');
     }
+    await app.close();
+  });
+
+  it('proxied PUT: an unparseable content type is 415 unsupported_media_type', async () => {
+    // No parser is registered for application/pdf (buildApp mirrors src/main.ts,
+    // which registers octet-stream + the media types), so Fastify rejects the
+    // body with FST_ERR_CTP_INVALID_MEDIA_TYPE (415) BEFORE the handler runs.
+    const { app, repo } = await buildApp(failingStorage(new Error('unused')));
+    const asset = await repo.create({ name: 'wrong-type' });
+    const res = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/assets/${asset.id}/upload`,
+      headers: { 'content-type': 'application/pdf' },
+      payload: 'not a video'
+    });
+    expect(res.statusCode).toBe(415);
+    const body = expectUploadError(res);
+    expect(body.cause).toBe('unsupported_media_type');
+    expect(body.error).toBe('unsupported_media_type');
+    expect(body.code).toBe('FST_ERR_CTP_INVALID_MEDIA_TYPE');
+    await app.close();
+  });
+
+  it('part-url: an out-of-range part number is 400 invalid_request', async () => {
+    const { app, repo } = await buildApp(failingStorage(new Error('unused')));
+    const asset = await repo.create({ name: 'bad-part' });
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${asset.id}/multipart/upload-123/part-url?partNumber=0`
+    });
+    expect(res.statusCode).toBe(400);
+    const body = expectUploadError(res);
+    expect(body.cause).toBe('invalid_request');
+    expect(body.error).toBe('invalid_request');
+    expect(body.code).toBe('FST_ERR_VALIDATION');
+    await app.close();
+  });
+
+  it('multipart complete: an empty parts list is 400 invalid_request', async () => {
+    const { app, repo } = await buildApp(failingStorage(new Error('unused')));
+    const asset = await repo.create({ name: 'no-parts' });
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/multipart/upload-123/complete`,
+      payload: { parts: [] }
+    });
+    expect(res.statusCode).toBe(400);
+    expect(expectUploadError(res).cause).toBe('invalid_request');
+    await app.close();
+  });
+
+  it('multipart complete: an oversized JSON body is 413 body_size_limit_exceeded', async () => {
+    // The framework `bodyLimit` (default 1048576 bytes,
+    // node_modules/fastify/lib/config-validator.js:1265 `defaultInitOptions`)
+    // DOES police the JSON-bodied routes, which Fastify buffers — unlike
+    // PUT /:id/upload, whose custom stream parser bypasses buffering and whose
+    // 10 GiB cap is enforced by SourceTooLargeError instead. This proves the
+    // FST_ERR_CTP_BODY_TOO_LARGE branch is reachable through a real route.
+    const { app, repo } = await buildApp(failingStorage(new Error('unused')));
+    const asset = await repo.create({ name: 'huge-parts' });
+    const oversized = JSON.stringify({
+      parts: [{ partNumber: 1, etag: 'e'.repeat(1024 * 1024 + 64) }]
+    });
+    expect(Buffer.byteLength(oversized)).toBeGreaterThan(1048576);
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/multipart/upload-123/complete`,
+      headers: { 'content-type': 'application/json' },
+      payload: oversized
+    });
+    expect(res.statusCode).toBe(413);
+    const body = expectUploadError(res);
+    expect(body.cause).toBe('body_size_limit_exceeded');
+    expect(body.code).toBe('FST_ERR_CTP_BODY_TOO_LARGE');
+    await app.close();
+  });
+
+  it('an unclassifiable fault is 500 unknown, still in the published envelope', async () => {
+    // A bug in our own code — NOT a storage call — must still carry a cause, and
+    // must be `unknown` rather than being mislabelled a storage failure.
+    const { app, repo } = await buildApp(failingStorage(new Error('unused')));
+    const asset = await repo.create({ name: 'boom' });
+    repo.get = async () => {
+      throw new Error('repository exploded');
+    };
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/upload-url`
+    });
+    expect(res.statusCode).toBe(500);
+    const body = expectUploadError(res);
+    expect(body.cause).toBe('unknown');
+    expect(body.error).toBe('upload_failed');
+    // The underlying error text stays server-side.
+    expect(JSON.stringify(body)).not.toContain('repository exploded');
     await app.close();
   });
 

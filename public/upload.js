@@ -69,6 +69,8 @@ export const UPLOAD_FAILURE_CAUSE = {
   ASSET_NOT_FOUND: 'asset_not_found',
   INVALID_ASSET_STATE: 'invalid_asset_state',
   NOT_AUTHORIZED: 'not_authorized',
+  INVALID_REQUEST: 'invalid_request',
+  UNSUPPORTED_MEDIA_TYPE: 'unsupported_media_type',
   UNKNOWN: 'unknown',
 };
 
@@ -113,7 +115,12 @@ export function causeFromResponse(status, body, origin) {
   }
   if (status === 404) return UPLOAD_FAILURE_CAUSE.ASSET_NOT_FOUND;
   if (status === 409) return UPLOAD_FAILURE_CAUSE.QUOTA_EXCEEDED;
+  if (status === 415) return UPLOAD_FAILURE_CAUSE.UNSUPPORTED_MEDIA_TYPE;
   if (status === 422) return UPLOAD_FAILURE_CAUSE.INVALID_ASSET_STATE;
+  if (status === 400) return UPLOAD_FAILURE_CAUSE.INVALID_REQUEST;
+  // 401 is the app-wide authentication gate (src/auth/middleware.ts
+  // registerAuth), which answers before the upload router and so carries no
+  // `cause` of its own; it means the same thing as the router's 403.
   if (status === 401 || status === 403) return UPLOAD_FAILURE_CAUSE.NOT_AUTHORIZED;
   if (status === 501) return UPLOAD_FAILURE_CAUSE.STORAGE_NOT_CONFIGURED;
   // 502/503/504 from a proxy that could not reach the API is a connection
@@ -214,20 +221,20 @@ async function uploadStreamed(assetId, file, deps) {
   let res;
   try {
     res = await fetch(
-    deps.apiBase + '/assets/' + encodeURIComponent(assetId) + '/upload',
-    {
-      method: 'PUT',
-      body: file,
-      headers: {
-        'Content-Type': file.type || 'application/octet-stream',
-        'Content-Length': String(file.size),
-        ...(deps.stackName ? { 'X-Stack-Name': deps.stackName } : {}),
-        // This raw PUT bypasses apiFetch, so present the same UI-scoped bearer
-        // the caller spreads on gated calls (issue #740). The presigned/multipart
-        // tiers PUT to object storage instead and carry no bearer.
-        ...(deps.authHeader || {}),
-      },
-    }
+      deps.apiBase + '/assets/' + encodeURIComponent(assetId) + '/upload',
+      {
+        method: 'PUT',
+        body: file,
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream',
+          'Content-Length': String(file.size),
+          ...(deps.stackName ? { 'X-Stack-Name': deps.stackName } : {}),
+          // This raw PUT bypasses apiFetch, so present the same UI-scoped bearer
+          // the caller spreads on gated calls (issue #740). The presigned/multipart
+          // tiers PUT to object storage instead and carry no bearer.
+          ...(deps.authHeader || {}),
+        },
+      }
     );
   } catch (err) {
     // fetch() itself rejected: the connection never completed (#771).

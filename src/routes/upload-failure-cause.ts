@@ -57,12 +57,16 @@ import { QuotaExceededError } from '../data/storage-quota.js';
 // Stable snake_case identifiers. A client MUST treat an unrecognised value as
 // `unknown` (forward compatibility) rather than failing to render.
 export const uploadFailureCauseSchema = z.enum([
-  // A body-size limit rejected the payload: the route's own 10 GiB stream cap
-  // (SourceTooLargeError), Fastify's `bodyLimit`
-  // (FST_ERR_CTP_BODY_TOO_LARGE), or — for the proxied PUT /:id/upload path —
-  // an upstream proxy's own request-body limit. The proxy variant never reaches
-  // this process (see the client note in public/upload.js), so the client maps
-  // a bodiless 413 onto this same code.
+  // A body-size limit rejected the payload. Three distinct limits, one code:
+  //   - PUT /:id/upload: the route's own 10 GiB stream cap, enforced by
+  //     SourceTooLargeError inside putStream. The framework `bodyLimit` does NOT
+  //     police this route — its custom stream parser hands the body through
+  //     without buffering — so the cap is the storage wrapper's, not Fastify's.
+  //   - the JSON-bodied routes (e.g. an oversized `parts` list on multipart
+  //     complete): the framework `bodyLimit`, FST_ERR_CTP_BODY_TOO_LARGE.
+  //   - an upstream proxy's own request-body limit on the proxied PUT. That
+  //     variant never reaches this process (see the client note in
+  //     public/upload.js), so the client maps a bodiless 413 onto this code too.
   'body_size_limit_exceeded',
   // The connection carrying the bytes broke or could not be established:
   // the client disconnected mid-stream, or the API could not reach the object
@@ -83,6 +87,14 @@ export const uploadFailureCauseSchema = z.enum([
   'invalid_asset_state',
   // The caller may not touch this asset/workspace (403).
   'not_authorized',
+  // The request itself did not satisfy the route's schema — an out-of-range
+  // part number, an empty/malformed `parts` body (400). The caller must fix the
+  // request; retrying it unchanged cannot succeed.
+  'invalid_request',
+  // The request body's Content-Type is not one this deployment can stream
+  // (415). Verified against node_modules/fastify/lib/errors.js:111-115
+  // `FST_ERR_CTP_INVALID_MEDIA_TYPE` (status 415).
+  'unsupported_media_type',
   // An upload failure that could not be classified. Reserved so clients always
   // have a defined fallback branch.
   'unknown'
@@ -117,6 +129,8 @@ export const UPLOAD_FAILURE_STATUS: Record<UploadFailureCause, number> = {
   asset_not_found: 404,
   invalid_asset_state: 422,
   not_authorized: 403,
+  invalid_request: 400,
+  unsupported_media_type: 415,
   unknown: 500
 };
 
@@ -132,6 +146,10 @@ export const UPLOAD_FAILURE_ERROR_CODE: Record<UploadFailureCause, string> = {
   asset_not_found: 'not_found',
   invalid_asset_state: 'invalid_state_transition',
   not_authorized: 'forbidden',
+  // `invalid_request` reuses the existing 400 code from the assets router
+  // (src/routes/assets.ts:1774) rather than inventing a second spelling.
+  invalid_request: 'invalid_request',
+  unsupported_media_type: 'unsupported_media_type',
   unknown: 'upload_failed'
 };
 
@@ -227,9 +245,64 @@ export function isConnectionError(err: unknown): boolean {
 
 // Whether a thrown error is Fastify's request-body-limit rejection. Verified
 // against node_modules/fastify/lib/errors.js:105-110 (FST_ERR_CTP_BODY_TOO_LARGE,
-// status 413).
+// status 413). Reachable on the JSON-bodied upload routes, which Fastify buffers
+// under the framework `bodyLimit` (default 1048576 bytes —
+// node_modules/fastify/lib/config-validator.js:1265 `defaultInitOptions`): an
+// oversized `parts` list on POST /:id/multipart/:uploadId/complete trips it
+// before the handler runs. NOT the mechanism on PUT /:id/upload, whose 10 GiB
+// cap is enforced by SourceTooLargeError inside putStream because the custom
+// stream parser hands the body straight through without buffering it.
 export function isBodyLimitError(err: unknown): boolean {
   return errorCode(err) === 'FST_ERR_CTP_BODY_TOO_LARGE';
+}
+
+// ─── Framework-level rejections ──────────────────────────────────────────────
+//
+// Fastify rejects some requests before (or instead of) running the handler:
+// schema validation, an unparseable content type, an oversized buffered body.
+// Those errors never pass through viaStorage(), so without this classifier they
+// would reach Fastify's DEFAULT error handler and come back in a different
+// envelope with no `cause` at all — breaking the one-field-to-branch-on contract
+// this module exists to provide (issue #771).
+//
+// Codes verified against node_modules/fastify/lib/errors.js:
+//   - :50-54   FST_ERR_VALIDATION               -> 400
+//   - :105-110 FST_ERR_CTP_BODY_TOO_LARGE       -> 413 (RangeError)
+//   - :111-115 FST_ERR_CTP_INVALID_MEDIA_TYPE   -> 415
+//   - :116-121 FST_ERR_CTP_INVALID_CONTENT_LENGTH -> 400 (RangeError)
+//   - :122-126 FST_ERR_CTP_EMPTY_JSON_BODY      -> 400
+//   - :127-131 FST_ERR_CTP_INVALID_JSON_BODY    -> 400
+// The zod validator compiler surfaces its failures as the SAME FST_ERR_VALIDATION
+// (node_modules/fastify-type-provider-zod/dist/src/errors.js
+// `hasZodFastifySchemaValidationErrors` decorates `err.validation`; the code on
+// the thrown error stays Fastify's), so one branch covers both.
+const FRAMEWORK_ERROR_CAUSES: Record<string, UploadFailureCause> = {
+  FST_ERR_VALIDATION: 'invalid_request',
+  FST_ERR_CTP_INVALID_CONTENT_LENGTH: 'invalid_request',
+  FST_ERR_CTP_EMPTY_JSON_BODY: 'invalid_request',
+  FST_ERR_CTP_INVALID_JSON_BODY: 'invalid_request',
+  FST_ERR_CTP_BODY_TOO_LARGE: 'body_size_limit_exceeded',
+  FST_ERR_CTP_INVALID_MEDIA_TYPE: 'unsupported_media_type'
+};
+
+// Classify a framework-level rejection, or return undefined when the error is
+// not one. The message is Fastify's own (a schema message such as
+// "querystring/partNumber Number must be greater than or equal to 1", or
+// "Unsupported Media Type") — it is generated from OUR schema and the caller's
+// own request, so it carries no endpoint or credential detail.
+export function classifyFrameworkError(err: unknown): UploadFailureError | undefined {
+  const code = errorCode(err);
+  if (!code) {
+    return undefined;
+  }
+  const cause = FRAMEWORK_ERROR_CAUSES[code];
+  if (!cause) {
+    return undefined;
+  }
+  return new UploadFailureError(cause, (err as Error).message, {
+    detailCode: code,
+    cause: err
+  });
 }
 
 // Classify any error thrown at (or on the way to) the storage boundary into a
