@@ -151,7 +151,15 @@ export async function reconcileFailedTranscodes(
 export type SettleFailedDeps = Pick<
   ReconcileFailedTranscodesDeps,
   'jobs' | 'assets' | 'pipeline' | 'logger'
->;
+> & {
+  // Optional EncoreClient (#746). When present, a genuine terminal settle
+  // ('encore-error') also cancels the job on Encore AND drains every buffered
+  // scaler-queue entry for it, so no orphaned Encore job keeps running with
+  // nobody listening and no duplicate queue entry survives to be re-dispatched.
+  // Omitted by callers that have no scaler wired (the settle degrades to the
+  // repository-only terminal write, unchanged).
+  encore?: EncoreClient;
+};
 
 // Why a transcode is being settled `failed` (#709). Drives whether the terminal
 // write is UNCONDITIONAL or CONDITIONAL:
@@ -210,6 +218,30 @@ export async function settleFailedTranscode(
     // path settled it first; don't re-fail the pipeline step.
     if (result.applied && deps.pipeline) {
       await releasePipelineLock(deps.pipeline, job.assetId, error);
+    }
+
+    // #746: on a genuine terminal settle, cancel the job on Encore and drain
+    // every buffered scaler-queue entry for it so nothing keeps running (or gets
+    // re-dispatched) with nobody listening for completion. Gated to:
+    //   - result.applied — only the path that actually drove this settle cleans
+    //     up; a no-op (already terminal) leaves the winning path's cleanup alone.
+    //   - reason === 'encore-error' — the UNCONDITIONAL terminal failure. A
+    //     'gone-from-active-set' drop is CONDITIONAL (#709): a late SUCCESSFUL
+    //     callback may still correct it to `done`, so we must NOT cancel a job
+    //     that could yet be succeeding.
+    // EncoreClient.cancel is idempotent (encore-client.ts:58) and drains ALL
+    // queue entries for the id (encore-scaler/index.ts cancel). Keyed by our
+    // externalId (job.encoreJobId — the id the scaler correlates on), so it is a
+    // no-op when the job never reached Encore. Best-effort: a cancel error must
+    // never abort the terminal settle.
+    if (result.applied && reason === 'encore-error' && deps.encore && job.encoreJobId) {
+      await deps.encore.cancel(job.encoreJobId).catch((err) => {
+        deps.logger?.warn?.(
+          '[failed-transcode-reconciler] cancel/drain after settle failed for job %s: %o',
+          job.id,
+          err
+        );
+      });
     }
 
     deps.logger?.info?.(
