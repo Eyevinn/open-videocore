@@ -2,8 +2,8 @@
 
 **Status of the core question: UNCONFIRMED from the repository alone.**
 **Scope: investigation / documentation only — no production code changes.**
-Related: #734, #711. Verified against branch `issue-766/ingress-auth-finding`
-(worktree `/home/node/ovc-766`), based on `origin/main`.
+Related: #734, #711. Verified against branch `issue-766/ingress-auth-finding`,
+based on `origin/main`.
 
 ---
 
@@ -197,5 +197,7 @@ All symbols below were read directly in this session:
 
 ## OSC limitation logged
 
-The absence of a documented downstream browser-session signal is an OSC-platform
-gap, logged to `docs/osc-feedback/incoming-ingress-ui-auth.md`.
+The absence of a documented, verifiable downstream browser-session signal is an
+OSC-platform gap. Per the agent-team convention (CLAUDE.md rule 6), OSC friction
+is logged in the `eng-open-videocore-agents` repo, not here; this gap is recorded
+there at `docs/osc-feedback/incoming-ingress-ui-auth.md`.
