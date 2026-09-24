@@ -122,6 +122,7 @@ import {
   PIPELINE_NAMES,
   type PipelineStepName
 } from '../pipeline/pipelines.js';
+import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { InMemoryCommentRepository, type CommentRepository } from '../data/comment-repo.js';
 import {
@@ -971,14 +972,44 @@ type AssetsRouterOptions = {
   audit?: AuditEmitter;
 };
 
+// Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
+// scene-detect) — issue #789. These steps are opt-in: the service instance they
+// call is configured per stack, and a stack without one must not report a no-op
+// as a completed run. `started: false` therefore always carries a human-readable
+// `reason` that is BOTH surfaced on the step (`skipReason`) and recorded on the
+// asset (`subtitlesError` / `sceneDetectionError`) so the skip is explainable
+// after the fact.
+type OptionalStepOutcome = { started: true } | { started: false; reason: string };
+
+// Skip reasons. They name the operator-facing knob that activates the step: the
+// per-stack instance name (StackConfig.autoSubtitlesInstanceName /
+// sceneDetectInstanceName, src/services/param-store.ts) or its deployment-wide
+// env equivalent (src/services/optional-services.ts registry).
+const SUBTITLES_UNCONFIGURED_REASON =
+  'subtitle generation skipped: no auto-subtitles service instance is configured for this stack ' +
+  '(autoSubtitlesInstanceName / AUTO_SUBTITLES_INSTANCE_NAME is unset)';
+const SUBTITLES_NO_STORAGE_REASON =
+  'subtitle generation skipped: object storage is not configured, so the source object cannot be read';
+const SCENE_DETECT_UNCONFIGURED_REASON =
+  'scene detection skipped: no scene-detection service instance is configured for this stack ' +
+  '(sceneDetectInstanceName / SCENE_DETECT_INSTANCE_NAME is unset)';
+const SCENE_DETECT_NO_STORAGE_REASON =
+  'scene detection skipped: object storage is not configured, so the source object cannot be read';
+
 // PipelineExecution response schemas (POST /:id/execute, GET /:id/executions).
-const stepStatusSchema = z.enum(['pending', 'running', 'done', 'failed']);
+// `skipped` (issue #789): an OPTIONAL step (subtitles / scene-detect) that did
+// not run because its OSC service instance is not configured for this stack.
+// Distinct from `done` so a no-op is not reported as a completed run; the reason
+// is surfaced on the step as `skipReason` and recorded on the asset. See
+// StepStatus in ../data/pipeline-repo.ts.
+const stepStatusSchema = z.enum(['pending', 'running', 'done', 'failed', 'skipped']);
 const stepExecutionSchema = z.object({
   name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
   status: stepStatusSchema,
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
+  skipReason: z.string().optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
   progress: z.number().optional()
@@ -1658,17 +1689,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // Detached, never blocks the caller, and the generator itself never throws
   // (records failures on the asset as `subtitlesError`). No-op when the OSC
   // auto-subtitles service or object storage is not configured — consistent with
-  // the OPTIONAL, opt-in nature of the step. Returns true when a generation was
-  // actually kicked off (false = skipped gracefully).
-  function triggerSubtitles(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+  // the OPTIONAL, opt-in nature of the step. Returns `{ started: true }` when a
+  // generation was actually kicked off; otherwise `{ started: false, reason }`
+  // naming WHY it was skipped (issue #789), so the caller can report the step as
+  // `skipped` rather than `done` and record the reason on the asset.
+  function triggerSubtitles(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): OptionalStepOutcome {
     // Activation is derived from the ACTIVE stack record (issue #217): the
     // resolver builds the generator from StackConfig.autoSubtitlesInstanceName
     // and exposes it on request.connections, so a freshly provisioned service is
     // picked up on the next run with no restart. An injected opts.subtitle
     // Generator (tests) still wins. Absent => skip gracefully (fire-and-forget).
     const generate = opts.subtitleGenerator ?? request.connections?.subtitleGenerator;
-    if (!generate || !storageFor) {
-      return false;
+    if (!generate) {
+      return { started: false, reason: SUBTITLES_UNCONFIGURED_REASON };
+    }
+    if (!storageFor) {
+      return { started: false, reason: SUBTITLES_NO_STORAGE_REASON };
     }
     void subtitleRunner(
       { assetId, objectKey },
@@ -1679,24 +1715,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         ...opts.subtitleDeps
       }
     );
-    return true;
+    return { started: true };
   }
 
   // Fire-and-forget scene/shot detection for a pipeline step (issue #115).
   // Detached, never blocks the caller, and the detector itself never throws
   // (records failures on the asset as `sceneDetectionError`). No-op when the OSC
   // eyevinn-function-scenes service or object storage is not configured —
-  // consistent with the OPTIONAL, opt-in nature of the step. Returns true when a
-  // detection was actually kicked off (false = skipped gracefully).
-  function triggerSceneDetect(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+  // consistent with the OPTIONAL, opt-in nature of the step. Returns
+  // `{ started: true }` when a detection was actually kicked off; otherwise
+  // `{ started: false, reason }` naming WHY it was skipped (issue #789), so the
+  // caller can report the step as `skipped` rather than `done` and record the
+  // reason on the asset.
+  function triggerSceneDetect(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): OptionalStepOutcome {
     // Activation is derived from the ACTIVE stack record (issue #217): the
     // resolver builds the detector from StackConfig.sceneDetectInstanceName and
     // exposes it on request.connections, so a freshly provisioned service is
     // picked up on the next run with no restart. An injected opts.sceneDetector
     // (tests) still wins. Absent => skip gracefully (fire-and-forget).
     const detect = opts.sceneDetector ?? request.connections?.sceneDetector;
-    if (!detect || !storageFor) {
-      return false;
+    if (!detect) {
+      return { started: false, reason: SCENE_DETECT_UNCONFIGURED_REASON };
+    }
+    if (!storageFor) {
+      return { started: false, reason: SCENE_DETECT_NO_STORAGE_REASON };
     }
     void sceneDetectRunner(
       { assetId, objectKey },
@@ -1707,7 +1749,36 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         ...opts.sceneDetectDeps
       }
     );
-    return true;
+    return { started: true };
+  }
+
+  // Record on the asset WHY an optional step was skipped (issue #789).
+  //
+  // The skip reason lands in the same field the step's runner uses for a failed
+  // attempt — `subtitlesError` / `sceneDetectionError` (AssetRepository
+  // UpdateAssetInput, src/data/asset-repo.ts) — so a caller reading the asset
+  // always finds an explanation for a missing subtitle track / missing
+  // sceneMetadata, whether the step failed or never ran. Neither field changes
+  // the asset's lifecycle status, and writing `sceneDetectionError` leaves
+  // `sceneMetadata` untouched (asset-repo update semantics).
+  //
+  // BEST-EFFORT: a failed write is logged and swallowed. A skip is not a
+  // pipeline failure, so this must never throw into the execute loop's
+  // try/catch and turn an unconfigured optional step into a failed execution.
+  async function recordOptionalStepSkip(
+    step: 'subtitles' | 'scene-detect',
+    assetId: string,
+    reason: string,
+    request: import('fastify').FastifyRequest
+  ): Promise<void> {
+    try {
+      await repo.update(
+        assetId,
+        step === 'subtitles' ? { subtitlesError: reason } : { sceneDetectionError: reason }
+      );
+    } catch (err) {
+      request.log.warn({ err, assetId, step }, 'failed to record optional pipeline step skip reason');
+    }
   }
 
   // Fire-and-forget thumbnail extraction for a pipeline step. Uses a default
@@ -2063,8 +2134,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // gracefully when unconfigured) and settle the step immediately. The
           // generator records its own success/failure on the asset and never
           // throws into this loop, so the step never fails the pipeline.
-          triggerSubtitles(asset.id, sourceObjectKey, request);
-          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          const outcome = triggerSubtitles(asset.id, sourceObjectKey, request);
+          if (outcome.started) {
+            stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          } else {
+            // #789: nothing ran, so `done` would be a lie. Settle as `skipped`
+            // (a terminal, non-failing state) and record WHY on the asset.
+            await recordOptionalStepSkip('subtitles', asset.id, outcome.reason, request);
+            stepsCopy[i] = {
+              ...step,
+              status: 'skipped',
+              skipReason: outcome.reason,
+              startedAt: now(),
+              completedAt: now()
+            };
+          }
           continue;
         }
         if (step.name === 'scene-detect') {
@@ -2072,8 +2156,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // skip gracefully when unconfigured) and settle the step immediately. The
           // detector records its own success/failure on the asset and never throws
           // into this loop, so the step never fails the pipeline.
-          triggerSceneDetect(asset.id, sourceObjectKey, request);
-          stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          const outcome = triggerSceneDetect(asset.id, sourceObjectKey, request);
+          if (outcome.started) {
+            stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          } else {
+            // #789: see the subtitles branch above.
+            await recordOptionalStepSkip('scene-detect', asset.id, outcome.reason, request);
+            stepsCopy[i] = {
+              ...step,
+              status: 'skipped',
+              skipReason: outcome.reason,
+              startedAt: now(),
+              completedAt: now()
+            };
+          }
           continue;
         }
         if (step.name === 'transcode') {
@@ -2154,8 +2250,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       return undefined;
     }
 
-    // All steps settled synchronously with none running/pending -> done.
-    const allDone = stepsCopy.every((s) => s.status === 'done');
+    // All steps settled synchronously with none running/pending -> done. A
+    // `skipped` optional step counts as settled (issue #789), so a `full` run
+    // still reports overall completion when the stack has no subtitles /
+    // scene-detection instance configured.
+    const allDone = stepsCopy.every(isStepComplete);
     const updated = await pipelineRepo.update(execution.id, {
       steps: stepsCopy,
       status: allDone ? 'done' : 'running'

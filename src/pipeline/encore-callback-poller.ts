@@ -32,6 +32,7 @@ import type { Redis } from 'ioredis';
 import type { Context } from '@osaas/client-core';
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
+import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
@@ -232,9 +233,11 @@ type EncoreOutput = {
   overallBitrate?: number;
 };
 
-// Are all steps of an execution terminal (done)? Mirrors the internal route.
+// Are all steps of an execution settled? Mirrors the internal route: `done` and
+// `skipped` (issue #789) both count, so an execution containing an unconfigured
+// optional step still closes out as complete.
 function allStepsDone(steps: StepExecution[]): boolean {
-  return steps.every((s) => s.status === 'done');
+  return steps.every(isStepComplete);
 }
 
 // Normalise Encore `output` to renditions. Identical to normaliseRenditions in
