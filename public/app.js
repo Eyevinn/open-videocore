@@ -22,6 +22,10 @@ import { createLogsTable } from './logs-table.js';
 // but push medium/large files straight to MinIO via the presigned single-part
 // and multipart routes so they never hit the proxy's request-body limit.
 import { uploadAssetFile, describeUploadFailure } from './upload.js';
+// Presigned thumbnail loading (issue #801). An <img> GET carries no
+// Authorization header, so thumbnails are resolved to a short-lived signed URL
+// over apiFetch first. Contract grounding lives in public/thumbnail-url.js.
+import { applyThumbnail } from './thumbnail-url.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -1978,9 +1982,9 @@ async function renderAssetDetailBody(id, bodyEl) {
       // First fetch existing thumbnails; if none, extract at 0s, 25%, 50%, 75%
       try {
         var existing = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails');
-        var existingUrls = existing && existing.thumbnails ? existing.thumbnails : [];
-        if (existingUrls.length) {
-          renderThumbnailStrip(thumbArea, existingUrls);
+        var existingThumbs = existing && existing.thumbnails ? existing.thumbnails : [];
+        if (existingThumbs.length) {
+          renderThumbnailStrip(thumbArea, id, existingThumbs.length);
           return;
         }
         // Extract using duration from technicalMetadata if available
@@ -1991,9 +1995,13 @@ async function renderAssetDetailBody(id, bodyEl) {
         var r = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails',
           { method: 'POST', body: JSON.stringify({ timecodes: timecodes }) });
         actionMsg.innerHTML = '';
-        var urls = r && r.thumbnails ? r.thumbnails : [];
-        if (urls.length) {
-          renderThumbnailStrip(thumbArea, urls);
+        // POST returns the object keys it just stored, and the runner replaces the
+        // asset's whole `thumbnails` array with exactly that list
+        // (src/pipeline/thumbnail.ts:164), so position i here is position i on the
+        // asset — the index the presigned-URL route is keyed by.
+        var extracted = r && r.thumbnails ? r.thumbnails : [];
+        if (extracted.length) {
+          renderThumbnailStrip(thumbArea, id, extracted.length);
         } else {
           showMsg(actionMsg, 'Thumbnails extracted.', 'success');
         }
@@ -2002,19 +2010,39 @@ async function renderAssetDetailBody(id, bodyEl) {
       }
     });
 
-    function renderThumbnailStrip(container, urls) {
+    // Render `count` thumbnails for `assetId`, addressed by their position in the
+    // asset's `thumbnails` array — the key both the listing route and the
+    // presigned-URL route use (see public/thumbnail-url.js for the contract).
+    //
+    // The <img> elements are created up front, in order, but WITHOUT a src: the
+    // API's thumbnail byte route sits behind the bearer gate and a browser's
+    // <img> GET sends no Authorization header (issue #801). Each src is then
+    // filled in from the presigned-URL endpoint over the authenticated apiFetch,
+    // so the browser's GET to storage carries the signature in the URL itself.
+    // Creating the elements first keeps the strip in index order regardless of
+    // which signature is issued first; one whose URL cannot be issued (or whose
+    // signed GET fails) is dropped rather than left as a broken-image icon.
+    function renderThumbnailStrip(container, assetId, count) {
+      if (!count) return;
       var titleEl = document.createElement('div');
       titleEl.className = 'section-title mt12';
       titleEl.textContent = 'Thumbnails';
       container.appendChild(titleEl);
       var strip = document.createElement('div');
       strip.className = 'thumbnails';
-      urls.forEach(function(u) {
+      for (var i = 0; i < count; i++) {
         var img = document.createElement('img');
-        img.src = u;
         img.alt = 'thumbnail';
         strip.appendChild(img);
-      });
+        applyThumbnail(img, {
+          apiFetch: apiFetch,
+          assetId: assetId,
+          index: i,
+          onFailure: (function(el) {
+            return function() { el.remove(); };
+          })(img)
+        });
+      }
       container.appendChild(strip);
     }
 
