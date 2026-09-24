@@ -4887,6 +4887,10 @@ TAB_RENDERERS['provision'] = renderProvisionTab;
 // These are re-used by detail.js via ES module import so the standalone page
 // shares the exact same renderer + helper logic (no duplication / divergence).
 export {
+  // Exported so the UI fetch-path auth test (issue #741) can drive the real
+  // apiFetch() against a gated router, catching future drift between the gate
+  // and the UI's credential handling alongside test/workspace-acl.test.ts.
+  apiFetch,
   isAssetWedged,
   filterWedgedAssets,
   renderAssetDetailBody,
