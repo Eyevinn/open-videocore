@@ -21,7 +21,7 @@ import { createLogsTable } from './logs-table.js';
 // Size-based upload routing (issue #747): stream small files through the proxy,
 // but push medium/large files straight to MinIO via the presigned single-part
 // and multipart routes so they never hit the proxy's request-body limit.
-import { uploadAssetFile } from './upload.js';
+import { uploadAssetFile, describeUploadFailure } from './upload.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -1363,7 +1363,14 @@ async function renderAssetsTab(container) {
             await abortMultipartUpload(assetId, multipartUploadId);
             if (assetsTable) assetsTable.reload();
           }
-          showMsg(uploadProgress, 'Error: ' + err.message, 'error');
+          // Show the identified CAUSE of the failure, not the bare transport
+          // status (issue #772). Every rejection out of uploadAssetFile carries
+          // a `failureCause` mirroring the API's `cause` field
+          // (src/routes/upload-failure-cause.ts `uploadErrorSchema`);
+          // describeUploadFailure() maps it to a sentence and degrades to the
+          // status — then to a generic line — when no structured cause is
+          // present (e.g. a failure of the `POST /assets` create call above).
+          showMsg(uploadProgress, describeUploadFailure(err), 'error');
           uploadBtn.disabled = false;
           uploadBtn.textContent = 'Upload';
         }

@@ -123,7 +123,28 @@ standard field for the originating error and is left alone. The same split
 applies server-side: `UploadFailureError.failureCause` is the code,
 `toResponseBody()` serialises it as `cause`.
 
-## Notes for #772 (UI)
+## What the ops UI shows (issue #772)
+
+`public/upload.js` also owns the user-facing text, so the cause codes and the
+sentences that explain them stay in one place:
+
+* `UPLOAD_FAILURE_MESSAGE` — one sentence per cause, e.g.
+  `body_size_limit_exceeded` → "the file exceeds the upload size limit enforced
+  on this deployment".
+* `resolveFailureCause(err)` — the cause of a thrown error: its `failureCause`
+  first, then its HTTP status via `causeFromResponse()`, then `undefined`.
+* `describeUploadFailure(err)` — the display string. It always leads with the
+  cause ("Upload failed: …") and appends the API's `message` as
+  "Details: …" when that adds anything; a message that only restates the
+  transport status ("Upload failed: HTTP 413") is dropped. An error with no
+  cause and no status — or an unrecognised cause code — falls back to the
+  `unknown` sentence rather than rendering a raw token or throwing.
+
+The upload modal in `public/app.js` renders exactly that string, so a failed
+upload now reads "Upload failed: the file exceeds the upload size limit enforced
+on this deployment." instead of "Error: Upload failed: HTTP 413".
+
+Guidance the wording follows:
 
 * Branch on `cause`; use `message` as the fallback display string.
 * `network_error` is the only routinely retryable cause.
