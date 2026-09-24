@@ -23,13 +23,21 @@ API reported success.
    can still land on `SuccessCriteriaMet`. Every caller therefore has to verify
    the output object out-of-band (we now HEAD the written key — see
    `src/pipeline/clip.ts:clip` and `src/pipeline/rewrap.ts:rewrap`).
-2. **Terminal status vocabulary is undocumented.** `waitForJobToComplete` in the
-   SDK polls for `'Complete'`, which this service never sets; the observed
-   terminal value is `'SuccessCriteriaMet'` (already logged for issue #6). There
-   is no published enumeration of the terminal values, so callers cannot write a
-   closed-world success check with confidence. We now treat *anything* outside
-   `{'SuccessCriteriaMet', 'Complete'}` as a failure, which is the safe default
-   but will misreport if the service introduces a new success value.
+2. **The whole `job.status` vocabulary is undocumented — not just the terminal
+   values.** `waitForJobToComplete` in the SDK polls for `'Complete'`, which this
+   service never sets; the observed terminal value is `'SuccessCriteriaMet'`
+   (already logged for issue #6). `getJob` is typed `Promise<any>`
+   (`@osaas/client-core/lib/job.d.ts:51`), so neither the terminal nor the
+   in-progress values are discoverable from the contract. We had to establish
+   them by polling a live job every 2s (2026-09-24): a job reports
+   `status: "Running"` for its entire execution and flips straight to
+   `"SuccessCriteriaMet"` on exit — there is no intermediate or empty value in
+   between. Because the in-progress vocabulary is also unpublished, a caller
+   cannot tell "a status I do not recognise" apart from "still working": we now
+   tolerate an unrecognised status for 30s and then fail (`osc-job-poll.ts`),
+   rather than polling it to the 5-minute timeout and holding an awaited HTTP
+   request open. A published enumeration, or a boolean `done`/`succeeded` field,
+   would remove the guesswork entirely.
 3. **Logs disappear with the instance.** `getLogsForInstance` is the only place
    ffmpeg's stderr is visible, and it is only reachable while the ephemeral
    instance exists. Removing the spent job (which we must do, or instances
@@ -46,8 +54,10 @@ API reported success.
 
 - A per-job result document: ffmpeg exit code, stderr tail, and the list of
   output URIs actually written, retained after the instance is reaped.
-- A documented, closed set of terminal `status` values, with an explicit
-  distinction between "job ran" and "job produced its declared output".
+- A documented, closed set of `status` values — in-progress *and* terminal —
+  with an explicit distinction between "job ran" and "job produced its declared
+  output". Today `'Running'` and `'SuccessCriteriaMet'` are only known to us by
+  observation.
 - Service documentation stating that ffmpeg output must be `s3://…` with the
   credential fields in the job body, and rejecting a job whose output target is
   an `http(s)://` URL rather than accepting it and writing nothing.

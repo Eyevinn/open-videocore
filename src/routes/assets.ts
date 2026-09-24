@@ -4234,6 +4234,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         );
         return reply.code(201).send(child);
       } catch (err) {
+        // The message can carry the tail of the ffmpeg log (issue #786), which is
+        // what makes a clip failure diagnosable. It is logged server-side in full
+        // and returned to the caller with presigned query strings already
+        // redacted by osc-clip.ts:redactLogQueryStrings — ffmpeg echoes its `-i`
+        // argument, and that argument is a presigned GET URL whose query string
+        // holds a live signature.
+        request.log.warn({ err, assetId: asset.id }, 'clip job failed');
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'clip_failed', message });
       }

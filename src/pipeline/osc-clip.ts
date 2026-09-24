@@ -61,15 +61,33 @@ export type OscJobApi = {
 // The ONLY job statuses that mean the ffmpeg job finished successfully.
 // eyevinn-ffmpeg-s3 reports 'SuccessCriteriaMet'; 'Complete' is the generic SDK
 // value (and what osc-job-poll.ts synthesises when the instance has already been
-// reaped). Anything else — 'Failed', 'Error', 'Stopped', a status this service
-// grew since, or an empty/unknown value — is treated as a FAILURE (issue #786:
-// checking only for two exact failure values let every other terminal value pass
-// as success). Verified against osc-job-poll.ts:TERMINAL_STATUS.
+// reaped). Any OTHER value returned by the poller is treated as a FAILURE
+// (issue #786: checking only for two exact failure values let every other
+// terminal value pass as success).
+//
+// What this actually observes, verified against
+// osc-job-poll.ts:TERMINAL_STATUS/ACTIVE_STATUS: the poller only ever RETURNS a
+// value from its terminal set, so in practice this branch sees 'Failed', 'Error'
+// or 'Stopped'. A status the poller recognises as neither terminal nor active —
+// a value this service grew since — does not arrive here as a status at all: the
+// poller throws after a bounded grace window, and the catch below turns that
+// into the same failure. The allow-list is kept as the second line of defence so
+// a future terminal value added to the poller cannot become a silent success.
 const SUCCESS_STATUSES = new Set(['SuccessCriteriaMet', 'Complete']);
 
 // Cap on how much ffmpeg log text is attached to a failure message, so a
 // runaway log cannot blow up an error string / response body.
 const MAX_LOG_CHARS = 4_000;
+
+// ffmpeg echoes its `-i` argument verbatim into stderr, and that argument is a
+// presigned MinIO GET URL whose query string carries a live SigV4 signature
+// (`X-Amz-Signature`, TTL per clip.ts:clipUrlTtlSeconds). The captured log is
+// attached to the thrown Error, which routes/assets.ts sends back in the 502
+// body, so every query string is stripped before the log leaves this module.
+// Path and status text — the parts that explain the failure — are preserved.
+export function redactLogQueryStrings(text: string): string {
+  return text.replace(/\?[^"\s]+/g, '?<redacted>');
+}
 
 // Build the destination URI the ffmpeg job writes to. Mirrors the
 // `s3://bucket/<objectKey>` form used by osc-rewrap.ts:rewrapCmdLine; the `.mp4`
@@ -105,11 +123,13 @@ function clipJobName(): string {
 // reaped). Never throws — a failed log fetch must not mask the real failure.
 // getLogsForInstance returns `string | string[]`
 // (@osaas/client-core/lib/core.d.ts:85), so both shapes are normalised here.
+// Query strings are redacted before the text is returned — see
+// redactLogQueryStrings.
 async function captureJobLogs(api: OscJobApi, name: string, sat: string): Promise<string> {
   try {
     const log = await api.getLogsForInstance(api.context, FFPROBE_SERVICE_ID, name, sat);
     const text = Array.isArray(log) ? log.join('\n') : String(log ?? '');
-    const trimmed = text.trim();
+    const trimmed = redactLogQueryStrings(text).trim();
     return trimmed.length > MAX_LOG_CHARS ? trimmed.slice(-MAX_LOG_CHARS) : trimmed;
   } catch {
     return '';
