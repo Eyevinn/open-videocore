@@ -8,6 +8,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
+import { isStepTerminal } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
@@ -15,10 +16,14 @@ import type { EncoreClient } from '../pipeline/encore-client.js';
 
 const stepExecutionSchema = z.object({
   name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
-  status: z.enum(['pending', 'running', 'done', 'failed']),
+  // `skipped` (issue #789): the step did not run because its OPTIONAL service
+  // instance is unconfigured — distinct from `done`. See StepStatus in
+  // ../data/pipeline-repo.ts.
+  status: z.enum(['pending', 'running', 'done', 'failed', 'skipped']),
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
+  skipReason: z.string().optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
   progress: z.number().optional()
@@ -136,10 +141,13 @@ export const pipelinesRouter: FastifyPluginAsync<PipelinesRouterOptions> = async
         }
       }
 
-      // Mark each non-terminal step as failed and the execution overall.
+      // Mark each non-terminal step as failed and the execution overall. An
+      // already-settled step is left as-is: `done` for a completed one and
+      // `skipped` for an optional step that never ran (issue #789) — cancelling
+      // the execution must not retroactively turn either into a failure.
       const now = new Date().toISOString();
       const updatedSteps = exec.steps.map((step) =>
-        step.status === 'done' ? step : { ...step, status: 'failed' as const, completedAt: now }
+        isStepTerminal(step) ? step : { ...step, status: 'failed' as const, completedAt: now }
       );
       const updated = await pipelineRepository.update(exec.id, {
         status: 'failed',

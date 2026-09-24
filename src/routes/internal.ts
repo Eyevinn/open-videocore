@@ -36,6 +36,7 @@ import {
 import type { JobRepository } from '../data/job-repo.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
+import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
 import {
@@ -136,9 +137,12 @@ type InternalRouterOptions = {
   audit?: AuditEmitter;
 };
 
-// Are all steps of an execution terminal (done)? Used to close out an execution.
+// Are all steps of an execution settled? Used to close out an execution. A
+// `skipped` optional step (issue #789) counts as settled alongside `done`, so a
+// callback-driven `full` run still completes when the stack has no subtitles /
+// scene-detection instance configured.
 function allStepsDone(steps: StepExecution[]): boolean {
-  return steps.every((s) => s.status === 'done');
+  return steps.every(isStepComplete);
 }
 
 // Build the Encore job API URL for packaging. Looks up the instance URL and
