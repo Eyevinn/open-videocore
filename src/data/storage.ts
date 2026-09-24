@@ -55,6 +55,28 @@ export function deliveryUrlTtlSeconds(): number {
   return parsed;
 }
 
+// Default lifetime for a thumbnail-image URL handed back to a browser
+// (issue #800). A thumbnail URL is consumed immediately by an <img> tag, so the
+// window only has to cover page render — much shorter than a playback session,
+// which keeps the blast radius of a URL leaked through a referrer header,
+// browser history or a shared screenshot small. Override globally via
+// THUMBNAIL_URL_TTL_SECONDS.
+export const DEFAULT_THUMBNAIL_URL_TTL_SECONDS = 5 * 60; // 5 minutes
+
+// Resolve the configured thumbnail-URL TTL (12-factor: config via env). Falls
+// back to the 5-minute default when unset or invalid.
+export function thumbnailUrlTtlSeconds(): number {
+  const raw = process.env['THUMBNAIL_URL_TTL_SECONDS'];
+  if (!raw) {
+    return DEFAULT_THUMBNAIL_URL_TTL_SECONDS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_THUMBNAIL_URL_TTL_SECONDS;
+  }
+  return parsed;
+}
+
 // Default gap between upload-liveness heartbeats on the proxied streaming
 // upload path (issue #731). While a slow-but-progressing PUT /:id/upload body
 // drains, the route touches the asset's `updatedAt` on this cadence so #726's
