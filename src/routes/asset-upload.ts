@@ -373,6 +373,20 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       const storage = storageFor();
       const objectKey = sourceObjectKey(asset.id);
       await storage.abortMultipartUpload(objectKey, request.params.uploadId);
+      // Do not leave a stranded `uploading` orphan (issue #748). Aborting the
+      // multipart session above reclaims the staged parts, but the asset was
+      // created in `uploading` (asset-repo.ts:1288) and — on a failed/cancelled
+      // upload — never received an object. Transition it to `failed` so it is
+      // not left dangling as a live `uploading` record with nothing behind it.
+      // `uploading -> failed` is an allowed transition (asset-repo.ts:35) and
+      // `status` is the UpdateAssetInput write contract (asset-repo.ts:616).
+      // Guard on the current status: an asset that already advanced past
+      // `uploading` (e.g. a late/duplicate abort arriving after upload-complete)
+      // is left untouched, keeping the route idempotent. This PREVENTS new
+      // orphans; #726 remediates pre-existing ones.
+      if (asset.status === 'uploading') {
+        await repo.update(asset.id, { status: 'failed' });
+      }
       return reply.code(204).send(null);
     }
   );
