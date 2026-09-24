@@ -18,6 +18,10 @@ import { createAssetsTable } from './assets-table.js';
 // (#368/#373) against the verified GET /api/v1/logs/ contract. See
 // public/logs-table.js.
 import { createLogsTable } from './logs-table.js';
+// Size-based upload routing (issue #747): stream small files through the proxy,
+// but push medium/large files straight to MinIO via the presigned single-part
+// and multipart routes so they never hit the proxy's request-body limit.
+import { uploadAssetFile } from './upload.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -1314,26 +1318,40 @@ async function renderAssetsTab(container) {
             method: 'POST',
             body: JSON.stringify({ name: file.name })
           });
+          // Assign the outer `assetId` (not a fresh `const`) so the catch below
+          // can clean up via abortMultipartUpload(assetId, …) on failure (#748).
           assetId = asset.id;
-          showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + Math.round(file.size / 1024 / 1024 * 10) / 10 + ' MB)…', 'info');
-          // Stream the file through the API (avoids CORS on MinIO presigned URLs).
-          const uploadRes = await fetch('/api/v1/assets/' + encodeURIComponent(assetId) + '/upload', {
-            method: 'PUT',
-            body: file,
-            headers: {
-              'Content-Type': file.type || 'application/octet-stream',
-              'Content-Length': String(file.size),
-              'X-Stack-Name': getActiveStack(),
-              // asset-upload is gated by the 401 presence gate too
-              // (src/routes/asset-upload.ts:131); this raw streaming PUT bypasses
-              // apiFetch, so present the same UI-scoped bearer (issue #740).
-              ...uiAuthHeader()
-            }
+          const totalMb = Math.round(file.size / 1024 / 1024 * 10) / 10;
+          showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + totalMb + ' MB)…', 'info');
+          // Route the transport by file size (issue #747). Small files stream
+          // through the proxied PUT /assets/:id/upload as before; medium/large
+          // files PUT straight to object storage via the presigned single-part
+          // or multipart routes so no single request carries the whole payload
+          // through the proxy (which enforces a body limit well below the
+          // route's 10 GiB bodyLimit and 413s large files otherwise).
+          await uploadAssetFile(assetId, file, {
+            apiFetch: apiFetch,
+            apiBase: API_BASE,
+            stackName: stackOverride || getActiveStack(),
+            // The streamed proxy PUT inside uploadAssetFile bypasses apiFetch, so
+            // hand it the same UI-scoped bearer apiFetch spreads (issue #740). The
+            // presigned/multipart PUTs go straight to object storage under their
+            // presigned signature and deliberately do NOT carry this header.
+            authHeader: uiAuthHeader(),
+            // Surface the multipart session id so the shared abort route can run
+            // on a later failure/cancel (issue #748). uploadAssetFile also aborts
+            // internally on a mid-transfer failure; this outer hook keeps #748's
+            // best-effort abortMultipartUpload() path wired as a safety net.
+            onMultipartInit: function (uploadId) { multipartUploadId = uploadId; },
+            onProgress: function (loaded, total) {
+              const pct = total ? Math.floor((loaded / total) * 100) : 0;
+              showMsg(
+                uploadProgress,
+                'Uploading ' + file.name + ' — ' + pct + '% (' + totalMb + ' MB)…',
+                'info'
+              );
+            },
           });
-          if (!uploadRes.ok) {
-            const err = await uploadRes.json().catch(() => ({}));
-            throw new Error(err.message || err.error || 'Upload failed: HTTP ' + uploadRes.status);
-          }
           close();
           if (assetsTable) assetsTable.reload();
         } catch (err) {
