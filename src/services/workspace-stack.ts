@@ -377,41 +377,213 @@ function buildInMemoryConnections(): WorkspaceConnections {
 
 export const STACK_CONFIG_NAMESPACE = "default";
 
-// Derive the deployment's own workspace (tenant) id from the OSC Context.
+// Explicit operator-set workspace id (12-factor: config via env). When set and
+// well-formed this WINS over every other source and is never persisted — an
+// operator who pins the namespace in the deployment's environment gets exactly
+// that namespace on every boot, with no OSC round-trip at all. Follows the
+// existing OVC_* convention (OVC_TRUST_ROLE_HEADER, src/main.ts:447).
+export const WORKSPACE_ID_ENV_VAR = 'OVC_WORKSPACE_ID';
+
+// Fixed key under which the deployment's workspace id is PINNED the first time
+// it is confidently derived (normally during provisioning), and read back on
+// every later boot. Deliberately NOT namespaced by the workspace id — it is the
+// value that yields the namespace — but prefixed with `openvideocore/` like
+// every other key this app writes (stackConfigKey, param-store.ts:131) so it is
+// distinguishable from any other consumer of the store.
 //
-// This is the SINGLE source of truth for the parameter-store namespace and is
-// called by BOTH sides of the read/write contract so their keys provably agree:
+// SECURITY (issue #712/#776): the config-service instance this key lives in is
+// the deployment's OWN (resolved from PARAMETER_STORE_INSTANCE_NAME against the
+// deployment's own authenticated Context, param-store.ts:724-740), so the pin is
+// only readable/writable by this deployment. Reading it back is NOT cross-tenant
+// probing: it yields this deployment's own id, and the only other namespace ever
+// read anywhere remains the literal `default` compatibility shim.
+export const WORKSPACE_ID_PIN_KEY = 'openvideocore/_meta/workspace-id';
+
+// Narrow read/write view over the parameter store used ONLY for the workspace-id
+// pin. Structurally satisfied by ConfigKvStore (param-store.ts:602-608, get/set/
+// delete/listByPrefix over the same eyevinn-app-config-svc HTTP contract), so
+// main.ts can pass the store it already builds with configKvStoreFromEnv. Kept
+// narrow so a caller/test can supply a two-method stub.
+export type WorkspaceIdStore = {
+  get(key: string): Promise<string | undefined>;
+  set(key: string, value: string): Promise<void>;
+};
+
+// A workspace id must be usable as a single key segment in
+// `openvideocore/<workspaceId>/<name>` (param-store.ts:131) and in the
+// listStackNames prefix (param-store.ts:558). A value carrying `/` would break
+// both, so it is rejected rather than silently corrupting the key space.
+function isUsableWorkspaceId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    !value.includes('/')
+  );
+}
+
+// Read the deployment's tenant id from OSC, or undefined when it cannot be
+// established (subscription list unreachable, empty, or carrying no tenantId).
+//
+// Contract: @osaas/client-core admin.d.ts:2-5,42 —
+//   Subscription = { serviceId: string; tenantId: string }
+//   listSubscriptions(context: Context): Promise<Subscription[]>
+// Every active subscription of a tenant carries the SAME tenantId, so any entry
+// identifies the tenant. We nonetheless take the lexicographically smallest
+// distinct tenantId rather than `find()`-ing the first element (issue #776): the
+// membership and ORDER of that list track service instances being created and
+// destroyed, which the deployment does not control, so "the first element" is
+// not a stable selector. Sorting makes the choice independent of list order.
+//
+// Returning undefined (rather than the `default` literal) is the point of this
+// helper: the caller can distinguish "OSC says the tenant is X" from "OSC could
+// not tell us", and must only PIN the former.
+async function readTenantIdFromOsc(osc: Context): Promise<string | undefined> {
+  try {
+    const subscriptions = await listSubscriptions(osc);
+    if (!Array.isArray(subscriptions)) return undefined;
+    const tenantIds = subscriptions
+      .map((s) => s?.tenantId)
+      .filter((id): id is string => isUsableWorkspaceId(id))
+      .map((id) => id.trim())
+      .sort();
+    return tenantIds[0];
+  } catch {
+    return undefined;
+  }
+}
+
+// Derive the deployment's workspace (tenant) id from the OSC Context alone.
+//
+// RETAINED as the last-resort derivation step of resolveWorkspaceId below and as
+// the pre-existing public helper. On its own it is NOT deterministic across
+// boots (issue #776): when the subscription list is momentarily empty or
+// unreachable it returns STACK_CONFIG_NAMESPACE instead of the tenant id it
+// returned on the previous boot. Prefer resolveWorkspaceId, which pins the first
+// confidently-derived value and reads it back thereafter.
+export async function deriveWorkspaceId(osc: Context): Promise<string> {
+  return (await readTenantIdFromOsc(osc)) ?? STACK_CONFIG_NAMESPACE;
+}
+
+// Where a resolved workspace id came from. Surfaced on the diagnostic log line
+// so an operator can tell a pinned (deterministic) resolution from a derived or
+// fallback one without reading code.
+export type WorkspaceIdSource = 'env' | 'pinned' | 'derived' | 'fallback';
+
+export type WorkspaceIdResolution = {
+  workspaceId: string;
+  source: WorkspaceIdSource;
+  // True when the value is guaranteed to repeat on the next boot with no config
+  // change: an explicit env var, or a value read back from / just written to the
+  // pin. False only for the `default` fallback taken when OSC could not tell us
+  // the tenant and nothing is pinned yet.
+  deterministic: boolean;
+};
+
+export type ResolveWorkspaceIdOptions = {
+  // Pin store. When omitted, resolution degrades to the pre-#776 derive-only
+  // behaviour (env var still wins) — used by callers/tests that have no store.
+  store?: WorkspaceIdStore;
+  log?: StackResolverLogger;
+};
+
+// Resolve the deployment's parameter-store namespace DETERMINISTICALLY.
+//
+// This is the SINGLE source of truth for the namespace and is called by BOTH
+// sides of the read/write contract so their keys provably agree:
 //   - the provision/deprovision routes (write side, src/routes/provision.ts)
 //     namespace every storeStackConfig/loadStackConfig/listStackNames by this id;
 //   - the runtime resolver below (read side) resolves the same namespace before
 //     every listStackNames/loadStackConfig.
-// Because both derive from the deployment's OWN authenticated Context via the
-// identical listSubscriptions logic, the resolver read key equals the provision
-// write key for the same deployment — closing the divergence that a fixed
-// literal namespace on the read side would reintroduce (issue #712).
 //
-// The tenant id is read from OSC via listSubscriptions: every active
-// subscription of a tenant carries the same tenantId (@osaas/client-core
-// admin.d.ts:2-5,42 — Subscription = { serviceId: string; tenantId: string };
-// listSubscriptions(context: Context): Promise<Subscription[]>), so the first
-// subscription's tenantId is the deployment's tenant.
+// Resolution order — each step is stable across boots of the SAME deployment:
+//   1. `OVC_WORKSPACE_ID` env var (explicit operator config, 12-factor). Never
+//      persisted; it is already deterministic by construction.
+//   2. The PINNED value read back from the deployment's own parameter store
+//      (WORKSPACE_ID_PIN_KEY). Written once — normally by the first provision —
+//      and read back on every boot thereafter. This is what makes the namespace
+//      independent of the OSC subscription set (issue #776 cause): the pin does
+//      not change when service instances are created or destroyed between boots.
+//   3. The tenant id derived from OSC (readTenantIdFromOsc). On success it is
+//      PINNED best-effort so step 2 answers every later boot.
+//   4. STACK_CONFIG_NAMESPACE (`default`) when OSC could not tell us the tenant
+//      and nothing is pinned. This branch deliberately does NOT pin: pinning a
+//      `default` we only chose because a read failed would permanently strand a
+//      deployment whose stacks live under a tenant-scoped key — the exact
+//      direction-2 failure issue #776 reports, which the #751 read fallback does
+//      not cover. Leaving the pin unset lets the next healthy boot pin the real
+//      tenant id instead.
 //
-// The read is best-effort: if the OSC subscription list is unreachable, empty,
-// or carries no tenantId, both sides fall back to STACK_CONFIG_NAMESPACE so a
-// single deployment (or a test/offline environment) still resolves a stable,
-// symmetric namespace.
-export async function deriveWorkspaceId(osc: Context): Promise<string> {
-  try {
-    const subscriptions = await listSubscriptions(osc);
-    const tenantId = Array.isArray(subscriptions)
-      ? subscriptions.find(
-          (s) => typeof s?.tenantId === 'string' && s.tenantId.length > 0
-        )?.tenantId
-      : undefined;
-    return tenantId ?? STACK_CONFIG_NAMESPACE;
-  } catch {
-    return STACK_CONFIG_NAMESPACE;
+// The pin read/write is best-effort in BOTH directions: any store failure is
+// logged and falls through to derivation, so a parameter-store blip can never
+// make the namespace unresolvable.
+export async function resolveWorkspaceId(
+  osc: Context,
+  opts: ResolveWorkspaceIdOptions = {}
+): Promise<WorkspaceIdResolution> {
+  const log = opts.log ?? noopLogger;
+
+  // 1. Explicit operator config wins outright and costs no round-trip.
+  const configured = process.env[WORKSPACE_ID_ENV_VAR];
+  if (configured !== undefined && configured.trim().length > 0) {
+    if (isUsableWorkspaceId(configured)) {
+      return { workspaceId: configured.trim(), source: 'env', deterministic: true };
+    }
+    log.warn(
+      { env: WORKSPACE_ID_ENV_VAR },
+      'ignoring configured workspace id: it must not contain "/" (it is a single parameter-store key segment)'
+    );
   }
+
+  // 2. Read back the pin written at provisioning time.
+  const store = opts.store;
+  if (store) {
+    try {
+      const pinned = await store.get(WORKSPACE_ID_PIN_KEY);
+      if (isUsableWorkspaceId(pinned)) {
+        return { workspaceId: pinned.trim(), source: 'pinned', deterministic: true };
+      }
+    } catch (err) {
+      log.warn(
+        {
+          err: err instanceof Error ? { message: err.message } : String(err),
+          key: WORKSPACE_ID_PIN_KEY
+        },
+        'workspace id: pin read failed; falling back to deriving it from OSC'
+      );
+    }
+  }
+
+  // 3. Derive from OSC and pin the result so step 2 answers next time.
+  const tenantId = await readTenantIdFromOsc(osc);
+  if (tenantId) {
+    if (store) {
+      try {
+        await store.set(WORKSPACE_ID_PIN_KEY, tenantId);
+        log.info(
+          { key: WORKSPACE_ID_PIN_KEY, workspaceId: tenantId },
+          'workspace id: pinned the derived tenant id; later boots read it back instead of re-deriving'
+        );
+      } catch (err) {
+        // Non-fatal: serve the derived id now and retry the pin next resolve.
+        log.warn(
+          {
+            err: err instanceof Error ? { message: err.message } : String(err),
+            key: WORKSPACE_ID_PIN_KEY
+          },
+          'workspace id: pin write failed; will retry on the next resolve'
+        );
+      }
+    }
+    return { workspaceId: tenantId, source: 'derived', deterministic: store !== undefined };
+  }
+
+  // 4. Nothing to pin — OSC could not tell us the tenant. Serve `default` for
+  // this resolve WITHOUT pinning it (see the header note).
+  return {
+    workspaceId: STACK_CONFIG_NAMESPACE,
+    source: 'fallback',
+    deterministic: false
+  };
 }
 
 export class WorkspaceStackResolver {
@@ -426,6 +598,17 @@ export class WorkspaceStackResolver {
   // last-known-good) so an operator can detect a degraded-but-not-crashed
   // instance via /health without logs.
   private resolverHealth: ResolverHealthSignal | undefined;
+  // Pin store for the deterministic workspace id (issue #776). Optional: when
+  // omitted the resolver degrades to derive-only namespace resolution, which is
+  // what every existing caller/test that wires no store already got.
+  private workspaceIdStore: WorkspaceIdStore | undefined;
+  // Memoised namespace for this process. Only a DETERMINISTIC resolution (env /
+  // pinned / derived-and-pinned) is memoised: the `default` fallback taken when
+  // OSC could not tell us the tenant is deliberately NOT cached, so a boot that
+  // started before the pin existed re-resolves and picks the pin up instead of
+  // staying stuck on `default` for the life of the process. Cleared by
+  // invalidate() so a provision that establishes the pin is seen immediately.
+  private namespaceMemo: string | undefined;
   // Diagnostic/observability logger. `info`/`warn` carry the read-path
   // diagnostics (issue #415: (namespace, stack name) correlation on each
   // resolve); `error` surfaces a transient parameter-store refresh failure
@@ -447,6 +630,12 @@ export class WorkspaceStackResolver {
     // degraded fallback (no-storage / stale last-known-good) so an operator can
     // detect a degraded-but-not-crashed instance via /health without logs.
     resolverHealth?: ResolverHealthSignal;
+    // Pin store backing the deterministic workspace id (issue #776). The SAME
+    // store the provision route is given, so the namespace the resolver READS
+    // under is the one provisioning PINNED. Optional: without it the resolver
+    // falls back to deriving the namespace from OSC on every resolve (pre-#776
+    // behaviour), which is not stable across boots.
+    workspaceIdStore?: WorkspaceIdStore;
     // Injected logger so read-path diagnostics (issue #415) and transient
     // parameter-store refresh failures (issue #419) are observable. Optional;
     // defaults to a noop for callers/tests that don't wire one.
@@ -458,7 +647,28 @@ export class WorkspaceStackResolver {
     this.couchPassword = opts.couchPassword;
     this.optionalSteps = opts.optionalSteps ?? {};
     this.resolverHealth = opts.resolverHealth;
+    this.workspaceIdStore = opts.workspaceIdStore;
     this.log = opts.log ?? noopLogger;
+  }
+
+  // Resolve the parameter-store namespace for this deployment (issue #776).
+  //
+  // Delegates to the shared resolveWorkspaceId — the SAME function the provision
+  // route writes under — so the resolver's read key provably equals the provision
+  // write key. The result is memoised for the life of the process ONLY when it is
+  // deterministic (env / pinned / derived-and-pinned); a non-deterministic
+  // `default` fallback is re-resolved every time so the process picks up the pin
+  // as soon as one exists.
+  private async resolveNamespace(): Promise<string> {
+    if (this.namespaceMemo !== undefined) return this.namespaceMemo;
+    const resolution = await resolveWorkspaceId(this.oscContext, {
+      ...(this.workspaceIdStore ? { store: this.workspaceIdStore } : {}),
+      log: this.log
+    });
+    if (resolution.deterministic) {
+      this.namespaceMemo = resolution.workspaceId;
+    }
+    return resolution.workspaceId;
   }
 
   // Read a stack config for the derived namespace, with a one-shot read-side
@@ -485,9 +695,14 @@ export class WorkspaceStackResolver {
   ): Promise<StackConfig | undefined> {
     const direct = await ps.loadStackConfig(namespace, name);
     if (direct) return direct;
-    // Post-#712 stacks derive `default` as their own namespace — the read above
-    // already covered the literal `default`, so there is nothing to fall back to
-    // and no second read is issued.
+    // A deployment whose OWN namespace IS the literal `default` has already had
+    // it read above, so there is nothing to fall back to and no second read is
+    // issued. This guard is deliberately NOT widened (issue #776): the failure it
+    // used to expose — a tenant-scoped stack booting under a spuriously-derived
+    // `default` and finding nothing — is closed at the cause by the pinned,
+    // deterministic namespace (resolveWorkspaceId), not by reading a namespace
+    // this deployment does not own. Widening it would mean probing namespaces
+    // across tenants, which is the isolation risk #712 closed.
     if (namespace === STACK_CONFIG_NAMESPACE) return undefined;
     const legacy = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, name);
     if (!legacy) return undefined;
@@ -568,12 +783,13 @@ export class WorkspaceStackResolver {
       return buildInMemoryConnections();
     }
 
-    // Resolve the parameter-store namespace via the SAME deriveWorkspaceId the
-    // provision route writes under (issue #712), so the resolver read key
-    // provably equals the provision write key for this deployment. Falls back to
-    // STACK_CONFIG_NAMESPACE identically on both sides when the OSC subscription
-    // list is unreachable/empty (test/offline environments).
-    const namespace = await deriveWorkspaceId(this.oscContext);
+    // Resolve the parameter-store namespace via the SAME resolveWorkspaceId the
+    // provision route writes under (issue #712/#776), so the resolver read key
+    // provably equals the provision write key for this deployment AND does not
+    // change between boots when the tenant's subscription set does. Falls back to
+    // STACK_CONFIG_NAMESPACE identically on both sides when there is no pin and
+    // the OSC subscription list is unreachable/empty (test/offline environments).
+    const namespace = await this.resolveNamespace();
 
     // Resolve the stack config: an explicit stack name addresses that stack
     // directly; otherwise use the first provisioned stack as the workspace
@@ -723,9 +939,10 @@ export class WorkspaceStackResolver {
   async resolveStackName(requestedStackName?: string): Promise<string | undefined> {
     const ps = this.paramStore;
     if (!ps) return undefined;
-    // Resolve the namespace via the SAME deriveWorkspaceId the provision route
-    // writes under (issue #712) so this read key equals the provision write key.
-    const namespace = await deriveWorkspaceId(this.oscContext);
+    // Resolve the namespace via the SAME resolveWorkspaceId the provision route
+    // writes under (issue #712/#776) so this read key equals the provision write
+    // key, on this boot and every later one.
+    const namespace = await this.resolveNamespace();
     try {
       if (requestedStackName) {
         const config = await this.loadStackConfigWithLegacyFallback(
@@ -775,7 +992,11 @@ export class WorkspaceStackResolver {
 
   // Invalidate all cached connections for a workspace (default + every named
   // stack), so a freshly provisioned/torn-down stack is picked up immediately.
+  // Also drops the memoised namespace (issue #776): a first provision is what
+  // normally PINS the workspace id, so a process that resolved before the pin
+  // existed must re-resolve here rather than keep serving the pre-pin namespace.
   invalidate(): void {
     this.cache.clear();
+    this.namespaceMemo = undefined;
   }
 }
