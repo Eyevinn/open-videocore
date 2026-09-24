@@ -405,4 +405,42 @@ describe('scale-down fails closed on a missing/unparseable idle timestamp (issue
     const persisted = JSON.parse(raw['inst-bad-ts-pkg']!) as EncoreInstanceRecord;
     expect(persisted.draining).toBe(true);
   });
+
+  // Review finding 6: the missing-timestamp warning is re-evaluated on every 10s
+  // tick and the condition persists until the instance is torn down, so an
+  // unthrottled warn emitted ~6 times a minute per affected instance. It must be
+  // logged, but once per instance per window — not once per tick.
+  it('throttles the missing-idle-timestamp warning to once per instance', async () => {
+    const redis = new FakeRedis();
+    const workspaceId = 'ws-warn-throttle';
+    // An unreachable instance is KEPT (never destroyed on an unconfirmed count),
+    // and its tracked activeJobs stays 0 — so the warn condition persists across
+    // every tick, exactly as it does in production until teardown.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('ECONNREFUSED');
+      })
+    );
+    await seed(redis, workspaceId, {
+      instanceId: 'inst-warn',
+      url: 'https://inst-warn.example',
+      activeJobs: 0,
+      lastIdleAt: null,
+      callbackTrustReady: true
+    });
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const loop = new EncoreScalerLoop(makeConfig(redis, workspaceId, 300_000));
+      for (let i = 0; i < 5; i++) await loop.tick();
+
+      const missingStampWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes('has no usable idle timestamp')
+      );
+      expect(missingStampWarnings).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });

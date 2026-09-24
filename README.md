@@ -345,13 +345,28 @@ bills by the hour. Eligible only means the instance is considered — it is stil
 checked against Encore's own in-flight job list and any pending packaging
 handoff, and is drained rather than destroyed if either says it is still needed.
 
-The scaler also sweeps, every few minutes, for Encore instances it owns that are
-running on OSC with no pool record at all — the residue of a spawn interrupted
-part-way through, a wiped Valkey, or a deleted deployment. Nothing else can see
-those instances, since every other teardown path works from the pool. An instance
-is only removed once it has been seen unaccounted-for across the whole grace
-window (10 minutes by default), so a spawn still waiting for its instance to
-become ready is never cut off mid-flight.
+The scaler also sweeps, every few minutes, for Encore instances (and their paired
+callback listeners) that are running on OSC with no pool record at all — the
+residue of a spawn interrupted part-way through, a wiped Valkey, or a deleted
+deployment. Nothing else can see those instances, since every other teardown path
+works from the pool. Because a deployment's cleanup sweep sees every instance in
+the OSC subscription, not just its own, four things must all hold before anything
+is removed:
+
+- the instance name proves it belongs to *this* deployment (each name carries a
+  fingerprint of the deployment identity, so two deployments with similar names —
+  `dev` and `dev-2`, say — can never reclaim each other's instances),
+- no pool, on any workspace, is tracking it,
+- it has been seen unaccounted-for across the whole grace window (20 minutes by
+  default), so a spawn still waiting for its instance to become ready is never cut
+  off mid-flight, and
+- the instance itself confirms it has no queued or in-progress job and no pending
+  packaging handoff. An instance that reports work, or that cannot be reached to
+  answer, is never destroyed by the sweep: it is taken back into the pool and
+  drained by the normal path instead.
+
+Anything the sweep declines to remove is logged by name, so an instance that
+cannot be reclaimed automatically is at least visible.
 
 **Collections**
 

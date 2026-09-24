@@ -19314,13 +19314,15 @@
                                 },
                                 "lastIdleAt": {
                                   "type": "number"
+                                },
+                                "readyAt": {
+                                  "type": "number"
                                 }
                               },
                               "required": [
                                 "instanceId",
                                 "url",
-                                "activeJobs",
-                                "lastIdleAt"
+                                "activeJobs"
                               ],
                               "additionalProperties": false
                             }

@@ -81,6 +81,15 @@ export type EncoreScalerConfig = {
   // tests and any caller that has not opted in); the registry wires
   // DEFAULT_ORPHAN_REAP_INTERVAL_MS in production.
   orphanReapIntervalMs?: number;
+  // #778 (review finding 4): bound (ms) on how long spawnInstance waits for an
+  // OSC instance to report `running`. @osaas/client-core's waitForInstanceReady
+  // polls getInstanceHealth in a `while` loop with NO timeout (lib/core.js:343-353,
+  // v0.24.0), so without this a spawn can hang forever while holding a live,
+  // billing OSC instance that has no pool record — the very state the orphan
+  // reaper's grace window is supposed to be able to outlast. On timeout the spawn
+  // fails and its cleanup path destroys the Encore instance and any paired
+  // listener. Unset uses DEFAULT_SPAWN_READY_TIMEOUT_MS.
+  spawnReadyTimeoutMs?: number;
   // #778: how long (ms) an instance must have been continuously observed as
   // orphaned before the reaper destroys it. Guards a spawn in progress, which
   // holds a live OSC instance with no pool record for as long as
