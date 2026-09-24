@@ -134,6 +134,41 @@ async function initStackSelector() {
 // jobs-table poll and by the standalone detached detail windows (detail.js).
 const DETAIL_POLL_INTERVAL_MS = 5000;
 
+// ─── UI-scoped access token (issue #740) ─────────────────────────────────────
+//
+// Every workspace-scoped router now attaches the 401 presence gate as its first
+// preHandler (authGate, src/auth/middleware.ts:76 → app.authenticate →
+// requireAuth, src/auth/workspace.ts:52), so a request without an
+// `Authorization: Bearer` header is rejected 401 "missing access token"
+// (src/auth/workspace.ts:54). The OSC auth wall authenticates the operator's
+// browser session before /ui loads, but it does NOT inject that bearer header
+// onto the page's own fetch()/XHR calls, so every gated call from the UI failed.
+//
+// requireAuth is a PURE PRESENCE gate: it admits ANY non-empty bearer string and
+// never inspects it for identity (src/auth/workspace.ts:22-32) — the sole inbound
+// security boundary is the OSC auth wall the request has already crossed. So the
+// UI only has to present a non-empty, UI-scoped token to satisfy the gate, and it
+// must NOT be handed the real OSC access token (that would leak a wall-crossing
+// credential into the browser). We mint an opaque, per-page token and hold it
+// ONLY in memory for the lifetime of the page — never localStorage/sessionStorage,
+// per CLAUDE.md's never-persist-tokens rule (mirrors the storage-secret handling
+// at app.js:3178-3181). An anonymous request from OUTSIDE the UI still carries no
+// token and still gets 401, so this does not weaken the gate (#711 intact).
+const UI_ACCESS_TOKEN = (function mintUiAccessToken() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return 'ui-' + crypto.randomUUID();
+    }
+  } catch (_) { /* fall through to a non-crypto fallback */ }
+  return 'ui-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+})();
+
+// The Authorization header the UI presents on gated requests. Held only in the
+// module realm for the page's lifetime; never persisted.
+function uiAuthHeader() {
+  return { 'Authorization': 'Bearer ' + UI_ACCESS_TOKEN };
+}
+
 // ─── API fetch helper ────────────────────────────────────────────────────────
 
 const API_BASE = window.location.origin + '/api/v1';
@@ -143,6 +178,9 @@ async function apiFetch(path, options = {}) {
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(stack ? { 'X-Stack-Name': stack } : {}),
+    // Satisfy the 401 presence gate on every gated router (issue #740). See the
+    // UI-scoped access token note above.
+    ...uiAuthHeader(),
     // Mirror the server's trusted role header (src/auth/principal.ts:36). Only
     // honoured server-side when OVC_TRUST_ROLE_HEADER=true (src/main.ts:431);
     // otherwise it is stripped and ignored, so sending it is always safe.
@@ -173,6 +211,26 @@ async function apiFetch(path, options = {}) {
     return res.json();
   }
   return null;
+}
+
+// Abort an in-progress multipart upload and clean up its server-side state
+// (issue #748). On a failed or cancelled multipart upload the client MUST hit
+// the documented abort route so the staged parts are reclaimed AND the asset is
+// not left stranded in `uploading`. Contract: DELETE
+// /assets/:id/multipart/:uploadId -> 204 (src/routes/asset-upload.ts:328, params
+// { id, uploadId } at asset-upload.ts:76); the server also transitions the asset
+// out of `uploading` (asset-upload.ts abort handler). Best-effort: swallows its
+// own errors so cleanup never masks the original upload failure being reported.
+async function abortMultipartUpload(assetId, uploadId) {
+  if (!assetId || !uploadId) return;
+  try {
+    await apiFetch(
+      '/assets/' + encodeURIComponent(assetId) + '/multipart/' + encodeURIComponent(uploadId),
+      { method: 'DELETE' }
+    );
+  } catch (_) {
+    /* best-effort cleanup — do not mask the original upload failure */
+  }
 }
 
 // ─── Utility helpers ─────────────────────────────────────────────────────────
@@ -1247,24 +1305,44 @@ async function renderAssetsTab(container) {
         if (!file) { showMsg(uploadProgress, 'Select a file first.', 'error'); return; }
         uploadBtn.disabled = true;
         uploadBtn.textContent = 'Uploading…';
+        // Track the asset and any multipart session so a failure or cancel can
+        // clean up rather than strand the asset in `uploading` (issue #748).
+        // `multipartUploadId` is set by the multipart transfer path (initiate ->
+        // part-urls -> complete, wired by the UI multipart routing in #747); the
+        // proxied PUT path below leaves it null. Whenever it is set, a thrown
+        // error triggers the documented abort route via abortMultipartUpload().
+        let assetId = null;
+        let multipartUploadId = null;
         try {
           const asset = await apiFetch('/assets', {
             method: 'POST',
             body: JSON.stringify({ name: file.name })
           });
-          const assetId = asset.id;
+          // Assign the outer `assetId` (not a fresh `const`) so the catch below
+          // can clean up via abortMultipartUpload(assetId, …) on failure (#748).
+          assetId = asset.id;
           const totalMb = Math.round(file.size / 1024 / 1024 * 10) / 10;
           showMsg(uploadProgress, 'Uploading ' + file.name + ' (' + totalMb + ' MB)…', 'info');
           // Route the transport by file size (issue #747). Small files stream
           // through the proxied PUT /assets/:id/upload as before; medium/large
-          // files PUT straight to MinIO via the presigned single-part or
-          // multipart routes so no single request carries the whole payload
+          // files PUT straight to object storage via the presigned single-part
+          // or multipart routes so no single request carries the whole payload
           // through the proxy (which enforces a body limit well below the
           // route's 10 GiB bodyLimit and 413s large files otherwise).
           await uploadAssetFile(assetId, file, {
             apiFetch: apiFetch,
             apiBase: API_BASE,
             stackName: stackOverride || getActiveStack(),
+            // The streamed proxy PUT inside uploadAssetFile bypasses apiFetch, so
+            // hand it the same UI-scoped bearer apiFetch spreads (issue #740). The
+            // presigned/multipart PUTs go straight to object storage under their
+            // presigned signature and deliberately do NOT carry this header.
+            authHeader: uiAuthHeader(),
+            // Surface the multipart session id so the shared abort route can run
+            // on a later failure/cancel (issue #748). uploadAssetFile also aborts
+            // internally on a mid-transfer failure; this outer hook keeps #748's
+            // best-effort abortMultipartUpload() path wired as a safety net.
+            onMultipartInit: function (uploadId) { multipartUploadId = uploadId; },
             onProgress: function (loaded, total) {
               const pct = total ? Math.floor((loaded / total) * 100) : 0;
               showMsg(
@@ -1277,6 +1355,14 @@ async function renderAssetsTab(container) {
           close();
           if (assetsTable) assetsTable.reload();
         } catch (err) {
+          // Abort/cleanup on failure or cancel so no orphan is left behind
+          // (issue #748). If a multipart session was open, hit its abort route;
+          // the server reclaims the staged parts and moves the asset out of
+          // `uploading`. Best-effort, so it never masks the error shown below.
+          if (multipartUploadId) {
+            await abortMultipartUpload(assetId, multipartUploadId);
+            if (assetsTable) assetsTable.reload();
+          }
           showMsg(uploadProgress, 'Error: ' + err.message, 'error');
           uploadBtn.disabled = false;
           uploadBtn.textContent = 'Upload';
@@ -4841,6 +4927,10 @@ export {
   // Exported so the add -> list -> edit -> list integration test can drive the
   // real Storage-tab flow against a stubbed fetch (issue #681).
   renderStorageTab,
+  // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
+  // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
+  // assert it presents the UI-scoped Authorization header (issue #740).
+  renderAssetsTab,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────

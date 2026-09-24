@@ -98,6 +98,10 @@ async function uploadStreamed(assetId, file, deps) {
         'Content-Type': file.type || 'application/octet-stream',
         'Content-Length': String(file.size),
         ...(deps.stackName ? { 'X-Stack-Name': deps.stackName } : {}),
+        // This raw PUT bypasses apiFetch, so present the same UI-scoped bearer
+        // the caller spreads on gated calls (issue #740). The presigned/multipart
+        // tiers PUT to object storage instead and carry no bearer.
+        ...(deps.authHeader || {}),
       },
     }
   );
@@ -146,6 +150,9 @@ async function uploadMultipart(assetId, file, deps) {
     method: 'POST',
   });
   const uploadId = init.uploadId;
+  // Surface the session id so the caller can wire its own best-effort abort/
+  // cleanup (issue #748); this path still aborts internally below on failure.
+  deps.onMultipartInit && deps.onMultipartInit(uploadId);
   const uploadIdEnc = encodeURIComponent(uploadId);
   const partCount = Math.ceil(file.size / MULTIPART_PART_BYTES);
   const parts = [];
@@ -203,11 +210,15 @@ async function uploadMultipart(assetId, file, deps) {
  *     throws on non-2xx). Used for every /api/v1 route call.
  *   - apiBase: absolute API base (e.g. origin + '/api/v1') for the raw streamed PUT.
  *   - stackName: active OSC stack name, forwarded as X-Stack-Name on the stream path.
+ *   - authHeader: optional header object (e.g. { Authorization: 'Bearer …' }) spread
+ *     onto the streamed proxy PUT, which bypasses apiFetch (issue #740).
+ *   - onMultipartInit(uploadId): optional hook fired once the multipart session is
+ *     initiated, so the caller can wire its own abort/cleanup (issue #748).
  *   - onProgress(loaded, total): optional cumulative byte-progress callback.
  *
  * @param {string} assetId
  * @param {File} file
- * @param {{apiFetch: Function, apiBase: string, stackName?: string, onProgress?: Function}} deps
+ * @param {{apiFetch: Function, apiBase: string, stackName?: string, authHeader?: object, onMultipartInit?: Function, onProgress?: Function}} deps
  * @returns {Promise<string>} the strategy used ('stream'|'presigned'|'multipart')
  */
 export async function uploadAssetFile(assetId, file, deps) {

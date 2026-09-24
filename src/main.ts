@@ -108,6 +108,11 @@ import {
   auditPurgeIntervalMsFromEnv
 } from './pipeline/audit-retention-purge-loop.js';
 import {
+  AbandonedUploadSweepLoop,
+  abandonedUploadIntervalMsFromEnv,
+  abandonedUploadThresholdMsFromEnv
+} from './pipeline/abandoned-upload-loop.js';
+import {
   WatchFolderService,
   watchFolderEnabled,
   classifyWatchFolderConfig,
@@ -137,7 +142,7 @@ import { Client as MinioClient } from 'minio';
 import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
-import { decideRetry, clearRetryState } from './encore-scaler/retry-store.js';
+import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
 import {
   createJob,
@@ -1222,7 +1227,13 @@ function activateScaler(redisUrl: string): void {
                 redis,
                 decoded.workspaceId,
                 encoreJobId,
-                failureText
+                failureText,
+                // #745: a reconcile-detected "drop" can be a FALSE POSITIVE (the
+                // job is still IN_PROGRESS on its instance). Cancel that prior
+                // attempt before re-dispatching so the same externalId is never
+                // active on two instances at once. Encore's serviceId is 'encore'
+                // (src/encore-scaler/types.ts:16).
+                makePriorAttemptCanceler(() => oscContext.getServiceAccessToken('encore'))
               );
             } catch (err) {
               // If the retry gate itself errors, fall through to the normal
@@ -2076,6 +2087,30 @@ const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
   }
 });
 auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
+
+// Abandoned-upload settle sweep (issue #726). An INDEPENDENT unref'd, overlap-
+// guarded interval (mirrors ArchivedAssetPurgeLoop, NOT a parallel mechanism)
+// that settles assets wedged in `uploading` past the liveness threshold to
+// `failed`, so a failed or interrupted upload no longer leaves a permanent orphan
+// in the asset list. No object is written and no quota headroom is held for an
+// abandoned upload (the reservation is already released — src/data/storage-quota.ts:32,
+// src/routes/asset-upload.ts:203), so storage/quota accounting is unaffected. It
+// reads the LIVE threshold each tick and is skipped entirely while it is
+// 0/disabled. `assetRepository` exposes both list() (enumerate `uploading`) and
+// update() (transition to `failed`) directly, so — unlike the archived purge —
+// no concrete-repo callback is needed.
+const abandonedUploadSweepLoop = new AbandonedUploadSweepLoop({
+  thresholdMs: abandonedUploadThresholdMsFromEnv,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    assets: assetRepository
+  }
+});
+abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
