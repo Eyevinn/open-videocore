@@ -55,6 +55,28 @@ export function deliveryUrlTtlSeconds(): number {
   return parsed;
 }
 
+// Default gap between upload-liveness heartbeats on the proxied streaming
+// upload path (issue #731). While a slow-but-progressing PUT /:id/upload body
+// drains, the route touches the asset's `updatedAt` on this cadence so #726's
+// stuck-upload sweep can tell a live slow upload apart from an abandoned one.
+// Well below any realistic sweep threshold; override via
+// UPLOAD_LIVENESS_INTERVAL_MS (12-factor: config via env).
+export const DEFAULT_UPLOAD_LIVENESS_INTERVAL_MS = 30 * 1000; // 30 seconds
+
+// Resolve the configured upload-liveness heartbeat interval in milliseconds
+// (issue #731). Falls back to the 30-second default when unset or invalid.
+export function uploadLivenessIntervalMs(): number {
+  const raw = process.env['UPLOAD_LIVENESS_INTERVAL_MS'];
+  if (!raw) {
+    return DEFAULT_UPLOAD_LIVENESS_INTERVAL_MS;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_UPLOAD_LIVENESS_INTERVAL_MS;
+  }
+  return parsed;
+}
+
 // One part of a multipart upload, as reported by the client on completion.
 export type CompletedPart = {
   partNumber: number;
