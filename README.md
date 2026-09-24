@@ -210,6 +210,7 @@ Key endpoints:
 | `POST` | `/api/v1/assets/:id/multipart/:uploadId/complete` | Complete a multipart upload |
 | `DELETE` | `/api/v1/assets/:id/multipart/:uploadId` | Abort a multipart upload |
 | `POST` | `/api/v1/assets/:id/upload-complete` | Finalize a completed upload |
+
 | `POST` | `/api/v1/assets/:id/transcode` | Submit an ABR transcoding job |
 | `POST` | `/api/v1/assets/:id/package` | Submit an HLS/DASH packaging job |
 | `POST` | `/api/v1/assets/:id/execute` | Run a pipeline execution |
@@ -231,6 +232,11 @@ Key endpoints:
 | `DELETE` | `/api/v1/assets/:id/subtitle-tracks/:trackId` | Remove a subtitle track |
 | `POST` | `/api/v1/assets/:id/tags` | Add a tag |
 | `DELETE` | `/api/v1/assets/:id/tags/:tag` | Remove a tag |
+
+Upload errors on the routes above return a machine-readable failure cause
+alongside the HTTP status (body-size limit, network/connection error, storage
+backend error, …) — see
+[Upload failure causes](docs/guides/upload-failure-causes.md).
 
 **Jobs**
 
