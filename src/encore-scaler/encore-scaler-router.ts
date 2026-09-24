@@ -129,22 +129,37 @@ export const encoreScalerRouter: FastifyPluginAsync<EncoreScalerRouterOptions> =
     { schema: { params: idParamSchema } },
     async (request, reply) => {
       const { id } = request.params;
+
+      // Drain EVERY buffered queue entry for this job first (#746). A job can be
+      // enqueued more than once (transport-class retry, #295), so removing only
+      // the first match leaves duplicates behind (e.g. 11 of 12). Using
+      // `lrem(..., 0, entry)` per distinct matching entry value removes all
+      // occurrences; entries differ by `enqueuedAt` so duplicates are not
+      // byte-identical. This runs even for a dispatched job so stale duplicates
+      // never survive the cancel.
+      const entries = await redis.lrange(keys.queue(workspaceId), 0, -1);
+      let drained = false;
+      for (const entry of entries) {
+        try {
+          const parsed = JSON.parse(entry) as QueuedJob;
+          if (parsed.jobId === id) {
+            // count 0 => remove ALL occurrences equal to this entry value.
+            await redis.lrem(keys.queue(workspaceId), 0, entry);
+            drained = true;
+          }
+        } catch {
+          // ignore unparseable entries
+        }
+      }
+
       const instanceId = await redis.hget(keys.jobInstance(workspaceId), id);
 
       if (!instanceId) {
-        // Still buffered: find and remove the matching queue entry.
-        const entries = await redis.lrange(keys.queue(workspaceId), 0, -1);
-        for (const entry of entries) {
-          try {
-            const parsed = JSON.parse(entry) as QueuedJob;
-            if (parsed.jobId === id) {
-              await redis.lrem(keys.queue(workspaceId), 1, entry);
-              await redis.hset(keys.jobStatus(workspaceId), id, 'CANCELLED');
-              return reply.code(200).send({ id, status: 'CANCELLED' });
-            }
-          } catch {
-            // ignore unparseable entries
-          }
+        // Not dispatched. If we drained one or more buffered entries the job is
+        // cancelled; otherwise there was nothing to cancel.
+        if (drained) {
+          await redis.hset(keys.jobStatus(workspaceId), id, 'CANCELLED');
+          return reply.code(200).send({ id, status: 'CANCELLED' });
         }
         return reply.code(404).send({ id, status: 'NOT_FOUND' });
       }

@@ -15,7 +15,8 @@ import { Client as MinioClient } from 'minio';
 import nano from 'nano';
 import {
   deprovisionStack,
-  deprovisionStackFromConfig
+  deprovisionStackFromConfig,
+  type StackTeardownResult
 } from '../services/deprovision.js';
 import {
   type ParamStore,
@@ -778,6 +779,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       // the serviceId and instance name needed for a removeInstance call.
       const provisioned: ProvisionedEntry[] = [];
 
+      // Subset of `provisioned` that THIS operation actually CREATED (issue
+      // #736). provision() is idempotent (#417): on "already taken" it fetches
+      // and returns a PRE-EXISTING instance, so `provisioned` can contain
+      // instances this run did not create. Only `created` is eligible for
+      // rollback on a mid-stack failure — an adopted (pre-existing) instance is
+      // never torn down, since a tenant may already depend on it.
+      const created: ProvisionedEntry[] = [];
+
       // Helper: provision one service with its own short-lived service access
       // token, then mark it as provisioned. Idempotent: if the named instance
       // already exists (OSC returns "Name is already taken") we fetch and
@@ -792,6 +801,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         const sat = await osc.getServiceAccessToken(serviceId);
         let instance: Instance | undefined;
         let lastErr: unknown;
+        // Whether this instance was ADOPTED (pre-existing, fetched via
+        // getInstance on "already taken") rather than freshly created by this
+        // call. Adopted instances are NOT rolled back on failure (issue #736).
+        let adopted = false;
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           try {
             instance = await createInstance(osc, serviceId, sat, { name, ...body });
@@ -800,6 +813,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes('already taken') || msg.includes('already exists')) {
               instance = (await getInstance(osc, serviceId, name, sat)) as Instance;
+              adopted = true;
               break;
             }
             lastErr = err;
@@ -814,7 +828,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           }
         }
         if (!instance) throw lastErr;
-        provisioned.push({ serviceId, name });
+        const entry: ProvisionedEntry = { serviceId, name };
+        provisioned.push(entry);
+        // Record for rollback ONLY when this call created the instance. An
+        // adopted pre-existing instance is intentionally excluded (issue #736).
+        if (!adopted) created.push(entry);
         return instance;
       };
 
@@ -973,7 +991,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // starting up — retry with backoff the same way we do for MinIO.
         const couchAdminUrl = couchdbUrl
           .replace(/\/$/, '')
-          .replace(/^(https?:\/\/)/, `$1admin:${couchdbAdminPassword}@`);
+          .replace(
+            /^(https?:\/\/)/,
+            `$1admin:${encodeURIComponent(couchdbAdminPassword)}@`
+          );
         const couchServer = nano(couchAdminUrl);
         const couchDbs = process.env['COUCHDB_ASSETS_DB']
           ? [process.env['COUCHDB_ASSETS_DB']]
@@ -1201,20 +1222,74 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           app.log.error(
-            { err, failedService: currentService, provisioned },
+            { err, failedService: currentService, provisioned, created },
             'provisioning failed'
           );
-          // Even on failure, persist whatever was provisioned so the deprovision
-          // route can clean up via the API. Without this, partially-provisioned
-          // stacks leave orphaned OSC instances that must be removed manually.
+
+          // Roll back the instances THIS operation CREATED (issue #736). A
+          // mid-stack failure previously left every created companion instance
+          // running and billing, with cleanup left to a separate deprovision
+          // call the tenant was never told to make. Tear them down best-effort
+          // here, in dependency-safe order, reusing the SAME idempotent
+          // teardown the DELETE route uses (deprovisionStackFromConfig ->
+          // teardownService: probes getInstance first, tolerates already-gone).
+          //
+          // CRITICAL (issue #736 trap): only `created` is rolled back. provision()
+          // is idempotent (#417) and ADOPTS a pre-existing instance on "already
+          // taken"; those live in `provisioned` but NOT `created`, so a rollback
+          // never deletes an instance the tenant already had.
+          let rollback: StackTeardownResult | undefined;
+          if (created.length > 0) {
+            try {
+              rollback = await deprovisionStackFromConfig(
+                osc,
+                name,
+                created.map((c) => ({
+                  serviceId: c.serviceId,
+                  instanceName: c.name
+                }))
+              );
+              if (rollback.status === 'failed') {
+                app.log.error(
+                  { rollback, name },
+                  'rollback left instances running; manual deprovision required'
+                );
+              }
+            } catch (rollbackErr) {
+              app.log.error(
+                { rollbackErr, name, created },
+                'rollback of created instances threw; some may still be running'
+              );
+            }
+          }
+
+          // Created instances that could NOT be torn down are still running and
+          // still billing — surfaced in the operation result with the exact
+          // deprovision call so the tenant can finish removing them.
+          const leftovers = (rollback?.services ?? []).filter(
+            (s) => s.status === 'failed'
+          );
+
+          // What is STILL RUNNING after rollback: every adopted (pre-existing)
+          // instance we left untouched, plus any created instance whose teardown
+          // failed. Successfully-removed created instances are omitted — they no
+          // longer exist.
+          const stillRunning: ProvisionedEntry[] = [
+            ...provisioned.filter(
+              (p) => !created.some((c) => c.serviceId === p.serviceId)
+            ),
+            ...leftovers.map((s) => ({ serviceId: s.serviceId, name }))
+          ];
+
+          // Persist the partial state as `failed` (issue #106) so the resolver
+          // never treats this never-completed stack as live, and the deprovision
+          // route can read services[] to finish removing whatever is still
+          // running. After rollback, services[] reflects ONLY what remains — not
+          // the instances this run already tore down.
           if (paramStore && provisioned.length > 0) {
             try {
               const workspaceId = await deriveWorkspaceId(osc);
               await paramStore.storeStackConfig(workspaceId, name, {
-                // Mark the partial write as failed (issue #106) so the resolver
-                // never treats this never-completed stack as live. The empty
-                // coordinates are still recorded, but the deprovision route
-                // reads services[] regardless of status to clean up.
                 status: 'failed',
                 minioEndpoint: '',
                 couchdbUrl: '',
@@ -1224,7 +1299,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 // Preserve the requested storage backend metadata on the partial
                 // write so deprovision/downstream can still resolve it (#211).
                 storage: storageMetadata,
-                services: provisioned.map((p) => ({
+                services: stillRunning.map((p) => ({
                   serviceId: p.serviceId,
                   instanceName: p.name
                 }))
@@ -1233,10 +1308,31 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               app.log.error({ storeErr }, 'failed to persist partial stack config');
             }
           }
+
           ops.update(op.id, {
             status: 'failed',
             completedAt: Date.now(),
-            error: `provisioning failed at ${currentService}: ${message}`
+            error: `provisioning failed at ${currentService}: ${message}`,
+            // Report the rollback outcome so the caller knows the created
+            // instances were torn down (or, if teardown itself failed, exactly
+            // which leftovers remain and how to remove them) — issue #736.
+            result: {
+              name,
+              failedService: currentService,
+              rollback: rollback
+                ? { status: rollback.status, services: rollback.services }
+                : { status: 'not_found', services: [] },
+              ...(leftovers.length > 0
+                ? {
+                    leftovers: leftovers.map((s) => ({
+                      serviceId: s.serviceId,
+                      instanceName: name,
+                      error: s.error
+                    })),
+                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                  }
+                : {})
+            }
           });
         }
         } finally {

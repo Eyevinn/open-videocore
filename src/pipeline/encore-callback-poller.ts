@@ -37,7 +37,7 @@ import { completeTranscode, type CallbackRendition } from './transcode.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
-import { decideRetry, clearRetryState } from '../encore-scaler/retry-store.js';
+import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
 
@@ -482,7 +482,11 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
           deps.redis,
           decoded.workspaceId,
           externalId,
-          failureMessage
+          failureMessage,
+          // #745: cancel any still-active prior Encore attempt for this externalId
+          // before the retry is re-dispatched. Encore's token is the same service
+          // access token the poller already uses to fetch job documents (line ~352).
+          makePriorAttemptCanceler(() => deps.oscContext.getServiceAccessToken('encore'))
         );
       } catch (err) {
         // If the retry gate itself errors, fall through to the normal terminal

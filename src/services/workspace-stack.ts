@@ -181,7 +181,7 @@ function buildConnectionsFromStack(
 
   const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
   const couchUrl = config.couchdbUrl.replace(/\/$/, '').replace(
-    /^(https?:\/\/)/, `$1admin:${couchPassword}@`
+    /^(https?:\/\/)/, `$1admin:${encodeURIComponent(couchPassword)}@`
   );
   const server = couchServer(couchUrl);
   const wc = () => new StackCouch(server, dbName);
@@ -461,6 +461,76 @@ export class WorkspaceStackResolver {
     this.log = opts.log ?? noopLogger;
   }
 
+  // Read a stack config for the derived namespace, with a one-shot read-side
+  // compatibility fallback to the literal `default` namespace for stacks
+  // provisioned before the tenant-scoped namespace landed (issue #712/#733).
+  //
+  // Order:
+  //   1. Read `loadStackConfig(namespace, name)` — the tenant-scoped key. A hit
+  //      returns immediately, so a stack provisioned AFTER #712 takes NO fallback
+  //      read on its hit path (issue #733 acceptance criterion).
+  //   2. On a miss, and only when the derived namespace is NOT already the literal
+  //      `default`, retry ONCE under `default`. This is the sole legacy namespace;
+  //      we never read another tenant's namespace and never scan across namespaces
+  //      (issue #733 security constraint — anything broader reintroduces the
+  //      cross-workspace leakage #712 closed).
+  //   3. On a legacy hit, migrate-on-read: write the config to the tenant-scoped
+  //      key and log at info, so the fallback is taken at most once per stack. The
+  //      migrate is best-effort — if the write throws, we still serve the resolved
+  //      config for this request and the next resolve retries the migrate.
+  private async loadStackConfigWithLegacyFallback(
+    ps: ParamStore,
+    namespace: string,
+    name: string
+  ): Promise<StackConfig | undefined> {
+    const direct = await ps.loadStackConfig(namespace, name);
+    if (direct) return direct;
+    // Post-#712 stacks derive `default` as their own namespace — the read above
+    // already covered the literal `default`, so there is nothing to fall back to
+    // and no second read is issued.
+    if (namespace === STACK_CONFIG_NAMESPACE) return undefined;
+    const legacy = await ps.loadStackConfig(STACK_CONFIG_NAMESPACE, name);
+    if (!legacy) return undefined;
+    try {
+      await ps.storeStackConfig(namespace, name, legacy);
+      this.log.info(
+        { op: 'migrateStackConfig', from: STACK_CONFIG_NAMESPACE, to: namespace, name },
+        'migrated legacy default-namespaced stack config to tenant-scoped key'
+      );
+    } catch (err) {
+      // A failed migrate is non-fatal: serve the legacy config this request and
+      // let the next resolve retry the write. Never fail the resolve on it.
+      this.log.warn(
+        {
+          err: err instanceof Error ? { message: err.message } : String(err),
+          from: STACK_CONFIG_NAMESPACE,
+          to: namespace,
+          name
+        },
+        'resolved legacy default-namespaced stack config but migrate-on-read write failed; will retry next resolve'
+      );
+    }
+    return legacy;
+  }
+
+  // List stack names for the derived namespace, with the same one-shot fallback
+  // to the literal `default` namespace (issue #733). Without this, a pre-#712
+  // stack whose names live only under `default/` stays invisible to the resolver's
+  // "first listed stack" path even when its config could be read directly. Falls
+  // back ONLY when the tenant-scoped listing is empty and the namespace is not
+  // already `default`; never scans other namespaces (issue #733 security
+  // constraint). Migration of the individual config happens on the subsequent
+  // load via loadStackConfigWithLegacyFallback.
+  private async listStackNamesWithLegacyFallback(
+    ps: ParamStore,
+    namespace: string
+  ): Promise<string[]> {
+    const direct = await ps.listStackNames(namespace);
+    if (direct.length > 0) return direct;
+    if (namespace === STACK_CONFIG_NAMESPACE) return direct;
+    return ps.listStackNames(STACK_CONFIG_NAMESPACE);
+  }
+
   // Resolve the backing-service connections for a workspace. When `stackName`
   // is given (from the X-Stack-Name request header) the named stack is used
   // instead of the workspace's default (first provisioned) stack — letting a
@@ -519,19 +589,19 @@ export class WorkspaceStackResolver {
           { source: 'x-stack-name', namespace, stackName },
           'resolver reading stack config by requested name'
         );
-        config = await ps.loadStackConfig(namespace, stackName);
+        config = await this.loadStackConfigWithLegacyFallback(ps, namespace, stackName);
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
         // connections. This prevents stale UI stack selections from breaking
         // all storage/asset operations.
         if (!config) {
-          const names = await ps.listStackNames(namespace);
+          const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
           this.log?.info?.(
             { namespace, requested: stackName, listed: names },
             'requested stack not found; falling back to first listed stack'
           );
           if (names.length > 0) {
-            config = await ps.loadStackConfig(namespace, names[0]);
+            config = await this.loadStackConfigWithLegacyFallback(ps, namespace, names[0]);
           }
         }
       } else {
@@ -539,13 +609,13 @@ export class WorkspaceStackResolver {
         // resolver uses the FIRST listed stack as the default. If the list is
         // empty here but the provision route logged a successful write, the
         // write key and the list prefix disagree — a read-side namespace/key bug.
-        const names = await ps.listStackNames(namespace);
+        const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
         this.log?.info?.(
           { source: 'default', namespace, listed: names },
           'resolver reading default stack config (no X-Stack-Name)'
         );
         if (names.length > 0) {
-          config = await ps.loadStackConfig(namespace, names[0]);
+          config = await this.loadStackConfigWithLegacyFallback(ps, namespace, names[0]);
         }
       }
     } catch (err) {
@@ -658,18 +728,22 @@ export class WorkspaceStackResolver {
     const namespace = await deriveWorkspaceId(this.oscContext);
     try {
       if (requestedStackName) {
-        const config = await ps.loadStackConfig(
+        const config = await this.loadStackConfigWithLegacyFallback(
+          ps,
           namespace,
           requestedStackName
         );
         // A requested name that resolves to a real config wins verbatim; the
         // request routes to exactly the stack it named regardless of provision
-        // order. Only when the requested name has NO stored config do we fall
-        // through to the workspace default (a stale UI selection must not break
-        // routing), matching resolve()'s fallback semantics.
+        // order. The legacy fallback also covers a pre-#712 stack whose config
+        // exists only under `default` (issue #733) — after migrate-on-read it is
+        // a direct hit next time. Only when the requested name has NO stored
+        // config (even under the legacy namespace) do we fall through to the
+        // workspace default (a stale UI selection must not break routing),
+        // matching resolve()'s fallback semantics.
         if (config) return requestedStackName;
       }
-      const names = await ps.listStackNames(namespace);
+      const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
       return names.length > 0 ? names[0] : undefined;
     } catch (err) {
       // A parameter-store read failure is not authority to invent a stack: log

@@ -513,6 +513,44 @@ export class CouchAssetRepository implements AssetRepository {
     return written ? updated : undefined;
   }
 
+  // Upload-liveness heartbeat (issue #731, unblocks #726). Refreshes ONLY the
+  // `updatedAt` clock on a still-`uploading` asset so a slow-but-progressing
+  // upload is distinguishable from an abandoned one. Distinct from update() (no
+  // editorial provenance) and — like the tier seams — NEVER touches lifecycle
+  // `status`/`statusHistory`. A non-`uploading` asset is a NO-OP: the preflight
+  // status guard short-circuits before any write, so a settled record's clock is
+  // never resurrected. Routed through updateWithRetry for the same conflict-retry
+  // safety as the other read-modify-write paths; the patchFn re-checks status
+  // under the loop so a concurrent settle that lands between preflight and write
+  // is honoured (the doc is written back unchanged). Returns undefined when the
+  // id is unknown.
+  async touchUploadProgress(id: string): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    // Cheap guard on the preflight read: skip the write entirely for the common
+    // non-uploading case so a heartbeat against a settled asset costs no put.
+    if (fromDoc(preflight).status !== 'uploading') {
+      return fromDoc(preflight);
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      // Re-check under the retry loop: a concurrent transition may have settled
+      // the asset since preflight. If so, keep its clock as-is (no resurrection)
+      // and write the doc back unchanged; otherwise bump `updatedAt`.
+      const next: Asset =
+        existing.status === 'uploading'
+          ? { ...existing, updatedAt: new Date().toISOString() }
+          : existing;
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
   // Workspace-scoped slug existence check (issue #131). Queries the top-level
   // `slug` mirror emitted by toDoc() so the lookup is a simple Mango selector.
   private async slugTaken(couch: StackCouch, slug: string): Promise<boolean> {
