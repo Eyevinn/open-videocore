@@ -52,7 +52,11 @@ import {
 } from './data/storage-quota.js';
 import { StorageQuotaReconciler } from './data/storage-quota-reconcile.js';
 import { makeS3Reader } from './pipeline/source.js';
-import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
+// Issue #804: STACK_CONFIG_NAMESPACE is deliberately NOT imported here any more.
+// Every parameter-store read/write in this file now goes through the resolver's
+// namespace-aware view (resolveStackConfig / listStackNames / loadStackConfig /
+// storeStackConfig), so no consumer can re-acquire its own namespace policy.
+import { WorkspaceStackResolver, type WorkspaceConnections } from './services/workspace-stack.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
   resolveStackRedisUrl,
@@ -856,8 +860,20 @@ const paramStoreProfilesUrl =
   publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
     ? undefined // env-var seams (tier 1/2) win; skip the param-store read entirely
     : await resolveEncoreProfilesUrlFromParamStore({
-        paramStore,
-        namespace: STACK_CONFIG_NAMESPACE,
+        // Issue #804: this read the LITERAL `default` namespace, so on any
+        // deployment whose namespace is a real tenant id it silently resolved
+        // nothing. Route it through the resolver's namespace-aware view
+        // (workspace-stack.ts listStackNames/loadStackConfig) so it addresses the
+        // same namespace — and takes the same #751 legacy fallback — as the read
+        // path. The helper's declared signature passes a workspaceId to each
+        // method (public-base-url.ts:134-144); the adapter ignores it because the
+        // resolver owns namespace resolution.
+        paramStore: {
+          listStackNames: () => stackResolver.listStackNames(),
+          loadStackConfig: (_ws: string, name: string) =>
+            stackResolver.loadStackConfig(name)
+        },
+        namespace: await stackResolver.resolveNamespace(),
         onError: (err) =>
           app.log.warn(
             { err },
@@ -967,7 +983,11 @@ function activateScaler(redisUrl: string): void {
     if (!paramStore) {
       throw new Error('parameter store unavailable; cannot resolve stack name');
     }
-    const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+    // Issue #804: was listStackNames(STACK_CONFIG_NAMESPACE) — the literal
+    // `default` — so on a tenant-scoped deployment it always found nothing and
+    // the diagnostic degraded to present=unknown. Routed through the resolver so
+    // it lists the namespace this deployment actually provisions under.
+    const names = await stackResolver.listStackNames();
     if (names.length === 0) {
       throw new Error('no provisioned stack; cannot resolve packager instance');
     }
@@ -1000,16 +1020,18 @@ function activateScaler(redisUrl: string): void {
     // named stack's queue is never mis-routed to the first-provisioned Valkey,
     // while single-stack behaviour is unchanged. Returns undefined when nothing
     // resolves, and the registry then reuses the process-global connection.
+    //
+    // Issue #804: these reads addressed the LITERAL `default` namespace, which
+    // #782's commit message called out as the remaining follow-up alongside
+    // probePackagerPresent and the on-demand packager. They now go through
+    // stackResolver.resolveStackConfig(stackKey) — the SAME derived namespace and
+    // #751 legacy fallback #782's own (untouched, working) resolveStackRedis path
+    // uses — so the named-stack lookup and the first-provisioned fallback are
+    // resolved identically by a single helper.
     resolveRedisUrl: async (stackKey: string): Promise<string | undefined> => {
       if (!paramStore) return undefined;
       try {
-        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
-        if (!config) {
-          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-          if (names.length > 0) {
-            config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
-          }
-        }
+        const config = await stackResolver.resolveStackConfig(stackKey);
         return config?.redisUrl && config.redisUrl.length > 0 ? config.redisUrl : undefined;
       } catch (err) {
         app.log.warn({ err, stackKey }, 'encore-scaler: failed to resolve per-stack Valkey URL from parameter store');
@@ -1055,27 +1077,78 @@ function activateScaler(redisUrl: string): void {
     // env-override deployment, which is not itself a stack name) do we fall back
     // to the first provisioned stack — so single-stack behaviour is unchanged
     // while a named stack is never mis-resolved to the first-provisioned one.
+    //
+    // Issue #804 — THIS is the read that broke transcoding. It addressed the
+    // LITERAL `default` namespace, so on a deployment whose namespace is a real
+    // tenant id it resolved nothing, returned undefined, and the registry fell
+    // back to the static `s3Config` above — which on OSC is undefined because
+    // ENCORE_S3_ENDPOINT is unset. spawnInstance then omits the whole s3 block
+    // (instance-pool.ts:164-169), Encore resolves the `s3://` input against AWS
+    // instead of the stack's MinIO, and the job dies with
+    // `ffprobe failed ... Server returned 404 Not Found`.
+    //
+    // Two changes: the read is namespace-aware (stackResolver.resolveStackConfig,
+    // same derived namespace + #751 legacy fallback as every other consumer), and
+    // an unresolvable endpoint now FAILS LOUDLY instead of silently degrading to
+    // an unset env var.
     resolveS3Config: async (stackKey: string) => {
-      if (!paramStore || !encoreS3SecretKey) return undefined;
-      try {
-        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
-        if (!config) {
-          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-          if (names.length > 0) {
-            config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
-          }
+      // A static ENCORE_S3_ENDPOINT (local dev / ops override) is a real,
+      // intentional configuration: leave the registry to use it.
+      const hasStaticFallback = Boolean(encoreS3Endpoint && encoreS3SecretKey);
+
+      // Fail loudly rather than hand Encore a job it will resolve against AWS.
+      const unresolvable = (reason: string, detail?: Record<string, unknown>) => {
+        if (hasStaticFallback) {
+          app.log.warn(
+            { stackKey, reason, ...detail },
+            'encore-scaler: could not resolve this stack\'s MinIO endpoint from the parameter store; falling back to the statically configured ENCORE_S3_ENDPOINT'
+          );
+          return undefined;
         }
-        if (config?.minioEndpoint) {
-          return {
-            endpoint: config.minioEndpoint,
-            accessKeyId: 'admin',
-            secretAccessKey: encoreS3SecretKey
-          };
-        }
-      } catch (err) {
-        app.log.warn({ err, stackKey }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
+        app.log.error(
+          { stackKey, reason, ...detail },
+          'encore-scaler: cannot resolve a MinIO S3 endpoint for this stack and no ENCORE_S3_ENDPOINT is configured; refusing to spawn an Encore instance that would resolve s3:// inputs against AWS'
+        );
+        throw new Error(
+          `encore-scaler: unresolvable MinIO S3 endpoint for stack "${stackKey}": ${reason}. ` +
+            'Without it a spawned Encore instance receives no s3Endpoint and resolves s3:// inputs against AWS S3 (404). ' +
+            'Provision a stack for this deployment\'s namespace, or set ENCORE_S3_ENDPOINT/ENCORE_S3_SECRET_KEY explicitly.'
+        );
+      };
+
+      if (!encoreS3SecretKey) {
+        return unresolvable(
+          'no MinIO secret is configured (ENCORE_S3_SECRET_KEY / MINIO_SECRET_KEY / MINIO_ROOT_PASSWORD are all unset)'
+        );
       }
-      return undefined;
+      if (!paramStore) {
+        return unresolvable('no parameter store is configured for this deployment');
+      }
+
+      let config: StackConfig | undefined;
+      try {
+        config = await stackResolver.resolveStackConfig(stackKey);
+      } catch (err) {
+        return unresolvable('the parameter-store read failed', {
+          err: err instanceof Error ? { message: err.message } : String(err)
+        });
+      }
+
+      if (!config) {
+        return unresolvable(
+          'no stack config is stored under this deployment\'s namespace',
+          { namespace: await stackResolver.resolveNamespace() }
+        );
+      }
+      if (!config.minioEndpoint) {
+        return unresolvable('the resolved stack config carries no minioEndpoint');
+      }
+
+      return {
+        endpoint: config.minioEndpoint,
+        accessKeyId: 'admin',
+        secretAccessKey: encoreS3SecretKey
+      };
     },
     // When the scaler dispatches a queued job to an Encore instance, advance the
     // Job record queued->running and the source asset to `processing`. The
@@ -1412,13 +1485,15 @@ function activateScaler(redisUrl: string): void {
       let packagedBucket = outputBucket;
       let stackCfg: StackConfig | undefined;
       try {
-        const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+        // Issue #804: was listStackNames/loadStackConfig against the LITERAL
+        // `default` namespace (the follow-up #782's commit message flagged), so
+        // on a tenant-scoped deployment it resolved no coordinates and every
+        // package step failed with "stack coordinates unavailable". Routed
+        // through the resolver's namespace-aware view.
+        const names = await stackResolver.listStackNames();
         if (names.length > 0) {
           stackName = names[0];
-          stackCfg = await paramStore.loadStackConfig(
-            STACK_CONFIG_NAMESPACE,
-            names[0]!
-          );
+          stackCfg = await stackResolver.loadStackConfig(names[0]!);
           if (stackCfg?.minioEndpoint) minioEndpoint = stackCfg.minioEndpoint;
           if (stackCfg?.packagedBucket) packagedBucket = stackCfg.packagedBucket;
         }
@@ -1466,10 +1541,11 @@ function activateScaler(redisUrl: string): void {
         // see it. Best-effort ground-truth read-modify-write against the stored
         // config; a failure here rethrows into the ensure step (fail loud).
         recordInInventory: async (instanceName) => {
-          const current = await paramStore.loadStackConfig(
-            STACK_CONFIG_NAMESPACE,
-            resolvedStackName
-          );
+          // Issue #804: read AND write are namespace-aware now. A read under the
+          // literal `default` returned nothing here, so the packager was never
+          // recorded; and a write under `default` would have put the inventory
+          // somewhere the resolver never reads.
+          const current = await stackResolver.loadStackConfig(resolvedStackName);
           if (!current) {
             app.log.warn(
               { stackName: resolvedStackName },
@@ -1490,11 +1566,7 @@ function activateScaler(redisUrl: string): void {
               { serviceId: PACKAGER_SERVICE_ID, instanceName }
             ]
           };
-          await paramStore.storeStackConfig(
-            STACK_CONFIG_NAMESPACE,
-            resolvedStackName,
-            updated
-          );
+          await stackResolver.storeStackConfig(resolvedStackName, updated);
           app.log.info(
             { stackName: resolvedStackName, serviceId: PACKAGER_SERVICE_ID },
             'on-demand packager: recorded instance in stack inventory'

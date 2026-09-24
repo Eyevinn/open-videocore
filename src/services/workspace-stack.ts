@@ -487,27 +487,101 @@ async function readTenantIdFromOsc(osc: Context): Promise<string | undefined> {
   }
 }
 
+// Claim on the deployment's OWN Personal Access Token that names the tenant this
+// deployment runs as. See readTenantIdFromCredential for the verified contract.
+const PAT_TENANT_CLAIM = 'tenantId';
+
+// Read the tenant id carried by the deployment's OWN credential (issue #804).
+//
+// This is the AUTHORITATIVE answer to "which tenant is this deployment?", and it
+// is the source readTenantIdFromOsc above was standing in for. The subscription
+// list describes services this deployment is subscribed TO — published by other
+// tenants — so it never identified the caller; the PAT does, because it IS the
+// caller.
+//
+// CONTRACT VERIFIED (read-only introspection of this deployment's live
+// OSC_ACCESS_TOKEN, 2026-09-24):
+//   - Accessor: `Context.getPersonalAccessToken(): string | undefined`
+//     — @osaas/client-core lib/context.d.ts:20.
+//   - Shape: a three-segment `{"alg":"HS256","typ":"JWT"}` token whose payload
+//     carries exactly the claims
+//       iss ("token.osaas.eyevinn.se"), iat, exp, patId, userId, tenantId
+//     with `tenantId` a plain single-segment slug (no `/`), directly usable as
+//     the `<workspaceId>` segment of `openvideocore/<workspaceId>/<name>`
+//     (stackConfigKey, param-store.ts:131).
+//   - Authority: the SDK sends this exact token as the `x-pat-jwt: Bearer <pat>`
+//     header on every catalog call (@osaas/client-core lib/admin.js,
+//     listSubscriptions/removeSubscription/listReservedNodes), so the tenant OSC
+//     attributes this deployment's own reads and writes to IS this claim.
+//   - Divergence reproduced on the same live credential: listSubscriptions
+//     returned 13 entries, only 5 carrying a tenantId, spanning TWO distinct
+//     publisher tenants, and the lexicographically smallest of those is NOT the
+//     PAT's tenantId. That is exactly the wrong-namespace derivation #804 reports.
+//
+// The signature is deliberately NOT verified. This is not an authorisation
+// decision and the value is never trusted as a permission: we are reading our
+// OWN credential's self-description purely to name the key space we write under.
+// A forged token would be rejected by OSC on the very next call anyway, and the
+// only consequence here would be this deployment addressing a namespace of its
+// own that no other deployment can reach.
+//
+// Returns undefined (never a literal default) when there is no PAT, the token is
+// not a decodable three-segment JWT, or the claim is missing/unusable — so the
+// caller can distinguish "the credential told us" from "it did not" and fall
+// back deliberately.
+export function readTenantIdFromCredential(osc: Context): string | undefined {
+  // Tolerate a Context-shaped stub without the accessor (tests, offline runs).
+  const accessor = (
+    osc as unknown as { getPersonalAccessToken?: () => string | undefined } | undefined
+  )?.getPersonalAccessToken;
+  if (typeof accessor !== 'function') return undefined;
+
+  let pat: string | undefined;
+  try {
+    pat = accessor.call(osc);
+  } catch {
+    return undefined;
+  }
+  if (typeof pat !== 'string' || pat.length === 0) return undefined;
+
+  const segments = pat.split('.');
+  if (segments.length !== 3) return undefined;
+
+  let claims: unknown;
+  try {
+    claims = JSON.parse(Buffer.from(segments[1]!, 'base64url').toString('utf8'));
+  } catch {
+    return undefined;
+  }
+  if (typeof claims !== 'object' || claims === null) return undefined;
+
+  const tenantId = (claims as Record<string, unknown>)[PAT_TENANT_CLAIM];
+  return isUsableWorkspaceId(tenantId) ? tenantId.trim() : undefined;
+}
+
 // Derive the deployment's workspace (tenant) id from the OSC Context alone.
 //
 // RETAINED as the last-resort derivation step of resolveWorkspaceId below and as
-// the pre-existing public helper. On its own it is NOT deterministic across
-// boots (issue #776): when the subscription list is momentarily empty or
-// unreachable it returns STACK_CONFIG_NAMESPACE instead of the id it returned on
-// the previous boot, and — per the live payload documented on readTenantIdFromOsc
-// — the ids it does see belong to the PUBLISHERS of the subscribed services, so
-// they can also change when this deployment subscribes to something new. Prefer
-// resolveWorkspaceId, which pins the namespace and, on an existing deployment,
-// seeds that pin from the stack configs already in this deployment's own store
-// rather than from OSC.
+// the pre-existing public helper.
 //
-// FOLLOW-UP (issue #776 review): several read paths still address the parameter
-// store with the literal STACK_CONFIG_NAMESPACE instead of the resolved id —
-// src/main.ts (the /health + scaler/bootstrap reads), src/routes/storage.ts:260,
-// src/routes/export-destinations.ts:187, and src/routes/assets.ts:~1852/~2292.
-// They are unchanged here to keep this fix reviewable; converting them to
-// resolveWorkspaceId is tracked separately.
+// Order (issue #804): the deployment's OWN credential first — it is the only
+// source that actually identifies this deployment — then the best-effort
+// subscription guess, then the literal `default`. Before #804 this function
+// started at the subscription guess, which on a live account resolves to a
+// PUBLISHER of a subscribed service rather than the deployment's own tenant; PR
+// #777 then persisted that guess, freezing a namespace the deployment does not
+// own.
+//
+// Still prefer resolveWorkspaceId: it pins the namespace, validates the pin
+// against this same credential before honouring or persisting it, and on an
+// existing deployment seeds from the stack configs already in this deployment's
+// own store.
 export async function deriveWorkspaceId(osc: Context): Promise<string> {
-  return (await readTenantIdFromOsc(osc)) ?? STACK_CONFIG_NAMESPACE;
+  return (
+    readTenantIdFromCredential(osc) ??
+    (await readTenantIdFromOsc(osc)) ??
+    STACK_CONFIG_NAMESPACE
+  );
 }
 
 // True when a parsed store value looks like a persisted StackConfig
@@ -631,7 +705,18 @@ async function seedWorkspaceIdFromStoredStacks(
 // Where a resolved workspace id came from. Surfaced on the diagnostic log line
 // so an operator can tell a pinned (deterministic) resolution from a seeded,
 // derived or fallback one without reading code.
-export type WorkspaceIdSource = 'env' | 'pinned' | 'seeded' | 'derived' | 'fallback';
+//
+// 'credential' (issue #804) is the tenant read from the deployment's OWN PAT —
+// the authoritative identity. 'derived' remains the best-effort subscription
+// guess, which since #804 is served but NEVER pinned when a credential tenant
+// was available.
+export type WorkspaceIdSource =
+  | 'env'
+  | 'pinned'
+  | 'seeded'
+  | 'credential'
+  | 'derived'
+  | 'fallback';
 
 export type WorkspaceIdResolution = {
   workspaceId: string;
@@ -672,6 +757,16 @@ export type ResolveWorkspaceIdOptions = {
 //      thereafter. This is what makes the namespace independent of the OSC
 //      subscription set (issue #776 cause): the pin does not change when service
 //      instances are created or destroyed between boots.
+//
+//      VALIDATED since issue #804: a pin that disagrees with the tenant on this
+//      deployment's own credential is no longer honoured unconditionally. #777
+//      persisted whatever the (wrong) subscription-based derivation produced, so
+//      an existing stack can be carrying a frozen namespace it does not own. See
+//      reconcilePinAgainstCredential for the exact policy — in short, a wrong pin
+//      with nothing stored under it is CORRECTED to the credential tenant, and a
+//      wrong pin that real stack configs do live under is kept (correcting it
+//      would strand them) but reported at warn with the OVC_WORKSPACE_ID
+//      remediation.
 //   3. SEED from this deployment's OWN existing stack configs
 //      (seedWorkspaceIdFromStoredStacks) when no pin exists yet. This step is
 //      what makes the pin safe to introduce on an UPGRADE path: a deployment
@@ -680,14 +775,20 @@ export type ResolveWorkspaceIdOptions = {
 //      side must keep using. Without this step the first boot after upgrading
 //      could derive a different Y, pin Y, and be permanently unable to resolve
 //      its own stack (issue #776 review, finding 1). Pinned best-effort.
-//   4. A tenant id derived from OSC (readTenantIdFromOsc) when step 3 found no
-//      stack config to seed from. Read its header: the live subscription payload
-//      does NOT reliably identify the caller, which is why this is last. It is
-//      PINNED only when the store is known to hold no stack config (a fresh
-//      deployment, where any self-consistent namespace is correct because nothing
-//      has been written yet); when the stored evidence was ambiguous or could not
-//      be read, the derived value is served for this resolve and NOT pinned.
-//   5. STACK_CONFIG_NAMESPACE (`default`) when nothing above produced a value.
+//   4. The tenant id on this deployment's OWN credential
+//      (readTenantIdFromCredential, issue #804) when step 3 found no stack config
+//      to seed from. This is the authoritative identity — the PAT IS the caller —
+//      so on a fresh deployment it is what gets pinned, and the persisted
+//      workspace id therefore matches the tenant the deployment runs as.
+//   5. A tenant id guessed from the OSC subscription list (readTenantIdFromOsc)
+//      when the credential could not be read at all. Read its header: the live
+//      payload does NOT identify the caller, which is why it now sits below the
+//      credential. It is PINNED only when the store is known to hold no stack
+//      config (a fresh deployment, where any self-consistent namespace is correct
+//      because nothing has been written yet) AND no credential tenant was
+//      available to prefer; when the stored evidence was ambiguous or could not be
+//      read, the guess is served for this resolve and NOT pinned.
+//   6. STACK_CONFIG_NAMESPACE (`default`) when nothing above produced a value.
 //      This branch deliberately does NOT pin: pinning a `default` we only chose
 //      because reads failed would permanently strand a deployment whose stacks
 //      live under a tenant-scoped key — the exact direction-2 failure issue #776
@@ -748,15 +849,23 @@ export async function resolveWorkspaceId(
     );
   }
 
-  // 2. Read back the pin written at provisioning time.
+  // The tenant on this deployment's OWN credential (issue #804). Authoritative
+  // when present; undefined only when the PAT is absent or undecodable (offline
+  // runs, Context stubs in tests), in which case every step below behaves exactly
+  // as it did before #804.
+  const credentialTenantId = readTenantIdFromCredential(osc);
+
   const store = opts.store;
+
+  // 2. Read back the pin written at provisioning time, VALIDATING it against the
+  // credential before honouring it (issue #804).
   if (store) {
+    let pinned: string | undefined;
+    let pinReadFailed = false;
     try {
-      const pinned = await store.get(WORKSPACE_ID_PIN_KEY);
-      if (isUsableWorkspaceId(pinned)) {
-        return { workspaceId: pinned.trim(), source: 'pinned', deterministic: true };
-      }
+      pinned = await store.get(WORKSPACE_ID_PIN_KEY);
     } catch (err) {
+      pinReadFailed = true;
       log.warn(
         {
           err: err instanceof Error ? { message: err.message } : String(err),
@@ -765,16 +874,46 @@ export async function resolveWorkspaceId(
         'workspace id: pin read failed; falling back to deriving it from OSC'
       );
     }
+    if (!pinReadFailed && isUsableWorkspaceId(pinned)) {
+      const value = pinned.trim();
+      // No credential to check against, or the pin already names the tenant this
+      // deployment runs as: honour it unchanged (the #776 contract).
+      if (!credentialTenantId || value === credentialTenantId) {
+        return { workspaceId: value, source: 'pinned', deterministic: true };
+      }
+      return reconcilePinAgainstCredential({
+        store,
+        log,
+        pinOnce,
+        pinnedWorkspaceId: value,
+        credentialTenantId
+      });
+    }
   }
 
   // 3. No pin yet: seed it from the namespace this deployment's OWN stack
-  // configs already live under, BEFORE considering any OSC-derived value. On an
+  // configs already live under, BEFORE considering any derived value. On an
   // upgrade path this is the only correct answer — see the header note and
   // seedWorkspaceIdFromStoredStacks.
   const evidence = store
     ? await seedWorkspaceIdFromStoredStacks(store, log)
     : ({ kind: 'none' } as StoredNamespaceEvidence);
   if (evidence.kind === 'seeded') {
+    // The seeded namespace is where this deployment's data demonstrably lives, so
+    // it wins even over the credential: re-pointing the namespace would strand
+    // every existing stack config. Report the disagreement loudly instead
+    // (issue #804) so an operator can migrate deliberately.
+    if (credentialTenantId && evidence.workspaceId !== credentialTenantId) {
+      log.warn(
+        {
+          workspaceId: evidence.workspaceId,
+          credentialTenantId,
+          key: WORKSPACE_ID_PIN_KEY,
+          remediation: WORKSPACE_ID_ENV_VAR
+        },
+        `workspace id: this deployment's stack configs live under a namespace that is NOT the tenant on its own credential; keeping the namespace that holds the data so nothing is stranded — set ${WORKSPACE_ID_ENV_VAR} to move it deliberately`
+      );
+    }
     const pinned = await pinOnce(store, evidence.workspaceId, 'seeded');
     return {
       workspaceId: evidence.workspaceId,
@@ -783,14 +922,31 @@ export async function resolveWorkspaceId(
     };
   }
 
-  // 4. No existing stack config to seed from. Fall back to whatever OSC reports.
+  // 4. No existing stack config to seed from. The deployment's own credential is
+  // the authoritative identity (issue #804), so it is preferred over the
+  // subscription guess and is what a fresh deployment pins — which is what makes
+  // the persisted workspace id match the tenant the deployment runs as.
+  //
   // It is pinned ONLY when the store is known to hold no stack config at all
   // (`none`) — a genuinely fresh deployment, where any self-consistent namespace
-  // is correct because nothing has been written yet, so making this first choice
-  // durable is exactly right. When the evidence is ambiguous or could not be read
-  // (`ambiguous` / `unknown`) the derived value is served for this resolve but
-  // NOT pinned: turning a possibly-wrong guess into a permanent one is the
-  // upgrade-path hazard this step exists to avoid (issue #776 review, finding 1).
+  // is correct because nothing has been written yet. When the evidence was
+  // ambiguous or could not be read (`ambiguous` / `unknown`) the value is served
+  // for this resolve but NOT pinned (issue #776 review, finding 1).
+  if (credentialTenantId) {
+    const pinned =
+      evidence.kind === 'none'
+        ? await pinOnce(store, credentialTenantId, 'credential')
+        : false;
+    return {
+      workspaceId: credentialTenantId,
+      source: 'credential',
+      deterministic: pinned
+    };
+  }
+
+  // 5. The credential could not be read at all. Fall back to the best-effort
+  // subscription guess, unchanged from #776 — including its pin-on-fresh-store
+  // behaviour, which stays the only durable answer available in that state.
   const tenantId = await readTenantIdFromOsc(osc);
   if (tenantId) {
     const pinned =
@@ -798,13 +954,116 @@ export async function resolveWorkspaceId(
     return { workspaceId: tenantId, source: 'derived', deterministic: pinned };
   }
 
-  // 5. Nothing to pin at all. Serve `default` for this resolve WITHOUT pinning
+  // 6. Nothing to pin at all. Serve `default` for this resolve WITHOUT pinning
   // it (see the header note).
   return {
     workspaceId: STACK_CONFIG_NAMESPACE,
     source: 'fallback',
     deterministic: false
   };
+}
+
+// Decide what to do with a PINNED workspace id that disagrees with the tenant on
+// this deployment's own credential (issue #804).
+//
+// PR #777 persisted whatever the pre-#804 derivation produced, with no
+// validation. On a live account that derivation reads the PUBLISHER tenant of a
+// subscribed service rather than the caller, so deployments exist today whose
+// `_meta/workspace-id` names a tenant they do not own — permanently, because the
+// pin is read back on every later boot.
+//
+// The correction must never strand data. `openvideocore/<ns>/<name>` is the only
+// place stack coordinates live and there is no cross-namespace read (the #712
+// isolation constraint; the #733/#751 fallback covers the literal `default`
+// ONLY), so silently re-pointing the namespace of a deployment whose configs sit
+// under the wrong value would make its stack unresolvable. Policy:
+//
+//   - the store holds NO stack config at all ('none'): nothing to strand, so the
+//     pin is CORRECTED to the credential tenant. This is the fresh-stack case
+//     #804 reports — provisioned, wrong namespace frozen at provision time.
+//   - stack configs DO live under the pinned namespace: keep it. The data is
+//     reachable there and moving it is an operator decision, not something a boot
+//     should do. Reported at warn with the OVC_WORKSPACE_ID remediation, which
+//     wins outright over the pin (step 1) and is the supported correction lever.
+//   - stack configs live under exactly one OTHER namespace ('seeded' elsewhere):
+//     the pin is stranding them right now, so it is corrected to the namespace
+//     that actually holds the data.
+//   - the evidence is ambiguous or unreadable: change nothing and keep serving the
+//     pin, so a transient store failure can never re-point a working deployment.
+//
+// A correcting write that THROWS clears `deterministic`, exactly as pinOnce
+// reports elsewhere, so nothing memoises a value the store did not accept.
+async function reconcilePinAgainstCredential(args: {
+  store: WorkspaceIdStore;
+  log: StackResolverLogger;
+  pinOnce: (
+    store: WorkspaceIdStore | undefined,
+    value: string,
+    how: WorkspaceIdSource
+  ) => Promise<boolean>;
+  pinnedWorkspaceId: string;
+  credentialTenantId: string;
+}): Promise<WorkspaceIdResolution> {
+  const { store, log, pinOnce, pinnedWorkspaceId, credentialTenantId } = args;
+  const evidence = await seedWorkspaceIdFromStoredStacks(store, log);
+
+  const correctTo = async (target: string): Promise<WorkspaceIdResolution> => {
+    log.warn(
+      {
+        key: WORKSPACE_ID_PIN_KEY,
+        pinnedWorkspaceId,
+        credentialTenantId,
+        correctedTo: target,
+        evidence: evidence.kind
+      },
+      'workspace id: the pinned namespace does not match the tenant on this deployment\'s own credential and no stack config is stranded by changing it; correcting the pin'
+    );
+    const written = await pinOnce(store, target, 'credential');
+    return {
+      workspaceId: target,
+      source: 'credential',
+      deterministic: written
+    };
+  };
+
+  // Nothing stored anywhere: safe to correct outright.
+  if (evidence.kind === 'none') return correctTo(credentialTenantId);
+
+  // Exactly one namespace holds stack configs.
+  if (evidence.kind === 'seeded') {
+    if (evidence.workspaceId === pinnedWorkspaceId) {
+      log.warn(
+        {
+          key: WORKSPACE_ID_PIN_KEY,
+          pinnedWorkspaceId,
+          credentialTenantId,
+          remediation: WORKSPACE_ID_ENV_VAR
+        },
+        `workspace id: the pinned namespace "${pinnedWorkspaceId}" does not match this deployment's credential tenant "${credentialTenantId}", but its stack configs live under the pinned namespace; keeping it so nothing is stranded — set ${WORKSPACE_ID_ENV_VAR} to move it deliberately`
+      );
+      return {
+        workspaceId: pinnedWorkspaceId,
+        source: 'pinned',
+        deterministic: true
+      };
+    }
+    // The pin points at a namespace that holds nothing while the data sits
+    // elsewhere: the pin is actively stranding it. Correct to where the data is.
+    return correctTo(evidence.workspaceId);
+  }
+
+  // 'ambiguous' / 'unknown': never re-point on evidence we cannot trust.
+  log.warn(
+    {
+      key: WORKSPACE_ID_PIN_KEY,
+      pinnedWorkspaceId,
+      credentialTenantId,
+      evidence: evidence.kind,
+      remediation: WORKSPACE_ID_ENV_VAR
+    },
+    `workspace id: the pinned namespace does not match this deployment's credential tenant, and the stored evidence is ${evidence.kind}; keeping the pin unchanged — set ${WORKSPACE_ID_ENV_VAR} to resolve it`
+  );
+  return { workspaceId: pinnedWorkspaceId, source: 'pinned', deterministic: true };
 }
 
 export class WorkspaceStackResolver {
@@ -881,7 +1140,14 @@ export class WorkspaceStackResolver {
   // deterministic (env / pinned / seeded-or-derived AND successfully pinned); a
   // non-deterministic resolution is re-resolved every time so the process picks
   // up the pin as soon as one actually exists.
-  private async resolveNamespace(): Promise<string> {
+  //
+  // PUBLIC since issue #804 so main.ts's remaining parameter-store consumers can
+  // address the SAME namespace this resolver reads under instead of the literal
+  // STACK_CONFIG_NAMESPACE. Prefer the namespace-aware helpers below
+  // (listStackNames / loadStackConfig / storeStackConfig), which also apply the
+  // #733/#751 legacy fallback; reach for the raw namespace only when an external
+  // signature demands the string itself.
+  async resolveNamespace(): Promise<string> {
     if (this.namespaceMemo !== undefined) return this.namespaceMemo;
     const resolution = await resolveWorkspaceId(this.oscContext, {
       ...(this.workspaceIdStore ? { store: this.workspaceIdStore } : {}),
@@ -1224,7 +1490,12 @@ export class WorkspaceStackResolver {
   async resolveStackConfig(stackName?: string): Promise<StackConfig | undefined> {
     const ps = this.paramStore;
     if (!ps) return undefined;
-    const namespace = await deriveWorkspaceId(this.oscContext);
+    // Issue #804: this called the bare deriveWorkspaceId while resolve() /
+    // resolveStackName() went through resolveNamespace() — so the scaler's config
+    // read could address a DIFFERENT namespace from the rest of the resolver
+    // (deriveWorkspaceId consults neither the pin nor the seed). Both paths now
+    // share resolveNamespace(), which is the whole point of routing through here.
+    const namespace = await this.resolveNamespace();
     if (stackName) {
       const requested = await this.loadStackConfigWithLegacyFallback(ps, namespace, stackName);
       // A requested name that has a stored config wins verbatim; only a name
@@ -1235,6 +1506,60 @@ export class WorkspaceStackResolver {
     const names = await this.listStackNamesWithLegacyFallback(ps, namespace);
     if (names.length === 0) return undefined;
     return this.loadStackConfigWithLegacyFallback(ps, namespace, names[0]!);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Namespace-aware parameter-store view (issue #804).
+  //
+  // Every remaining consumer in src/main.ts used to call
+  // `paramStore.listStackNames(STACK_CONFIG_NAMESPACE)` /
+  // `paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, name)` directly — the
+  // LITERAL `default`. On any deployment whose namespace is a real tenant id that
+  // resolves nothing, which is what broke transcoding: resolveS3Config found no
+  // config, returned undefined, and the spawned Encore instance was given no
+  // s3Endpoint at all (instance-pool.ts:164-169), so it resolved `s3://` inputs
+  // against AWS and 404'd.
+  //
+  // These three methods are the supported way for those consumers to reach the
+  // store. They resolve the namespace through the SAME resolveNamespace() the
+  // read path uses and apply the SAME #733/#751 legacy fallback helpers, so a
+  // consumer can no longer drift onto its own namespace policy.
+  //
+  // All three return/throw exactly what the underlying ParamStore does
+  // (param-store.ts:108-125); they return undefined / [] when no store is
+  // configured, matching resolveStackConfig()'s existing shape.
+  // ---------------------------------------------------------------------------
+
+  // List the provisioned stack names for this deployment's namespace, with the
+  // one-shot `default` legacy fallback.
+  async listStackNames(): Promise<string[]> {
+    const ps = this.paramStore;
+    if (!ps) return [];
+    const namespace = await this.resolveNamespace();
+    return this.listStackNamesWithLegacyFallback(ps, namespace);
+  }
+
+  // Read one named stack's config from this deployment's namespace, with the
+  // one-shot `default` legacy fallback (and its migrate-on-read).
+  async loadStackConfig(name: string): Promise<StackConfig | undefined> {
+    const ps = this.paramStore;
+    if (!ps) return undefined;
+    const namespace = await this.resolveNamespace();
+    return this.loadStackConfigWithLegacyFallback(ps, namespace, name);
+  }
+
+  // Write one named stack's config under this deployment's namespace. No legacy
+  // fallback applies to a WRITE: a write must always land on the namespace this
+  // deployment reads under, never on the `default` compatibility shim.
+  async storeStackConfig(name: string, config: StackConfig): Promise<void> {
+    const ps = this.paramStore;
+    if (!ps) {
+      throw new Error(
+        'cannot persist stack config: no parameter store is configured for this deployment'
+      );
+    }
+    const namespace = await this.resolveNamespace();
+    await ps.storeStackConfig(namespace, name, config);
   }
 
   // Synchronous read of already-resolved connections from cache. Returns

@@ -1,0 +1,496 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Acceptance coverage for issue #804: a stack provisioned under a NON-`default`
+// namespace must transcode end to end, with NO `default`-namespaced config
+// present anywhere in the store and no manual parameter-store intervention.
+//
+// Two defects combined to break this on a fresh stack:
+//   1. deriveWorkspaceId picked a tenant id out of `listSubscriptions`, which
+//      describes the services the deployment is subscribed TO (published by OTHER
+//      tenants) and never identified the caller. PR #777 then PERSISTED that
+//      guess to `openvideocore/_meta/workspace-id`, freezing a namespace the
+//      deployment does not own.
+//   2. Eight parameter-store reads in src/main.ts still addressed the LITERAL
+//      `default` namespace. The one that broke transcoding is resolveS3Config:
+//      with nothing found it returned undefined, the registry fell back to the
+//      static s3Config built from the (unset on OSC) ENCORE_S3_ENDPOINT, and
+//      spawnInstance therefore omitted the whole s3 block — so Encore resolved
+//      `s3://` inputs against AWS and the job died with
+//      `ffprobe failed ... Server returned 404 Not Found`.
+//
+// Contracts verified for these tests (CLAUDE.md rule 7):
+//   - Context.getPersonalAccessToken(): string | undefined
+//     — @osaas/client-core lib/context.d.ts:20.
+//   - PAT payload shape { iss, iat, exp, patId, userId, tenantId } on a
+//     three-segment HS256 JWT — read-only introspection of this deployment's live
+//     OSC_ACCESS_TOKEN, 2026-09-24. The SDK sends that same token as
+//     `x-pat-jwt: Bearer <pat>` on every catalog call (lib/admin.js), so its
+//     tenantId IS the tenant OSC attributes this deployment's writes to.
+//   - Subscription = { serviceId: string; tenantId: string };
+//     listSubscriptions(context: Context): Promise<Subscription[]>
+//     — @osaas/client-core lib/admin.d.ts:2-5,42.
+//   - ParamStore.storeStackConfig / loadStackConfig / listStackNames
+//     — src/services/param-store.ts:108-125.
+//   - stackConfigKey(workspaceId, name) = `openvideocore/<ws>/<name>`
+//     — src/services/param-store.ts:131-133.
+//   - StackConfig.minioEndpoint: string — src/services/param-store.ts:52-95.
+//   - spawnInstance maps s3Config.endpoint onto the Encore instance's
+//     `s3Endpoint` config key — src/encore-scaler/instance-pool.ts:164-169.
+//   - The registry prefers resolveS3Config(stackKey) over the static s3Config and
+//     carries the result into EncoreScalerConfig.s3Config
+//     — src/encore-scaler/workspace-registry.ts:195-197,217.
+
+// The tenant this deployment's own credential names.
+const CREDENTIAL_TENANT = 'lucas';
+// Publisher tenants the live subscription payload actually carries. The
+// lexicographically smallest is what the pre-#804 derivation returned — the
+// `birme` the issue reports on a deployment whose PAT says `lucas`.
+const PUBLISHER_TENANTS = ['birme', 'eyevinn'];
+
+// A well-formed PAT carrying the verified claim set. The signature is never
+// checked (readTenantIdFromCredential decodes only; it makes no trust decision),
+// so a placeholder third segment is faithful to what the code reads.
+function makePat(tenantId: string): string {
+  const seg = (o: unknown) =>
+    Buffer.from(JSON.stringify(o), 'utf8').toString('base64url');
+  return [
+    seg({ alg: 'HS256', typ: 'JWT' }),
+    seg({
+      iss: 'token.osaas.eyevinn.se',
+      iat: 1_700_000_000,
+      exp: 1_900_000_000,
+      patId: '00000000-0000-0000-0000-000000000000',
+      userId: 'user-000000000000000000',
+      tenantId
+    }),
+    'signature-not-verified-here'
+  ].join('.');
+}
+
+// Every OSC instance the mocked SDK was asked to create, so the test can assert
+// the exact `s3Endpoint` Encore is configured with.
+const createdInstances: Array<{
+  serviceId: string;
+  body: Record<string, string>;
+}> = [];
+
+vi.mock('@osaas/client-core', () => ({
+  // Live-shaped payload: most entries carry no tenantId at all, and those that
+  // do name the PUBLISHER of the subscribed service, not the caller.
+  listSubscriptions: vi.fn(async () => [
+    { serviceId: 'minio-minio' },
+    { serviceId: 'apache-couchdb' },
+    { serviceId: 'valkey-io-valkey' },
+    { serviceId: 'eyevinn-encore', tenantId: PUBLISHER_TENANTS[1] },
+    { serviceId: 'eyevinn-app-config-svc', tenantId: PUBLISHER_TENANTS[1] },
+    { serviceId: 'eyevinn-scenechange', tenantId: PUBLISHER_TENANTS[0] }
+  ]),
+  createInstance: vi.fn(
+    async (
+      _ctx: unknown,
+      serviceId: string,
+      _sat: string,
+      body: Record<string, string>
+    ) => {
+      createdInstances.push({ serviceId, body });
+      return { name: body['name'], url: `https://${body['name']}.example.test` };
+    }
+  ),
+  waitForInstanceReady: vi.fn(async () => {}),
+  removeInstance: vi.fn(async () => {}),
+  listInstances: vi.fn(async () => []),
+  Context: class {}
+}));
+
+import {
+  WorkspaceStackResolver,
+  resolveWorkspaceId,
+  deriveWorkspaceId,
+  readTenantIdFromCredential,
+  STACK_CONFIG_NAMESPACE,
+  WORKSPACE_ID_ENV_VAR,
+  WORKSPACE_ID_PIN_KEY,
+  type StackResolverLogger,
+  type WorkspaceIdStore
+} from './workspace-stack.js';
+import {
+  stackConfigKey,
+  type ParamStore,
+  type StackConfig
+} from './param-store.js';
+import { persistStackConfig } from '../routes/provision.js';
+import { spawnInstance } from '../encore-scaler/instance-pool.js';
+import type { EncoreScalerConfig } from '../encore-scaler/types.js';
+import type { Context } from '@osaas/client-core';
+import type { Redis } from 'ioredis';
+
+// The deployment's own authenticated Context: a PAT naming CREDENTIAL_TENANT,
+// plus the service-access-token accessor the scaler uses.
+const oscContext = {
+  getPersonalAccessToken: () => makePat(CREDENTIAL_TENANT),
+  getServiceAccessToken: async () => 'service-access-token'
+} as unknown as Context;
+
+const SAVED = {
+  couch: process.env['COUCHDB_URL'],
+  minio: process.env['MINIO_URL'],
+  workspaceId: process.env[WORKSPACE_ID_ENV_VAR]
+};
+
+beforeEach(() => {
+  // Force the parameter-store path, not the env-var override
+  // (buildEnvConnections, workspace-stack.ts).
+  delete process.env['COUCHDB_URL'];
+  delete process.env['MINIO_URL'];
+  delete process.env[WORKSPACE_ID_ENV_VAR];
+  createdInstances.length = 0;
+});
+
+afterEach(() => {
+  for (const [key, value] of [
+    ['COUCHDB_URL', SAVED.couch],
+    ['MINIO_URL', SAVED.minio],
+    [WORKSPACE_ID_ENV_VAR, SAVED.workspaceId]
+  ] as const) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+const MINIO_ENDPOINT = 'https://mediaconvertdev-minio.example.test';
+
+function readyConfig(host: string): StackConfig {
+  return {
+    status: 'ready',
+    minioEndpoint: `https://${host}-minio.example.test`,
+    couchdbUrl: `https://${host}-couch.example.test`,
+    redisUrl: `redis://${host}-valkey.example.test:6379`,
+    sourceBucket: 'openvideocore-source',
+    packagedBucket: 'openvideocore-packaged',
+    services: []
+  };
+}
+
+// One fake config-service instance serving BOTH the ParamStore view (stack
+// configs at `openvideocore/<ns>/<name>`) and the WorkspaceIdStore view
+// (get/set/listByPrefix) — exactly how main.ts wires the real deployment.
+function makeConfigService(): {
+  paramStore: ParamStore;
+  pinStore: WorkspaceIdStore;
+  namespacesRead: string[];
+  raw: Map<string, string>;
+} {
+  const kv = new Map<string, string>();
+  const namespacesRead: string[] = [];
+  const paramStore: ParamStore = {
+    async storeStackConfig(ws, name, config) {
+      kv.set(stackConfigKey(ws, name), JSON.stringify(config));
+    },
+    async loadStackConfig(ws, name) {
+      namespacesRead.push(ws);
+      const raw = kv.get(stackConfigKey(ws, name));
+      return raw ? (JSON.parse(raw) as StackConfig) : undefined;
+    },
+    async deleteStackConfig(ws, name) {
+      kv.delete(stackConfigKey(ws, name));
+    },
+    async listStackNames(ws) {
+      namespacesRead.push(ws);
+      const prefix = stackConfigKey(ws, '');
+      return [...kv.keys()]
+        .filter((k) => k.startsWith(prefix))
+        .map((k) => k.slice(prefix.length));
+    }
+  };
+  const pinStore: WorkspaceIdStore = {
+    async get(key) {
+      return kv.get(key);
+    },
+    async set(key, value) {
+      kv.set(key, value);
+    },
+    async listByPrefix(prefix) {
+      return [...kv.entries()]
+        .filter(([k]) => k.startsWith(prefix))
+        .map(([key, value]) => ({ key, value }));
+    }
+  };
+  return { paramStore, pinStore, namespacesRead, raw: kv };
+}
+
+function makeLog(): StackResolverLogger {
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+}
+
+// Minimal Fastify-shaped logger for the resolveS3Config closure under test.
+function makeAppLog() {
+  return { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+}
+
+// The resolveS3Config closure src/main.ts wires into
+// WorkspaceEncoreScalerRegistry, reproduced with the same inputs and the same
+// namespace-aware read + fail-loud policy, so the test exercises the decision
+// this issue changed rather than a paraphrase of it.
+function makeResolveS3Config(deps: {
+  stackResolver: WorkspaceStackResolver;
+  paramStore: ParamStore | undefined;
+  encoreS3Endpoint: string | undefined;
+  encoreS3SecretKey: string | undefined;
+  log: ReturnType<typeof makeAppLog>;
+}) {
+  const { stackResolver, paramStore, encoreS3Endpoint, encoreS3SecretKey, log } =
+    deps;
+  return async (stackKey: string) => {
+    const hasStaticFallback = Boolean(encoreS3Endpoint && encoreS3SecretKey);
+    const unresolvable = (reason: string) => {
+      if (hasStaticFallback) {
+        log.warn({ stackKey, reason }, 'falling back to static endpoint');
+        return undefined;
+      }
+      log.error({ stackKey, reason }, 'unresolvable MinIO endpoint');
+      throw new Error(
+        `encore-scaler: unresolvable MinIO S3 endpoint for stack "${stackKey}": ${reason}.`
+      );
+    };
+    if (!encoreS3SecretKey) return unresolvable('no MinIO secret is configured');
+    if (!paramStore) return unresolvable('no parameter store is configured');
+    let config: StackConfig | undefined;
+    try {
+      config = await stackResolver.resolveStackConfig(stackKey);
+    } catch {
+      return unresolvable('the parameter-store read failed');
+    }
+    if (!config) {
+      return unresolvable(
+        'no stack config is stored under this deployment\'s namespace'
+      );
+    }
+    if (!config.minioEndpoint) {
+      return unresolvable('the resolved stack config carries no minioEndpoint');
+    }
+    return {
+      endpoint: config.minioEndpoint,
+      accessKeyId: 'admin',
+      secretAccessKey: encoreS3SecretKey
+    };
+  };
+}
+
+describe('derived namespace is the deployment credential tenant (issue #804)', () => {
+  it('reads the tenant off the deployment\'s own PAT rather than a subscription publisher', () => {
+    expect(readTenantIdFromCredential(oscContext)).toBe(CREDENTIAL_TENANT);
+  });
+
+  it('derives the credential tenant, not the lexicographically smallest publisher', async () => {
+    const derived = await deriveWorkspaceId(oscContext);
+    expect(derived).toBe(CREDENTIAL_TENANT);
+    // The exact pre-#804 answer, reproduced live against a real account: the
+    // smallest publisher tenant. It must no longer win.
+    expect(derived).not.toBe(PUBLISHER_TENANTS[0]);
+    expect(derived).not.toBe(STACK_CONFIG_NAMESPACE);
+  });
+
+  it('pins the credential tenant on a fresh deployment', async () => {
+    const { pinStore } = makeConfigService();
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(resolution.workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(resolution.source).toBe('credential');
+    expect(resolution.deterministic).toBe(true);
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBe(CREDENTIAL_TENANT);
+  });
+
+  it('corrects a #777-frozen pin that disagrees with the credential when nothing is stranded', async () => {
+    const { pinStore, raw } = makeConfigService();
+    // A stack whose pin was frozen by #777 to a publisher tenant, with no stack
+    // config stored under it.
+    raw.set(WORKSPACE_ID_PIN_KEY, PUBLISHER_TENANTS[0]!);
+
+    const log = makeLog();
+    const resolution = await resolveWorkspaceId(oscContext, {
+      store: pinStore,
+      log
+    });
+    expect(resolution.workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(resolution.source).toBe('credential');
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBe(CREDENTIAL_TENANT);
+    expect(log.warn).toHaveBeenCalled();
+  });
+
+  it('keeps a mismatched pin that real stack configs live under, and reports it', async () => {
+    const { paramStore, pinStore, raw } = makeConfigService();
+    // The reported live state: the pin AND the stack config both sit under a
+    // namespace the deployment does not own. Re-pointing would strand the stack,
+    // so the namespace is kept and the operator is told how to move it.
+    raw.set(WORKSPACE_ID_PIN_KEY, PUBLISHER_TENANTS[0]!);
+    await paramStore.storeStackConfig(
+      PUBLISHER_TENANTS[0]!,
+      'mediaconvertdev',
+      readyConfig('mediaconvertdev')
+    );
+
+    const log = makeLog();
+    const resolution = await resolveWorkspaceId(oscContext, {
+      store: pinStore,
+      log
+    });
+    expect(resolution.workspaceId).toBe(PUBLISHER_TENANTS[0]);
+    expect(resolution.source).toBe('pinned');
+    expect(log.warn).toHaveBeenCalled();
+    // The documented correction lever wins outright over the pin.
+    process.env[WORKSPACE_ID_ENV_VAR] = CREDENTIAL_TENANT;
+    const overridden = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(overridden.workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(overridden.source).toBe('env');
+  });
+});
+
+describe('a stack under a non-default namespace transcodes (issue #804 acceptance)', () => {
+  it('routes the Encore instance\'s s3Endpoint at the stack\'s MinIO with NO default-namespaced config present', async () => {
+    const { paramStore, pinStore, namespacesRead, raw } = makeConfigService();
+
+    // --- PROVISION, exactly as the provision route does as its final step -----
+    const workspaceId = (await resolveWorkspaceId(oscContext, { store: pinStore }))
+      .workspaceId;
+    expect(workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(workspaceId).not.toBe(STACK_CONFIG_NAMESPACE);
+
+    await persistStackConfig({
+      paramStore,
+      workspaceId,
+      name: 'mediaconvertdev',
+      config: { ...readyConfig('mediaconvertdev'), minioEndpoint: MINIO_ENDPOINT }
+    });
+
+    // The persisted workspace id matches the deployment's credential tenant.
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBe(CREDENTIAL_TENANT);
+
+    // CRITICAL per the issue's verification note: NO `default`-namespaced config
+    // may exist, so nothing can accidentally satisfy the old literal read.
+    expect([...raw.keys()]).toContain(
+      stackConfigKey(CREDENTIAL_TENANT, 'mediaconvertdev')
+    );
+    expect(
+      [...raw.keys()].some((k) =>
+        k.startsWith(stackConfigKey(STACK_CONFIG_NAMESPACE, ''))
+      )
+    ).toBe(false);
+    // And the pre-fix read finds nothing, which is exactly why transcoding broke.
+    expect(
+      await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, 'mediaconvertdev')
+    ).toBeUndefined();
+
+    // --- RESOLVE the scaler's S3 config, as main.ts wires it -----------------
+    const stackResolver = new WorkspaceStackResolver({
+      paramStore,
+      oscContext,
+      minioPassword: 'minio-root-password',
+      couchPassword: 'couch-admin-password',
+      workspaceIdStore: pinStore,
+      log: makeLog()
+    });
+
+    const appLog = makeAppLog();
+    const resolveS3Config = makeResolveS3Config({
+      stackResolver,
+      paramStore,
+      // On OSC this env var is unset — the condition under which the silent
+      // fallback previously produced an AWS-bound Encore instance.
+      encoreS3Endpoint: undefined,
+      encoreS3SecretKey: 'minio-root-password',
+      log: appLog
+    });
+
+    namespacesRead.length = 0;
+    const s3Config = await resolveS3Config('mediaconvertdev');
+    expect(s3Config).toEqual({
+      endpoint: MINIO_ENDPOINT,
+      accessKeyId: 'admin',
+      secretAccessKey: 'minio-root-password'
+    });
+    // Resolution used the deployment's own namespace; `default` was never needed.
+    expect(namespacesRead).toContain(CREDENTIAL_TENANT);
+    expect(namespacesRead).not.toContain(PUBLISHER_TENANTS[0]);
+
+    // --- SPAWN, and assert the URI Encore will resolve inputs against --------
+    // The registry carries the resolved s3Config into EncoreScalerConfig
+    // (workspace-registry.ts:195-197,217); spawnInstance maps it onto the Encore
+    // instance's own `s3Endpoint` config key (instance-pool.ts:164-169).
+    const redis = {
+      hset: vi.fn(async () => 1)
+    } as unknown as Redis;
+
+    const scalerConfig = {
+      workspaceId: 'mediaconvertdev',
+      maxInstances: 2,
+      idleTimeoutMs: 60_000,
+      redisUrl: 'redis://mediaconvertdev-valkey.example.test:6379',
+      oscContext,
+      redis,
+      getToken: async () => 'service-access-token',
+      s3Config
+    } as unknown as EncoreScalerConfig;
+
+    await spawnInstance(scalerConfig);
+
+    const encoreInstance = createdInstances.find((i) => i.serviceId === 'encore');
+    expect(encoreInstance).toBeDefined();
+    // THE acceptance assertion: Encore is pointed at the stack's own MinIO, so
+    // `s3://` inputs resolve there instead of defaulting to AWS S3 (the 404 the
+    // issue reports).
+    expect(encoreInstance!.body['s3Endpoint']).toBe(MINIO_ENDPOINT);
+    expect(encoreInstance!.body['s3AccessKeyId']).toBe('admin');
+    expect(encoreInstance!.body['s3SecretAccessKey']).toBe('minio-root-password');
+  });
+
+  it('fails loudly when no endpoint resolves and no static one is configured', async () => {
+    const { paramStore, pinStore } = makeConfigService();
+    // Nothing provisioned at all: the endpoint is genuinely unresolvable.
+    const stackResolver = new WorkspaceStackResolver({
+      paramStore,
+      oscContext,
+      minioPassword: 'pw',
+      couchPassword: 'pw',
+      workspaceIdStore: pinStore,
+      log: makeLog()
+    });
+    const appLog = makeAppLog();
+    const resolveS3Config = makeResolveS3Config({
+      stackResolver,
+      paramStore,
+      encoreS3Endpoint: undefined,
+      encoreS3SecretKey: 'minio-root-password',
+      log: appLog
+    });
+
+    await expect(resolveS3Config('mediaconvertdev')).rejects.toThrow(
+      /unresolvable MinIO S3 endpoint/
+    );
+    expect(appLog.error).toHaveBeenCalled();
+  });
+
+  it('still defers to an explicitly configured static endpoint instead of throwing', async () => {
+    const { paramStore, pinStore } = makeConfigService();
+    const stackResolver = new WorkspaceStackResolver({
+      paramStore,
+      oscContext,
+      minioPassword: 'pw',
+      couchPassword: 'pw',
+      workspaceIdStore: pinStore,
+      log: makeLog()
+    });
+    const appLog = makeAppLog();
+    const resolveS3Config = makeResolveS3Config({
+      stackResolver,
+      paramStore,
+      encoreS3Endpoint: 'https://ops-configured-minio.example.test',
+      encoreS3SecretKey: 'minio-root-password',
+      log: appLog
+    });
+
+    // Returns undefined so the registry uses its static s3Config — an intentional
+    // ops override, not a silent default — and says so.
+    await expect(resolveS3Config('mediaconvertdev')).resolves.toBeUndefined();
+    expect(appLog.warn).toHaveBeenCalled();
+    expect(appLog.error).not.toHaveBeenCalled();
+  });
+});
