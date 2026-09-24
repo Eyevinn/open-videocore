@@ -28,6 +28,7 @@ import {
 import {
   destroyInstance,
   listInstances,
+  reapOrphanedInstances,
   spawnInstance,
   updateInstance
 } from './instance-pool.js';
@@ -50,9 +51,68 @@ export const DEFAULT_CALLBACK_TRUST_TIMEOUT_MS = 60_000;
 // the finished job from its active set and the poller decrementing activeJobs.
 export const DEFAULT_RECONCILE_GRACE_MS = 10_000;
 
+// #778: how often the tick sweeps OSC for scaler-owned instances with no pool
+// record when EncoreScalerConfig.orphanReapIntervalMs is left to the registry's
+// default. The sweep costs one OSC list call plus a pool SCAN, so it runs on a
+// much coarser cadence than the 10s tick.
+export const DEFAULT_ORPHAN_REAP_INTERVAL_MS = 5 * 60_000;
+
+// Resolve the epoch-ms an instance's idle clock should be measured from (#778).
+//
+// `lastIdleAt` is only advanced when a job COMPLETES (the callback poller's
+// decrement — encore-callback-poller.ts:320, routes/internal.ts:194). An
+// instance that is spawned and never dispatched a job therefore has no
+// completion behind it, and any record whose `lastIdleAt` was lost or written
+// as a non-number makes `now - lastIdleAt > idleTimeoutMs` evaluate to NaN >
+// number, i.e. false, forever: the instance is never a teardown candidate and
+// bills indefinitely.
+//
+// Order of preference:
+//   1. lastIdleAt — a real completion timestamp when there is one.
+//   2. readyAt    — the moment the instance entered the pool ready for work, so
+//                   a never-dispatched instance is idle from readiness.
+//   3. undefined  — nothing usable; callers FAIL CLOSED (see below).
+//
+// Numeric strings are accepted because the record round-trips through JSON in
+// Valkey and may have been repaired out of band.
+export function resolveIdleSince(record: EncoreInstanceRecord): number | undefined {
+  for (const candidate of [record.lastIdleAt, record.readyAt] as unknown[]) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+    if (typeof candidate === 'string' && candidate.trim() !== '') {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+// Whether an instance's idle age exceeds idleTimeoutMs (#778).
+//
+// Fails CLOSED: when no usable idle timestamp exists the instance is treated as
+// eligible (idle age unknown => assume aged) rather than held forever. Eligible
+// only means "candidate": the scale-down path still runs the authoritative
+// Encore real-work check and the packaging-pin check before anything is
+// destroyed (#513/#525 pt.2), so an unknown timestamp can never kill an
+// instance that has in-flight work or a pending packaging handoff — such an
+// instance is drained, exactly as before.
+export function isIdlePastTimeout(
+  record: EncoreInstanceRecord,
+  now: number,
+  idleTimeoutMs: number
+): boolean {
+  const idleSince = resolveIdleSince(record);
+  if (idleSince === undefined) return true;
+  return now - idleSince > idleTimeoutMs;
+}
+
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
+  // #778: epoch ms of the last orphan sweep, so the sweep runs on its own
+  // (much coarser) cadence than the tick. 0 = never swept, so the first tick
+  // after start-up sweeps immediately — that is when a pool lost to a restart
+  // is most likely to have left instances behind.
+  private lastOrphanSweepAt = 0;
 
   constructor(private config: EncoreScalerConfig) {}
 
@@ -156,7 +216,23 @@ export class EncoreScalerLoop {
     const survivors: EncoreInstanceRecord[] = [];
     let activeCount = instances.length;
     for (const inst of instances) {
-      const idlePastTimeout = now - inst.lastIdleAt > idleTimeoutMs;
+      // #778: idle age is measured from the last COMPLETION if there is one,
+      // else from the moment the instance became ready (readyAt) — so an
+      // instance that was spawned and never dispatched a job ages out normally.
+      // A record with neither usable timestamp fails closed (eligible), never
+      // "hold forever"; the real-work + packaging-pin checks below still decide
+      // whether it is destroyed or drained.
+      const idlePastTimeout = isIdlePastTimeout(inst, now, idleTimeoutMs);
+      if (inst.activeJobs === 0 && resolveIdleSince(inst) === undefined) {
+        console.warn(
+          '[encore-scaler] instance %s has no usable idle timestamp ' +
+            '(lastIdleAt=%o readyAt=%o); treating it as idle-aged rather than ' +
+            'holding it indefinitely (#778)',
+          inst.instanceId,
+          inst.lastIdleAt,
+          inst.readyAt
+        );
+      }
       // A candidate for teardown is either an instance the tracked count already
       // considers idle-and-aged, or one already marked draining (which is being
       // held only until its real work clears — see below).
@@ -234,6 +310,14 @@ export class EncoreScalerLoop {
     }
     instances = survivors;
 
+    // 4b. Reap instances OSC is still running for this workspace that have no
+    //     pool record at all (#778). Scale-down above can only ever consider
+    //     what is in the pool hash, so an instance orphaned by a spawn that died
+    //     before the pool write, a wiped Valkey, or a deleted deployment has
+    //     nothing else that can remove it. Opt-in (the registry enables it in
+    //     production) and throttled to its own cadence; never fatal to the tick.
+    await this.reapOrphansIfDue();
+
     // 5. Dispatch pending jobs to instances with spare capacity.
     for (const inst of instances) {
       // A draining instance (issue #513) is being torn down: it must receive no
@@ -293,6 +377,28 @@ export class EncoreScalerLoop {
         inst.activeJobs += 1;
         await updateInstance(redis, workspaceId, inst);
       }
+    }
+  }
+
+  // Run the orphan sweep (#778) when its own interval has elapsed. Disabled
+  // unless EncoreScalerConfig.orphanReapIntervalMs is a positive number, so a
+  // caller that has not opted in (tests, embedders) makes no extra OSC calls.
+  // Swallows every error: a sweep failure must never break the tick's
+  // scaling/dispatch work, exactly like the other best-effort hooks above.
+  private async reapOrphansIfDue(): Promise<void> {
+    const intervalMs = this.config.orphanReapIntervalMs;
+    if (typeof intervalMs !== 'number' || !(intervalMs > 0)) return;
+    const now = Date.now();
+    if (now - this.lastOrphanSweepAt < intervalMs) return;
+    this.lastOrphanSweepAt = now;
+    try {
+      await reapOrphanedInstances(this.config);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] orphan reap error (workspace=%s):',
+        this.config.workspaceId,
+        err
+      );
     }
   }
 

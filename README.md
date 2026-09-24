@@ -332,6 +332,27 @@ the pool's upper bound and how aggressively it scales back down.
 > latency/headroom decision, not a fix for in-flight work — it does not change
 > which instances are eligible for teardown, only the floor they stop at.
 
+#### What the idle clock measures
+
+An instance's idle age is measured from the last job it finished. An instance
+that has never been given a job has no such timestamp, so its clock runs from the
+moment it entered the pool ready for work — a spawned-but-never-dispatched
+instance is torn down within `ENCORE_IDLE_TIMEOUT_MS` of becoming ready, exactly
+like one that has gone idle after a transcode. If a pool record turns up without
+a usable timestamp at all, the instance is treated as eligible for teardown
+rather than kept: unknown age must not mean "run forever" for something that
+bills by the hour. Eligible only means the instance is considered — it is still
+checked against Encore's own in-flight job list and any pending packaging
+handoff, and is drained rather than destroyed if either says it is still needed.
+
+The scaler also sweeps, every few minutes, for Encore instances it owns that are
+running on OSC with no pool record at all — the residue of a spawn interrupted
+part-way through, a wiped Valkey, or a deleted deployment. Nothing else can see
+those instances, since every other teardown path works from the pool. An instance
+is only removed once it has been seen unaccounted-for across the whole grace
+window (10 minutes by default), so a spawn still waiting for its instance to
+become ready is never cut off mid-flight.
+
 **Collections**
 
 | Method | Path | Description |

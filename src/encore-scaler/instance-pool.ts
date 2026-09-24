@@ -75,6 +75,15 @@ export async function updateInstance(
   await redis.hset(keys.pool(workspaceId), record.instanceId, JSON.stringify(record));
 }
 
+// The stable name prefix every instance this scaler spawns for `workspaceId`
+// carries: spawnInstance names instances
+// `scaler{sanitisedWorkspaceId}{Date.now().toString(36)}`, so the prefix is the
+// part that identifies ownership. Single source of truth for the three callers
+// that need it (spawn, reconcile-from-OSC, orphan reap) so they can never drift.
+export function scalerInstancePrefix(workspaceId: string): string {
+  return `scaler${workspaceId.replace(/[^a-z0-9]/gi, '').toLowerCase()}`;
+}
+
 // Reconcile the Valkey pool for workspaceId against the actual OSC instance
 // list. Intended for startup after a Valkey wipe or unclean shutdown: discovers
 // any scaler-owned Encore instances that are still running on OSC but absent
@@ -106,8 +115,8 @@ export async function reconcilePoolFromOsc(
   }
 
   // Instances spawned by this scaler for this workspace are named with this
-  // stable prefix. Using the same sanitisation as spawnInstance (line 88).
-  const prefix = `scaler${config.workspaceId.replace(/[^a-z0-9]/gi, '').toLowerCase()}`;
+  // stable prefix. Using the same sanitisation as spawnInstance.
+  const prefix = scalerInstancePrefix(config.workspaceId);
   const ours = allOscInstances.filter(
     (inst) => typeof inst.name === 'string' && inst.name.startsWith(prefix)
   );
@@ -136,7 +145,11 @@ export async function reconcilePoolFromOsc(
       // spawnInstance. Dispatch still works: Encore posts to the callback
       // listener directly using the URL it was configured with at creation time.
       activeJobs: 0,
-      lastIdleAt: now
+      lastIdleAt: now,
+      // #778: a re-discovered instance has no completion history we can see, so
+      // its idle clock starts now — it is idle from the moment it (re)enters the
+      // pool ready to take work, and idleTimeoutMs applies to it normally.
+      readyAt: now
     });
     added += 1;
   }
@@ -154,7 +167,7 @@ export async function spawnInstance(
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
   // Lowercase-alphanumeric, matching OSC's instance-name rules
   // (isValidInstanceName) and the provision route's own naming constraints.
-  const name = `scaler${config.workspaceId.replace(/[^a-z0-9]/gi, '').toLowerCase()}${Date.now().toString(36)}`;
+  const name = `${scalerInstancePrefix(config.workspaceId)}${Date.now().toString(36)}`;
 
   let lastErr: unknown;
   let instance: OscInstance | undefined;
@@ -253,12 +266,19 @@ export async function spawnInstance(
       config.oscContext
     );
 
+    const readyAt = Date.now();
     const record: EncoreInstanceRecord = {
       instanceId,
       url: encoreUrl,
       callbackListenerUrl: instanceUrl(callback),
       activeJobs: 0,
-      lastIdleAt: Date.now()
+      lastIdleAt: readyAt,
+      // #778: the instance is idle from right now. `lastIdleAt` only advances on
+      // job COMPLETION, so an instance that never gets dispatched a job would
+      // otherwise have nothing but this initial value behind its idle clock;
+      // recording readiness separately keeps the clock computable even if a
+      // later write drops or corrupts lastIdleAt.
+      readyAt
     };
     await updateInstance(config.redis, config.workspaceId, record);
     return record;
@@ -312,4 +332,147 @@ export async function destroyInstance(
   // still-running instance, making the next tick spawn a replacement — which is
   // exactly the runaway-spawning bug this fixes.
   await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+}
+
+// Default grace window for the orphan reaper (#778): how long an instance must
+// be continuously observed running on OSC with NO pool record before it is
+// destroyed. Must comfortably exceed a worst-case spawn, which holds exactly
+// that state (live OSC instance, pool record not yet written) while it waits on
+// waitForInstanceReady for both the Encore instance and its paired callback
+// listener, plus up to two 5s/10s transient retries on each.
+export const DEFAULT_ORPHAN_GRACE_MS = 10 * 60_000;
+
+// Collect every instanceId tracked in ANY pool hash on this Valkey, not just
+// this workspace's. Several stacks can share one Valkey, and a workspaceId that
+// sanitises to the same instance-name prefix as another would otherwise let one
+// workspace's sweep classify another's live instance as an orphan. Uses SCAN
+// (cursor paging) rather than KEYS so a large keyspace never blocks Valkey —
+// same approach as routes/scaler.ts scanWorkspaceIds.
+async function trackedInstanceIdsAcrossPools(redis: Redis): Promise<Set<string>> {
+  const poolPrefix = keys.pool('');
+  const tracked = new Set<string>();
+  let cursor = '0';
+  do {
+    const [next, batch] = await redis.scan(cursor, 'MATCH', `${poolPrefix}*`, 'COUNT', 100);
+    cursor = next;
+    for (const key of batch) {
+      const fields = await redis.hkeys(key);
+      for (const field of fields) tracked.add(field);
+    }
+  } while (cursor !== '0');
+  return tracked;
+}
+
+// Destroy scaler-owned Encore instances that are running on OSC but have NO
+// pool record at all (#778).
+//
+// Why this is needed: every other teardown path iterates the pool hash
+// (scaler-loop.ts scale-down, workspace-registry.ts teardown), so an instance
+// that never made it into the hash — a spawn that died between createInstance
+// and the pool write, a wiped/unreachable Valkey, a deleted deployment — has
+// nothing that can ever remove it, and it bills until someone notices it by
+// eye. reconcilePoolFromOsc() re-adopts such instances, but only at startup and
+// only when the workspace has no pool key at all.
+//
+// Safety: an instance is only destroyed once it has been observed orphaned for
+// `orphanGraceMs` continuously (first sighting is recorded in
+// keys.orphanSeen(workspaceId) and merely returns), so an in-progress spawn —
+// which legitimately holds a live OSC instance with no pool record — is never
+// reaped underneath itself. An instance that is tracked in any pool hash is
+// never a candidate here at all, so instances with in-flight work, a pending
+// packaging handoff, or a draining flag are untouched by this path: they are
+// handled by the drain logic in scaler-loop.ts.
+//
+// Contracts verified (CLAUDE.md rule 7):
+//   - oscListInstances(context, serviceId, token): Promise<any>
+//     (@osaas/client-core lib/core.d.ts:65) — raw JSON array; each element
+//     carries `name` (instance id). No creation timestamp is exposed, which is
+//     why first-sighting is tracked in Valkey rather than read from OSC.
+//   - removeInstance(context, serviceId, name, token): Promise<void>
+//     (@osaas/client-core lib/core.d.ts:46), via destroyInstance() above.
+//   - keys.pool / keys.orphanSeen (types.ts).
+//
+// Returns the ids actually destroyed. Never throws: OSC or Valkey trouble makes
+// this a no-op for the tick, and the next sweep retries.
+export async function reapOrphanedInstances(
+  config: EncoreScalerConfig
+): Promise<string[]> {
+  const graceMs = config.orphanGraceMs ?? DEFAULT_ORPHAN_GRACE_MS;
+  const seenKey = keys.orphanSeen(config.workspaceId);
+
+  let allOscInstances: OscInstance[];
+  try {
+    const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+    allOscInstances = (await oscListInstances(
+      config.oscContext,
+      ENCORE_SERVICE_ID,
+      sat
+    )) as OscInstance[];
+    if (!Array.isArray(allOscInstances)) return [];
+  } catch {
+    // OSC unavailable — skip this sweep entirely rather than act on a partial
+    // view of reality.
+    return [];
+  }
+
+  const prefix = scalerInstancePrefix(config.workspaceId);
+  const oursOnOsc = allOscInstances
+    .map((inst) => (typeof inst.name === 'string' ? inst.name : undefined))
+    .filter((name): name is string => !!name && name.startsWith(prefix));
+
+  let tracked: Set<string>;
+  let seen: Record<string, string>;
+  try {
+    [tracked, seen] = await Promise.all([
+      trackedInstanceIdsAcrossPools(config.redis),
+      config.redis.hgetall(seenKey)
+    ]);
+  } catch {
+    return []; // Valkey unavailable — never destroy on an unverifiable pool view.
+  }
+
+  const orphanIds = new Set(oursOnOsc.filter((id) => !tracked.has(id)));
+
+  // Drop sightings for instances that are no longer orphaned (adopted into a
+  // pool, or gone from OSC) so a later orphaning restarts the grace window.
+  const staleSightings = Object.keys(seen).filter((id) => !orphanIds.has(id));
+  if (staleSightings.length > 0) {
+    await config.redis.hdel(seenKey, ...staleSightings).catch(() => undefined);
+  }
+
+  const now = Date.now();
+  const reaped: string[] = [];
+  for (const instanceId of orphanIds) {
+    const firstSeen = Number(seen[instanceId]);
+    if (!Number.isFinite(firstSeen)) {
+      // First sighting (or an unreadable one): start the grace window now and
+      // leave the instance alone this sweep.
+      await config.redis.hset(seenKey, instanceId, String(now)).catch(() => undefined);
+      continue;
+    }
+    if (now - firstSeen <= graceMs) continue; // still inside the grace window
+
+    try {
+      await destroyInstance(instanceId, config);
+      await config.redis.hdel(seenKey, instanceId).catch(() => undefined);
+      reaped.push(instanceId);
+      console.warn(
+        '[encore-scaler] reaped orphaned Encore instance with no pool record (#778)',
+        {
+          workspaceId: config.workspaceId,
+          instanceId,
+          orphanedForMs: now - firstSeen
+        }
+      );
+    } catch (err) {
+      // Keep the sighting so the next sweep retries this instance.
+      console.error(
+        '[encore-scaler] failed to reap orphaned instance (workspace=%s instance=%s):',
+        config.workspaceId,
+        instanceId,
+        err
+      );
+    }
+  }
+  return reaped;
 }
