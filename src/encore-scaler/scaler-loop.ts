@@ -31,7 +31,11 @@ import {
   spawnInstance,
   updateInstance
 } from './instance-pool.js';
-import { recordDispatch, requeueInterruptedByScaleDown } from './retry-store.js';
+import {
+  makePriorAttemptCanceler,
+  recordDispatch,
+  requeueInterruptedByScaleDown
+} from './retry-store.js';
 import { probeCallbackTrust } from './callback-trust-probe.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 
@@ -560,7 +564,15 @@ export class EncoreScalerLoop {
         const st = (trackedStatuses[jobId] ?? '').toUpperCase();
         if (st !== 'RUNNING' && st !== 'QUEUED') continue;
 
-        const requeued = await requeueInterruptedByScaleDown(redis, workspaceId, jobId);
+        // #745: cancel any still-active prior Encore attempt for this externalId
+        // before the scale-down re-enqueue lands a fresh dispatch, so the same
+        // externalId is never left running on two instances at once.
+        const requeued = await requeueInterruptedByScaleDown(
+          redis,
+          workspaceId,
+          jobId,
+          makePriorAttemptCanceler(this.config.getToken)
+        );
         if (requeued) {
           console.warn(
             `[encore-scaler] scale-down: job ${jobId} interrupted by scale-down of ` +
