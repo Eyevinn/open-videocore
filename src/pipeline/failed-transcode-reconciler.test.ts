@@ -9,6 +9,7 @@ import { InMemoryPipelineRepository } from '../data/pipeline-repo.js';
 import type { EncoreClient } from './encore-client.js';
 import {
   reconcileFailedTranscodes,
+  settleFailedTranscode,
   DEFAULT_STALL_TIMEOUT_MS
 } from './failed-transcode-reconciler.js';
 
@@ -32,10 +33,31 @@ function fakeEncore(
   };
 }
 
+// A fake EncoreClient that RECORDS cancel(externalId) calls instead of throwing,
+// so the #746 terminal-settle cancel/drain guard (failed-transcode-reconciler.ts:237)
+// can be exercised. getJobStatus/submit are unused by the direct settle path.
+function cancelSpyEncore(): { encore: EncoreClient; cancels: string[] } {
+  const cancels: string[] = [];
+  return {
+    cancels,
+    encore: {
+      async submit() {
+        throw new Error('submit not expected');
+      },
+      async cancel(encoreJobId: string): Promise<void> {
+        cancels.push(encoreJobId);
+      },
+      async getJobStatus(): Promise<string | undefined> {
+        throw new Error('getJobStatus not expected');
+      }
+    }
+  };
+}
+
 // Build a `running` transcode job whose source asset is `processing`, plus a
 // running PipelineExecution with a running `transcode` step — i.e. the exact
 // stuck shape issue #273 describes. Returns the repos + created records.
-async function stuckTranscode(opts?: { encoreInternalJobId?: string }) {
+async function stuckTranscode(opts?: { encoreInternalJobId?: string; encoreJobId?: string }) {
   const jobs = new InMemoryJobRepository();
   const assets = new InMemoryAssetRepository();
   const pipeline = new InMemoryPipelineRepository();
@@ -47,7 +69,13 @@ async function stuckTranscode(opts?: { encoreInternalJobId?: string }) {
   const internalId = opts?.encoreInternalJobId ?? 'encore-internal-1';
   const job = await jobs.create({ type: 'transcode', assetId: asset.id, profile: 'program-x265' });
   // pending -> running, with Encore's internal id recorded (as submitTranscode does).
-  await jobs.update(job.id, { status: 'running', encoreInternalJobId: internalId });
+  // encoreJobId (our externalId, the scaler's correlation key) is set only when a
+  // caller asks for it — the cancel/drain guard (line 237) keys on it.
+  await jobs.update(job.id, {
+    status: 'running',
+    encoreInternalJobId: internalId,
+    ...(opts?.encoreJobId ? { encoreJobId: opts.encoreJobId } : {})
+  });
 
   const execution = await pipeline.create({
     assetId: asset.id,
@@ -214,5 +242,56 @@ describe('reconcileFailedTranscodes', () => {
     expect(result).toEqual({ scanned: 1, failed: 1 });
     expect((await jobs.get(job.id))?.status).toBe('failed');
     expect((await assets.get(asset.id))?.status).toBe('failed');
+  });
+
+  // #746: on a GENUINE terminal settle (reason 'encore-error') the job is
+  // cancelled/drained on Encore so no orphaned Encore job keeps running and no
+  // buffered scaler-queue duplicate survives to be re-dispatched. The guard at
+  // failed-transcode-reconciler.ts:237 fires only when job.encoreJobId is set —
+  // the other tests set only encoreInternalJobId, so this path was unexercised.
+  it('terminal encore-error settle cancels+drains on Encore when encoreJobId is set (#746)', async () => {
+    const { jobs, assets, pipeline, jobId, assetId, executionId } =
+      await stuckTranscode({ encoreJobId: 'ext-cancel-1' });
+    const { encore, cancels } = cancelSpyEncore();
+
+    const job = (await jobs.get(jobId))!;
+    await settleFailedTranscode(
+      { jobs, assets, pipeline, encore },
+      job,
+      'transcode failed on Encore',
+      'encore-error'
+    );
+
+    // The cancel/drain was invoked with our externalId (the scaler's key).
+    expect(cancels).toEqual(['ext-cancel-1']);
+
+    // ...and the terminal settle itself still applied (job failed, asset out of
+    // processing, pipeline lock released).
+    expect((await jobs.get(jobId))?.status).toBe('failed');
+    expect((await assets.get(assetId))?.status).toBe('failed');
+    expect((await pipeline.get(executionId))?.status).toBe('failed');
+  });
+
+  // #746/#709: a CONDITIONAL 'gone-from-active-set' drop must NOT cancel on
+  // Encore, because a late SUCCESSFUL callback may still correct the job to
+  // `done`. The settle applies (droppedByScaler) but the cancel guard's
+  // reason === 'encore-error' clause holds it back even though encoreJobId is set.
+  it('conditional gone-from-active-set drop does NOT cancel on Encore (#746/#709)', async () => {
+    const { jobs, assets, pipeline, jobId } =
+      await stuckTranscode({ encoreJobId: 'ext-cancel-2' });
+    const { encore, cancels } = cancelSpyEncore();
+
+    const job = (await jobs.get(jobId))!;
+    await settleFailedTranscode(
+      { jobs, assets, pipeline, encore },
+      job,
+      'job vanished from Encore active set',
+      'gone-from-active-set'
+    );
+
+    // The settle applied (the job is now failed/dropped)...
+    expect((await jobs.get(jobId))?.status).toBe('failed');
+    // ...but no Encore cancel/drain was issued for a conditional drop.
+    expect(cancels).toEqual([]);
   });
 });
