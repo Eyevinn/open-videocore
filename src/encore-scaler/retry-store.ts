@@ -35,6 +35,40 @@ import {
 
 const PAYLOAD_TTL_SECONDS = 86_400; // 24h, matches the dispatch-time UUID/URL keys.
 
+// #743: is an entry for `jobId` already sitting in this workspace's pending queue
+// (keys.queue) or transient inflight list (keys.inflight)? Both are Valkey lists of
+// JSON-serialized QueuedJob objects, each carrying a `jobId` field (types.ts:185-197).
+// A retry re-dispatch (decideRetry) must be idempotent: without this guard, a second
+// failure signal for a job whose retry is ALREADY queued (or being dispatched, hence
+// inflight) LPUSHes another copy, so one execution can accumulate far more than
+// MAX_ENCODE_ATTEMPTS entries (observed: 12 entries against a bound of 3).
+//
+// CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7)
+//   - keys.queue / keys.inflight are Valkey lists (types.ts:206-207); QueuedJob has
+//     a `jobId` correlation id (types.ts:185-197).
+//   - Scan idiom (LRANGE 0 -1 + JSON.parse as QueuedJob + match parsed.jobId, ignore
+//     unparseable entries) mirrors the router's cancel path
+//     (encore-scaler-router.ts:136-148) and index.ts:104.
+async function hasQueuedOrInflightEntry(
+  redis: Redis,
+  workspaceId: string,
+  jobId: string
+): Promise<boolean> {
+  const [queued, inflight] = await Promise.all([
+    redis.lrange(keys.queue(workspaceId), 0, -1),
+    redis.lrange(keys.inflight(workspaceId), 0, -1)
+  ]);
+  for (const entry of [...queued, ...inflight]) {
+    try {
+      const parsed = JSON.parse(entry) as QueuedJob;
+      if (parsed.jobId === jobId) return true;
+    } catch {
+      // ignore unparseable entries — mirrors the router cancel scan
+    }
+  }
+  return false;
+}
+
 // #745: a best-effort canceler for the STILL-ACTIVE PRIOR Encore attempt of an
 // externalId, invoked immediately BEFORE that externalId is re-dispatched. Re-
 // dispatch (a #295 transport/IO retry, or a #514 scale-down re-enqueue) can
@@ -208,6 +242,12 @@ export async function requeueInterruptedByScaleDown(
 // caller-facing encode-attempt log (finalizeEncodeAttempt) accepts.
 export type RetryDecision =
   | { action: 'retry'; attempt: number; failureClass: MessageFailureClass; backoffMs: number }
+  // #743: the job already has a retry entry queued or inflight, so re-dispatching
+  // again would create a duplicate queue entry. The caller MUST treat this exactly
+  // like 'retry' for settle purposes (the job stays non-terminal — a pending retry
+  // is in flight) but MUST NOT settle, finalize another encode attempt, or free a
+  // slot: no new dispatch happened, so there is nothing further to account for.
+  | { action: 'skip'; reason: 'already-pending'; failureClass: MessageFailureClass }
   | { action: 'settle'; reason: 'exhausted' | 'not-retryable'; failureClass: MessageFailureClass };
 
 // The gate. Given an observed Encore failure `message` for jobId, decide whether
@@ -217,6 +257,12 @@ export type RetryDecision =
 // pinned the caller-facing status back to 'RUNNING' so the caller does not see a
 // hung/settled job while the retry is pending. The caller MUST NOT call
 // completeTranscode({ success:false }) in that case.
+//
+// On 'skip' (#743) an entry for this job was ALREADY queued/inflight, so this
+// function did NOT re-queue (avoiding a duplicate queue entry). The caller MUST
+// NOT settle and MUST NOT run completeTranscode — the pending retry stays in
+// flight — and it should not finalize another encode attempt or free a slot for
+// this duplicate signal, since no new dispatch occurred.
 //
 // On 'settle' the caller settles the job terminal exactly as before (this is the
 // pre-#295 behaviour) and should call clearRetryState afterwards.
@@ -263,6 +309,17 @@ export async function decideRetry(
     payload = JSON.parse(payloadRaw) as Record<string, unknown>;
   } catch {
     return { action: 'settle', reason: 'not-retryable', failureClass };
+  }
+
+  // #743: make re-dispatch idempotent. If an entry for this jobId is ALREADY in
+  // the pending queue or the inflight list, its retry is already scheduled (or is
+  // mid-dispatch), so LPUSHing another copy would create a duplicate queue entry —
+  // the exact bug that let one execution accumulate 12 entries against a bound of
+  // MAX_ENCODE_ATTEMPTS. Skip the enqueue and every state mutation below (the
+  // pending entry already carries the correct payload/attempts). This check runs
+  // BEFORE any hset/hdel/del/lpush so a duplicate failure signal is a true no-op.
+  if (await hasQueuedOrInflightEntry(redis, workspaceId, jobId)) {
+    return { action: 'skip', reason: 'already-pending', failureClass };
   }
 
   const nextAttempt = attemptsSoFar + 1;

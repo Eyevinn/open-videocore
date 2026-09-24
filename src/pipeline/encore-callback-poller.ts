@@ -523,6 +523,20 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
         await decrementActiveJobs(deps.redis, externalId, deps.logger);
         return; // do not settle; the retry is pending.
       }
+      if (decision?.action === 'skip') {
+        // #743: this job already has a retry entry queued/inflight, so decideRetry
+        // did NOT enqueue a duplicate. Treat as a pure no-op: the pending retry
+        // owns the re-dispatch (and already finalized/decremented for its own
+        // attempt), so do NOT settle, finalize another encode attempt, or free a
+        // slot for this duplicate failure signal.
+        deps.logger.info({
+          msg: 'encore-callback-poller: retry already queued/inflight — skipping duplicate re-dispatch',
+          externalId,
+          failureClass: decision.failureClass,
+          failureMessage
+        });
+        return; // do not settle; a retry is already pending.
+      }
       if (decision?.action === 'settle') {
         // Retries exhausted or non-retryable: fall through to settle terminal,
         // then clear the retry bookkeeping.

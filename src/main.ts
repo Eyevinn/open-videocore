@@ -1262,6 +1262,20 @@ function activateScaler(redisUrl: string): void {
               );
               continue; // retry pending; do not settle this drop.
             }
+            if (decision?.action === 'skip') {
+              // #743: a retry entry for this job is already queued/inflight, so
+              // decideRetry did NOT enqueue a duplicate. The pending retry keeps
+              // the job non-terminal, so do NOT settle this drop.
+              app.log.info(
+                {
+                  encoreJobId,
+                  failureClass: decision.failureClass,
+                  failureText
+                },
+                'encore-scaler: reconcile-detected drop — retry already queued/inflight, skipping duplicate re-dispatch'
+              );
+              continue; // retry already pending; do not settle this drop.
+            }
             if (decision?.action === 'settle') {
               app.log.info(
                 {
