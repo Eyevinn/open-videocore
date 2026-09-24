@@ -885,6 +885,24 @@ export interface AssetRepository {
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
+  // Upload-liveness heartbeat (issue #731, unblocks #726). Refreshes the
+  // `updatedAt` clock on an asset that is STILL `uploading`, so a legitimately
+  // slow-but-progressing upload (a multi-hour proxied stream, or a long series
+  // of multipart part transfers) is distinguishable from an abandoned one. This
+  // is the capability #726's stuck-upload sweep keys off to honour its "an
+  // upload still in progress is never settled, however long it takes" criterion:
+  // without it, `createdAt`/`updatedAt`/the `null -> uploading` transition are
+  // all frozen at creation and a live slow upload is indistinguishable from a
+  // dead one.
+  //
+  // DEDICATED write seam (mirrors setStorageTier/setRehydrateState): it bypasses
+  // update() so no editorial provenance is appended, and it NEVER touches
+  // lifecycle `status`/`statusHistory` — it only moves the `updatedAt` clock.
+  // Idempotent and side-effect-light: a NO-OP (returns the asset unchanged, no
+  // write) when the asset is not `uploading`, so it can never resurrect the
+  // liveness/purge clock of an already-settled record. Returns the asset
+  // (refreshed or unchanged), or undefined when the id is unknown.
+  touchUploadProgress(id: string): Promise<Asset | undefined>;
   // Transition the asset's editorial review state (issue #134). Validates the
   // move against the review state machine (throws InvalidReviewTransitionError
   // on an illegal move) and persists the new state. Returns the updated asset,
@@ -1523,6 +1541,26 @@ export class InMemoryAssetRepository implements AssetRepository {
       next.provenance = [...(existing.provenance ?? []), ...entries];
     }
     this.store.set(key, next);
+    return { ...next };
+  }
+
+  // Upload-liveness heartbeat (issue #731, unblocks #726). Bumps ONLY
+  // `updatedAt` on a still-`uploading` asset; bypasses update() so no editorial
+  // provenance rides along and NEVER touches `status`/`statusHistory`. No-op
+  // (returns the asset unchanged, no write) for any non-`uploading` status, so a
+  // settled asset's clock can never be resurrected. Returns undefined when the
+  // id is unknown.
+  async touchUploadProgress(id: string): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing) {
+      return undefined;
+    }
+    if (existing.status !== 'uploading') {
+      return { ...existing };
+    }
+    const now = new Date().toISOString();
+    const next: Asset = { ...existing, updatedAt: now };
+    this.store.set(id, next);
     return { ...next };
   }
 

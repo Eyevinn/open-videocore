@@ -102,6 +102,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   async update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined> {
     return (await this.repo()).update(id, patch);
   }
+  async touchUploadProgress(id: string): Promise<Asset | undefined> {
+    return (await this.repo()).touchUploadProgress(id);
+  }
   async transitionReviewState(id: string, to: AssetReviewState): Promise<Asset | undefined> {
     return (await this.repo()).transitionReviewState(id, to);
   }
