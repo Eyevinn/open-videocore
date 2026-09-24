@@ -16345,6 +16345,90 @@
               }
             }
           },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "404": {
             "description": "Default Response",
             "content": {
@@ -16355,12 +16439,32 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16377,12 +16481,32 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16399,12 +16523,158 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16421,12 +16691,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16481,6 +16813,90 @@
               }
             }
           },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "404": {
             "description": "Default Response",
             "content": {
@@ -16491,12 +16907,158 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16513,12 +17075,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16569,6 +17193,90 @@
               }
             }
           },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "404": {
             "description": "Default Response",
             "content": {
@@ -16579,12 +17287,158 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16601,12 +17455,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16676,6 +17592,90 @@
               }
             }
           },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "404": {
             "description": "Default Response",
             "content": {
@@ -16686,12 +17686,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16708,12 +17770,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16809,6 +17933,90 @@
               }
             }
           },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "404": {
             "description": "Default Response",
             "content": {
@@ -16819,12 +18027,158 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16841,12 +18195,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16892,6 +18308,90 @@
               }
             }
           },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "404": {
             "description": "Default Response",
             "content": {
@@ -16902,12 +18402,158 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16924,12 +18570,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -16976,6 +18684,90 @@
               }
             }
           },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
           "404": {
             "description": "Default Response",
             "content": {
@@ -16986,12 +18778,32 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -17008,12 +18820,200 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }
@@ -17030,12 +19030,74 @@
                     "error": {
                       "type": "string"
                     },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
                     "message": {
+                      "type": "string"
+                    },
+                    "code": {
                       "type": "string"
                     }
                   },
                   "required": [
-                    "error"
+                    "error",
+                    "cause"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "cause": {
+                      "type": "string",
+                      "enum": [
+                        "body_size_limit_exceeded",
+                        "network_error",
+                        "storage_backend_error",
+                        "storage_not_configured",
+                        "quota_exceeded",
+                        "asset_not_found",
+                        "invalid_asset_state",
+                        "not_authorized",
+                        "invalid_request",
+                        "unsupported_media_type",
+                        "unknown"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error",
+                    "cause"
                   ],
                   "additionalProperties": false
                 }

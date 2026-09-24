@@ -232,6 +232,11 @@ Key endpoints:
 | `POST` | `/api/v1/assets/:id/tags` | Add a tag |
 | `DELETE` | `/api/v1/assets/:id/tags/:tag` | Remove a tag |
 
+Upload errors on the routes above return a machine-readable failure cause
+alongside the HTTP status (body-size limit, network/connection error, storage
+backend error, …) — see
+[Upload failure causes](docs/guides/upload-failure-causes.md).
+
 **Jobs**
 
 | Method | Path | Description |

@@ -33,6 +33,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   chooseUploadStrategy,
   uploadAssetFile,
+  causeFromResponse,
+  UPLOAD_FAILURE_CAUSE,
   STREAM_MAX_BYTES,
   MULTIPART_MIN_BYTES,
   MULTIPART_PART_BYTES,
@@ -330,5 +332,184 @@ describe('uploadAssetFile stream tier (<= 32 MiB) — AC3 regression guard', () 
     await expect(uploadAssetFile('asset-1', makeFakeFile(8 * MiB), deps(apiFetch))).rejects.toThrow(
       /Payload Too Large/
     );
+  });
+});
+
+// ─── failure causes (issue #771) ─────────────────────────────────────────────
+//
+// Every rejection out of uploadAssetFile carries a machine-readable
+// `failureCause` from UPLOAD_FAILURE_CAUSE, mirroring the API's `cause` field
+// (src/routes/upload-failure-cause.ts `uploadFailureCauseSchema` /
+// `uploadErrorSchema`). The client has to classify as well as the server
+// because two of the three required causes can never be seen server-side on
+// these tiers: a proxy answers the oversize 413 itself (the #747 failure), and
+// the presigned/multipart tiers PUT browser -> object storage, so a dropped
+// connection or an S3 rejection never reaches the API at all.
+
+describe('causeFromResponse (issue #771)', () => {
+  it("prefers the API's own cause field when the structured envelope is present", () => {
+    expect(
+      causeFromResponse(502, { error: 'storage_error', cause: 'storage_backend_error' }, 'api')
+    ).toBe(UPLOAD_FAILURE_CAUSE.STORAGE_BACKEND_ERROR);
+  });
+
+  it('maps a bodiless 413 — the proxy answering instead of the API — to the body-size cause', () => {
+    // This is the #747 failure mode: the proxy in front of the API rejects the
+    // request body itself, so there is no JSON envelope to read.
+    expect(causeFromResponse(413, undefined, 'api')).toBe(
+      UPLOAD_FAILURE_CAUSE.BODY_SIZE_LIMIT_EXCEEDED
+    );
+  });
+
+  it('maps an error status from object storage itself to storage_backend_error', () => {
+    expect(causeFromResponse(403, undefined, 'storage')).toBe(
+      UPLOAD_FAILURE_CAUSE.STORAGE_BACKEND_ERROR
+    );
+  });
+
+  it.each([
+    [404, UPLOAD_FAILURE_CAUSE.ASSET_NOT_FOUND],
+    [409, UPLOAD_FAILURE_CAUSE.QUOTA_EXCEEDED],
+    [415, UPLOAD_FAILURE_CAUSE.UNSUPPORTED_MEDIA_TYPE],
+    [422, UPLOAD_FAILURE_CAUSE.INVALID_ASSET_STATE],
+    [400, UPLOAD_FAILURE_CAUSE.INVALID_REQUEST],
+    [403, UPLOAD_FAILURE_CAUSE.NOT_AUTHORIZED],
+    [501, UPLOAD_FAILURE_CAUSE.STORAGE_NOT_CONFIGURED],
+    [504, UPLOAD_FAILURE_CAUSE.NETWORK_ERROR],
+    [418, UPLOAD_FAILURE_CAUSE.UNKNOWN],
+  ])('falls back to the status when the API sent no cause: %d', (status, expected) => {
+    expect(causeFromResponse(status, undefined, 'api')).toBe(expected);
+  });
+
+  it('ignores a cause value it does not recognise (forward compatibility)', () => {
+    expect(causeFromResponse(404, { cause: 'invented_later' }, 'api')).toBe(
+      UPLOAD_FAILURE_CAUSE.ASSET_NOT_FOUND
+    );
+  });
+});
+
+describe('uploadAssetFile failure causes (issue #771)', () => {
+  it('stream tier: a proxy 413 with no JSON body -> body_size_limit_exceeded', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 413,
+      // A proxy answers with HTML, so json() rejects.
+      json: async () => {
+        throw new Error('not json');
+      },
+    }) as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    const { apiFetch } = fakeApiFetch();
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(8 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({
+      failureCause: UPLOAD_FAILURE_CAUSE.BODY_SIZE_LIMIT_EXCEEDED,
+      status: 413,
+    });
+  });
+
+  it("stream tier: the API's structured 413 envelope -> body_size_limit_exceeded", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 413,
+      json: async () => ({
+        error: 'payload_too_large',
+        cause: 'body_size_limit_exceeded',
+        message: 'source exceeds maximum allowed size of 1024 bytes',
+      }),
+    }) as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    const { apiFetch } = fakeApiFetch();
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(8 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({
+      failureCause: UPLOAD_FAILURE_CAUSE.BODY_SIZE_LIMIT_EXCEEDED,
+      message: 'source exceeds maximum allowed size of 1024 bytes',
+    });
+  });
+
+  it('stream tier: fetch itself rejecting -> network_error', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { apiFetch } = fakeApiFetch();
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(8 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({ failureCause: UPLOAD_FAILURE_CAUSE.NETWORK_ERROR });
+  });
+
+  it('stream tier: the API reporting an unreachable store -> storage_backend_error', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 502,
+      json: async () => ({
+        error: 'storage_error',
+        cause: 'storage_backend_error',
+        message: 'the storage backend rejected or failed the upload during putStream',
+        code: 'AccessDenied',
+      }),
+    }) as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+    const { apiFetch } = fakeApiFetch();
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(8 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({
+      failureCause: UPLOAD_FAILURE_CAUSE.STORAGE_BACKEND_ERROR,
+      code: 'AccessDenied',
+    });
+  });
+
+  it('presigned tier: a dropped browser -> storage PUT -> network_error, and no finalize', async () => {
+    const xhr = installStubbedXHR(() => ({ networkError: true }) as XhrOutcome);
+    restoreXHR = xhr.restore;
+    const { apiFetch, calls } = fakeApiFetch();
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(64 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({ failureCause: UPLOAD_FAILURE_CAUSE.NETWORK_ERROR });
+    // The upload never completed, so the asset must not be finalized.
+    expect(calls.some((c) => c.path.endsWith('/upload-complete'))).toBe(false);
+  });
+
+  it('multipart tier: object storage refusing a part -> storage_backend_error + abort', async () => {
+    const xhr = installStubbedXHR(() => ({ status: 403 }));
+    restoreXHR = xhr.restore;
+    const { apiFetch, calls } = fakeApiFetch();
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(160 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({
+      failureCause: UPLOAD_FAILURE_CAUSE.STORAGE_BACKEND_ERROR,
+      status: 403,
+    });
+    // #748's best-effort abort still runs.
+    expect(calls.some((c) => c.options.method === 'DELETE')).toBe(true);
+  });
+
+  it('multipart tier: a CORS-hidden ETag -> storage_backend_error', async () => {
+    const xhr = installStubbedXHR(() => ({ status: 200, etag: '' }));
+    restoreXHR = xhr.restore;
+    const { apiFetch } = fakeApiFetch();
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(160 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({ failureCause: UPLOAD_FAILURE_CAUSE.STORAGE_BACKEND_ERROR });
+  });
+
+  it("multipart tier: an API route failure is tagged from the API's own envelope", async () => {
+    // apiFetch (public/app.js) throws an Error carrying `status` + parsed `body`.
+    const apiFetch = vi.fn(async (path: string) => {
+      if (path.endsWith('/multipart/initiate')) {
+        const err = new Error('the storage backend could not be reached') as Error & {
+          status?: number;
+          body?: unknown;
+        };
+        err.status = 502;
+        err.body = { error: 'storage_unreachable', cause: 'network_error' };
+        throw err;
+      }
+      throw new Error('unexpected apiFetch path: ' + path);
+    });
+    await expect(
+      uploadAssetFile('asset-1', makeFakeFile(160 * MiB), deps(apiFetch))
+    ).rejects.toMatchObject({ failureCause: UPLOAD_FAILURE_CAUSE.NETWORK_ERROR });
   });
 });

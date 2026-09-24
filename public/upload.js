@@ -41,6 +41,122 @@ export const MULTIPART_MIN_BYTES = 128 * 1024 * 1024; // 128 MiB
 // plausible proxy limit; 10000-part cap => ~160 GiB ceiling.
 export const MULTIPART_PART_BYTES = 16 * 1024 * 1024; // 16 MiB
 
+// ─── Failure causes (issue #771) ────────────────────────────────────────────
+//
+// Mirror of the server-side enum `uploadFailureCauseSchema`
+// (src/routes/upload-failure-cause.ts) — the API returns one of these in the
+// `cause` field of every upload error body. Duplicated here (not imported)
+// because this module is plain browser JS and the enum is the CONTRACT, not an
+// implementation detail; keep the two lists in step.
+//
+// Two of the three required causes can NEVER be classified by the server on the
+// paths this module drives, which is why the client classifies too:
+//   - a proxy in front of the API rejects an oversize body itself, so the 413
+//     comes back with the proxy's own (usually HTML) body and never reaches the
+//     API process — that is exactly the failure #747/#758 worked around;
+//   - the presigned and multipart tiers PUT bytes browser -> object storage, so
+//     a connection drop or an S3-level rejection on those PUTs is never seen by
+//     the API at all.
+// Every Error this module throws therefore carries a `failureCause` property
+// holding one of these codes, so the UI (issue #772) has a single field to
+// branch on regardless of which tier failed.
+export const UPLOAD_FAILURE_CAUSE = {
+  BODY_SIZE_LIMIT_EXCEEDED: 'body_size_limit_exceeded',
+  NETWORK_ERROR: 'network_error',
+  STORAGE_BACKEND_ERROR: 'storage_backend_error',
+  STORAGE_NOT_CONFIGURED: 'storage_not_configured',
+  QUOTA_EXCEEDED: 'quota_exceeded',
+  ASSET_NOT_FOUND: 'asset_not_found',
+  INVALID_ASSET_STATE: 'invalid_asset_state',
+  NOT_AUTHORIZED: 'not_authorized',
+  INVALID_REQUEST: 'invalid_request',
+  UNSUPPORTED_MEDIA_TYPE: 'unsupported_media_type',
+  UNKNOWN: 'unknown',
+};
+
+const KNOWN_CAUSES = Object.keys(UPLOAD_FAILURE_CAUSE).map(function (k) {
+  return UPLOAD_FAILURE_CAUSE[k];
+});
+
+// Build an Error carrying a machine-readable failure cause.
+export function uploadError(message, cause, extra) {
+  const err = new Error(message);
+  err.failureCause = KNOWN_CAUSES.indexOf(cause) >= 0 ? cause : UPLOAD_FAILURE_CAUSE.UNKNOWN;
+  if (extra && extra.status !== undefined) err.status = extra.status;
+  if (extra && extra.code !== undefined) err.code = extra.code;
+  return err;
+}
+
+/**
+ * Derive the failure cause for a non-2xx HTTP response.
+ *
+ * Preference order:
+ *   1. the API's own `cause` field, when the body is the structured upload
+ *      error envelope (src/routes/upload-failure-cause.ts `uploadErrorSchema`);
+ *   2. the status, for responses that did NOT come from the API — the proxy's
+ *      413 (body limit) and object storage's own S3 error statuses;
+ *   3. `unknown`, so the caller always has a defined branch.
+ *
+ * @param {number} status HTTP status
+ * @param {object|undefined} body parsed JSON body, when there was one
+ * @param {'api'|'storage'} origin who answered: the API (possibly via a proxy
+ *   that may have answered instead) or object storage directly
+ */
+export function causeFromResponse(status, body, origin) {
+  const declared = body && typeof body.cause === 'string' ? body.cause : undefined;
+  if (declared && KNOWN_CAUSES.indexOf(declared) >= 0) return declared;
+  // 413 with no structured body: the proxy in front of the API answered, not
+  // the API. Same meaning, so the same code.
+  if (status === 413) return UPLOAD_FAILURE_CAUSE.BODY_SIZE_LIMIT_EXCEEDED;
+  if (origin === 'storage') {
+    // Object storage answered with an error status: it was reachable and
+    // refused/failed the write (expired signature, bad part, denied).
+    return UPLOAD_FAILURE_CAUSE.STORAGE_BACKEND_ERROR;
+  }
+  if (status === 404) return UPLOAD_FAILURE_CAUSE.ASSET_NOT_FOUND;
+  if (status === 409) return UPLOAD_FAILURE_CAUSE.QUOTA_EXCEEDED;
+  if (status === 415) return UPLOAD_FAILURE_CAUSE.UNSUPPORTED_MEDIA_TYPE;
+  if (status === 422) return UPLOAD_FAILURE_CAUSE.INVALID_ASSET_STATE;
+  if (status === 400) return UPLOAD_FAILURE_CAUSE.INVALID_REQUEST;
+  // 401 is the app-wide authentication gate (src/auth/middleware.ts
+  // registerAuth), which answers before the upload router and so carries no
+  // `cause` of its own; it means the same thing as the router's 403.
+  if (status === 401 || status === 403) return UPLOAD_FAILURE_CAUSE.NOT_AUTHORIZED;
+  if (status === 501) return UPLOAD_FAILURE_CAUSE.STORAGE_NOT_CONFIGURED;
+  // 502/503/504 from a proxy that could not reach the API is a connection
+  // failure from the caller's point of view.
+  if (status === 502 || status === 503 || status === 504) {
+    return UPLOAD_FAILURE_CAUSE.NETWORK_ERROR;
+  }
+  return UPLOAD_FAILURE_CAUSE.UNKNOWN;
+}
+
+// Attach a cause to an error thrown by the injected apiFetch. The ops UI's
+// apiFetch exposes `status` and the parsed `body` on the Error it throws
+// (public/app.js apiFetch), so the API's structured `cause` is readable here;
+// a rejection with neither (fetch itself failing) is a network error.
+function withApiFailureCause(err) {
+  if (err && err.failureCause) return err;
+  if (err && typeof err === 'object') {
+    err.failureCause =
+      err.status === undefined
+        ? UPLOAD_FAILURE_CAUSE.NETWORK_ERROR
+        : causeFromResponse(err.status, err.body, 'api');
+    return err;
+  }
+  return uploadError(String(err), UPLOAD_FAILURE_CAUSE.UNKNOWN);
+}
+
+// Run an API call through the injected apiFetch, tagging any failure with a
+// cause so every rejection out of this module carries one.
+async function viaApi(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    throw withApiFailureCause(err);
+  }
+}
+
 /**
  * @param {number} sizeBytes
  * @returns {'stream'|'presigned'|'multipart'}
@@ -71,14 +187,27 @@ function putToStorage(url, blob, contentType, onProgress) {
         // Access-Control-Expose-Headers: ETag (see osc-feedback log).
         resolve(xhr.getResponseHeader('ETag') || '');
       } else {
-        reject(new Error('Storage PUT failed: HTTP ' + xhr.status));
+        // Object storage answered with an error status (#771): it was reached,
+        // so this is a storage-backend failure — unless it rejected the part on
+        // size, which keeps the body-limit meaning.
+        reject(
+          uploadError(
+            'Storage PUT failed: HTTP ' + xhr.status,
+            causeFromResponse(xhr.status, undefined, 'storage'),
+            { status: xhr.status }
+          )
+        );
       }
     });
     xhr.addEventListener('error', function () {
-      reject(new Error('Storage PUT failed: network error'));
+      // XHR reports transport failures (DNS, TLS, refused, dropped, CORS
+      // preflight failure) with no status at all — a connection error.
+      reject(
+        uploadError('Storage PUT failed: network error', UPLOAD_FAILURE_CAUSE.NETWORK_ERROR)
+      );
     });
     xhr.addEventListener('abort', function () {
-      reject(new Error('Storage PUT aborted'));
+      reject(uploadError('Storage PUT aborted', UPLOAD_FAILURE_CAUSE.NETWORK_ERROR));
     });
     xhr.send(blob);
   });
@@ -89,25 +218,42 @@ function putToStorage(url, blob, contentType, onProgress) {
 // { id, status } (assetStatusResponse, asset-upload.ts:111-114). The handler
 // itself transitions uploading -> processing, so no upload-complete call.
 async function uploadStreamed(assetId, file, deps) {
-  const res = await fetch(
-    deps.apiBase + '/assets/' + encodeURIComponent(assetId) + '/upload',
-    {
-      method: 'PUT',
-      body: file,
-      headers: {
-        'Content-Type': file.type || 'application/octet-stream',
-        'Content-Length': String(file.size),
-        ...(deps.stackName ? { 'X-Stack-Name': deps.stackName } : {}),
-        // This raw PUT bypasses apiFetch, so present the same UI-scoped bearer
-        // the caller spreads on gated calls (issue #740). The presigned/multipart
-        // tiers PUT to object storage instead and carry no bearer.
-        ...(deps.authHeader || {}),
-      },
-    }
-  );
+  let res;
+  try {
+    res = await fetch(
+      deps.apiBase + '/assets/' + encodeURIComponent(assetId) + '/upload',
+      {
+        method: 'PUT',
+        body: file,
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream',
+          'Content-Length': String(file.size),
+          ...(deps.stackName ? { 'X-Stack-Name': deps.stackName } : {}),
+          // This raw PUT bypasses apiFetch, so present the same UI-scoped bearer
+          // the caller spreads on gated calls (issue #740). The presigned/multipart
+          // tiers PUT to object storage instead and carry no bearer.
+          ...(deps.authHeader || {}),
+        },
+      }
+    );
+  } catch (err) {
+    // fetch() itself rejected: the connection never completed (#771).
+    throw uploadError(
+      'Upload failed: ' + ((err && err.message) || 'network error'),
+      UPLOAD_FAILURE_CAUSE.NETWORK_ERROR
+    );
+  }
   if (!res.ok) {
-    const err = await res.json().catch(function () { return {}; });
-    throw new Error(err.message || err.error || 'Upload failed: HTTP ' + res.status);
+    // Prefer the API's structured body. A proxy that enforces its own
+    // request-body limit answers 413 here INSTEAD of the API, with a non-JSON
+    // body — causeFromResponse maps that to body_size_limit_exceeded too, so
+    // the UI sees one code for "too big" whoever rejected it.
+    const body = await res.json().catch(function () { return undefined; });
+    throw uploadError(
+      (body && (body.message || body.error)) || 'Upload failed: HTTP ' + res.status,
+      causeFromResponse(res.status, body, 'api'),
+      { status: res.status, code: body && body.code }
+    );
   }
   deps.onProgress && deps.onProgress(file.size, file.size);
 }
@@ -119,20 +265,22 @@ async function uploadStreamed(assetId, file, deps) {
 // POST /assets/:id/upload-complete to transition uploading -> processing
 //   (asset-upload.ts:353-421).
 async function uploadPresigned(assetId, file, deps) {
-  const presign = await deps.apiFetch(
-    '/assets/' + encodeURIComponent(assetId) + '/upload-url',
-    { method: 'POST' }
-  );
+  const presign = await viaApi(function () {
+    return deps.apiFetch('/assets/' + encodeURIComponent(assetId) + '/upload-url', {
+      method: 'POST',
+    });
+  });
   await putToStorage(
     presign.url,
     file,
     file.type || 'application/octet-stream',
     deps.onProgress
   );
-  await deps.apiFetch(
-    '/assets/' + encodeURIComponent(assetId) + '/upload-complete',
-    { method: 'POST' }
-  );
+  await viaApi(function () {
+    return deps.apiFetch('/assets/' + encodeURIComponent(assetId) + '/upload-complete', {
+      method: 'POST',
+    });
+  });
 }
 
 // --- multipart (large files) -------------------------------------------------
@@ -146,8 +294,8 @@ async function uploadPresigned(assetId, file, deps) {
 // then POST /assets/:id/upload-complete -> status -> processing.
 async function uploadMultipart(assetId, file, deps) {
   const idEnc = encodeURIComponent(assetId);
-  const init = await deps.apiFetch('/assets/' + idEnc + '/multipart/initiate', {
-    method: 'POST',
+  const init = await viaApi(function () {
+    return deps.apiFetch('/assets/' + idEnc + '/multipart/initiate', { method: 'POST' });
   });
   const uploadId = init.uploadId;
   // Surface the session id so the caller can wire its own best-effort abort/
@@ -162,10 +310,12 @@ async function uploadMultipart(assetId, file, deps) {
       const start = (partNumber - 1) * MULTIPART_PART_BYTES;
       const end = Math.min(start + MULTIPART_PART_BYTES, file.size);
       const chunk = file.slice(start, end);
-      const partInfo = await deps.apiFetch(
-        '/assets/' + idEnc + '/multipart/' + uploadIdEnc +
-          '/part-url?partNumber=' + partNumber
-      );
+      const partInfo = await viaApi(function () {
+        return deps.apiFetch(
+          '/assets/' + idEnc + '/multipart/' + uploadIdEnc +
+            '/part-url?partNumber=' + partNumber
+        );
+      });
       const chunkBase = uploadedBytes;
       const etag = await putToStorage(
         partInfo.url,
@@ -176,18 +326,23 @@ async function uploadMultipart(assetId, file, deps) {
         }
       );
       if (!etag) {
-        throw new Error(
+        // The part landed but the ETag header was not exposed cross-origin, so
+        // the session can never be completed: a storage-side (CORS) failure.
+        throw uploadError(
           'Storage did not return an ETag for part ' + partNumber +
-            ' (MinIO must expose the ETag header via CORS to complete multipart uploads)'
+            ' (MinIO must expose the ETag header via CORS to complete multipart uploads)',
+          UPLOAD_FAILURE_CAUSE.STORAGE_BACKEND_ERROR
         );
       }
       parts.push({ partNumber: partNumber, etag: etag });
       uploadedBytes = end;
     }
-    await deps.apiFetch(
-      '/assets/' + idEnc + '/multipart/' + uploadIdEnc + '/complete',
-      { method: 'POST', body: JSON.stringify({ parts: parts }) }
-    );
+    await viaApi(function () {
+      return deps.apiFetch('/assets/' + idEnc + '/multipart/' + uploadIdEnc + '/complete', {
+        method: 'POST',
+        body: JSON.stringify({ parts: parts }),
+      });
+    });
   } catch (err) {
     // Best-effort abort so an abandoned multipart session does not leak staged
     // part data in MinIO (asset-upload.ts:328 DELETE /:id/multipart/:uploadId).
@@ -199,7 +354,9 @@ async function uploadMultipart(assetId, file, deps) {
     } catch (_) { /* best-effort */ }
     throw err;
   }
-  await deps.apiFetch('/assets/' + idEnc + '/upload-complete', { method: 'POST' });
+  await viaApi(function () {
+    return deps.apiFetch('/assets/' + idEnc + '/upload-complete', { method: 'POST' });
+  });
 }
 
 /**
@@ -215,6 +372,10 @@ async function uploadMultipart(assetId, file, deps) {
  *   - onMultipartInit(uploadId): optional hook fired once the multipart session is
  *     initiated, so the caller can wire its own abort/cleanup (issue #748).
  *   - onProgress(loaded, total): optional cumulative byte-progress callback.
+ *
+ * On failure the rejected Error carries a machine-readable `failureCause` — one
+ * of UPLOAD_FAILURE_CAUSE — mirroring the API's `cause` field
+ * (src/routes/upload-failure-cause.ts). See docs/guides/upload-failure-causes.md.
  *
  * @param {string} assetId
  * @param {File} file
