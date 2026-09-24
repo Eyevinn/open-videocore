@@ -181,7 +181,7 @@ function buildConnectionsFromStack(
 
   const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
   const couchUrl = config.couchdbUrl.replace(/\/$/, '').replace(
-    /^(https?:\/\/)/, `$1admin:${couchPassword}@`
+    /^(https?:\/\/)/, `$1admin:${encodeURIComponent(couchPassword)}@`
   );
   const server = couchServer(couchUrl);
   const wc = () => new StackCouch(server, dbName);
