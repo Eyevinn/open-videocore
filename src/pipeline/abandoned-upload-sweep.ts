@@ -18,10 +18,16 @@
 // ELIGIBILITY (issue #726 acceptance criteria):
 //   - Enumerate assets in `uploading` (list({ status: 'uploading' })), paged.
 //   - Settle one whose liveness stamp (`updatedAt`) is older than a configurable
-//     threshold. `updatedAt` is the liveness signal the issue names: an untouched
-//     record has `createdAt === updatedAt`, and any progress on the record moves
-//     it forward. The threshold must EXCEED the longest legitimate upload, so it
-//     is configurable (never fixed) — see abandoned-upload-loop.ts.
+//     threshold. `updatedAt` is a GENUINE liveness signal on this branch: the
+//     upload-liveness heartbeat (issue #731) refreshes `updatedAt` on a still-
+//     `uploading` asset on a fixed cadence — via AssetRepository.touchUploadProgress
+//     (src/data/asset-repo.ts:1553-1565; couch-asset-repo.ts touchUploadProgress)
+//     driven from the upload routes (src/routes/asset-upload.ts). So a slow-but-
+//     progressing upload keeps moving `updatedAt` forward and is never settled,
+//     even the presigned single-part / multipart paths whose bytes bypass the API.
+//     The threshold must EXCEED the heartbeat cadence (and the longest legitimate
+//     gap between heartbeats), so it is configurable (never fixed) — see
+//     abandoned-upload-loop.ts.
 //   - An upload still in progress is NEVER settled, however long it takes: the
 //     eligibility is re-checked against a FRESH read immediately before the
 //     write (get() → still `uploading` AND still past the cutoff), so a record
