@@ -4873,6 +4873,10 @@ export {
   // Exported so the add -> list -> edit -> list integration test can drive the
   // real Storage-tab flow against a stubbed fetch (issue #681).
   renderStorageTab,
+  // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
+  // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
+  // assert it presents the UI-scoped Authorization header (issue #740).
+  renderAssetsTab,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
