@@ -1120,6 +1120,7 @@ Response 202 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
       "progress": 0
@@ -1153,6 +1154,7 @@ Response 200 (application/json)
         "jobId": "string",
         "encoreJobId": "string",
         "error": "string",
+        "skipReason": "string",
         "startedAt": "string",
         "completedAt": "string",
         "progress": 0
@@ -1187,6 +1189,7 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
       "progress": 0
@@ -1649,6 +1652,7 @@ Response 200 (application/json)
         "jobId": "string",
         "encoreJobId": "string",
         "error": "string",
+        "skipReason": "string",
         "startedAt": "string",
         "completedAt": "string",
         "progress": 0
@@ -2318,6 +2322,7 @@ Response 200 (application/json)
           "jobId": null,
           "encoreJobId": null,
           "error": null,
+          "skipReason": null,
           "startedAt": null,
           "completedAt": null,
           "progress": null
@@ -2353,6 +2358,7 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
       "progress": 0
@@ -2385,6 +2391,7 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
       "progress": 0
