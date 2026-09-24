@@ -28,7 +28,8 @@ import {
 } from '../services/param-store.js';
 import {
   STACK_CONFIG_NAMESPACE,
-  deriveWorkspaceId
+  resolveWorkspaceId,
+  type WorkspaceIdStore
 } from '../services/workspace-stack.js';
 import {
   AUTO_SUBTITLES_SERVICE_ID,
@@ -238,11 +239,19 @@ type ProvisionRouterOptions = {
   // back. When undefined the store is not configured: provision still succeeds
   // but skips persistence (logged), and GET /:name responds 501.
   paramStore?: ParamStore;
+  // Pin store for the deterministic workspace id (issue #776). The FIRST
+  // confident derivation — normally during the first provision here — writes the
+  // deployment's workspace id to WORKSPACE_ID_PIN_KEY, and every later boot of
+  // both this route and the runtime resolver reads it back instead of
+  // re-deriving it from a subscription list whose membership the deployment does
+  // not control. MUST be the same store main.ts hands the resolver. Optional:
+  // when omitted the namespace degrades to derive-only (pre-#776 behaviour).
+  workspaceIdStore?: WorkspaceIdStore;
   // Invoked after a stack is provisioned or torn down so the caller can drop any
   // cached per-workspace connections for that workspace (see
   // WorkspaceStackResolver.invalidate). The workspaceId passed is the
-  // deployment's own tenant (deriveWorkspaceId). Optional: when omitted no cache
-  // invalidation is signalled.
+  // deployment's own workspace id (resolveWorkspaceId). Optional: when omitted
+  // no cache invalidation is signalled.
   onStackChange?: (workspaceId: string) => void;
   // Late-bound accessor for the scaler registry. The registry is created lazily
   // in main.ts *after* this router registers (only once a stack exists), so it
@@ -450,11 +459,14 @@ async function redisUrlFrom(
   return `redis://${clusterHost}:6379`;
 }
 
-// The deployment's own workspace (tenant) id is derived from the OSC Context via
-// the shared deriveWorkspaceId (src/services/workspace-stack.ts). The SAME
-// function backs the runtime resolver's reads, so the namespace a provision
-// route WRITES under provably equals the namespace the resolver READS under for
-// this deployment (issue #712) — read/write can no longer diverge.
+// The deployment's own workspace id is resolved via the shared
+// resolveWorkspaceId (src/services/workspace-stack.ts). The SAME function backs
+// the runtime resolver's reads, so the namespace a provision route WRITES under
+// provably equals the namespace the resolver READS under for this deployment
+// (issue #712) — read/write can no longer diverge. Since #776 that id is also
+// stable across boots: it comes from OVC_WORKSPACE_ID or from a value pinned in
+// the deployment's own parameter store, not from the current OSC subscription
+// list (whose membership changes as service instances come and go).
 //
 // The provision/deprovision routes are NOT caller-authenticated: the OSC SDK
 // authenticates to OSC with the deployment's own OSC_ACCESS_TOKEN (carried on
@@ -526,8 +538,41 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     getScalerRegistry,
     operationStore: ops,
     publicBaseUrl,
-    seedProfiles
+    seedProfiles,
+    workspaceIdStore
   } = opts;
+
+  // Memoised namespace for this process. Only a DETERMINISTIC resolution (env /
+  // pinned / seeded-or-derived AND successfully pinned) is memoised — those
+  // cannot change without a redeploy. The `default` fallback, and any resolution
+  // whose pin write threw, are deliberately NOT memoised, so the next call
+  // re-resolves and picks up the pin the moment one actually exists.
+  let memoisedWorkspaceId: string | undefined;
+
+  // The parameter-store namespace this route WRITES under (issue #712/#776).
+  //
+  // Delegates to the shared resolveWorkspaceId (services/workspace-stack.ts) —
+  // the SAME function the runtime resolver reads under — so the write key and
+  // the read key cannot diverge. Resolution is deterministic across boots: the
+  // explicit OVC_WORKSPACE_ID env var, else the id PINNED in the deployment's own
+  // parameter store, else a freshly derived tenant id which is then pinned here
+  // (this route is normally the first thing to run, so provisioning is what
+  // establishes the pin), else the literal `default`.
+  async function currentWorkspaceId(): Promise<string> {
+    if (memoisedWorkspaceId !== undefined) return memoisedWorkspaceId;
+    const resolution = await resolveWorkspaceId(osc, {
+      ...(workspaceIdStore ? { store: workspaceIdStore } : {}),
+      log: {
+        info: (o, m) => fastify.log.info(o as object, m),
+        warn: (o, m) => fastify.log.warn(o as object, m),
+        error: (o, m) => fastify.log.error(o as object, m)
+      }
+    });
+    if (resolution.deterministic) {
+      memoisedWorkspaceId = resolution.workspaceId;
+    }
+    return resolution.workspaceId;
+  }
 
   // Operator-supplied credentials (ADR-002). Read once at registration time so
   // a misconfigured deployment fails fast at startup rather than mid-provision.
@@ -571,7 +616,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
   // middleware authenticates to OSC using this deployment's own OSC_ACCESS_TOKEN
   // (ADR-002), and there is no per-caller token for these routes. Parameter
-  // store scoping uses the deployment's own tenant id (deriveWorkspaceId).
+  // store scoping uses the deployment's own workspace id (resolveWorkspaceId).
 
   // In-flight provisioning guard (issue #417). Repeated or concurrent POST /
   // calls for the SAME stack name must not each spawn a fresh set of companion
@@ -695,7 +740,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         try {
           if (paramStore) {
             try {
-              const wsId = await deriveWorkspaceId(osc);
+              const wsId = await currentWorkspaceId();
               const existing = await paramStore.loadStackConfig(wsId, name);
               // A completed stack: converge, return its coordinates, create
               // nothing. isReadyStack treats a legacy status-less config as
@@ -1151,7 +1196,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               instanceName: name
             }))
           };
-          const workspaceId = await deriveWorkspaceId(osc);
+          const workspaceId = await currentWorkspaceId();
           try {
             await persistStackConfig({
               paramStore,
@@ -1288,7 +1333,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // the instances this run already tore down.
           if (paramStore && provisioned.length > 0) {
             try {
-              const workspaceId = await deriveWorkspaceId(osc);
+              const workspaceId = await currentWorkspaceId();
               await paramStore.storeStackConfig(workspaceId, name, {
                 status: 'failed',
                 minioEndpoint: '',
@@ -1363,7 +1408,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         return reply.code(501).send({ error: 'parameter store not configured (set PARAMETER_STORE_INSTANCE_NAME and PARAMETER_STORE_API_KEY)' });
       }
       try {
-        const workspaceId = await deriveWorkspaceId(osc);
+        const workspaceId = await currentWorkspaceId();
         const names = await opts.paramStore.listStackNames(workspaceId);
         return reply.send(names);
       } catch (err) {
@@ -1419,7 +1464,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       //     NonRetryableParamStoreError, or 5xx/network exhausting the bounded
       //     retry as a plain Error) -> the coordinates could not be resolved ->
       //     a deliberate, structured 502 rather than an unhandled bare 500.
-      const workspaceId = await deriveWorkspaceId(osc);
+      const workspaceId = await currentWorkspaceId();
       let config: StackConfig | undefined;
       try {
         config = await paramStore.loadStackConfig(workspaceId, name);
@@ -1517,7 +1562,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         });
       }
 
-      const workspaceId = await deriveWorkspaceId(osc);
+      const workspaceId = await currentWorkspaceId();
       let config: StackConfig | undefined;
       try {
         config = await paramStore.loadStackConfig(workspaceId, name);
@@ -1614,7 +1659,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // Discovery: the stored config is namespaced by the deployment's own
           // workspace (tenant). A miss means the stack never existed under this
           // deployment, or was already deprovisioned.
-          const workspaceId = await deriveWorkspaceId(osc);
+          const workspaceId = await currentWorkspaceId();
           const config = await paramStore.loadStackConfig(workspaceId, name);
           if (!config) {
             // Idempotent: a retry after a successful teardown (entry already

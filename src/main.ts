@@ -394,6 +394,13 @@ const stackResolver = new WorkspaceStackResolver({
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
   optionalSteps: optionalStepBuilders,
+  // Deterministic parameter-store namespace (issue #776). The resolver resolves
+  // the workspace id from OVC_WORKSPACE_ID or from the value pinned in this
+  // deployment's own config service, NOT from the current OSC subscription list
+  // — so two boots of the same deployment read the same namespace even when the
+  // tenant's set of service instances changed in between. This is the SAME store
+  // handed to the provision router below, which is what writes the pin.
+  ...(backendKvStore ? { workspaceIdStore: backendKvStore } : {}),
   // Aggregate degraded-resolution signal (issue #422): the resolver emits on
   // every no-storage / stale fallback so /health reports a degraded-but-not-
   // crashed instance without reading logs.
@@ -465,6 +472,10 @@ await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
   osc: oscContext,
   paramStore,
+  // Same pin store the resolver above reads (issue #776): the first provision
+  // PINS this deployment's workspace id, and every later boot of either side
+  // reads that pinned value back instead of re-deriving it.
+  ...(backendKvStore ? { workspaceIdStore: backendKvStore } : {}),
   operationStore,
   publicBaseUrl: resolvePublicBaseUrl(),
   // Invalidate the resolver cache after a successful provision/teardown so the

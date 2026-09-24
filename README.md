@@ -159,6 +159,7 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `MINIO_ROOT_PASSWORD` | **Yes** | Admin password used when provisioning MinIO instances. |
 | `COUCHDB_ADMIN_PASSWORD` | **Yes** | Admin password used when provisioning CouchDB instances. |
 | `PORT` | No | HTTP port (default `3000`). |
+| `OVC_WORKSPACE_ID` | No | Pins the parameter-store namespace this deployment reads and writes its stack configuration under. Leave unset for normal use: the id is derived from the deployment's own OSC tenant the first time it is needed, written once to the deployment's own config service, and read back on every later boot, so it stays the same across restarts. Set it only to migrate a deployment onto a specific namespace or to make the value explicit in the environment. Must not contain `/`. |
 | `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). |
 | `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances the auto-scaler keeps warm per workspace even when idle (default `0` — scale to zero). Set to `1` or more to keep a warm floor for production / latency-sensitive shared pools. See [Auto-scaler warm floor](#auto-scaler-warm-floor-cost-vs-reliability) for the cost-vs-reliability trade-off. |
 | `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`, i.e. 5 minutes). Sets the boot-time default; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`idleTimeoutMs`, minimum `10000`). |
