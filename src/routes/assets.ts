@@ -545,9 +545,18 @@ const deliveryResolutionSchema = z.object({
 //                        omitted; `resolution` carries the packaged prefix and
 //                        master manifest keys for deterministic client-side
 //                        resolution instead.
+//   - `failed`         — the asset's ingest/processing lifecycle ended in
+//                        `failed` (`AssetStatus`, src/data/asset-repo.ts:25-29)
+//                        and it never produced packaged output, so there is no
+//                        playable HLS/DASH URL — only the stored source object
+//                        (issue #810). `urls.hls`/`urls.dash` are always
+//                        omitted; `urls.source` may still be present so a
+//                        caller can fetch the raw source to diagnose or
+//                        re-ingest. NEVER `ready`: a consumer that keys off
+//                        `status` must not read a failed asset as playable.
 const deliverySchema = z.object({
   assetId: z.string(),
-  status: z.enum(['ready', 'not_configured']),
+  status: z.enum(['ready', 'not_configured', 'failed']),
   urls: deliveryUrlsSchema,
   resolution: deliveryResolutionSchema.optional(),
   expiresAt: z.string()
@@ -2877,6 +2886,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //     a presigned GET URL so the raw source can be downloaded/played.
   //   - If neither is available the asset has nothing to deliver -> 404.
   // Presigned source URLs expire after DELIVERY_URL_TTL_SECONDS (default 1h).
+  // On the source-only path the body's `status` reflects the asset's lifecycle
+  // status: a `failed` asset is reported as `status: 'failed'`, never `ready`
+  // (issue #810).
   //   200 — delivery URLs returned
   //   404 — unknown/foreign asset, or asset has no deliverable output
   //   501 — a source-only asset but object storage is not configured here
@@ -3058,12 +3070,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // public/derived object URL (never credential-bearing) against the source
       // public base. For the MinIO backend keep the presigned-GET proxy path,
       // which requires object storage to be configured.
+      //
+      // Readiness on this path is the asset's OWN lifecycle status (issue
+      // #810), not merely "a source object exists". Reaching here means the
+      // asset produced NO packaged HLS/DASH output; if its lifecycle ended in
+      // `failed` (`AssetStatus`, src/data/asset-repo.ts:25-29) then there is no
+      // playable output at all, and `ready` — documented above as "a
+      // fully-resolvable playback or download URL" — would tell a consumer the
+      // opposite of the truth. Such an asset is reported as `failed`: the
+      // source URL is still emitted (useful for diagnosing the failure or
+      // re-ingesting), but no consumer keying off `status` can mistake it for
+      // playable. A `failed` asset that DOES have packaged manifests is handled
+      // by the branch above and stays `ready` — that output really is playable.
       if (asset.objectKey) {
+        const sourceStatus = asset.status === 'failed' ? 'failed' : 'ready';
         if (sourceBase) {
           const source = externalObjectUrl(sourceBase, asset.objectKey);
           return reply
             .code(200)
-            .send({ assetId: asset.id, status: 'ready', urls: { source }, expiresAt });
+            .send({ assetId: asset.id, status: sourceStatus, urls: { source }, expiresAt });
         }
         if (!storageFor) {
           return reply.code(501).send({
@@ -3074,7 +3099,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const source = await storageFor().presignedGet(asset.objectKey, ttl);
         return reply
           .code(200)
-          .send({ assetId: asset.id, status: 'ready', urls: { source }, expiresAt });
+          .send({ assetId: asset.id, status: sourceStatus, urls: { source }, expiresAt });
       }
 
       // Nothing to deliver yet (no packaged output and no stored source object).

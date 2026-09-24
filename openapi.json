@@ -7126,7 +7126,8 @@
                       "type": "string",
                       "enum": [
                         "ready",
-                        "not_configured"
+                        "not_configured",
+                        "failed"
                       ]
                     },
                     "urls": {

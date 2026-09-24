@@ -7,6 +7,8 @@
 //   - 404 for unknown / cross-workspace assets (existence not leaked)
 //   - 501 when a source-only asset needs presigning but storage is unconfigured
 //   - DELIVERY_URL_TTL_SECONDS controls the expiry / presign window
+//   - `status: failed` (never `ready`) for a failed asset with only a source
+//     object and no packaged manifests (issue #810)
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -354,6 +356,60 @@ describe('GET /:id/delivery', () => {
     const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
     expect(res.statusCode).toBe(404);
     expect(res.json().error).toBe('no_delivery');
+  });
+
+  // Issue #810: a `failed` asset whose source object happens to exist has NO
+  // playable output — it never produced packaged manifests. The source fallback
+  // used to report `status: ready` purely because `objectKey` was set, telling a
+  // consumer the opposite of the truth. It must report `failed` instead.
+  it('does not return status=ready for a failed asset with only a source object', async () => {
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, { objectKey: `ingest/${id}` });
+    await repo.update(id, { status: 'failed' });
+    // Precondition: failed lifecycle status, a stored source, no manifests.
+    const stored = await repo.get(id);
+    expect(stored?.status).toBe('failed');
+    expect(stored?.manifestUrls).toBeUndefined();
+
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    const body = res.json();
+    expect(body.status).not.toBe('ready');
+    expect(body.status).toBe('failed');
+    // No playable output is advertised...
+    expect(body.urls.hls).toBeUndefined();
+    expect(body.urls.dash).toBeUndefined();
+    // ...but the raw source stays fetchable for diagnosis / re-ingest.
+    expect(body.urls.source).toContain(`ingest/${id}`);
+  });
+
+  // Issue #810 (converse): a non-failed source-only asset is unchanged — a
+  // presigned source download URL is a fully-resolvable URL, so it stays `ready`.
+  it('still returns status=ready for a non-failed source-only asset', async () => {
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, { objectKey: `ingest/${id}` });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe('ready');
+  });
+
+  // Issue #810: a `failed` asset that DID produce packaged manifests keeps
+  // `ready` — that packaged output really is playable, so the lifecycle check
+  // applies only to the source-only fallback.
+  it('keeps status=ready for a failed asset that has packaged manifests', async () => {
+    const { app, repo } = await buildApp();
+    const id = await createAsset(app);
+    await repo.update(id, {
+      objectKey: `ingest/${id}`,
+      manifestUrls: { hls: 'https://cdn.example/packaged/x/index.m3u8' }
+    });
+    await repo.update(id, { status: 'failed' });
+    const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe('ready');
+    expect(body.urls.hls).toBe('https://cdn.example/packaged/x/index.m3u8');
   });
 
   it('requires authentication', async () => {
