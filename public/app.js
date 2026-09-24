@@ -1769,19 +1769,50 @@ async function renderAssetDetailBody(id, bodyEl) {
       console.warn('GET /profiles request failed; falling back to default ["program"]', e);
     }
 
+    // Which opt-in steps the ACTIVE stack has configured (issue #790). Read
+    // before the options are built so an unconfigured optional step is disabled
+    // up front rather than silently skipped at run time. Fail-open: an
+    // unreadable stack config leaves every option enabled.
+    var stepAvailability = await loadOptionalStepAvailability();
+
     // Build the pipeline options from the shared catalog so future built-in
     // pipelines appear automatically. Each option label shows the pipeline id
     // plus its ordered step list, e.g. "subtitles (subtitles)".
     var pipelineOptions = PIPELINE_CATALOG.map(function(p) {
       var stepSummary = p.steps.join(' + ');
-      return '<option value="' + escHtml(p.name) + '">' +
-        escHtml(p.name + ' (' + stepSummary + ')') + '</option>';
+      var label = p.name + ' (' + stepSummary + ')';
+      var blocked = unconfiguredOptionalSteps(p, stepAvailability);
+      var unavailable = isPipelineUnavailable(p, stepAvailability);
+      var title = p.description;
+      if (unavailable) {
+        // Nothing this pipeline does is configured — disable it and say why.
+        label += ' — not configured for this stack';
+        title = notConfiguredText(blocked) +
+          '. Provision the ' + optionalServiceNames(blocked) +
+          ' service from the Provision tab to enable this pipeline.';
+      } else if (blocked.length > 0) {
+        // Mixed pipeline: still runnable, but warn which step will be skipped.
+        label += ' — ' + blocked.join(', ') + ' will be skipped';
+        title = notConfiguredText(blocked) + ', so that step is skipped. The other steps still run.';
+      }
+      return '<option value="' + escHtml(p.name) + '"' +
+        (unavailable ? ' disabled' : '') +
+        ' title="' + escHtml(title) + '">' +
+        escHtml(label) + '</option>';
     }).join('');
+
+    // Steps the stack cannot run, surfaced once above the selector so the reason
+    // is readable without hovering a disabled option (touch-safe, and announced
+    // by assistive tech alongside the selector).
+    var unconfiguredSteps = Object.keys(OPTIONAL_STEP_CONFIG).filter(function(step) {
+      return stepAvailability[step] === false;
+    });
 
     const runDiv = document.createElement('div');
     runDiv.className = 'mt12 flex-gap';
     runDiv.innerHTML = [
-      '<select id="pipeline-select" class="input">',
+      '<select id="pipeline-select" class="input"' +
+        (unconfiguredSteps.length > 0 ? ' aria-describedby="pipeline-unconfigured-note"' : '') + '>',
       pipelineOptions,
       '</select>',
       '<select id="profile-select" class="input" title="Encode profile (for pipelines with a transcode step)">',
@@ -1791,9 +1822,39 @@ async function renderAssetDetailBody(id, bodyEl) {
     ].join('');
     body.appendChild(runDiv);
 
+    // One plain-language line explaining the disabled options (issue #790).
+    // Rendered only when something is actually unconfigured, so a fully
+    // provisioned stack sees no extra chrome.
+    if (unconfiguredSteps.length > 0) {
+      const stepNote = document.createElement('div');
+      stepNote.id = 'pipeline-unconfigured-note';
+      stepNote.className = 'mt8 text-muted';
+      stepNote.style.fontSize = '12px';
+      stepNote.textContent =
+        notConfiguredText(unconfiguredSteps) +
+        ', so pipelines that only use those steps are disabled. Provision ' +
+        optionalServiceNames(unconfiguredSteps) +
+        ' from the Provision tab to enable them.';
+      body.appendChild(stepNote);
+    }
+
     // Show/hide profile selector based on whether chosen pipeline has a transcode step.
     var pipelineSel = runDiv.querySelector('#pipeline-select');
     var profileSel = runDiv.querySelector('#profile-select');
+
+    // Never leave a disabled option as the active selection. Browsers already
+    // skip disabled options when picking the default, but the catalog order is
+    // data-driven and a future first entry could be optional.
+    var selectedOpt = pipelineSel.options[pipelineSel.selectedIndex];
+    if (!selectedOpt || selectedOpt.disabled) {
+      for (var oi = 0; oi < pipelineSel.options.length; oi++) {
+        if (!pipelineSel.options[oi].disabled) {
+          pipelineSel.selectedIndex = oi;
+          break;
+        }
+      }
+    }
+
     function updateProfileVisibility() {
       var hasTranscode = ENCODE_PIPELINES.indexOf(pipelineSel.value) !== -1;
       profileSel.style.display = hasTranscode ? '' : 'none';
@@ -4522,6 +4583,108 @@ var STEP_ICONS = {
   'scene-detect': '🎬'
 };
 
+// ─── Optional pipeline step availability (issue #790) ────────────────────────
+//
+// The subtitles and scene-detect steps are OPT-IN: the runtime builds them from
+// the ACTIVE stack record, NOT from boot-time env vars — the resolver activates
+// them only when the stack was provisioned with an instance name
+// (src/services/workspace-stack.ts:225-233, StackConfig.autoSubtitlesInstanceName
+// / sceneDetectInstanceName). When the name is unset the step SILENTLY skips at
+// run time (src/routes/assets.ts:1650 triggerSubtitles / :1678 triggerSceneDetect
+// both return false and do nothing), so an operator who picks such a pipeline
+// gets an execution that appears to run and produces nothing.
+//
+// The per-stack configured state is already on the wire: GET
+// /api/v1/provision/:name returns the stored config (src/routes/provision.ts,
+// storedConfigSchema) which carries BOTH the raw instance names and the derived
+// boolean summary `options: { autoSubtitles, sceneDetect }`. That `options`
+// object is attached ONLY when at least one optional service is active
+// (provision.ts GET /:name handler), so a stack with neither omits it entirely —
+// hence the fallback to the raw *InstanceName fields below. No new endpoint and
+// no new OSC contract is needed for this view.
+var OPTIONAL_STEP_CONFIG = {
+  'subtitles': {
+    // Name of the optional-service card that provisions this step, so the
+    // explanation can point the operator at the right control.
+    serviceLabel: 'auto-subtitles',
+    // Derived boolean on the GET /provision/:name response (storedConfigSchema.options).
+    optionsKey: 'autoSubtitles',
+    // Raw stored field, used when `options` is absent (no optional service active).
+    instanceField: 'autoSubtitlesInstanceName'
+  },
+  'scene-detect': {
+    serviceLabel: 'scene-detect',
+    optionsKey: 'sceneDetect',
+    instanceField: 'sceneDetectInstanceName'
+  }
+};
+
+// Resolve which optional steps the ACTIVE stack has configured.
+// Returns a map of step name -> boolean. FAIL-OPEN: when there is no active
+// stack, or the config read fails, every optional step is reported available so
+// a transient read error never hides a working pipeline from the operator.
+async function loadOptionalStepAvailability() {
+  var availability = {};
+  Object.keys(OPTIONAL_STEP_CONFIG).forEach(function(step) { availability[step] = true; });
+
+  var stack = stackOverride || getActiveStack();
+  if (!stack) return availability;
+
+  var config;
+  try {
+    config = await apiFetch('/provision/' + encodeURIComponent(stack));
+  } catch (e) {
+    console.warn('GET /provision/' + stack + ' failed; optional pipeline steps left enabled', e);
+    return availability;
+  }
+  if (!config || typeof config !== 'object') return availability;
+
+  Object.keys(OPTIONAL_STEP_CONFIG).forEach(function(step) {
+    var field = OPTIONAL_STEP_CONFIG[step];
+    var derived = config.options && typeof config.options[field.optionsKey] === 'boolean'
+      ? config.options[field.optionsKey]
+      : null;
+    availability[step] = derived !== null
+      ? derived
+      : (typeof config[field.instanceField] === 'string' && config[field.instanceField].length > 0);
+  });
+  return availability;
+}
+
+// The optional steps of `pipeline` that the active stack has NOT configured.
+// A step with no entry in OPTIONAL_STEP_CONFIG is always required/available and
+// is never reported here.
+function unconfiguredOptionalSteps(pipeline, availability) {
+  return pipeline.steps.filter(function(step) {
+    return OPTIONAL_STEP_CONFIG[step] && availability[step] === false;
+  });
+}
+
+// A pipeline is unrunnable only when EVERY one of its steps is an unconfigured
+// optional step — selecting it could not do any work. A mixed pipeline (e.g.
+// `full`) still performs its other steps, so it stays selectable and is instead
+// labelled with the step that will be skipped.
+function isPipelineUnavailable(pipeline, availability) {
+  var blocked = unconfiguredOptionalSteps(pipeline, availability);
+  return blocked.length > 0 && blocked.length === pipeline.steps.length;
+}
+
+// Short human label listing unconfigured steps, e.g.
+// "scene-detect is not configured for this stack".
+function notConfiguredText(steps) {
+  return steps.join(', ') + (steps.length === 1 ? ' is' : ' are') + ' not configured for this stack';
+}
+
+// The optional-service card names behind a set of steps, for "provision X"
+// guidance. Falls back to the step name for a step with no registered service.
+function optionalServiceNames(steps) {
+  return steps
+    .map(function(step) {
+      return (OPTIONAL_STEP_CONFIG[step] && OPTIONAL_STEP_CONFIG[step].serviceLabel) || step;
+    })
+    .join(', ');
+}
+
 var EXEC_STATUS_CLASS = {
   running: 'status-processing',
   done: 'status-ready',
@@ -4638,15 +4801,26 @@ async function renderPipelinesTab(container) {
   wrap.className = 'pipelines-wrap';
 
   // ── Compact catalog strip ──
+  // Optional steps the ACTIVE stack has not configured are marked here too
+  // (issue #790), so the catalog and the asset detail picker tell the same story.
+  var stepAvailability = await loadOptionalStepAvailability();
   var catalogBar = document.createElement('div');
   catalogBar.className = 'pipeline-catalog-bar';
   PIPELINE_CATALOG.forEach(function(pipeline) {
     var pill = document.createElement('span');
-    pill.className = 'pipeline-catalog-pill';
-    pill.title = pipeline.description + '\nSteps: ' + pipeline.steps.join(' → ');
+    var blocked = unconfiguredOptionalSteps(pipeline, stepAvailability);
+    var unavailable = isPipelineUnavailable(pipeline, stepAvailability);
+    pill.className = 'pipeline-catalog-pill' + (unavailable ? ' is-unavailable' : '');
+    pill.title = pipeline.description + '\nSteps: ' + pipeline.steps.join(' → ') +
+      (blocked.length > 0
+        ? '\n' + notConfiguredText(blocked) + (unavailable ? '.' : ', so that step is skipped.')
+        : '');
     pill.innerHTML =
       '<span class="pipeline-catalog-pill-name">' + escHtml(pipeline.label) + '</span>' +
-      '<span class="pipeline-catalog-pill-id">' + escHtml(pipeline.name) + '</span>';
+      '<span class="pipeline-catalog-pill-id">' + escHtml(pipeline.name) + '</span>' +
+      (unavailable
+        ? '<span class="pipeline-catalog-pill-note">not configured</span>'
+        : '');
     catalogBar.appendChild(pill);
   });
   wrap.appendChild(catalogBar);

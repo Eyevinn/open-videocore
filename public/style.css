@@ -1251,6 +1251,35 @@ pre.code-block {
   font-family: monospace;
 }
 
+/* A pipeline whose every step is an optional service the active stack has not
+   configured (issue #790). Dimmed, with a dashed border so it reads as
+   "unavailable" rather than merely low-contrast. */
+.pipeline-catalog-pill.is-unavailable {
+  border-style: dashed;
+  opacity: 0.6;
+}
+
+.pipeline-catalog-pill.is-unavailable:hover {
+  border-color: var(--border);
+}
+
+.pipeline-catalog-pill-note {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 6px;
+}
+
+/* Disabled pipeline options in the run-pipeline picker (issue #790). Native
+   disabled styling is inconsistent across browsers, so make it explicit. */
+#pipeline-select option:disabled {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 .pipeline-step-arrow {
   color: var(--text-muted);
   font-size: 12px;
