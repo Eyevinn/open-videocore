@@ -333,6 +333,49 @@ the pool's upper bound and how aggressively it scales back down.
 > latency/headroom decision, not a fix for in-flight work — it does not change
 > which instances are eligible for teardown, only the floor they stop at.
 
+#### What the idle clock measures
+
+An instance's idle age is measured from the last job it finished. An instance
+that has never been given a job has no such timestamp, so its clock runs from the
+moment it entered the pool ready for work — a spawned-but-never-dispatched
+instance is torn down within `ENCORE_IDLE_TIMEOUT_MS` of becoming ready, exactly
+like one that has gone idle after a transcode. If a pool record turns up without
+a usable timestamp at all, the instance is treated as eligible for teardown
+rather than kept: unknown age must not mean "run forever" for something that
+bills by the hour. Eligible only means the instance is considered — it is still
+checked against Encore's own in-flight job list and any pending packaging
+handoff, and is drained rather than destroyed if either says it is still needed.
+
+The scaler also sweeps, every few minutes, for Encore instances (and their paired
+callback listeners) that are running on OSC with no pool record at all — the
+residue of a spawn interrupted part-way through, a wiped Valkey, or a deleted
+deployment. Nothing else can see those instances, since every other teardown path
+works from the pool. Because a deployment's cleanup sweep sees every instance in
+the OSC subscription, not just its own, four things must all hold before anything
+is removed:
+
+- the instance name proves it belongs to *this* deployment (each name carries a
+  fingerprint of the deployment identity, so two deployments with similar names —
+  `dev` and `dev-2`, say — can never reclaim each other's instances),
+- no pool, on any workspace, is tracking it,
+- it has been seen unaccounted-for across the whole grace window (20 minutes by
+  default), so a spawn still waiting for its instance to become ready is never cut
+  off mid-flight, and
+- the instance itself confirms it has no queued or in-progress job and no pending
+  packaging handoff. An instance that reports work, or that cannot be reached to
+  answer, is never destroyed by the sweep: it is taken back into the pool and
+  drained by the normal path instead.
+
+Anything the sweep declines to remove is logged by name, so an instance that
+cannot be reclaimed automatically is at least visible.
+
+The fingerprint is derived from the deployment's workspace identity, which
+assumes what the rest of the scaler already assumes: one workspace identity means
+one deployment within a subscription. Two deployments configured with the same
+workspace identity but pointing at different Valkeys would produce the same
+fingerprint and each would treat the other's untracked instances as its own to
+reclaim. Give each deployment its own workspace identity.
+
 **Collections**
 
 | Method | Path | Description |

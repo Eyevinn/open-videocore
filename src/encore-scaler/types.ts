@@ -72,6 +72,36 @@ export type EncoreScalerConfig = {
   // Default DEFAULT_RECONCILE_GRACE_MS (10_000); override via
   // ENCORE_RECONCILE_GRACE_MS.
   reconcileGraceMs?: number;
+  // #778: how often (ms) the tick sweeps OSC for scaler-owned Encore instances
+  // that have NO pool record at all — instances orphaned by a spawn that died
+  // between createInstance and the pool write, a wiped Valkey, or a deleted
+  // deployment. Nothing else can ever tear those down: every teardown path
+  // (scale-down, teardown()) iterates the pool hash, so an instance missing
+  // from it bills forever. Unset or <= 0 disables the sweep (the default for
+  // tests and any caller that has not opted in); the registry wires
+  // DEFAULT_ORPHAN_REAP_INTERVAL_MS in production.
+  orphanReapIntervalMs?: number;
+  // #778 (review finding 4): bound (ms) on how long spawnInstance waits for an
+  // OSC instance to report `running`. @osaas/client-core's waitForInstanceReady
+  // polls getInstanceHealth in a `while` loop with NO timeout and no abort
+  // (lib/core.js:343-353, v0.24.0), so without this a spawn can hang forever
+  // while holding a live,
+  // billing OSC instance that has no pool record — the very state the orphan
+  // reaper's grace window is supposed to be able to outlast. On timeout the spawn
+  // fails and its cleanup path destroys the Encore instance and any paired
+  // listener. Unset uses DEFAULT_SPAWN_READY_TIMEOUT_MS.
+  spawnReadyTimeoutMs?: number;
+  // #778 (review round 2): how often (ms) that bounded wait re-checks
+  // getInstanceHealth. The scaler owns the poll loop instead of racing a timer
+  // against waitForInstanceReady, because the SDK helper exposes no abort and
+  // would keep polling forever after we stopped waiting. Unset uses
+  // DEFAULT_SPAWN_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
+  spawnReadyPollIntervalMs?: number;
+  // #778: how long (ms) an instance must have been continuously observed as
+  // orphaned before the reaper destroys it. Guards a spawn in progress, which
+  // holds a live OSC instance with no pool record for as long as
+  // waitForInstanceReady takes. Unset uses DEFAULT_ORPHAN_GRACE_MS.
+  orphanGraceMs?: number;
   // Redis connection string, passed to each paired callback listener so it can
   // put completion messages on the packaging queue.
   redisUrl: string;
@@ -187,6 +217,17 @@ export type EncoreInstanceRecord = {
   callbackPathUnusableStatus?: number;
   activeJobs: number; // jobs currently running on this instance
   lastIdleAt: number; // epoch ms when activeJobs last reached 0
+  // Epoch ms at which this instance entered the pool ready to take work (#778).
+  // The idle clock's FALLBACK basis: `lastIdleAt` only advances when a job
+  // COMPLETES (encore-callback-poller.ts:320, routes/internal.ts:194), so an
+  // instance that is spawned and never dispatched a job has no completion to
+  // key off. Recording readiness explicitly means "never dispatched" is idle
+  // from the moment it became ready and the existing idleTimeoutMs applies to
+  // it like any other idle instance. Optional so records written by an earlier
+  // version (or hand-repaired out of band) still load; the scale-down path
+  // fails CLOSED when neither timestamp is a usable number — see
+  // resolveIdleSince() in scaler-loop.ts.
+  readyAt?: number;
   // Set when scale-down has selected this instance for teardown but it still
   // has real in-flight work (issue #513, drain-don't-kill). A draining instance
   // is removed from routing (never dispatched a new job) and is only torn down
@@ -262,5 +303,13 @@ export const keys = {
   // (minInstances:0, short idleTimeoutMs) before the packager has had a
   // chance to GET that instance's /encoreJobs/{uuid} endpoint. See
   // src/encore-scaler/packaging-pin.ts.
-  pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`
+  pendingPackaging: (instanceId: string) => `encore:pending-packaging:${instanceId}`,
+  // #778: hash of orphan-candidate instanceId -> epoch ms (string) of the FIRST
+  // sweep that saw a scaler-owned Encore instance running on OSC with no pool
+  // record. The orphan reaper only destroys an instance that is still orphaned
+  // after the grace window, so an instance mid-spawn (created on OSC, pool
+  // record not yet written — instance-pool.ts spawnInstance) is never reaped
+  // out from under the spawn that is still in progress. Entries are deleted as
+  // soon as the instance is adopted into the pool, reaped, or disappears.
+  orphanSeen: (workspaceId: string) => `encore:orphan-seen:${workspaceId}`
 };
