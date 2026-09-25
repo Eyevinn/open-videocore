@@ -350,11 +350,17 @@ function buildColumns(renderCtx) {
       key: 'thumb',
       label: '',
       width: '52px',
+      // No inline `onerror` attribute: helmet's default CSP keeps
+      // `script-src-attr 'none'` in force (src/main.ts registers helmet without
+      // useDefaults:false and without a scriptSrcAttr override), so an inline
+      // handler is blocked and only produces a console violation. The hide-on-
+      // failure handler is bound from JS in wireRowHandlers() instead, which
+      // script-src-attr does not govern. Issue #824.
       render: (a) =>
         a.thumbnails && a.thumbnails.length
           ? '<img src="/api/v1/assets/' +
             escHtml(a.id) +
-            '/thumbnails/0" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+            '/thumbnails/0" class="thumb-xs" alt="" loading="lazy">'
           : '<div class="thumb-xs thumb-placeholder"></div>',
     },
     {
@@ -553,6 +559,18 @@ export function createAssetsTable(deps) {
   function wireRowHandlers() {
     const tbody = table.el.querySelector('tbody');
     if (!tbody) return;
+
+    // Hide a thumbnail whose image fails to load (404 after a purge, 401 for an
+    // unauthenticated <img>, transient 5xx) instead of leaving a broken-image
+    // icon in the row. Bound as a listener, never as an inline attribute: the
+    // deployment's CSP inherits helmet's default `script-src-attr 'none'`, which
+    // blocks inline handlers regardless of `script-src 'unsafe-inline'`.
+    // Rows are rebuilt on every render, so each fresh <img> is wired here.
+    tbody.querySelectorAll('img.thumb-xs').forEach(function (img) {
+      img.addEventListener('error', function () {
+        img.style.display = 'none';
+      });
+    });
 
     tbody.querySelectorAll('tr[data-row-key]').forEach(function (tr) {
       const id = tr.getAttribute('data-row-key');
