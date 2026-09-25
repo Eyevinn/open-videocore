@@ -59,7 +59,7 @@ The 200 body always has this shape:
 ```jsonc
 {
   "assetId": "string",                 // the asset id echoed back
-  "status": "ready" | "not_configured",
+  "status": "ready" | "not_configured" | "failed",
   "urls": {                            // present keys depend on status (see below)
     "hls":  "string (optional)",
     "dash": "string (optional)",
@@ -79,8 +79,8 @@ Fields and their sources:
 
 - `assetId` — the requested asset id. Schema: `src/routes/assets.ts:362`.
 - `status` — the readiness signal a consumer keys off. Enum
-  `["ready", "not_configured"]`. Schema + semantics:
-  `src/routes/assets.ts:351-363`.
+  `["ready", "not_configured", "failed"]` (`failed` added by #810). Schema +
+  semantics: `deliverySchema`, `src/routes/assets.ts:538-563`.
 - `urls.hls` / `urls.dash` — playback manifest URLs. Schema:
   `src/routes/assets.ts:332-336`. Only present when `status` is `ready`.
 - `urls.source` — presigned/derived source download URL for a source-only asset
@@ -95,7 +95,7 @@ Fields and their sources:
 
 Status codes:
 
-- `200` — a delivery body (either `ready` or `not_configured`).
+- `200` — a delivery body (`ready`, `not_configured`, or `failed`).
 - `404` — unknown/foreign asset, or an asset with no packaged output and no
   stored source object to deliver. `src/routes/assets.ts:2011-2013`,
   `src/routes/assets.ts:2198-2201`.
@@ -125,7 +125,8 @@ formats the packaged output actually produced are advertised
 `ready` is also returned for external storage backends (the object store / CDN
 is itself the public origin, `src/routes/assets.ts:2067-2079`), for a relocated
 per-execution destination (`src/routes/assets.ts:2044-2060`), and for
-source-only download URLs (`src/routes/assets.ts:2178-2194`).
+source-only download URLs — but on the source-only path ONLY when the asset's
+own lifecycle status is not `failed` (see the `failed` variant below, #810).
 
 **A `ready` HLS/DASH URL is a `/stream/*` URL. Fetch it directly with a player —
 do not attempt to resolve it against a bucket.**
@@ -159,6 +160,30 @@ configure `PUBLIC_BASE_URL` on the deployment so `/delivery` can advertise
 absolute `/stream/*` URLs. The `resolution` metadata exists only for operators
 who already hold object-store credentials; it is not a supported path for normal
 API consumers.
+
+#### The `failed` variant (#810)
+
+`status: "failed"` means the asset's own ingest/processing lifecycle ended in
+`failed` (`AssetStatus`, `src/data/asset-repo.ts:25-29`) AND it produced no
+packaged output — so the only thing `/delivery` can point at is the stored
+source object. Before #810 this case fell through the source fallback and was
+reported as `ready` purely because `objectKey` was set, which told a consumer
+the opposite of the truth: there is no playable output.
+
+Body shape:
+
+- `urls.hls` / `urls.dash` are **always omitted** (there are no manifests).
+- `urls.source` is still emitted (presigned or external-origin URL, same as the
+  non-failed source-only case) so an operator can fetch the raw source to
+  diagnose the failure or re-ingest it.
+- `status` is `failed`, never `ready`, so a consumer that treats `status` as
+  "playable output exists" cannot be misled.
+
+Scope: the check applies **only** to the source-only fallback. A `failed` asset
+that did produce packaged manifests still returns `ready` for those manifests —
+that output genuinely is playable. Emitting the source URL under a non-`ready`
+status is the same pattern as `not_configured`: the readiness signal, not the
+presence of a URL, is what a consumer keys off.
 
 ### 2. `GET /api/v1/assets/:id/stream/*` behaviour
 
@@ -316,7 +341,7 @@ directly, and let the player resolve child references through `/stream/*`.
 - The packaged bucket stays private, which is the desirable posture for
   multi-tenant deployments.
 - The `status` enum gives consumers an unambiguous readiness signal; an
-  unplayable state is `not_configured`, never a fake-ready `200`.
+  unplayable state is `not_configured` or `failed`, never a fake-ready `200`.
 
 **Negative / trade-offs:**
 - All packaged bytes transit the API process in proxy mode, so the API is on the
@@ -334,7 +359,7 @@ directly, and let the player resolve child references through `/stream/*`.
 - ADR-011 — per-execution packaged-output destination (relocated delivery URLs).
 - Issues #502 (persist packaged prefix/keys), #503 (resolve packaged prefix for
   `/stream`), #506 (resolvable delivery URLs or `not_configured`), #509 (this
-  documentation task).
+  documentation task), #810 (`failed` status for a failed, source-only asset).
 - Code: `src/routes/assets.ts` (delivery + stream handlers, schemas),
   `src/pipeline/packaging.ts` (proxy/output prefixes, delivery mode),
   `src/pipeline/manifest-rewrite.ts` (child-reference rewriting),

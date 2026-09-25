@@ -35,14 +35,46 @@
 //   - Node global fetch + AbortSignal.timeout for the bounded wait: same
 //     fetch(...) usage the scaler already relies on in scaler-loop.ts:275 and
 //     reconcile() (scaler-loop.ts:214-220), with a bounded timeout added.
+//
+// HTTP STATUS IS PART OF THE ANSWER (issue #813)
+// ----------------------------------------------
+// A completed TLS handshake is necessary but NOT sufficient for the callback
+// path to be usable. If the listener ingress answers the probe with 401 or 403,
+// the transport is fine but the ingress is REJECTING requests — the progress/
+// completion POST Encore makes to `${callbackListenerUrl}/encoreCallback` will
+// fail the same way (the 401 observed in #811). Folding that into the trusted
+// case made the gate report readiness for a callback path that cannot work, so
+// 401/403 is now its own `callback-unusable` state: reachable, trusted at the
+// TLS layer, but not usable. Every other status (404/405 from a HEAD on `/`,
+// 5xx while the listener finishes booting) still means "trusted" — those prove
+// the handshake without proving anything about authorisation.
 
-// Result of a single probe attempt. `ok` means the TLS handshake to the ingress
-// completed (any HTTP status counts — even a 404 proves trust). `errorClass`
-// distinguishes a genuine trust/handshake failure (the #463 race) from a
-// plain timeout so the caller can surface a precise structured error.
+// Result of a single probe attempt.
+//   - state 'trusted'          — handshake completed AND the ingress did not
+//                                reject the request (`ok: true`).
+//   - state 'callback-unusable'— handshake completed but the ingress answered
+//                                401/403: the callback path is reachable and
+//                                rejecting requests, so Encore's callback POST
+//                                will fail too (issue #813).
+//   - state 'probe-failed'     — no HTTP response at all; `errorClass`
+//                                distinguishes a genuine trust/handshake
+//                                failure (the #463 race) from a plain timeout
+//                                or other connection error so the caller can
+//                                surface a precise structured error.
 export type CallbackTrustProbeResult =
-  | { ok: true }
-  | { ok: false; errorClass: 'tls-trust' | 'timeout' | 'connection'; detail: string };
+  | { ok: true; state: 'trusted'; status: number }
+  | { ok: false; state: 'callback-unusable'; status: number; detail: string }
+  | {
+      ok: false;
+      state: 'probe-failed';
+      errorClass: 'tls-trust' | 'timeout' | 'connection';
+      detail: string;
+    };
+
+// HTTP statuses from the listener ingress that mean "callback path not usable"
+// rather than "trust confirmed" (issue #813). Kept narrow on purpose: only an
+// authentication/authorisation rejection proves the callback POST would fail.
+const CALLBACK_REJECTED_STATUSES = new Set([401, 403]);
 
 // Substrings that identify a certificate-trust / TLS-handshake failure — the
 // exact class of error the #463 race produces before the ingress cert is
@@ -90,9 +122,10 @@ export type FetchLike = (
   init?: { method?: string; signal?: AbortSignal }
 ) => Promise<{ status: number }>;
 
-// Perform ONE bounded TLS-trust probe against the callback-listener ingress
-// origin. Resolves to { ok: true } if the HTTPS request completes a handshake
-// (any HTTP status), else classifies the failure. Never throws.
+// Perform ONE bounded trust/usability probe against the callback-listener
+// ingress origin. Resolves to state 'trusted' when the HTTPS request completes
+// a handshake and the ingress did not reject it, 'callback-unusable' on a
+// 401/403 (issue #813), else classifies the transport failure. Never throws.
 export async function probeCallbackTrust(
   callbackListenerUrl: string,
   timeoutMs: number,
@@ -106,35 +139,54 @@ export async function probeCallbackTrust(
   } catch {
     return {
       ok: false,
+      state: 'probe-failed',
       errorClass: 'connection',
       detail: `invalid callbackListenerUrl: ${callbackListenerUrl}`
     };
   }
 
   try {
-    // A HEAD keeps the probe cheap; we only need the handshake to complete.
-    await fetchImpl(origin, {
+    // A HEAD keeps the probe cheap; we only need the handshake to complete and
+    // the ingress's answer to it.
+    const res = await fetchImpl(origin, {
       method: 'HEAD',
       signal: AbortSignal.timeout(timeoutMs)
     });
-    // Any HTTP response — including 404/405 — means the TLS handshake succeeded
-    // and the ingress certificate is issued and trusted. Trust path confirmed.
-    return { ok: true };
+    // A 401/403 means the handshake succeeded but the ingress is rejecting
+    // requests: Encore's callback POST to this same origin will be rejected the
+    // same way, so the callback path is NOT usable (issue #813).
+    if (CALLBACK_REJECTED_STATUSES.has(res.status)) {
+      return {
+        ok: false,
+        state: 'callback-unusable',
+        status: res.status,
+        detail: `callback-listener ingress rejected the probe with HTTP ${res.status} — the callback path is reachable but not usable`
+      };
+    }
+    // Any other HTTP response — including 404/405 — means the TLS handshake
+    // succeeded and the ingress certificate is issued and trusted, with nothing
+    // indicating the callback POST would be rejected. Trust path confirmed.
+    return { ok: true, state: 'trusted', status: res.status };
   } catch (err) {
     const detail = stringifyError(err);
     const isTimeout =
       err instanceof Error &&
       (err.name === 'TimeoutError' || err.name === 'AbortError');
     if (isTimeout) {
-      return { ok: false, errorClass: 'timeout', detail: `probe timed out after ${timeoutMs}ms` };
+      return {
+        ok: false,
+        state: 'probe-failed',
+        errorClass: 'timeout',
+        detail: `probe timed out after ${timeoutMs}ms`
+      };
     }
     const lower = detail.toLowerCase();
     if (TLS_TRUST_SIGNATURES.some((sig) => lower.includes(sig.toLowerCase()))) {
-      return { ok: false, errorClass: 'tls-trust', detail };
+      return { ok: false, state: 'probe-failed', errorClass: 'tls-trust', detail };
     }
     // Any other network error (DNS not yet resolving, connection refused while
     // the ingress spins up): still not ready for a first job, but not a cert
     // problem. Treated the same as a timeout for gating (retry next tick).
-    return { ok: false, errorClass: 'connection', detail };
+    return { ok: false, state: 'probe-failed', errorClass: 'connection', detail };
   }
 }

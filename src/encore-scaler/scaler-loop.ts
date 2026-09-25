@@ -868,6 +868,14 @@ export class EncoreScalerLoop {
   //   - Only once the elapsed time since the FIRST probe exceeds the bounded
   //     deadline do we quarantine the instance and emit a structured error
   //     (instanceId + ingress hostname) rather than throw into the tick loop.
+  //   - A 401/403 from the listener ingress is NOT a transport failure and is
+  //     NOT "trusted" either (issue #813): the callback path is reachable but
+  //     rejecting requests. Past the bounded wait that resolves to the degraded
+  //     `callbackPathUnusableAt` state — persisted, logged, and dispatched to
+  //     anyway so completion falls back to the terminal-job sweep instead of
+  //     halting the pool. `callbackTrustReady` is never set for it, so
+  //     "callback path confirmed working" stays distinguishable from
+  //     "callback path rejecting, sweep-only fallback in effect".
   //
   // callbackTrustTimeoutMs plays TWO roles here (intentionally the same value):
   //   1. the per-probe AbortSignal window for a single HTTPS handshake, and
@@ -878,6 +886,11 @@ export class EncoreScalerLoop {
   private async ensureCallbackTrust(inst: EncoreInstanceRecord): Promise<boolean> {
     if (inst.callbackTrustReady) return true;
     if (inst.callbackTrustQuarantinedAt) return false;
+    // Already resolved to the degraded sweep-only fallback (issue #813): the
+    // listener ingress rejected the probe for the whole bounded wait. The state
+    // was persisted and logged once; do not re-probe every tick and do not
+    // withhold jobs (completion falls back to the terminal-job sweep).
+    if (inst.callbackPathUnusableAt) return true;
     // No listener URL to probe (reconciled-from-OSC instance): fail open.
     if (!inst.callbackListenerUrl) return true;
 
@@ -906,13 +919,44 @@ export class EncoreScalerLoop {
       return true;
     }
 
-    // Probe failed. If we are still inside the bounded wait, do NOT quarantine —
-    // stay ineligible this tick and let a later tick re-probe so the transient
-    // PKIX/handshake race can resolve. This treats tls-trust, connection, and a
-    // per-probe timeout identically while the deadline has not been exceeded.
+    // Probe did NOT confirm the callback path. If we are still inside the
+    // bounded wait, do NOT resolve either way — stay ineligible this tick and
+    // let a later tick re-probe so a transient PKIX/handshake race (or a
+    // listener whose auth is still settling) can resolve. This treats
+    // tls-trust, connection, timeout and a 401/403 rejection identically while
+    // the deadline has not been exceeded.
     const elapsedMs = Date.now() - inst.callbackTrustFirstProbeAt;
     if (elapsedMs <= timeoutMs) {
       return false;
+    }
+
+    // Bounded wait EXCEEDED with the listener ingress still REJECTING the probe
+    // (HTTP 401/403, issue #813). The TLS trust path is established — this is
+    // not the #463 race — but the callback path is unusable: Encore's callback
+    // POST would be rejected the same way. Record the degraded state on the
+    // instance (persisted, queryable) and log it loudly rather than letting it
+    // pass as "trusted" the way the status-blind probe used to. Jobs are still
+    // dispatched: their completion is reconciled by the terminal-job sweep
+    // (src/pipeline/encore-callback-poller.ts sweepTerminalJobs), which is
+    // strictly better than quarantining every instance and halting transcoding.
+    if (result.state === 'callback-unusable') {
+      inst.callbackPathUnusableAt = Date.now();
+      inst.callbackPathUnusableStatus = result.status;
+      await updateInstance(this.config.redis, this.config.workspaceId, inst);
+      console.error(
+        '[encore-scaler] callback path NOT usable — listener ingress rejected the trust probe; callbacks will fail, falling back to sweep-only completion for this instance',
+        {
+          workspaceId: this.config.workspaceId,
+          instanceId: inst.instanceId,
+          callbackIngressHostname: hostname,
+          status: result.status,
+          detail: result.detail,
+          timeoutMs,
+          elapsedMs,
+          degraded: true
+        }
+      );
+      return true;
     }
 
     // Bounded wait EXCEEDED: quarantine the instance from job assignment and

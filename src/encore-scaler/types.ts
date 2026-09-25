@@ -171,6 +171,20 @@ export type EncoreInstanceRecord = {
   // assignment and NOT dispatched to. Records the epoch-ms the quarantine was
   // applied so the condition is queryable rather than silently retried forever.
   callbackTrustQuarantinedAt?: number;
+  // Set when the trust probe kept getting an authorisation rejection (HTTP
+  // 401/403) from the paired callback-listener ingress for the whole bounded
+  // wait (issue #813). The TLS trust path is fine but the callback path is NOT
+  // usable: Encore's progress/completion POST will be rejected the same way, so
+  // this instance's jobs are completed by the terminal-job reconciliation sweep
+  // (src/pipeline/encore-callback-poller.ts sweepTerminalJobs) instead of by
+  // callbacks. This is a DEGRADED state, explicitly distinct from
+  // `callbackTrustReady` (callback path confirmed working): the instance is
+  // still dispatched to — halting the pool would be worse than sweep-only
+  // completion — but the condition is persisted (and logged) so an operator or
+  // an alert can see it. `callbackPathUnusableStatus` records the rejecting
+  // status for triage.
+  callbackPathUnusableAt?: number;
+  callbackPathUnusableStatus?: number;
   activeJobs: number; // jobs currently running on this instance
   lastIdleAt: number; // epoch ms when activeJobs last reached 0
   // Set when scale-down has selected this instance for teardown but it still
