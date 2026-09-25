@@ -14,11 +14,12 @@
 //     redisListener.ts, 2026-07-07). `url` is the packager's INPUT, so a
 //     dispatch with an empty url is a job the packager can never act on.
 //   - `StepExecution.encoreJobId` ("Encore external job ID (transcode steps)")
-//     and `PipelineExecution` — src/data/pipeline-repo.ts:19-40.
+//     and `PipelineExecution` — src/data/pipeline-repo.ts:43-56 (field at :47)
+//     and :58-70.
 //   - `Rendition` (`asset.renditions[]`) — src/data/asset-repo.ts:384-400,
 //     519-521.
 //   - Encore pool key layout used to resolve the job URL: `keys.pool`,
-//     `keys.jobInstance`, `keys.jobUuid` — src/encore-scaler/types.ts:208-213;
+//     `keys.jobInstance`, `keys.jobUuid` — src/encore-scaler/types.ts:222-227;
 //     `encodeEncoreJobId` — src/data/job-repo.ts:287-289.
 //   - Execute-route enum `PIPELINE_NAMES` — src/pipeline/pipelines.ts.
 

@@ -1197,10 +1197,11 @@ export function externalObjectKeyFromSourceUrl(
 // C3). There is no rendition/bucket-prefix form of that work item, so a
 // package-only pipeline can only be built on top of an earlier transcode's job.
 //
-// `StepExecution.encoreJobId` (src/data/pipeline-repo.ts:19-28 — "Encore
-// external job ID (transcode steps)") is the recorded handle; it is stamped on
-// the transcode step at dispatch (startPipelineExecution below) and the step
-// reaches `done` when the callback poller applies a successful completion.
+// `StepExecution.encoreJobId` (src/data/pipeline-repo.ts:43-56, field at :47 —
+// "Encore external job ID (transcode steps)") is the recorded handle; it is
+// stamped on the transcode step at dispatch (startPipelineExecution below) and
+// the step reaches `done` when the callback poller applies a successful
+// completion.
 // Executions are scanned newest-first by `createdAt` (ISO-8601, lexicographically
 // ordered) so the freshest transcode — the one whose Encore instance is most
 // likely still in the pool — is preferred.
