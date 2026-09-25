@@ -4544,7 +4544,7 @@ var PIPELINE_CATALOG = [
   {
     name: 'package',
     label: 'Package',
-    description: 'Package an already-transcoded asset to HLS/DASH from its existing renditions, without re-encoding. Requires transcoded renditions to exist.',
+    description: 'Package an already-transcoded asset to HLS/DASH without re-encoding. Use it to finish a run whose transcode succeeded but whose packaging failed. Requires an existing transcode whose job is still resolvable.',
     steps: ['package']
   },
   {
@@ -5122,6 +5122,10 @@ export {
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
   renderAssetsTab,
+  // Exported so a parity test can assert this hand-maintained catalog still
+  // agrees with the backend's BUILT_IN_PIPELINES / PIPELINE_DESCRIPTIONS
+  // (issue #739) — the pipeline picker and the execute enum must not drift.
+  PIPELINE_CATALOG,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────

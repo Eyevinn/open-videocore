@@ -1188,9 +1188,53 @@ export function externalObjectKeyFromSourceUrl(
   return key;
 }
 
+// The Encore job id of the most recent SUCCESSFUL transcode recorded for an
+// asset's pipeline executions (issue #739). This is the packager's input handle
+// for a package-only run: the packager's work item is `{ jobId, url }` where
+// `url` is an Encore job API URL (CONTRACT: `PackagingJob` in
+// src/pipeline/packaging.ts:166-174, verified from the packager's
+// redisListener.ts; restated in ADR-021-external-s3-endpoint-source-and-packaged
+// C3). There is no rendition/bucket-prefix form of that work item, so a
+// package-only pipeline can only be built on top of an earlier transcode's job.
+//
+// `StepExecution.encoreJobId` (src/data/pipeline-repo.ts:19-28 — "Encore
+// external job ID (transcode steps)") is the recorded handle; it is stamped on
+// the transcode step at dispatch (startPipelineExecution below) and the step
+// reaches `done` when the callback poller applies a successful completion.
+// Executions are scanned newest-first by `createdAt` (ISO-8601, lexicographically
+// ordered) so the freshest transcode — the one whose Encore instance is most
+// likely still in the pool — is preferred.
+export function latestCompletedTranscodeEncoreJobId(
+  executions: readonly import('../data/pipeline-repo.js').PipelineExecution[]
+): string | undefined {
+  const newestFirst = [...executions].sort((a, b) =>
+    a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0
+  );
+  for (const execution of newestFirst) {
+    // Last matching step wins within one execution: a re-driven execution can
+    // carry more than one transcode attempt, and the latest is the live output.
+    for (let i = execution.steps.length - 1; i >= 0; i--) {
+      const step = execution.steps[i];
+      if (step.name === 'transcode' && step.status === 'done' && step.encoreJobId) {
+        return step.encoreJobId;
+      }
+    }
+  }
+  return undefined;
+}
+
 // Resolve the Encore job URL for packaging by looking up the instance URL from
 // the Redis pool using the encoreJobId → instanceId → EncoreInstanceRecord chain.
 // Returns undefined when the instance is no longer in the pool.
+//
+// Deliberately POOL-BASED rather than reading the dispatch-time
+// `keys.jobEncoreUrl` direct key the callback poller prefers
+// (src/pipeline/encore-callback-poller.ts:265-290): that key outlives the
+// instance (24h TTL, src/encore-scaler/scaler-loop.ts:963) but the URL it holds
+// only answers while the instance is running, and the packager is the party that
+// has to fetch it. Resolving through the pool means "unresolvable" and
+// "unreachable for the packager" are the same condition, so callers can refuse
+// up front instead of enqueueing a job that would stall.
 async function resolveEncoreJobUrlForPackaging(
   encoreJobId: string,
   redis: import('ioredis').Redis | undefined
@@ -2042,14 +2086,73 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       });
       return undefined;
     }
+    // Package-only pipeline (issue #739), part 2: resolve the packager's ACTUAL
+    // INPUT before creating the execution.
+    //
+    // Having renditions is necessary but NOT sufficient. The packager's work
+    // item is `{ jobId, url }` and `url` is the Encore job API URL it fetches to
+    // locate the transcoded output (CONTRACT: `PackagingJob`,
+    // src/pipeline/packaging.ts:166-174, verified from the packager's
+    // redisListener.ts; `PackagingTrigger.triggerPackaging(assetId,
+    // encoreJobUrl)` at :187-192). The envelope has no slot for "package these
+    // `renditions[].objectKey` values", and the Encore job document is only
+    // served while that Encore instance is in the pool. So a package-only run is
+    // supportable exactly when a previous transcode's instance is still live —
+    // which is the recovery case this pipeline is for (a pipeline whose
+    // `transcode` succeeded and whose `package` failed).
+    //
+    // Both failure modes are refused synchronously with a 409 naming the reason.
+    // Dispatching anyway (e.g. with an empty url) would be a broken contract
+    // call: the packager would have nothing to fetch, never signal, and
+    // reconcileStalledPackages (src/pipeline/stalled-package-reconciler.ts)
+    // would fail the step 15 minutes later with an opaque "packager never
+    // signalled completion" — the exact failure #739 exists to remove.
+    //
+    // SCOPE: packaging an asset whose Encore instance is long gone (the
+    // "transcoded last week" case) needs a packager work item keyed by rendition
+    // object keys, which the service does not offer. Logged as OSC friction —
+    // docs/osc-feedback/incoming-encore-packager-contract.md finding 6.
+    let packageOnlyEncoreJobUrl: string | undefined;
+    if (firstStep === 'package') {
+      const encoreJobId = latestCompletedTranscodeEncoreJobId(existing);
+      if (!encoreJobId) {
+        reply.code(409).send({
+          error: 'no_transcode_job',
+          message:
+            'asset has renditions but no recorded completed transcode job to package from; the packager is driven by an Encore job URL, so run the abr-vod pipeline to transcode and package'
+        });
+        return undefined;
+      }
+      packageOnlyEncoreJobUrl = await resolveEncoreJobUrlForPackaging(
+        encoreJobId,
+        opts.packagingRedis
+      );
+      if (!packageOnlyEncoreJobUrl) {
+        reply.code(409).send({
+          error: 'instance_not_found',
+          message:
+            'Encore instance no longer in pool — cannot resolve the job URL the packager needs; re-run the abr-vod pipeline to produce packageable output'
+        });
+        return undefined;
+      }
+    }
     // Unified source-object resolution (issue #612): every first step below
     // consumes the asset's source object, so gate them all through the ONE
     // shared resolver. A source-less asset now fails identically here and in the
     // single-operation routes (POST /:id/{transcode,package,thumbnails,clip,
     // export,extract-metadata}) — a consistent 409 no_object.
+    //
+    // `package` is deliberately NOT in this list (issue #739). It is the one
+    // first step that does not read the asset's source object: the packager
+    // fetches the Encore job's transcoded output, resolved above. An asset whose
+    // source was archived or deleted after a successful transcode still has
+    // exactly the output a package-only run consumes, so gating it on the source
+    // would 409 `no_object` on a runnable pipeline. Every OTHER first step below
+    // does read the source and is unchanged. (`package` is only ever a first
+    // step in the package-only pipeline — in `abr-vod`/`full` the preceding
+    // `transcode` step is the first step and is gated here as before.)
     if (
       firstStep === 'transcode' ||
-      firstStep === 'package' ||
       firstStep === 'extract-metadata' ||
       firstStep === 'thumbnail' ||
       firstStep === 'subtitles' ||
@@ -2265,7 +2368,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           if (opts.ensurePackaging) {
             await opts.ensurePackaging();
           }
-          void opts.packaging!.triggerPackaging(asset.id, '');
+          // The Encore job URL the packager fetches (issue #739). This branch is
+          // only ever reached with `package` as the FIRST step — every pipeline
+          // that has `package` after a `transcode` breaks out of this loop at the
+          // transcode step and is resumed by the callback poller, which resolves
+          // its own URL (src/pipeline/encore-callback-poller.ts:724). So the
+          // package-only pre-flight above has already resolved a real, live URL.
+          // Throwing rather than dispatching with a placeholder keeps the
+          // invariant enforced: an enqueue with an unusable `url` is a job the
+          // packager can never act on, so the step fails here (502, with the
+          // reason on the step) instead of stalling for 15 minutes.
+          if (!packageOnlyEncoreJobUrl) {
+            throw new Error(
+              'package step reached without a resolved Encore job URL — refusing to enqueue a packaging job the packager cannot act on'
+            );
+          }
+          void opts.packaging!.triggerPackaging(asset.id, packageOnlyEncoreJobUrl);
           stepsCopy[i] = { ...step, status: 'running', startedAt: now() };
           break; // async — advanced by packager callback
         }
