@@ -113,6 +113,34 @@ function buildSelector(query: SearchQuery): Record<string, unknown> {
   if (query.tamsTimerange) {
     selector['structural.tams.timerange'] = { $eq: query.tamsTimerange };
   }
+  // Lifecycle status + created-at range (issue #833) ARE pushed down, unlike
+  // tags/mimeType/metadata above. Both address fields that genuinely exist on
+  // the stored document, so neither repeats the #345 mistake:
+  //   - `state` is the top-level lifecycle mirror written by
+  //     couch-asset-repo.ts `toDoc()` and already used by that repo's own
+  //     `buildSelector()` to serve `GET /api/v1/assets/?status=`. Reusing it
+  //     here is what makes the two endpoints' status semantics identical.
+  //   - `administrative.createdAt` is a REQUIRED field of AssetDocumentSchema
+  //     (asset-document.ts); `$gte`/`$lte` over it is the Mango condition-
+  //     operator contract cited in couch-asset-repo.ts buildSelector().
+  // Pushing them down also matters for completeness, not just speed: this
+  // method fetches at most MAX_LIMIT candidates, so narrowing in the database
+  // means the cap applies to MATCHING documents rather than to the whole
+  // workspace. The in-process `matchesQuery` pass re-checks both, so the match
+  // semantics remain identical to the in-memory backend.
+  if (query.status) {
+    selector['state'] = query.status;
+  }
+  if (query.createdFrom !== undefined || query.createdTo !== undefined) {
+    const range: Record<string, string> = {};
+    if (query.createdFrom !== undefined) {
+      range['$gte'] = query.createdFrom;
+    }
+    if (query.createdTo !== undefined) {
+      range['$lte'] = query.createdTo;
+    }
+    selector['administrative.createdAt'] = range;
+  }
   // Operator metadata (issue #12) is NOT pushed down either: it is persisted
   // under `descriptive.custom.<key>` (asset-document.ts -> fromAssetDocument maps
   // it to `asset.metadata`), so a top-level `metadata.<key>` selector matched
