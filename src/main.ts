@@ -86,6 +86,10 @@ import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
 import { registerPrincipal } from './auth/principal.js';
 import { registerAuth } from './auth/middleware.js';
+import {
+  resolveUiPresenceTrust,
+  UI_PRESENCE_TRUST_HEADER_ENV
+} from './auth/ui-presence-trust.js';
 import { internalRouter } from './routes/internal.js';
 import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
@@ -428,7 +432,33 @@ const stackResolver = new WorkspaceStackResolver({
 // resolve a per-request workspace, so it does not reintroduce the scoping #64
 // removed. Must run before the routers register, since they reference
 // app.authenticate at registration time.
-registerAuth(app);
+//
+// OVC_TRUST_UI_PRESENCE_HEADER (issue #767) is the one OPT-IN relaxation, and it
+// mirrors OVC_TRUST_ROLE_HEADER below: when an operator names the header their
+// fronting auth layer sets on an already-authenticated browser request, the gate
+// admits the bundled UI's own same-origin `/ui` calls that carry it rather than
+// 401-ing them. Unset (the default) ⇒ the gate is exactly the #711 gate above and
+// anonymous requests from anywhere, /ui included, still get 401. The app
+// hardcodes NO header name: the #766 investigation
+// (docs/findings/ingress-ui-auth-766.md) found the fronting layer's browser-auth
+// signal UNCONFIRMED from this repo, so trust is asserted by the operator about
+// their own deployment, never inferred here. See src/auth/ui-presence-trust.ts.
+const uiPresenceTrust = resolveUiPresenceTrust();
+if (uiPresenceTrust.reason === 'forbidden-header-name') {
+  app.log.warn(
+    { headerName: uiPresenceTrust.headerName },
+    `${UI_PRESENCE_TRUST_HEADER_ENV} names a header that must not be trusted — fronting-layer UI trust stays DISABLED (issue #767)`
+  );
+} else if (uiPresenceTrust.config !== null) {
+  app.log.warn(
+    {
+      headerName: uiPresenceTrust.config.headerName,
+      requiresExpectedValue: uiPresenceTrust.config.expectedValue !== undefined
+    },
+    'fronting-layer UI trust ENABLED (issue #767) — same-origin /ui requests carrying this header are admitted without a bearer token; the fronting layer MUST strip client-supplied copies of it'
+  );
+}
+registerAuth(app, { uiPresenceTrust: uiPresenceTrust.config });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
 // the app trusts every request that reaches it.

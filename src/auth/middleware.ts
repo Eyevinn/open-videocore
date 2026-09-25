@@ -9,9 +9,16 @@
 // connection-resolving preHandler can gate on it. The 401 presence gate here is
 // DISTINCT from the 403 authorisation failure the role gate returns
 // (src/auth/authorize.ts, ADR-018 decision 5).
+//
+// One OPT-IN exception exists (issue #767): a deployment may declare that its
+// fronting auth layer marks already-authenticated browser requests with a named
+// header, in which case the gate admits the UI's own same-origin /ui calls that
+// carry that signal instead of 401-ing them. It is off unless configured — see
+// src/auth/ui-presence-trust.ts for the trust model and why there is no default.
 
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AuthError, requireAuth } from './workspace.js';
+import { isTrustedUiPresenceRequest, type UiPresenceTrustConfig } from './ui-presence-trust.js';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -29,15 +36,45 @@ function extractToken(request: FastifyRequest): string | undefined {
   return match ? match[1].trim() : undefined;
 }
 
+// Options for the presence gate. Every field is optional and omitting the whole
+// object must leave the gate byte-for-byte identical to its pre-#767 behaviour.
+export interface AuthOptions {
+  // Opt-in fronting-layer trust for the UI's own same-origin calls (issue #767,
+  // src/auth/ui-presence-trust.ts). `null`/omitted — the DEFAULT — means the
+  // deployment has not opted in: the gate looks at nothing but the bearer token,
+  // so anonymous traffic from anywhere, /ui included, still gets 401 (#711).
+  uiPresenceTrust?: UiPresenceTrustConfig | null;
+}
+
 // Register `request.authenticated` (default false) and an `authenticate`
 // preHandler that all guarded routes attach. Call once at app setup.
-export function registerAuth(app: FastifyInstance): void {
+export function registerAuth(app: FastifyInstance, opts: AuthOptions = {}): void {
   app.decorateRequest('authenticated', false);
+  const uiPresenceTrust = opts.uiPresenceTrust ?? null;
 
   app.decorate(
     'authenticate',
     async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
       const token = extractToken(request);
+
+      // Opt-in fronting-layer trust (issue #767). Consulted ONLY when the request
+      // carries no bearer token at all — i.e. only in the case that would
+      // otherwise be a 401 — and only when the deployment has explicitly named a
+      // trusted header, so an unset configuration cannot change any outcome. The
+      // admitted request is a same-origin call from this instance's own /ui pages
+      // bearing the operator-declared fronting-layer signal; every other
+      // anonymous request falls through to the 401 below.
+      if (token === undefined && uiPresenceTrust !== null) {
+        if (isTrustedUiPresenceRequest(request.headers, uiPresenceTrust)) {
+          request.authenticated = true;
+          request.log.debug(
+            { trustedHeader: uiPresenceTrust.headerName },
+            'admitted same-origin /ui request on the trusted fronting-layer signal (issue #767)'
+          );
+          return;
+        }
+      }
+
       try {
         request.authenticated = await requireAuth(token);
       } catch (err) {

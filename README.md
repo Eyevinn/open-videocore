@@ -72,6 +72,28 @@ reach every endpoint — asset management, provisioning, storage, and
 tear-down included. Do not map the container port to a public interface unless
 an authenticating proxy sits in front of it.
 
+### Optional: trusting your fronting layer for the built-in UI
+
+The operator UI at `/ui` is a static mount, but the API calls it makes go through
+the same presence gate, so they need a bearer credential of their own. If your
+fronting auth layer already authenticates the browser session *and* marks each
+such request with a header, you can name that header in
+`OVC_TRUST_UI_PRESENCE_HEADER` and the gate will admit the UI's own same-origin
+`/ui` requests that carry it without a bearer token.
+
+This is **off by default and has no default header name**: the fronting layer's
+browser-authentication signal could not be confirmed from this repository (see
+[`docs/findings/ingress-ui-auth-766.md`](docs/findings/ingress-ui-auth-766.md)),
+so the app never guesses one — enabling this is your assertion about your own
+deployment. Trust is configuration-based, exactly like `OVC_TRUST_ROLE_HEADER`:
+the value is not verified, so **your fronting layer must overwrite or strip any
+client-supplied copy of the header.** As defence in depth the request must also be
+a browser same-origin fetch (`Sec-Fetch-Site: same-origin`) referred from a page
+under `/ui` on the same host, and you can require an exact shared-secret value via
+`OVC_TRUST_UI_PRESENCE_HEADER_VALUE`. Everything else — including anonymous API
+traffic from outside the UI — still gets 401. See
+[`src/auth/ui-presence-trust.ts`](src/auth/ui-presence-trust.ts) and `.env.example`.
+
 ## Quick start
 
 The easiest way to get Open Videocore running is through an AI agent connected to OSC via MCP. The agent handles provisioning through natural language — no CLI, no copy-pasting resource IDs.
