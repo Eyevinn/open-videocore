@@ -8,43 +8,58 @@
 // unnoticed. The fix is the URL-issuing sibling route: the API hands back a
 // short-lived signed object-store URL that a header-less GET can use.
 //
-// What is asserted here, and at which layer:
-//   1. header-less GET semantics on BOTH thumbnail routes (this suite, in
-//      process, runs in CI) — an <img>-shaped request to either API route is
-//      refused 401, and the URL the browser is meant to use instead is an
-//      off-API, signed URL that carries no Authorization requirement from this
-//      API at all.
-//   2. the storage hop — an actual header-less GET of the issued URL returning
-//      200 image/jpeg, and the same object refusing an UNSIGNED GET — needs a
-//      live object store. It cannot be proven against a test double (a double
-//      would only be asserting its own stub logic), so it lives in the gated
-//      `describe.skipIf` block at the bottom, implemented against the real
-//      signer + real object store and skipped when no stack is wired up. Same
-//      honesty pattern as test/burn-in-decoded-frame.e2e.test.ts.
-//      See docs/osc-feedback/incoming-minio-presigned-blocked.md — whether an
-//      anonymous presigned GET is reachable from outside the cluster is still
-//      an open question against OSC storage, so asserting a 200 from a stub
-//      here would be actively misleading.
+// What is asserted here, and at which layer — ALL of it runs in CI:
+//   1. header-less GET semantics on BOTH thumbnail routes — an <img>-shaped
+//      request to either API route is refused 401, and the URL the browser is
+//      meant to use instead is an off-API, signed URL that carries no
+//      Authorization requirement from this API at all.
+//   2. the storage hop, end to end: the URL the route issues is signed by the
+//      REAL storage client and then fetched over a real HTTP hop with no
+//      Authorization header, against an object store that independently
+//      recomputes the AWS SigV4 query signature (test/s3-presigned-verifier.ts)
+//      and serves bytes only when it matches an unexpired presigned request.
+//      Unsigned, tampered and expired variants of the same URL are refused 403.
+//      No container runtime or live stack needed, so these assertions run on
+//      every push (issue #803 acceptance criterion 3).
+//
+// On the object store this is modelled against: an earlier OSC friction log
+// (agents repo, docs/osc-feedback/incoming-minio-presigned-blocked.md,
+// 2026-06-02) recorded every presigned GET returning 403 from outside the
+// cluster, which is why the proxying byte route exists at all. That was re-verified
+// on 2026-09-25 against a live OSC storage instance from outside the cluster
+// and no longer reproduces — an anonymous presigned GET returned
+// 200 image/jpeg, while the unsigned, tampered and expired variants returned
+// 403 AccessDenied / 403 SignatureDoesNotMatch / 403 AccessDenied (recorded in
+// the agents repo as docs/osc-feedback/incoming-presigned-get-thumbnails.md,
+// which supersedes the 2026-06-02 log). Those are exactly the four outcomes the
+// in-process verifier reproduces, and the live re-check is kept as a gated
+// sibling suite in test/thumbnail-presigned-fetch.e2e.test.ts.
 //
 // Contract sources verified (read before writing any assertion):
-//   - GET /:id/thumbnails/:index/url — src/routes/assets.ts:4431 (handler:
+//   - GET /:id/thumbnails/:index/url — src/routes/assets.ts:4440 (handler:
 //     404 unknown asset / out-of-range index, 501 no storage, 502 sign failure,
 //     200 otherwise; signs via storageFor().presignedGet(objectKey, ttl) at
-//     src/routes/assets.ts:4467).
+//     src/routes/assets.ts:4476).
 //   - 200 body shape `thumbnailUrlSchema` { assetId, index, objectKey, url,
 //     expiresAt, expiresInSeconds } — src/routes/assets.ts:611.
 //   - GET /:id/thumbnails/:index (byte route, image/jpeg) —
-//     src/routes/assets.ts:4384.
+//     src/routes/assets.ts:4393.
 //   - 401 presence gate: `authGate` — src/auth/middleware.ts:76, attached as
 //     the router's first preHandler at src/routes/assets.ts:1560; the 401 body
-//     + `WWW-Authenticate: Bearer` header come from src/auth/middleware.ts:44.
+//     + `WWW-Authenticate: Bearer` header come from src/auth/middleware.ts:48.
 //   - `requireAuth` (presence-only token check) — src/auth/workspace.ts:52.
 //   - `WorkspaceStorage.presignedGet(localKey, expirySeconds)` /
 //     `WorkspaceStorage` constructor (client, bucket) — src/data/storage.ts:132,
 //     src/data/storage.ts:108; `thumbnailUrlTtlSeconds()` +
 //     DEFAULT_THUMBNAIL_URL_TTL_SECONDS (THUMBNAIL_URL_TTL_SECONDS, default
 //     300s) — src/data/storage.ts:68 / :64.
-//   - live MinioClient construction options — src/services/workspace-stack.ts:319.
+//   - storage client construction options — src/services/workspace-stack.ts:319
+//     (endPoint/port/useSSL/accessKey/secretKey; the test client additionally
+//     pins `region` so presigning never needs a GetBucketLocation round trip —
+//     node_modules/minio/dist/esm/internal/client.mjs:539).
+//   - `presignedGetObject(bucket, object, expires, respHeaders, requestDate)` —
+//     node_modules/minio/dist/esm/internal/client.mjs:2619; the `requestDate`
+//     parameter is what lets the expired-URL case be deterministic.
 //   - harness setup (Fastify + zod compilers + registerAuth + assetsRouter with
 //     a WorkspaceStorage double) reused from test/thumbnail.test.ts and
 //     test/delivery.test.ts.
@@ -53,6 +68,11 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
 import { Readable } from 'node:stream';
+import { Client as MinioClient } from 'minio';
+import {
+  startVerifyingObjectStore,
+  type VerifyingObjectStore
+} from './s3-presigned-verifier.js';
 
 vi.mock('../src/auth/workspace.js', async () => {
   const actual = await vi.importActual<typeof import('../src/auth/workspace.js')>(
@@ -60,11 +80,13 @@ vi.mock('../src/auth/workspace.js', async () => {
   );
   return {
     ...actual,
+    // The gate on this router is presence-only (`requireAuth`,
+    // src/auth/workspace.ts:52), so exactly one valid token is enough; a
+    // second workspace here would imply tenant-scoping coverage this suite
+    // does not have (the handler's `repo.get` is unscoped — see #803 review).
     resolveWorkspaceId: vi.fn(async (token?: string) => {
-      const map: Record<string, string> = { 'token-a': 'workspace-a', 'token-b': 'workspace-b' };
-      const ws = token ? map[token] : undefined;
-      if (!ws) throw new actual.AuthError('invalid token');
-      return ws;
+      if (token !== 'token-a') throw new actual.AuthError('invalid token');
+      return 'workspace-a';
     })
   };
 });
@@ -80,6 +102,10 @@ const A = { authorization: 'Bearer token-a' };
 // route streams whatever storage hands back, so the exact payload only has to
 // be distinguishable from an error body.
 const JPEG_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+
+// Every outbound call is bounded, per the API's own rule for external calls.
+// Loopback, so this only ever fires if the fixture server wedges.
+const FETCH_TIMEOUT_MS = 10_000;
 
 // Storage double. `presignedGet` returns an ABSOLUTE URL on a different origin
 // than the API — that is the real signer's shape (src/data/storage.ts:132
@@ -285,86 +311,149 @@ describe('unauthenticated access to the thumbnail bytes is still refused', () =>
 });
 
 // ---------------------------------------------------------------------------
-// Storage hop — real signed URL against a real object store.
+// The storage hop, end to end, in CI.
 //
-// GATED, and skipped by default. Proving that a header-less GET of the issued
-// URL returns 200 image/jpeg — and that the SAME object refuses an unsigned GET
-// — is a statement about the object store's signature verification and bucket
-// policy, not about this API. A test double cannot establish it (it would only
-// re-assert the double's own stub), and there is no object store in CI or in the
-// dev container, so this block runs ONLY when one is wired up via env:
-//
-//   THUMBNAIL_E2E_S3_ENDPOINT    e.g. https://minio.example:9000
-//   THUMBNAIL_E2E_S3_ACCESS_KEY
-//   THUMBNAIL_E2E_S3_SECRET_KEY
-//   THUMBNAIL_E2E_S3_BUCKET      the (private) source bucket thumbnails live in
-//
-// Run it from OUTSIDE the cluster: that is the exact verification
-// docs/osc-feedback/incoming-minio-presigned-blocked.md is still waiting on —
-// whether an anonymous presigned GET is reachable at all, or whether the 403
-// recorded there is unchanged.
+// Everything above stops at "the route returned a string". These tests take the
+// string the route actually issued, signed by the REAL storage client, and make
+// the request a browser would make: an HTTP GET with no Authorization header,
+// no cookies, nothing. The object store on the other end is
+// test/s3-presigned-verifier.ts, which recomputes the AWS SigV4 query signature
+// from the spec (node:crypto only, no help from the signing SDK) and serves
+// bytes only when it matches an unexpired presigned request — so a URL this
+// suite accepts is one a real S3-compatible store accepts, and the four
+// outcomes below are the four observed live on 2026-09-25 (see file header).
 // ---------------------------------------------------------------------------
 
-const E2E_ENDPOINT = process.env['THUMBNAIL_E2E_S3_ENDPOINT'];
-const E2E_ACCESS_KEY = process.env['THUMBNAIL_E2E_S3_ACCESS_KEY'];
-const E2E_SECRET_KEY = process.env['THUMBNAIL_E2E_S3_SECRET_KEY'];
-const E2E_BUCKET = process.env['THUMBNAIL_E2E_S3_BUCKET'];
-const E2E_SKIP = !E2E_ENDPOINT || !E2E_ACCESS_KEY || !E2E_SECRET_KEY || !E2E_BUCKET;
+const E2E_BUCKET = 'source-bucket';
 
-// Every external call is bounded, per the API's own rule for outbound calls.
-const E2E_TIMEOUT_MS = 15_000;
+async function buildAppOverVerifyingStore(): Promise<{
+  app: FastifyInstance;
+  repo: InMemoryAssetRepository;
+  store: VerifyingObjectStore;
+  client: MinioClient;
+}> {
+  const store = await startVerifyingObjectStore();
+  const endpoint = new URL(store.endpoint);
+  // Mirrors src/services/workspace-stack.ts:319, plus a pinned region so
+  // signing needs no GetBucketLocation round trip (client.mjs:539).
+  const client = new MinioClient({
+    endPoint: endpoint.hostname,
+    port: Number(endpoint.port),
+    useSSL: false,
+    accessKey: store.accessKey,
+    secretKey: store.secretKey,
+    region: store.region
+  });
+  const app = Fastify();
+  app.setValidatorCompiler(validatorCompiler);
+  app.setSerializerCompiler(serializerCompiler);
+  registerAuth(app);
+  const repo = new InMemoryAssetRepository();
+  const storage = new WorkspaceStorage(client, E2E_BUCKET);
+  await app.register(assetsRouter, {
+    prefix: '/api/v1/assets',
+    repository: repo,
+    storageFor: () => storage
+  });
+  await app.ready();
+  return { app, repo, store, client };
+}
 
-describe.skipIf(E2E_SKIP)('browser fetch of a real presigned thumbnail URL (live object store)', () => {
-  // Built inside the block so the import is not paid for in the skipped case.
-  async function liveStorage(): Promise<{ storage: WorkspaceStorage; put: (key: string) => Promise<void>; remove: (key: string) => Promise<void> }> {
-    const { Client: MinioClient } = await import('minio');
-    const url = new URL(E2E_ENDPOINT as string);
-    const useSSL = url.protocol === 'https:';
-    // Client options mirror src/services/workspace-stack.ts:319.
-    const client = new MinioClient({
-      endPoint: url.hostname,
-      port: url.port ? Number(url.port) : useSSL ? 443 : 80,
-      useSSL,
-      accessKey: E2E_ACCESS_KEY as string,
-      secretKey: E2E_SECRET_KEY as string
+describe('a real browser fetch of the issued URL (signature-verifying object store)', () => {
+  let ctx: Awaited<ReturnType<typeof buildAppOverVerifyingStore>> | undefined;
+
+  afterEach(async () => {
+    await ctx?.store.close();
+    await ctx?.app.close();
+    ctx = undefined;
+  });
+
+  async function mintUrl(): Promise<{ url: string; key: string }> {
+    ctx = await buildAppOverVerifyingStore();
+    const { app, repo, store } = ctx;
+    const { id, key } = await assetWithThumbnail(app, repo);
+    store.putObject(E2E_BUCKET, key, JPEG_BYTES, 'image/jpeg');
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${id}/thumbnails/0/url`,
+      headers: A
     });
-    const bucket = E2E_BUCKET as string;
-    return {
-      storage: new WorkspaceStorage(client, bucket),
-      // putObject(bucket, key, payload, size, metaData) —
-      // node_modules/minio/dist/esm/internal/client.d.mts:291.
-      put: async (key: string) => {
-        await client.putObject(bucket, key, JPEG_BYTES, JPEG_BYTES.length, {
-          'Content-Type': 'image/jpeg'
-        });
-      },
-      remove: async (key: string) => {
-        await client.removeObject(bucket, key);
-      }
-    };
+    expect(res.statusCode).toBe(200);
+    return { url: res.json().url as string, key };
   }
 
-  it('a GET with NO Authorization header returns 200 image/jpeg, and the same object refuses an unsigned GET', async () => {
-    const { storage, put, remove } = await liveStorage();
-    const key = `thumbnails/e2e-${Date.now()}/thumb_0s.jpg`;
-    await put(key);
-    try {
-      const signed = await storage.presignedGet(key, DEFAULT_THUMBNAIL_URL_TTL_SECONDS);
+  it('serves 200 image/jpeg to a GET carrying NO Authorization header', async () => {
+    const { url } = await mintUrl();
 
-      // The browser path: a bare GET, no headers at all.
-      const rendered = await fetch(signed, { signal: AbortSignal.timeout(E2E_TIMEOUT_MS) });
-      expect(rendered.status).toBe(200);
-      expect(rendered.headers.get('content-type')).toContain('image/jpeg');
-      expect(Buffer.from(await rendered.arrayBuffer())).toEqual(JPEG_BYTES);
+    // No headers, no credentials: exactly what <img src={url}> sends.
+    const rendered = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
 
-      // Same object, signature stripped: the bucket is private, so an
-      // unauthenticated AND unsigned read must be refused.
-      const unsigned = new URL(signed);
-      unsigned.search = '';
-      const refused = await fetch(unsigned, { signal: AbortSignal.timeout(E2E_TIMEOUT_MS) });
-      expect([401, 403]).toContain(refused.status);
-    } finally {
-      await remove(key).catch(() => undefined);
-    }
+    expect(rendered.status).toBe(200);
+    expect(rendered.headers.get('content-type')).toBe('image/jpeg');
+    expect(Buffer.from(await rendered.arrayBuffer())).toEqual(JPEG_BYTES);
+    // ...and the store confirms it authorised the request on the signature
+    // alone, with no Authorization header present.
+    const served = ctx!.store.requests.at(-1)!;
+    expect(served.hadAuthorizationHeader).toBe(false);
+    expect(served.status).toBe(200);
+  });
+
+  it('refuses the same object when the signature is stripped (403 AccessDenied)', async () => {
+    const { url } = await mintUrl();
+
+    const unsigned = new URL(url);
+    unsigned.search = '';
+    const refused = await fetch(unsigned, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).toContain('AccessDenied');
+    expect(refused.headers.get('content-type')).not.toContain('image/jpeg');
+  });
+
+  it('refuses a tampered signature (403 SignatureDoesNotMatch)', async () => {
+    const { url } = await mintUrl();
+
+    // Same expiry window, same credential scope, one flipped signature: the
+    // URL is only good for the exact object+window it was signed for.
+    const tampered = new URL(url);
+    tampered.searchParams.set('X-Amz-Signature', 'deadbeef'.repeat(8));
+    const refused = await fetch(tampered, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).toContain('SignatureDoesNotMatch');
+  });
+
+  it('refuses a correctly signed URL once its TTL has elapsed (403 AccessDenied)', async () => {
+    const { key } = await mintUrl();
+
+    // Signed for the default TTL but backdated past it, so the signature is
+    // valid and the window is not — no sleeping, no fake timers.
+    const signedInThePast = await ctx!.client.presignedGetObject(
+      E2E_BUCKET,
+      key,
+      DEFAULT_THUMBNAIL_URL_TTL_SECONDS,
+      undefined,
+      new Date(Date.now() - (DEFAULT_THUMBNAIL_URL_TTL_SECONDS + 60) * 1000)
+    );
+    const refused = await fetch(signedInThePast, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    });
+
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).toContain('AccessDenied');
+  });
+
+  it('does not serve a sibling object the URL was not signed for (403, not a blanket bucket read)', async () => {
+    const { url } = await mintUrl();
+
+    // The signature covers one key. Point it at a sibling key and the
+    // signature no longer matches — a leaked thumbnail URL is not a bucket key.
+    const neighbour = new URL(url);
+    neighbour.pathname = `/${E2E_BUCKET}/thumbnails/someone-else/thumb_0s.jpg`;
+    const refused = await fetch(neighbour, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).toContain('SignatureDoesNotMatch');
   });
 });
