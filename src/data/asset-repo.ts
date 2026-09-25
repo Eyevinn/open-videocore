@@ -882,6 +882,24 @@ export interface AssetRepository {
     id: string,
     input: AttachExternalIdInput
   ): Promise<Asset | undefined>;
+  // Detach an upstream external identifier from an asset (issue #867, ADR-019).
+  // The inverse of attachExternalId and the same kind of DEDICATED system write
+  // seam for `administrative.externalIdentifiers` — distinct from `update()`,
+  // whose UpdateAssetInput deliberately carries no `externalIdentifiers` field
+  // (asset-repo.ts:613-674), so the editorial patch path cannot reach this set.
+  // Without this seam a mistyped identifier attached via POST /:id/external-ids
+  // is permanent.
+  //
+  // IDEMPOTENT: removes every `{ namespace, id }` entry equal to `ref` and
+  // returns the updated asset. Detaching a pair the asset does NOT carry is a
+  // no-op that still returns the asset — the caller maps that to the same
+  // success status as a real removal, so retries are safe. Returns undefined
+  // ONLY when the asset id is unknown (mapped to 404 by the route).
+  //
+  // `(namespace, id)` uniqueness across the array is out of scope here (deferred
+  // to #577's enforcement work): the filter removes ALL equal entries, so an
+  // asset that accumulated a duplicate pair in advisory mode is left clean.
+  detachExternalId(id: string, ref: ExternalIdentifier): Promise<Asset | undefined>;
   list(opts?: ListOptions): Promise<ListResult>;
   search(query: string): Promise<Asset[]>;
   update(id: string, patch: UpdateAssetInput): Promise<Asset | undefined>;
@@ -1428,6 +1446,33 @@ export class InMemoryAssetRepository implements AssetRepository {
         { namespace: input.namespace, id: input.id }
       ],
       updatedAt: now
+    };
+    this.store.set(id, next);
+    return { ...next };
+  }
+
+  // Detach an external identifier (issue #867). Mirrors the CouchDB backend: the
+  // removal is a pure filter over the persisted set and is idempotent — when the
+  // asset does not carry the pair the stored record is returned untouched (no
+  // `updatedAt` bump), so a retried DELETE is a genuine no-op.
+  async detachExternalId(id: string, ref: ExternalIdentifier): Promise<Asset | undefined> {
+    const existing = this.store.get(id);
+    if (!existing || this.tombstones.has(id)) {
+      return undefined;
+    }
+    const before = existing.externalIdentifiers ?? [];
+    const remaining = before.filter((e) => !(e.namespace === ref.namespace && e.id === ref.id));
+    // Idempotent no-op: nothing matched, so the asset is unchanged.
+    if (remaining.length === before.length) {
+      return { ...existing };
+    }
+    const next: Asset = {
+      ...existing,
+      // Drop the field entirely once the set is empty, matching how #575 models
+      // "no external identifiers" (toAssetDocument attaches the block only when
+      // non-empty, asset-document.ts:504-506).
+      externalIdentifiers: remaining.length > 0 ? remaining : undefined,
+      updatedAt: new Date().toISOString()
     };
     this.store.set(id, next);
     return { ...next };

@@ -28,6 +28,7 @@ import {
   type AssetStatus,
   type AttachExternalIdInput,
   type CreateAssetInput,
+  type ExternalIdentifier,
   type ListOptions,
   type ListResult,
   type RehydratePhase,
@@ -250,6 +251,51 @@ export class CouchAssetRepository implements AssetRepository {
           { namespace: input.namespace, id: input.id }
         ],
         updatedAt: now
+      };
+      updated = next;
+      return toDoc(next);
+    });
+    return written ? updated : undefined;
+  }
+
+  // Detach an external identifier (issue #867, ADR-019). The inverse of
+  // attachExternalId above and the same kind of DEDICATED system write path for
+  // `administrative.externalIdentifiers` — update() never touches the set. The
+  // read-modify-write is routed through updateWithRetry (src/data/couchdb.ts) for
+  // the same concurrent-write safety as every other dedicated write seam
+  // (issues #278/#279/#281); the patch is pure and re-runs safely per attempt.
+  //
+  // IDEMPOTENT: the removal is a filter over the persisted array, so detaching a
+  // pair the asset does not carry writes the document back unchanged and still
+  // reports success. No uniqueness gate is involved (that is #577's concern on
+  // the attach side only) — ALL entries equal to `ref` are removed, so a
+  // duplicate accumulated in advisory mode is cleared too. Returns undefined
+  // only when the id is unknown.
+  async detachExternalId(id: string, ref: ExternalIdentifier): Promise<Asset | undefined> {
+    const couch = this.couchFor();
+    const preflight = await couch.get(id);
+    if (!preflight || preflight.resourceType !== RESOURCE_TYPE) {
+      return undefined;
+    }
+    let updated: Asset | undefined;
+    const written = await updateWithRetry(couch, id, (current) => {
+      const existing = fromDoc(current);
+      const before = existing.externalIdentifiers ?? [];
+      const remaining = before.filter((e) => !(e.namespace === ref.namespace && e.id === ref.id));
+      // Idempotent no-op: nothing matched, so the document is written back as-is
+      // (no `updatedAt` bump) and the route still reports success.
+      if (remaining.length === before.length) {
+        updated = existing;
+        return toDoc(existing);
+      }
+      const next: Asset = {
+        ...existing,
+        // An empty set is persisted as an ABSENT `administrative.externalIdentifiers`
+        // block, matching #575's round-trip model (asset-document.ts:504-506 only
+        // attaches the block when non-empty, and fromDoc maps absent/empty back to
+        // undefined at asset-document.ts:712-715).
+        externalIdentifiers: remaining.length > 0 ? remaining : undefined,
+        updatedAt: new Date().toISOString()
       };
       updated = next;
       return toDoc(next);
