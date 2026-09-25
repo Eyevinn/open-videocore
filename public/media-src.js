@@ -82,8 +82,14 @@
  *        DELIVERY_MODE=proxy: they are `/api/v1/assets/:id/stream/*` paths
  *        behind the same bearer gate, and signing the manifest would not help
  *        because the player resolves each child segment against the same gated
- *        prefix (ADR-003 §2). See `isLoadableMediaUrl` below, which refuses
- *        them, and docs/osc-feedback/incoming-presigned-playback-segments.md.
+ *        prefix (ADR-003 §2), so there is nothing this module could do with one
+ *        — see docs/osc-feedback/incoming-presigned-playback-segments.md.
+ *        `isLoadableMediaUrl` refuses that specific gated prefix as a BACKSTOP
+ *        (`isBearerGatedStreamUrl` below), so handing one to this module fails
+ *        loudly and locally instead of 401-ing in the element. That backstop
+ *        recognizes a path SHAPE, not authorization in general: it is not a
+ *        substitute for the caller branching on WHICH key came back, which is
+ *        still the caller's job (CONTRIBUTING.md → "Inline media elements").
  *
  *   3. GET /api/v1/assets/{id}/files                          (issue #119)
  *      openapi.json → .paths["/api/v1/assets/{id}/files"].get
@@ -100,9 +106,47 @@
 
 // ─── Loadability ──────────────────────────────────────────────────────────────
 
-// Only an absolute http(s) URL may reach a media element's `src`.
+// A `/assets/<id>/stream/...` path: the ONE bearer-gated route our own API can
+// hand back as an ABSOLUTE, otherwise perfectly loadable-looking URL.
 //
-// Two jobs, both deliberate:
+// CONTRACT (CLAUDE.md rule 7):
+//   openapi.json → .paths["/api/v1/assets/{id}/stream/{*}"].get   (200 only)
+//   source       → src/routes/assets.ts:3287 (`'/:id/stream/*'`), behind the
+//                  router-wide bearer gate `authGate` (:1573)
+// Under DELIVERY_MODE=proxy the delivery route advertises exactly this shape in
+// `urls.hls`/`urls.dash`: `proxyManifestUrlsFor` (src/pipeline/packaging.ts:269)
+// appends `<id>/stream/index.m3u8` (`proxyStreamPrefix`, :260) to
+// `assetsBaseUrl(request.url)`, and that branch early-returns
+// `notConfiguredDelivery` unless the base is absolute (src/routes/assets.ts:3151)
+// — so the manifest URLs a caller can actually receive are absolute and pass an
+// `^https?://` test like any presigned storage URL. Matching the path shape is
+// the only way to tell them apart client-side.
+//
+// Matched on the PATH ONLY (query/fragment stripped by the URL parse), and
+// anchored on a whole `assets/<one segment>/stream` run so a query parameter or
+// a signature that merely mentions the words cannot trip it. No presigned
+// storage URL we issue collides: our object keys live under `packaged/`,
+// `sources/`, `ingest/`, `thumbnails/` and `subtitles/` prefixes
+// (`outputPrefix`, src/pipeline/packaging.ts:63; src/routes/assets.ts:2489, :4876).
+const GATED_STREAM_PATH = /(?:^|\/)assets\/[^/]+\/stream(?:\/|$)/i;
+
+export function isBearerGatedStreamUrl(url) {
+  if (typeof url !== 'string' || url === '') return false;
+  let path;
+  try {
+    // A base is supplied so a relative path is classified too; it is never
+    // fetched and never leaves this function.
+    path = new URL(url, 'https://relative.invalid').pathname;
+  } catch (_) {
+    path = url.split('?')[0].split('#')[0];
+  }
+  return GATED_STREAM_PATH.test(path);
+}
+
+// Only an absolute http(s) URL that is not itself a token-protected API path may
+// reach a media element's `src`.
+//
+// Three jobs, all deliberate:
 //   1. Trust boundary. The value comes from our own API, so this is an assertion
 //      rather than a fix for a known attack: it stops a surprising
 //      `javascript:`/`data:` value from ever being assigned.
@@ -112,8 +156,16 @@
 //      paths an inline element cannot authenticate against, and a URL-issuing
 //      route that returned one would be silently unusable. Failing loudly here
 //      turns that into a visible, testable failure instead of a broken element.
+//   3. It rejects the ABSOLUTE form of the gated stream prefix too. Absoluteness
+//      alone does not make a URL loadable by an unauthenticated element: under
+//      DELIVERY_MODE=proxy `urls.hls`/`urls.dash` are absolute URLs on a gated
+//      path (see `isBearerGatedStreamUrl`), and assigning one 401s in the
+//      element — the #785/#802 failure this module exists to prevent. This is a
+//      backstop for a known-emittable URL shape, NOT a general authorization
+//      check: a caller must still branch on which delivery key it received.
 export function isLoadableMediaUrl(url) {
-  return typeof url === 'string' && /^https?:\/\//i.test(url);
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false;
+  return !isBearerGatedStreamUrl(url);
 }
 
 // Read a loadable URL out of a JSON body by field path, e.g. `'url'`
@@ -229,6 +281,16 @@ const OWNER_KEY = '__openVideocoreMediaSrcOwner';
  * its `onFailure` — its teardown is scoped to the URL it assigned itself. So a
  * re-rendered row or a re-populated thumbnail strip cannot blank out an element
  * a newer, healthy call just filled in.
+ *
+ * ONE KNOWN EDGE, bounded and deliberate: an `error` belonging to the PREVIOUS
+ * invocation's resource that arrives while this invocation's `apiFetch` is still
+ * in flight is attributed to this invocation (it owns the only live listener and
+ * has assigned nothing yet, so neither staleness guard in `fail()` applies), and
+ * aborts it. The element then lands in the documented empty/placeholder state —
+ * never a stale or wrong asset — no listener leaks, and the next call on the
+ * element works normally, so this is strictly better than showing the resource
+ * that just failed. Closing it needs the predecessor's URL to be recorded at
+ * takeover and `error`-sourced failures distinguished from fetch-sourced ones.
  *
  * @param {Element} el          an `<img>`, `<video>`, `<audio>` or `<source>`
  * @param {object}  options
