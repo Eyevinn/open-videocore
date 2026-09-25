@@ -52,6 +52,46 @@ afterEach(() => {
   }
 });
 
+describe('DELETE /api/v1/assets/:id/external-ids/:namespace/:externalId (issue #867)', () => {
+  it('204: removes an attached pair', async () => {
+    const repo = new InMemoryAssetRepository();
+    const asset: Asset = await repo.create({ name: 'src' });
+    const app = await buildApp(repo);
+    await repo.attachExternalId(asset.id, { namespace: 'ingest-mam', id: 'X-1' });
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/assets/${asset.id}/external-ids/ingest-mam/X-1`
+    });
+    expect(res.statusCode).toBe(204);
+    expect((await repo.get(asset.id))?.externalIdentifiers).toBeUndefined();
+  });
+
+  it('204: idempotent when the pair was never attached', async () => {
+    const repo = new InMemoryAssetRepository();
+    const asset: Asset = await repo.create({ name: 'src' });
+    const app = await buildApp(repo);
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/assets/${asset.id}/external-ids/ingest-mam/never-attached`
+    });
+    expect(res.statusCode).toBe(204);
+  });
+
+  it('404: unknown asset id returns not_found', async () => {
+    const repo = new InMemoryAssetRepository();
+    const app = await buildApp(repo);
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/v1/assets/01JQZZZZZZZZZZZZZZZZZZZZZZ/external-ids/ingest-mam/X-1'
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: 'not_found' });
+  });
+});
+
 describe('POST /api/v1/assets/:id/external-ids (issue #577)', () => {
   it('200: attaches an external id and persists it on the asset', async () => {
     const repo = new InMemoryAssetRepository();

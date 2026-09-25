@@ -2801,6 +2801,87 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // Detach an upstream external identifier from an asset (issue #867, ADR-019).
+  // The missing inverse of the attach route above: without it a mistyped
+  // `{ namespace, id }` attached via POST /:id/external-ids was permanent, since
+  // PATCH /:id cannot reach the set (UpdateAssetInput carries no
+  // `externalIdentifiers` field, asset-repo.ts:613-674). Goes through the
+  // dedicated repository seam AssetRepository.detachExternalId (asset-repo.ts:902)
+  // for the same reason attach does — CouchDB routes it through updateWithRetry,
+  // so the read-modify-write is conflict-safe.
+  //
+  // PATH SHAPE mirrors the `/by-external-id/:namespace/:id` resolver
+  // (assets.ts:2718): the composite external key is addressed as two path
+  // segments, so an upstream id containing a colon (e.g. a URN) stays
+  // unambiguous. The second segment is named `:externalId` rather than a second
+  // `:id` because Fastify's router (find-my-way) silently COLLAPSES duplicate
+  // parameter names within one path — the last occurrence wins and the asset id
+  // would be lost. The wire path is unchanged:
+  // `/api/v1/assets/{id}/external-ids/{namespace}/{externalId}`.
+  //
+  // IDEMPOTENT by contract: 204 whether or not the asset carried the pair, so a
+  // retried or duplicated DELETE is never an error. Detaching a pair that was
+  // never attached is NOT a 404 — the asset, not the pair, is the addressed
+  // resource, matching the `DELETE /:id/tags/:tag` precedent (assets.ts:4859)
+  // where removing an absent tag is a no-op success rather than a 404. 204 (not
+  // 200 with the asset) because `assetSchema` declares no `externalIdentifiers`
+  // field, so a 200 body would be serialized WITHOUT the very field the caller
+  // just changed — an empty success is the honest envelope.
+  //
+  // Enforcing `(namespace, id)` uniqueness across the array is explicitly OUT OF
+  // SCOPE here (deferred to #577); the detach simply removes every entry equal to
+  // the pair, so an asset that accumulated a duplicate in advisory mode is
+  // cleared in one call.
+  //
+  // Error -> status mapping:
+  //   - empty `namespace` / `externalId` -> 400 (params schema, before handler).
+  //   - unknown asset id -> 404 (the ONLY 404 on this route).
+  //   - pair not attached -> 204 (idempotent success, not an error).
+  app.delete(
+    '/:id/external-ids/:namespace/:externalId',
+    {
+      schema: {
+        summary: 'Detach an upstream external identifier from an asset',
+        description:
+          'Remove the `{ namespace, id }` external identifier from the asset ' +
+          '(ADR-019) — the inverse of `POST /assets/{id}/external-ids`, for ' +
+          'correcting a mistyped or stale correlation. Idempotent: returns 204 ' +
+          'whether or not the asset carried the pair, so a repeated call is never ' +
+          'an error. 404 is returned only when the asset itself does not exist.',
+        params: z.object({
+          id: z.string().describe('Asset id.'),
+          namespace: z
+            .string()
+            .min(1)
+            .describe(
+              'Upstream system-of-record label the external id belongs to (e.g. ' +
+                '`ingest-mam`, `rights-registry`). Required, non-empty.'
+            ),
+          externalId: z
+            .string()
+            .min(1)
+            .describe(
+              'Opaque foreign-key value in that system (UUID / numeric id / slug). ' +
+                'Required, non-empty.'
+            )
+        }),
+        response: { 204: z.null(), 400: errorSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.detachExternalId(request.params.id, {
+        namespace: request.params.namespace,
+        id: request.params.externalId
+      });
+      // undefined means the ASSET is unknown — the only not-found case. A pair
+      // that was never attached comes back as the unchanged asset, i.e. 204.
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(204).send(null);
+    }
+  );
+
   // List the external identifiers attached to an asset (issue #866, ADR-019).
   // The READ-BACK half of the POST route above: `administrative.externalIdentifiers[]`
   // (asset-document.ts:329) is system-owned and deliberately NOT projected onto the
