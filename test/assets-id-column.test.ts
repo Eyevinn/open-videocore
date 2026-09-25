@@ -170,6 +170,29 @@ describe('copyable id cell helper (issue #851)', () => {
     await vi.waitFor(() => expect(btn.textContent).toBe('Copied'));
   });
 
+  it('announces the outcome as a status message and never leaves a stale name', async () => {
+    const host = document.createElement('div');
+    host.innerHTML = copyableIdCellHtml(ULID, 'Copy asset id');
+    document.body.appendChild(host);
+
+    const btn = host.querySelector('.' + COPY_ID_BTN_CLASS) as HTMLButtonElement;
+    // The button is its own polite live region, so the "Copied" feedback is a
+    // programmatically determinable status message (WCAG 2.1 SC 4.1.3, AA) and
+    // not a sighted-only flash.
+    expect(btn.getAttribute('aria-live')).toBe('polite');
+    expect(btn.getAttribute('aria-label')).toBe('Copy asset id');
+
+    wireCopyIdButtons(host, {
+      nav: { clipboard: { writeText: vi.fn(async () => {}) } } as unknown as Navigator,
+    });
+    btn.click();
+
+    // The accessible name moves with the visible text, so a screen reader never
+    // reads "Copy asset id" off a button that now says "Copied".
+    await vi.waitFor(() => expect(btn.textContent).toBe('Copied'));
+    expect(btn.getAttribute('aria-label')).toBe('Copied');
+  });
+
   it('degrades without a clipboard API — the value stays selectable text', () => {
     const host = document.createElement('div');
     host.innerHTML = copyableIdCellHtml(ULID, 'Copy asset id');

@@ -45,6 +45,12 @@ export const COPY_ID_BTN_CLASS = 'copy-id-btn';
  * always-visible click-to-copy button. No hover-only `title` carries the value
  * — the text IS the value.
  *
+ * ACCESSIBILITY: the button carries `aria-live="polite"` so the transient
+ * "Copied" / "Copy failed" feedback written into it by wireCopyIdButtons() is a
+ * programmatically determinable status message (WCAG 2.1 SC 4.1.3, level AA)
+ * rather than a visual-only flash. The visible word "Copy" is the start of the
+ * accessible name, so the name still contains the label (SC 2.5.3).
+ *
  * @param {string} value  the identifier to display and copy (e.g. an asset ULID)
  * @param {string} [label] accessible label for the button ("Copy asset id")
  * @returns {string} escaped HTML
@@ -59,6 +65,7 @@ export function copyableIdCellHtml(value, label) {
     '</span>' +
     '<button type="button" class="' + COPY_ID_BTN_CLASS + '" ' +
     'data-copy-id="' + escHtml(v) + '" ' +
+    'aria-live="polite" ' +
     'aria-label="' + escHtml(aria) + '">Copy</button>'
   );
 }
@@ -105,10 +112,18 @@ export function wireCopyIdButtons(root, opts) {
       if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
       const value = btn.dataset.copyId || '';
       const previous = btn.textContent;
+      const previousLabel = btn.getAttribute('aria-label');
+      // Report the outcome on the button and move its accessible name with the
+      // visible text, so a screen reader never reads a stale "Copy asset id"
+      // while the button says "Copied". The button is an aria-live region
+      // (markup above), which is what makes this feedback a status message
+      // instead of a sighted-only flash.
       const restore = function (text) {
         btn.textContent = text;
+        if (previousLabel !== null) btn.setAttribute('aria-label', text);
         setTimeout(function () {
           btn.textContent = previous;
+          if (previousLabel !== null) btn.setAttribute('aria-label', previousLabel);
         }, 1500);
       };
       if (value && nav && nav.clipboard && nav.clipboard.writeText) {
