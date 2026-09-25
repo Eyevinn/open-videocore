@@ -25,7 +25,10 @@
 //       createInstance(context, serviceId, token, body): Promise<any>  (:32)
 //       removeInstance(context, serviceId, name, token): Promise<void> (:46)
 //       listInstances(context, serviceId, token): Promise<any>         (:65)
-//       waitForInstanceReady(serviceId, name, context): Promise<void>
+//       getInstanceHealth(context, serviceId, name, token): Promise<string> (:86)
+//     'running' is the ready state the SDK's own waitForInstanceReady gates on
+//     (lib/core.js:347-349); the scaler polls getInstanceHealth itself because
+//     waitForInstanceReady has no timeout and no abort (lib/core.js:343-353).
 //     listInstances returns the raw JSON array from the OSC instances endpoint
 //     (lib/core.js listInstances) — elements carry `name`/`url`, and NO creation
 //     timestamp, which is why first-sighting is tracked in Valkey.
@@ -49,13 +52,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const createInstance = vi.fn();
 const removeInstance = vi.fn(async () => undefined);
 const listInstances = vi.fn(async () => [] as Array<Record<string, unknown>>);
-const waitForInstanceReady = vi.fn(async () => undefined);
+const getInstanceHealth = vi.fn(async (..._args: unknown[]) => 'running');
 
 vi.mock('@osaas/client-core', () => ({
   createInstance: (...args: unknown[]) => createInstance(...args),
   removeInstance: (...args: unknown[]) => removeInstance(...args),
   listInstances: (...args: unknown[]) => listInstances(...args),
-  waitForInstanceReady: (...args: unknown[]) => waitForInstanceReady(...args)
+  getInstanceHealth: (...args: unknown[]) => getInstanceHealth(...args)
 }));
 
 import {
@@ -148,6 +151,9 @@ function makeConfig(
     oscContext: OSC_CONTEXT_STUB,
     redis: redis as unknown as EncoreScalerConfig['redis'],
     getToken: async () => 'test-token',
+    // Keep the readiness poll sub-millisecond in tests; production uses the
+    // 1s default (DEFAULT_SPAWN_READY_POLL_INTERVAL_MS).
+    spawnReadyPollIntervalMs: 1,
     ...overrides
   };
 }
@@ -182,8 +188,8 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
     removeInstance.mockReset();
     removeInstance.mockResolvedValue(undefined);
     listInstances.mockReset();
-    waitForInstanceReady.mockReset();
-    waitForInstanceReady.mockResolvedValue(undefined);
+    getInstanceHealth.mockReset();
+    getInstanceHealth.mockResolvedValue('running');
   });
 
   it('records when the instance became ready so a never-dispatched instance can age out', async () => {
@@ -219,17 +225,18 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
       name: (body as { name: string }).name,
       url: `https://${(body as { name: string }).name}.example`
     }));
-    // Encore becomes ready; the LISTENER never does.
-    waitForInstanceReady.mockImplementation(async (serviceId: string) => {
-      if (serviceId === ENCORE_CALLBACK_LISTENER_SERVICE_ID) {
+    // Encore becomes ready; the LISTENER never does. getInstanceHealth's
+    // 2nd positional arg is the serviceId (lib/core.d.ts:86).
+    getInstanceHealth.mockImplementation(async (..._args: unknown[]) => {
+      if (_args[1] === ENCORE_CALLBACK_LISTENER_SERVICE_ID) {
         throw new Error('listener never became ready');
       }
-      return undefined;
+      return 'running';
     });
 
-    await expect(spawnInstance(makeConfig(redis, workspaceId))).rejects.toThrow(
-      /listener never became ready/
-    );
+    await expect(
+      spawnInstance(makeConfig(redis, workspaceId, { spawnReadyTimeoutMs: 20 }))
+    ).rejects.toThrow(/listener never became ready/);
 
     const removedServices = removeInstance.mock.calls.map((call) => call[1]);
     expect(removedServices).toContain(ENCORE_SERVICE_ID);
@@ -249,8 +256,9 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
       name: (body as { name: string }).name,
       url: `https://${(body as { name: string }).name}.example`
     }));
-    // Never resolves — exactly what the unbounded OSC helper does.
-    waitForInstanceReady.mockImplementation(() => new Promise<void>(() => undefined));
+    // Health never reaches 'running' — exactly the state the unbounded OSC
+    // helper would spin on forever.
+    getInstanceHealth.mockResolvedValue('starting');
 
     await expect(
       spawnInstance(makeConfig(redis, workspaceId, { spawnReadyTimeoutMs: 50 }))
@@ -259,6 +267,37 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
     // The live Encore instance is destroyed rather than left to bill.
     expect(removeInstance.mock.calls.map((call) => call[1])).toContain(ENCORE_SERVICE_ID);
     expect(await redis.hgetall(keys.pool(workspaceId))).toEqual({});
+  });
+
+  // Review round 2 (non-blocking, instance-pool.ts:285): the first fix raced a
+  // timer against waitForInstanceReady, which has no abort — so after the
+  // timeout the SDK's `while (!instanceOk)` loop kept issuing one
+  // getInstanceHealth call per second for the lifetime of the process, once per
+  // timed-out spawn. The scaler now owns the poll loop, so polling stops at the
+  // deadline: no health call may be issued after the spawn has rejected.
+  it('stops polling health once the readiness deadline passes', async () => {
+    const redis = new FakeRedis();
+    const workspaceId = 'ws-nopoll';
+    createInstance.mockImplementation(async (_ctx, _svc, _tok, body) => ({
+      name: (body as { name: string }).name,
+      url: `https://${(body as { name: string }).name}.example`
+    }));
+    getInstanceHealth.mockResolvedValue('starting');
+
+    await expect(
+      spawnInstance(
+        makeConfig(redis, workspaceId, {
+          spawnReadyTimeoutMs: 30,
+          spawnReadyPollIntervalMs: 5
+        })
+      )
+    ).rejects.toThrow(/timed out after 30ms/);
+
+    const callsAtRejection = getInstanceHealth.mock.calls.length;
+    expect(callsAtRejection).toBeGreaterThan(0);
+    // Well past several poll intervals and past the original timeout.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(getInstanceHealth.mock.calls.length).toBe(callsAtRejection);
   });
 });
 
@@ -273,7 +312,8 @@ describe('orphan reaper — instances on OSC with no pool record (issue #778)', 
     removeInstance.mockResolvedValue(undefined);
     listInstances.mockReset();
     listInstances.mockResolvedValue([]);
-    waitForInstanceReady.mockReset();
+    getInstanceHealth.mockReset();
+    getInstanceHealth.mockResolvedValue('running');
     // Default: every instance the reaper asks reports NO active jobs.
     stubEncoreActiveJobs(0);
   });

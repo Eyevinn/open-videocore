@@ -83,13 +83,20 @@ export type EncoreScalerConfig = {
   orphanReapIntervalMs?: number;
   // #778 (review finding 4): bound (ms) on how long spawnInstance waits for an
   // OSC instance to report `running`. @osaas/client-core's waitForInstanceReady
-  // polls getInstanceHealth in a `while` loop with NO timeout (lib/core.js:343-353,
-  // v0.24.0), so without this a spawn can hang forever while holding a live,
+  // polls getInstanceHealth in a `while` loop with NO timeout and no abort
+  // (lib/core.js:343-353, v0.24.0), so without this a spawn can hang forever
+  // while holding a live,
   // billing OSC instance that has no pool record — the very state the orphan
   // reaper's grace window is supposed to be able to outlast. On timeout the spawn
   // fails and its cleanup path destroys the Encore instance and any paired
   // listener. Unset uses DEFAULT_SPAWN_READY_TIMEOUT_MS.
   spawnReadyTimeoutMs?: number;
+  // #778 (review round 2): how often (ms) that bounded wait re-checks
+  // getInstanceHealth. The scaler owns the poll loop instead of racing a timer
+  // against waitForInstanceReady, because the SDK helper exposes no abort and
+  // would keep polling forever after we stopped waiting. Unset uses
+  // DEFAULT_SPAWN_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
+  spawnReadyPollIntervalMs?: number;
   // #778: how long (ms) an instance must have been continuously observed as
   // orphaned before the reaper destroys it. Guards a spawn in progress, which
   // holds a live OSC instance with no pool record for as long as

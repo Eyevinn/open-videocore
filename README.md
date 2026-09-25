@@ -368,6 +368,13 @@ is removed:
 Anything the sweep declines to remove is logged by name, so an instance that
 cannot be reclaimed automatically is at least visible.
 
+The fingerprint is derived from the deployment's workspace identity, which
+assumes what the rest of the scaler already assumes: one workspace identity means
+one deployment within a subscription. Two deployments configured with the same
+workspace identity but pointing at different Valkeys would produce the same
+fingerprint and each would treat the other's untracked instances as its own to
+reclaim. Give each deployment its own workspace identity.
+
 **Collections**
 
 | Method | Path | Description |

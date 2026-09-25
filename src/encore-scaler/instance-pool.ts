@@ -8,7 +8,7 @@
 // Contract sources (verified against @osaas/client-core lib/core.d.ts):
 //   createInstance(context, serviceId, token, body): Promise<any>
 //   removeInstance(context, serviceId, name, token): Promise<void>
-//   waitForInstanceReady(serviceId, name, ctx): Promise<void>
+//   getInstanceHealth(context, serviceId, name, token): Promise<string>  (:86)
 // The Encore serviceId is 'encore' (src/services/stack.ts:25). The returned
 // instance object carries `name` (instance id) and `url` — same fields the
 // provision route reads via instanceUrl() (src/routes/provision.ts:129).
@@ -17,9 +17,9 @@ import { createHash } from 'node:crypto';
 import type { Redis } from 'ioredis';
 import {
   createInstance,
+  getInstanceHealth,
   listInstances as oscListInstances,
-  removeInstance,
-  waitForInstanceReady
+  removeInstance
 } from '@osaas/client-core';
 import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './types.js';
 import { fetchEncoreActiveState } from './encore-active-state.js';
@@ -265,46 +265,83 @@ export async function reconcilePoolFromOsc(
 // docs/osc-feedback/incoming-waitforinstanceready-unbounded.md.
 export const DEFAULT_SPAWN_READY_TIMEOUT_MS = 5 * 60_000;
 
-// waitForInstanceReady with a deadline.
+// How often (ms) the bounded readiness wait re-checks instance health. Matches
+// the 1s cadence @osaas/client-core's own waitForInstanceReady uses
+// (lib/core.js:343-353, v0.24.0) so this is no chattier than the helper it
+// replaces. The final sleep is clamped to the remaining budget, so a timeout
+// shorter than one interval still ends on time.
+export const DEFAULT_SPAWN_READY_POLL_INTERVAL_MS = 1_000;
+
+// Wait for an OSC instance to report `running`, with a hard deadline.
 //
-// Contract: waitForInstanceReady(serviceId, name, ctx): Promise<void>
-// (@osaas/client-core lib/core.d.ts). It resolves once getInstanceHealth returns
-// 'running' and otherwise polls forever, so the only way to bound it from the
-// outside is to stop waiting on it. The abandoned poll keeps its own rejection
-// handled so a later failure can never surface as an unhandled rejection.
+// This polls getInstanceHealth directly rather than racing a timer against
+// @osaas/client-core's waitForInstanceReady (review round 2, non-blocking
+// finding on instance-pool.ts:285). Racing left the helper's internal
+// `while (!instanceOk)` loop running after we stopped waiting — the SDK offers
+// no AbortSignal and no cancellation — so every timed-out spawn leaked one
+// getInstanceHealth request per second for the lifetime of the process. Owning
+// the loop means the polling stops exactly when the deadline passes.
+//
+// Contract (verified, @osaas/client-core@0.24.0 lib/core.d.ts:86):
+//   getInstanceHealth(context: Context, serviceId: string, name: string,
+//                     token: string): Promise<string>
+// It resolves the instance's health string; 'running' is the ready state the
+// SDK's own helper gates on (lib/core.js:347-349). Transient health-probe
+// failures (a 404/503 while the instance is still being scheduled) are treated
+// as "not ready yet" and retried until the deadline rather than aborting the
+// spawn, with the last error folded into the timeout message.
+//
+// Both limitations are logged as OSC friction (CLAUDE.md rule 6):
+// docs/osc-feedback/incoming-waitforinstanceready-unbounded.md.
 async function waitForInstanceReadyBounded(
   serviceId: string,
   instanceId: string,
   config: EncoreScalerConfig
 ): Promise<void> {
   const timeoutMs = config.spawnReadyTimeoutMs ?? DEFAULT_SPAWN_READY_TIMEOUT_MS;
-  // Wrapped so a mock/implementation that throws synchronously or returns a
-  // non-promise still behaves like a promise here.
-  const ready = (async () =>
-    waitForInstanceReady(serviceId, instanceId, config.oscContext))();
-  void ready.catch(() => undefined);
+  const pollIntervalMs =
+    config.spawnReadyPollIntervalMs ?? DEFAULT_SPAWN_READY_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+  const sat = await config.oscContext.getServiceAccessToken(serviceId);
 
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      ready,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(
-          () =>
-            reject(
-              new Error(
-                `timed out after ${timeoutMs}ms waiting for OSC instance ${instanceId} ` +
-                  `(service ${serviceId}) to report running`
-              )
-            ),
-          timeoutMs
-        );
-        timer.unref?.();
-      })
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
+  let lastError: unknown;
+  let lastStatus: string | undefined;
+  for (;;) {
+    // Sleep first, as the SDK helper does: a just-created instance is never
+    // healthy on the same tick it was created.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.min(pollIntervalMs, remaining));
+      timer.unref?.();
+    });
+
+    try {
+      const status = await getInstanceHealth(
+        config.oscContext,
+        serviceId,
+        instanceId,
+        sat
+      );
+      lastStatus = status;
+      if (status === 'running') return;
+    } catch (err) {
+      lastError = err;
+    }
+    if (Date.now() >= deadline) break;
   }
+
+  const detail = lastError
+    ? `; last health check error: ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`
+    : lastStatus
+      ? `; last reported health: ${lastStatus}`
+      : '';
+  throw new Error(
+    `timed out after ${timeoutMs}ms waiting for OSC instance ${instanceId} ` +
+      `(service ${serviceId}) to report running${detail}`
+  );
 }
 
 // Spawn a fresh Encore OSC instance and register it in the pool. The instance
