@@ -2735,8 +2735,8 @@ Response 200 (application/json)
       "events": [
         "string"
       ],
-      "createdAt": "string",
-      "secret": "string"
+      "hasSecret": true,
+      "createdAt": "string"
     }
   ]
 }
@@ -2763,6 +2763,7 @@ Response 201 (application/json)
   "events": [
     "string"
   ],
+  "hasSecret": true,
   "createdAt": "string",
   "secret": "string"
 }
