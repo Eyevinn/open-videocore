@@ -341,11 +341,11 @@ describe('shared table states', () => {
 //
 // Verified contract: GET /api/v1/assets/{id}/thumbnails/{index}/url
 //   openapi.json .paths["/api/v1/assets/{id}/thumbnails/{index}/url"].get
-//   src/routes/assets.ts:4431 (route), :611 (`thumbnailUrlSchema`)
+//   src/routes/assets.ts:4438 (route), :611 (`thumbnailUrlSchema`)
 //   200 body: { assetId, index, objectKey, url, expiresAt, expiresInSeconds }.
 // The table reads exactly one field: `url`.
 describe('thumbnail cells resolve a presigned URL (issue #801)', () => {
-  const PRESIGNED = 'https://storage.example/thumbnails/a1/thumb_0s.jpg?X-Amz-Signature=abc';
+  const PRESIGNED = 'https://storage.example/thumbnails/a1/thumb_0s.jpg?sig=abc';
 
   const rowWithThumb = {
     id: 'a1',
@@ -407,7 +407,30 @@ describe('thumbnail cells resolve a presigned URL (issue #801)', () => {
     expect(img.classList.contains('thumb-placeholder')).toBe(false);
   });
 
-  it('keeps the placeholder — not a broken image — when the URL cannot be issued', async () => {
+  it('falls back to the authenticated byte route when no signed URL can be issued', async () => {
+    // Contract: GET /api/v1/assets/{id}/thumbnails/{index} streams image/jpeg
+    // from behind the bearer gate (src/routes/assets.ts:4391), so the table
+    // reads it with apiFetch and shows the bytes as a blob URL.
+    const objectUrl = 'blob:ops-ui/row-thumb';
+    (URL as unknown as { createObjectURL: unknown }).createObjectURL = vi.fn(() => objectUrl);
+    const { apiFetch, calls } = thumbApi((path) => {
+      if (path.endsWith('/url')) throw new Error('object storage failed to sign');
+      return {
+        blob: async () => new Blob([new Uint8Array([0xff, 0xd8])], { type: 'image/jpeg' }),
+      };
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await settle();
+    await settle();
+
+    expect(calls).toContain('/assets/a1/thumbnails/0');
+    const img = t.el.querySelector('tbody img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toBe(objectUrl);
+    expect(img.getAttribute('src')).not.toContain('/api/v1/');
+  });
+
+  it('keeps the placeholder — not a broken image — when neither route answers', async () => {
     // e.g. 501 not_configured / 502 storage_error, which apiFetch throws.
     const { apiFetch } = thumbApi(() => {
       throw new Error('object storage is not configured');

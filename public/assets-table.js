@@ -444,11 +444,13 @@ function buildColumns(renderCtx) {
 // GET /assets/:id/thumbnails/:index/url (contract in public/thumbnail-url.js).
 //
 // Cost is bounded by the page size — at most one request per visible row that
-// actually has a thumbnail, issued once per render, never per repaint. Failures
-// are silent by design: the row keeps its placeholder box (applyThumbnail
-// re-applies `thumb-placeholder`) rather than turning a storage hiccup into a
-// table-wide error. A response that arrives after the rows were replaced lands
-// on a detached element and is discarded with it.
+// actually has a thumbnail, issued once per render, never per repaint (a second
+// request follows only for a row whose signed URL could not be issued or loaded,
+// which then falls back to the authenticated byte route). Failures are silent by
+// design: the row keeps its placeholder box (applyThumbnail re-applies
+// `thumb-placeholder`) rather than turning a storage hiccup into a table-wide
+// error. A response that arrives after the rows were replaced lands on a
+// detached element and is discarded with it.
 function hydrateThumbnails(tbodyEl, apiFetch) {
   if (!tbodyEl || typeof apiFetch !== 'function') return;
   tbodyEl.querySelectorAll('img[data-thumb-asset-id]').forEach(function (img) {

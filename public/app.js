@@ -177,7 +177,13 @@ function uiAuthHeader() {
 
 const API_BASE = window.location.origin + '/api/v1';
 
-async function apiFetch(path, options = {}) {
+// `options.raw` (issue #801): resolve with the Response itself instead of a
+// parsed JSON body, for routes that serve bytes rather than JSON — e.g.
+// GET /api/v1/assets/:id/thumbnails/:index, which streams image/jpeg
+// (src/routes/assets.ts:4391-4405). Non-ok handling is unchanged, so a caller
+// still sees the same thrown Error for 404/501. `raw` is stripped before the
+// options reach fetch(); it is not a fetch init field.
+async function apiFetch(path, { raw = false, ...options } = {}) {
   const stack = stackOverride || getActiveStack();
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
@@ -210,6 +216,7 @@ async function apiFetch(path, options = {}) {
     err.body = body;
     throw err;
   }
+  if (raw) return res;
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
     return res.json();
@@ -2020,16 +2027,24 @@ async function renderAssetDetailBody(id, bodyEl) {
     // filled in from the presigned-URL endpoint over the authenticated apiFetch,
     // so the browser's GET to storage carries the signature in the URL itself.
     // Creating the elements first keeps the strip in index order regardless of
-    // which signature is issued first; one whose URL cannot be issued (or whose
-    // signed GET fails) is dropped rather than left as a broken-image icon.
+    // which signature is issued first; one whose URL cannot be issued falls back
+    // to the authenticated byte route's bytes, and one that neither source can
+    // resolve is dropped rather than left as a broken-image icon.
     function renderThumbnailStrip(container, assetId, count) {
       if (!count) return;
+      var strip = document.createElement('div');
+      strip.className = 'thumbnails';
+      // The "Thumbnails" heading is added by the FIRST image that actually
+      // resolves, not up front: an image that cannot be resolved removes itself,
+      // so a heading written in advance can end up labelling an empty strip.
       var titleEl = document.createElement('div');
       titleEl.className = 'section-title mt12';
       titleEl.textContent = 'Thumbnails';
-      container.appendChild(titleEl);
-      var strip = document.createElement('div');
-      strip.className = 'thumbnails';
+      function showTitle() {
+        if (titleEl.parentNode) return;
+        if (strip.parentNode === container) container.insertBefore(titleEl, strip);
+        else container.appendChild(titleEl);
+      }
       for (var i = 0; i < count; i++) {
         var img = document.createElement('img');
         img.alt = 'thumbnail';
@@ -2038,6 +2053,7 @@ async function renderAssetDetailBody(id, bodyEl) {
           apiFetch: apiFetch,
           assetId: assetId,
           index: i,
+          onSuccess: showTitle,
           onFailure: (function(el) {
             return function() { el.remove(); };
           })(img)
