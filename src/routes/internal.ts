@@ -316,7 +316,19 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           // the safety net if this never runs.
           if (opts.redis) {
             try {
-              const encoreJobId = execution.steps.find((s) => s.name === 'transcode')?.encoreJobId;
+              // Correlate via the `transcode` step, falling back to the
+              // `package` step (issue #739). A package-only execution has NO
+              // transcode step — its single `package` step carries the earlier
+              // transcode's Encore job id, stamped at dispatch
+              // (src/routes/assets.ts, package-only branch), which is the id the
+              // pin was taken under. Without the fallback the lookup resolves
+              // `undefined`, the unpin is skipped, and the pin holds an
+              // otherwise-idle instance out of scale-down for its full TTL.
+              // CONTRACT: `StepExecution.encoreJobId?: string`
+              // (src/data/pipeline-repo.ts:43-56, field at :47).
+              const encoreJobId =
+                execution.steps.find((s) => s.name === 'transcode')?.encoreJobId ??
+                execution.steps.find((s) => s.name === 'package')?.encoreJobId;
               const decoded = encoreJobId ? decodeEncoreJobId(encoreJobId) : undefined;
               if (encoreJobId && decoded) {
                 const instanceId = await opts.redis.hget(keys.jobInstance(decoded.workspaceId), encoreJobId);

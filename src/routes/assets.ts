@@ -158,6 +158,7 @@ import { isProfileRunnable } from '../services/profile-runnability.js';
 import { validateProfileColourSignalling } from '../pipeline/profile-colour-guard.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { pinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import { isDependencyUnreachableError } from '../encore-scaler/dependency-timeout.js';
 import {
   checkStackReachability,
@@ -1228,6 +1229,14 @@ export function latestCompletedTranscodeEncoreJobId(
 // the Redis pool using the encoreJobId → instanceId → EncoreInstanceRecord chain.
 // Returns undefined when the instance is no longer in the pool.
 //
+// Returns the resolved `instanceId` alongside the `url` because resolution alone
+// is only a point-in-time check: the caller must PIN that instance against
+// scale-down before enqueueing the packaging job (#525 pt.2 —
+// src/encore-scaler/packaging-pin.ts, gated in
+// src/encore-scaler/scaler-loop.ts:281-283 via `hasPendingPackaging`). The
+// instanceId is already walked here, so returning it avoids a second read of
+// `keys.jobInstance` at the pin site.
+//
 // Deliberately POOL-BASED rather than reading the dispatch-time
 // `keys.jobEncoreUrl` direct key the callback poller prefers
 // (src/pipeline/encore-callback-poller.ts:265-290): that key outlives the
@@ -1239,7 +1248,7 @@ export function latestCompletedTranscodeEncoreJobId(
 async function resolveEncoreJobUrlForPackaging(
   encoreJobId: string,
   redis: import('ioredis').Redis | undefined
-): Promise<string | undefined> {
+): Promise<{ url: string; instanceId: string } | undefined> {
   if (!redis) return undefined;
   const decoded = decodeEncoreJobId(encoreJobId);
   if (!decoded) return undefined;
@@ -1252,7 +1261,10 @@ async function resolveEncoreJobUrlForPackaging(
   if (!instanceJson || !encoreUuid) return undefined;
   try {
     const record = JSON.parse(instanceJson) as EncoreInstanceRecord;
-    return `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`;
+    return {
+      url: `${record.url.replace(/\/+$/, '')}/encoreJobs/${encoreUuid}`,
+      instanceId
+    };
   } catch {
     return undefined;
   }
@@ -2114,6 +2126,8 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     // object keys, which the service does not offer. Logged as OSC friction —
     // docs/osc-feedback/incoming-encore-packager-contract.md finding 6.
     let packageOnlyEncoreJobUrl: string | undefined;
+    let packageOnlyEncoreJobId: string | undefined;
+    let packageOnlyInstanceId: string | undefined;
     if (firstStep === 'package') {
       const encoreJobId = latestCompletedTranscodeEncoreJobId(existing);
       if (!encoreJobId) {
@@ -2124,11 +2138,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         });
         return undefined;
       }
-      packageOnlyEncoreJobUrl = await resolveEncoreJobUrlForPackaging(
+      const resolved = await resolveEncoreJobUrlForPackaging(
         encoreJobId,
         opts.packagingRedis
       );
-      if (!packageOnlyEncoreJobUrl) {
+      if (!resolved) {
         reply.code(409).send({
           error: 'instance_not_found',
           message:
@@ -2136,6 +2150,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         });
         return undefined;
       }
+      packageOnlyEncoreJobUrl = resolved.url;
+      packageOnlyInstanceId = resolved.instanceId;
+      packageOnlyEncoreJobId = encoreJobId;
     }
     // Unified source-object resolution (issue #612): every first step below
     // consumes the asset's source object, so gate them all through the ONE
@@ -2384,8 +2401,67 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               'package step reached without a resolved Encore job URL — refusing to enqueue a packaging job the packager cannot act on'
             );
           }
+          // #525 pt.2 pin, for the package-only path (issue #739). Resolution
+          // above is a point-in-time check, NOT a guarantee: the packager fetches
+          // `packageOnlyEncoreJobUrl` asynchronously, and between resolve and
+          // fetch the scaler may tear the instance down — at which point the
+          // packager never signals and reconcileStalledPackages fails the step 15
+          // minutes later with the opaque "packager never signalled completion"
+          // this pipeline exists to remove.
+          //
+          // A package-only run is MORE exposed than the transcode->package
+          // handoff it borrows its shape from: there the pin lands the instant
+          // the job goes terminal, before activeJobs is decremented, so the idle
+          // clock has not started. Here the transcode finished minutes-to-hours
+          // ago, the instance is already idle, and it is the prime teardown
+          // candidate on the next scaler tick.
+          //
+          // CONTRACT: pinInstanceForPackaging(redis, instanceId, encoreJobId)
+          // (src/encore-scaler/packaging-pin.ts:40-52, Pick<Redis,'sadd'|'pexpire'>)
+          // writes keys.pendingPackaging(instanceId)
+          // (src/encore-scaler/types.ts:306) with the same TTL the stalled-package
+          // reconciler uses; scale-down honours it via `hasPendingPackaging`
+          // (src/encore-scaler/scaler-loop.ts:281-283 — "Do NOT destroy it").
+          // Pinned BEFORE the enqueue, matching the ordering rationale at
+          // src/pipeline/encore-callback-poller.ts:571-580 and
+          // src/routes/internal.ts:525-547 — a pin taken after the packager has
+          // already been handed the job is a pin that can lose the race.
+          //
+          // Best-effort, like both existing pin sites (they catch and warn): a
+          // pin failure means the Redis the pool state was just read from is
+          // faulty, and failing the step would deny a run that is still likely to
+          // succeed. Unpinned is the pre-fix behaviour, not worse than it.
+          if (opts.packagingRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
+            try {
+              await pinInstanceForPackaging(
+                opts.packagingRedis,
+                packageOnlyInstanceId,
+                packageOnlyEncoreJobId
+              );
+            } catch (err) {
+              request.log.warn(
+                { err, instanceId: packageOnlyInstanceId, encoreJobId: packageOnlyEncoreJobId },
+                'failed to pin Encore instance for package-only packaging; proceeding unpinned'
+              );
+            }
+          }
           void opts.packaging!.triggerPackaging(asset.id, packageOnlyEncoreJobUrl);
-          stepsCopy[i] = { ...step, status: 'running', startedAt: now() };
+          // Stamp the transcode's Encore job id on the `package` step. A
+          // package-only execution has NO transcode step, and the packager's
+          // success callback releases the pin by looking the job id up on the
+          // execution (src/routes/internal.ts:317-327) — without this the unpin
+          // resolves `undefined`, is skipped, and the pin above lingers for its
+          // full TTL, blocking scale-down of an otherwise idle instance. It also
+          // gives operators and the stalled reconciler the only correlatable
+          // handle a package-only run has. `StepExecution.encoreJobId` is
+          // `string | undefined` (CONTRACT: src/data/pipeline-repo.ts:43-56,
+          // field at :47) — documented as transcode-stamped, not restricted to it.
+          stepsCopy[i] = {
+            ...step,
+            status: 'running',
+            ...(packageOnlyEncoreJobId ? { encoreJobId: packageOnlyEncoreJobId } : {}),
+            startedAt: now()
+          };
           break; // async — advanced by packager callback
         }
       }
@@ -4227,10 +4303,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // Resolve the Encore instance URL + UUID from Redis. Both must be present
       // (stored at dispatch time). If the instance has been scaled down, packaging
       // cannot proceed — the Encore job data is only accessible while the instance runs.
-      const encoreJobUrl = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
-      if (!encoreJobUrl) {
+      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
+      if (!resolvedPackagingTarget) {
         return reply.code(409).send({ error: 'instance_not_found', message: 'Encore instance no longer in pool — cannot resolve job URL for packaging' });
       }
+      const encoreJobUrl = resolvedPackagingTarget.url;
       // On-demand packager provisioning (epic #226, issue #244): the direct
       // package path also ensures the packager is live before enqueueing, so a
       // job is never dropped onto an unconsumed queue. Idempotent/concurrency-
@@ -4254,7 +4331,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // asynchronous steps (transcode/package) advance via OSC callbacks.
   //   202 — pipeline execution created
   //   404 — unknown asset
-  //   409 — a pipeline is already running / asset has no stored object
+  //   409 — a pipeline is already running / asset has no stored object /
+  //         (package-only, issue #739) `no_renditions` — nothing to package,
+  //         `no_transcode_job` — no recorded completed transcode to package from,
+  //         `instance_not_found` — the transcode's Encore instance is no longer
+  //         pooled, so the job URL the packager needs cannot be resolved
   //   501 — pipeline execution or the required OSC service is not configured
   //   502 — the first step's submission failed
   app.post(
