@@ -8,25 +8,47 @@
 // that instance URL (getInstance().url) and its service access token, then POSTs
 // the detection request to the function's endpoint.
 //
-// !!! WIRE SHAPE NOT CONTRACT-VERIFIED !!!
-// The get-service-schema tool describes ONLY the create-service-instance CONFIG
-// for eyevinn-function-scenes (required `name` (string) ONLY — it is a serverless
-// media function). It does NOT expose the runtime endpoint's request path or the
-// request/response BODY shape. That un-verified wire shape is deliberately
-// ISOLATED in this file (behind the injected SceneDetector interface from
-// scene-detector.ts) so it can be corrected in exactly one place, or swapped for
-// a stub, without touching the fire-and-forget orchestration. The request/
-// response mapping below encodes our best-effort assumption:
-//   request : { url: <presigned source> } POSTed to the function root ('/').
-//   response: a JSON envelope carrying either a structured `scenes` list or a
-//             bare `cuts` list of scene-boundary timecodes in seconds.
-// Both the endpoint path (`OSC_SCENE_DETECT_PATH`, default '/') and these field
-// names are overridable / centralised here precisely because they are NOT
-// contract-verified; scene-detector.ts normalizes whatever shape comes back.
+// !!! THE WIRE SHAPE BELOW IS KNOWN-WRONG — DO NOT COPY IT (issue #797/#798) !!!
+// The real contract has now been CONFIRMED from the service's own source and
+// OpenAPI document (see "Contract sources" below), and this file does not match
+// it. What the code below does versus what the service actually accepts:
+//   path   : POSTs to the function root ('/') — but '/' is the function's
+//            HEALTHCHECK (`server.get("/")`, index.js:33). It has no POST route,
+//            which is the real reason #783 saw `POST / -> 405 Allow: GET`. The
+//            detection endpoint is `POST /api/v1`.
+//   field  : sends `{ url: ... }` — the confirmed source-URL field is
+//            `medialocator` (api.json `#/model/request`, index.js:45).
+//   model  : treats detection as ONE synchronous call — it is actually an
+//            ASYNCHRONOUS JOB API: `POST /api/v1` returns
+//            `{ thumbnails, status }` (relative URLs) which the caller then polls.
+//   result : expects `{ scenes, cuts }` — the service returns NO scene-boundary
+//            timecodes at all, only extracted keyframe image URIs. The cut
+//            timecodes go to a file inside the job workdir that no documented
+//            endpoint exposes.
+// There is NO source-URL QUERY PARAMETER anywhere in the service: no handler ever
+// reads `req.query`. #797 was opened to find that parameter's name; the confirmed
+// answer is that it does not exist.
 //
-// Contract sources:
+// The wrong shape is left in place ON PURPOSE: #797 is contract-confirmation only
+// and explicitly excludes an implementation change; #798 is the fix. It stays
+// ISOLATED in this file (behind the injected SceneDetector interface from
+// scene-detector.ts) so #798 corrects it in exactly one place without touching the
+// fire-and-forget orchestration. Note that #798's own task text is written against
+// the false "GET + query parameter" premise and must be re-scoped — see the
+// investigation note for what the fix actually has to do.
+//
+// Contract sources (verified 2026-09-25):
+//   - Upstream service source `Eyevinn/function-scenes`
+//     @ 492a18f23e253194c27800563ea0c96bef187aef: `api.json` (the OpenAPI 3.0.0
+//     document the function itself serves at /api/docs/) — symbols
+//     `#/model/request.medialocator` (required) and `#/model/createJobResponse`
+//     (`thumbnails`, `status`); and `index.js` route table — `server.get("/")`
+//     (healthcheck, :33), `server.post("/api/v1")` (:39),
+//     `server.get("/api/v1/:id/status")` (:78),
+//     `server.get("/api/v1/:id/thumbnails")` (:63).
+//   - Full write-up: docs/investigations/797-function-scenes-runtime-contract.md
 //   - get-service-schema `eyevinn-function-scenes` (provisioning config: `name`
-//     only). Runtime wire shape NOT exposed by get-service-schema — isolated here.
+//     only — it exposes NO runtime wire shape, which is why the source was needed).
 //   - services/stack.ts SCENE_DETECT_SERVICE_ID.
 
 import { getInstance, type Context } from '@osaas/client-core';
@@ -45,16 +67,24 @@ export type OscSceneApi = {
   // instance.
   instanceName: string;
   // Runtime endpoint path on the function, appended to the instance URL. Default
-  // '/'. Overridable because the path is NOT contract-verified (see file header).
+  // '/'. KNOWN-WRONG default (issue #798): '/' is the function's healthcheck; the
+  // confirmed detection path is '/api/v1' (index.js:39). The override exists so a
+  // deployment can already point at the right path via SCENE_DETECT_PATH, but the
+  // request body and response handling are still wrong until #798 lands.
   path?: string;
   // Injectable fetch for tests; defaults to the global fetch.
   fetchImpl?: typeof fetch;
 };
 
-// Build the JSON request body for the detection endpoint. Kept in one function
-// so the (unverified) field names are easy to correct once the real contract is
-// known. `url` mirrors the ffmpeg-s3 `-i` / auto-subtitles convention: the
-// function is handed an addressable, short-lived presigned source URL.
+// Build the JSON request body for the detection endpoint.
+//
+// KNOWN-WRONG (issue #798): the confirmed contract names this field
+// `medialocator`, not `url` — `api.json` `#/model/request` marks `medialocator`
+// required, and the handler reads `req.body.medialocator` (index.js:45). Kept in
+// one function so #798 corrects the name in a single place. The value itself is
+// right: `medialocator` is documented as "URL to video file or video stream" and
+// is handed straight to `ffmpeg -i`, so a short-lived presigned GET URL satisfies
+// it (same convention as the ffmpeg-s3 `-i` / auto-subtitles paths).
 export function sceneRequestBody(presignedUrl: string): Record<string, unknown> {
   return { url: presignedUrl };
 }
@@ -102,9 +132,11 @@ export function makeOscSceneDetector(api: OscSceneApi): SceneDetector {
       throw new Error(`scene-detect function failed: HTTP ${res.status}`);
     }
 
-    // Parse the JSON envelope. The exact shape is not contract-verified (see file
-    // header); we pass whatever `scenes`/`cuts` fields are present straight to the
-    // normalizer in scene-detector.ts, which defends every field.
+    // Parse the JSON envelope. KNOWN-WRONG (issue #798): the confirmed contract
+    // returns `{ thumbnails, status }` (relative URLs to poll) from POST /api/v1 —
+    // never `scenes`/`cuts`. Both fields below therefore always resolve to
+    // undefined against the real service. The normalizer in scene-detector.ts
+    // defends every field, so this degrades to "no scenes" rather than throwing.
     const json = (await res.json()) as SceneDetectorResult;
     return {
       scenes: json.scenes,
