@@ -223,11 +223,16 @@ The evidence does not support a regression:
   ("feat(scaler): pair callback listener with each Encore instance", 2026-07-07);
   the same single commit introduced `ENCORE_CALLBACK_LISTENER_SERVICE_ID` in
   `src/encore-scaler/instance-pool.ts`. (Run repo-wide, the same `-S` search
-  reaches further back to `f128ae1`, 2026-06-02 — the superseded `backend-api`
-  Encore client, which is a different, pre-scaler code path. It read the URI
+  returns six commits; the oldest **call site** that puts `progressCallbackUri`
+  into an Encore job payload is `f128ae1`, 2026-06-02 — the superseded
+  `backend-api` Encore client, a different, pre-scaler code path. It read the URI
   from `ENCORE_CALLBACK_URL` in `backend-api/src/pipeline/transcode.ts:75` and
   likewise attached no credential to the listener leg, so the claim holds under
-  either scoping.) There has never been a credential to lose.
+  either scoping. The three older hits are not call sites: `799a678` adds an
+  optional `progressCallbackUri` to an inbound request schema and states in the
+  same diff that it is *not* forwarded, `c292546` is a code comment, and
+  `2f8349a` is a prose row in `ADR-001-osc-stack.md`.) There has never been a
+  credential to lose.
 - **#457 and #812 are the same race at different layers.** #457 (2026-08-31)
   caught the window at the TLS layer (ingress certificate not yet trusted);
   #812 catches it at the authorisation layer (the callback path still
@@ -395,31 +400,43 @@ With #818 merged, **step 1 below is the sole remaining code change.**
    `callbackPathUnusableAt` path already leans on it deliberately.
 
 This is an in-repo fix. No OSC change is required to unblock #814 — but the
-underlying platform behaviour is still a gap worth reporting (section 6).
+underlying platform behaviour is a gap, and is logged as one (section 6).
 
 ---
 
 ## 6. OSC friction logged
 
-Two distinct platform issues fall out of this and are logged in the agent-team
-repo per CLAUDE.md rule 6 (OSC friction lives in `eng-open-videocore-agents`, not
-here):
+Two distinct platform issues fall out of this. Both are logged, per CLAUDE.md
+rule 6, in **this** repo at
+[`docs/osc-feedback/incoming-callback-listener-ingress-auth-window-fresh-instance.md`](../osc-feedback/incoming-callback-listener-ingress-auth-window-fresh-instance.md)
+— added by this change, alongside the 14 `incoming-*.md` logs already here. (The
+earlier TLS-layer log for the same lifecycle band, `#457`'s
+`incoming-callback-listener-tls-trust-race-first-job.md`, lives in
+`eng-open-videocore-agents`; that repo keeps its own `docs/osc-feedback/`, and
+whoever consolidates for submission should pick both up.)
 
-- `docs/osc-feedback/incoming-callback-listener-ingress-auth-window-fresh-instance.md`
-  — a freshly-created `eyevinn-encore-callback-listener` instance's ingress
-  starts answering on `/` ~13–18 s **before** `/encoreCallback` stops returning
-  401, so the origin returns 200 while the callback path is still auth-walled.
-  The log states only that observable and explicitly declines to assert *why*
-  the origin answers 200 (§2, "not determined") so the platform team is not sent
-  after the wrong mechanism. Requested capability: a readiness signal that means
-  "ingress routing *and* inbound authorisation are both live on the callback
-  path", or ordering the authorisation policy before the hostname starts serving.
-- The same log records the contract gap: the inbound authentication policy for
-  per-instance ingresses (which paths are auth-walled, which are reachable
-  unauthenticated) is **not represented anywhere in the catalog service record**
-  (`availableServiceInstanceOptions` = `["name","RedisUrl","EncoreUrl","RedisQueue"]`),
-  so it cannot be verified contract-first ahead of time — it can only be
+What the log records:
+
+- **The window.** A freshly-created `eyevinn-encore-callback-listener` instance's
+  ingress starts answering on `/` ~13–18 s **before** `/encoreCallback` stops
+  returning 401, so the origin returns 200 while the callback path is still
+  auth-walled. The log states only that observable and explicitly declines to
+  assert *why* the origin answers 200 (§2, "not determined") so the platform team
+  is not sent after the wrong mechanism. Requested capability: a readiness signal
+  that means "ingress routing *and* inbound authorisation are both live on the
+  callback path", or ordering the authorisation policy before the hostname starts
+  serving.
+- **The contract gap.** The inbound authentication policy for per-instance
+  ingresses (which paths are auth-walled, which are reachable unauthenticated,
+  and from what point in the instance lifecycle) is **not represented anywhere in
+  the catalog service record** (`availableServiceInstanceOptions` =
+  `["name","RedisUrl","EncoreUrl","RedisQueue"]`, re-fetched live while addressing
+  review), so it cannot be verified contract-first ahead of time — it can only be
   discovered empirically, as it was here.
+- **One minor, as a footnote in the log.** `GET /mysubscriptions` on the catalog
+  answers **500** (`FST_ERR_FAILED_ERROR_SERIALIZATION`) rather than 401 when the
+  auth header is present but in the wrong form; the correct header is
+  `x-pat-jwt: Bearer <PAT>` (`@osaas/client-core@0.24.0` `lib/context.js:24-31`).
 
 ---
 
@@ -435,7 +452,7 @@ here):
 | `probeCallbackTrust` passes during that window, **including after #818** | **Confirmed** — `HEAD origin → 200` observed in both runs at the moment `/encoreCallback` was still 401; on `main`, 200 ∉ `CALLBACK_REJECTED_STATUSES` (`callback-trust-probe.ts:77`) and the target is still the origin (`:138,151`) |
 | Encore's job payload has no callback-credential field | **Confirmed** — live `/v3/api-docs` from an Encore instance; `EncoreJobRequestBody` property list; `components` has only `schemas` |
 | Catalog record documents no auth requirement or knob | **Confirmed** — live `/mysubscriptions` record |
-| No in-repo regression | **Confirmed** — `git log -S "progressCallbackUri" -- src/encore-scaler/scaler-loop.ts` → single commit `7eb6217` (2026-07-07); the older repo-wide hit `f128ae1` (2026-06-02, superseded `backend-api` client) also carried no credential |
+| No in-repo regression | **Confirmed** — `git log -S "progressCallbackUri" -- src/encore-scaler/scaler-loop.ts` → single commit `7eb6217` (2026-07-07); the oldest repo-wide **call site**, `f128ae1` (2026-06-02, superseded `backend-api` client), also carried no credential — the three older `-S` hits are a request-schema field that is explicitly not forwarded, a comment and ADR prose |
 | The `testsimon` tenant's instance failed for this same reason | **Inferred (high confidence)** — reproduced in tenant `oscaidev`; the reported symptom, path, status code and instance age all match phase 2. Not reproduced in `testsimon` itself, which this session cannot reach |
 | A `HEAD`/`GET` on `/encoreCallback` also 401s during the window | **Inferred** — the timed runs probed `POST` only; §1c shows the ingress verdict is method-independent on every path tested. #814 should confirm directly |
 | Exact mechanism *inside* the OSC ingress | **Not determined** — black box; observable only from outside. Does not change the fix direction |
@@ -446,11 +463,23 @@ here):
 
 Live platform (fetched this session):
 
-- `GET https://catalog.svc.prod.osaas.io/mysubscriptions` → `serviceId: "eyevinn-encore-callback-listener"`:
-  `availableServiceInstanceOptions`, `serviceInstanceOptions`, `serviceAssociations`, `apiUrl`, `repoUrl`.
-- `GET https://api-eyevinn-encore-callback-listener.auto.prod-se.osaas.io/encore-callback-listenerinstance` (`x-jwt: Bearer <SAT>`) → instance list + `url` per instance.
+- `GET https://catalog.svc.prod.osaas.io/mysubscriptions` (`x-pat-jwt: Bearer <PAT>`,
+  the header contract in `@osaas/client-core@0.24.0` `lib/context.js:24-31`) →
+  `serviceId: "eyevinn-encore-callback-listener"`: `availableServiceInstanceOptions`
+  = `["name","RedisUrl","EncoreUrl","RedisQueue"]`, `serviceInstanceOptions` (no
+  auth/token/credential option), `serviceAssociations` (`RedisUrl → valkey-io-valkey`,
+  `EncoreUrl → encore`), `apiUrl`, `repoUrl`. **Re-fetched 2026-09-25 while
+  addressing review — unchanged.**
+- `POST https://token.svc.prod.osaas.io/servicetoken` (`x-pat-jwt: Bearer <PAT>`,
+  body `{"serviceId":"eyevinn-encore-callback-listener"}`) → `{ token }`, the SAT
+  used below.
+- `GET https://api-eyevinn-encore-callback-listener.auto.prod-se.osaas.io/encore-callback-listenerinstance` (`x-jwt: Bearer <SAT>`) → instance list + `url` per instance (6 instances on 2026-09-25).
 - `GET <encore-instance>/v3/api-docs` → `components.schemas.EncoreJobRequestBody.properties.progressCallbackUri`; `components` keys = `["schemas"]` only (no `securitySchemes`); no top-level `security`.
-- Live HTTP probes of listener ingresses, warm and freshly created (tables and timelines above), re-run on a warm instance while addressing review.
+- Live HTTP probes of listener ingresses, warm and freshly created (tables and
+  timelines above). The §1b/§1c steady-state rows were re-run unauthenticated on
+  **two** warm instances (`ovc`, `scalerqabeta0911mtwkc5fu`) on 2026-09-25 while
+  addressing review — identical results; no `POST` was sent this round, to avoid
+  enqueuing a synthetic callback.
 
 Upstream service source:
 
