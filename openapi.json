@@ -2458,6 +2458,26 @@
             "in": "query",
             "name": "parentId",
             "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "description": "Inclusive lower bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the first instant of that UTC day) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "description": "Inclusive upper bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the LAST instant of that UTC day, so the named day is included) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
           }
         ],
         "responses": {
@@ -2951,6 +2971,28 @@
                     "limit",
                     "offset",
                     "total"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -20124,7 +20166,7 @@
         "tags": [
           "search"
         ],
-        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`.",
+        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`. The exact-filter tier also carries `status` (exact lifecycle match, asset-only) and an inclusive created-at range `from`/`to` (issue #833); both are applied to the whole matched set before pagination, so they narrow `total` and every page rather than the page in hand.",
         "parameters": [
           {
             "schema": {
@@ -20164,6 +20206,42 @@
             "in": "query",
             "name": "mimeType",
             "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "uploading",
+                "processing",
+                "ready",
+                "failed",
+                "archived"
+              ]
+            },
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "description": "Exact-match lifecycle status filter, identical in accepted values and match semantics to `GET /api/v1/assets/?status=`. Applied independently of `q`, so the same status answers the same asset set with or without a free-text term. Asset-only: supplying it excludes all collection hits, since a collection has no lifecycle status."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "description": "Inclusive lower bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the first instant of that UTC day) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "description": "Inclusive upper bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the LAST instant of that UTC day, so the named day is included) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
           },
           {
             "schema": {

@@ -306,11 +306,26 @@ in the ops UI.
 
 **Search**
 
-The single canonical search endpoint. It combines an exact-filter tier (`tags`,
-`mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text
-tier (`q`, over name and description) behind one contract; all filters are ANDed
-and results are paginated (`page`/`pageSize`, returned as `{ assets, total,
-page }`).
+The single canonical search endpoint. It combines an exact-filter tier (`status`,
+`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`, `from`/`to`)
+with a free-text tier (`q`, over name and description) behind one contract; all
+filters are ANDed and results are paginated (`page`/`pageSize`, returned as
+`{ assets, total, page }`).
+
+`status` takes the same values and has the same exact-match semantics as
+`GET /api/v1/assets?status=`, and is applied independently of `q` — the same
+status answers the same asset set with or without a free-text term. It is
+asset-only: supplying it excludes collection hits, since a collection has no
+lifecycle status.
+
+`from` and `to` bound the asset creation timestamp and are accepted by **both**
+`GET /api/v1/search` and `GET /api/v1/assets`. Each takes either a calendar date
+(`YYYY-MM-DD`) or a full ISO 8601 date-time, and **both bounds are inclusive**: a
+bare `from` date means the first instant of that UTC day and a bare `to` date the
+last, so `?from=2026-03-01&to=2026-03-01` returns everything created during
+1 March. The range is applied to the whole result set before pagination, so it
+narrows `total` and every page rather than only the page returned. A `from` later
+than `to` is a `400`, not an empty page.
 
 | Method | Path | Description |
 |---|---|---|

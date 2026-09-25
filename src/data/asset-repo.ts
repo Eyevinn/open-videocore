@@ -13,6 +13,7 @@
 
 // ADR-003/#59: workspace guard removed (structural OSC isolation).
 import { ulid } from 'ulid';
+import { withinCreatedRange } from './created-range.js';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -698,6 +699,12 @@ export type ListOptions = {
   // `versionGroupId` equals this value — used by the versions listing surface to
   // enumerate every version in a chain. Independent of `parentId`.
   versionGroupId?: string;
+  // Inclusive created-at range (issue #833), carried already normalised to
+  // canonical UTC instants by the route (src/data/created-range.ts). The filter
+  // is applied to the WHOLE result set before `limit`/`offset` are taken, so a
+  // range narrows every page and `total`, not just the page returned.
+  createdFrom?: string;
+  createdTo?: string;
 };
 
 export type ListResult = {
@@ -1490,6 +1497,11 @@ export class InMemoryAssetRepository implements AssetRepository {
     }
     if (opts.versionGroupId !== undefined) {
       all = all.filter((a) => a.versionGroupId === opts.versionGroupId);
+    }
+    // Created-at range (issue #833), applied BEFORE the slice below so it
+    // narrows the full set (and therefore `total`) rather than one page.
+    if (opts.createdFrom !== undefined || opts.createdTo !== undefined) {
+      all = all.filter((a) => withinCreatedRange(a.createdAt, opts));
     }
     all.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     const items = all.slice(offset, offset + limit).map((a) => ({ ...a }));

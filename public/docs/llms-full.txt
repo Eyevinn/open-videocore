@@ -493,6 +493,8 @@ limitqueryintegeroptional
 offsetqueryintegeroptional
 statusquerystring (uploading, processing, ready, failed, archived)optional
 parentIdquerystringoptional
+fromquerystringoptional
+toquerystringoptional
 
   Response
 Response 200 (application/json)
@@ -2660,6 +2662,9 @@ NameInTypeRequired
 qquerystringoptional
 tagsquerystringoptional
 mimeTypequerystringoptional
+statusquerystring (uploading, processing, ready, failed, archived)optional
+fromquerystringoptional
+toquerystringoptional
 tamsFlowIdquerystringoptional
 tamsTimerangequerystringoptional
 pagequeryintegeroptional

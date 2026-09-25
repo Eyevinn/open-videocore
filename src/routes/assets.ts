@@ -38,6 +38,15 @@ import {
   type PackagedOutput,
   type SubtitleTrack
 } from '../data/asset-repo.js';
+// Created-at range filtering (issue #833). The wire grammar, the inclusive
+// bound semantics and the normalisation to canonical UTC instants live in ONE
+// module shared with GET /api/v1/search/, so the two endpoints cannot answer a
+// differently-shaped range for the same query string.
+import {
+  CreatedFromSchema,
+  CreatedToSchema,
+  resolveCreatedRange
+} from '../data/created-range.js';
 // Collection membership (issue #570). The asset DELETE route blocks archiving an
 // asset that is still a member of one or more collections; the collection repo
 // owns the authoritative membership representation (the flat `assetIds` list,
@@ -365,7 +374,13 @@ const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   offset: z.coerce.number().int().min(0).optional(),
   status: statusSchema.optional(),
-  parentId: z.string().min(1).optional()
+  parentId: z.string().min(1).optional(),
+  // Inclusive created-at range (issue #833). Same grammar and same match
+  // semantics as `GET /api/v1/search/?from=&to=` — both import the one
+  // definition in data/created-range.ts. Applied to the whole result set before
+  // `limit`/`offset`, so it narrows `total` and every page.
+  from: CreatedFromSchema.optional(),
+  to: CreatedToSchema.optional()
 });
 
 // TAMS-addressed lookup query params (issue #175, sub-task of #116; contract
@@ -2516,9 +2531,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
   app.get(
     '/',
-    { schema: { querystring: listQuerySchema, response: { 200: listSchema } } },
-    async (request) => {
-      return repo.list(request.query);
+    {
+      schema: {
+        querystring: listQuerySchema,
+        response: { 200: listSchema, 400: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { from, to, ...rest } = request.query;
+      // An inverted range is a caller mistake, not an empty page (issue #833).
+      const created = resolveCreatedRange({ from, to });
+      if (!created.ok) {
+        return reply.code(400).send({ error: 'invalid_created_range', message: created.message });
+      }
+      return repo.list({ ...rest, ...created.range });
     }
   );
 

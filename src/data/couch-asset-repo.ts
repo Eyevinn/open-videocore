@@ -729,6 +729,41 @@ function buildSelector(opts: ListOptions): Record<string, unknown> {
     // Mirror of structural.versionGroupId for indexable Mango filtering (#118).
     selector['versionGroupId'] = opts.versionGroupId;
   }
+  // Created-at range (issue #833), pushed DOWN into Mango rather than applied to
+  // the fetched page. `list()` paginates in the database (limit/skip) and counts
+  // with the same selector, so filtering after the fetch would only ever narrow
+  // the page in hand and leave `total` wrong — the range has to be part of the
+  // selector for it to hold across every page.
+  //
+  // CONTRACT (verified, not assumed) — Apache CouchDB 3.5 documentation,
+  // `ddocs/mango.rst`:
+  //   - "Condition Operators" table: `$gte` = "The field is greater than or
+  //     equal to the argument", `$lte` = "The field is less than or equal to
+  //     the argument", both taking "Any JSON" as the argument, so a string
+  //     bound is valid ("Strict type matching is used" — both sides are
+  //     strings here).
+  //   - `find/subfields`: dot notation addresses a nested field, which is how
+  //     `structural.tams.*` is already pushed down in couch-search-repo.ts.
+  //   - Note under "Condition Operators": the field "must exist in the document
+  //     for the selector to match". `administrative.createdAt` is REQUIRED by
+  //     AssetDocumentSchema (asset-document.ts), so it exists on every asset
+  //     document and nothing is silently dropped.
+  // The bound arrives normalised to the canonical `new Date().toISOString()`
+  // shape (created-range.ts) — identical fixed-width form to the stored value —
+  // so the comparison is between equally-shaped strings and orders
+  // chronologically. There is deliberately no top-level `createdAt` mirror
+  // added here: documents written before this change carry no such mirror, and
+  // filtering on one would silently exclude every pre-existing asset.
+  if (opts.createdFrom !== undefined || opts.createdTo !== undefined) {
+    const range: Record<string, string> = {};
+    if (opts.createdFrom !== undefined) {
+      range['$gte'] = opts.createdFrom;
+    }
+    if (opts.createdTo !== undefined) {
+      range['$lte'] = opts.createdTo;
+    }
+    selector['administrative.createdAt'] = range;
+  }
   return selector;
 }
 
