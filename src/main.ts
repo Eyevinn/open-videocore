@@ -1546,6 +1546,15 @@ function activateScaler(redisUrl: string): void {
     // deactivateScaler clears independently). undefined when the packager secrets
     // are absent, exactly as for the manual path, so the handoff is a no-op then.
     ensurePackaging,
+    // #829: webhook delivery for transcode terminal states. The poller is the
+    // path that completes transcodes on any deployment where Encore's callback
+    // does not reach POST /api/v1/internal/encore-callback (and on every
+    // completion recovered by its sweep), so without this the four events
+    // `transcode.complete` / `asset.ready` / `transcode.failed` / `asset.failed`
+    // were never dispatched. Same dispatcher instance the internal router gets
+    // (see the internalRouter registration below), so both terminal-state paths
+    // deliver identical payloads to the same registrations.
+    webhookDispatcher,
     logger: app.log
   });
 
