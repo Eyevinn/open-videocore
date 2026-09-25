@@ -747,14 +747,27 @@ const rewrapRunner = storageAvailable
       })
   : undefined;
 
-const clipRunner: ClipRunner | undefined = storageAvailable
-  ? makeOscClipRunner({
-      context: oscContext,
-      createJob,
-      getJob,
-      getLogsForInstance,
-      removeJob
-    })
+// Clip / trim (issue #17) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to seek
+// to a window and stream-copy it into a new child asset. Like the thumbnail
+// extractor and the re-wrap runner it is a factory so the route can supply the
+// workspace's MinIO credentials (resolved from the stack config) at request
+// time: the clip is written to `s3://bucket/key` via the ffmpeg-s3 native S3
+// writer, because ffmpeg cannot mux an MP4 to a presigned HTTPS PUT URL
+// (issue #786 — the job "succeeded" and no object was written). When object
+// storage is missing POST /:id/clip responds 501.
+const clipRunner = storageAvailable
+  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): ClipRunner =>
+      makeOscClipRunner({
+        context: oscContext,
+        createJob,
+        getJob,
+        getLogsForInstance,
+        removeJob,
+        s3Endpoint: s3.endpoint,
+        s3AccessKey: s3.accessKey,
+        s3SecretKey: s3.secretKey,
+        s3Bucket: s3.bucket
+      })
   : undefined;
 
 // Auto-subtitles (issue #114) and scene detection (issue #115) are OPTIONAL,
