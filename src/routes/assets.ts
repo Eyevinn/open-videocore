@@ -95,7 +95,10 @@ import {
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
 import { InvalidPathTemplateError } from '../services/destination-path-template.js';
-import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+import {
+  STACK_CONFIG_NAMESPACE,
+  stackResolvedMinioEndpoint
+} from '../services/workspace-stack.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
@@ -2924,15 +2927,23 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const packagedBase = externalPublicBaseUrl(stackStorage?.packaged);
       const sourceBase = externalPublicBaseUrl(stackStorage?.source);
       // Public origin for the DEFAULT per-stack MinIO backend (issue #859).
-      // PACKAGED_PUBLIC_BASE_URL wins when set; otherwise the resolved stack's
-      // OWN MinIO endpoint (StackConfig.minioEndpoint, carried per request as
-      // connections.s3Config.endpoint) IS the public origin for its packaged
-      // bucket, so a zero-config stack advertises absolute, anonymously
-      // fetchable manifest URLs instead of falling through to the authorized
-      // stream proxy below. Undefined when no stack is resolved (env-override /
-      // in-memory), which keeps the pre-#859 relative-then-proxy behaviour.
+      // PACKAGED_PUBLIC_BASE_URL wins when set; otherwise a PROVISIONED stack's
+      // OWN MinIO endpoint (StackConfig.minioEndpoint) IS the public origin for
+      // its packaged bucket, so a zero-config stack advertises absolute,
+      // anonymously fetchable manifest URLs instead of falling through to the
+      // authorized stream proxy below. That is sound precisely because this
+      // codebase applies the anonymous-read policy to the packaged bucket when it
+      // provisions the stack (routes/provision.ts, issue #199).
+      //
+      // The endpoint comes from `stackResolvedMinioEndpoint`, NOT from
+      // `s3Config.endpoint` directly: on the env-override path (COUCHDB_URL /
+      // MINIO_URL) that same field carries MINIO_URL verbatim for a MinIO we never
+      // policy-configured, so deriving an origin there would swap a working
+      // authorized proxy URL for one that 403s. It returns undefined for the
+      // env-override and in-memory paths, keeping their pre-#859
+      // relative-then-proxy behaviour unchanged.
       const packagedPublicBase = packagedPublicOrigin(
-        request.connections?.s3Config?.endpoint
+        stackResolvedMinioEndpoint(request.connections)
       );
 
       // Preferred: packaged streaming manifests (issue #9 / #200 / #201 / #213).
@@ -3421,13 +3432,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // already resolve to something absolute.
       //
       // The origin resolved against is the SAME one /:id/delivery uses
-      // (issue #859): PACKAGED_PUBLIC_BASE_URL when set, else the resolved
-      // stack's own MinIO endpoint (connections.s3Config.endpoint). Keeping the
-      // two call sites on one origin is what makes `manifestUrl` here match the
+      // (issue #859): PACKAGED_PUBLIC_BASE_URL when set, else a PROVISIONED
+      // stack's own MinIO endpoint via `stackResolvedMinioEndpoint` (undefined on
+      // the env-override / in-memory paths, which therefore keep proxying).
+      // Keeping the two call sites on one origin — and on the same
+      // stack-only restriction — is what makes `manifestUrl` here match the
       // `urls.hls`/`urls.dash` delivery advertises, as this endpoint's contract
       // documents above.
       const packagedPublicBase = packagedPublicOrigin(
-        request.connections?.s3Config?.endpoint
+        stackResolvedMinioEndpoint(request.connections)
       );
       const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
       const toAbsoluteManifestUrl = (stored: string, proxyUrl: string | undefined): string => {

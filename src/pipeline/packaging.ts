@@ -305,6 +305,12 @@ export class PublicManifestBaseUrlError extends Error {
 // (services/workspace-stack.ts buildConnectionsFromStack), so a caller holding
 // resolved connections can derive the origin without a global env read.
 //
+// Callers MUST source the argument from
+// `services/workspace-stack.ts stackResolvedMinioEndpoint(connections)`, NOT from
+// `s3Config.endpoint` directly: that same field is also populated verbatim from
+// MINIO_URL on the env-override path, where no anonymous-read bucket policy has
+// been applied by this codebase and a derived "public" URL would 403.
+//
 // Returns the endpoint WITHOUT a bucket path segment: a stored manifest URL for
 // the zero-config case is already bucket-prefixed (`/<packagedBucket>/...`,
 // baked in by `packagingPublicBaseUrl()` at packaging time), and
@@ -313,11 +319,19 @@ export class PublicManifestBaseUrlError extends Error {
 // (`<endpoint>/<bucket>/<key>`) is what MinIO serves, mirroring how
 // `externalPublicBaseUrl` derives an S3-compatible object URL above.
 //
-// Returns undefined when no endpoint is available (no stack resolved) or when the
-// value is not an absolute http(s) URL — a non-absolute origin is not usable and
-// must fall through to the caller's existing fallback rather than be handed to
-// `resolvePublicManifestUrl` (which would reject it as a misconfiguration).
-// NEVER carries credentials: only the endpoint's scheme/host/port/path is used.
+// Returns undefined when no endpoint is available (no PROVISIONED stack resolved —
+// callers pass `stackResolvedMinioEndpoint(connections)`, which is undefined on the
+// env-override and in-memory paths) or when the value is not an absolute http(s)
+// URL — a non-absolute origin is not usable and must fall through to the caller's
+// existing fallback rather than be handed to `resolvePublicManifestUrl` (which
+// would reject it as a misconfiguration).
+//
+// The returned origin is REBUILT from the parsed URL — scheme + host(+port) +
+// path only — so it can never carry userinfo (`https://user:pw@host` would
+// otherwise echo an operator credential into a public API response) and never
+// carries a query or fragment (either would make the `origin + '/' + key` join in
+// `resolvePublicManifestUrl` malformed). `minioEndpoint` is operator-writable via
+// the parameter store, so this is enforced here rather than assumed.
 export function stackPackagedPublicOrigin(
   minioEndpoint: string | undefined
 ): string | undefined {
@@ -329,7 +343,8 @@ export function stackPackagedPublicOrigin(
   if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
     return undefined;
   }
-  return endpoint.replace(/\/+$/, '');
+  const path = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.protocol}//${parsed.host}${path}`;
 }
 
 // The public-facing origin for the packaged bucket (MinIO/CDN), or undefined when
@@ -341,11 +356,14 @@ export function stackPackagedPublicOrigin(
 // Precedence (issue #859):
 //   1. `PACKAGED_PUBLIC_BASE_URL` — the explicit operator override — wins when
 //      set, verbatim (an operator-fronted CDN origin beats the raw MinIO host).
-//   2. the resolved stack's own `minioEndpoint` (see stackPackagedPublicOrigin),
-//      so a zero-config stack still has an ABSOLUTE public origin instead of
-//      degrading to a root-relative path.
-//   3. undefined — no stack resolved (env-override / in-memory connection paths):
-//      the caller keeps its pre-#859 behaviour.
+//   2. the PROVISIONED stack's own `minioEndpoint` (see
+//      stackPackagedPublicOrigin), so a zero-config stack still has an ABSOLUTE
+//      public origin instead of degrading to a root-relative path.
+//   3. undefined — every other deployment shape: no provisioned stack resolved,
+//      the env-override path (COUCHDB_URL/MINIO_URL), or in-memory connections.
+//      The caller keeps its pre-#859 behaviour (relative value, then the
+//      authorized stream proxy). Only the explicit PACKAGED_PUBLIC_BASE_URL makes
+//      those deployments advertise a public origin.
 export function packagedPublicOrigin(
   stackMinioEndpoint?: string
 ): string | undefined {
