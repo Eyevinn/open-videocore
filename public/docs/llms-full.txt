@@ -2546,7 +2546,8 @@ Response 200 (application/json)
           "instanceId": null,
           "url": null,
           "activeJobs": null,
-          "lastIdleAt": null
+          "lastIdleAt": null,
+          "readyAt": null
         }
       ]
     }
