@@ -2458,6 +2458,17 @@ async function renderPipelineDetailBody(id, bodyEl) {
 
 // ─── COLLECTIONS TAB ─────────────────────────────────────────────────────────
 
+// A collection hit clicked in the Search tab (issue #849). The Collections tab
+// has no deep link, and switchTab() re-renders it from scratch with an async
+// renderer, so stash the id here and let renderCollectionsTab open the detail
+// panel once its list has loaded.
+let pendingCollectionFocusId = null;
+
+function openCollectionFromSearch(id) {
+  pendingCollectionFocusId = id;
+  switchTab('collections');
+}
+
 async function renderCollectionsTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
@@ -2575,6 +2586,15 @@ async function renderCollectionsTab(container) {
 
   listSection.querySelector('#coll-refresh').addEventListener('click', loadCollections);
   await loadCollections();
+
+  // Arrived here from a collection hit in the Search tab (issue #849): open that
+  // collection's detail straight away, then clear the hand-off so a later manual
+  // visit to this tab opens nothing.
+  if (pendingCollectionFocusId) {
+    const focusId = pendingCollectionFocusId;
+    pendingCollectionFocusId = null;
+    await showCollectionDetail(focusId, detailPanel, loadCollections);
+  }
 }
 
 async function showCollectionDetail(id, detailPanel, onRefresh) {
@@ -2690,6 +2710,130 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
 }
 
 // ─── SEARCH TAB ──────────────────────────────────────────────────────────────
+//
+// Verified contract (CLAUDE.md rule 7) — GET /api/v1/search:
+//   src/routes/search.ts `searchResultSchema` (the 200 response schema) returns
+//   `{ assets, collections, total, collectionTotal, page }`, all five required.
+//   - `assets`:          asset hits, each stamped `type: 'asset'`
+//                        (`assetSchema.extend({ type: z.literal('asset') })`,
+//                        stamped in the route handler's return).
+//   - `collections`:     collection hits (`collectionHitSchema`), each carrying
+//                        `type: 'collection'` plus id / name / description? /
+//                        tags? / custom? / createdAt / updatedAt (issue #561).
+//   - `total`:           count of matching ASSETS only.
+//   - `collectionTotal`: count of matching COLLECTIONS, reported separately.
+//   Mirrored in openapi.json at "/api/v1/search/".get.responses.200 (same five
+//   required properties; `type` is an enum of the single literal on each side).
+// Note the asset hit contract has no `tags`/`mimeType` field, so those columns
+// stay '—' for asset rows (pre-existing behaviour); collection hits do carry
+// `tags`, which the shared Tags column renders.
+
+// Flatten one search response into a single ordered row list plus both counts.
+// Asset hits come first, then collection hits. Each row keeps the `type`
+// discriminator the server already stamped on the hit — the kind is never
+// inferred from which fields happen to be present (see hitType below).
+function normaliseSearchResults(res) {
+  const envelope = res && typeof res === 'object' && !Array.isArray(res) ? res : {};
+  // `assets` is the contract field; `items`/`results` are tolerated only so an
+  // older/proxied envelope still lists something rather than nothing.
+  const assetHits = Array.isArray(res) ? res
+    : (Array.isArray(envelope.assets) ? envelope.assets
+      : (Array.isArray(envelope.items) ? envelope.items
+        : (Array.isArray(envelope.results) ? envelope.results : [])));
+  const collectionHits = Array.isArray(envelope.collections) ? envelope.collections : [];
+
+  const rows = assetHits.map(function(a) { return { type: hitType(a, 'asset'), item: a }; })
+    .concat(collectionHits.map(function(c) { return { type: hitType(c, 'collection'), item: c }; }));
+
+  const assetTotal = typeof envelope.total === 'number' ? envelope.total : assetHits.length;
+  const collectionTotal = typeof envelope.collectionTotal === 'number'
+    ? envelope.collectionTotal
+    : collectionHits.length;
+
+  return { rows: rows, assetTotal: assetTotal, collectionTotal: collectionTotal, total: assetTotal + collectionTotal };
+}
+
+// Read the discriminator off a hit. The server stamps `type` on every hit, so
+// it is authoritative. `fallback` is the array the hit arrived in, used only if
+// a hit somehow lacks the field (e.g. an older server): still provenance, not a
+// guess at the shape.
+function hitType(hit, fallback) {
+  const t = hit && hit.type;
+  return t === 'asset' || t === 'collection' ? t : fallback;
+}
+
+// "3 results (2 assets, 1 collection)" — the reported count covers both kinds.
+function searchResultSummary(counts) {
+  const plural = function(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); };
+  return plural(counts.total, 'result') +
+    ' (' + plural(counts.assetTotal, 'asset') + ', ' + plural(counts.collectionTotal, 'collection') + ')';
+}
+
+// Build the results view for one search response. Pure: takes the already-fetched
+// envelope, performs no network call, returns a detached element.
+// `opts.onOpenAsset(id)` / `opts.onOpenCollection(id)` handle a row click.
+function renderSearchResults(res, opts) {
+  opts = opts || {};
+  const counts = normaliseSearchResults(res);
+  const wrap = document.createElement('div');
+
+  if (counts.rows.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    // "No results." only when BOTH counts are genuinely zero (issue #849).
+    empty.textContent = (counts.assetTotal === 0 && counts.collectionTotal === 0)
+      ? 'No results.'
+      : 'No results on this page.';
+    wrap.appendChild(empty);
+    return wrap;
+  }
+
+  const summary = document.createElement('div');
+  summary.className = 'text-muted search-result-summary';
+  summary.textContent = searchResultSummary(counts);
+  wrap.appendChild(summary);
+
+  const rows = counts.rows.map(function(row) {
+    const isCollection = row.type === 'collection';
+    const hit = row.item || {};
+    const id = hit.id == null ? '' : String(hit.id);
+    const label = hit.title || hit.name || '—';
+    const link = '<a href="#" class="search-hit-link" data-hit-type="' + escHtml(row.type) + '"' +
+      ' data-hit-id="' + escHtml(id) + '" style="color:var(--accent)">' + escHtml(label) + '</a>';
+    return '<tr class="search-hit" data-hit-type="' + escHtml(row.type) + '" data-hit-id="' + escHtml(id) + '">' +
+      '<td><span class="tag search-hit-type">' + (isCollection ? 'Collection' : 'Asset') + '</span></td>' +
+      '<td class="cell-id" title="' + escHtml(id) + '">' + escHtml(hit.slug || id) + '</td>' +
+      '<td>' + link + '</td>' +
+      '<td>' + (isCollection ? '<span class="text-muted">—</span>' : renderBadge(hit.status)) + '</td>' +
+      '<td>' + renderTags(hit.tags) + '</td>' +
+      '<td>' + (isCollection ? '<span class="text-muted">—</span>' : escHtml(hit.mimeType || '—')) + '</td>' +
+      '<td>' + escHtml(fmtDate(hit.createdAt)) + '</td>' +
+      '</tr>';
+  }).join('');
+
+  const tableWrap = document.createElement('div');
+  tableWrap.className = 'table-wrap mt8';
+  tableWrap.innerHTML = '<table>' +
+    '<thead><tr><th>Type</th><th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>MIME type</th><th>Created</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody>' +
+    '</table>';
+  wrap.appendChild(tableWrap);
+
+  tableWrap.querySelectorAll('.search-hit-link').forEach(function(link) {
+    link.addEventListener('click', function(ev) {
+      ev.preventDefault();
+      const id = link.dataset.hitId;
+      if (!id) return;
+      if (link.dataset.hitType === 'collection') {
+        if (typeof opts.onOpenCollection === 'function') opts.onOpenCollection(id);
+      } else if (typeof opts.onOpenAsset === 'function') {
+        opts.onOpenAsset(id);
+      }
+    });
+  });
+
+  return wrap;
+}
 
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
@@ -2736,33 +2880,17 @@ async function renderSearchTab(container) {
 
     try {
       const res = await apiFetch('/search?' + params.toString());
-      const assets = Array.isArray(res) ? res :
-        (res && (res.items || res.results || res.assets) ? (res.items || res.results || res.assets) : []);
       loader.remove();
-      if (assets.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No results.';
-        resultsEl.appendChild(empty);
-        return;
-      }
-      const rows = assets.map(function(a) {
-        return '<tr>' +
-          '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
-          '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
-          '<td>' + renderBadge(a.status) + '</td>' +
-          '<td>' + renderTags(a.tags) + '</td>' +
-          '<td>' + escHtml(a.mimeType || '—') + '</td>' +
-          '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
-          '</tr>';
-      }).join('');
-      const tableWrap = document.createElement('div');
-      tableWrap.className = 'table-wrap';
-      tableWrap.innerHTML = '<table>' +
-        '<thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>MIME type</th><th>Created</th></tr></thead>' +
-        '<tbody>' + rows + '</tbody>' +
-        '</table>';
-      resultsEl.appendChild(tableWrap);
+      resultsEl.appendChild(renderSearchResults(res, {
+        // Same "switch tab, then open the detail panel" move the job → asset
+        // link makes (see showJobDetail's onAssetLink).
+        onOpenAsset: function(id) {
+          switchTab('assets');
+          const panel = document.getElementById('asset-detail');
+          if (panel) showAssetDetail(id, panel);
+        },
+        onOpenCollection: openCollectionFromSearch,
+      }));
     } catch (err) {
       loader.remove();
       showMsg(resultsEl, 'Error: ' + err.message, 'error');
@@ -5112,6 +5240,12 @@ export {
   // Exported so the add -> list -> edit -> list integration test can drive the
   // real Storage-tab flow against a stubbed fetch (issue #681).
   renderStorageTab,
+  // Search results view (issue #849). Exported so a DOM/unit test can exercise
+  // the pure envelope flattening + row rendering (asset AND collection hits,
+  // marked by the server's `type` discriminator) without a network call.
+  normaliseSearchResults,
+  searchResultSummary,
+  renderSearchResults,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
