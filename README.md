@@ -271,9 +271,10 @@ tier (`q`, over name and description) behind one contract; all filters are ANDed
 and results are paginated (`page`/`pageSize`, returned as `{ assets, total,
 page }`). `mimeType` filters on the container format extracted from the media
 and takes either a container token (`mp4`, `webm`) or a common media MIME type
-(`video/mp4`), which is resolved onto the container family it names; a MIME type
-that maps to no container family is rejected with `400 unsupported_mime_type`
-rather than returning an empty page.
+(`video/mp4`), which is resolved onto the container family it names. A MIME type
+that neither resolves to a container family nor names a content type this API
+accepts on upload can never match anything, so it is rejected with `400
+unsupported_mime_type` rather than returning an empty page.
 
 | Method | Path | Description |
 |---|---|---|

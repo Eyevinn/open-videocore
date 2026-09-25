@@ -159,6 +159,10 @@ const searchQuerySchema = z
     tags: tagsSchema,
     mimeType: z
       .string()
+      // Trim BEFORE the length check so a whitespace-only value is a 400 rather
+      // than a filter the matcher has to interpret (it would otherwise pass
+      // `.min(1)` and the repo would have to decide what a blank filter means).
+      .trim()
       .min(1)
       .max(128)
       .optional()
@@ -169,9 +173,10 @@ const searchQuerySchema = z
           '(`video/mp4`), which is resolved onto the ffprobe container family it ' +
           'names — so `video/mp4` matches an asset stored as `mov,mp4,m4a` ' +
           '(issue #822). Matching is case-insensitive and per family token. A ' +
-          'MIME-shaped value that maps to no container family can never match ' +
-          'any asset and is rejected with 400 `unsupported_mime_type` rather ' +
-          'than silently returning an empty result set.'
+          'MIME-shaped value that neither maps to a container family nor names a ' +
+          'content type this API accepts on upload can never match any asset, ' +
+          'and is rejected with 400 `unsupported_mime_type` rather than silently ' +
+          'returning an empty result set.'
       ),
     // TAMS address lookup (issue #168, epic #116). Reuse the field validation
     // from the asset model (asset-document.ts) rather than re-declaring it:
@@ -254,11 +259,14 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
     },
     async (request, reply) => {
       const { q, tags, mimeType, tamsFlowId, tamsTimerange, page, pageSize } = request.query;
-      // Reject a MIME-shaped `mimeType` that maps to no container family
-      // (issue #822). The filter compares against ffprobe's format_name, which
-      // never contains `/`, so such a value is structurally unmatchable: it
-      // would return an empty page indistinguishable from "no assets match".
-      // Failing at the boundary names the problem instead.
+      // Reject a `mimeType` that can never match any asset here (issue #822):
+      // MIME-shaped, no container family resolves it, AND it is not a content
+      // type this API accepts on upload. The filter compares against ffprobe's
+      // format_name, which never contains `/`, so such a value would return an
+      // empty page indistinguishable from "no assets match"; failing at the
+      // boundary names the problem instead. A type the API DOES ingest is
+      // excluded from this gate — a real asset can carry it, so it gets an
+      // ordinary result rather than being called unsupported.
       if (mimeType !== undefined && isUnmatchableMimeTypeFilter(mimeType)) {
         return reply.code(400).send({
           error: 'unsupported_mime_type',

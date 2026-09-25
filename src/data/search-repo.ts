@@ -8,6 +8,7 @@
 
 import type { Asset } from './asset-repo.js';
 import type { Collection } from './collection-repo.js';
+import { isAcceptedUploadContentType, normaliseContentType } from './media-types.js';
 
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
@@ -197,11 +198,19 @@ export function assetContainerFormatTokens(asset: Asset): string[] {
 // Each entry lists the format_name tokens that legitimately carry that MIME
 // type. The mov/mp4/m4a family is one ffprobe format, so `video/mp4` and
 // `video/quicktime` both address it (issue #822: "video/mp4 matches an asset
-// whose containerFormat is mp4 or mov").
+// whose containerFormat is mp4 or mov"). For the same reason `video/3gpp` and
+// `video/3gpp2` address it too: the probe output captured in
+// test/osc-ffprobe.test.ts:18 ("Input #0, mov,mp4,m4a,3gp,3g2,mj2") shows
+// ffprobe reports ONE family string for all of them, so the `3gp`/`3g2` tokens
+// are not separable from `mp4`/`mov` after the fact. `video/3gpp` is an accepted
+// upload content type (UPLOAD_CONTENT_TYPES), so it has to resolve here rather
+// than be told it is unsupported.
 const MIME_TYPE_CONTAINER_ALIASES: Readonly<Record<string, readonly string[]>> = {
   'video/mp4': ['mp4', 'mov', 'm4v', 'm4a', '3gp', '3g2', 'mj2', 'isom', 'mp42'],
   'application/mp4': ['mp4', 'mov', 'm4v', 'm4a'],
   'audio/mp4': ['mp4', 'mov', 'm4a'],
+  'video/3gpp': ['3gp', '3g2', 'mp4', 'mov', 'm4a'],
+  'video/3gpp2': ['3g2', '3gp', 'mp4', 'mov'],
   'video/quicktime': ['mov', 'mp4', 'qt'],
   'video/webm': ['webm', 'matroska'],
   'audio/webm': ['webm', 'matroska'],
@@ -223,18 +232,16 @@ const MIME_TYPE_CONTAINER_ALIASES: Readonly<Record<string, readonly string[]>> =
 // A filter value is MIME-shaped when it carries the `type/subtype` separator.
 // A container format token never contains `/` (it comes from ffprobe's
 // format_name), so a MIME-shaped value can only ever match through the alias
-// map above — which is what makes an UNRECOGNISED one structurally impossible
-// to match and therefore worth rejecting at the boundary (issue #822).
+// map above.
 export function isMimeTypeShaped(value: string): boolean {
   return value.includes('/');
 }
 
 // The container tokens a MIME-shaped filter value addresses, or undefined when
-// the value is not a recognised MIME type.
+// the value is not a recognised MIME type. Parameters are dropped before lookup
+// (e.g. `video/mp4; codecs="avc1.42E01E"`).
 export function containerAliasesForMimeType(value: string): readonly string[] | undefined {
-  // Drop any parameters (e.g. `video/mp4; codecs="avc1.42E01E"`) before lookup.
-  const base = value.split(';')[0]!.trim().toLowerCase();
-  return MIME_TYPE_CONTAINER_ALIASES[base];
+  return MIME_TYPE_CONTAINER_ALIASES[normaliseContentType(value)];
 }
 
 // Every MIME type the filter can resolve, sorted — surfaced in the 400 message
@@ -243,13 +250,30 @@ export function supportedMimeTypeFilters(): string[] {
   return Object.keys(MIME_TYPE_CONTAINER_ALIASES).sort();
 }
 
-// True when the value is MIME-shaped but maps to no container family, i.e. it
-// can never match any asset. Callers (src/routes/search.ts) turn this into a
-// 400 so "you used a vocabulary this filter cannot resolve" is distinguishable
-// from "nothing matched" (issue #822 acceptance criterion 3).
+// True when the value can never match ANY asset in this system, which is what
+// makes it worth rejecting at the boundary rather than answering with an empty
+// page (issue #822 acceptance criterion 3). Three conditions, all required:
+//
+//   1. it is MIME-shaped — a bare container token like `avi` may simply match
+//      nothing today and match tomorrow, so it is a legitimate empty result;
+//   2. no alias maps it onto a container family; AND
+//   3. it is not a content type this API accepts on upload
+//      (UPLOAD_CONTENT_TYPES, data/media-types.ts).
+//
+// Condition 3 is the one that keeps the claim above honest. An accepted upload
+// type CAN be carried by a real asset, so rejecting it would be telling an
+// operator that a format this product ingests is unsupported vocabulary — and
+// would turn a request that used to answer 200 into a hard error. Such a value
+// falls through to an ordinary (possibly empty) result instead. Deriving this
+// from the shared array rather than restating it means registering a new upload
+// type cannot leave a stale rejection behind.
 export function isUnmatchableMimeTypeFilter(value: string): boolean {
   const trimmed = value.trim();
-  return isMimeTypeShaped(trimmed) && containerAliasesForMimeType(trimmed) === undefined;
+  return (
+    isMimeTypeShaped(trimmed) &&
+    containerAliasesForMimeType(trimmed) === undefined &&
+    !isAcceptedUploadContentType(trimmed)
+  );
 }
 
 // Match one asset against the `mimeType` filter (issue #822). Accepts either a
@@ -258,7 +282,12 @@ export function isUnmatchableMimeTypeFilter(value: string): boolean {
 export function matchesMimeTypeFilter(asset: Asset, filter: string): boolean {
   const value = filter.trim().toLowerCase();
   if (value.length === 0) {
-    return true;
+    // A blank filter is NOT "no filter": returning true here would silently turn
+    // `?mimeType=%20` into a request for every asset — the same class of
+    // wrong-but-plausible answer issue #822 is about, inverted. The route
+    // schema trims and rejects a blank value (400) before reaching here, so this
+    // is belt-and-braces for any other caller of the matcher.
+    return false;
   }
   const tokens = assetContainerFormatTokens(asset);
   if (tokens.length === 0) {
@@ -269,7 +298,11 @@ export function matchesMimeTypeFilter(asset: Asset, filter: string): boolean {
     return aliases.some((alias) => tokens.includes(alias));
   }
   if (isMimeTypeShaped(value)) {
-    // Unrecognised MIME type: structurally unmatchable (rejected at the route).
+    // A MIME type with no alias cannot be compared against a container token.
+    // Where it is also not an accepted upload type the route has already
+    // rejected it (isUnmatchableMimeTypeFilter); where it IS one — e.g. an
+    // `image/*` still, or `application/octet-stream` — it reaches here and
+    // matches nothing, because no MIME type is recoverable from format_name.
     return false;
   }
   // Bare container value. Match a single family token ("mp4" against
