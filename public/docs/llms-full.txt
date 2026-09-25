@@ -8,13 +8,20 @@ Health
 
   GET /health
 
-  Liveness probe that also reports service identity.
+  Liveness probe that also reports service identity, the build identity of the running image (`build`), resolver health, and per-method ingest availability.
 
   Response
 Response 200 (application/json)
 {
   "status": "string",
   "service": "string",
+  "build": {
+    "version": "string",
+    "commit": "string",
+    "sourceDigest": "string",
+    "builtAt": "string",
+    "packageVersion": "string"
+  },
   "resolver": {
     "degraded": true,
     "mode": "none",
