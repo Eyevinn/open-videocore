@@ -191,8 +191,49 @@ Key endpoints:
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness probe with service identity |
+| `GET` | `/health` | Liveness probe with service identity, build identity, resolver and ingest status |
 | `GET` | `/healthz` | Minimal liveness probe |
+
+### Which build is a deployment running?
+
+`GET /health` is the one endpoint that answers this, and it needs no
+authentication:
+
+```console
+$ curl -s https://<your-instance>/health | jq .build
+{
+  "version": "v1.5.0-56-g92a13cc",
+  "commit": "92a13cc4f0e1b2a3d5c7890fab12cd34ef567890",
+  "sourceDigest": "11cb8d5651d972cc",
+  "builtAt": "2026-09-25T06:11:02Z",
+  "packageVersion": "1.5.0"
+}
+```
+
+`packageVersion` is the release line, not the build — it only moves when a
+release is cut, so two instances on different images share it. The other fields
+identify the build:
+
+- `version` and `commit` come from `git describe --tags --always --dirty` and
+  `git rev-parse HEAD` at image build time, passed in as `--build-arg
+  BUILD_VERSION` / `BUILD_COMMIT` (see the `Dockerfile`). A builder with no git
+  metadata to pass reports `"unknown"` for both rather than guessing.
+- `sourceDigest` is always present. The image build computes it from the files
+  it ships, using `scripts/source-digest.mjs`. To turn a digest back into the
+  commit it was built from:
+
+  ```console
+  $ scripts/find-build-commit.sh 11cb8d5651d972cc
+  ```
+
+The full build string is served unauthenticated on purpose: this project is open
+source, so a commit identifier discloses nothing that is not already public, and
+the people who need it — an operator checking a stack after a channel switch,
+support asking what a customer is running, a probe asserting the expected build
+— are the least likely to hold a token.
+
+The OpenAPI document's `info.version` deliberately stays pinned to
+`packageVersion`, so the docs badge keeps tracking releases.
 
 **Assets**
 
@@ -265,11 +306,26 @@ in the ops UI.
 
 **Search**
 
-The single canonical search endpoint. It combines an exact-filter tier (`tags`,
-`mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text
-tier (`q`, over name and description) behind one contract; all filters are ANDed
-and results are paginated (`page`/`pageSize`, returned as `{ assets, total,
-page }`).
+The single canonical search endpoint. It combines an exact-filter tier (`status`,
+`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`, `from`/`to`)
+with a free-text tier (`q`, over name and description) behind one contract; all
+filters are ANDed and results are paginated (`page`/`pageSize`, returned as
+`{ assets, total, page }`).
+
+`status` takes the same values and has the same exact-match semantics as
+`GET /api/v1/assets?status=`, and is applied independently of `q` — the same
+status answers the same asset set with or without a free-text term. It is
+asset-only: supplying it excludes collection hits, since a collection has no
+lifecycle status.
+
+`from` and `to` bound the asset creation timestamp and are accepted by **both**
+`GET /api/v1/search` and `GET /api/v1/assets`. Each takes either a calendar date
+(`YYYY-MM-DD`) or a full ISO 8601 date-time, and **both bounds are inclusive**: a
+bare `from` date means the first instant of that UTC day and a bare `to` date the
+last, so `?from=2026-03-01&to=2026-03-01` returns everything created during
+1 March. The range is applied to the whole result set before pagination, so it
+narrows `total` and every page rather than only the page returned. A `from` later
+than `to` is a `400`, not an empty page.
 
 | Method | Path | Description |
 |---|---|---|
@@ -332,6 +388,49 @@ the pool's upper bound and how aggressively it scales back down.
 > an instance once it reports **zero** active jobs, so raising the floor is a
 > latency/headroom decision, not a fix for in-flight work — it does not change
 > which instances are eligible for teardown, only the floor they stop at.
+
+#### What the idle clock measures
+
+An instance's idle age is measured from the last job it finished. An instance
+that has never been given a job has no such timestamp, so its clock runs from the
+moment it entered the pool ready for work — a spawned-but-never-dispatched
+instance is torn down within `ENCORE_IDLE_TIMEOUT_MS` of becoming ready, exactly
+like one that has gone idle after a transcode. If a pool record turns up without
+a usable timestamp at all, the instance is treated as eligible for teardown
+rather than kept: unknown age must not mean "run forever" for something that
+bills by the hour. Eligible only means the instance is considered — it is still
+checked against Encore's own in-flight job list and any pending packaging
+handoff, and is drained rather than destroyed if either says it is still needed.
+
+The scaler also sweeps, every few minutes, for Encore instances (and their paired
+callback listeners) that are running on OSC with no pool record at all — the
+residue of a spawn interrupted part-way through, a wiped Valkey, or a deleted
+deployment. Nothing else can see those instances, since every other teardown path
+works from the pool. Because a deployment's cleanup sweep sees every instance in
+the OSC subscription, not just its own, four things must all hold before anything
+is removed:
+
+- the instance name proves it belongs to *this* deployment (each name carries a
+  fingerprint of the deployment identity, so two deployments with similar names —
+  `dev` and `dev-2`, say — can never reclaim each other's instances),
+- no pool, on any workspace, is tracking it,
+- it has been seen unaccounted-for across the whole grace window (20 minutes by
+  default), so a spawn still waiting for its instance to become ready is never cut
+  off mid-flight, and
+- the instance itself confirms it has no queued or in-progress job and no pending
+  packaging handoff. An instance that reports work, or that cannot be reached to
+  answer, is never destroyed by the sweep: it is taken back into the pool and
+  drained by the normal path instead.
+
+Anything the sweep declines to remove is logged by name, so an instance that
+cannot be reclaimed automatically is at least visible.
+
+The fingerprint is derived from the deployment's workspace identity, which
+assumes what the rest of the scaler already assumes: one workspace identity means
+one deployment within a subscription. Two deployments configured with the same
+workspace identity but pointing at different Valkeys would produce the same
+fingerprint and each would treat the other's untracked instances as its own to
+reclaim. Give each deployment its own workspace identity.
 
 **Collections**
 

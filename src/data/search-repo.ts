@@ -6,8 +6,9 @@
 // using Mango queries (see couch-search-repo.ts). Both apply the workspace
 // partition so a query can only ever reach the caller's own assets.
 
-import type { Asset } from './asset-repo.js';
+import type { Asset, AssetStatus } from './asset-repo.js';
 import type { Collection } from './collection-repo.js';
+import { withinCreatedRange } from './created-range.js';
 
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
@@ -36,6 +37,18 @@ export interface SearchQuery {
   // channel (issue #168 acceptance criterion).
   tamsFlowId?: string;
   tamsTimerange?: string;
+  // Lifecycle status (issue #833). EXACT match on the asset's `status`, the
+  // identical semantics `GET /api/v1/assets/` already has via
+  // `ListOptions.status` (asset-repo.ts) -> `state` Mango mirror
+  // (couch-asset-repo.ts buildSelector). Asset-only: collections have no
+  // lifecycle state, so setting it excludes every collection hit.
+  status?: AssetStatus;
+  // Inclusive created-at range (issue #833), already normalised to canonical UTC
+  // instants by the route (created-range.ts). Applies to assets AND collections
+  // (both carry a `createdAt`), and — like every other filter here — is applied
+  // to the whole matched set before the page slice, so it narrows `total` too.
+  createdFrom?: string;
+  createdTo?: string;
   page?: number;
   pageSize?: number;
 }
@@ -115,7 +128,14 @@ export function collectionTags(collection: Collection): string[] {
 //     being set excludes all collections — a query that addresses assets by
 //     container/TAMS is not asking for collections.
 export function matchesCollectionQuery(collection: Collection, query: SearchQuery): boolean {
-  if (query.mimeType || query.tamsFlowId || query.tamsTimerange) {
+  // `status` joins the asset-only filters (issue #833): a collection has no
+  // lifecycle state, so a query that asks for one is not asking for collections.
+  if (query.mimeType || query.tamsFlowId || query.tamsTimerange || query.status) {
+    return false;
+  }
+  // The created-at range (issue #833) is NOT asset-only — a collection carries a
+  // `createdAt` of its own, so the range applies to it on the same terms.
+  if (!withinCreatedRange(collection.createdAt, query)) {
     return false;
   }
   if (query.q) {
@@ -182,6 +202,16 @@ export function clampPageSize(pageSize?: number): number {
 // fallback when the text index is unavailable. Keeps match semantics identical
 // across backends.
 export function matchesQuery(asset: Asset, query: SearchQuery): boolean {
+  // Exact-filter tier first, and deliberately INDEPENDENT of `q` (issue #833
+  // acceptance criterion: a status filter answers the same set whether or not
+  // free text is supplied). Exact match on `Asset.status`, the same comparison
+  // `InMemoryAssetRepository.list` makes for `GET /api/v1/assets/?status=`.
+  if (query.status && asset.status !== query.status) {
+    return false;
+  }
+  if (!withinCreatedRange(asset.createdAt, query)) {
+    return false;
+  }
   if (query.q) {
     const q = query.q.toLowerCase();
     const inName = asset.name.toLowerCase().includes(q);

@@ -17,6 +17,7 @@ import type {
   AssetReviewState,
   AttachExternalIdInput,
   CreateAssetInput,
+  ExternalIdentifier,
   RehydratePhase,
   SetDeleteLockInput,
   StorageByteClass,
@@ -92,6 +93,9 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
   }
   async attachExternalId(id: string, input: AttachExternalIdInput): Promise<Asset | undefined> {
     return (await this.repo()).attachExternalId(id, input);
+  }
+  async detachExternalId(id: string, ref: ExternalIdentifier): Promise<Asset | undefined> {
+    return (await this.repo()).detachExternalId(id, ref);
   }
   async list(opts?: ListOptions): Promise<ListResult> {
     return (await this.repo()).list(opts);

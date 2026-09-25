@@ -32,6 +32,35 @@
                     "service": {
                       "type": "string"
                     },
+                    "build": {
+                      "type": "object",
+                      "properties": {
+                        "version": {
+                          "type": "string"
+                        },
+                        "commit": {
+                          "type": "string"
+                        },
+                        "sourceDigest": {
+                          "type": "string"
+                        },
+                        "builtAt": {
+                          "type": "string",
+                          "nullable": true
+                        },
+                        "packageVersion": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "version",
+                        "commit",
+                        "sourceDigest",
+                        "builtAt",
+                        "packageVersion"
+                      ],
+                      "additionalProperties": false
+                    },
                     "resolver": {
                       "type": "object",
                       "properties": {
@@ -141,6 +170,7 @@
                   "required": [
                     "status",
                     "service",
+                    "build",
                     "resolver",
                     "ingest"
                   ],
@@ -2428,6 +2458,26 @@
             "in": "query",
             "name": "parentId",
             "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "description": "Inclusive lower bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the first instant of that UTC day) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "description": "Inclusive upper bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the LAST instant of that UTC day, so the named day is included) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
           }
         ],
         "responses": {
@@ -2921,6 +2971,28 @@
                     "limit",
                     "offset",
                     "total"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
                   ],
                   "additionalProperties": false
                 }
@@ -5326,6 +5398,169 @@
             }
           }
         }
+      },
+      "get": {
+        "summary": "List an asset's upstream external identifiers",
+        "description": "List the `{ namespace, id }` external identifiers attached to the asset (ADR-019), exactly as stored. `namespace` labels the upstream system of record; `id` is the opaque foreign key in that system. Returns an empty array when the asset carries none, and 404 when the asset id is unknown.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "External identifiers attached to the asset, in persisted order. Empty when none are attached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "namespace": {
+                        "type": "string",
+                        "description": "Upstream system-of-record label the external id belongs to (e.g. `ingest-mam`, `rights-registry`)."
+                      },
+                      "id": {
+                        "type": "string",
+                        "description": "Opaque foreign-key value in that system (UUID / numeric id / slug)."
+                      }
+                    },
+                    "required": [
+                      "namespace",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "description": "External identifiers attached to the asset, in persisted order. Empty when none are attached."
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/assets/{id}/external-ids/{namespace}/{externalId}": {
+      "delete": {
+        "summary": "Detach an upstream external identifier from an asset",
+        "description": "Remove the `{ namespace, id }` external identifier from the asset (ADR-019) \u2014 the inverse of `POST /assets/{id}/external-ids`, for correcting a mistyped or stale correlation. Idempotent: returns 204 whether or not the asset carried the pair, so a repeated call is never an error. 404 is returned only when the asset itself does not exist.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "description": "Asset id."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "description": "Upstream system-of-record label the external id belongs to (e.g. `ingest-mam`, `rights-registry`). Required, non-empty."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "path",
+            "name": "externalId",
+            "required": true,
+            "description": "Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "enum": [
+                    "null"
+                  ],
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/assets/{id}": {
@@ -7126,7 +7361,8 @@
                       "type": "string",
                       "enum": [
                         "ready",
-                        "not_configured"
+                        "not_configured",
+                        "failed"
                       ]
                     },
                     "urls": {
@@ -19471,13 +19707,15 @@
                                 },
                                 "lastIdleAt": {
                                   "type": "number"
+                                },
+                                "readyAt": {
+                                  "type": "number"
                                 }
                               },
                               "required": [
                                 "instanceId",
                                 "url",
-                                "activeJobs",
-                                "lastIdleAt"
+                                "activeJobs"
                               ],
                               "additionalProperties": false
                             }
@@ -19928,7 +20166,7 @@
         "tags": [
           "search"
         ],
-        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`.",
+        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`. The exact-filter tier also carries `status` (exact lifecycle match, asset-only) and an inclusive created-at range `from`/`to` (issue #833); both are applied to the whole matched set before pagination, so they narrow `total` and every page rather than the page in hand.",
         "parameters": [
           {
             "schema": {
@@ -19968,6 +20206,42 @@
             "in": "query",
             "name": "mimeType",
             "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "uploading",
+                "processing",
+                "ready",
+                "failed",
+                "archived"
+              ]
+            },
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "description": "Exact-match lifecycle status filter, identical in accepted values and match semantics to `GET /api/v1/assets/?status=`. Applied independently of `q`, so the same status answers the same asset set with or without a free-text term. Asset-only: supplying it excludes all collection hits, since a collection has no lifecycle status."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "description": "Inclusive lower bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the first instant of that UTC day) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^(\\d{4})-(\\d{2})-(\\d{2})(?:T(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,3})?)?(?:Z|[+-](\\d{2}):(\\d{2}))?)?$"
+            },
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "description": "Inclusive upper bound on the asset creation timestamp (`createdAt`). Accepts a calendar date (`YYYY-MM-DD`, interpreted as the LAST instant of that UTC day, so the named day is included) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page."
           },
           {
             "schema": {
@@ -20371,10 +20645,13 @@
                         "type": "string"
                       }
                     },
-                    "secret": {
-                      "type": "string"
+                    "hasSecret": {
+                      "type": "boolean"
                     },
                     "createdAt": {
+                      "type": "string"
+                    },
+                    "secret": {
                       "type": "string"
                     }
                   },
@@ -20382,6 +20659,7 @@
                     "id",
                     "url",
                     "events",
+                    "hasSecret",
                     "createdAt"
                   ],
                   "additionalProperties": false
@@ -20439,8 +20717,8 @@
                               "type": "string"
                             }
                           },
-                          "secret": {
-                            "type": "string"
+                          "hasSecret": {
+                            "type": "boolean"
                           },
                           "createdAt": {
                             "type": "string"
@@ -20450,6 +20728,7 @@
                           "id",
                           "url",
                           "events",
+                          "hasSecret",
                           "createdAt"
                         ],
                         "additionalProperties": false
