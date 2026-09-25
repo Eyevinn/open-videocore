@@ -4578,9 +4578,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // Proxy a single thumbnail image through the API. OSC MinIO blocks anonymous
-  // presigned URL access, so the browser cannot load MinIO URLs directly.
-  // This endpoint fetches the object using admin credentials and streams it.
+  // Proxy a single thumbnail image through the API: fetches the object with the
+  // deployment's storage credentials and streams it to a bearer-carrying caller.
+  //
+  // Originally this was the ONLY option, because anonymous presigned GETs
+  // against the hosted object store were observed returning 403 from outside
+  // the cluster (#113). That no longer reproduces — re-verified 2026-09-25 from
+  // outside the cluster: presigned anonymous GET → 200 image/jpeg, unsigned →
+  // 403 AccessDenied, tampered → 403 SignatureDoesNotMatch, expired → 403
+  // AccessDenied. So `/:id/thumbnails/:index/url` below is now the browser path
+  // (see #800), and this route stays for server-to-server callers that already
+  // hold a token and for deployments whose object store is not reachable from
+  // the client. Coverage: test/thumbnail-unauthenticated-fetch.test.ts.
   //   200 — image/jpeg stream
   //   404 — unknown asset or out-of-range index
   //   501 — storage not configured
