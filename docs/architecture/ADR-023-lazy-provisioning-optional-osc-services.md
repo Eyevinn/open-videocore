@@ -21,7 +21,7 @@ from without re-deriving anything.
 | Service | Lazy on first use? | Decision |
 |---|---|---|
 | `eyevinn-function-scenes` (scene detection) | **Yes — feasible today** | Implement lazy provisioning. Its create config requires only `name`, which a deployment already knows (the stack name). It is the same shape as the already-lazily-provisioned `eyevinn-encore-packager`, so the existing pattern is reused rather than invented. Design in [§4](#4-design-for-scene-detection-ready-for-an-implementation-issue). |
-| `eyevinn-auto-subtitles` (subtitles) | **No — not fully lazy today** | Keep **explicit** operator provisioning as the primary path. Its create config additionally requires `openaikey`, an operator-supplied secret that is not available at arbitrary first-use time, and the service reports `supportsUpdate: false`, so a wrongly-keyed instance can only be repaired by delete + recreate. A narrow, strictly-guarded lazy path is *permitted* but is lower value and explicitly deferred. Rationale in [§5](#5-decision-for-subtitles-explicit-provisioning-stays-the-primary-path). |
+| `eyevinn-auto-subtitles` (subtitles) | **No — not fully lazy today** | Keep **explicit** operator provisioning as the primary path. Its create config additionally requires `openaikey`, an operator-supplied secret that is not available at arbitrary first-use time — on its own sufficient to rule out unconditional lazy provisioning. Compounding it, whether a wrongly-keyed instance can be repaired in place is **unknown**: the catalog does not report update support at schema-query time (§2.3), so the design must tolerate delete + recreate being the only repair. A narrow, strictly-guarded lazy path is *permitted* but is lower value and explicitly deferred. Rationale in [§5](#5-decision-for-subtitles-explicit-provisioning-stays-the-primary-path). |
 
 The `skipped` step status from #789 / PR #805 is therefore **not** a stopgap for
 either service. For scene detection it remains the correct terminal state for the
@@ -77,31 +77,59 @@ configuration. That is the friction #781/#791 is aimed at.
 
 ## 2. Verified contract sources (CLAUDE.md rule 7)
 
-### 2.1 OSC MCP reachability in this session
+### 2.1 How the live contract was fetched (re-verified 2026-09-25)
 
-The live OSC MCP tools (`get-service-schema`, `list-available-services`) were
-**not reachable** from this execution context: `ToolSearch` — the documented
-mechanism for loading the `mcp__OSC__*` schemas — returned *"No such tool
-available: ToolSearch. ToolSearch is disabled for this session."* No OSC MCP tool
-was directly invokable, and `node_modules/@osaas` ships only `client-core` (no
-generated per-service schema), so the contract was not reachable offline either.
-This is the same friction previously logged for the on-demand packager
-(`docs/osc-feedback/incoming-epic226-ondemand-packager-schema.md`) and is
-re-logged for this issue in
-`docs/osc-feedback/incoming-issue791-lazy-provision-optional-services.md`.
+**Every catalog fact in §2.2 and §2.3 is grounded in a live `get-service-schema`
+query run while revising this ADR**, not in memory and not solely in repo
+comments.
 
-**No service field is invented in this ADR.** Every catalog fact below is taken
-from a contract verification already recorded *in this repository*, plus the
-independent verification carried out on the #791 issue thread (2026-09-24). The
-two agree. Anyone implementing this design should re-run `get-service-schema` for
-both serviceIds when the MCP is reachable and correct this ADR if it has drifted.
+The first draft of this ADR claimed the OSC MCP was unreachable. **That was
+wrong, and the error was local, not OSC's.** The authoring session had
+`ToolSearch` disabled (*"No such tool available: ToolSearch. ToolSearch is
+disabled for this session"*), and the draft reasoned from "the tool-discovery
+mechanism is disabled" to "the contract is unreachable" without trying the MCP
+endpoint itself. The endpoint was up the whole time.
+
+Method that does work from an automated agent context, and that a future
+implementer should reuse:
+
+- `POST $OSC_MCP_URL` (`https://mcp.osaas.io/mcp`) with
+  `Authorization: Bearer $OSC_ACCESS_TOKEN` — both are already present in the
+  execution environment — and `Accept: application/json, text/event-stream`.
+- `initialize` → `serverInfo: { name: 'osc-remote-mcp', version: '8.10.0' }`.
+- Read-only catalog calls are dispatched through the `osc_call_tool` envelope
+  (`{ name, args }`; `name` required), per its live `tools/list` inputSchema.
+- `get-service-schema` inputSchema (live): `serviceId` **and** `verbosity`
+  (`'concise' | 'detailed'`) are **both required**.
+
+`node_modules/@osaas` ships only `client-core` and no generated per-service
+schema, so the offline route genuinely does not exist — but that is irrelevant
+when the MCP endpoint is reachable, which it is.
+
+The live output agrees with the repo's 2026-07-12/13 comments on every field
+name, type and requirement. Where it does **not** agree is update support — see
+§2.3, which the first draft got wrong.
 
 ### 2.2 `eyevinn-function-scenes` — create config requires `name` ONLY
 
-- `src/services/optional-services.ts:24-26` — *"get-service-schema for
+**Live `get-service-schema` (2026-09-25), verbatim:**
+
+> Configuration schema for **Scene Detect Media Function**
+> (`eyevinn-function-scenes`):
+> **Configuration Options:**
+> - **name** (string, required) — Name of mediafunction
+
+That is the **entire** option list: one required field, no optional fields, no
+`Service Dependencies` block, no secret. The live response also carries
+`**Update Support:** Not confirmed at schema-query time.` and the platform-wide
+instance-naming constraints reproduced in §2.3a.
+
+Corroborating repo verifications (2026-07-12/13), which the live query confirms:
+
+- `src/services/optional-services.ts:25-26` — *"get-service-schema for
   `eyevinn-function-scenes` (fetched by orchestrator 2026-07-12): required `name`
   ONLY. No secret."*
-- `src/services/optional-services.ts:86-93` — the registry entry declares
+- `src/services/optional-services.ts:85-93` — the registry entry declares
   `fields: []`, i.e. **zero** request-supplied config fields beyond `name`.
 - `src/routes/provision.ts:1118-1120` — *"Contract (get-service-schema, verified
   2026-07-13): create config requires ONLY `name` — no external key dependency."*
@@ -121,14 +149,74 @@ provision already has. Nothing must be asked of, or held on behalf of, the
 operator. The un-verified *runtime* wire shape is orthogonal — it is already
 shipped and already isolated; lazy provisioning does not touch it.
 
-### 2.3 `eyevinn-auto-subtitles` — create config requires `name` AND `openaikey`; no update support
+### 2.3 `eyevinn-auto-subtitles` — create config requires `name` AND `openaikey`; update support is UNKNOWN
 
-- `src/services/optional-services.ts:20-24` — *"get-service-schema for
+**Live `get-service-schema` (2026-09-25), verbatim:**
+
+> Configuration schema for **Subtitle Generator** (`eyevinn-auto-subtitles`):
+> **Configuration Options:**
+> - **name** (string, required) — Name of auto-subtitles. Pattern: `^\w+$`
+> - **openaikey** (string, required) — *"Your OpenAI API key required to access
+>   OpenAI Whisper service for audio transcription and subtitle generation"*
+> - **awsAccessKeyId** (string, optional)
+> - **awsSecretAccessKey** (string, optional)
+> - **awsRegion** (string, optional)
+> - **s3Endpoint** (string, optional)
+>
+> **Service Dependencies:** Parameter **s3Endpoint** requires a **minio-minio**
+> instance (protocol: http, routing: INTERNAL)
+
+This confirms the required-field set and the `minio-minio` auto-wiring.
+
+**Correction — `supportsUpdate` is not a catalog field.** An earlier draft of
+this ADR asserted that the service *"reports `supportsUpdate: false`"*. **It does
+not, and no such field exists anywhere in the OSC catalog.** What the live
+response actually returns — identically for `eyevinn-auto-subtitles`,
+`eyevinn-function-scenes` and `eyevinn-encore-packager` — is:
+
+> **Update Support:** Not confirmed at schema-query time. If you need to change
+> configuration after creation, attempt `update-service-instance` — if the
+> service does not support updates, a clear error will be returned with
+> delete-and-recreate instructions.
+
+The `get-service-schema` tool description states the rule explicitly: *"The
+response includes an Update Support indicator when confirmed; absence means
+update support is unknown at schema-query time (runtime attempt will confirm)."*
+
+So the accurate statement is: **this repo's 2026-07-12 verification recorded no
+config-update support, and the live schema query confirms nothing either way.**
+Determining it for certain requires attempting `update-service-instance` against
+a real instance. This ADR therefore treats "cannot patch `openaikey` in place" as
+an **unverified worst case that the design must tolerate**, not as an established
+catalog fact — which is the same conservative posture, correctly attributed.
+
+**This correction does not change the decision.** Requiring `openaikey` — an
+operator-supplied secret unavailable at arbitrary first-use time — is on its own
+sufficient to rule out unconditional lazy provisioning (§3 item 2, §5).
+
+### 2.3a Platform-wide instance-name constraints (live, both services)
+
+The live response for **every** service queried carries:
+
+> - pattern: `^[a-z0-9]+$` (lowercase alphanumeric only, other characters are
+>   stripped)
+> - maxLength: **20** (post-sanitization)
+> - Names are sanitized to lowercase and stripped of non-alphanumerics before the
+>   length check.
+> - Underlying reason: K8s DNS-1035 63-char limit on
+>   `{tenant}-{serviceId}-{instanceName}`.
+
+This matters to §4.1, where "instance name == stack name" is load-bearing. See
+§4.1 for the consequence and §4.7 for the acceptance criterion.
+
+Corroborating repo verifications (2026-07-12/13):
+
+- `src/services/optional-services.ts:21-24` — *"get-service-schema for
   `eyevinn-auto-subtitles` (fetched by orchestrator 2026-07-12): required `name`
   (`^\w+$`) and `openaikey` (SECRET); optional awsAccessKeyId /
   awsSecretAccessKey (SECRET) / awsRegion / s3Endpoint. **No config update
   support (delete + create to change config).**"*
-- `src/services/optional-services.ts:68-85` — the registry entry declares
+- `src/services/optional-services.ts:67-84` — the registry entry declares
   `openaikey` as `{ secret: true, required: true }`, with `awsAccessKeyId`,
   `awsSecretAccessKey` (also secret), `awsRegion`, `s3Endpoint` as optional
   pass-throughs.
@@ -138,9 +226,12 @@ shipped and already isolated; lazy provisioning does not touch it.
 - serviceId constant: `src/services/stack.ts` (`AUTO_SUBTITLES_SERVICE_ID`,
   imported at `src/services/optional-services.ts:28-31`).
 
-The #791 thread's independent verification adds that `s3Endpoint` auto-wires to
-`minio-minio` and that the service reports `supportsUpdate: false` — consistent
-with the repo's *"No config update support (delete + create to change config)"*.
+The repo comments at `:129-130` and `provision.ts:1089-1096` assert *"No config
+update support"* / *"No update-service-instance support"*. These are legitimate
+prior observations from 2026-07-12/13, but they are **not** reproducible from
+`get-service-schema` — see the correction above. Treat them as an unverified
+worst case, and re-check by attempting `update-service-instance` if a future
+design needs to depend on the answer.
 
 ### 2.4 The existing lazy-provisioning pattern (the precedent to reuse)
 
@@ -228,15 +319,19 @@ and `services[]` without risking a double teardown.
    one already in production. Design: §4.
 
 2. **Subtitles (`eyevinn-auto-subtitles`): NOT fully lazy-provisionable on first
-   use.** Two independent blockers (§2.3):
-   - the create config requires `openaikey`, an **operator-supplied secret**.
-     A first-use trigger has no way to obtain it unless the operator already
-     stored it out of band, so lazy provisioning cannot be unconditional;
-   - `supportsUpdate: false` / *"No config update support (delete + create to
-     change config)"*. An instance created with a missing, stale or wrong key
-     cannot be patched — it must be destroyed and recreated. Speculative lazy
-     creation therefore has a **worse** failure mode than skipping: it leaves a
-     billable, unusable instance that only an explicit deprovision can clear.
+   use.** One sufficient blocker, plus one unresolved risk (§2.3):
+   - **Blocker (verified live, 2026-09-25):** the create config requires
+     `openaikey`, an **operator-supplied secret**. A first-use trigger has no way
+     to obtain it unless the operator already stored it out of band, so lazy
+     provisioning cannot be unconditional. This alone settles the decision.
+   - **Unresolved risk (not a verified fact):** whether a wrongly-keyed instance
+     can be repaired in place is **unknown** — the catalog reports *"Update
+     Support: Not confirmed at schema-query time"* for every service, and this
+     repo's 2026-07-12 note records no config-update support. If that note is
+     right, speculative lazy creation has a **worse** failure mode than skipping:
+     it leaves a billable, unusable instance that only an explicit deprovision
+     can clear. Because the downside is unbounded and unverified, the design
+     assumes the worst case rather than betting on update support existing.
 
    Decision: keep explicit provisioning via
    `POST /api/v1/optional-services/auto-subtitles/provision` (§2.5) as the
@@ -286,6 +381,31 @@ same invariant for its ground-truth check
 `getInstance(SCENE_DETECT_SERVICE_ID, stackName)` is a complete existence check,
 OSC's own name uniqueness makes more than one instance per stack impossible by
 construction, and the existing teardown path (§2.6) keeps working unchanged.
+
+**Caveat — the 20-character platform limit (pre-existing, must be handled here).**
+Per §2.3a, OSC sanitizes instance names to `^[a-z0-9]+$` and enforces
+`maxLength: 20` **post-sanitization**. Stack names are validated at
+`src/routes/provision.ts:158-162` as `.max(63).regex(/^[a-z0-9]+$/)`. The charset
+agrees; **the length does not.** A stack name of 21–63 characters is therefore
+truncated by OSC, which breaks the invariant above in a specific and silent way:
+
+- `getInstance(SCENE_DETECT_SERVICE_ID, stackName)` probes the **un**truncated
+  name, so the ground-truth existence check **misses** an instance that does
+  exist under the truncated name;
+- the `"already taken"`/`"already exists"` tolerance (§2.4) partly masks this —
+  the duplicate create is swallowed — but the persisted
+  `sceneDetectInstanceName` then does not match the real instance, so runtime
+  activation and teardown both address a name OSC does not have.
+
+This is **pre-existing in the eager path** (`provision.ts:1123-1125` has the same
+mismatch) and is not introduced by lazy provisioning. But since this section
+promises an implementer they need not re-derive the wiring, the implementation
+MUST apply the same derivation OSC does — sanitize to `^[a-z0-9]+$`, lowercase,
+then truncate to 20 — in **one shared helper** used by the create call, the
+`getInstance` probe, the persisted `sceneDetectInstanceName`, and teardown. Do
+not sanitize at only one of those four sites; that is exactly the drift described
+above. Whether to additionally tighten the stack-name validator to `.max(20)` is
+a separate, breaking-change decision and is out of scope here.
 
 ### 4.2 Reuse the single-flight guard
 
@@ -511,15 +631,23 @@ nowhere is a **cost-leaking orphan**: whole-stack teardown enumerates
    it was persisted, and when the persist failed (ground-truth probe, §4.6).
 9. No change to `openapi.json` step/status schemas (they already carry `skipped`
    and `skipReason`).
+10. **A stack whose name exceeds the 20-character OSC limit (§2.3a, §4.1) still
+    round-trips.** With a stack name of 21+ characters: the create call, the
+    `getInstance` existence probe, the persisted `sceneDetectInstanceName` and
+    teardown all use the **same** sanitized-and-truncated name; a second
+    execution resolves `status: 'exists'` and issues **zero** `createInstance`
+    calls; and teardown removes the instance OSC actually holds. A test at the
+    boundary (exactly 20) and just over it (21) is the cheapest way to pin this.
 
 ---
 
 ## 5. Decision for subtitles: explicit provisioning stays the primary path
 
 **`eyevinn-auto-subtitles` is not lazily provisionable on first use today.** Per
-§2.3 its create config requires `openaikey`, an operator-supplied secret, and the
-service does not support config update (`supportsUpdate: false` / *"delete +
-create to change config"*).
+§2.3 its create config requires `openaikey`, an operator-supplied secret — which
+is sufficient on its own. Whether an existing instance's config can be updated in
+place is **unknown** (the catalog does not confirm update support at
+schema-query time), so the design below assumes it cannot.
 
 The durable behaviour:
 
@@ -535,9 +663,9 @@ The durable behaviour:
    existing `SUBTITLES_UNCONFIGURED_REASON`
    (`src/routes/assets.ts:990-992`) settling the step as `skipped` is the correct
    terminal state, not a stopgap. Creating a keyless or wrongly-keyed instance is
-   strictly worse than skipping, because `supportsUpdate: false` means it can
-   only be repaired by delete + recreate — a billable, unusable instance the
-   operator must notice and clean up.
+   strictly worse than skipping: if config update is unsupported (§2.3 — assumed,
+   not confirmed) it can only be repaired by delete + recreate, leaving a
+   billable, unusable instance the operator must notice and clean up.
 3. **Permitted but deferred — a narrow lazy path guarded on a pre-stored key.**
    If a future issue wants first-use provisioning for subtitles, it is
    *acceptable* only under all of these conditions:
@@ -552,8 +680,11 @@ The durable behaviour:
      (`src/routes/provision.ts:790-800`, `:1106-1113`;
      `src/routes/optional-services.ts:258-270`). The literal key must never enter
      the create body, a log line, an operation record, or a response.
-   - **Because `supportsUpdate: false`, an existing instance must be ADOPTED
-     as-is, never recreated to apply a changed key.** Reuse the packager's
+   - **Because in-place config update cannot be relied on (§2.3), an existing
+     instance must be ADOPTED as-is, never recreated to apply a changed key.**
+     Before building on this, confirm the answer by attempting
+     `update-service-instance` once against a throwaway instance; if update turns
+     out to be supported, this constraint can be relaxed. Reuse the packager's
      `exists` semantics (`src/services/packager-provisioning.ts:236-239`). Key
      rotation stays an explicit operator action —
      `DELETE /api/v1/optional-services/auto-subtitles`
@@ -643,7 +774,7 @@ detector's existing error path already records a failure on the asset as
 |---|---|
 | "A documented decision (ADR note or OSC feedback log) on whether lazy provisioning is possible for these two services today." | This ADR, §3 (with the decision table at the top). Supporting friction logged in `docs/osc-feedback/incoming-issue791-lazy-provision-optional-services.md`. |
 | "If feasible, a design ready for a `surface-data-pipeline`/`surface-infra` implementation issue." | §4, including trigger point (§4.3), failure handling (§4.4), timeout/back-pressure (§4.5), persistence (§4.6) and acceptance criteria (§4.7). |
-| "Introspect the live OSC catalog … confirm whether an on-demand provisioning path exists with the same shape used for the existing lazily-provisioned services." | §2.2-§2.4. The OSC MCP was unreachable in this session (§2.1); the catalog facts come from in-repo recorded `get-service-schema` verifications plus the #791 thread's 2026-09-24 verification, which agree. Scene detection matches the packager's shape; subtitles does not. |
+| "Introspect the live OSC catalog … confirm whether an on-demand provisioning path exists with the same shape used for the existing lazily-provisioned services." | §2.2-§2.4. Done against the **live** catalog: `get-service-schema` was run for `eyevinn-function-scenes`, `eyevinn-auto-subtitles` and `eyevinn-encore-packager` on 2026-09-25 (method in §2.1), and the in-repo 2026-07-12/13 verifications corroborate it on every field. Scene detection matches the packager's shape; subtitles does not. |
 | "If not feasible today, log the gap to `docs/osc-feedback/` and confirm the minimal fix (skipped status + reason field) is the durable behaviour rather than a stopgap." | §5 and §6 ("The `skipped` status stays"), plus the feedback log. |
 
 ---
@@ -652,19 +783,33 @@ detector's existing error path already records a failure on the asset as
 
 Every line reference below was read in this branch before being cited.
 
-**Catalog / service contracts (recorded `get-service-schema` verifications):**
+**Catalog / service contracts — PRIMARY (live `get-service-schema`, 2026-09-25):**
+- `eyevinn-function-scenes` — required `name` only; no optional fields, no
+  dependencies, no secret (§2.2).
+- `eyevinn-auto-subtitles` — required `name` (`^\w+$`) + `openaikey`; optional
+  `awsAccessKeyId` / `awsSecretAccessKey` / `awsRegion` / `s3Endpoint`;
+  `s3Endpoint` requires a `minio-minio` instance (§2.3).
+- Both, plus `eyevinn-encore-packager` — *"Update Support: Not confirmed at
+  schema-query time"*; instance names `^[a-z0-9]+$`, `maxLength: 20`
+  post-sanitization (§2.3, §2.3a).
+- Fetched via `POST $OSC_MCP_URL` → `osc_call_tool` → `get-service-schema`
+  (`serviceId` + `verbosity` both required); server `osc-remote-mcp` 8.10.0.
+
+**Catalog / service contracts — CORROBORATING (in-repo, 2026-07-12/13):**
 - `src/services/optional-services.ts:20-26` — both services' create configs.
 - `src/services/optional-services.ts:66-94` — the field registry
   (`openaikey` required+secret; scene detection `fields: []`).
-- `src/routes/provision.ts:1089-1096` — auto-subtitles: `name` + `openaikey`, no
-  update support.
+- `src/routes/provision.ts:1089-1096` — auto-subtitles: `name` + `openaikey`;
+  also asserts "no update support", which the live schema does **not** confirm
+  either way (§2.3).
 - `src/routes/provision.ts:1118-1120` — function-scenes: `name` only.
 - `src/pipeline/scene-detector.ts:32-37`, `src/pipeline/osc-scene-detect.ts:11-29`
   — same create config, plus the runtime wire shape is NOT exposed by
   `get-service-schema`.
 - `src/services/stack.ts:93` — `SCENE_DETECT_SERVICE_ID`.
-- Issue #791 thread, OSC verification 2026-09-24 — `supportsUpdate: false` and
-  `s3Endpoint` auto-wiring to `minio-minio` for auto-subtitles.
+- Issue #791 thread, OSC verification 2026-09-24 — `s3Endpoint` auto-wiring to
+  `minio-minio` for auto-subtitles (confirmed live 2026-09-25). The same thread's
+  `supportsUpdate: false` reading is **superseded** — see §2.3.
 
 **Current eager provisioning:**
 - `src/routes/provision.ts:667-668` (opt-in flags), `:597` (`OPENAI_API_KEY`),
