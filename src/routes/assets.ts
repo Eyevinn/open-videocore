@@ -38,6 +38,15 @@ import {
   type PackagedOutput,
   type SubtitleTrack
 } from '../data/asset-repo.js';
+// Created-at range filtering (issue #833). The wire grammar, the inclusive
+// bound semantics and the normalisation to canonical UTC instants live in ONE
+// module shared with GET /api/v1/search/, so the two endpoints cannot answer a
+// differently-shaped range for the same query string.
+import {
+  CreatedFromSchema,
+  CreatedToSchema,
+  resolveCreatedRange
+} from '../data/created-range.js';
 // Collection membership (issue #570). The asset DELETE route blocks archiving an
 // asset that is still a member of one or more collections; the collection repo
 // owns the authoritative membership representation (the flat `assetIds` list,
@@ -131,6 +140,7 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
+import { oscClipJobLog } from '../pipeline/osc-clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
@@ -364,7 +374,13 @@ const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   offset: z.coerce.number().int().min(0).optional(),
   status: statusSchema.optional(),
-  parentId: z.string().min(1).optional()
+  parentId: z.string().min(1).optional(),
+  // Inclusive created-at range (issue #833). Same grammar and same match
+  // semantics as `GET /api/v1/search/?from=&to=` — both import the one
+  // definition in data/created-range.ts. Applied to the whole result set before
+  // `limit`/`offset`, so it narrows `total` and every page.
+  from: CreatedFromSchema.optional(),
+  to: CreatedToSchema.optional()
 });
 
 // TAMS-addressed lookup query params (issue #175, sub-task of #116; contract
@@ -932,9 +948,12 @@ type AssetsRouterOptions = {
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
   // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
-  // (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
-  // object storage), POST /:id/clip responds 501.
-  clipRunner?: ClipRunner;
+  // (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
+  // extractor / rewrap runner it may be a factory that receives the workspace's
+  // s3Config so the OSC job can write the clip directly to the right MinIO
+  // bucket via `s3://bucket/key` (a presigned PUT URL does NOT work —
+  // issue #786). When absent (or no object storage), POST /:id/clip responds 501.
+  clipRunner?: ClipRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner);
   clip?: typeof runClip;
   clipDeps?: Partial<ClipDeps>;
   // HLS/DASH packaging (issue #9). When present, POST /:id/package is enabled.
@@ -2512,9 +2531,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
   app.get(
     '/',
-    { schema: { querystring: listQuerySchema, response: { 200: listSchema } } },
-    async (request) => {
-      return repo.list(request.query);
+    {
+      schema: {
+        querystring: listQuerySchema,
+        response: { 200: listSchema, 400: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { from, to, ...rest } = request.query;
+      // An inverted range is a caller mistake, not an empty page (issue #833).
+      const created = resolveCreatedRange({ from, to });
+      if (!created.ok) {
+        return reply.code(400).send({ error: 'invalid_created_range', message: created.message });
+      }
+      return repo.list({ ...rest, ...created.range });
     }
   );
 
@@ -2794,6 +2824,159 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send(updated);
+    }
+  );
+
+  // Detach an upstream external identifier from an asset (issue #867, ADR-019).
+  // The missing inverse of the attach route above: without it a mistyped
+  // `{ namespace, id }` attached via POST /:id/external-ids was permanent, since
+  // PATCH /:id cannot reach the set (UpdateAssetInput carries no
+  // `externalIdentifiers` field, asset-repo.ts:613-674). Goes through the
+  // dedicated repository seam AssetRepository.detachExternalId (asset-repo.ts:902)
+  // for the same reason attach does — CouchDB routes it through updateWithRetry,
+  // so the read-modify-write is conflict-safe.
+  //
+  // PATH SHAPE mirrors the `/by-external-id/:namespace/:id` resolver
+  // (assets.ts:2718): the composite external key is addressed as two path
+  // segments, so an upstream id containing a colon (e.g. a URN) stays
+  // unambiguous. The second segment is named `:externalId` rather than a second
+  // `:id` because Fastify's router (find-my-way) silently COLLAPSES duplicate
+  // parameter names within one path — the last occurrence wins and the asset id
+  // would be lost. The wire path is unchanged:
+  // `/api/v1/assets/{id}/external-ids/{namespace}/{externalId}`.
+  //
+  // IDEMPOTENT by contract: 204 whether or not the asset carried the pair, so a
+  // retried or duplicated DELETE is never an error. Detaching a pair that was
+  // never attached is NOT a 404 — the asset, not the pair, is the addressed
+  // resource, matching the `DELETE /:id/tags/:tag` precedent (assets.ts:4859)
+  // where removing an absent tag is a no-op success rather than a 404. 204 (not
+  // 200 with the asset) because `assetSchema` declares no `externalIdentifiers`
+  // field, so a 200 body would be serialized WITHOUT the very field the caller
+  // just changed — an empty success is the honest envelope.
+  //
+  // Enforcing `(namespace, id)` uniqueness across the array is explicitly OUT OF
+  // SCOPE here (deferred to #577); the detach simply removes every entry equal to
+  // the pair, so an asset that accumulated a duplicate in advisory mode is
+  // cleared in one call.
+  //
+  // Error -> status mapping:
+  //   - empty `namespace` / `externalId` -> 400 (params schema, before handler).
+  //   - unknown asset id -> 404 (the ONLY 404 on this route).
+  //   - pair not attached -> 204 (idempotent success, not an error).
+  app.delete(
+    '/:id/external-ids/:namespace/:externalId',
+    {
+      schema: {
+        summary: 'Detach an upstream external identifier from an asset',
+        description:
+          'Remove the `{ namespace, id }` external identifier from the asset ' +
+          '(ADR-019) — the inverse of `POST /assets/{id}/external-ids`, for ' +
+          'correcting a mistyped or stale correlation. Idempotent: returns 204 ' +
+          'whether or not the asset carried the pair, so a repeated call is never ' +
+          'an error. 404 is returned only when the asset itself does not exist.',
+        params: z.object({
+          id: z.string().describe('Asset id.'),
+          namespace: z
+            .string()
+            .min(1)
+            .describe(
+              'Upstream system-of-record label the external id belongs to (e.g. ' +
+                '`ingest-mam`, `rights-registry`). Required, non-empty.'
+            ),
+          externalId: z
+            .string()
+            .min(1)
+            .describe(
+              'Opaque foreign-key value in that system (UUID / numeric id / slug). ' +
+                'Required, non-empty.'
+            )
+        }),
+        response: { 204: z.null(), 400: errorSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const updated = await repo.detachExternalId(request.params.id, {
+        namespace: request.params.namespace,
+        id: request.params.externalId
+      });
+      // undefined means the ASSET is unknown — the only not-found case. A pair
+      // that was never attached comes back as the unchanged asset, i.e. 204.
+      if (!updated) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.code(204).send(null);
+    }
+  );
+
+  // List the external identifiers attached to an asset (issue #866, ADR-019).
+  // The READ-BACK half of the POST route above: `administrative.externalIdentifiers[]`
+  // (asset-document.ts:329) is system-owned and deliberately NOT projected onto the
+  // asset response envelope (`assetSchema` declares no `externalIdentifiers`, so the
+  // fastify-zod serializer strips it from the POST/GET `/:id` bodies), which left the
+  // attached pairs unreadable over HTTP. This dedicated sub-resource exposes them
+  // without widening the asset envelope.
+  //
+  // Returned AS STORED: the array mirrors the persisted order and contents of
+  // `administrative.externalIdentifiers[]` element for element — no dedup, sort, or
+  // reformatting — so a caller sees exactly what the attach path wrote. Each element
+  // is the `{ namespace, id }` pair of ExternalIdentifierSchema
+  // (asset-document.ts:173-186) / the `ExternalIdentifier` type (asset-repo.ts:281-286).
+  //
+  // Resolution goes through `repo.get` (id only), matching the sibling write path
+  // `attachExternalId(request.params.id, …)` rather than GET `/:id`'s slug fallback,
+  // so the id grammar accepted by attach and by this read-back is identical.
+  //
+  // Error -> status mapping:
+  //   - unknown asset id -> 404 `{ error: 'not_found' }` (the same envelope the POST
+  //     route and the `/by-external-id` resolver use).
+  //   - known asset with no identifiers attached -> 200 `[]` (an empty set is a
+  //     valid state, not a miss; the persisted field is optional/absent pre-#575).
+  app.get(
+    '/:id/external-ids',
+    {
+      schema: {
+        summary: "List an asset's upstream external identifiers",
+        description:
+          'List the `{ namespace, id }` external identifiers attached to the asset ' +
+          '(ADR-019), exactly as stored. `namespace` labels the upstream system of ' +
+          'record; `id` is the opaque foreign key in that system. Returns an empty ' +
+          'array when the asset carries none, and 404 when the asset id is unknown.',
+        params: z.object({ id: z.string() }),
+        response: {
+          200: z
+            .array(
+              z.object({
+                namespace: z
+                  .string()
+                  .describe(
+                    'Upstream system-of-record label the external id belongs to ' +
+                      '(e.g. `ingest-mam`, `rights-registry`).'
+                  ),
+                id: z
+                  .string()
+                  .describe(
+                    'Opaque foreign-key value in that system (UUID / numeric id / slug).'
+                  )
+              })
+            )
+            .describe(
+              'External identifiers attached to the asset, in persisted order. ' +
+                'Empty when none are attached.'
+            ),
+          404: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // Absent (pre-#575 documents, or an asset that never had one attached) maps to
+      // an empty array — `Asset.externalIdentifiers` is optional (asset-repo.ts:568)
+      // and docToAsset collapses an empty persisted array to undefined
+      // (asset-document.ts:712-715).
+      return reply.code(200).send(asset.externalIdentifiers ?? []);
     }
   );
 
@@ -4342,6 +4525,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'clip extraction is not configured'
         });
       }
+      // Resolve the injected runner. In production it is a factory that needs
+      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the clip
+      // to `s3://bucket/key` natively (issue #786); tests inject a plain
+      // ClipRunner and no s3Config, so fall back to using it directly. Mirrors
+      // the rewrap runner resolution above.
+      const clipS3Cfg = request.connections?.s3Config;
+      const resolvedClipRunner =
+        typeof opts.clipRunner === 'function' && clipS3Cfg
+          ? (opts.clipRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner)({
+              ...clipS3Cfg,
+              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
+            })
+          : (opts.clipRunner as ClipRunner);
       try {
         const child = await clipRunnerOrchestrator(
           {
@@ -4355,12 +4551,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             assets: repo,
             storage: storageFor(),
-            runner: opts.clipRunner,
+            runner: resolvedClipRunner,
             ...opts.clipDeps
           }
         );
         return reply.code(201).send(child);
       } catch (err) {
+        // The ffmpeg log is what makes a clip failure diagnosable (issue #786),
+        // but it is output from a service we do not control and can carry
+        // storage endpoints, bucket names and container paths. So it is logged
+        // SERVER-SIDE ONLY (osc-clip.ts:OscClipJobError carries it as data, not
+        // in `message`), and the caller gets just the status-bearing sentence.
+        request.log.warn(
+          { err, assetId: asset.id, oscJobLog: oscClipJobLog(err) },
+          'clip job failed'
+        );
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'clip_failed', message });
       }
@@ -4399,9 +4604,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // Proxy a single thumbnail image through the API. OSC MinIO blocks anonymous
-  // presigned URL access, so the browser cannot load MinIO URLs directly.
-  // This endpoint fetches the object using admin credentials and streams it.
+  // Proxy a single thumbnail image through the API: fetches the object with the
+  // deployment's storage credentials and streams it to a bearer-carrying caller.
+  //
+  // Originally this was the ONLY option, because anonymous presigned GETs
+  // against the hosted object store were observed returning 403 from outside
+  // the cluster (#113). That no longer reproduces — re-verified 2026-09-25 from
+  // outside the cluster: presigned anonymous GET → 200 image/jpeg, unsigned →
+  // 403 AccessDenied, tampered → 403 SignatureDoesNotMatch, expired → 403
+  // AccessDenied. So `/:id/thumbnails/:index/url` below is now the browser path
+  // (see #800), and this route stays for server-to-server callers that already
+  // hold a token and for deployments whose object store is not reachable from
+  // the client. Coverage: test/thumbnail-unauthenticated-fetch.test.ts.
   //   200 — image/jpeg stream
   //   404 — unknown asset or out-of-range index
   //   501 — storage not configured

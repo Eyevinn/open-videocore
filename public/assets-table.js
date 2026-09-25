@@ -71,6 +71,7 @@ import {
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
+import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
 
 // ─── Contract constants (verified above) ─────────────────────────────────────
 
@@ -357,15 +358,27 @@ function buildColumns(renderCtx) {
             '/thumbnails/0" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
           : '<div class="thumb-xs thumb-placeholder"></div>',
     },
+    // Issue #851: the column headed "ID" carries the ULID `id` — the value every
+    // asset-id endpoint accepts (see the CONTRACT GROUNDING block in
+    // public/copy-id.js) — as selectable text with a click-to-copy button, not a
+    // hover-only tooltip. The slug keeps its place in its own "Slug" column.
     {
       key: 'id',
       label: 'ID',
-      render: (a) =>
-        '<span class="cell-id" title="' +
-        escHtml(a.id) +
-        '">' +
-        escHtml(a.slug || a.id) +
-        '</span>',
+      render: (a) => copyableIdCellHtml(a.id, 'Copy asset id'),
+    },
+    // The slug is a real field on the tier-1 list item (openapi.json
+    // .paths["/api/v1/assets/"].get ... items.properties.slug) but is ABSENT from
+    // the tier-2 search projection (`assetSchema` in src/routes/search.ts:67-94
+    // has no `slug`, and Fastify serializes against that schema). So this cell
+    // renders an em-dash while a free-text `q` term is active — an honest empty,
+    // not a wrong value. Noted with the other tier-2 contract gaps above; no
+    // issue tracks widening that projection yet, so treat this as a known gap
+    // rather than a scheduled fix.
+    {
+      key: 'slug',
+      label: 'Slug',
+      render: (a) => slugCellHtml(a.slug),
     },
     {
       key: 'title',
@@ -553,6 +566,11 @@ export function createAssetsTable(deps) {
   function wireRowHandlers() {
     const tbody = table.el.querySelector('tbody');
     if (!tbody) return;
+
+    // Click-to-copy for the asset id cell (issue #851). Bound before the row
+    // handler below; the copy handler stops propagation so copying an id does
+    // not also open that row's detail panel.
+    wireCopyIdButtons(tbody);
 
     tbody.querySelectorAll('tr[data-row-key]').forEach(function (tr) {
       const id = tr.getAttribute('data-row-key');

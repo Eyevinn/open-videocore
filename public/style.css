@@ -238,6 +238,41 @@ tbody td {
   white-space: nowrap;
 }
 
+/* Identifier cell that must show its value IN FULL (issue #851): a 26-char ULID
+   is wider than the 140px .cell-id cap, and a truncated id cannot be read or
+   selected. Deliberately NO `user-select: all` here: inside a clickable table
+   row that click also opens the detail panel, so a "one click selects it"
+   affordance would be a lie. The copy button beside the value is the
+   affordance; the text stays normally selectable. */
+.cell-id-value {
+  display: inline-block;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+  color: var(--text);
+  vertical-align: middle;
+}
+
+/* Click-to-copy button beside an identifier (issue #851). Always visible — the
+   id must be copyable without hovering for a tooltip. */
+.copy-id-btn {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 16px;
+  vertical-align: middle;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.copy-id-btn:hover {
+  color: var(--text);
+  border-color: var(--accent, var(--border));
+}
+
 /* Status badges */
 .badge {
   display: inline-block;
