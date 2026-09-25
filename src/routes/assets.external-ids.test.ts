@@ -168,3 +168,88 @@ describe('POST /api/v1/assets/:id/external-ids (issue #577)', () => {
     expect(dup.statusCode).toBe(200);
   });
 });
+
+// Read-back half of the same sub-resource (issue #866).
+//
+// Contract under test (src/routes/assets.ts, GET '/:id/external-ids'):
+//   - 200 with a JSON ARRAY of `{ namespace, id }` mirroring the persisted
+//     `administrative.externalIdentifiers[]` (asset-document.ts:329, element schema
+//     ExternalIdentifierSchema at asset-document.ts:173-183) as stored;
+//   - 200 `[]` when the asset exists but carries none (the persisted field is
+//     optional, asset-repo.ts:568);
+//   - 404 `{ error: 'not_found' }` for an unknown asset id, the same envelope the
+//     POST route and the `/by-external-id` resolver return.
+describe('GET /api/v1/assets/:id/external-ids (issue #866)', () => {
+  it('200: returns an identifier attached through the POST route, namespace included', async () => {
+    const repo = new InMemoryAssetRepository();
+    const asset: Asset = await repo.create({ name: 'src' });
+    const app = await buildApp(repo);
+
+    const attach = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${asset.id}/external-ids`,
+      payload: { namespace: 'ingest-mam', id: 'X-1' }
+    });
+    expect(attach.statusCode).toBe(200);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${asset.id}/external-ids`
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([{ namespace: 'ingest-mam', id: 'X-1' }]);
+  });
+
+  it('200: returns every attached pair, in persisted order, without dedup or reformatting', async () => {
+    const repo = new InMemoryAssetRepository();
+    const asset = await repo.create({ name: 'src' });
+    const app = await buildApp(repo);
+
+    for (const pair of [
+      { namespace: 'ingest-mam', id: 'X-1' },
+      { namespace: 'rights-registry', id: 'urn:rights:42' }
+    ]) {
+      const attach = await app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${asset.id}/external-ids`,
+        payload: pair
+      });
+      expect(attach.statusCode).toBe(200);
+    }
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${asset.id}/external-ids`
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([
+      { namespace: 'ingest-mam', id: 'X-1' },
+      { namespace: 'rights-registry', id: 'urn:rights:42' }
+    ]);
+  });
+
+  it('200: an asset with no external identifiers returns an empty array', async () => {
+    const repo = new InMemoryAssetRepository();
+    const asset = await repo.create({ name: 'src' });
+    const app = await buildApp(repo);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/v1/assets/${asset.id}/external-ids`
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it('404: unknown asset id returns not_found', async () => {
+    const repo = new InMemoryAssetRepository();
+    const app = await buildApp(repo);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/assets/does-not-exist/external-ids'
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: 'not_found' });
+  });
+});
