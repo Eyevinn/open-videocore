@@ -372,7 +372,9 @@ function buildColumns(renderCtx) {
     // the tier-2 search projection (`assetSchema` in src/routes/search.ts:67-94
     // has no `slug`, and Fastify serializes against that schema). So this cell
     // renders an em-dash while a free-text `q` term is active — an honest empty,
-    // not a wrong value. Noted with the other tier-2 contract gaps above.
+    // not a wrong value. Noted with the other tier-2 contract gaps above; no
+    // issue tracks widening that projection yet, so treat this as a known gap
+    // rather than a scheduled fix.
     {
       key: 'slug',
       label: 'Slug',

@@ -1613,23 +1613,24 @@ async function renderAssetDetailBody(id, bodyEl) {
 
     // Build KV grid with escaped values
     const kvRows = [
-      // With a slug, the "ID" row keeps the friendly handle (issue #133) and the
-      // copyable ULID follows on its own row below. Without one, this row IS the
-      // ULID, so it carries the copy affordance itself (issue #851).
-      asset.slug
-        ? ['ID', '<span class="text-mono">' + escHtml(asset.slug) + '</span>']
-        : ['ID', copyableIdCellHtml(asset.id, 'Copy asset id')],
+      // Issue #851: "ID" carries the ULID unconditionally — never the slug, and
+      // never a value that varies per asset. It is the one value every asset-id
+      // endpoint accepts (the collections membership route resolves it with a
+      // plain repo.get — no slug fallback), and it matches the ID column of the
+      // Assets table this pane opens from, so the two never disagree about what
+      // "ID" means. The copy button is here because a 26-character ULID should
+      // never have to be retyped into a form.
+      //
+      // Contract: openapi.json .paths["/api/v1/assets/{id}"].get 200 schema —
+      // `id` is in `required`, `slug` is an optional property.
+      ['ID', copyableIdCellHtml(asset.id, 'Copy asset id')],
     ];
-    // When a human-friendly slug is present, keep the raw ULID visible too so it
-    // stays discoverable in the detail pane. If there is no slug, the "ID" row
-    // above already shows the ULID — avoid a duplicate/empty row.
-    //
-    // Issue #851: the ULID is the value every asset-id endpoint accepts (the
-    // collections membership route resolves it with a plain repo.get — no slug
-    // fallback), so give it a click-to-copy button here too. A 26-character ULID
-    // should never have to be retyped into a form.
+    // The slug keeps its place as the human-readable handle (issues #131/#132/
+    // #133) — under its own honest label, never as "ID". Omitted entirely for
+    // pre-slug assets, which have no slug at all (optional in the contract
+    // above, and `slug?: string` on `Asset`, src/data/asset-repo.ts:455).
     if (asset.slug) {
-      kvRows.push(['ULID', copyableIdCellHtml(asset.id, 'Copy asset id')]);
+      kvRows.push(['Slug', '<span class="text-mono">' + escHtml(asset.slug) + '</span>']);
     }
     // Status cell; when the scene-detect pipeline recorded a failure
     // (asset.sceneDetectionError, a plain string per src/routes/assets.ts:381),
@@ -2676,9 +2677,23 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
       assetsDiv.appendChild(empty);
     } else {
       // Issue #851: the "ID" column carries the ULID the membership endpoints
-      // take (PUT/DELETE /collections/:id/assets/:assetId resolve it with a
-      // plain repo.get — no slug fallback), copyable straight into the
-      // add-asset field above. The slug gets its own labelled column.
+      // take, copyable straight into the add-asset field above. The slug gets
+      // its own labelled column.
+      //
+      // Contract, precisely: PUT /collections/:id/assets/:assetId resolves the
+      // asset with a plain `assets.get()` — no slug fallback, so a slug 422s
+      // (src/routes/collections.ts:501-510). DELETE does not resolve the asset
+      // at all; it removes by exact id, so a slug is a silent 200 no-op rather
+      // than a rejection (src/routes/collections.ts:542-547). Either way the
+      // ULID is the only value that works.
+      //
+      // The member objects here are full assets — GET /collections/:id sends
+      // `{ ...collection, assets: liveAssets }` where liveAssets is `Asset[]`
+      // (src/routes/collections.ts:342-346) — so `slug` is available, optional
+      // per `slug?: string` on `Asset` (src/data/asset-repo.ts:455). The
+      // response schema itself is `z.record(z.unknown())` passthrough
+      // (collectionWithAssetsSchema, src/routes/collections.ts:96-98), so it
+      // does not strip it.
       const rows = assets.map(function(a) {
         return '<tr>' +
           '<td>' + copyableIdCellHtml(a.id, 'Copy asset id') + '</td>' +
@@ -2782,8 +2797,9 @@ async function renderSearchTab(container) {
       // .paths["/api/v1/search/"].get...assets.items.properties has no `slug`,
       // unlike the list item schema on GET /api/v1/assets/ which does. Fastify
       // serializes against that schema, so a slug would be stripped even if the
-      // repository returned it. Reported as a follow-up; the contract is owned
-      // outside this change.
+      // repository returned it. Widening that projection is an API-contract
+      // change owned outside this UI fix and is NOT tracked by an issue yet — do
+      // not read this comment as a filed follow-up.
       const rows = assets.map(function(a) {
         return '<tr>' +
           '<td>' + copyableIdCellHtml(a.id, 'Copy asset id') + '</td>' +
