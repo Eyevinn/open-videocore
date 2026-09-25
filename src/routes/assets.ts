@@ -131,6 +131,7 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
+import { oscClipJobLog } from '../pipeline/osc-clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
@@ -932,9 +933,12 @@ type AssetsRouterOptions = {
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
   // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
-  // (eyevinn-ffmpeg-s3 in production, a stub in tests). When absent (or no
-  // object storage), POST /:id/clip responds 501.
-  clipRunner?: ClipRunner;
+  // (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
+  // extractor / rewrap runner it may be a factory that receives the workspace's
+  // s3Config so the OSC job can write the clip directly to the right MinIO
+  // bucket via `s3://bucket/key` (a presigned PUT URL does NOT work —
+  // issue #786). When absent (or no object storage), POST /:id/clip responds 501.
+  clipRunner?: ClipRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner);
   clip?: typeof runClip;
   clipDeps?: Partial<ClipDeps>;
   // HLS/DASH packaging (issue #9). When present, POST /:id/package is enabled.
@@ -4342,6 +4346,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'clip extraction is not configured'
         });
       }
+      // Resolve the injected runner. In production it is a factory that needs
+      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the clip
+      // to `s3://bucket/key` natively (issue #786); tests inject a plain
+      // ClipRunner and no s3Config, so fall back to using it directly. Mirrors
+      // the rewrap runner resolution above.
+      const clipS3Cfg = request.connections?.s3Config;
+      const resolvedClipRunner =
+        typeof opts.clipRunner === 'function' && clipS3Cfg
+          ? (opts.clipRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner)({
+              ...clipS3Cfg,
+              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
+            })
+          : (opts.clipRunner as ClipRunner);
       try {
         const child = await clipRunnerOrchestrator(
           {
@@ -4355,12 +4372,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           {
             assets: repo,
             storage: storageFor(),
-            runner: opts.clipRunner,
+            runner: resolvedClipRunner,
             ...opts.clipDeps
           }
         );
         return reply.code(201).send(child);
       } catch (err) {
+        // The ffmpeg log is what makes a clip failure diagnosable (issue #786),
+        // but it is output from a service we do not control and can carry
+        // storage endpoints, bucket names and container paths. So it is logged
+        // SERVER-SIDE ONLY (osc-clip.ts:OscClipJobError carries it as data, not
+        // in `message`), and the caller gets just the status-bearing sentence.
+        request.log.warn(
+          { err, assetId: asset.id, oscJobLog: oscClipJobLog(err) },
+          'clip job failed'
+        );
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'clip_failed', message });
       }
