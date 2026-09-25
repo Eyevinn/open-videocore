@@ -1,9 +1,14 @@
 # ADR-003: Delivery and stream URL contract for API consumers
 
-**Status:** ACCEPTED 2026-09-03
+**Status:** ACCEPTED 2026-09-03 — **Context amended 2026-09-25 (#857)**
 **Date:** 2026-09-03
 **Author agent:** claude-opus-4-8
 **Issue:** #509 (closes the delivery ADR ADR-001 reserved as "ADR-003: Delivery and CDN integration")
+**Amended:** 2026-09-25, #857 — the object-storage access premise recorded below was
+factually wrong. It is corrected in "Object-storage access model". The described
+behaviour of `/delivery` and `/stream/*` is unchanged (this amendment corrects the
+document, not the implementation); the conclusions that rested only on the old
+premise are now listed under "Open questions raised by the corrected premise".
 
 ---
 
@@ -13,8 +18,9 @@ ADR-001 open question 4 deferred delivery URLs to a post-v1 delivery ADR
 (reserved as ADR-003), which was never written. In the absence of a documented
 URL contract, a consuming application reached directly into the packaged object
 bucket and reimplemented storage-layout knowledge as a workaround. That
-workaround requires direct bucket access, which is not available to (and must
-not be required of) a normal API consumer.
+workaround requires the consumer to know the storage layout, which is not (and
+must not become) part of the API contract — the layout has already changed once
+(#502/#503), and bucket listing is denied, so a consumer cannot rediscover it.
 
 This ADR documents the **real, implemented** delivery and stream contract as
 merged by #502, #503, and #506, so a developer with zero prior knowledge can
@@ -23,26 +29,91 @@ proxy for playback using only these docs, with no direct bucket access.
 
 Every field and behaviour below is traceable to a cited source location.
 
-### Why delivery is proxied through the API
+### Object-storage access model
 
-Packaged output (CMAF HLS/DASH manifests + segments) is stored in a **private**
-object-storage bucket. The default OSC object-storage backend (MinIO) blocks
-externally-resolvable presigned and public bucket GETs at the OSC reverse proxy,
-so a presigned or raw bucket URL handed to a player does not resolve from
-outside the platform. Consequently:
+**Corrected 2026-09-25 (#857).** An earlier revision of this section claimed that
+the default OSC object-storage backend (MinIO) blocks externally-resolvable
+presigned and public bucket GETs at the OSC reverse proxy, and derived the
+`/stream/*` proxy design from that claim. **That premise was false**, and nothing
+in this ADR should be read as resting on it.
 
-- The API never advertises a presigned or raw bucket URL for packaged playback.
-- Playback is served by streaming packaged objects back through the authorized
-  API route `GET /api/v1/assets/:id/stream/*`, which reads from the private
-  bucket using the deployment's own credentials.
-- **Clients must consume the `/stream/*` URLs returned by `/delivery` — never a
-  presigned URL, never a raw/direct bucket URL, and never a reconstructed
-  storage path.**
+What is actually true (confirmed by OSC, 2026-09-25):
 
-Source: `src/routes/assets.ts:2028` (comment: "OSC MinIO blocks external
-presigned/public GETs"), `src/routes/assets.ts:2205-2212` (proxy-delivery
-rationale), `src/routes/assets.ts:2123` ("OSC MinIO blocks external
-presigned/public GETs").
+- OSC object-storage endpoints are **publicly reachable**. Access is not gated at
+  a platform reverse proxy; it is governed **per bucket, by that bucket's own
+  policy**.
+- The **default** bucket policy is **strict** — no anonymous access. A bucket that
+  acts as a delivery **origin** (one whose objects a player fetches directly) is
+  normally made **public** by policy.
+- Presigned URLs **do** resolve from outside the platform.
+
+In this deployment the origin bucket is **`openvideocore-packaged`**. Provisioning
+applies an anonymous read-only policy to that bucket **and to it alone**:
+`s3:GetObject` for principal `*` on `arn:aws:s3:::openvideocore-packaged/*`, with
+no `s3:ListBucket` and no write. `openvideocore-source` keeps the default strict
+policy. Sources: `packagedPolicy`, `src/routes/provision.ts:996-1006` and
+`setBucketPolicy(PACKAGED_BUCKET, packagedPolicy)`, `src/routes/provision.ts:1011`;
+rationale comment `src/routes/provision.ts:983-995` ("the SOURCE bucket MUST stay
+private, so this loop deliberately targets PACKAGED_BUCKET alone … objects are
+readable by exact key but the bucket is not browsable"); bucket names
+`src/routes/provision.ts:63-64`.
+
+#### Observed behaviour (evidence)
+
+Measured externally, 2026-09-25 — unauthenticated, unsigned, **no `Authorization`
+header**:
+
+| Request | Result |
+|---|---|
+| `GET` packaged manifest — `openvideocore-packaged/<assetId>/<uuid>/index.m3u8` | `200`, body begins `#EXTM3U` |
+| `GET` source object — `openvideocore-source/ingest/<assetId>` | `403` |
+| Bucket **listing** of `openvideocore-packaged` | `403` |
+| Bucket **listing** of `openvideocore-source` | `403` |
+| Presigned URL from `GET /api/v1/assets/{id}/files` — `source` | `200` |
+| Presigned URL from `GET /api/v1/assets/{id}/files` — each of the five renditions | `200` |
+
+(`/files` presigns `source` and every rendition via `storage.presignedGet(key, ttl)`:
+`src/routes/assets.ts:3303` onwards, presign calls at `src/routes/assets.ts:3348`
+and `src/routes/assets.ts:3368-3371`.)
+
+Two conclusions follow, and both matter for the rest of this ADR:
+
+1. **The configuration is correct; only the earlier description of it was wrong.**
+   The packaged bucket is publicly readable *by design* because it is an origin
+   bucket; the source bucket is correctly strict.
+2. **Neither bucket can be enumerated.** Listing is denied on both, so object
+   paths are **not discoverable**. A caller can only fetch an object whose exact
+   key it already holds — and packaged keys are job-nested
+   (`<assetId>/<packagerJobId>/…`, see "packaged-prefix resolution" below), so
+   they cannot be guessed from the asset id.
+
+#### Why delivery is proxied through the API
+
+The implemented behaviour is unchanged by the correction above, and is documented
+in full in the Decision below:
+
+- The API does not advertise a raw bucket URL for packaged playback; on the
+  default backend it advertises `/stream/*` URLs.
+- Playback is served by streaming packaged objects back through the API route
+  `GET /api/v1/assets/:id/stream/*`, which reads the packaged bucket using the
+  deployment's own credentials.
+- **Clients must consume the URLs returned by `/delivery` — never a reconstructed
+  storage path.** On the corrected premise this still holds, but for different
+  reasons: listing is denied so paths are not discoverable; the real prefix is
+  job-nested and resolved server-side (#502/#503); and the storage layout is not
+  part of the API contract and changes without notice.
+
+What the correction removes is the *justification* that the proxy is the only
+thing that can work. It is not: the packaged bucket is a public origin, and
+presigned URLs resolve externally. **Whether the proxy should remain the default
+delivery posture is therefore an open product decision, deliberately not decided
+here** — see "Open questions raised by the corrected premise".
+
+Note for implementers: three code comments still assert the old premise verbatim
+(`src/routes/assets.ts:2922-2923`, `src/routes/assets.ts:2961`,
+`src/routes/assets.ts:3018`: "OSC MinIO blocks external presigned/public GETs").
+#857 is documentation-only and does not touch them; they are wrong and tracked as
+OPEN-2 below.
 
 ---
 
@@ -105,9 +176,10 @@ Status codes:
 #### The `ready` variant
 
 `status: "ready"` means `urls` holds a **fully-resolvable, absolute** playback
-or download URL that plays without workarounds. On the default private-bucket
-(MinIO) backend, `urls.hls` / `urls.dash` are absolute `/stream/*` proxy URLs of
-the form:
+or download URL that plays without workarounds. On the default per-stack MinIO
+backend, `urls.hls` / `urls.dash` are absolute `/stream/*` proxy URLs of the form
+(this is what the code does today; see OPEN-1 on whether it should stay the
+default):
 
 ```
 <PUBLIC_BASE_URL>/api/v1/assets/<id>/stream/index.m3u8   (HLS)
@@ -157,9 +229,11 @@ neither format resolves to a playable URL (`src/routes/assets.ts:2154-2156`).
 
 The correct fix for `not_configured` is **not** direct bucket access — it is to
 configure `PUBLIC_BASE_URL` on the deployment so `/delivery` can advertise
-absolute `/stream/*` URLs. The `resolution` metadata exists only for operators
-who already hold object-store credentials; it is not a supported path for normal
-API consumers.
+absolute `/stream/*` URLs. The `resolution` metadata exists only for an operator
+who can already address the objects — it tells that operator the exact keys,
+which is precisely what bucket listing does not (listing is `403` on both
+buckets). It is not a supported path for normal API consumers, and the layout it
+exposes is not part of the API contract.
 
 #### The `failed` variant (#810)
 
@@ -207,7 +281,7 @@ filenames the packager emits (`src/pipeline/packaging.ts:71-77`,
 
 `*` is the object path **relative to the asset's packaged prefix**. The route
 resolves the REAL prefix the packager wrote under and maps
-`objectKey = <streamPrefix>/<relative>` inside the private packaged bucket
+`objectKey = <streamPrefix>/<relative>` inside the packaged bucket
 (`src/routes/assets.ts:2259-2260`). Prefix resolution (`resolveStreamPrefix`,
 `src/routes/assets.ts:966-980`) prefers, in order:
 
@@ -228,7 +302,7 @@ comment `src/routes/assets.ts:2251-2258`).
 When the requested object is a manifest (`.m3u8` / `.mpd`, detected by
 `isManifestPath`, `src/pipeline/manifest-rewrite.ts:49-52`), the route rewrites
 every child reference so it resolves back through this same `/stream/*` prefix
-rather than escaping to a bare bucket host or an unsigned URL. Rewrite invoked at
+rather than escaping to a bare bucket host or a stored object-key path. Rewrite invoked at
 `src/routes/assets.ts:2304-2335`; rewrite logic in
 `src/pipeline/manifest-rewrite.ts` (`rewriteManifest`,
 `src/pipeline/manifest-rewrite.ts:287-296`).
@@ -277,20 +351,28 @@ playback.**
 ### 3. Delivery-mode configuration (operator-facing)
 
 `DELIVERY_MODE` (env, 12-factor) selects a mutually-exclusive delivery posture
-for the default private-bucket backend (`deliveryMode`,
+for the default per-stack MinIO backend (`deliveryMode`,
 `src/pipeline/packaging.ts:236-247`):
 
-- `proxy` — `/delivery` advertises `/stream/*` proxy URLs; the packaged bucket
-  stays private. `src/routes/assets.ts:2090-2114`.
+- `proxy` — `/delivery` advertises `/stream/*` proxy URLs; the client never
+  addresses the packaged bucket directly. This mode does **not** change the
+  packaged bucket's policy — that bucket remains a public-read origin (see
+  "Object-storage access model"), so "proxy" describes what the API *advertises*,
+  not what the bucket *permits*. `src/routes/assets.ts:2090-2114`.
 - `public` (default when unset/unrecognised) — advertises the stored CMAF
   manifest URLs resolved to a public origin; on the zero-config MinIO backend
-  (no `PACKAGED_PUBLIC_BASE_URL`) the stored value is a bare, non-fetchable
-  object-key path, so the handler routes it through the same `/stream/*` proxy
+  (no `PACKAGED_PUBLIC_BASE_URL`) the stored value is a **bare object-key path
+  with no scheme and no host** (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`),
+  which a player cannot fetch for that reason alone — not because the bucket
+  denies it. The handler therefore routes it through the same `/stream/*` proxy
   to keep the advertised URL absolute and resolvable (#341,
-  `src/routes/assets.ts:2116-2162`).
+  `src/routes/assets.ts:2116-2162`). Setting `PACKAGED_PUBLIC_BASE_URL` to the
+  bucket's own externally-reachable origin makes this mode emit a directly
+  fetchable URL instead; see OPEN-3.
 
 In both modes on the default backend, resolvable playback ultimately flows
-through `/stream/*`. To get absolute `ready` URLs, set `PUBLIC_BASE_URL`.
+through `/stream/*` unless `PACKAGED_PUBLIC_BASE_URL` is set. To get absolute
+`ready` URLs, set `PUBLIC_BASE_URL`.
 
 ---
 
@@ -337,18 +419,58 @@ directly, and let the player resolve child references through `/stream/*`.
 
 **Positive:**
 - A consumer can play back an asset using only `/delivery` + `/stream/*`, with no
-  bucket credentials and no storage-layout knowledge.
-- The packaged bucket stays private, which is the desirable posture for
-  multi-tenant deployments.
+  bucket credentials and no storage-layout knowledge. (Re-justified on the
+  corrected premise: bucket listing is `403` on both buckets and packaged keys are
+  job-nested, so the layout is not discoverable by a consumer anyway — the API is
+  the only supported way to learn a playable URL.)
+- One advertised URL shape per deployment, resolved server-side, so the storage
+  layout stays an implementation detail the API can change (as #502/#503 did)
+  without breaking consumers.
+- The **source** bucket stays strictly private (`403` unauthenticated), and
+  **neither** bucket is enumerable — so raw masters are not externally readable
+  and no bucket can be crawled.
 - The `status` enum gives consumers an unambiguous readiness signal; an
   unplayable state is `not_configured` or `failed`, never a fake-ready `200`.
 
 **Negative / trade-offs:**
 - All packaged bytes transit the API process in proxy mode, so the API is on the
   playback data path (mitigate with a fronting CDN over `/stream/*` if needed —
-  segment responses set `Cache-Control` and advertise `Accept-Ranges`).
+  segment responses set `Cache-Control` and advertise `Accept-Ranges`). On the
+  corrected premise this cost is now a *choice*, not a necessity — see OPEN-1.
 - Fully-resolvable `ready` URLs require `PUBLIC_BASE_URL` to be configured;
   otherwise `/delivery` returns `not_configured`.
+
+### Open questions raised by the corrected premise (#857)
+
+These were previously treated as settled by the old, false premise. Correcting the
+premise reopens them. #857 is documentation-only and deliberately does **not**
+resolve any of them.
+
+- **OPEN-1 — Should `/stream/*` proxying remain the default delivery posture?**
+  The original justification ("a presigned or public bucket URL does not resolve
+  externally") is void: the packaged bucket is a public-read origin and presigned
+  URLs resolve externally with `200`. There may still be good reasons to keep the
+  proxy as the default (per-request authorisation on playback, no key leakage, a
+  stable URL shape, manifest rewriting, CDN-frontable single origin), but they
+  have not been weighed against serving the origin bucket directly. This is a
+  product decision, not a documentation fix.
+- **OPEN-2 — Code comments still assert the false premise.** `src/routes/assets.ts:2922-2923`,
+  `:2961`, and `:3018` still read "OSC MinIO blocks external presigned/public
+  GETs". They are wrong and should be corrected in a code change (out of scope
+  here); until then, treat this section — not those comments — as authoritative.
+- **OPEN-3 — `DELIVERY_MODE=public` behaviour on the default backend.** The #341
+  fallback routes public mode through the proxy because the *stored* value is a
+  bare object-key path. Now that the packaged bucket is known to be an
+  externally-readable origin, whether the deployment should instead set
+  `PACKAGED_PUBLIC_BASE_URL` to that origin by default (making public mode
+  genuinely direct) is open.
+- **OPEN-4 — Is public-read on the packaged bucket the right posture for
+  multi-tenant deployments?** Anyone holding an exact packaged key can fetch that
+  object with no credentials and no token. Enumeration is denied and keys are
+  job-nested (`<assetId>/<packagerJobId>/…`), so keys are not guessable, but the
+  ADR should not assert "the packaged bucket stays private" — it does not. Whether
+  unauthenticated key-based access to packaged output is acceptable, and how it
+  relates to the authorisation model in ADR-018, needs a security review.
 
 ---
 
@@ -357,11 +479,16 @@ directly, and let the player resolve child references through `/stream/*`.
 - ADR-001 open question 4 (delivery deferral; this ADR is the reserved
   "ADR-003: Delivery and CDN integration").
 - ADR-011 — per-execution packaged-output destination (relocated delivery URLs).
+- ADR-018 — authorisation model (relevant to OPEN-4).
 - Issues #502 (persist packaged prefix/keys), #503 (resolve packaged prefix for
   `/stream`), #506 (resolvable delivery URLs or `not_configured`), #509 (this
-  documentation task), #810 (`failed` status for a failed, source-only asset).
+  documentation task), #810 (`failed` status for a failed, source-only asset),
+  #199 (anonymous read-only policy on the packaged bucket), #341 (proxy fallback
+  for a non-absolute public-mode URL), #857 (this amendment: correct the
+  object-storage access model).
 - Code: `src/routes/assets.ts` (delivery + stream handlers, schemas),
-  `src/pipeline/packaging.ts` (proxy/output prefixes, delivery mode),
-  `src/pipeline/manifest-rewrite.ts` (child-reference rewriting),
+  `src/routes/provision.ts` (per-bucket policy: `PACKAGED_BUCKET` public read,
+  `SOURCE_BUCKET` strict), `src/pipeline/packaging.ts` (proxy/output prefixes,
+  delivery mode), `src/pipeline/manifest-rewrite.ts` (child-reference rewriting),
   `src/data/asset-repo.ts` (`PackagedOutput` shape), `openapi.json` (generated
   contract).
