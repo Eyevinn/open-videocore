@@ -42,12 +42,42 @@
  *
  *   2. GET /api/v1/assets/{id}/delivery                      (issues #14/#810)
  *      openapi.json → .paths["/api/v1/assets/{id}/delivery"].get
+ *                     (the generated spec declares no operationId on any path,
+ *                      so path item + method is the identifier)
  *      source       → src/routes/assets.ts:3053 (route), :558 (`deliverySchema`),
  *                     :520 (`deliveryUrlsSchema`)
  *      200 body: { assetId, status: 'ready'|'not_configured'|'failed',
  *                  urls: { hls?, dash?, source? }, resolution?, expiresAt }
  *      → loadable URL field for a `<video>`/`<source>`: `urls.source` — the
  *        presigned GET on the stored source object (src/routes/assets.ts:3256).
+ *
+ *      IMPORTANT: `urls.source` and `urls.hls`/`urls.dash` ARE MUTUALLY EXCLUSIVE.
+ *        Every key of `deliveryUrlsSchema` is optional (:520-524) and the
+ *        handler takes exactly ONE branch per asset:
+ *          - asset HAS packaged output (`asset.manifestUrls.hls || .dash`):
+ *            the packaged branch (:3085) early-returns `urls: { hls?, dash? }`
+ *            on every one of its paths. `source` is NEVER emitted, and the
+ *            source fallback is unreachable for that asset.
+ *          - packaged output exists but public delivery is not configured:
+ *            `status: 'not_configured'` with `urls: {}` and `resolution`
+ *            instead (`notConfiguredDelivery`, :1360). No URL key at all.
+ *          - asset has NO packaged output, only a stored source object
+ *            (:3242): `urls: { source }`, with `status: 'failed'` rather than
+ *            `'ready'` when the asset's own lifecycle failed (#810).
+ *          - neither packaged output nor source object: 404 `no_delivery`
+ *            (:3264), which `apiFetch` throws.
+ *        So `urlField: 'urls.source'` resolves falsy for EVERY packaged asset,
+ *        and this helper then returns false having assigned nothing. A caller
+ *        must branch on WHICH key is present (or on `status`) rather than
+ *        assume `urls.source` is always there:
+ *          - `urls.source` present → pass it through this module.
+ *          - `urls.hls`/`urls.dash` present → not inline-playable under
+ *            DELIVERY_MODE=proxy (next paragraph). To preview such an asset
+ *            inline, read its source object from contract 3 below
+ *            (`files[]` entry with `type: 'source'`, whose `url` is already a
+ *            presigned GET and is emitted whether or not the asset is
+ *            packaged). Otherwise degrade to a "no inline playback" state.
+ *          - `urls: {}` (`not_configured`) → "no inline playback".
  *        NOTE `urls.hls` / `urls.dash` are NOT usable here under
  *        DELIVERY_MODE=proxy: they are `/api/v1/assets/:id/stream/*` paths
  *        behind the same bearer gate, and signing the manifest would not help
@@ -117,12 +147,53 @@ export function readMediaUrl(body, field) {
 export function assignMediaSrc(el, url) {
   if (!el || !isLoadableMediaUrl(url)) return false;
   el.src = url;
-  const parent = el.tagName === 'SOURCE' ? el.parentElement : null;
-  if (parent && typeof parent.load === 'function') {
-    parent.load();
-  }
+  reselectParent(el);
   return true;
 }
+
+// Tell a `<source>`'s parent to re-run the resource-selection algorithm. Shared
+// by assignment and clearing: BOTH directions need it, for the same reason. A
+// `<source>` never loads or unloads anything itself — the parent `<video>` /
+// `<audio>` holds the selected resource, so a child's `src` changing (to a new
+// URL, or to nothing) is invisible to the parent until `load()` re-selects.
+// No-op for any element that is not a `<source>` inside a media parent.
+function reselectParent(el) {
+  const parent = el && el.tagName === 'SOURCE' ? el.parentElement : null;
+  if (parent && typeof parent.load === 'function') parent.load();
+}
+
+// Undo `assignMediaSrc`: drop the element's src and, for a `<source>`, make the
+// parent let go of the dead resource too.
+//
+// Removing the attribute alone is not enough for a `<source>` (the bug this
+// exists to fix): the parent `<video>` has already SELECTED that resource, and
+// clearing the child it selected from does not deselect it. Without the
+// `load()` the parent stays bound to a URL that just failed — it keeps showing
+// the broken/stalled resource, and any later re-selection can still resolve to
+// it. `load()` makes the parent re-run selection over the now-empty candidate
+// list and return to its empty state, which is what the failure path promises.
+export function clearMediaSrc(el) {
+  if (!el) return false;
+  if (typeof el.removeAttribute === 'function') el.removeAttribute('src');
+  reselectParent(el);
+  return true;
+}
+
+// The URL this element is CURRENTLY pointed at, as the literal string that was
+// assigned. Read from the content attribute rather than the `src` IDL property
+// because the property resolves against the document base and can come back
+// normalized (percent-encoding, default port), which would break the identity
+// comparison in `applyPresignedMediaSrc`'s staleness check.
+function currentMediaSrc(el) {
+  if (el && typeof el.getAttribute === 'function') return el.getAttribute('src') || '';
+  return el && typeof el.src === 'string' ? el.src : '';
+}
+
+// Where an element's current `applyPresignedMediaSrc` invocation parks its
+// identity + error listener, so the NEXT invocation on the same element can
+// find and retire it. A single property (not a listener registry) because only
+// one invocation may own an element at a time — the later one always wins.
+const OWNER_KEY = '__openVideocoreMediaSrcOwner';
 
 // ─── The pattern ──────────────────────────────────────────────────────────────
 
@@ -150,6 +221,14 @@ export function assignMediaSrc(el, url) {
  * media the presigned URL is the only viable path, which is why a deployment
  * that cannot presign must degrade to "no inline playback" rather than to a
  * worse playback experience.
+ *
+ * SAFE ON A REUSED ELEMENT. Calling this again on an element that is already
+ * showing (or still resolving) an earlier presigned URL is well defined: the
+ * LAST call wins, the previous call's error listener is removed rather than
+ * left to accumulate, and a superseded call can no longer clear the src or fire
+ * its `onFailure` — its teardown is scoped to the URL it assigned itself. So a
+ * re-rendered row or a re-populated thumbnail strip cannot blank out an element
+ * a newer, healthy call just filled in.
  *
  * @param {Element} el          an `<img>`, `<video>`, `<audio>` or `<source>`
  * @param {object}  options
@@ -184,10 +263,61 @@ export async function applyPresignedMediaSrc(el, options) {
 
   if (!el) return false;
 
+  // Elements are REUSED — a re-rendered asset row, a thumbnail strip populated
+  // a second time, a `<video>` repointed at a different asset — so an element
+  // can be handed to this function again while an earlier invocation on it is
+  // still in flight or still listening. `token` is this invocation's identity
+  // (object identity, so it cannot collide) and is parked on the element; the
+  // element belongs to whichever invocation parked its token LAST.
+  const token = {};
+
+  // Is this invocation still the one that owns the element? False once a later
+  // invocation has taken over — at which point everything this one does to the
+  // element would be interference with a newer, healthier assignment.
+  function isCurrent() {
+    const owner = el[OWNER_KEY];
+    return Boolean(owner) && owner.token === token;
+  }
+
+  // Stop listening and hand ownership back, so a failed/finished invocation
+  // leaves no listener behind on a reused element.
+  function release() {
+    if (!isCurrent()) return;
+    if (typeof el.removeEventListener === 'function') {
+      el.removeEventListener('error', onError);
+    }
+    el[OWNER_KEY] = null;
+  }
+
+  // The URL THIS invocation assigned ('' until it assigns one). It scopes the
+  // failure path: an invocation may only tear down the src it put there itself.
+  let assignedUrl = '';
+
   function fail() {
     if (notifiedFailure) return false;
+    // Two staleness guards, both required, covering the two windows in which a
+    // later invocation can overtake this one:
+    //
+    //   1. Before this invocation assigned anything. Its `apiFetch` is still in
+    //      flight; a newer invocation has already resolved and assigned a good
+    //      URL. Ownership has moved, so this one must fail SILENTLY — no
+    //      `removeAttribute`, no `onFailure` — or it would strip the healthy
+    //      src the newer invocation just set and report a failure for an
+    //      element that is working.
+    //   2. After it assigned. The element is no longer pointed at this
+    //      invocation's URL (something else, including a newer invocation via
+    //      `assignMediaSrc`, has repointed it), so the resource that failed is
+    //      not the one on screen and is not ours to clear.
+    //
+    // Either way this is not an error the caller can act on, so the one-shot
+    // failure latch is deliberately NOT set: if this invocation ever does
+    // regain relevance, a real failure can still be reported.
+    if (!isCurrent()) return false;
+    if (assignedUrl && currentMediaSrc(el) !== assignedUrl) return false;
     notifiedFailure = true;
-    el.removeAttribute('src');
+    release();
+    // Clearing a `<source>` also re-selects its parent — see `clearMediaSrc`.
+    clearMediaSrc(el);
     if (placeholderClass && el.classList) el.classList.add(placeholderClass);
     if (onFailure) onFailure();
     return false;
@@ -207,9 +337,22 @@ export async function applyPresignedMediaSrc(el, options) {
   // assigned so an immediate failure is not missed. `<source>` reports its own
   // failure on itself (the parent `<video>` only reports when every candidate
   // source failed), so listening on the element passed in is correct for both.
-  el.addEventListener('error', function () {
+  function onError() {
     fail();
-  });
+  }
+
+  // Retire the previous invocation's listener BEFORE registering ours.
+  // Otherwise handlers accumulate on every reuse of the element (an unbounded
+  // leak on a list that re-renders), and one `error` event would run every
+  // stale invocation's `fail()` as well as this one's.
+  const previousOwner = el[OWNER_KEY];
+  if (previousOwner && typeof el.removeEventListener === 'function') {
+    el.removeEventListener('error', previousOwner.onError);
+  }
+  el[OWNER_KEY] = { token, onError };
+  if (typeof el.addEventListener === 'function') {
+    el.addEventListener('error', onError);
+  }
 
   if (typeof o.apiFetch !== 'function') return fail();
 
@@ -223,8 +366,21 @@ export async function applyPresignedMediaSrc(el, options) {
     return fail();
   }
 
+  // Overtaken while the fetch was in flight: a newer invocation owns the
+  // element and has assigned (or is about to assign) its own URL. Assigning
+  // this older, already-superseded URL now would win the race by arriving last
+  // and leave the element showing the wrong asset. Drop out silently — the
+  // newer invocation reports its own outcome.
+  if (!isCurrent()) return false;
+
   const url = readMediaUrl(body, o.urlField);
+  // `urlField` resolved to nothing. For `urls.source` on a PACKAGED asset this
+  // is the expected, documented outcome rather than a fault — see contract 2 in
+  // the module header (packaged and source URLs are mutually exclusive).
   if (!isLoadableMediaUrl(url)) return fail();
   if (!assignMediaSrc(el, url)) return fail();
+  // Recorded only now, so `fail()` before this point stays in its "assigned
+  // nothing yet" mode and is scoped by ownership alone.
+  assignedUrl = url;
   return succeed();
 }

@@ -71,8 +71,9 @@ assign that. Use the shared helper — `public/media-src.js`:
 ```js
 import { applyPresignedMediaSrc } from './media-src.js';
 
-// <video> playing an asset's stored source object.
+// <video> playing an asset's stored SOURCE object.
 // GET /assets/:id/delivery -> { urls: { source } }, a presigned GET.
+// Only for an asset with no packaged output — see the caveat below.
 const video = document.createElement('video');
 applyPresignedMediaSrc(video, {
   apiFetch,
@@ -87,10 +88,60 @@ dotted field carrying the loadable URL (`'url'` by default). It resolves
 `true`/`false`, never throws, refuses anything that is not an absolute `http(s)`
 URL, and removes the `src` again on failure so the element falls back to its
 placeholder rather than a broken-media icon. For a `<source>` it also re-selects
-the parent `<video>`, which otherwise ignores a `src` set on a child after it has
-already picked its resource.
+the parent `<video>` — in both directions, on assignment (a `src` set on a child
+after the parent picked its resource is otherwise ignored) and on failure (a
+cleared child otherwise leaves the parent bound to the dead resource).
 
-Two things worth knowing before adding a new inline media feature:
+It is also safe to call again on an element that is already showing or still
+resolving an earlier URL — a re-rendered row, a re-populated thumbnail strip. The
+last call wins: the previous call's `error` listener is removed rather than left
+to pile up, and a superseded call can no longer clear the `src` or fire its
+`onFailure` against the newer one.
+
+### `urls.source` is not available for every asset
+
+`GET /api/v1/assets/:id/delivery` returns **either** packaged manifests **or** a
+source download — never both. Every key of `urls` is optional, and the handler
+takes exactly one branch per asset:
+
+| Asset | Response |
+| --- | --- |
+| Has packaged output (HLS/DASH) | `status: 'ready'`, `urls: { hls?, dash? }` — **no `source`** |
+| Has packaged output, public delivery not configured | `status: 'not_configured'`, `urls: {}` plus `resolution` |
+| No packaged output, stored source object only | `urls: { source }`; `status: 'failed'` if the asset's own lifecycle failed, else `'ready'` |
+| Neither | `404 no_delivery` |
+
+So the snippet above resolves falsy — and the helper returns `false`, having
+assigned nothing — for **every packaged asset**. Do not treat `urls.source` as
+always present. Branch on which key you actually got (or on `status`):
+
+```js
+import { assignMediaSrc } from './media-src.js';
+
+// Already-resolved URL, so assign it directly — no second round trip.
+const delivery = await apiFetch('/assets/' + encodeURIComponent(id) + '/delivery');
+
+if (delivery.urls.source) {
+  assignMediaSrc(video, delivery.urls.source);          // presigned, plays inline
+} else if (delivery.urls.hls || delivery.urls.dash) {
+  // Packaged. Not inline-playable under DELIVERY_MODE=proxy (below). Either
+  // preview the source object from GET /assets/:id/files (its `type: 'source'`
+  // entry carries a presigned `url`, packaged or not), or show "no inline
+  // playback" and link the manifest for a player that can authenticate.
+  showNoInlinePlayback(delivery.status);
+} else {
+  showNoInlinePlayback(delivery.status);                 // not_configured
+}
+```
+
+Contract: `openapi.json` →
+`.paths["/api/v1/assets/{id}/delivery"].get.responses["200"]` (the generated spec
+declares no `operationId`, so the path item plus method is the identifier);
+source `src/routes/assets.ts` — route `:3053`, `deliverySchema` `:558`,
+`deliveryUrlsSchema` `:520`, packaged branch `:3085`, source fallback `:3242`,
+`notConfiguredDelivery` `:1360`.
+
+Two more things worth knowing before adding a new inline media feature:
 
 - **Do not fall back to a blob object URL for audio/video.** A blob URL holds the
   whole object in memory and serves no range requests, so seeking and progressive
