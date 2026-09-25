@@ -332,3 +332,109 @@ describe('shared table states', () => {
     expect(t.el.querySelector('tr.ops-table-empty td')!.textContent).toBe('No assets found.');
   });
 });
+
+describe('thumbnail failure fallback is CSP-safe (issue #824)', () => {
+  // Contract verified before writing this block:
+  //   - helmet 8.2.0 default CSP directives include `"script-src-attr": ["'none'"]`
+  //     (node_modules/helmet/index.cjs, getDefaultDirectives) and src/main.ts
+  //     registers @fastify/helmet WITHOUT `useDefaults: false` and WITHOUT a
+  //     `scriptSrcAttr` override, so that default stays in force. `script-src
+  //     'unsafe-inline'` does not cover event-handler attributes.
+  //   - public/ops-ui-table.js `renderBody()` assigns each cell via
+  //     `td.innerHTML = String(col.render(row) ?? '')`, so a column renderer can
+  //     only emit markup; anything behavioural must be bound afterwards — the
+  //     module already does that in `wireRowHandlers()`, called after setRows().
+  // Therefore the hide-on-failure handler must be attached from JS, and the
+  // rendered markup must carry no inline handler attribute.
+
+  const assetWithThumb = (id: string) => ({
+    id,
+    name: 'n-' + id,
+    status: 'ready',
+    createdAt: '2026-01-01T00:00:00Z',
+    thumbnails: ['0'],
+  });
+
+  const thumbs = (t: { el: HTMLElement }) =>
+    Array.from(t.el.querySelectorAll<HTMLImageElement>('img.thumb-xs'));
+
+  it('renders the thumbnail with no inline event-handler attribute', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [assetWithThumb('a1')], total: 1 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const [img] = thumbs(t);
+    expect(img).toBeDefined();
+    expect(img.getAttribute('src')).toBe('/api/v1/assets/a1/thumbnails/0');
+    expect(img.hasAttribute('onerror')).toBe(false);
+    // Nothing else inline either — script-src-attr 'none' blocks them all.
+    expect(img.outerHTML).not.toMatch(/\son[a-z]{3,}\s*=/i);
+  });
+
+  it('hides a thumbnail whose load fails, via a JS-bound error listener', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [assetWithThumb('a1'), assetWithThumb('a2')], total: 2 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    const [failing, healthy] = thumbs(t);
+    expect(failing.style.display).toBe('');
+
+    // What the browser does when the image request 401s/404s.
+    failing.dispatchEvent(new Event('error'));
+
+    expect(failing.style.display).toBe('none');
+    // Only the failing image is hidden.
+    expect(healthy.style.display).toBe('');
+  });
+
+  it('re-binds the listener on every re-render (rows are rebuilt each load)', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [assetWithThumb('a1')], total: 1 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    // Re-render the table the way the filter box does (issue #824 reproduction).
+    t.state.setFilter('status', 'ready');
+    await tick();
+
+    const [img] = thumbs(t);
+    expect(img.hasAttribute('onerror')).toBe(false);
+    img.dispatchEvent(new Event('error'));
+    expect(img.style.display).toBe('none');
+  });
+
+  it('keeps public/ free of inline event-handler attributes', async () => {
+    // Standing guard so the fix cannot regress anywhere in the ops UI.
+    const { readdirSync, readFileSync, statSync } = await import('node:fs');
+    // vitest resolves paths from the project root; import.meta.url is not a
+    // file: URL under the happy-dom environment.
+    const root = process.cwd() + '/public/';
+
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = dir + entry;
+        if (statSync(full).isDirectory()) walk(full + '/');
+        else if (/\.(js|html)$/.test(entry)) files.push(full);
+      }
+    };
+    walk(root);
+    expect(files.length).toBeGreaterThan(0);
+
+    // Matches an HTML attribute handler (`onerror="…"`, including one written
+    // inside a JS string), but not a property assignment (`el.onclick = fn`).
+    const inlineHandler = /["'\s](on[a-z]{3,})\s*=\s*\\?["']/i;
+    const offenders = files
+      .filter((f) => inlineHandler.test(readFileSync(f, 'utf8')))
+      .map((f) => f.slice(root.length));
+    expect(offenders).toEqual([]);
+  });
+});
