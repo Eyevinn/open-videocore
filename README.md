@@ -269,7 +269,11 @@ The single canonical search endpoint. It combines an exact-filter tier (`tags`,
 `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text
 tier (`q`, over name and description) behind one contract; all filters are ANDed
 and results are paginated (`page`/`pageSize`, returned as `{ assets, total,
-page }`).
+page }`). `mimeType` filters on the container format extracted from the media
+and takes either a container token (`mp4`, `webm`) or a common media MIME type
+(`video/mp4`), which is resolved onto the container family it names; a MIME type
+that maps to no container family is rejected with `400 unsupported_mime_type`
+rather than returning an empty page.
 
 | Method | Path | Description |
 |---|---|---|

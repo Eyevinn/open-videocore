@@ -17,7 +17,12 @@ export interface SearchQuery {
   q?: string;
   // Asset tags; an asset matches when it carries all requested tags.
   tags?: string[];
-  // Container/MIME type, matched against the extracted containerFormat.
+  // Container format filter (issue #822). Matched against the probe-extracted
+  // `technicalMetadata.containerFormat`, which ffprobe reports as a
+  // comma-separated family ("mov,mp4,m4a"). Accepts either a bare container
+  // token ("mp4") or a common media MIME type ("video/mp4"), which is resolved
+  // onto that family — the parameter is named `mimeType` on the wire, so it now
+  // accepts what its name claims instead of silently matching nothing.
   mimeType?: string;
   // Free-form metadata filter (issue #12). An asset matches when, for every
   // key/value pair given here, its `metadata` carries that exact value
@@ -150,10 +155,127 @@ export function assetTags(asset: Asset): string[] {
   return Array.isArray(tags) ? tags.filter((t): t is string => typeof t === 'string') : [];
 }
 
-// The MIME / container type used for the mimeType filter. We expose the
-// extracted containerFormat (issue #6) so callers can filter by, e.g., "mp4".
-export function assetMimeType(asset: Asset): string | undefined {
+// The raw container format the `mimeType` filter matches against: the value
+// extracted by the probe (issue #6), read from
+// `Asset.technicalMetadata.containerFormat` (asset-repo.ts:312).
+export function assetContainerFormat(asset: Asset): string | undefined {
   return asset.technicalMetadata?.containerFormat;
+}
+
+// The container format split into its family tokens.
+//
+// ffprobe reports `format.format_name` as a COMMA-SEPARATED format family, and
+// the extractor stores that string verbatim
+// (src/pipeline/metadata-extractor.ts:125 `containerFormat: format.format_name`)
+// — so a real MP4 is persisted as `mov,mp4,m4a,3gp,3g2,mj2` and a WebM as
+// `matroska,webm` (asserted in test/metadata-extraction.test.ts:128,189).
+// Comparing the whole string by equality therefore missed the very values an
+// operator would type ("mp4"), so we match per token. Tokens are lower-cased;
+// comparison is case-insensitive throughout.
+export function assetContainerFormatTokens(asset: Asset): string[] {
+  const raw = assetContainerFormat(asset);
+  if (!raw) {
+    return [];
+  }
+  return raw
+    .toLowerCase()
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+}
+
+// MIME type -> container-format family (issue #822).
+//
+// The `mimeType` filter is documented and labelled as a MIME type but compares
+// against the probe's container format, which is NEVER a MIME type: `video/mp4`
+// could not match anything, and the failure was silent (an empty result set).
+// Rather than rename the parameter out from under existing callers, we map the
+// common media MIME types onto the container family tokens ffprobe actually
+// emits, so the filter accepts what it claims AND keeps accepting bare
+// container values ("mp4", "webm") as before.
+//
+// Each entry lists the format_name tokens that legitimately carry that MIME
+// type. The mov/mp4/m4a family is one ffprobe format, so `video/mp4` and
+// `video/quicktime` both address it (issue #822: "video/mp4 matches an asset
+// whose containerFormat is mp4 or mov").
+const MIME_TYPE_CONTAINER_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  'video/mp4': ['mp4', 'mov', 'm4v', 'm4a', '3gp', '3g2', 'mj2', 'isom', 'mp42'],
+  'application/mp4': ['mp4', 'mov', 'm4v', 'm4a'],
+  'audio/mp4': ['mp4', 'mov', 'm4a'],
+  'video/quicktime': ['mov', 'mp4', 'qt'],
+  'video/webm': ['webm', 'matroska'],
+  'audio/webm': ['webm', 'matroska'],
+  'video/x-matroska': ['matroska', 'mkv', 'webm'],
+  'video/x-msvideo': ['avi'],
+  'video/mp2t': ['mpegts', 'ts'],
+  'video/mpeg': ['mpeg', 'mpegvideo', 'mpegts'],
+  'video/ogg': ['ogg', 'ogv'],
+  'audio/ogg': ['ogg', 'oga'],
+  'video/x-flv': ['flv'],
+  'audio/mpeg': ['mp3'],
+  'audio/aac': ['aac', 'adts'],
+  'audio/flac': ['flac'],
+  'audio/wav': ['wav'],
+  'audio/x-wav': ['wav'],
+  'audio/vnd.wave': ['wav']
+};
+
+// A filter value is MIME-shaped when it carries the `type/subtype` separator.
+// A container format token never contains `/` (it comes from ffprobe's
+// format_name), so a MIME-shaped value can only ever match through the alias
+// map above — which is what makes an UNRECOGNISED one structurally impossible
+// to match and therefore worth rejecting at the boundary (issue #822).
+export function isMimeTypeShaped(value: string): boolean {
+  return value.includes('/');
+}
+
+// The container tokens a MIME-shaped filter value addresses, or undefined when
+// the value is not a recognised MIME type.
+export function containerAliasesForMimeType(value: string): readonly string[] | undefined {
+  // Drop any parameters (e.g. `video/mp4; codecs="avc1.42E01E"`) before lookup.
+  const base = value.split(';')[0]!.trim().toLowerCase();
+  return MIME_TYPE_CONTAINER_ALIASES[base];
+}
+
+// Every MIME type the filter can resolve, sorted — surfaced in the 400 message
+// so a caller that used an unsupported one is told what IS accepted.
+export function supportedMimeTypeFilters(): string[] {
+  return Object.keys(MIME_TYPE_CONTAINER_ALIASES).sort();
+}
+
+// True when the value is MIME-shaped but maps to no container family, i.e. it
+// can never match any asset. Callers (src/routes/search.ts) turn this into a
+// 400 so "you used a vocabulary this filter cannot resolve" is distinguishable
+// from "nothing matched" (issue #822 acceptance criterion 3).
+export function isUnmatchableMimeTypeFilter(value: string): boolean {
+  const trimmed = value.trim();
+  return isMimeTypeShaped(trimmed) && containerAliasesForMimeType(trimmed) === undefined;
+}
+
+// Match one asset against the `mimeType` filter (issue #822). Accepts either a
+// MIME type (mapped onto the container family) or a bare container token, and
+// matches per token so the comma-separated ffprobe family string is handled.
+export function matchesMimeTypeFilter(asset: Asset, filter: string): boolean {
+  const value = filter.trim().toLowerCase();
+  if (value.length === 0) {
+    return true;
+  }
+  const tokens = assetContainerFormatTokens(asset);
+  if (tokens.length === 0) {
+    return false;
+  }
+  const aliases = containerAliasesForMimeType(value);
+  if (aliases) {
+    return aliases.some((alias) => tokens.includes(alias));
+  }
+  if (isMimeTypeShaped(value)) {
+    // Unrecognised MIME type: structurally unmatchable (rejected at the route).
+    return false;
+  }
+  // Bare container value. Match a single family token ("mp4" against
+  // "mov,mp4,m4a"), or the whole stored string ("mov,mp4,m4a" verbatim) so a
+  // caller that already filters on the exact persisted value keeps working.
+  return tokens.includes(value) || assetContainerFormat(asset)?.toLowerCase() === value;
 }
 
 // TAMS flow ids projected onto the asset for address lookup (issue #168). Read
@@ -196,8 +318,11 @@ export function matchesQuery(asset: Asset, query: SearchQuery): boolean {
       return false;
     }
   }
+  // Container/MIME filter (issue #822). Delegated so both backends share one
+  // definition of "matches": MIME types map onto the ffprobe container family,
+  // bare container values match a single family token.
   if (query.mimeType) {
-    if (assetMimeType(asset) !== query.mimeType) {
+    if (!matchesMimeTypeFilter(asset, query.mimeType)) {
       return false;
     }
   }

@@ -20,7 +20,12 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { TamsFlowIdSchema, TamsTimerangeSchema } from '../data/asset-document.js';
-import { MAX_PAGE_SIZE, type SearchRepository } from '../data/search-repo.js';
+import {
+  MAX_PAGE_SIZE,
+  isUnmatchableMimeTypeFilter,
+  supportedMimeTypeFilters,
+  type SearchRepository
+} from '../data/search-repo.js';
 import { authGate } from '../auth/middleware.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -152,7 +157,22 @@ const searchQuerySchema = z
           'ingest `title` field or the legacy `name` alias (issue #347).'
       ),
     tags: tagsSchema,
-    mimeType: z.string().min(1).max(128).optional(),
+    mimeType: z
+      .string()
+      .min(1)
+      .max(128)
+      .optional()
+      .describe(
+        'Container-format filter, matched against the probe-extracted ' +
+          '`technicalMetadata.containerFormat`. Accepts either a bare container ' +
+          'token (`mp4`, `mov`, `webm`, `matroska`) or a common media MIME type ' +
+          '(`video/mp4`), which is resolved onto the ffprobe container family it ' +
+          'names — so `video/mp4` matches an asset stored as `mov,mp4,m4a` ' +
+          '(issue #822). Matching is case-insensitive and per family token. A ' +
+          'MIME-shaped value that maps to no container family can never match ' +
+          'any asset and is rejected with 400 `unsupported_mime_type` rather ' +
+          'than silently returning an empty result set.'
+      ),
     // TAMS address lookup (issue #168, epic #116). Reuse the field validation
     // from the asset model (asset-document.ts) rather than re-declaring it:
     // `tamsFlowId` is a single flow UUID and `tamsTimerange` the ADR-008 TAI
@@ -223,14 +243,32 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
           '`tamsTimerange`) never match a collection. Asset hits and collection hits ' +
           'are returned in separate arrays and each carries a `type` discriminator ' +
           "(`'asset'` | `'collection'`) so they are unambiguously distinguishable. " +
+          '`mimeType` filters on the extracted container format and accepts either ' +
+          'a container token (`mp4`) or a common media MIME type (`video/mp4`), ' +
+          'which is resolved onto the container family it names (issue #822). ' +
           'Results are paginated via `page`/`pageSize` and returned as ' +
           '`{ assets, collections, total, collectionTotal, page }`.',
         querystring: searchQuerySchema,
         response: { 200: searchResultSchema, 400: errorSchema }
       }
     },
-    async (request) => {
+    async (request, reply) => {
       const { q, tags, mimeType, tamsFlowId, tamsTimerange, page, pageSize } = request.query;
+      // Reject a MIME-shaped `mimeType` that maps to no container family
+      // (issue #822). The filter compares against ffprobe's format_name, which
+      // never contains `/`, so such a value is structurally unmatchable: it
+      // would return an empty page indistinguishable from "no assets match".
+      // Failing at the boundary names the problem instead.
+      if (mimeType !== undefined && isUnmatchableMimeTypeFilter(mimeType)) {
+        return reply.code(400).send({
+          error: 'unsupported_mime_type',
+          message:
+            `Unsupported mimeType filter "${mimeType}". This filter matches the ` +
+            'container format extracted from the media, so it accepts a container ' +
+            'token (e.g. "mp4", "mov", "webm", "matroska") or one of these MIME ' +
+            `types: ${supportedMimeTypeFilters().join(', ')}.`
+        });
+      }
       const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
       const result = await repo.search({
         q,
