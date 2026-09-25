@@ -540,12 +540,14 @@ const deliveryResolutionSchema = z.object({
 // application keys off, so it never advertises an unplayable URL as ready:
 //   - `ready`          — `urls` holds a fully-resolvable (absolute) playback or
 //                        download URL that plays without workarounds.
-//   - `not_configured` — packaged output exists but public delivery is not
-//                        configured on this deployment, so no resolvable
+//   - `not_configured` — packaged output exists but the delivery posture this
+//                        deployment selected is not configured, so no resolvable
 //                        playback URL can be built. `urls.hls`/`urls.dash` are
 //                        omitted; `resolution` carries the packaged prefix and
 //                        master manifest keys for deterministic client-side
-//                        resolution instead.
+//                        resolution instead, and `missingConfig`/`message`
+//                        name the configuration that is missing (issue #860) so
+//                        the misconfiguration is actionable rather than silent.
 //   - `failed`         — the asset's ingest/processing lifecycle ended in
 //                        `failed` (`AssetStatus`, src/data/asset-repo.ts:25-29)
 //                        and it never produced packaged output, so there is no
@@ -560,6 +562,12 @@ const deliverySchema = z.object({
   status: z.enum(['ready', 'not_configured', 'failed']),
   urls: deliveryUrlsSchema,
   resolution: deliveryResolutionSchema.optional(),
+  // Present only on a `not_configured` body (issue #860): the env var names this
+  // deployment must set before `/delivery` can advertise a playable URL for the
+  // delivery mode it is in, plus a human-readable explanation. Additive and
+  // optional — a `ready`/`failed` body omits both.
+  missingConfig: z.array(z.string()).optional(),
+  message: z.string().optional(),
   expiresAt: z.string()
 });
 
@@ -1350,16 +1358,30 @@ function deliveryResolutionFor(
   };
 }
 
+// The configuration a `not_configured` delivery body reports as missing (issue
+// #860): the env var name(s) an operator must set for the delivery mode this
+// deployment is in, plus a human-readable explanation. Required so the body
+// always says WHICH configuration is absent — the substitution this replaced
+// concealed that, and the missing variable went unnoticed until playback failed
+// with an unexplained 401.
+type MissingDeliveryConfig = {
+  config: string[];
+  message: string;
+};
+
 // The `not_configured` delivery body (issue #506): the asset HAS packaged
 // output but this deployment cannot advertise a fully-resolvable playback URL
-// (public delivery not configured — no PUBLIC_BASE_URL / public origin). The
-// response carries NO playable `urls.hls`/`urls.dash` so a consuming
-// application never treats it as ready; `resolution` carries the persisted
-// packaged prefix + master manifest keys (#502) so a client with its own
-// object-store access can resolve the manifest objects deterministically.
+// for its selected delivery mode (`public`: no packaged public origin;
+// `proxy`: no API public origin). The response carries NO playable
+// `urls.hls`/`urls.dash` so a consuming application never treats it as ready;
+// `resolution` carries the persisted packaged prefix + master manifest keys
+// (#502) so a client with its own object-store access can resolve the manifest
+// objects deterministically, and `missingConfig`/`message` name the missing
+// configuration so the operator can fix it (issue #860).
 function notConfiguredDelivery(
   asset: { id: string; packagedOutput?: PackagedOutput },
-  expiresAt: string
+  expiresAt: string,
+  missing: MissingDeliveryConfig
 ): z.infer<typeof deliverySchema> {
   const resolution = deliveryResolutionFor(asset);
   return {
@@ -1367,9 +1389,35 @@ function notConfiguredDelivery(
     status: 'not_configured',
     urls: {},
     ...(resolution ? { resolution } : {}),
+    missingConfig: missing.config,
+    message: missing.message,
     expiresAt
   };
 }
+
+// The missing configuration for each delivery mode's `not_configured` body
+// (issue #860). Kept next to `notConfiguredDelivery` so the two branches of the
+// mutually-exclusive delivery mode (`deliveryMode`,
+// src/pipeline/packaging.ts:245-253) report the variable that actually governs
+// them — never the other mode's.
+const MISSING_PUBLIC_DELIVERY_CONFIG: MissingDeliveryConfig = {
+  config: ['PACKAGED_PUBLIC_BASE_URL'],
+  message:
+    'DELIVERY_MODE=public requires PACKAGED_PUBLIC_BASE_URL to be set to the ' +
+    'absolute public origin of the packaged bucket (e.g. ' +
+    'https://cdn.example.com/openvideocore-packaged) so the stored manifest ' +
+    'path resolves to a fetchable URL. It is unset or not an absolute origin, ' +
+    'so no public playback URL can be advertised. Set it, or select ' +
+    'DELIVERY_MODE=proxy to stream packaged objects through this API instead.'
+};
+
+const MISSING_PROXY_DELIVERY_CONFIG: MissingDeliveryConfig = {
+  config: ['PUBLIC_BASE_URL'],
+  message:
+    'DELIVERY_MODE=proxy requires PUBLIC_BASE_URL to be set to the absolute ' +
+    'public origin of this API so the packaged-object proxy URL is resolvable. ' +
+    'It is unset, so no proxy playback URL can be advertised.'
+};
 
 // Content-Type for a packaged object served through the proxy route (issue
 // #201), inferred from its extension. Covers the CMAF/HLS/DASH file types the
@@ -3043,6 +3091,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //     a presigned GET URL so the raw source can be downloaded/played.
   //   - If neither is available the asset has nothing to deliver -> 404.
   // Presigned source URLs expire after DELIVERY_URL_TTL_SECONDS (default 1h).
+  // On the packaged path the advertised URL always matches the deployment's
+  // DELIVERY_MODE posture: `public` advertises only a resolvable public origin
+  // URL and `proxy` advertises only a `/stream/*` URL. A mode whose own
+  // configuration is missing returns `status: 'not_configured'` naming the
+  // variable to set, never the other mode's URL (issue #860).
   // On the source-only path the body's `status` reflects the asset's lifecycle
   // status: a `failed` asset is reported as `status: 'failed'`, never `ready`
   // (issue #810).
@@ -3139,18 +3192,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         //               resolved to the public-facing MinIO/CDN origin at read
         //               time (issue #200); a missing/invalid public origin is
         //               surfaced as an explicit 501, not a relative/internal path.
+        // The two modes have deliberately different security postures, so the
+        // `public` branch NEVER emits a proxy URL and the `proxy` branch never
+        // emits a public bucket URL (issue #860). A deployment that cannot
+        // satisfy its own mode reports `not_configured` naming the missing
+        // variable — it does not quietly adopt the other mode's posture.
         if (deliveryMode() === 'proxy') {
           const proxyBase = assetsBaseUrl(request.url);
           // A proxy URL is only fully resolvable when the API's public origin is
           // configured (PUBLIC_BASE_URL). Without it `assetsBaseUrl` yields a
           // relative path, so `proxyManifestUrlsFor` would produce a bare,
           // non-resolvable URL — exactly what issue #506 forbids advertising as
-          // ready. In that case public delivery is NOT configured: return an
+          // ready. In that case proxy delivery is NOT configured: return an
           // unambiguous `not_configured` response (no playback URL) plus the
-          // packaged-location metadata for deterministic client-side resolution.
+          // packaged-location metadata for deterministic client-side resolution
+          // and the name of the variable to set (issue #860).
           if (!isAbsoluteUrl(proxyBase)) {
             return reply.code(200).send(
-              notConfiguredDelivery(asset, expiresAt)
+              notConfiguredDelivery(asset, expiresAt, MISSING_PROXY_DELIVERY_CONFIG)
             );
           }
           const proxied = proxyManifestUrlsFor(asset.id, proxyBase);
@@ -3171,40 +3230,38 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // configured. On the zero-config per-stack MinIO backend it hands back
           // the stored value verbatim (issue #320), which is a bare object-key
           // path (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
-          // scheme/host and no signature — not fetchable by a player, and OSC
-          // MinIO blocks external presigned/public GETs. When the resolved value
-          // is still non-absolute, route the manifest through the authorized
-          // stream proxy instead (issue #341), mirroring the DELIVERY_MODE=proxy
-          // branch above so `delivery.hls`/`delivery.dash` are always absolute,
-          // resolvable URLs — consistent with how `source` is emitted. The proxy
-          // base is derived from PUBLIC_BASE_URL / request context via
-          // `assetsBaseUrl`, never hardcoded.
-          const proxyBase = assetsBaseUrl(request.url);
-          const proxied = proxyManifestUrlsFor(asset.id, proxyBase);
-          // Whether the stream-proxy fallback can yield a fully-resolvable
-          // (absolute) URL — only when the API's public origin is configured
-          // (PUBLIC_BASE_URL). See the DELIVERY_MODE=proxy branch above.
-          const proxyResolvable = isAbsoluteUrl(proxyBase);
-          const toAbsolute = (
-            stored: string | undefined,
-            proxyUrl: string | undefined
-          ): string | undefined => {
+          // scheme/host and no signature — not fetchable by a player.
+          //
+          // That unresolvable value used to be routed through the authorized
+          // stream proxy (issue #341). It no longer is (issue #860): the proxy
+          // is the OTHER delivery mode's posture — a private bucket streamed
+          // back through an authorized route — and the two modes are documented
+          // as never both active (`deliveryMode`,
+          // src/pipeline/packaging.ts:231-241). Substituting it here put a
+          // deployment nominally in `public` mode into `proxy` behaviour, and
+          // because the substituted URL was absolute the response still looked
+          // ready, so the missing PACKAGED_PUBLIC_BASE_URL stayed invisible
+          // until a player hit the proxy route's 401. A missing public origin is
+          // a CONFIGURATION problem, not a resolvability problem to route
+          // around, so it is reported as such below — no proxy URL is built on
+          // this path at all.
+          const toAbsolute = (stored: string | undefined): string | undefined => {
             if (!stored) return undefined;
             const resolved = resolvePublicManifestUrl(stored);
-            if (isAbsoluteUrl(resolved)) return resolved;
-            // The stored value is a bare object-key path (zero-config MinIO). It
-            // is only resolvable through the proxy when the proxy base itself is
-            // absolute; otherwise there is no resolvable URL to advertise.
-            return proxyResolvable ? proxyUrl : undefined;
+            // Only a genuinely public, absolute URL is advertisable in this mode.
+            return isAbsoluteUrl(resolved) ? resolved : undefined;
           };
-          const hls = toAbsolute(asset.manifestUrls.hls, proxied.hls);
-          const dash = toAbsolute(asset.manifestUrls.dash, proxied.dash);
-          // Neither format resolved to a playable URL although packaged output
-          // exists → public delivery is not configured. Never advertise a 200
-          // that looks ready with no resolvable URL (issue #506): emit the
-          // explicit `not_configured` signal + resolution metadata instead.
+          const hls = toAbsolute(asset.manifestUrls.hls);
+          const dash = toAbsolute(asset.manifestUrls.dash);
+          // Neither format resolved to a playable public URL although packaged
+          // output exists → public delivery is not configured. Never advertise a
+          // 200 that looks ready with no resolvable URL (issue #506): emit the
+          // explicit `not_configured` signal, the resolution metadata, and the
+          // name of the missing variable (issue #860) instead.
           if (!hls && !dash) {
-            return reply.code(200).send(notConfiguredDelivery(asset, expiresAt));
+            return reply
+              .code(200)
+              .send(notConfiguredDelivery(asset, expiresAt, MISSING_PUBLIC_DELIVERY_CONFIG));
           }
           return reply.code(200).send({
             assetId: asset.id,

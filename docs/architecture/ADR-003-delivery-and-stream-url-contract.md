@@ -134,13 +134,19 @@ do not attempt to resolve it against a bucket.**
 #### The `not_configured` variant
 
 `status: "not_configured"` means the asset HAS packaged output, but this
-deployment cannot advertise a fully-resolvable playback URL — because the API's
-own public origin (`PUBLIC_BASE_URL`) is unset, so no absolute proxy URL can be
-built. Body shape (built by `notConfiguredDelivery`,
-`src/routes/assets.ts:1013-1025`):
+deployment cannot advertise a fully-resolvable playback URL **for the delivery
+mode it is in** — under `proxy` because the API's own public origin
+(`PUBLIC_BASE_URL`) is unset, so no absolute proxy URL can be built; under
+`public` because the packaged bucket's public origin
+(`PACKAGED_PUBLIC_BASE_URL`) is unset or not absolute, so the stored manifest
+path cannot be resolved to a fetchable URL (#860). Body shape (built by
+`notConfiguredDelivery`, `src/routes/assets.ts:1013-1025`):
 
 - `urls.hls` / `urls.dash` are **omitted** (`urls` is `{}`) so a consumer never
   mistakes an unplayable value for a ready URL.
+- `missingConfig` + `message` name the configuration that is missing for the
+  active mode (#860), so the operator can fix the deployment instead of
+  diagnosing a URL that does not work.
 - `resolution` carries the persisted packaged location so a client with its own
   object-store access can locate the master manifest objects deterministically:
   `packagedBucket`, `packagedPrefix` (the job-nested prefix the packager wrote
@@ -156,10 +162,14 @@ absolute (`src/routes/assets.ts:2099-2103`) and from the public-mode branch when
 neither format resolves to a playable URL (`src/routes/assets.ts:2154-2156`).
 
 The correct fix for `not_configured` is **not** direct bucket access — it is to
-configure `PUBLIC_BASE_URL` on the deployment so `/delivery` can advertise
-absolute `/stream/*` URLs. The `resolution` metadata exists only for operators
-who already hold object-store credentials; it is not a supported path for normal
-API consumers.
+configure the variable the body names: `PACKAGED_PUBLIC_BASE_URL` under
+`DELIVERY_MODE=public`, or `PUBLIC_BASE_URL` under `DELIVERY_MODE=proxy` so
+`/delivery` can advertise absolute `/stream/*` URLs. Nor is the fix to switch
+modes implicitly: `public` mode does not fall back to a proxy URL when its own
+origin is missing (#860), because that would put a deployment into the other
+mode's security posture while it reports being in `public`. The `resolution`
+metadata exists only for operators who already hold object-store credentials; it
+is not a supported path for normal API consumers.
 
 #### The `failed` variant (#810)
 
@@ -283,14 +293,19 @@ for the default private-bucket backend (`deliveryMode`,
 - `proxy` — `/delivery` advertises `/stream/*` proxy URLs; the packaged bucket
   stays private. `src/routes/assets.ts:2090-2114`.
 - `public` (default when unset/unrecognised) — advertises the stored CMAF
-  manifest URLs resolved to a public origin; on the zero-config MinIO backend
-  (no `PACKAGED_PUBLIC_BASE_URL`) the stored value is a bare, non-fetchable
-  object-key path, so the handler routes it through the same `/stream/*` proxy
-  to keep the advertised URL absolute and resolvable (#341,
-  `src/routes/assets.ts:2116-2162`).
+  manifest URLs resolved to the packaged bucket's public origin
+  (`PACKAGED_PUBLIC_BASE_URL`); on the zero-config MinIO backend, where that
+  origin is unset, the stored value is a bare, non-fetchable object-key path and
+  `/delivery` reports `not_configured` naming the missing variable
+  (`src/routes/assets.ts:2116-2162`).
 
-In both modes on the default backend, resolvable playback ultimately flows
-through `/stream/*`. To get absolute `ready` URLs, set `PUBLIC_BASE_URL`.
+The modes are never both active. `public` mode does not substitute a `/stream/*`
+proxy URL when its own origin is missing — it used to (#341), which silently
+gave a nominally-`public` deployment the proxy posture and hid the missing
+`PACKAGED_PUBLIC_BASE_URL` behind a ready-looking `200` whose URL then required a
+bearer token; #860 replaced that substitution with an explicit `not_configured`.
+To get absolute `ready` URLs, set the variable the active mode needs:
+`PACKAGED_PUBLIC_BASE_URL` for `public`, `PUBLIC_BASE_URL` for `proxy`.
 
 ---
 
@@ -347,8 +362,12 @@ directly, and let the player resolve child references through `/stream/*`.
 - All packaged bytes transit the API process in proxy mode, so the API is on the
   playback data path (mitigate with a fronting CDN over `/stream/*` if needed —
   segment responses set `Cache-Control` and advertise `Accept-Ranges`).
-- Fully-resolvable `ready` URLs require `PUBLIC_BASE_URL` to be configured;
-  otherwise `/delivery` returns `not_configured`.
+- Fully-resolvable `ready` URLs require the active mode's origin to be
+  configured (`PACKAGED_PUBLIC_BASE_URL` for `public`, `PUBLIC_BASE_URL` for
+  `proxy`); otherwise `/delivery` returns `not_configured`. Since #860 a `public`
+  deployment that never set its packaged public origin gets `not_configured`
+  where it previously got a proxy URL — the misconfiguration is now visible
+  rather than absorbed.
 
 ---
 
@@ -359,7 +378,9 @@ directly, and let the player resolve child references through `/stream/*`.
 - ADR-011 — per-execution packaged-output destination (relocated delivery URLs).
 - Issues #502 (persist packaged prefix/keys), #503 (resolve packaged prefix for
   `/stream`), #506 (resolvable delivery URLs or `not_configured`), #509 (this
-  documentation task), #810 (`failed` status for a failed, source-only asset).
+  documentation task), #810 (`failed` status for a failed, source-only asset),
+  #860 (`public` mode never falls back to a proxy URL; `not_configured` names the
+  missing configuration).
 - Code: `src/routes/assets.ts` (delivery + stream handlers, schemas),
   `src/pipeline/packaging.ts` (proxy/output prefixes, delivery mode),
   `src/pipeline/manifest-rewrite.ts` (child-reference rewriting),
