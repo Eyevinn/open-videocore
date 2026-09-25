@@ -296,12 +296,19 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     
 <article class="endpoint" id="get-health">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/health</code></h3>
-  <p class="endpoint-desc">Liveness probe that also reports service identity.</p>
+  <p class="endpoint-desc">Liveness probe that also reports service identity, the build identity of the running image (`build`), resolver health, and per-method ingest availability.</p>
   
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;status&quot;: &quot;string&quot;,
   &quot;service&quot;: &quot;string&quot;,
+  &quot;build&quot;: {
+    &quot;version&quot;: &quot;string&quot;,
+    &quot;commit&quot;: &quot;string&quot;,
+    &quot;sourceDigest&quot;: &quot;string&quot;,
+    &quot;builtAt&quot;: &quot;string&quot;,
+    &quot;packageVersion&quot;: &quot;string&quot;
+  },
   &quot;resolver&quot;: {
     &quot;degraded&quot;: true,
     &quot;mode&quot;: &quot;none&quot;,

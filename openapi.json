@@ -32,6 +32,35 @@
                     "service": {
                       "type": "string"
                     },
+                    "build": {
+                      "type": "object",
+                      "properties": {
+                        "version": {
+                          "type": "string"
+                        },
+                        "commit": {
+                          "type": "string"
+                        },
+                        "sourceDigest": {
+                          "type": "string"
+                        },
+                        "builtAt": {
+                          "type": "string",
+                          "nullable": true
+                        },
+                        "packageVersion": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "version",
+                        "commit",
+                        "sourceDigest",
+                        "builtAt",
+                        "packageVersion"
+                      ],
+                      "additionalProperties": false
+                    },
                     "resolver": {
                       "type": "object",
                       "properties": {
@@ -141,6 +170,7 @@
                   "required": [
                     "status",
                     "service",
+                    "build",
                     "resolver",
                     "ingest"
                   ],

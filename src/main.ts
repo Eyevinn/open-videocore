@@ -124,6 +124,7 @@ import {
   watchFolderMisconfiguredMessage
 } from './pipeline/watch-folder.js';
 import { healthRouter } from './routes/health.js';
+import { resolveBuildInfo } from './build-info.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
@@ -170,12 +171,18 @@ declare module 'fastify' {
 // the cap so the part-url / complete / abort routes accept real upload IDs.
 const app = Fastify({ logger: true, maxParamLength: 500 });
 
-// Single source of truth for the API version: read package.json's version at
-// startup rather than hardcoding it in the OpenAPI info block (issue #542).
+// Single source of truth for the API RELEASE LINE: read package.json's version
+// at startup rather than hardcoding it in the OpenAPI info block (issue #542).
 // The spec served at /api-docs, the /api-docs/json document, and the committed
 // openapi.json (generated from that document by generate-openapi.sh) all flow
 // from info.version below, so pinning it to the package version keeps the docs
 // badge and the live Swagger UI from drifting away from the real release.
+//
+// This is deliberately NOT the build identity (issue #827): package.json is
+// only bumped at release, so every build between two tags carries the earlier
+// tag's number and two different images report the same string here. The build
+// identity is injected by the image build and reported on GET /health as
+// `build` — see src/build-info.ts and the Dockerfile.
 const PACKAGE_VERSION: string = (() => {
   const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
   try {
@@ -284,7 +291,14 @@ const resolverHealth = new ResolverHealthSignal();
 // actually active — programmatically, without reading server logs. The signals
 // are read at request time (via closures) so the report always reflects the
 // current storage + watch-folder configuration.
+//
+// The `build` field (issue #827) reports the build identity injected by the
+// image build, so two instances running different images are distinguishable
+// from the outside even when they carry the same package.json version. Resolved
+// once at startup: the values are baked into the image and cannot change while
+// the process runs.
 await app.register(healthRouter, {
+  buildInfo: resolveBuildInfo(process.env, PACKAGE_VERSION),
   resolverSnapshot: () => resolverHealth.snapshot(),
   ingestSignals: () => ({
     storageAvailable,

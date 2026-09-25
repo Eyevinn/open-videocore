@@ -191,8 +191,49 @@ Key endpoints:
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness probe with service identity |
+| `GET` | `/health` | Liveness probe with service identity, build identity, resolver and ingest status |
 | `GET` | `/healthz` | Minimal liveness probe |
+
+### Which build is a deployment running?
+
+`GET /health` is the one endpoint that answers this, and it needs no
+authentication:
+
+```console
+$ curl -s https://<your-instance>/health | jq .build
+{
+  "version": "v1.5.0-56-g92a13cc",
+  "commit": "92a13cc4f0e1b2a3d5c7890fab12cd34ef567890",
+  "sourceDigest": "11cb8d5651d972cc",
+  "builtAt": "2026-09-25T06:11:02Z",
+  "packageVersion": "1.5.0"
+}
+```
+
+`packageVersion` is the release line, not the build — it only moves when a
+release is cut, so two instances on different images share it. The other fields
+identify the build:
+
+- `version` and `commit` come from `git describe --tags --always --dirty` and
+  `git rev-parse HEAD` at image build time, passed in as `--build-arg
+  BUILD_VERSION` / `BUILD_COMMIT` (see the `Dockerfile`). A builder with no git
+  metadata to pass reports `"unknown"` for both rather than guessing.
+- `sourceDigest` is always present. The image build computes it from the files
+  it ships, using `scripts/source-digest.mjs`. To turn a digest back into the
+  commit it was built from:
+
+  ```console
+  $ scripts/find-build-commit.sh 11cb8d5651d972cc
+  ```
+
+The full build string is served unauthenticated on purpose: this project is open
+source, so a commit identifier discloses nothing that is not already public, and
+the people who need it — an operator checking a stack after a channel switch,
+support asking what a customer is running, a probe asserting the expected build
+— are the least likely to hold a token.
+
+The OpenAPI document's `info.version` deliberately stays pinned to
+`packageVersion`, so the docs badge keeps tracking releases.
 
 **Assets**
 
