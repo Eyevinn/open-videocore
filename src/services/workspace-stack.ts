@@ -963,6 +963,28 @@ async function migrateStackConfigsIntoNamespace(args: {
   return { kind: 'migrated', from, stackNames: copied };
 }
 
+// The remediation clause both namespace/credential-disagreement warnings end
+// with. Conditional because the copy it promises does not happen for every
+// source namespace (#804 review, non-blocking finding 2):
+//
+//   - source is a tenant-scoped namespace -> migrateStackConfigsIntoNamespace
+//     copies each `openvideocore/<from>/<stack>` across and the target is pinned
+//     (see the `sources` filter and the `migrated` return above), so the move is
+//     real and durable.
+//   - source IS the literal `default` -> that same filter excludes it, so NO key
+//     is copied and nothing is pinned. Promising a copy there would be untrue.
+//     Nothing is stranded either: loadStackConfigWithLegacyFallback reads
+//     `openvideocore/default/<stack>` from any namespace, so the stack keeps
+//     resolving under the new namespace with no data move at all. That state is
+//     reachable — seedWorkspaceIdFromStoredStacks legitimately seeds `default`
+//     for a pre-#712 store whose stacks all live under the literal namespace.
+function namespaceMoveRemediation(from: string, to: string): string {
+  if (from === STACK_CONFIG_NAMESPACE) {
+    return `to move it, set ${WORKSPACE_ID_ENV_VAR}=${to} and restart: no keys need copying, because a config under openvideocore/${STACK_CONFIG_NAMESPACE}/<stack> is still resolved from any namespace by the legacy read fallback`;
+  }
+  return `to move it, set ${WORKSPACE_ID_ENV_VAR}=${to} and restart: the next boot copies each openvideocore/${from}/<stack> to openvideocore/${to}/<stack> and pins the new namespace`;
+}
+
 // Where a resolved workspace id came from. Surfaced on the diagnostic log line
 // so an operator can tell a pinned (deterministic) resolution from a seeded,
 // derived or fallback one without reading code.
@@ -1200,17 +1222,20 @@ export async function resolveWorkspaceId(
     // strand every existing stack config. Report the disagreement loudly instead
     // (issue #804) and name the lever that actually moves the data — since the
     // #804 review, setting the env var COPIES the stack configs into the namespace
-    // it names and pins it (migrateStackConfigsIntoNamespace, step 1 above), so
-    // this instruction is an accurate description of what will happen.
+    // it names and pins it (migrateStackConfigsIntoNamespace, step 1 above) —
+    // except when the data already sits under the literal `default`, which
+    // namespaceMoveRemediation words accurately rather than promising a copy that
+    // will not happen.
     if (credentialTenantId && evidence.workspaceId !== credentialTenantId) {
       log.warn(
         {
           workspaceId: evidence.workspaceId,
           credentialTenantId,
           key: WORKSPACE_ID_PIN_KEY,
-          remediation: `${WORKSPACE_ID_ENV_VAR}=${credentialTenantId}`
+          remediation: `${WORKSPACE_ID_ENV_VAR}=${credentialTenantId}`,
+          movesKeys: evidence.workspaceId !== STACK_CONFIG_NAMESPACE
         },
-        `workspace id: this deployment's stack configs live under namespace "${evidence.workspaceId}", which is NOT the tenant on its own credential ("${credentialTenantId}"); keeping the namespace that holds the data so nothing is stranded — to move it, set ${WORKSPACE_ID_ENV_VAR}=${credentialTenantId} and restart: the next boot copies each openvideocore/${evidence.workspaceId}/<stack> to openvideocore/${credentialTenantId}/<stack> and pins the new namespace`
+        `workspace id: this deployment's stack configs live under namespace "${evidence.workspaceId}", which is NOT the tenant on its own credential ("${credentialTenantId}"); keeping the namespace that holds the data so nothing is stranded — ${namespaceMoveRemediation(evidence.workspaceId, credentialTenantId)}`
       );
     }
     const pinned = await pinOnce(store, evidence.workspaceId, 'seeded');
@@ -1349,9 +1374,10 @@ async function reconcilePinAgainstCredential(args: {
           key: WORKSPACE_ID_PIN_KEY,
           pinnedWorkspaceId,
           credentialTenantId,
-          remediation: `${WORKSPACE_ID_ENV_VAR}=${credentialTenantId}`
+          remediation: `${WORKSPACE_ID_ENV_VAR}=${credentialTenantId}`,
+          movesKeys: pinnedWorkspaceId !== STACK_CONFIG_NAMESPACE
         },
-        `workspace id: the pinned namespace "${pinnedWorkspaceId}" does not match this deployment's credential tenant "${credentialTenantId}", but its stack configs live under the pinned namespace; keeping it so nothing is stranded — to move it, set ${WORKSPACE_ID_ENV_VAR}=${credentialTenantId} and restart: the next boot copies each openvideocore/${pinnedWorkspaceId}/<stack> to openvideocore/${credentialTenantId}/<stack> and pins the new namespace`
+        `workspace id: the pinned namespace "${pinnedWorkspaceId}" does not match this deployment's credential tenant "${credentialTenantId}", but its stack configs live under the pinned namespace; keeping it so nothing is stranded — ${namespaceMoveRemediation(pinnedWorkspaceId, credentialTenantId)}`
       );
       return {
         workspaceId: pinnedWorkspaceId,
