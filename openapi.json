@@ -19635,13 +19635,15 @@
                                 },
                                 "lastIdleAt": {
                                   "type": "number"
+                                },
+                                "readyAt": {
+                                  "type": "number"
                                 }
                               },
                               "required": [
                                 "instanceId",
                                 "url",
-                                "activeJobs",
-                                "lastIdleAt"
+                                "activeJobs"
                               ],
                               "additionalProperties": false
                             }
@@ -20535,10 +20537,13 @@
                         "type": "string"
                       }
                     },
-                    "secret": {
-                      "type": "string"
+                    "hasSecret": {
+                      "type": "boolean"
                     },
                     "createdAt": {
+                      "type": "string"
+                    },
+                    "secret": {
                       "type": "string"
                     }
                   },
@@ -20546,6 +20551,7 @@
                     "id",
                     "url",
                     "events",
+                    "hasSecret",
                     "createdAt"
                   ],
                   "additionalProperties": false
@@ -20603,8 +20609,8 @@
                               "type": "string"
                             }
                           },
-                          "secret": {
-                            "type": "string"
+                          "hasSecret": {
+                            "type": "boolean"
                           },
                           "createdAt": {
                             "type": "string"
@@ -20614,6 +20620,7 @@
                           "id",
                           "url",
                           "events",
+                          "hasSecret",
                           "createdAt"
                         ],
                         "additionalProperties": false
