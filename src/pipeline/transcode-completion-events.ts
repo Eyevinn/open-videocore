@@ -1,20 +1,35 @@
 // Transcode terminal-state webhook events (issue #829).
 //
-// A transcode can reach a terminal state through EITHER of two paths:
+// THE CONTRACT FOR ANYONE ADDING A COMPLETION PATH: every production site that
+// applies a transcode terminal state does so by calling `completeTranscode`
+// (src/pipeline/transcode.ts — `export async function completeTranscode`). That
+// call is the JOIN, and each one MUST be paired with a call to
+// `dispatchTranscodeCompletionEvents` below, immediately behind it. A completion
+// applied without that pairing is #829: the job and its asset change state, the
+// API reports the change, and the subscriber is told nothing, silently.
+//
+// There are currently THREE such paths (an earlier revision of this header said
+// two, and the one it omitted is exactly where the bug survived a first fix):
 //   1. POST /api/v1/internal/encore-callback (src/routes/internal.ts) — Encore's
 //      completion webhook, reachable only when the API is deployed publicly.
 //   2. The Encore completion callback poller
 //      (src/pipeline/encore-callback-poller.ts) — drains the callback listener's
 //      Valkey sorted set AND independently sweeps Encore for terminal jobs whose
 //      callback message never landed (the listener's fire-and-forget zAdd, and
-//      failures Encore never calls back on).
+//      failures Encore never calls back on). Success and failure.
+//   3. `settleFailedTranscode` (src/pipeline/failed-transcode-reconciler.ts) —
+//      FAILURE only, on two production routes neither of the above can observe:
+//      the #273 stall sweep (a job whose Encore record was garbage-collected,
+//      404 past the stall timeout, or an Encore-reported failure the sweep sees
+//      first) and the scaler's #449 `onJobsDropped` settle (a job gone from an
+//      instance's live QUEUED/IN_PROGRESS set). Both are invisible to path 2,
+//      whose sweep can only reconcile jobs Encore still reports as terminal.
 //
-// Both paths apply the completion through the SAME `completeTranscode`
-// (src/pipeline/transcode.ts:220), but webhook dispatch used to live only in
-// path 1 — so on a deployment where completions arrive via path 2, subscribers
-// to `transcode.complete`, `asset.ready`, `transcode.failed` and `asset.failed`
-// silently received nothing (#829). This module owns the dispatch so both paths
-// emit byte-identical payloads from one place and neither can drift or forget.
+// Webhook dispatch originally lived only in path 1 — so on a deployment where
+// completions arrive via path 2 or 3, subscribers to `transcode.complete`,
+// `asset.ready`, `transcode.failed` and `asset.failed` silently received nothing
+// (#829). This module owns the dispatch so all three paths emit byte-identical
+// payloads from one place and none can drift or forget.
 //
 // Contract sources verified before writing (CLAUDE.md rule 7):
 //   - Event-type vocabulary: WEBHOOK_EVENT_TYPES — src/data/webhook-repo.ts:28-36

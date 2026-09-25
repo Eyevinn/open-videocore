@@ -31,7 +31,9 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import type { Job, JobRepository } from '../data/job-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import type { EncoreClient } from './encore-client.js';
+import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { completeTranscode } from './transcode.js';
+import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
 
 // Non-terminal statuses a transcode Job can sit in while waiting on Encore.
 // Terminal statuses (done/failed/cancelled) are skipped — nothing to reconcile.
@@ -69,6 +71,11 @@ export type ReconcileFailedTranscodesDeps = {
   now?: () => number;
   stallTimeoutMs?: number;
   logger?: Logger;
+  // Optional webhook dispatcher (#829). Forwarded to settleFailedTranscode so a
+  // transcode this sweep settles terminal emits `transcode.failed` /
+  // `asset.failed` exactly as the callback route and the completion poller do.
+  // Absent on deployments with webhooks disabled — emission is then a no-op.
+  webhookDispatcher?: WebhookDispatcher;
 };
 
 export type ReconcileFailedTranscodesResult = {
@@ -150,7 +157,7 @@ export async function reconcileFailedTranscodes(
 // path without depending on an EncoreClient/clock.
 export type SettleFailedDeps = Pick<
   ReconcileFailedTranscodesDeps,
-  'jobs' | 'assets' | 'pipeline' | 'logger'
+  'jobs' | 'assets' | 'pipeline' | 'logger' | 'webhookDispatcher'
 > & {
   // Optional EncoreClient (#746). When present, a genuine terminal settle
   // ('encore-error') also cancels the job on Encore AND drains every buffered
@@ -212,6 +219,49 @@ export async function settleFailedTranscode(
       },
       { jobs: deps.jobs, assets: deps.assets }
     );
+
+    // #829: this is the THIRD production path that applies a transcode terminal
+    // state (the other two are POST /api/v1/internal/encore-callback and the
+    // completion poller). It drives the caller-facing Job to `failed` and the
+    // source asset to `failed`, so without this dispatch a subscriber to
+    // `transcode.failed` / `asset.failed` got the exact silence #829 reports:
+    // the state the API reports changed, and nothing was delivered. Emitted
+    // IMMEDIATELY behind completeTranscode (the shared join every terminal path
+    // pairs with a dispatch) so neither the pipeline-lock release nor the #746
+    // cancel/drain below can swallow the event by throwing first. The helper's
+    // `result.applied` guard means a job another path already settled emits
+    // nothing.
+    //
+    // Deliberate call on `reason` (the reviewer's open question on this PR): we
+    // emit for BOTH reasons, including the CONDITIONAL 'gone-from-active-set'
+    // drop (#709), rather than gating to 'encore-error' the way the #746
+    // cancel/drain below is gated. Two things separate the two decisions:
+    //   - Cancel is an IRREVERSIBLE destructive action against Encore — a job
+    //     that might still be succeeding must not be killed, hence that gate. A
+    //     webhook is a notification, and a wrong one is correctable.
+    //   - The correction is STRUCTURALLY guaranteed to be delivered, not merely
+    //     hoped for. A late SUCCESSFUL callback for a `droppedByScaler` job is
+    //     the one documented exception to first-terminal-write-wins
+    //     (transcode.ts — `isConditionalDropFailed`), and it returns
+    //     `applied: true`. Both paths that can carry that callback now dispatch,
+    //     so the subscriber receives `transcode.complete` + `asset.ready` +
+    //     `encode.completed` afterwards.
+    // So the delivered sequence for a reversed drop is
+    // `transcode.failed` -> `transcode.complete` (and `asset.failed` ->
+    // `asset.ready`), which mirrors the job/asset states GET /api/v1/jobs/:id
+    // reported at each moment. Staying silent here would instead reintroduce
+    // #829's actual defect for the common case where the drop is genuine and no
+    // late callback ever arrives: the job ends `failed` permanently and the
+    // subscriber is never told. Webhook delivery tracking observable API state
+    // is the property #829 asks for; last-event-wins on a contradiction is the
+    // lesser cost, and a subscriber can always re-read the job to settle it.
+    dispatchTranscodeCompletionEvents({
+      dispatcher: deps.webhookDispatcher,
+      job,
+      success: false,
+      error,
+      result
+    });
 
     // Only touch the pipeline lock when completeTranscode actually applied (i.e.
     // the job was still non-terminal). A no-op (already terminal) means another

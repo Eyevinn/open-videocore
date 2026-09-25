@@ -134,9 +134,11 @@ type PollerDeps = {
   // Throwing fails the `package` step with a diagnostic instead of enqueueing.
   ensurePackaging?: () => Promise<void>;
   // Webhook event dispatcher (issue #13, wired here by #829). This module is one
-  // of the TWO paths that can apply a transcode completion (the other is
-  // src/routes/internal.ts POST /encore-callback), and until #829 it was the
-  // only one with no dispatcher — so on a deployment whose completions arrive
+  // of the THREE paths that can apply a transcode terminal state (the others are
+  // src/routes/internal.ts POST /encore-callback and settleFailedTranscode in
+  // src/pipeline/failed-transcode-reconciler.ts — enumerated in full in
+  // src/pipeline/transcode-completion-events.ts), and until #829 the callback
+  // route was the only one with a dispatcher — so on a deployment whose completions arrive
   // through this poller (the callback listener's fire-and-forget zAdd dropping a
   // message, or a failure Encore never calls back on, both of which the sweep
   // below exists to cover), subscribers to `transcode.complete`, `asset.ready`,
