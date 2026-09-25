@@ -142,6 +142,7 @@ import {
   manifestUrlsForLocation,
   outputPrefix,
   packagedBucket,
+  packagedPublicOrigin,
   packagedRelocationOrigin,
   proxyManifestUrlsFor,
   resolvePackagedOutput,
@@ -2919,10 +2920,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // For 'external' backends we emit URLs against the operator's public/CDN
       // origin (publicBaseUrl) or an endpointUrl-derived object URL. For 'minio'
       // (or unset) these resolve to undefined and the MinIO delivery-mode path
-      // (proxy/public, #200/#201) is kept unchanged — OSC MinIO blocks external
-      // presigned/public GETs.
+      // (proxy/public, #200/#201/#859) handles the per-stack backend below.
       const packagedBase = externalPublicBaseUrl(stackStorage?.packaged);
       const sourceBase = externalPublicBaseUrl(stackStorage?.source);
+      // Public origin for the DEFAULT per-stack MinIO backend (issue #859).
+      // PACKAGED_PUBLIC_BASE_URL wins when set; otherwise the resolved stack's
+      // OWN MinIO endpoint (StackConfig.minioEndpoint, carried per request as
+      // connections.s3Config.endpoint) IS the public origin for its packaged
+      // bucket, so a zero-config stack advertises absolute, anonymously
+      // fetchable manifest URLs instead of falling through to the authorized
+      // stream proxy below. Undefined when no stack is resolved (env-override /
+      // in-memory), which keeps the pre-#859 relative-then-proxy behaviour.
+      const packagedPublicBase = packagedPublicOrigin(
+        request.connections?.s3Config?.endpoint
+      );
 
       // Preferred: packaged streaming manifests (issue #9 / #200 / #201 / #213).
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
@@ -3009,14 +3020,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
         try {
-          // In the default `public` mode, `resolvePublicManifestUrl` returns a
-          // genuinely public absolute URL only when PACKAGED_PUBLIC_BASE_URL is
-          // configured. On the zero-config per-stack MinIO backend it hands back
-          // the stored value verbatim (issue #320), which is a bare object-key
-          // path (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
-          // scheme/host and no signature — not fetchable by a player, and OSC
-          // MinIO blocks external presigned/public GETs. When the resolved value
-          // is still non-absolute, route the manifest through the authorized
+          // In the default `public` mode, `resolvePublicManifestUrl` resolves the
+          // stored manifest path against `packagedPublicBase` — the explicit
+          // PACKAGED_PUBLIC_BASE_URL when set, else the resolved stack's own
+          // MinIO origin (issue #859). The stored value itself is a bucket-
+          // prefixed object-key path (e.g.
+          // `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
+          // scheme/host, so it only becomes fetchable once joined onto that
+          // origin. When NO origin is resolvable at all (no stack on this
+          // deployment) the stored value is handed back verbatim (issue #320)
+          // and is still non-absolute: route the manifest through the authorized
           // stream proxy instead (issue #341), mirroring the DELIVERY_MODE=proxy
           // branch above so `delivery.hls`/`delivery.dash` are always absolute,
           // resolvable URLs — consistent with how `source` is emitted. The proxy
@@ -3033,7 +3046,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             proxyUrl: string | undefined
           ): string | undefined => {
             if (!stored) return undefined;
-            const resolved = resolvePublicManifestUrl(stored);
+            const resolved = resolvePublicManifestUrl(stored, packagedPublicBase);
             if (isAbsoluteUrl(resolved)) return resolved;
             // The stored value is a bare object-key path (zero-config MinIO). It
             // is only resolvable through the proxy when the proxy base itself is
@@ -3406,9 +3419,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // so the ops UI's "Open" link (public/app.js) was unclickable. Route
       // through the authorized stream proxy when the stored value doesn't
       // already resolve to something absolute.
+      //
+      // The origin resolved against is the SAME one /:id/delivery uses
+      // (issue #859): PACKAGED_PUBLIC_BASE_URL when set, else the resolved
+      // stack's own MinIO endpoint (connections.s3Config.endpoint). Keeping the
+      // two call sites on one origin is what makes `manifestUrl` here match the
+      // `urls.hls`/`urls.dash` delivery advertises, as this endpoint's contract
+      // documents above.
+      const packagedPublicBase = packagedPublicOrigin(
+        request.connections?.s3Config?.endpoint
+      );
       const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
       const toAbsoluteManifestUrl = (stored: string, proxyUrl: string | undefined): string => {
-        const resolved = resolvePublicManifestUrl(stored);
+        const resolved = resolvePublicManifestUrl(stored, packagedPublicBase);
         return isAbsoluteUrl(resolved) ? resolved : proxyUrl ?? resolved;
       };
 
