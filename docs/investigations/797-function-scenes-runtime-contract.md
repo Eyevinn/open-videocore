@@ -52,7 +52,7 @@ Verified from the restify route registrations in `index.js`:
 | `DELETE /api/v1/:id` | line 116 | Delete + clean up a job. |
 | `GET /images/*` | line 131 | Static file serving of the generated images from `/var/jobs/`. |
 
-**No route anywhere in the service reads a query parameter.** `index.js:25` registers
+**No route anywhere in the service reads a query parameter.** `index.js:24` registers
 `Restify.plugins.queryParser()`, but no handler ever touches `req.query` — the only
 request inputs are `req.body.medialocator` (line 45), `req.body.state` (line 99) and
 the `:id` path parameter. This is the definitive answer to #797's question: the
@@ -139,11 +139,12 @@ Errors are `restify-errors` instances passed to `next(err)`, serialised by resti
 JSON `{"code": "...", "message": "..."}`:
 
 - Missing/unparseable body on `POST /api/v1` → `InvalidContentError` → **`400`**,
-  `code: "InvalidContent"`, `message: "Missing Request Body"` (`index.js:58`).
+  `code: "InvalidContent"`, `message: "Missing Request Body"` (`index.js:59`).
 - Any failure inside job creation (including ffmpeg failing to open the source URL) →
-  `InternalServerError` → **`500`** carrying the underlying message (`index.js:53-55`).
-- `GET /api/v1/:id/thumbnails` on an unknown id throws inside the handler and also
-  surfaces as **`500`**, not `404` (`index.js:71-75`) — there is no not-found path.
+  `InternalServerError` → **`500`** carrying the underlying message (`index.js:55`).
+- `GET /api/v1/:id/thumbnails` on an unknown id throws inside the handler
+  (`sceneDetect.getJob(req.params.id)`, `index.js:68`) and also surfaces as **`500`**,
+  not `404` (`index.js:73`) — there is no not-found path.
   Same for a job in state `failed`: `"Can't get thumbnails of a job that has failed"`.
 
 `api.json` documents **no** non-200 responses; the error shape above comes from the
@@ -196,5 +197,20 @@ only; #798 is the fix.
 (a single required `name`), with `upstreamUrl` / `upstreamVersion` null, and the OSC
 wiki's summary conflicted with the #783 probe. Neither pointed at
 `Eyevinn/function-scenes`, which is where the answer was the whole time. Two prior
-daily runs were blocked on this. Logged as OSC friction:
-`eng-open-videocore-agents/docs/osc-feedback/incoming-function-scenes-catalog-no-upstream-source-link.md`.
+daily runs were blocked on this.
+
+Two further gaps were confirmed first-hand while writing this note. The catalog HTTP API
+(`GET https://catalog.svc.prod.osaas.io/service/eyevinn-function-scenes`) rejects a valid,
+unexpired personal access token in every header form tried (`Authorization: Bearer <pat>`
+and bare `<pat>` → `401 {"error":"invalid authorization header"}`; `x-pat-jwt` / `x-jwt` →
+`401 missing authorization header`), and no `/servicespec*` route exists (`404`). And
+`@osaas/client-core@0.24.0` does not re-export `getService` from its entry point at all
+(39 exports, none of them `getService`, though `lib/core.d.ts:2` declares it); calling
+`lib/core.js`'s `getService` directly fails with
+`Service eyevinn-function-scenes not found in your subscriptions`, so catalog metadata is
+only readable for services you have already subscribed to.
+
+Logged as OSC friction in the agents repo at
+`docs/osc-feedback/incoming-function-scenes-catalog-no-upstream-source-link.md`
+(`Eyevinn/eng-open-videocore-agents`, pushed 2026-09-25 as commit `2ae6ed4` on branch
+`osc-feedback/function-scenes-catalog-contract` — awaiting merge to `main`).
