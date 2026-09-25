@@ -20,7 +20,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 //
 // Contracts verified for these tests (CLAUDE.md rule 7):
 //   - Context.getPersonalAccessToken(): string | undefined
-//     — @osaas/client-core lib/context.d.ts:20.
+//     — @osaas/client-core lib/context.d.ts:23.
 //   - PAT payload shape { iss, iat, exp, patId, userId, tenantId } on a
 //     three-segment HS256 JWT — read-only introspection of this deployment's live
 //     OSC_ACCESS_TOKEN, 2026-09-24. The SDK sends that same token as
@@ -38,7 +38,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 //     `s3Endpoint` config key — src/encore-scaler/instance-pool.ts:164-169.
 //   - The registry prefers resolveS3Config(stackKey) over the static s3Config and
 //     carries the result into EncoreScalerConfig.s3Config
-//     — src/encore-scaler/workspace-registry.ts:195-197,217.
+//     — src/encore-scaler/workspace-registry.ts (getOrCreate: resolveS3Config ??
+//     s3Config, then `s3Config,` into EncoreScalerConfig).
+//   - createResolveS3Config(deps): (stackKey: string) =>
+//     Promise<EncoreS3Config | undefined> — src/services/scaler-s3-config.ts.
+//     This is the SHIPPED policy main.ts wires as the registry's resolveS3Config;
+//     the tests below execute it directly rather than a copy, so main.ts cannot
+//     silently drift away from the behaviour asserted here.
 
 // The tenant this deployment's own credential names.
 const CREDENTIAL_TENANT = 'lucas';
@@ -118,6 +124,7 @@ import {
   type ParamStore,
   type StackConfig
 } from './param-store.js';
+import { createResolveS3Config } from './scaler-s3-config.js';
 import { persistStackConfig } from '../routes/provision.js';
 import { spawnInstance } from '../encore-scaler/instance-pool.js';
 import type { EncoreScalerConfig } from '../encore-scaler/types.js';
@@ -222,58 +229,9 @@ function makeLog(): StackResolverLogger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
-// Minimal Fastify-shaped logger for the resolveS3Config closure under test.
+// Minimal Fastify-shaped logger for the resolveS3Config policy under test.
 function makeAppLog() {
   return { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
-}
-
-// The resolveS3Config closure src/main.ts wires into
-// WorkspaceEncoreScalerRegistry, reproduced with the same inputs and the same
-// namespace-aware read + fail-loud policy, so the test exercises the decision
-// this issue changed rather than a paraphrase of it.
-function makeResolveS3Config(deps: {
-  stackResolver: WorkspaceStackResolver;
-  paramStore: ParamStore | undefined;
-  encoreS3Endpoint: string | undefined;
-  encoreS3SecretKey: string | undefined;
-  log: ReturnType<typeof makeAppLog>;
-}) {
-  const { stackResolver, paramStore, encoreS3Endpoint, encoreS3SecretKey, log } =
-    deps;
-  return async (stackKey: string) => {
-    const hasStaticFallback = Boolean(encoreS3Endpoint && encoreS3SecretKey);
-    const unresolvable = (reason: string) => {
-      if (hasStaticFallback) {
-        log.warn({ stackKey, reason }, 'falling back to static endpoint');
-        return undefined;
-      }
-      log.error({ stackKey, reason }, 'unresolvable MinIO endpoint');
-      throw new Error(
-        `encore-scaler: unresolvable MinIO S3 endpoint for stack "${stackKey}": ${reason}.`
-      );
-    };
-    if (!encoreS3SecretKey) return unresolvable('no MinIO secret is configured');
-    if (!paramStore) return unresolvable('no parameter store is configured');
-    let config: StackConfig | undefined;
-    try {
-      config = await stackResolver.resolveStackConfig(stackKey);
-    } catch {
-      return unresolvable('the parameter-store read failed');
-    }
-    if (!config) {
-      return unresolvable(
-        'no stack config is stored under this deployment\'s namespace'
-      );
-    }
-    if (!config.minioEndpoint) {
-      return unresolvable('the resolved stack config carries no minioEndpoint');
-    }
-    return {
-      endpoint: config.minioEndpoint,
-      accessKeyId: 'admin',
-      secretAccessKey: encoreS3SecretKey
-    };
-  };
 }
 
 describe('derived namespace is the deployment credential tenant (issue #804)', () => {
@@ -390,9 +348,11 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
     });
 
     const appLog = makeAppLog();
-    const resolveS3Config = makeResolveS3Config({
-      stackResolver,
-      paramStore,
+    // The SHIPPED policy — the exact factory main.ts wires into
+    // WorkspaceEncoreScalerRegistry.resolveS3Config — not a copy of it, so
+    // main.ts cannot drift away from what this test proves (#804).
+    const resolveS3Config = createResolveS3Config({
+      stackConfigSource: stackResolver,
       // On OSC this env var is unset — the condition under which the silent
       // fallback previously produced an AWS-bound Encore instance.
       encoreS3Endpoint: undefined,
@@ -454,9 +414,8 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
       log: makeLog()
     });
     const appLog = makeAppLog();
-    const resolveS3Config = makeResolveS3Config({
-      stackResolver,
-      paramStore,
+    const resolveS3Config = createResolveS3Config({
+      stackConfigSource: stackResolver,
       encoreS3Endpoint: undefined,
       encoreS3SecretKey: 'minio-root-password',
       log: appLog
@@ -479,9 +438,8 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
       log: makeLog()
     });
     const appLog = makeAppLog();
-    const resolveS3Config = makeResolveS3Config({
-      stackResolver,
-      paramStore,
+    const resolveS3Config = createResolveS3Config({
+      stackConfigSource: stackResolver,
       encoreS3Endpoint: 'https://ops-configured-minio.example.test',
       encoreS3SecretKey: 'minio-root-password',
       log: appLog

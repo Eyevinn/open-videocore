@@ -451,8 +451,9 @@ function isUsableWorkspaceId(value: unknown): value is string {
 //   listSubscriptions(context: Context): Promise<Subscription[]>
 //
 // OBSERVED contract (read-only introspection against a live account,
-// 2026-09-24, logged in docs/osc-feedback/incoming-no-stable-deployment-identity-
-// in-sdk.md): the payload does NOT match the declaration. Of 13 returned
+// 2026-09-24, logged in the agents repo as
+// docs/osc-feedback/incoming-no-sdk-accessor-for-own-tenant-identity.md): the
+// payload does NOT match the declaration. Of 13 returned
 // subscriptions, 10 carried NO `tenantId` field at all despite the type
 // declaring it non-optional, and the 3 that did carry it split across TWO
 // distinct values that look like the PUBLISHER/owner tenant of the subscribed
@@ -502,7 +503,7 @@ const PAT_TENANT_CLAIM = 'tenantId';
 // CONTRACT VERIFIED (read-only introspection of this deployment's live
 // OSC_ACCESS_TOKEN, 2026-09-24):
 //   - Accessor: `Context.getPersonalAccessToken(): string | undefined`
-//     — @osaas/client-core lib/context.d.ts:20.
+//     — @osaas/client-core lib/context.d.ts:23.
 //   - Shape: a three-segment `{"alg":"HS256","typ":"JWT"}` token whose payload
 //     carries exactly the claims
 //       iss ("token.osaas.eyevinn.se"), iat, exp, patId, userId, tenantId
@@ -576,6 +577,20 @@ export function readTenantIdFromCredential(osc: Context): string | undefined {
 // against this same credential before honouring or persisting it, and on an
 // existing deployment seeds from the stack configs already in this deployment's
 // own store.
+//
+// FOLLOW-UP (carried forward from the #776 review; #804 cleared src/main.ts but
+// not these). Three route modules still address the parameter store with the
+// literal STACK_CONFIG_NAMESPACE rather than the resolved namespace:
+//   - src/routes/storage.ts:260
+//   - src/routes/export-destinations.ts:187
+//   - src/routes/assets.ts:1942, :2410
+// These are all ADR-017 storage-backend registry records, and every one of those
+// call sites — registration on the /storage/backends surface and lookup from the
+// export/probe paths — passes the SAME constant, so they round-trip correctly
+// today and are deliberately out of #804's scope. They are recorded here because this is
+// the only in-code note of the divergence: if any one of them is ever converted
+// to the resolved namespace on its own, it will strand the records the others
+// wrote, which is the #733 failure mode.
 export async function deriveWorkspaceId(osc: Context): Promise<string> {
   return (
     readTenantIdFromCredential(osc) ??
@@ -1007,27 +1022,37 @@ async function reconcilePinAgainstCredential(args: {
   const { store, log, pinOnce, pinnedWorkspaceId, credentialTenantId } = args;
   const evidence = await seedWorkspaceIdFromStoredStacks(store, log);
 
-  const correctTo = async (target: string): Promise<WorkspaceIdResolution> => {
+  // `source` names where the corrected value came FROM, not merely that a
+  // correction happened: correcting to the credential tenant is 'credential',
+  // while correcting to the namespace the stack configs actually live under is
+  // 'seeded' — by construction that value is NOT the credential tenant, so
+  // labelling it 'credential' would mis-report both the log line and the
+  // returned WorkspaceIdResolution.
+  const correctTo = async (
+    target: string,
+    source: Extract<WorkspaceIdSource, 'credential' | 'seeded'>
+  ): Promise<WorkspaceIdResolution> => {
     log.warn(
       {
         key: WORKSPACE_ID_PIN_KEY,
         pinnedWorkspaceId,
         credentialTenantId,
         correctedTo: target,
+        correctedFrom: source,
         evidence: evidence.kind
       },
       'workspace id: the pinned namespace does not match the tenant on this deployment\'s own credential and no stack config is stranded by changing it; correcting the pin'
     );
-    const written = await pinOnce(store, target, 'credential');
+    const written = await pinOnce(store, target, source);
     return {
       workspaceId: target,
-      source: 'credential',
+      source,
       deterministic: written
     };
   };
 
   // Nothing stored anywhere: safe to correct outright.
-  if (evidence.kind === 'none') return correctTo(credentialTenantId);
+  if (evidence.kind === 'none') return correctTo(credentialTenantId, 'credential');
 
   // Exactly one namespace holds stack configs.
   if (evidence.kind === 'seeded') {
@@ -1049,7 +1074,8 @@ async function reconcilePinAgainstCredential(args: {
     }
     // The pin points at a namespace that holds nothing while the data sits
     // elsewhere: the pin is actively stranding it. Correct to where the data is.
-    return correctTo(evidence.workspaceId);
+    // That target is the SEEDED namespace, not the credential tenant.
+    return correctTo(evidence.workspaceId, 'seeded');
   }
 
   // 'ambiguous' / 'unknown': never re-point on evidence we cannot trust.

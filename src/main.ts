@@ -63,6 +63,9 @@ import {
   logScalerNotActivated,
   type StackRedisResolution
 } from './services/scaler-redis-url.js';
+// Per-stack MinIO endpoint resolution for the scaler (issue #804). Extracted so
+// the fail-loud policy is executed by tests rather than reimplemented in them.
+import { createResolveS3Config } from './services/scaler-s3-config.js';
 import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
@@ -856,6 +859,17 @@ const publicBaseUrl = resolvePublicBaseUrl();
 // awaited (see paramStore above). Undefined when there is no store, no stack, or
 // the field is unset — in which case resolveEncoreProfilesUrl falls through to
 // the remote default, byte-identical to pre-#315 behaviour.
+//
+// The namespace is resolved ONCE here and both handed to the helper and used to
+// validate what the helper passes back into the adapter below.
+const profilesNamespace = await stackResolver.resolveNamespace();
+const assertProfilesNamespace = (ws: string, method: string): void => {
+  if (ws === profilesNamespace) return;
+  app.log.warn(
+    { requested: ws, resolved: profilesNamespace, method },
+    'profiles URL: the parameter-store adapter was asked for a namespace other than the one the stack resolver resolved; reading the resolved namespace'
+  );
+};
 const paramStoreProfilesUrl =
   publicBaseUrl || process.env['ENCORE_PROFILES_URL_OVERRIDE']
     ? undefined // env-var seams (tier 1/2) win; skip the param-store read entirely
@@ -866,14 +880,23 @@ const paramStoreProfilesUrl =
         // (workspace-stack.ts listStackNames/loadStackConfig) so it addresses the
         // same namespace — and takes the same #751 legacy fallback — as the read
         // path. The helper's declared signature passes a workspaceId to each
-        // method (public-base-url.ts:134-144); the adapter ignores it because the
-        // resolver owns namespace resolution.
+        // method (public-base-url.ts:134-144). The resolver owns namespace
+        // resolution, so the adapter cannot forward that argument — but it does
+        // NOT silently drop it either: it checks that what the helper passes is
+        // the namespace the resolver resolved, and says so if it ever is not.
+        // Otherwise this is exactly the seam #804 is about — a source whose
+        // namespace argument diverges from the one actually read, unnoticed.
         paramStore: {
-          listStackNames: () => stackResolver.listStackNames(),
-          loadStackConfig: (_ws: string, name: string) =>
-            stackResolver.loadStackConfig(name)
+          listStackNames: (ws: string) => {
+            assertProfilesNamespace(ws, 'listStackNames');
+            return stackResolver.listStackNames();
+          },
+          loadStackConfig: (ws: string, name: string) => {
+            assertProfilesNamespace(ws, 'loadStackConfig');
+            return stackResolver.loadStackConfig(name);
+          }
         },
-        namespace: await stackResolver.resolveNamespace(),
+        namespace: profilesNamespace,
         onError: (err) =>
           app.log.warn(
             { err },
@@ -1091,65 +1114,21 @@ function activateScaler(redisUrl: string): void {
     // same derived namespace + #751 legacy fallback as every other consumer), and
     // an unresolvable endpoint now FAILS LOUDLY instead of silently degrading to
     // an unset env var.
-    resolveS3Config: async (stackKey: string) => {
-      // A static ENCORE_S3_ENDPOINT (local dev / ops override) is a real,
-      // intentional configuration: leave the registry to use it.
-      const hasStaticFallback = Boolean(encoreS3Endpoint && encoreS3SecretKey);
-
-      // Fail loudly rather than hand Encore a job it will resolve against AWS.
-      const unresolvable = (reason: string, detail?: Record<string, unknown>) => {
-        if (hasStaticFallback) {
-          app.log.warn(
-            { stackKey, reason, ...detail },
-            'encore-scaler: could not resolve this stack\'s MinIO endpoint from the parameter store; falling back to the statically configured ENCORE_S3_ENDPOINT'
-          );
-          return undefined;
-        }
-        app.log.error(
-          { stackKey, reason, ...detail },
-          'encore-scaler: cannot resolve a MinIO S3 endpoint for this stack and no ENCORE_S3_ENDPOINT is configured; refusing to spawn an Encore instance that would resolve s3:// inputs against AWS'
-        );
-        throw new Error(
-          `encore-scaler: unresolvable MinIO S3 endpoint for stack "${stackKey}": ${reason}. ` +
-            'Without it a spawned Encore instance receives no s3Endpoint and resolves s3:// inputs against AWS S3 (404). ' +
-            'Provision a stack for this deployment\'s namespace, or set ENCORE_S3_ENDPOINT/ENCORE_S3_SECRET_KEY explicitly.'
-        );
-      };
-
-      if (!encoreS3SecretKey) {
-        return unresolvable(
-          'no MinIO secret is configured (ENCORE_S3_SECRET_KEY / MINIO_SECRET_KEY / MINIO_ROOT_PASSWORD are all unset)'
-        );
-      }
-      if (!paramStore) {
-        return unresolvable('no parameter store is configured for this deployment');
-      }
-
-      let config: StackConfig | undefined;
-      try {
-        config = await stackResolver.resolveStackConfig(stackKey);
-      } catch (err) {
-        return unresolvable('the parameter-store read failed', {
-          err: err instanceof Error ? { message: err.message } : String(err)
-        });
-      }
-
-      if (!config) {
-        return unresolvable(
-          'no stack config is stored under this deployment\'s namespace',
-          { namespace: await stackResolver.resolveNamespace() }
-        );
-      }
-      if (!config.minioEndpoint) {
-        return unresolvable('the resolved stack config carries no minioEndpoint');
-      }
-
-      return {
-        endpoint: config.minioEndpoint,
-        accessKeyId: 'admin',
-        secretAccessKey: encoreS3SecretKey
-      };
-    },
+    //
+    // The policy itself lives in src/services/scaler-s3-config.ts rather than in
+    // this closure, following the precedent #782 set with scaler-redis-url.ts:
+    // an inline closure here is what let main.ts drift away from the resolver,
+    // and it cannot be executed by a test. createResolveS3Config REJECTS when it
+    // cannot resolve and no static fallback is set — every registry call site
+    // handles that (workspace-registry.ts:77).
+    resolveS3Config: createResolveS3Config({
+      // Undefined when no parameter store is configured: the resolver would have
+      // nothing to read, so the policy reports that rather than probing.
+      stackConfigSource: paramStore ? stackResolver : undefined,
+      encoreS3Endpoint,
+      encoreS3SecretKey,
+      log: app.log
+    }),
     // When the scaler dispatches a queued job to an Encore instance, advance the
     // Job record queued->running and the source asset to `processing`. The
     // scaler has no repositories of its own, so we resolve the job here by the
@@ -1637,8 +1616,12 @@ function activateScaler(redisUrl: string): void {
   // Start loops for any workspaces that had pool entries from a previous run.
   // This triggers reconcile() on the first tick, correcting stale activeJobs
   // counts left by jobs that completed while the server was down.
+  // The per-workspace log callback (issue #804) surfaces a single stack that
+  // could not be resumed — e.g. one whose MinIO endpoint resolveS3Config now
+  // refuses to guess — while the remaining stacks still start. The outer catch
+  // remains for a failure of the discovery scan itself.
   void scalerRegistry
-    .resumeExistingWorkspaces()
+    .resumeExistingWorkspaces((msg, err) => app.log.warn({ err }, msg))
     .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
 
   app.log.info({ redisUrl }, 'encore-scaler: activated against provisioned stack Valkey');

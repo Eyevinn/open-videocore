@@ -74,6 +74,20 @@ export type WorkspaceEncoreScalerConfig = {
   // which is the EFFECTIVE stack identity the transcode request resolved to
   // (issue #615 — decoded from the encoreJobId contextId), so the endpoint is
   // resolved for the named stack, never the first-provisioned one.
+  //
+  // MAY REJECT (issue #804). Resolving `undefined` means "no per-stack endpoint,
+  // use the static s3Config" — a legitimate outcome only when a static
+  // ENCORE_S3_ENDPOINT is actually configured. When there is no static fallback
+  // and no endpoint can be resolved, the implementation
+  // (src/services/scaler-s3-config.ts) REJECTS rather than resolving undefined,
+  // because spawning an Encore instance with no s3Endpoint makes it resolve
+  // `s3://` inputs against AWS S3 and fail with a 404 that names no cause.
+  // Call sites must therefore decide per path:
+  //   - getOrCreate (below): the rejection propagates. On the submit path that is
+  //     wanted — the job is marked failed with the real reason rather than
+  //     dispatched to an instance that cannot read its input.
+  //   - resumeExistingWorkspaces: catches per workspace, so one unresolvable
+  //     stack cannot strand the others.
   resolveS3Config?: (stackKey: string) => Promise<import('./types.js').EncoreS3Config | undefined>;
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).
@@ -277,7 +291,19 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // instances kept running. In that case, reconcilePoolFromOsc() re-discovers
   // those instances from OSC and re-populates the pool so the loop can dispatch
   // to them instead of spawning fresh duplicates.
-  async resumeExistingWorkspaces(): Promise<void> {
+  //
+  // Every per-workspace body is isolated (issue #804): resolveS3Config may now
+  // REJECT for a stack whose MinIO endpoint cannot be resolved, and before this
+  // guard that single rejection escaped the loop and left EVERY remaining
+  // workspace unresumed — swallowed by main.ts as one `failed to resume existing
+  // workspaces` warning. A stack that cannot be resumed is logged and skipped;
+  // the others still start, and the skipped one is resumed lazily on its next
+  // submit (getOrCreate), where failing loudly is the wanted behaviour.
+  async resumeExistingWorkspaces(
+    // Same optional logging seam as teardownAll below, so the registry keeps no
+    // logger dependency of its own.
+    log?: (msg: string, err?: unknown) => void
+  ): Promise<void> {
     // The restart discovery scan runs against the injected process-global
     // connection (`this.config.redis` — the first-provisioned stack's Valkey).
     // Once a workspaceId is discovered, resolveStackRedis() below re-binds it to
@@ -303,37 +329,48 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     }
 
     for (const workspaceId of workspaceIds) {
-      // Reconcile from OSC when the pool is absent or empty — this re-discovers
-      // any instances that survived a Valkey wipe or unclean shutdown so the
-      // loop can dispatch to them rather than spawning duplicates.
-      if (!workspaceIdsWithPool.has(workspaceId)) {
-        let s3Config = this.config.s3Config;
-        if (this.config.resolveS3Config) {
-          s3Config = (await this.config.resolveS3Config(workspaceId)) ?? s3Config;
+      try {
+        // Reconcile from OSC when the pool is absent or empty — this re-discovers
+        // any instances that survived a Valkey wipe or unclean shutdown so the
+        // loop can dispatch to them rather than spawning duplicates.
+        if (!workspaceIdsWithPool.has(workspaceId)) {
+          let s3Config = this.config.s3Config;
+          if (this.config.resolveS3Config) {
+            s3Config = (await this.config.resolveS3Config(workspaceId)) ?? s3Config;
+          }
+          // Re-populate the pool on the stack's OWN Valkey (issue #615): resolve the
+          // per-stack connection so the re-discovered instances are written to the
+          // physical Valkey this workspace's loop will read from, not the
+          // first-provisioned one.
+          const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
+          const scalerConfig = {
+            workspaceId,
+            maxInstances: this.config.maxInstances,
+            minInstances: this.config.minInstances,
+            idleTimeoutMs: this.config.idleTimeoutMs,
+            oscContext: this.config.oscContext,
+            redis,
+            redisUrl,
+            getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
+            s3Config,
+            profilesUrl: this.config.profilesUrl,
+            onDispatched: this.config.onDispatched
+          };
+          await reconcilePoolFromOsc(scalerConfig).catch(() => {
+            // OSC unavailable at startup — skip; the loop will spawn fresh instances.
+          });
         }
-        // Re-populate the pool on the stack's OWN Valkey (issue #615): resolve the
-        // per-stack connection so the re-discovered instances are written to the
-        // physical Valkey this workspace's loop will read from, not the
-        // first-provisioned one.
-        const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
-        const scalerConfig = {
-          workspaceId,
-          maxInstances: this.config.maxInstances,
-          minInstances: this.config.minInstances,
-          idleTimeoutMs: this.config.idleTimeoutMs,
-          oscContext: this.config.oscContext,
-          redis,
-          redisUrl,
-          getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
-          s3Config,
-          profilesUrl: this.config.profilesUrl,
-          onDispatched: this.config.onDispatched
-        };
-        await reconcilePoolFromOsc(scalerConfig).catch(() => {
-          // OSC unavailable at startup — skip; the loop will spawn fresh instances.
-        });
+        await this.getOrCreate(workspaceId);
+      } catch (err) {
+        // Isolate the failure to this stack (issue #804). The commonest cause is
+        // resolveS3Config rejecting because this stack has no resolvable MinIO
+        // endpoint — which must not prevent the OTHER discovered stacks from
+        // resuming. This one is retried on its next submit.
+        log?.(
+          `encore-scaler: failed to resume workspace ${workspaceId}; skipping it and continuing with the rest`,
+          err
+        );
       }
-      await this.getOrCreate(workspaceId);
     }
   }
 
