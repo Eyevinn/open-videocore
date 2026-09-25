@@ -88,6 +88,15 @@ export type WorkspaceEncoreScalerConfig = {
   //     dispatched to an instance that cannot read its input.
   //   - resumeExistingWorkspaces: catches per workspace, so one unresolvable
   //     stack cannot strand the others.
+  //   - getJobStatus (:256) and cancel (:262) also route through getOrCreate and
+  //     can therefore reject too (#804 review, finding 5). Every caller already
+  //     wraps them: src/routes/jobs.ts:179 (cancel, "Encore unreachable or job
+  //     already gone — proceed with local cancel"), src/routes/jobs.ts:246
+  //     (getJobStatus, "leave status as-is"), and
+  //     src/pipeline/failed-transcode-reconciler.ts:104 (warn + `continue`). So on
+  //     those paths an unresolvable endpoint degrades to a skipped status poll or a
+  //     local-only cancel — never an unhandled rejection — which is why they are
+  //     left to propagate rather than being special-cased here.
   resolveS3Config?: (stackKey: string) => Promise<import('./types.js').EncoreS3Config | undefined>;
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).

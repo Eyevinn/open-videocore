@@ -13,6 +13,7 @@ import nano from 'nano';
 import { Client as MinioClient } from 'minio';
 import {
   isReadyStack,
+  stackConfigKey,
   type ParamStore,
   type StackConfig,
   type StorageBackendConfig
@@ -375,13 +376,72 @@ function buildInMemoryConnections(): WorkspaceConnections {
   };
 }
 
+// SCOPING NOTE — what the `<workspaceId>` key segment is actually for, and why it
+// is still here (asked on issue #804, answered in the #804 review, finding 4).
+//
+// The question raised was whether the middle segment of
+// `openvideocore/<workspaceId>/<stackName>` (stackConfigKey, param-store.ts:131)
+// discriminates anything at all, since its stated justification — "namespaced by
+// workspace so two tenants may use the same stack name without collision" — rests
+// on a store shared between tenants, and the store is not shared: it is ONE
+// `eyevinn-app-config-svc` instance (DEFAULT_PARAM_STORE_INSTANCE_NAME =
+// 'ovcconfig', param-store.ts:704) resolved through this deployment's own OSC
+// Context. If the segment discriminates nothing, the cheaper fix for #804 would
+// be to collapse the WRITES onto the constant instead of moving the READS onto
+// the derived value, deleting the derivation, the pin and this whole module's
+// reconciliation machinery.
+//
+// ANSWER (verified against the accepted ADRs and the code, not assumed): nothing
+// anticipates one deployment serving several tenants.
+//   - ADR-018-authorisation-model.md, decision 3 (docs/architecture, "Interaction
+//     with structural per-deployment tenant isolation"): "One deployed stack == one
+//     tenant's workspace ... a deployed instance *is* the tenant's workspace and
+//     there is no shared backing store to scope across." This is the authoritative
+//     auth/tenancy decision.
+//   - ADR-020-quota-deployment-model-and-metering-source.md, Decision 1 (ACCEPTED
+//     2026-09-07): "One deployed open-videocore instance is one tenant", and its
+//     boundary condition — a future shared multi-tenant hosting mode "MUST first
+//     revisit the auth model in src/auth/workspace.ts (re-introduce per-request
+//     tenant resolution)"; until then callers "MUST NOT introduce a per-request
+//     tenant/workspace dimension".
+//   - src/auth/workspace.ts:1-20 — the auth wall is a PURE presence gate that reads
+//     no per-request workspace identifier; :41-46 —
+//     `DEPLOYMENT_CONTEXT = 'default'` is "the single, deployment-wide resource
+//     context ... NOT a tenant/workspace identifier derived from the request".
+//     src/routes/provision.ts:460-475 records that #64 deliberately removed
+//     per-request tenant resolution.
+// So the segment does NOT earn its place on isolation grounds. Collapsing it is
+// the right cleanup and should be its own change; it is deliberately NOT this one:
+//   - this direction fixes the reported stack with NO data migration (its config
+//     is already under the derived namespace and resolves there), whereas
+//     collapsing the writes onto `default` makes that same config invisible to
+//     BOTH subsystems until it is migrated;
+//   - #804 is a release blocker, and the smallest change that is provably safe on
+//     the stack in front of us is the one that does not move data;
+//   - the derivation the #804 discussion called unnecessary is already inert:
+//     deriveWorkspaceId has no production caller, and both sides now go through
+//     resolveWorkspaceId, so the read/write mismatch that actually broke
+//     transcoding cannot recur whichever value that function returns;
+//   - and the collapse needs exactly the cross-namespace migration this change
+//     adds (migrateStackConfigsIntoNamespace): setting OVC_WORKSPACE_ID=default
+//     already performs it, so the follow-up is a default change plus a deletion,
+//     not new machinery.
 export const STACK_CONFIG_NAMESPACE = "default";
 
 // Explicit operator-set workspace id (12-factor: config via env). When set and
-// well-formed this WINS over every other source and is never persisted — an
-// operator who pins the namespace in the deployment's environment gets exactly
-// that namespace on every boot, with no OSC round-trip at all. Follows the
-// existing OVC_* convention (OVC_TRUST_ROLE_HEADER, src/main.ts:447).
+// well-formed this WINS over every other source — an operator who pins the
+// namespace in the deployment's environment gets exactly that namespace on every
+// boot, with no OSC round-trip at all. Follows the existing OVC_* convention
+// (OVC_TRUST_ROLE_HEADER, src/main.ts:447).
+//
+// A bare override is NOT persisted (it is already deterministic by construction,
+// and removing the var must restore the previous resolution). The one exception,
+// added in the #804 review: when this var names a namespace that holds no stack
+// config while this deployment's configs sit under exactly one other namespace,
+// they are copied across and the new namespace IS pinned — because that is the
+// documented lever for correcting a wrong namespace, and a correction that
+// vanished with the env var would leave the stack stranded. See
+// migrateStackConfigsIntoNamespace.
 export const WORKSPACE_ID_ENV_VAR = 'OVC_WORKSPACE_ID';
 
 // Fixed key under which the deployment's workspace id is PINNED the first time
@@ -435,11 +495,22 @@ const RESERVED_KEY_SEGMENTS = new Set(['_meta', 'storagebackends']);
 // `openvideocore/<workspaceId>/<name>` (param-store.ts:131) and in the
 // listStackNames prefix (param-store.ts:558). A value carrying `/` would break
 // both, so it is rejected rather than silently corrupting the key space.
+//
+// A RESERVED segment is rejected for the same reason (#804 review, finding 7),
+// giving this guard the same rule the seeding filter already applies: with
+// `_meta` accepted as a workspace id, `stackConfigKey('_meta', 'workspace-id')`
+// is byte-identical to WORKSPACE_ID_PIN_KEY, so a stack named `workspace-id`
+// would overwrite the pin itself; with `storagebackends` accepted, stack keys
+// collide with the storage-backend registry's key space
+// (storage-backend-registry.ts:321). Both require a tenant literally named after
+// one of our own literals, so this is defence in depth rather than an observed
+// failure.
 function isUsableWorkspaceId(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     value.trim().length > 0 &&
-    !value.includes('/')
+    !value.includes('/') &&
+    !RESERVED_KEY_SEGMENTS.has(value.trim())
   );
 }
 
@@ -451,8 +522,9 @@ function isUsableWorkspaceId(value: unknown): value is string {
 //   listSubscriptions(context: Context): Promise<Subscription[]>
 //
 // OBSERVED contract (read-only introspection against a live account,
-// 2026-09-24, logged in the agents repo as
-// docs/osc-feedback/incoming-no-sdk-accessor-for-own-tenant-identity.md): the
+// 2026-09-24, logged in THIS repo as
+// docs/osc-feedback/incoming-no-sdk-accessor-for-own-tenant-identity.md — the
+// citation names the committed file, not an uncommitted one): the
 // payload does NOT match the declaration. Of 13 returned
 // subscriptions, 10 carried NO `tenantId` field at all despite the type
 // declaring it non-optional, and the 3 that did carry it split across TWO
@@ -562,8 +634,15 @@ export function readTenantIdFromCredential(osc: Context): string | undefined {
 
 // Derive the deployment's workspace (tenant) id from the OSC Context alone.
 //
-// RETAINED as the last-resort derivation step of resolveWorkspaceId below and as
-// the pre-existing public helper.
+// RETAINED FOR TESTS AND BACK-COMPAT ONLY (#804 review, finding 6). Since #804
+// no production path calls it: every write goes through provision.ts's
+// `currentWorkspaceId` -> resolveWorkspaceId, and every read through
+// WorkspaceStackResolver.resolveNamespace() -> resolveWorkspaceId. It is exported
+// and covered so an external consumer of this module is not broken, and because
+// its header is the only in-code record of the FOLLOW-UP below. Do not introduce
+// a new caller: unlike resolveWorkspaceId it consults neither the pin nor the
+// stored-stack seed, so a caller of this helper can address a different namespace
+// from the rest of the deployment — the exact divergence #804 was filed for.
 //
 // Order (issue #804): the deployment's OWN credential first — it is the only
 // source that actually identifies this deployment — then the best-effort
@@ -664,6 +743,50 @@ type StoredNamespaceEvidence =
   | { kind: 'unknown' }
   | { kind: 'none' };
 
+// One stored stack config, as recovered from a raw `listByPrefix` listing of this
+// deployment's own config-service instance.
+type StoredStackConfigEntry = {
+  workspaceId: string;
+  stackName: string;
+  // The stored value verbatim: the exact `JSON.stringify(StackConfig)` that
+  // storeStackConfig wrote (param-store.ts:446). Kept as the raw string so a copy
+  // is byte-identical to the original write and needs no re-serialisation.
+  value: string;
+};
+
+// Recognise the stack-config keys in a raw store listing. SINGLE definition of
+// what counts as a stack config, shared by seedWorkspaceIdFromStoredStacks (which
+// reads the namespaces) and migrateStackConfigsIntoNamespace (which copies the
+// entries), so the two can never disagree about which keys they are reasoning
+// over. Rules, unchanged from the seeding filter this was factored out of:
+//   - the key is exactly `openvideocore/<ns>/<name>` (stackConfigKey,
+//     param-store.ts:131-133) — two segments after the shared prefix, which also
+//     excludes the four-segment storage-backend keys;
+//   - `<ns>` is a usable single key segment and not one of our own literals
+//     (isUsableWorkspaceId, which since the #804 review also rejects
+//     RESERVED_KEY_SEGMENTS);
+//   - the value parses as a StackConfig (looksLikeStackConfig).
+function parseStoredStackConfigEntries(
+  entries: Array<{ key: string; value: string }>
+): StoredStackConfigEntry[] {
+  const parsed: StoredStackConfigEntry[] = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry.key !== 'string' || typeof entry.value !== 'string') {
+      continue;
+    }
+    if (!entry.key.startsWith(OVC_KEY_PREFIX)) continue;
+    const segments = entry.key.slice(OVC_KEY_PREFIX.length).split('/');
+    if (segments.length !== 2) continue;
+    const ns = segments[0];
+    const stackName = segments[1];
+    if (!isUsableWorkspaceId(ns)) continue;
+    if (typeof stackName !== 'string' || stackName.length === 0) continue;
+    if (!looksLikeStackConfig(entry.value)) continue;
+    parsed.push({ workspaceId: ns, stackName, value: entry.value });
+  }
+  return parsed;
+}
+
 async function seedWorkspaceIdFromStoredStacks(
   store: WorkspaceIdStore,
   log: StackResolverLogger
@@ -684,19 +807,9 @@ async function seedWorkspaceIdFromStoredStacks(
   }
   if (!Array.isArray(entries)) return { kind: 'unknown' };
 
-  const namespaces = new Set<string>();
-  for (const entry of entries) {
-    if (!entry || typeof entry.key !== 'string' || typeof entry.value !== 'string') {
-      continue;
-    }
-    if (!entry.key.startsWith(OVC_KEY_PREFIX)) continue;
-    const segments = entry.key.slice(OVC_KEY_PREFIX.length).split('/');
-    if (segments.length !== 2) continue;
-    const ns = segments[0];
-    if (!isUsableWorkspaceId(ns) || RESERVED_KEY_SEGMENTS.has(ns)) continue;
-    if (!looksLikeStackConfig(entry.value)) continue;
-    namespaces.add(ns);
-  }
+  const namespaces = new Set(
+    parseStoredStackConfigEntries(entries).map((e) => e.workspaceId)
+  );
 
   const tenantScoped = [...namespaces]
     .filter((ns) => ns !== STACK_CONFIG_NAMESPACE)
@@ -715,6 +828,139 @@ async function seedWorkspaceIdFromStoredStacks(
     return { kind: 'seeded', workspaceId: STACK_CONFIG_NAMESPACE };
   }
   return { kind: 'none' };
+}
+
+// What the namespace migration did, so the caller can decide whether the move is
+// now durable enough to pin.
+export type NamespaceMigration =
+  // The target namespace already holds this deployment's stack configs, or there
+  // is nothing anywhere to copy. Either way the target resolves the stack.
+  | { kind: 'not-needed' }
+  // `count` configs were copied from `from` into the target.
+  | { kind: 'migrated'; from: string; stackNames: string[] }
+  // Deliberately did nothing: the store cannot enumerate ('no-listing'), the
+  // listing failed ('store-error'), or several namespaces hold configs and
+  // picking one would be a guess ('ambiguous').
+  | { kind: 'skipped'; reason: 'no-listing' | 'store-error' | 'ambiguous' };
+
+// Make `target` a namespace that actually resolves this deployment's stacks, by
+// copying its stack configs there when they live somewhere else (issue #804
+// review, finding 2).
+//
+// WHY THIS EXISTS. OVC_WORKSPACE_ID is the documented lever for correcting a
+// deployment whose namespace is wrong — the #777 pin froze whatever the pre-#804
+// derivation produced, and on a live account that is a PUBLISHER tenant of a
+// subscribed service rather than this deployment. Before this function the lever
+// only re-pointed the READS: `openvideocore/<old>/<stack>` stayed where it was,
+// `loadStackConfigWithLegacyFallback` falls back to the literal `default` and to
+// nothing else, and an operator who followed the log message verbatim turned a
+// working stack into an unresolvable one — a hard transcode failure (the now
+// loud resolveS3Config) plus a deprovision inventory that no longer sees the
+// stack (#335). The lever has to move the data, not just the pointer.
+//
+// SAFETY. This is the same shape, and the same argument, as the #751
+// migrate-on-read (loadStackConfigWithLegacyFallback below): the store is this
+// deployment's OWN eyevinn-app-config-svc instance, resolved from
+// PARAMETER_STORE_INSTANCE_NAME against its own authenticated Context
+// (param-store.ts:706-740), and every key copied was written by this deployment.
+// Nothing outside this store is read and no key outside `openvideocore/` is
+// touched, so the #712 isolation constraint is untouched — see also the
+// "one deployment is one tenant" note above STACK_CONFIG_NAMESPACE.
+//
+// Rules:
+//   - target already holds >= 1 stack config  -> 'not-needed'. Never overwrite:
+//     a config under the target is by definition the one this deployment reads,
+//     and the older copy must not clobber it.
+//   - exactly ONE other namespace holds them  -> copy each config across,
+//     verbatim. The literal `default` is not counted as a source, because the
+//     #751 read fallback already covers `default` without a copy.
+//   - several other namespaces hold them      -> 'ambiguous', copy nothing. Which
+//     history is current is not knowable here; an operator resolves it.
+//   - nothing anywhere / no listing / listing threw -> copy nothing.
+//
+// COPY, not move: the source keys are left in place. WorkspaceIdStore is
+// deliberately narrow (get/set/listByPrefix — no delete), and leaving the old
+// keys means a migration that is interrupted part-way, or an operator who reverts
+// the env var, still finds the data where it was. The cost is that
+// seedWorkspaceIdFromStoredStacks can later see two tenant-scoped namespaces and
+// report 'ambiguous' — which never re-points a working deployment (it only
+// declines to pin), and does not arise on the path that matters because the pin is
+// written below.
+//
+// Every write is best-effort and independent: one rejected copy is logged and the
+// rest still proceed, and the outcome reports only the names that actually landed.
+async function migrateStackConfigsIntoNamespace(args: {
+  store: WorkspaceIdStore;
+  log: StackResolverLogger;
+  target: string;
+}): Promise<NamespaceMigration> {
+  const { store, log, target } = args;
+  if (typeof store.listByPrefix !== 'function') return { kind: 'skipped', reason: 'no-listing' };
+
+  let entries: Array<{ key: string; value: string }>;
+  try {
+    entries = await store.listByPrefix(OVC_KEY_PREFIX);
+  } catch (err) {
+    log.warn(
+      {
+        err: err instanceof Error ? { message: err.message } : String(err),
+        prefix: OVC_KEY_PREFIX,
+        target
+      },
+      'workspace id: could not list this deployment\'s stack configs; not migrating them into the configured namespace'
+    );
+    return { kind: 'skipped', reason: 'store-error' };
+  }
+  if (!Array.isArray(entries)) return { kind: 'skipped', reason: 'store-error' };
+
+  const stored = parseStoredStackConfigEntries(entries);
+  if (stored.some((e) => e.workspaceId === target)) return { kind: 'not-needed' };
+
+  const sources = [
+    ...new Set(
+      stored
+        .map((e) => e.workspaceId)
+        .filter((ns) => ns !== target && ns !== STACK_CONFIG_NAMESPACE)
+    )
+  ].sort();
+  if (sources.length === 0) return { kind: 'not-needed' };
+  if (sources.length > 1) {
+    log.warn(
+      { candidates: sources, target, prefix: OVC_KEY_PREFIX },
+      `workspace id: several namespaces hold stack configs, so none was migrated into "${target}" — copy the intended openvideocore/<namespace>/<stack> key to openvideocore/${target}/<stack> by hand`
+    );
+    return { kind: 'skipped', reason: 'ambiguous' };
+  }
+
+  const from = sources[0]!;
+  const copied: string[] = [];
+  for (const entry of stored) {
+    if (entry.workspaceId !== from) continue;
+    const to = stackConfigKey(target, entry.stackName);
+    try {
+      await store.set(to, entry.value);
+      copied.push(entry.stackName);
+    } catch (err) {
+      // Best-effort per key: report it and keep going. The next resolve retries,
+      // and the partial state is still strictly better than before (the copies
+      // that landed are readable under the target).
+      log.warn(
+        {
+          err: err instanceof Error ? { message: err.message } : String(err),
+          from,
+          to: target,
+          stackName: entry.stackName
+        },
+        'workspace id: copying a stack config into the configured namespace failed; will retry on the next resolve'
+      );
+    }
+  }
+  if (copied.length === 0) return { kind: 'skipped', reason: 'store-error' };
+  log.info(
+    { op: 'migrateStackConfig', from, to: target, stackNames: copied },
+    `workspace id: migrated ${copied.length} stack config(s) from namespace "${from}" into the configured namespace "${target}"`
+  );
+  return { kind: 'migrated', from, stackNames: copied };
 }
 
 // Where a resolved workspace id came from. Surfaced on the diagnostic log line
@@ -765,8 +1011,17 @@ export type ResolveWorkspaceIdOptions = {
 //     every listStackNames/loadStackConfig.
 //
 // Resolution order — each step is stable across boots of the SAME deployment:
-//   1. `OVC_WORKSPACE_ID` env var (explicit operator config, 12-factor). Never
-//      persisted; it is already deterministic by construction.
+//   1. `OVC_WORKSPACE_ID` env var (explicit operator config, 12-factor). Already
+//      deterministic by construction, so a bare override is not persisted.
+//
+//      MIGRATES since the #804 review: this is the supported lever for correcting
+//      a deployment whose namespace is wrong, and a lever that re-points reads
+//      without moving the data would strand the very stack it was used on (there
+//      is no cross-namespace read — the #733/#751 fallback covers the literal
+//      `default` only). So when the configured namespace holds no stack config and
+//      exactly one other namespace holds this deployment's, the configs are copied
+//      across and the new namespace is pinned, making the correction durable. See
+//      migrateStackConfigsIntoNamespace.
 //   2. The PINNED value read back from the deployment's own parameter store
 //      (WORKSPACE_ID_PIN_KEY). Written once and read back on every boot
 //      thereafter. This is what makes the namespace independent of the OSC
@@ -781,7 +1036,7 @@ export type ResolveWorkspaceIdOptions = {
 //      with nothing stored under it is CORRECTED to the credential tenant, and a
 //      wrong pin that real stack configs do live under is kept (correcting it
 //      would strand them) but reported at warn with the OVC_WORKSPACE_ID
-//      remediation.
+//      remediation — which, per step 1, actually moves the data.
 //   3. SEED from this deployment's OWN existing stack configs
 //      (seedWorkspaceIdFromStoredStacks) when no pin exists yet. This step is
 //      what makes the pin safe to introduce on an UPGRADE path: a deployment
@@ -852,15 +1107,43 @@ export async function resolveWorkspaceId(
     }
   }
 
-  // 1. Explicit operator config wins outright and costs no round-trip.
+  const store = opts.store;
+
+  // 1. Explicit operator config wins outright.
+  //
+  // Since the #804 review this step also MIGRATES (finding 2): the env var is the
+  // documented lever for correcting a deployment carrying a wrong namespace, so
+  // when the configured namespace holds no stack config and exactly one other
+  // namespace holds this deployment's, the configs are copied across and the new
+  // namespace is pinned — which makes the correction outlive the env var instead
+  // of stranding the stack the operator was trying to move. Everything else about
+  // this step is unchanged: the env value always wins, and any store failure is
+  // logged and ignored (migrateStackConfigsIntoNamespace never throws).
   const configured = process.env[WORKSPACE_ID_ENV_VAR];
   if (configured !== undefined && configured.trim().length > 0) {
     if (isUsableWorkspaceId(configured)) {
-      return { workspaceId: configured.trim(), source: 'env', deterministic: true };
+      const workspaceId = configured.trim();
+      if (store) {
+        const migration = await migrateStackConfigsIntoNamespace({
+          store,
+          log,
+          target: workspaceId
+        });
+        // Pin ONLY when a migration actually moved data. A bare env override stays
+        // exactly as it was before — non-persisting, so removing the var restores
+        // the previous resolution — whereas a completed move must be durable: the
+        // configs now live under `workspaceId`, and a later boot without the env
+        // var must resolve there rather than back to the namespace the operator
+        // just migrated off.
+        if (migration.kind === 'migrated') {
+          await pinOnce(store, workspaceId, 'env');
+        }
+      }
+      return { workspaceId, source: 'env', deterministic: true };
     }
     log.warn(
       { env: WORKSPACE_ID_ENV_VAR },
-      'ignoring configured workspace id: it must not contain "/" (it is a single parameter-store key segment)'
+      `ignoring configured workspace id: it must be a single parameter-store key segment — no "/", and not one of ${[...RESERVED_KEY_SEGMENTS].join(', ')}`
     );
   }
 
@@ -869,8 +1152,6 @@ export async function resolveWorkspaceId(
   // runs, Context stubs in tests), in which case every step below behaves exactly
   // as it did before #804.
   const credentialTenantId = readTenantIdFromCredential(osc);
-
-  const store = opts.store;
 
   // 2. Read back the pin written at provisioning time, VALIDATING it against the
   // credential before honouring it (issue #804).
@@ -915,18 +1196,21 @@ export async function resolveWorkspaceId(
     : ({ kind: 'none' } as StoredNamespaceEvidence);
   if (evidence.kind === 'seeded') {
     // The seeded namespace is where this deployment's data demonstrably lives, so
-    // it wins even over the credential: re-pointing the namespace would strand
-    // every existing stack config. Report the disagreement loudly instead
-    // (issue #804) so an operator can migrate deliberately.
+    // it wins even over the credential: re-pointing the namespace on its own would
+    // strand every existing stack config. Report the disagreement loudly instead
+    // (issue #804) and name the lever that actually moves the data — since the
+    // #804 review, setting the env var COPIES the stack configs into the namespace
+    // it names and pins it (migrateStackConfigsIntoNamespace, step 1 above), so
+    // this instruction is an accurate description of what will happen.
     if (credentialTenantId && evidence.workspaceId !== credentialTenantId) {
       log.warn(
         {
           workspaceId: evidence.workspaceId,
           credentialTenantId,
           key: WORKSPACE_ID_PIN_KEY,
-          remediation: WORKSPACE_ID_ENV_VAR
+          remediation: `${WORKSPACE_ID_ENV_VAR}=${credentialTenantId}`
         },
-        `workspace id: this deployment's stack configs live under a namespace that is NOT the tenant on its own credential; keeping the namespace that holds the data so nothing is stranded — set ${WORKSPACE_ID_ENV_VAR} to move it deliberately`
+        `workspace id: this deployment's stack configs live under namespace "${evidence.workspaceId}", which is NOT the tenant on its own credential ("${credentialTenantId}"); keeping the namespace that holds the data so nothing is stranded — to move it, set ${WORKSPACE_ID_ENV_VAR}=${credentialTenantId} and restart: the next boot copies each openvideocore/${evidence.workspaceId}/<stack> to openvideocore/${credentialTenantId}/<stack> and pins the new namespace`
       );
     }
     const pinned = await pinOnce(store, evidence.workspaceId, 'seeded');
@@ -999,7 +1283,10 @@ export async function resolveWorkspaceId(
 //   - stack configs DO live under the pinned namespace: keep it. The data is
 //     reachable there and moving it is an operator decision, not something a boot
 //     should do. Reported at warn with the OVC_WORKSPACE_ID remediation, which
-//     wins outright over the pin (step 1) and is the supported correction lever.
+//     wins outright over the pin (step 1) and is the supported correction lever —
+//     and which, since the #804 review, MOVES THE DATA rather than only the
+//     pointer (migrateStackConfigsIntoNamespace), so following the warning leaves
+//     the stack resolvable instead of stranding it.
 //   - stack configs live under exactly one OTHER namespace ('seeded' elsewhere):
 //     the pin is stranding them right now, so it is corrected to the namespace
 //     that actually holds the data.
@@ -1062,9 +1349,9 @@ async function reconcilePinAgainstCredential(args: {
           key: WORKSPACE_ID_PIN_KEY,
           pinnedWorkspaceId,
           credentialTenantId,
-          remediation: WORKSPACE_ID_ENV_VAR
+          remediation: `${WORKSPACE_ID_ENV_VAR}=${credentialTenantId}`
         },
-        `workspace id: the pinned namespace "${pinnedWorkspaceId}" does not match this deployment's credential tenant "${credentialTenantId}", but its stack configs live under the pinned namespace; keeping it so nothing is stranded — set ${WORKSPACE_ID_ENV_VAR} to move it deliberately`
+        `workspace id: the pinned namespace "${pinnedWorkspaceId}" does not match this deployment's credential tenant "${credentialTenantId}", but its stack configs live under the pinned namespace; keeping it so nothing is stranded — to move it, set ${WORKSPACE_ID_ENV_VAR}=${credentialTenantId} and restart: the next boot copies each openvideocore/${pinnedWorkspaceId}/<stack> to openvideocore/${credentialTenantId}/<stack> and pins the new namespace`
       );
       return {
         workspaceId: pinnedWorkspaceId,
@@ -1087,7 +1374,7 @@ async function reconcilePinAgainstCredential(args: {
       evidence: evidence.kind,
       remediation: WORKSPACE_ID_ENV_VAR
     },
-    `workspace id: the pinned namespace does not match this deployment's credential tenant, and the stored evidence is ${evidence.kind}; keeping the pin unchanged — set ${WORKSPACE_ID_ENV_VAR} to resolve it`
+    `workspace id: the pinned namespace does not match this deployment's credential tenant, and the stored evidence is ${evidence.kind}; keeping the pin unchanged — set ${WORKSPACE_ID_ENV_VAR} to the namespace whose openvideocore/<namespace>/<stack> keys this deployment should read to resolve it`
   );
   return { workspaceId: pinnedWorkspaceId, source: 'pinned', deterministic: true };
 }

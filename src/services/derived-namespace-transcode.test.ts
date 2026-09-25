@@ -46,12 +46,21 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 //     the tests below execute it directly rather than a copy, so main.ts cannot
 //     silently drift away from the behaviour asserted here.
 
+// SYNTHETIC fixture values throughout, matching the convention in the sibling
+// suites (workspace-namespace-stability.test.ts:452-458,
+// provision.workspace-pin.test.ts:95, scaler-redis-url.test.ts:41): no assertion
+// below depends on a real tenant or stack name, and the observed live values stay
+// in issue #804 rather than in this public repo.
+//
 // The tenant this deployment's own credential names.
-const CREDENTIAL_TENANT = 'lucas';
-// Publisher tenants the live subscription payload actually carries. The
-// lexicographically smallest is what the pre-#804 derivation returned — the
-// `birme` the issue reports on a deployment whose PAT says `lucas`.
-const PUBLISHER_TENANTS = ['birme', 'eyevinn'];
+const CREDENTIAL_TENANT = 'workspace-tenant-a';
+// Publisher tenants of the services this deployment is subscribed TO, as the live
+// payload carries them. The LEXICOGRAPHICALLY SMALLEST is what the pre-#804
+// derivation returned (readTenantIdFromOsc: `.sort()` then `[0]`,
+// workspace-stack.ts:543-548) — i.e. a tenant that merely publishes a service this
+// deployment consumes, not the deployment's own. Ordered so that the credential
+// tenant is NOT the smallest, which is the condition the issue reproduces.
+const PUBLISHER_TENANTS = ['publisher-one', 'publisher-two'];
 
 // A well-formed PAT carrying the verified claim set. The signature is never
 // checked (readTenantIdFromCredential decodes only; it makes no trust decision),
@@ -164,7 +173,9 @@ afterEach(() => {
   }
 });
 
-const MINIO_ENDPOINT = 'https://mediaconvertdev-minio.example.test';
+// Deliberately NOT the host readyConfig() derives, so an assertion on this value
+// proves the endpoint came from the stored config rather than from any default.
+const MINIO_ENDPOINT = 'https://stack-minio.example.test';
 
 function readyConfig(host: string): StackConfig {
   return {
@@ -282,8 +293,8 @@ describe('derived namespace is the deployment credential tenant (issue #804)', (
     raw.set(WORKSPACE_ID_PIN_KEY, PUBLISHER_TENANTS[0]!);
     await paramStore.storeStackConfig(
       PUBLISHER_TENANTS[0]!,
-      'mediaconvertdev',
-      readyConfig('mediaconvertdev')
+      'mediastack',
+      readyConfig('mediastack')
     );
 
     const log = makeLog();
@@ -294,11 +305,121 @@ describe('derived namespace is the deployment credential tenant (issue #804)', (
     expect(resolution.workspaceId).toBe(PUBLISHER_TENANTS[0]);
     expect(resolution.source).toBe('pinned');
     expect(log.warn).toHaveBeenCalled();
+    // The warning must describe a lever that WORKS: it names the env var, the
+    // value to set, and the fact that the keys are copied (#804 review, finding 2 —
+    // the previous message told the operator to set a var that moved nothing).
+    const warning = (log.warn as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map((c) => String(c[1]))
+      .join('\n');
+    expect(warning).toContain(`${WORKSPACE_ID_ENV_VAR}=${CREDENTIAL_TENANT}`);
+    expect(warning).toContain(stackConfigKey(PUBLISHER_TENANTS[0]!, '<stack>'));
+    expect(warning).toContain(stackConfigKey(CREDENTIAL_TENANT, '<stack>'));
+
     // The documented correction lever wins outright over the pin.
     process.env[WORKSPACE_ID_ENV_VAR] = CREDENTIAL_TENANT;
     const overridden = await resolveWorkspaceId(oscContext, { store: pinStore });
     expect(overridden.workspaceId).toBe(CREDENTIAL_TENANT);
     expect(overridden.source).toBe('env');
+  });
+
+  // #804 review, finding 2: the correction lever must MOVE THE STACK, not just the
+  // pointer. Before this, setting OVC_WORKSPACE_ID on the reported live state
+  // (pin + config under a publisher namespace) re-pointed reads at a namespace
+  // holding nothing — turning a working stack into an unresolvable one, now a hard
+  // failure because resolveS3Config throws rather than silently defaulting.
+  it('migrates the stack configs into the namespace OVC_WORKSPACE_ID names, and pins it', async () => {
+    const { paramStore, pinStore, raw } = makeConfigService();
+    raw.set(WORKSPACE_ID_PIN_KEY, PUBLISHER_TENANTS[0]!);
+    const stranded = { ...readyConfig('mediastack'), minioEndpoint: MINIO_ENDPOINT };
+    await paramStore.storeStackConfig(PUBLISHER_TENANTS[0]!, 'mediastack', stranded);
+    await paramStore.storeStackConfig(
+      PUBLISHER_TENANTS[0]!,
+      'second',
+      readyConfig('second')
+    );
+
+    process.env[WORKSPACE_ID_ENV_VAR] = CREDENTIAL_TENANT;
+    const log = makeLog();
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore, log });
+    expect(resolution.workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(resolution.source).toBe('env');
+
+    // EVERY stack config is now readable under the namespace reads address, and
+    // byte-identical to what was stored (no re-serialisation).
+    expect(await paramStore.loadStackConfig(CREDENTIAL_TENANT, 'mediastack')).toEqual(
+      stranded
+    );
+    expect(await paramStore.listStackNames(CREDENTIAL_TENANT)).toEqual(
+      expect.arrayContaining(['mediastack', 'second'])
+    );
+    expect(raw.get(stackConfigKey(CREDENTIAL_TENANT, 'mediastack'))).toBe(
+      raw.get(stackConfigKey(PUBLISHER_TENANTS[0]!, 'mediastack'))
+    );
+    // The originals are left in place: a copy, not a move.
+    expect(raw.has(stackConfigKey(PUBLISHER_TENANTS[0]!, 'mediastack'))).toBe(true);
+    // And the move is durable — the pin now names the new namespace, so removing
+    // the env var does not send the deployment back to the namespace it left.
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBe(CREDENTIAL_TENANT);
+    delete process.env[WORKSPACE_ID_ENV_VAR];
+    const afterRestart = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(afterRestart.workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(afterRestart.source).toBe('pinned');
+  });
+
+  it('does not overwrite configs already under the configured namespace, and does not pin a bare override', async () => {
+    const { paramStore, pinStore } = makeConfigService();
+    const own = { ...readyConfig('mediastack'), minioEndpoint: MINIO_ENDPOINT };
+    await paramStore.storeStackConfig(CREDENTIAL_TENANT, 'mediastack', own);
+    // A stale copy under another namespace must NOT clobber the live one.
+    await paramStore.storeStackConfig(
+      PUBLISHER_TENANTS[0]!,
+      'mediastack',
+      readyConfig('stale')
+    );
+
+    process.env[WORKSPACE_ID_ENV_VAR] = CREDENTIAL_TENANT;
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore });
+    expect(resolution.workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(await paramStore.loadStackConfig(CREDENTIAL_TENANT, 'mediastack')).toEqual(own);
+    // Nothing was migrated, so the env override stays non-persisting exactly as it
+    // was before the #804 review.
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBeUndefined();
+  });
+
+  it('migrates nothing when several namespaces hold configs, and says so', async () => {
+    const { paramStore, pinStore, raw } = makeConfigService();
+    await paramStore.storeStackConfig(PUBLISHER_TENANTS[0]!, 'mediastack', readyConfig('a'));
+    await paramStore.storeStackConfig(PUBLISHER_TENANTS[1]!, 'other', readyConfig('b'));
+
+    process.env[WORKSPACE_ID_ENV_VAR] = CREDENTIAL_TENANT;
+    const log = makeLog();
+    const resolution = await resolveWorkspaceId(oscContext, { store: pinStore, log });
+    expect(resolution.workspaceId).toBe(CREDENTIAL_TENANT);
+    // Which history is current is not knowable here: copy nothing, pin nothing,
+    // and tell the operator what to do by hand.
+    expect(raw.has(stackConfigKey(CREDENTIAL_TENANT, 'mediastack'))).toBe(false);
+    expect(await pinStore.get(WORKSPACE_ID_PIN_KEY)).toBeUndefined();
+    expect(log.warn).toHaveBeenCalled();
+  });
+
+  it('never fails the resolve when the migration write throws', async () => {
+    const { paramStore, pinStore, raw } = makeConfigService();
+    await paramStore.storeStackConfig(PUBLISHER_TENANTS[0]!, 'mediastack', readyConfig('a'));
+    const failing: WorkspaceIdStore = {
+      get: (key) => pinStore.get(key),
+      set: async () => {
+        throw new Error('config service unavailable');
+      },
+      listByPrefix: (prefix) => pinStore.listByPrefix!(prefix)
+    };
+
+    process.env[WORKSPACE_ID_ENV_VAR] = CREDENTIAL_TENANT;
+    const log = makeLog();
+    const resolution = await resolveWorkspaceId(oscContext, { store: failing, log });
+    expect(resolution.workspaceId).toBe(CREDENTIAL_TENANT);
+    expect(resolution.source).toBe('env');
+    expect(raw.has(stackConfigKey(CREDENTIAL_TENANT, 'mediastack'))).toBe(false);
+    expect(log.warn).toHaveBeenCalled();
   });
 });
 
@@ -315,8 +436,8 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
     await persistStackConfig({
       paramStore,
       workspaceId,
-      name: 'mediaconvertdev',
-      config: { ...readyConfig('mediaconvertdev'), minioEndpoint: MINIO_ENDPOINT }
+      name: 'mediastack',
+      config: { ...readyConfig('mediastack'), minioEndpoint: MINIO_ENDPOINT }
     });
 
     // The persisted workspace id matches the deployment's credential tenant.
@@ -325,7 +446,7 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
     // CRITICAL per the issue's verification note: NO `default`-namespaced config
     // may exist, so nothing can accidentally satisfy the old literal read.
     expect([...raw.keys()]).toContain(
-      stackConfigKey(CREDENTIAL_TENANT, 'mediaconvertdev')
+      stackConfigKey(CREDENTIAL_TENANT, 'mediastack')
     );
     expect(
       [...raw.keys()].some((k) =>
@@ -334,7 +455,7 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
     ).toBe(false);
     // And the pre-fix read finds nothing, which is exactly why transcoding broke.
     expect(
-      await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, 'mediaconvertdev')
+      await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, 'mediastack')
     ).toBeUndefined();
 
     // --- RESOLVE the scaler's S3 config, as main.ts wires it -----------------
@@ -361,7 +482,7 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
     });
 
     namespacesRead.length = 0;
-    const s3Config = await resolveS3Config('mediaconvertdev');
+    const s3Config = await resolveS3Config('mediastack');
     expect(s3Config).toEqual({
       endpoint: MINIO_ENDPOINT,
       accessKeyId: 'admin',
@@ -380,10 +501,10 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
     } as unknown as Redis;
 
     const scalerConfig = {
-      workspaceId: 'mediaconvertdev',
+      workspaceId: 'mediastack',
       maxInstances: 2,
       idleTimeoutMs: 60_000,
-      redisUrl: 'redis://mediaconvertdev-valkey.example.test:6379',
+      redisUrl: 'redis://mediastack-valkey.example.test:6379',
       oscContext,
       redis,
       getToken: async () => 'service-access-token',
@@ -421,7 +542,7 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
       log: appLog
     });
 
-    await expect(resolveS3Config('mediaconvertdev')).rejects.toThrow(
+    await expect(resolveS3Config('mediastack')).rejects.toThrow(
       /unresolvable MinIO S3 endpoint/
     );
     expect(appLog.error).toHaveBeenCalled();
@@ -447,7 +568,7 @@ describe('a stack under a non-default namespace transcodes (issue #804 acceptanc
 
     // Returns undefined so the registry uses its static s3Config — an intentional
     // ops override, not a silent default — and says so.
-    await expect(resolveS3Config('mediaconvertdev')).resolves.toBeUndefined();
+    await expect(resolveS3Config('mediastack')).resolves.toBeUndefined();
     expect(appLog.warn).toHaveBeenCalled();
     expect(appLog.error).not.toHaveBeenCalled();
   });
