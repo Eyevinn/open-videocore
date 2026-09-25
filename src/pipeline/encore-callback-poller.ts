@@ -116,6 +116,16 @@ type PollerDeps = {
   // from ENCORE_RECONCILE_GRACE_MS. Unset => DEFAULT_RECONCILE_GRACE_MS so
   // behaviour is unchanged when the env var is absent.
   reconcileGraceMs?: number;
+  // #830: minimum interval between two persisted progress writes for the SAME
+  // transcode job. The sweep reads Encore's own `progress` off the IN_PROGRESS
+  // findByStatus page it already pages through per instance; without a bound,
+  // every sweep cycle would issue a CouchDB write per running job. Threaded the
+  // same way sweepIntervalMs is (raw value in, default applied at use); main.ts
+  // reads it from ENCORE_PROGRESS_WRITE_INTERVAL_MS. Unset =>
+  // DEFAULT_PROGRESS_WRITE_INTERVAL_MS. Mirrors url-pull-worker.ts's
+  // PROGRESS_INTERVAL_MS (:43-44), which throttles ingest progress writes for
+  // exactly the same reason.
+  progressWriteIntervalMs?: number;
   // On-demand packager provisioning (epic #226, issue #244; #496). The SAME
   // closure the assets router receives as `ensurePackaging` (src/routes/assets.ts
   // opts, called at assets.ts:1484 on the manual package-start path). Threaded in
@@ -891,10 +901,163 @@ const DEFAULT_SWEEP_PAGE_SIZE = 100;
 // the only thing that differs per status is the findByStatus query below.
 const SWEEP_STATUSES = ['SUCCESSFUL', 'FAILED'] as const;
 
+// #830 — live transcode progress.
+//
+// A running transcode reported progress: 0 for its entire duration: Encore
+// computes the value and returns it on every job document, the Job record has a
+// `progress` field, the pipelines route enriches a running step from it
+// (src/routes/pipelines.ts:56-71 enrichWithProgress) and both UI surfaces render
+// it — but nothing ever copied Encore's number onto our job. The push channel
+// (progressCallbackUri, injected at dispatch by scaler-loop.ts:992-996) delivers
+// only the terminal callback on current stacks (#812), so the value is read here
+// instead, off a response this loop already fetches.
+//
+// CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7) — Encore's own OpenAPI document,
+// fetched live from a running OSC Encore instance at GET /v3/api-docs
+// (2026-09-25, instance scalerovctestmtvumibi):
+//   - path `/encoreJobs/search/findByStatus`, operationId
+//     `executeSearch-encorejob-get`, `status` query enum
+//     [NEW, QUEUED, IN_PROGRESS, SUCCESSFUL, FAILED, CANCELLED]; 200 response
+//     schema `PagedModelEntityModelEncoreJob` =
+//     { _embedded: { encoreJobs: EntityModelEncoreJob[] }, page, _links }.
+//   - `EntityModelEncoreJob.progress` — {"type":"integer","format":"int32",
+//     "default":"0","description":"The EncoreJob progress","example":57,
+//     "readOnly":true}. Integer percent, 0-100 (the live evidence on #830 shows
+//     8 -> 27 -> 47 -> 75 over one run).
+//   - `EntityModelEncoreJob.externalId` — {"type":"string","description":
+//     "External id - for external backreference"}. This is OUR encoreJobId: the
+//     transcode dispatch submits `externalId: encoreJobId`
+//     (src/pipeline/transcode.ts:146) and JobRepository.findByEncoreJobId
+//     (src/data/job-repo.ts:257) resolves it back to the local job — the same
+//     lookup the terminal sweep below already performs.
+//   - Write target: UpdateJobInput.progress (src/data/job-repo.ts:176), clamped
+//     to 0-100 by clampProgress (job-repo.ts:306-309).
+const PROGRESS_STATUS = 'IN_PROGRESS';
+
+// Minimum gap between two persisted progress writes for one job (#830 acceptance
+// criterion: "Progress writes are throttled rather than issued on every poll").
+const DEFAULT_PROGRESS_WRITE_INTERVAL_MS = 10_000;
+
+// Drop a throttle entry this long after its last write, so the map cannot grow
+// without bound across a long-lived process (a job that stops appearing on the
+// IN_PROGRESS page has finished and will never be rate-limited again).
+const PROGRESS_THROTTLE_TTL_MS = 60 * 60_000;
+
+type ProgressThrottleEntry = { at: number; value: number };
+
+// Throttle state keyed by the poller's own deps object, so each running poller
+// (and each test) gets an isolated map that is collected with it.
+const progressThrottleByDeps = new WeakMap<PollerDeps, Map<string, ProgressThrottleEntry>>();
+
+function progressThrottleState(deps: PollerDeps): Map<string, ProgressThrottleEntry> {
+  let state = progressThrottleByDeps.get(deps);
+  if (!state) {
+    state = new Map();
+    progressThrottleByDeps.set(deps, state);
+  }
+  return state;
+}
+
+// Read Encore's reported `progress` for every IN_PROGRESS job on ONE instance and
+// persist it onto the matching local transcode job.
+//
+// Deliberately additive and best-effort: it never enqueues, never changes a job's
+// status, and swallows every fetch/parse/repository error (a progress number is
+// cosmetic — failing to read it must never disturb the terminal reconciliation
+// this sweep exists for). Runs inside the existing per-instance sweep loop, so it
+// adds no control loop and no new timer (#464: "Do NOT add a second control loop;
+// extend this one").
+//
+// Two independent guards keep CouchDB writes off the poll cadence:
+//   1. unchanged value  — Encore reports integer percent, so most cycles repeat
+//                         the previous number; those are skipped outright.
+//   2. minimum interval — a changed value is still only written once per
+//                         progressWriteIntervalMs per job.
+// Returns the number of jobs actually written (test observability).
+export async function syncInProgressJobProgress(
+  deps: PollerDeps,
+  record: EncoreInstanceRecord,
+  sat: string,
+  opts: { pageSize: number; now?: () => number }
+): Promise<number> {
+  const { logger, jobRepository } = deps;
+  const now = opts.now ?? (() => Date.now());
+  const intervalMs = deps.progressWriteIntervalMs ?? DEFAULT_PROGRESS_WRITE_INTERVAL_MS;
+  const throttle = progressThrottleState(deps);
+
+  const searchUrl =
+    `${record.url.replace(/\/+$/, '')}/encoreJobs/search/findByStatus` +
+    `?status=${PROGRESS_STATUS}&page=0&size=${opts.pageSize}`;
+
+  let encoreJobs: Array<{ externalId?: string; progress?: number }> = [];
+  try {
+    const res = await fetch(searchUrl, { headers: { authorization: `Bearer ${sat}` } });
+    if (!res.ok) return 0;
+    const body = (await res.json()) as {
+      _embedded?: { encoreJobs?: typeof encoreJobs };
+    };
+    encoreJobs = body._embedded?.encoreJobs ?? [];
+  } catch {
+    return 0;
+  }
+
+  let written = 0;
+  const at = now();
+
+  for (const encoreJob of encoreJobs) {
+    const externalId = encoreJob.externalId;
+    const progress = encoreJob.progress;
+    // `progress` is optional on the schema and defaults to 0; a non-numeric or
+    // absent value carries no information, so there is nothing to copy.
+    if (!externalId || typeof progress !== 'number' || !Number.isFinite(progress)) continue;
+
+    const previous = throttle.get(externalId);
+    // Guard 1: Encore has not moved since the last value we persisted.
+    if (previous && previous.value === progress) continue;
+    // Guard 2: it has moved, but not long enough ago to spend a write on.
+    if (previous && at - previous.at < intervalMs) continue;
+
+    try {
+      const found = await jobRepository.findByEncoreJobId(externalId);
+      if (!found) continue;
+      const { job } = found;
+      // Never write progress onto a job that has already settled — a terminal
+      // job's progress is whatever completeTranscode left there.
+      if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') continue;
+      if (job.progress === progress) {
+        // Already correct in the store (e.g. first sight after a restart):
+        // record it so the unchanged-value guard suppresses future cycles.
+        throttle.set(externalId, { at, value: progress });
+        continue;
+      }
+      await jobRepository.update(job.id, { progress });
+      throttle.set(externalId, { at, value: progress });
+      written++;
+      logger.info({
+        msg: 'encore-callback-poller: progress updated from encore',
+        externalId,
+        jobId: job.id,
+        progress,
+        instanceId: record.instanceId
+      });
+    } catch (err) {
+      logger.warn({ msg: 'encore-callback-poller: progress update failed', externalId, err });
+    }
+  }
+
+  // Bounded-memory housekeeping: forget jobs we have not written for in an hour.
+  for (const [key, entry] of throttle) {
+    if (at - entry.at > PROGRESS_THROTTLE_TTL_MS) throttle.delete(key);
+  }
+
+  return written;
+}
+
 // Scan `encore:pool:*` keys to find all workspaces that have an active pool,
-// then for each workspace check every Encore instance for terminal jobs
-// (SUCCESSFUL or FAILED) that have a UUID→externalId mapping but whose local job
-// is not yet in a terminal state. If such a job exists and is not already in the
+// then for each workspace check every Encore instance for (a) live progress on
+// its IN_PROGRESS jobs (#830, syncInProgressJobProgress above) and (b) terminal
+// jobs (SUCCESSFUL or FAILED) that have a UUID→externalId mapping but whose local
+// job is not yet in a terminal state. If such a job exists and is not already in the
 // queue, push a synthetic message so the regular loop picks it up and runs the
 // shared handleMessage → completeTranscode path (which marks the job done or
 // failed based on the live Encore status).
@@ -934,6 +1097,11 @@ export async function sweepTerminalJobs(deps: PollerDeps, queueKey: string): Pro
 
       let record: EncoreInstanceRecord;
       try { record = JSON.parse(instanceJson) as EncoreInstanceRecord; } catch { continue; }
+
+      // #830: copy Encore's own `progress` onto the matching local jobs for this
+      // instance's IN_PROGRESS page. Same loop, same timer, same page-size bound
+      // as the terminal statuses below; never throws (best-effort by contract).
+      await syncInProgressJobProgress(deps, record, sat, { pageSize });
 
       // Query each terminal status in turn. Both SUCCESSFUL and FAILED jobs are
       // reconciled the same way — the only per-status difference is this query;

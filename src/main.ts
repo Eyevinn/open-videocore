@@ -1562,6 +1562,12 @@ function activateScaler(redisUrl: string): void {
     sweepMaxInstances: process.env['ENCORE_SWEEP_MAX_INSTANCES']
       ? parseInt(process.env['ENCORE_SWEEP_MAX_INSTANCES'], 10)
       : undefined,
+    // #830: minimum gap between two persisted progress writes for the same
+    // transcode job, as the sweep copies Encore's reported `progress` off the
+    // IN_PROGRESS page it already fetches. Unset => the poller's own 10s default.
+    progressWriteIntervalMs: process.env['ENCORE_PROGRESS_WRITE_INTERVAL_MS']
+      ? parseInt(process.env['ENCORE_PROGRESS_WRITE_INTERVAL_MS'], 10)
+      : undefined,
     // #708: grace window the poller uses for the keys.jobCompletionSeen PX TTL so
     // reconcile's dropped-job diff can skip a just-completed job. Uses the SAME
     // value forwarded to the scaler loop (ENCORE_RECONCILE_GRACE_MS) so the write
