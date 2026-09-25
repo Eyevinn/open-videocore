@@ -16,6 +16,7 @@ import nano from 'nano';
 import {
   deprovisionStack,
   deprovisionStackFromConfig,
+  unmatchedSkipServiceIds,
   type StackTeardownResult
 } from '../services/deprovision.js';
 import {
@@ -35,7 +36,8 @@ import {
   AUTO_SUBTITLES_SERVICE_ID,
   PACKAGER_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
-  STACK_SERVICES
+  STACK_SERVICES,
+  TEARDOWN_ORDER
 } from '../services/stack.js';
 import {
   packagerOscApiFromContext,
@@ -222,7 +224,10 @@ const nameParamSchema = z.object({
 const serviceTeardownResultSchema = z.object({
   serviceId: z.string(),
   role: z.string(),
-  status: z.enum(['removed', 'not_found', 'failed']),
+  // `skipped` (issue #738) means the caller asked for this serviceId to be
+  // preserved via ?skipServiceIds= — the instance is still running on purpose,
+  // which is distinct from both `failed` (could not remove) and `not_found`.
+  status: z.enum(['removed', 'not_found', 'failed', 'skipped']),
   error: z.string().optional()
 });
 
@@ -230,6 +235,66 @@ const teardownResponseSchema = z.object({
   name: z.string(),
   status: z.enum(['removed', 'not_found', 'partial', 'failed']),
   services: z.array(serviceTeardownResultSchema)
+});
+
+// Syntactic shape of an OSC serviceId as accepted by ?skipServiceIds= (issue
+// #738). Same shape the stack's own serviceIds take (`minio-minio`,
+// `apache-couchdb`, `valkey-io-valkey`, `eyevinn-encore-packager` —
+// services/stack.ts). Only syntax is checked here; whether the id is actually
+// part of THIS stack is validated against the stored services[] during teardown,
+// where the stack's real inventory is known.
+const SERVICE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+// Cap on how many serviceIds one request may preserve — a stack has a handful of
+// services, so this only bounds abusive input.
+const MAX_SKIP_SERVICE_IDS = 16;
+
+// DELETE /:name query (issue #738). `skipServiceIds` is the opt-in selective
+// teardown control: the named OSC serviceIds are PRESERVED (reported `skipped`)
+// while the rest of the stack is torn down — e.g.
+// `?skipServiceIds=minio-minio` keeps a workspace's object storage and its
+// contents alive. Accepts repeated params (?skipServiceIds=a&skipServiceIds=b)
+// or a comma-separated list (?skipServiceIds=a,b), mirroring the `tags`
+// convention in routes/search.ts. Omitted => full teardown (unchanged default).
+const deprovisionQuerySchema = z.object({
+  skipServiceIds: z
+    .union([z.string(), z.array(z.string())])
+    .optional()
+    .transform((v) => {
+      if (v === undefined) return undefined;
+      const raw = Array.isArray(v) ? v : [v];
+      const flattened = raw
+        .flatMap((s) => s.split(','))
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return flattened.length > 0 ? [...new Set(flattened)] : undefined;
+    })
+    .superRefine((ids, ctx) => {
+      if (!ids) return;
+      if (ids.length > MAX_SKIP_SERVICE_IDS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `skipServiceIds accepts at most ${MAX_SKIP_SERVICE_IDS} serviceIds`
+        });
+      }
+      for (const id of ids) {
+        if (!SERVICE_ID_PATTERN.test(id)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `invalid serviceId '${id}': must be lowercase alphanumeric with hyphens`
+          });
+        }
+      }
+    })
+    .describe(
+      'OSC serviceIds to PRESERVE instead of tearing down (opt-in selective ' +
+        'teardown). Repeated or comma-separated, e.g. ' +
+        '`?skipServiceIds=minio-minio`. Each preserved service is reported ' +
+        'with `status: "skipped"` and the stack status becomes `partial`; the ' +
+        'stored stack config is retained so a later unscoped DELETE can ' +
+        'finish the teardown. A serviceId that is not part of the stack fails ' +
+        'the operation without removing anything. Omit for a full teardown.'
+    )
 });
 
 type ProvisionRouterOptions = {
@@ -1606,11 +1671,23 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   //   - 404 status=not_found  no instances existed for this name
   //   - 502 status=failed     one or more instances failed to remove; the
   //                           call is safe to retry (idempotent)
+  //
+  // Selective teardown (issue #738): `?skipServiceIds=<id>[,<id>]` preserves the
+  // named OSC service instances (e.g. `minio-minio`, to keep a workspace's
+  // stored objects) and tears down everything else. Preserved services report
+  // `status: 'skipped'` in the operation result and the stack status is
+  // `partial`. Because the stack is then only partly torn down, the stored stack
+  // config is DELIBERATELY retained so the surviving instance stays discoverable
+  // and a later unscoped DELETE finishes the job (already-removed services
+  // report not_found, so the retry converges). A serviceId that is not part of
+  // this stack fails the operation before anything is removed rather than being
+  // silently ignored. Omitting the param is the unchanged full teardown.
   app.delete(
     '/:name',
     {
       schema: {
         params: nameParamSchema,
+        querystring: deprovisionQuerySchema,
         response: {
           202: acceptedSchema
         }
@@ -1618,6 +1695,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     },
     async (request, reply) => {
       const { name } = request.params;
+      const skipServiceIds = request.query.skipServiceIds ?? [];
 
       // Create the async operation and return 202 immediately. The teardown
       // runs in the background closure below; the caller polls GET
@@ -1629,26 +1707,54 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         try {
           ops.update(op.id, { status: 'running' });
 
+          // Selective teardown was requested: honour it for the on-demand
+          // packager reconciliation below too, so `?skipServiceIds=<packager>`
+          // is not quietly overridden by the introspection path.
+          const skipPackager = skipServiceIds.includes(PACKAGER_SERVICE_ID);
+          const teardownOptions =
+            skipServiceIds.length > 0 ? { skipServiceIds } : undefined;
+
           // Without a parameter store there is no per-workspace ownership record
           // to consult, so fall back to the legacy hardcoded-list teardown. This
           // keeps store-less deployments working; ownership scoping (#29)
           // requires the store and is exercised on the path below.
           if (!paramStore) {
+            // Reject a skip target this teardown could never touch, BEFORE
+            // removing anything (issue #738). The store-less path tears down the
+            // static TEARDOWN_ORDER, so that is the tearable inventory here.
+            const unmatched = unmatchedSkipServiceIds(
+              skipServiceIds,
+              TEARDOWN_ORDER
+            );
+            if (unmatched.length > 0) {
+              ops.update(op.id, {
+                status: 'failed',
+                completedAt: Date.now(),
+                error:
+                  `skipServiceIds: not part of this stack: ${unmatched.join(', ')}` +
+                  '; nothing was torn down'
+              });
+              return;
+            }
+
             // Tear down any on-demand packager first (consumer before the queue
             // it consumes), reconciling via introspection (issue #246). Safe
             // whether or not packaging ever ran: not_found when no packager
             // exists. A failure is logged but does not abort the static teardown.
-            const packagerTeardown = await teardownOnDemandPackager(
-              packagerOscApiFromContext(osc),
-              name
-            );
-            if (packagerTeardown.status === 'failed') {
-              app.log.error(
-                { packagerTeardown, name },
-                'on-demand packager teardown failed; continuing static teardown'
+            // Skipped entirely when the caller asked to preserve the packager.
+            if (!skipPackager) {
+              const packagerTeardown = await teardownOnDemandPackager(
+                packagerOscApiFromContext(osc),
+                name
               );
+              if (packagerTeardown.status === 'failed') {
+                app.log.error(
+                  { packagerTeardown, name },
+                  'on-demand packager teardown failed; continuing static teardown'
+                );
+              }
             }
-            const result = await deprovisionStack(osc, name);
+            const result = await deprovisionStack(osc, name, teardownOptions);
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
@@ -1668,6 +1774,39 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               status: 'done',
               completedAt: Date.now(),
               result: { name, status: 'not_found', services: [] }
+            });
+            return;
+          }
+
+          // Selective teardown (issue #738): validate the requested skip targets
+          // against this stack's REAL inventory before anything destructive
+          // happens — the stored services[], the optional opt-in instances it
+          // activated, and the on-demand packager (removable via the
+          // reconciliation below even when it is not in services[]). A serviceId
+          // that matches nothing fails the operation with the offending ids
+          // named, leaving the stack untouched: silently ignoring it would make
+          // the control inert, which is the defect this option exists to avoid.
+          const skipCandidates = [
+            ...config.services,
+            { serviceId: PACKAGER_SERVICE_ID },
+            ...(config.autoSubtitlesInstanceName
+              ? [{ serviceId: AUTO_SUBTITLES_SERVICE_ID }]
+              : []),
+            ...(config.sceneDetectInstanceName
+              ? [{ serviceId: SCENE_DETECT_SERVICE_ID }]
+              : [])
+          ];
+          const unmatched = unmatchedSkipServiceIds(
+            skipServiceIds,
+            skipCandidates
+          );
+          if (unmatched.length > 0) {
+            ops.update(op.id, {
+              status: 'failed',
+              completedAt: Date.now(),
+              error:
+                `skipServiceIds: not part of this stack: ${unmatched.join(', ')}` +
+                '; nothing was torn down'
             });
             return;
           }
@@ -1709,10 +1848,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // second removeInstance here would be a redundant teardown of the
           // same instance. Teardown must touch each stored service exactly once
           // (PACKAGER_SERVICE_ID, stack.ts:44 — the packager serviceId).
+          //
+          // Also skipped when the caller asked to PRESERVE the packager
+          // (?skipServiceIds=<packager>, issue #738) — otherwise this
+          // introspection path would remove the very instance the request asked
+          // to keep, making the option inert for that serviceId.
           const packagerInStoredServices = config.services.some(
             (s) => s.serviceId === PACKAGER_SERVICE_ID
           );
-          if (!packagerInStoredServices) {
+          if (!packagerInStoredServices && !skipPackager) {
             const packagerTeardown = await teardownOnDemandPackager(
               packagerOscApiFromContext(osc),
               name
@@ -1731,7 +1875,9 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // torn down too: their instance names are passed alongside services[]
           // and deprovisionStackFromConfig merges (and dedupes) them so a stack
           // that activated auto-subtitles or scene-detect is fully removed.
-          const result = await deprovisionStackFromConfig(
+          // `teardownOptions` carries the caller's ?skipServiceIds= set (#738):
+          // matching services are reported 'skipped' and left running.
+          const storedResult = await deprovisionStackFromConfig(
             osc,
             name,
             config.services,
@@ -1742,8 +1888,32 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               ...(config.sceneDetectInstanceName
                 ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
                 : {})
-            }
+            },
+            teardownOptions
           );
+
+          // A preserved on-demand packager is invisible to the call above when it
+          // is not recorded in services[] — nothing enumerated it, so nothing
+          // reported it. Surface it explicitly so the result never implies the
+          // whole stack is gone while a deliberately kept instance is still
+          // running (and so the stored config is retained below). role
+          // 'packaging' matches the teardown-only descriptor in stack.ts.
+          const result: StackTeardownResult =
+            skipPackager && !packagerInStoredServices
+              ? {
+                  ...storedResult,
+                  status:
+                    storedResult.status === 'failed' ? 'failed' : 'partial',
+                  services: [
+                    {
+                      serviceId: PACKAGER_SERVICE_ID,
+                      role: 'packaging',
+                      status: 'skipped'
+                    },
+                    ...storedResult.services
+                  ]
+                }
+              : storedResult;
 
           if (result.status === 'failed') {
             app.log.error({ result }, 'stack teardown reported failures');
@@ -1753,19 +1923,40 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             return;
           }
 
-          // removed | partial | not_found — every instance is gone (or was
-          // already gone). The stack is fully torn down, so remove the stored
-          // coordinates. deleteStackConfig is idempotent, so a retry that
-          // re-finds a stale entry still converges. A delete failure is logged
-          // but does not fail the call: the OSC instances are already removed
-          // and a stale config entry is a recoverable inconsistency.
-          try {
-            await paramStore.deleteStackConfig(workspaceId, name);
-          } catch (err) {
-            app.log.error(
-              { err, name },
-              'stack torn down but failed to remove parameter store entry'
+          // Selective teardown (issue #738): at least one instance was preserved
+          // on request, so the stack is NOT fully torn down. Keep the stored
+          // coordinates — deleting them would orphan the surviving instance
+          // (nothing left to enumerate it by, so no later DELETE could remove
+          // it). The retained entry also lets an unscoped DELETE finish the
+          // teardown later: the already-removed services report not_found, so
+          // the retry converges. Same policy the failure path above uses.
+          const anySkipped = result.services.some((s) => s.status === 'skipped');
+          if (anySkipped) {
+            app.log.info(
+              {
+                name,
+                workspaceId,
+                skipped: result.services
+                  .filter((s) => s.status === 'skipped')
+                  .map((s) => s.serviceId)
+              },
+              'selective teardown: stored stack config retained for preserved services'
             );
+          } else {
+            // removed | partial | not_found — every instance is gone (or was
+            // already gone). The stack is fully torn down, so remove the stored
+            // coordinates. deleteStackConfig is idempotent, so a retry that
+            // re-finds a stale entry still converges. A delete failure is logged
+            // but does not fail the call: the OSC instances are already removed
+            // and a stale config entry is a recoverable inconsistency.
+            try {
+              await paramStore.deleteStackConfig(workspaceId, name);
+            } catch (err) {
+              app.log.error(
+                { err, name },
+                'stack torn down but failed to remove parameter store entry'
+              );
+            }
           }
 
           // Drop cached connections for this workspace so the removed stack is

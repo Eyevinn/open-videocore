@@ -204,6 +204,7 @@ Response 200 (application/json)
 
   Parameters
 NameInTypeRequired
+skipServiceIdsquerystringoptional
 namepathstringrequired
 
   Response

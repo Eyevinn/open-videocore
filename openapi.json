@@ -653,6 +653,25 @@
         "parameters": [
           {
             "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "in": "query",
+            "name": "skipServiceIds",
+            "required": false,
+            "description": "OSC serviceIds to PRESERVE instead of tearing down (opt-in selective teardown). Repeated or comma-separated, e.g. `?skipServiceIds=minio-minio`. Each preserved service is reported with `status: \"skipped\"` and the stack status becomes `partial`; the stored stack config is retained so a later unscoped DELETE can finish the teardown. A serviceId that is not part of the stack fails the operation without removing anything. Omit for a full teardown."
+          },
+          {
+            "schema": {
               "type": "string",
               "minLength": 1,
               "maxLength": 63,

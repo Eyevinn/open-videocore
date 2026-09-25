@@ -76,11 +76,18 @@ async function waitForOperation(
 // completion and return its final teardown result.
 async function deprovisionAndWait(
   app: Awaited<ReturnType<typeof buildApp>>,
-  name: string
-): Promise<{ status: string; result: { status: string; services?: unknown[] } }> {
+  name: string,
+  // Optional raw query string (without the leading `?`), e.g.
+  // 'skipServiceIds=minio-minio' for selective teardown (issue #738).
+  query?: string
+): Promise<{
+  status: string;
+  error?: string;
+  result: { status: string; services?: unknown[] };
+}> {
   const res = await app.inject({
     method: 'DELETE',
-    url: `/api/v1/provision/${name}`
+    url: `/api/v1/provision/${name}${query ? `?${query}` : ''}`
   });
   expect(res.statusCode).toBe(202);
   const { operationId, status } = res.json();
@@ -186,6 +193,217 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     expect(op.result.status).toBe('failed');
     // Entry retained so a retry can re-read services[] and finish teardown.
     expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+});
+
+// Opt-in selective teardown (issue #738): ?skipServiceIds=<id>[,<id>] preserves
+// the named OSC service instances and tears down the rest of the stack.
+describe('DELETE /api/v1/provision/:name — selective teardown (issue #738)', () => {
+  type ServiceResult = { serviceId: string; role: string; status: string };
+
+  // serviceIds passed to getInstance / removeInstance (arg index 1 in the
+  // client-core signature getInstance(ctx, serviceId, name, token)).
+  const probed = () => getInstance.mock.calls.map((c) => c[1] as string);
+  const removed = () => removeInstance.mock.calls.map((c) => c[1] as string);
+
+  it('preserves the named service, reports it skipped, and keeps the store entry', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=minio-minio'
+    );
+
+    expect(op.status).toBe('done');
+    // A deliberately preserved instance means the stack is not fully removed.
+    expect(op.result.status).toBe('partial');
+    const services = op.result.services as ServiceResult[];
+    expect(services.find((s) => s.serviceId === 'minio-minio')?.status).toBe(
+      'skipped'
+    );
+    // Preserved storage was never probed and never removed.
+    expect(probed()).not.toContain('minio-minio');
+    expect(removed()).not.toContain('minio-minio');
+    // Every OTHER stored service was still torn down.
+    expect(removed()).toHaveLength(STORED_CONFIG.services.length - 1);
+    // The stored config is retained: deleting it would orphan the surviving
+    // instance, and it lets a later unscoped DELETE finish the teardown.
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+
+  it('accepts a comma-separated list', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=minio-minio,apache-couchdb'
+    );
+
+    expect(op.result.status).toBe('partial');
+    const skipped = (op.result.services as ServiceResult[])
+      .filter((s) => s.status === 'skipped')
+      .map((s) => s.serviceId);
+    expect(skipped.sort()).toEqual(['apache-couchdb', 'minio-minio']);
+    expect(removed()).toHaveLength(STORED_CONFIG.services.length - 2);
+  });
+
+  it('accepts repeated query params', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=minio-minio&skipServiceIds=valkey-io-valkey'
+    );
+
+    const skipped = (op.result.services as ServiceResult[])
+      .filter((s) => s.status === 'skipped')
+      .map((s) => s.serviceId);
+    expect(skipped.sort()).toEqual(['minio-minio', 'valkey-io-valkey']);
+  });
+
+  it('fails the operation without removing anything when a skip target is not part of the stack', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=some-other-service'
+    );
+
+    // Loud, not inert: the request is rejected and the stack is untouched.
+    expect(op.status).toBe('failed');
+    expect(op.error).toContain('some-other-service');
+    expect(removeInstance).not.toHaveBeenCalled();
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed serviceId with 400 before creating an operation', async () => {
+    const app = await buildApp(makeParamStore(STORED_CONFIG));
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/api/v1/provision/mystack?skipServiceIds=Not_A_ServiceId'
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(removeInstance).not.toHaveBeenCalled();
+  });
+
+  it('tears down the whole stack when the param is omitted (unchanged default)', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(app, 'mystack');
+
+    expect(op.result.status).toBe('removed');
+    expect(
+      (op.result.services as ServiceResult[]).some((s) => s.status === 'skipped')
+    ).toBe(false);
+    expect(paramStore.deleteStackConfig).toHaveBeenCalled();
+  });
+
+  it('preserves an on-demand packager that is not recorded in services[]', async () => {
+    // Stack provisioned by the lazy-packager path: the packager is removed by
+    // the introspection reconciliation, not by the stored-config teardown.
+    const configWithoutPackager = {
+      ...STORED_CONFIG,
+      services: [
+        { serviceId: 'minio-minio', instanceName: 'mystack' },
+        { serviceId: 'apache-couchdb', instanceName: 'mystack' },
+        { serviceId: 'valkey-io-valkey', instanceName: 'mystack' }
+      ]
+    };
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(configWithoutPackager);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=eyevinn-encore-packager'
+    );
+
+    // The reconciliation path must not remove the instance the caller kept.
+    expect(removed()).not.toContain('eyevinn-encore-packager');
+    // …and the preserved packager is reported even though nothing enumerated it.
+    expect(op.result.status).toBe('partial');
+    const packager = (op.result.services as ServiceResult[]).find(
+      (s) => s.serviceId === 'eyevinn-encore-packager'
+    );
+    expect(packager?.status).toBe('skipped');
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+
+  it('still reports failed (not partial) when another service fails alongside a skip', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === 'apache-couchdb') throw new Error('boom');
+      return undefined;
+    });
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=minio-minio'
+    );
+
+    expect(op.result.status).toBe('failed');
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+
+  it('works on the store-less legacy path and skips the packager reconciliation', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+
+    const app = await buildApp();
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=minio-minio,eyevinn-encore-packager'
+    );
+
+    expect(op.result.status).toBe('partial');
+    const skipped = (op.result.services as ServiceResult[])
+      .filter((s) => s.status === 'skipped')
+      .map((s) => s.serviceId);
+    expect(skipped.sort()).toEqual(['eyevinn-encore-packager', 'minio-minio']);
+    expect(removed()).not.toContain('minio-minio');
+    expect(removed()).not.toContain('eyevinn-encore-packager');
+  });
+
+  it('rejects an unknown skip target on the legacy path too', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockResolvedValue(undefined);
+
+    const app = await buildApp();
+    const op = await deprovisionAndWait(
+      app,
+      'mystack',
+      'skipServiceIds=not-in-this-stack'
+    );
+
+    expect(op.status).toBe('failed');
+    expect(op.error).toContain('not-in-this-stack');
+    expect(removeInstance).not.toHaveBeenCalled();
   });
 });
 

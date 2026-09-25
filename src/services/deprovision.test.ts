@@ -9,7 +9,11 @@ vi.mock('@osaas/client-core', () => ({
   removeInstance: (...args: unknown[]) => removeInstance(...args)
 }));
 
-import { deprovisionStack } from './deprovision.js';
+import {
+  deprovisionStack,
+  deprovisionStackFromConfig,
+  unmatchedSkipServiceIds
+} from './deprovision.js';
 import { TEARDOWN_ORDER } from './stack.js';
 
 // Minimal Context stub — only getServiceAccessToken is exercised.
@@ -115,5 +119,130 @@ describe('deprovisionStack', () => {
     const second = await deprovisionStack(osc, NAME);
     expect(second.status).toBe('not_found');
     expect(removeInstance).not.toHaveBeenCalled();
+  });
+});
+
+// Opt-in selective teardown (issue #738).
+describe('selective teardown (skipServiceIds)', () => {
+  const STORED = [
+    { serviceId: 'minio-minio', instanceName: NAME },
+    { serviceId: 'apache-couchdb', instanceName: NAME },
+    { serviceId: 'valkey-io-valkey', instanceName: NAME }
+  ];
+
+  it('deprovisionStack: reports the skipped service and never touches it', async () => {
+    getInstance.mockResolvedValue({ name: NAME });
+    removeInstance.mockResolvedValue(undefined);
+
+    const result = await deprovisionStack(osc, NAME, {
+      skipServiceIds: ['minio-minio']
+    });
+
+    // Not fully torn down: something is still running on purpose.
+    expect(result.status).toBe('partial');
+    const storage = result.services.find((s) => s.serviceId === 'minio-minio');
+    expect(storage?.status).toBe('skipped');
+    expect(storage?.role).toBe('storage');
+    // Never probed, never removed.
+    expect(getInstance.mock.calls.map((c) => c[1])).not.toContain('minio-minio');
+    expect(removeInstance.mock.calls.map((c) => c[1])).not.toContain(
+      'minio-minio'
+    );
+    // Everything else was still attempted.
+    expect(removeInstance).toHaveBeenCalledTimes(TEARDOWN_ORDER.length - 1);
+  });
+
+  it('deprovisionStackFromConfig: skips by serviceId and removes the rest', async () => {
+    getInstance.mockResolvedValue({ name: NAME });
+    removeInstance.mockResolvedValue(undefined);
+
+    const result = await deprovisionStackFromConfig(
+      osc,
+      NAME,
+      STORED,
+      undefined,
+      { skipServiceIds: ['minio-minio'] }
+    );
+
+    expect(result.status).toBe('partial');
+    expect(
+      result.services.find((s) => s.serviceId === 'minio-minio')?.status
+    ).toBe('skipped');
+    expect(removeInstance).toHaveBeenCalledTimes(STORED.length - 1);
+  });
+
+  it('deprovisionStackFromConfig: can skip an optional opt-in service', async () => {
+    getInstance.mockResolvedValue({ name: NAME });
+    removeInstance.mockResolvedValue(undefined);
+
+    const result = await deprovisionStackFromConfig(
+      osc,
+      NAME,
+      STORED,
+      { autoSubtitlesInstanceName: NAME },
+      { skipServiceIds: ['eyevinn-auto-subtitles'] }
+    );
+
+    expect(result.status).toBe('partial');
+    expect(
+      result.services.find((s) => s.serviceId === 'eyevinn-auto-subtitles')
+        ?.status
+    ).toBe('skipped');
+    expect(removeInstance).toHaveBeenCalledTimes(STORED.length);
+  });
+
+  it('an all-skipped teardown is partial, not not_found', async () => {
+    const result = await deprovisionStackFromConfig(
+      osc,
+      NAME,
+      STORED,
+      undefined,
+      { skipServiceIds: STORED.map((s) => s.serviceId) }
+    );
+
+    expect(result.status).toBe('partial');
+    expect(result.services.every((s) => s.status === 'skipped')).toBe(true);
+    expect(getInstance).not.toHaveBeenCalled();
+    expect(removeInstance).not.toHaveBeenCalled();
+  });
+
+  it('a failure elsewhere still wins over a skip', async () => {
+    getInstance.mockResolvedValue({ name: NAME });
+    removeInstance.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === 'apache-couchdb') throw new Error('OSC 503');
+      return undefined;
+    });
+
+    const result = await deprovisionStackFromConfig(
+      osc,
+      NAME,
+      STORED,
+      undefined,
+      { skipServiceIds: ['minio-minio'] }
+    );
+
+    expect(result.status).toBe('failed');
+  });
+
+  it('an empty / omitted skip list is an unchanged full teardown', async () => {
+    getInstance.mockResolvedValue({ name: NAME });
+    removeInstance.mockResolvedValue(undefined);
+
+    const result = await deprovisionStackFromConfig(osc, NAME, STORED, undefined, {
+      skipServiceIds: []
+    });
+
+    expect(result.status).toBe('removed');
+    expect(removeInstance).toHaveBeenCalledTimes(STORED.length);
+  });
+
+  it('unmatchedSkipServiceIds names skip targets the teardown cannot honour', () => {
+    expect(unmatchedSkipServiceIds(['minio-minio'], STORED)).toEqual([]);
+    expect(
+      unmatchedSkipServiceIds(['minio-minio', 'not-in-stack'], STORED)
+    ).toEqual(['not-in-stack']);
+    // Deduped, and an empty request matches nothing by definition.
+    expect(unmatchedSkipServiceIds(['x', 'x'], STORED)).toEqual(['x']);
+    expect(unmatchedSkipServiceIds([], STORED)).toEqual([]);
   });
 });

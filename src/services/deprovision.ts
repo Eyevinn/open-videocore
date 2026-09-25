@@ -22,7 +22,13 @@ export type StoredService = { serviceId: string; instanceName: string };
 //   not_found  — instance did not exist (already gone / never created) — this
 //                is a success from an idempotency standpoint
 //   failed     — the OSC call errored; the operation should be retried
-export type TeardownStatus = 'removed' | 'not_found' | 'failed';
+//   skipped    — the caller asked for this serviceId to be preserved (issue
+//                #738, opt-in selective teardown). The instance was NOT probed
+//                and NOT removed; it is still running on purpose. Distinct from
+//                `failed` so callers can tell "kept deliberately" from "could
+//                not remove", and from `not_found` so they do not conclude the
+//                instance is gone.
+export type TeardownStatus = 'removed' | 'not_found' | 'failed' | 'skipped';
 
 export type ServiceTeardownResult = {
   serviceId: string;
@@ -35,7 +41,9 @@ export type ServiceTeardownResult = {
 //   removed     — every service was removed this call
 //   not_found   — every service was already absent (nothing to do)
 //   partial     — a mix of removed/not_found, but at least one removal happened
-//                 and no failures
+//                 and no failures; ALSO the status whenever any service was
+//                 skipped on request (issue #738) — a stack that deliberately
+//                 keeps an instance alive is by definition not fully removed
 //   failed      — at least one service failed to tear down (retryable)
 export type StackTeardownStatus =
   | 'removed'
@@ -105,6 +113,36 @@ function orderStoredServices(
     }));
 }
 
+// Opt-in selective teardown (issue #738). `skipServiceIds` names OSC serviceIds
+// whose instances must be PRESERVED while the rest of the stack is removed —
+// e.g. keeping `minio-minio` so a workspace's stored objects survive the
+// teardown of its queue/database. Semantics:
+//   - matching entries are reported with status 'skipped' and never probed or
+//     removed (no getInstance, no removeInstance call for them)
+//   - the aggregate stack status becomes 'partial': the stack is deliberately
+//     not fully torn down
+//   - omitting the option (or passing an empty list) preserves the previous
+//     behaviour exactly: the whole stack is torn down
+// Matching is by serviceId, NOT by instance name or role, so every stored entry
+// for that serviceId is preserved.
+export type TeardownOptions = {
+  skipServiceIds?: readonly string[];
+};
+
+// The serviceIds in `skipServiceIds` that match nothing in `candidates` — i.e.
+// a caller asked to preserve something this teardown was never going to touch.
+// Callers MUST treat a non-empty result as a rejected request rather than
+// silently ignoring it: an inert teardown-scoping control is exactly the defect
+// that motivated this option (issue #738, found via open-media-convert#263), so
+// an unmatched skip target must be loud, not accepted-and-ignored.
+export function unmatchedSkipServiceIds(
+  skipServiceIds: readonly string[],
+  candidates: readonly { serviceId: string }[]
+): string[] {
+  const tearable = new Set(candidates.map((c) => c.serviceId));
+  return [...new Set(skipServiceIds)].filter((id) => !tearable.has(id));
+}
+
 // Aggregate a list of per-service results into a stack-level status.
 function aggregate(
   name: string,
@@ -112,10 +150,16 @@ function aggregate(
 ): StackTeardownResult {
   const anyFailed = services.some((s) => s.status === 'failed');
   const anyRemoved = services.some((s) => s.status === 'removed');
+  const anySkipped = services.some((s) => s.status === 'skipped');
 
   let status: StackTeardownStatus;
   if (anyFailed) {
     status = 'failed';
+  } else if (anySkipped) {
+    // A deliberately preserved instance means the stack is still (partly) up,
+    // whatever happened to the rest. Reported ahead of the not_found/removed
+    // cases so an all-skipped teardown is never mistaken for "nothing left".
+    status = 'partial';
   } else if (!anyRemoved) {
     status = 'not_found';
   } else if (services.every((s) => s.status === 'removed')) {
@@ -134,13 +178,23 @@ function aggregate(
 // each step probes for existence first and treats a missing instance as success.
 export async function deprovisionStack(
   osc: Context,
-  name: string
+  name: string,
+  options?: TeardownOptions
 ): Promise<StackTeardownResult> {
   const services: ServiceTeardownResult[] = [];
+  const skip = new Set(options?.skipServiceIds ?? []);
 
   // Sequential teardown: respecting dependency order requires that a consumer
   // is fully removed before the producer it depends on, so we do not parallelise.
   for (const service of TEARDOWN_ORDER) {
+    if (skip.has(service.serviceId)) {
+      services.push({
+        serviceId: service.serviceId,
+        role: service.role,
+        status: 'skipped'
+      });
+      continue;
+    }
     services.push(await teardownService(osc, service, name));
   }
 
@@ -205,11 +259,17 @@ function optionalStoredServices(
 // sort ahead of the known producers in orderStoredServices) and torn down early.
 // Idempotency is unchanged: a not-found optional instance during a retry reports
 // not_found rather than erroring, so a partial teardown converges on retry.
+//
+// `options.skipServiceIds` (issue #738) preserves the named serviceIds — core or
+// optional — instead of removing them; they are reported 'skipped' and the stack
+// status becomes 'partial'. The skip set is applied AFTER the merge/dedupe above,
+// so an instance recorded in both places is preserved once, consistently.
 export async function deprovisionStackFromConfig(
   osc: Context,
   name: string,
   stored: readonly StoredService[],
-  optional?: OptionalStackInstances
+  optional?: OptionalStackInstances,
+  options?: TeardownOptions
 ): Promise<StackTeardownResult> {
   // Merge the optional instances into the stored list, deduped by
   // serviceId+instanceName so an instance recorded in BOTH places (services[]
@@ -226,8 +286,17 @@ export async function deprovisionStackFromConfig(
   }
 
   const services: ServiceTeardownResult[] = [];
+  const skip = new Set(options?.skipServiceIds ?? []);
 
   for (const { service, instanceName } of orderStoredServices(merged)) {
+    if (skip.has(service.serviceId)) {
+      services.push({
+        serviceId: service.serviceId,
+        role: service.role,
+        status: 'skipped'
+      });
+      continue;
+    }
     services.push(await teardownService(osc, service, instanceName));
   }
 
