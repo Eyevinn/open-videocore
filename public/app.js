@@ -1161,7 +1161,13 @@ function openDetailWindow(type, id) {
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
 
-const TABS = ['assets', 'jobs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+// Routing allowlist. This MUST stay in step with the `.tab-btn[data-tab]`
+// buttons rendered by public/index.html and with the TAB_RENDERERS registry
+// below. `logs` was rendered and had a registered renderer but was never added
+// here, so switchTab dropped every click on it (issue #823). The list is kept
+// explicit rather than derived from the DOM so a stray/injected button cannot
+// become routable; auditTabWiring() below is what keeps the three in step.
+const TABS = ['assets', 'jobs', 'logs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -1176,8 +1182,53 @@ function isTabAllowed(name) {
   return typeof gate === 'function' ? gate() : true;
 }
 
+// Report — rather than silently ignore — any rendered tab button that is not
+// routable (issue #823 acceptance criterion 3). A button with no allowlist
+// entry is inert; a button in the allowlist with no registered renderer would
+// throw in switchTab. Both are wiring mistakes that must be loud at startup.
+// Pure: takes the root to scan and returns the problems, so a test can assert
+// on the result without capturing console output.
+function auditTabWiring(root) {
+  const scope = root || document;
+  const problems = [];
+  scope.querySelectorAll('.tab-btn[data-tab]').forEach(function (btn) {
+    const name = btn.dataset.tab;
+    const inAllowlist = TABS.includes(name);
+    const hasRenderer = typeof TAB_RENDERERS[name] === 'function';
+    if (!inAllowlist || !hasRenderer) {
+      problems.push({ tab: name, inAllowlist: inAllowlist, hasRenderer: hasRenderer });
+    }
+  });
+  // Also catch the inverse: an allowlisted tab with no renderer would throw the
+  // moment anything routed to it (including a stale persisted TAB_KEY).
+  TABS.forEach(function (name) {
+    if (typeof TAB_RENDERERS[name] !== 'function' && !problems.some(function (p) { return p.tab === name; })) {
+      problems.push({ tab: name, inAllowlist: true, hasRenderer: false });
+    }
+  });
+  return problems;
+}
+
+function reportTabWiring(root) {
+  const problems = auditTabWiring(root);
+  problems.forEach(function (p) {
+    const reasons = [];
+    if (!p.inAllowlist) reasons.push('missing from the TABS allowlist');
+    if (!p.hasRenderer) reasons.push('has no registered renderer in TAB_RENDERERS');
+    console.error('[ops-ui] tab "' + p.tab + '" is not routable: ' + reasons.join(' and ') + '.');
+  });
+  return problems;
+}
+
 function switchTab(name) {
-  if (!TABS.includes(name)) return;
+  // Never fail silently on an unroutable name: a bare `return` here left the
+  // previous view on screen with no error, which is exactly what hid #823. It
+  // also blanked the page on boot from a stale persisted TAB_KEY. Report and
+  // fall back to the always-available default instead.
+  if (!TABS.includes(name)) {
+    console.error('[ops-ui] switchTab("' + name + '"): unknown tab, falling back to "assets".');
+    name = 'assets';
+  }
   // Fail closed: never render a role-gated view for a role that may not see it,
   // even if an old persisted TAB_KEY or a manual call names it.
   if (!isTabAllowed(name)) name = 'assets';
@@ -1193,6 +1244,9 @@ function switchTab(name) {
 }
 
 function setupTabs() {
+  // Startup wiring check (issue #823): surface any rendered-but-unroutable tab
+  // before the operator discovers it by clicking a dead button.
+  reportTabWiring(document);
   document.querySelectorAll('.tab-btn').forEach(function(btn) {
     // Hide the sidebar entry for any role-gated tab the current role may not
     // access. Acceptance criterion #680: the Storage link renders only for
@@ -5171,6 +5225,16 @@ export {
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
   renderAssetsTab,
+  // Exported so a DOM/unit test can prove every rendered tab button is
+  // routable — i.e. present in the allowlist AND backed by a renderer — and
+  // that an unroutable one is reported rather than silently dropped (#823).
+  TABS,
+  TAB_RENDERERS,
+  TAB_KEY,
+  switchTab,
+  setupTabs,
+  auditTabWiring,
+  reportTabWiring,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
