@@ -81,12 +81,42 @@ const MAX_LOG_CHARS = 4_000;
 
 // ffmpeg echoes its `-i` argument verbatim into stderr, and that argument is a
 // presigned MinIO GET URL whose query string carries a live SigV4 signature
-// (`X-Amz-Signature`, TTL per clip.ts:clipUrlTtlSeconds). The captured log is
-// attached to the thrown Error, which routes/assets.ts sends back in the 502
-// body, so every query string is stripped before the log leaves this module.
-// Path and status text — the parts that explain the failure — are preserved.
+// (`X-Amz-Signature`, TTL per clip.ts:clipUrlTtlSeconds). The captured log ends
+// up in the server log, so every query string is stripped before the log leaves
+// this module — a live signature does not belong in a log file either. Path and
+// status text — the parts that explain the failure — are preserved. This is
+// defence in depth, not the primary control: the log is never returned to the
+// caller (see OscClipJobError).
 export function redactLogQueryStrings(text: string): string {
   return text.replace(/\?[^"\s]+/g, '?<redacted>');
+}
+
+// Error thrown when the ffmpeg job does not end in a known-good state.
+//
+// The captured ffmpeg log is carried as a PROPERTY (and as `cause`), never
+// concatenated into `message` (issue #786 round-2 review). `message` is what
+// routes/assets.ts sends back in the 502 body, and the log is output from a
+// service we do not control: it can carry storage endpoint hostnames, bucket
+// names, container paths, and anything else that service chooses to print.
+// redactLogQueryStrings is a deny-list — it strips query strings and nothing
+// else — so it cannot be relied on to sanitise a form we have not anticipated.
+// Operators read the full text from the server log (routes/assets.ts logs
+// `oscJobLog` on the warn line); callers get only the status-bearing sentence.
+export class OscClipJobError extends Error {
+  readonly jobLog: string;
+  constructor(message: string, jobLog: string) {
+    super(message, jobLog ? { cause: jobLog } : undefined);
+    this.name = 'OscClipJobError';
+    this.jobLog = jobLog;
+  }
+}
+
+// Pull the captured ffmpeg log off an error for server-side logging, without
+// assuming the error is an OscClipJobError (the orchestrator rethrows whatever
+// the runner threw, and its own verification errors carry no log).
+export function oscClipJobLog(err: unknown): string | undefined {
+  const log = (err as { jobLog?: unknown } | null | undefined)?.jobLog;
+  return typeof log === 'string' && log.length > 0 ? log : undefined;
 }
 
 // Build the destination URI the ffmpeg job writes to. Mirrors the
@@ -139,8 +169,8 @@ async function captureJobLogs(api: OscJobApi, name: string, sat: string): Promis
 // Construct the production ClipRunner. Each invocation creates one ephemeral
 // ffmpeg job that writes the clip to `s3://<bucket>/<outputKey>`, waits for
 // completion, and — on anything other than a known-good terminal status —
-// captures the job's logs before the instance is removed and throws with them
-// attached. The orchestrator (pipeline/clip.ts) additionally verifies the object
+// captures the job's logs before the instance is removed and throws an
+// OscClipJobError carrying them as data (server-side diagnostics only). The orchestrator (pipeline/clip.ts) additionally verifies the object
 // really landed, because a "successful" status is not proof of a written object.
 export function makeOscClipRunner(api: OscJobApi): ClipRunner {
   return async (
@@ -168,7 +198,14 @@ export function makeOscClipRunner(api: OscJobApi): ClipRunner {
     // fetchable while the instance still exists.
     let failure: string | undefined;
     try {
-      const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
+      // failFastOnUnknownStatus: POST /:id/clip awaits this runner, so a status
+      // the poller cannot classify must not hold the caller's connection open
+      // for the full 5-minute poll timeout. Opt-in per caller — the
+      // fire-and-forget ingest pipelines deliberately stay tolerant. See
+      // osc-job-poll.ts:PollOptions.
+      const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat, {
+        failFastOnUnknownStatus: true
+      });
       if (!SUCCESS_STATUSES.has(status)) {
         failure = `OSC clip job "${name}" ended with non-success status "${status}"`;
       }
@@ -185,7 +222,9 @@ export function makeOscClipRunner(api: OscJobApi): ClipRunner {
     }
 
     if (failure) {
-      throw new Error(logs ? `${failure}; ffmpeg log: ${logs}` : failure);
+      // The log goes on the error as data, NOT into the message — see
+      // OscClipJobError.
+      throw new OscClipJobError(failure, logs);
     }
   };
 }

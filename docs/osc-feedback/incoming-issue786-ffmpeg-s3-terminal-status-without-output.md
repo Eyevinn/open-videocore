@@ -32,12 +32,18 @@ API reported success.
    them by polling a live job every 2s (2026-09-24): a job reports
    `status: "Running"` for its entire execution and flips straight to
    `"SuccessCriteriaMet"` on exit — there is no intermediate or empty value in
-   between. Because the in-progress vocabulary is also unpublished, a caller
-   cannot tell "a status I do not recognise" apart from "still working": we now
-   tolerate an unrecognised status for 30s and then fail (`osc-job-poll.ts`),
-   rather than polling it to the 5-minute timeout and holding an awaited HTTP
-   request open. A published enumeration, or a boolean `done`/`succeeded` field,
-   would remove the guesswork entirely.
+   between. That single observation is the ENTIRE evidence base for our
+   in-progress set, and it cost us a review round: because a caller cannot tell
+   "a status I do not recognise" apart from "still working", any fail-fast on an
+   unrecognised status risks failing a healthy job that happens to report a
+   queueing value we have never seen (`Pending`, `ContainerCreating`, …) during a
+   cold start. We ended up (a) padding the in-progress set with a guessed
+   scheduling vocabulary, (b) stretching the tolerance window to 120s to clear a
+   plausible image pull, and (c) restricting the fail-fast to the two pipelines
+   that hold an HTTP request open, leaving the per-ingest pipelines to poll to
+   the 5-minute timeout — three guesses standing in for one published list
+   (`osc-job-poll.ts`). A published enumeration, or a boolean `done`/`succeeded`
+   field, would remove all three.
 3. **Logs disappear with the instance.** `getLogsForInstance` is the only place
    ffmpeg's stderr is visible, and it is only reachable while the ephemeral
    instance exists. Removing the spent job (which we must do, or instances
@@ -57,7 +63,13 @@ API reported success.
 - A documented, closed set of `status` values — in-progress *and* terminal —
   with an explicit distinction between "job ran" and "job produced its declared
   output". Today `'Running'` and `'SuccessCriteriaMet'` are only known to us by
-  observation.
+  observation. The **in-progress** list matters as much as the terminal one:
+  client code that wants to fail fast on an unexpected status has to know which
+  values mean "still working", including every queueing/cold-start value the
+  scheduler can emit before the container runs. We are currently guessing that
+  list. If a full enumeration is not on the cards, a single boolean (`terminal`
+  or `done`) on the job document would be enough — a caller could then poll on
+  the boolean and treat `status` as display text.
 - Service documentation stating that ffmpeg output must be `s3://…` with the
   credential fields in the job body, and rejecting a job whose output target is
   an `http(s)://` URL rather than accepting it and writing nothing.

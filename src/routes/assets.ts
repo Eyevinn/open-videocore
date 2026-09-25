@@ -129,6 +129,7 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
+import { oscClipJobLog } from '../pipeline/osc-clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
@@ -4234,13 +4235,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         );
         return reply.code(201).send(child);
       } catch (err) {
-        // The message can carry the tail of the ffmpeg log (issue #786), which is
-        // what makes a clip failure diagnosable. It is logged server-side in full
-        // and returned to the caller with presigned query strings already
-        // redacted by osc-clip.ts:redactLogQueryStrings — ffmpeg echoes its `-i`
-        // argument, and that argument is a presigned GET URL whose query string
-        // holds a live signature.
-        request.log.warn({ err, assetId: asset.id }, 'clip job failed');
+        // The ffmpeg log is what makes a clip failure diagnosable (issue #786),
+        // but it is output from a service we do not control and can carry
+        // storage endpoints, bucket names and container paths. So it is logged
+        // SERVER-SIDE ONLY (osc-clip.ts:OscClipJobError carries it as data, not
+        // in `message`), and the caller gets just the status-bearing sentence.
+        request.log.warn(
+          { err, assetId: asset.id, oscJobLog: oscClipJobLog(err) },
+          'clip job failed'
+        );
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'clip_failed', message });
       }

@@ -43,6 +43,7 @@ import {
   clipCmdLine,
   clipDestinationUri,
   redactLogQueryStrings,
+  oscClipJobLog,
   type OscJobApi
 } from '../src/pipeline/osc-clip.js';
 import type { WorkspaceStorage } from '../src/data/storage.js';
@@ -389,9 +390,17 @@ describe('makeOscClipRunner', () => {
       'Output file is empty, nothing was encoded'
     ]);
 
-    await expect(
-      makeOscClipRunner(api)('https://minio/src?sig=get', 'clips/a.mp4', 1, 4)
-    ).rejects.toThrow(/non-success status "Failed".*Output file is empty/s);
+    const err = (await makeOscClipRunner(api)(
+      'https://minio/src?sig=get',
+      'clips/a.mp4',
+      1,
+      4
+    ).catch((e: unknown) => e)) as Error & { jobLog?: string };
+
+    // The status-bearing sentence is the message (that is what the 502 body
+    // carries); the ffmpeg output rides along as DATA for the server log only.
+    expect(err.message).toMatch(/non-success status "Failed"/);
+    expect(err.jobLog).toContain('Output file is empty, nothing was encoded');
 
     // Logs are only fetchable while the ephemeral instance exists, so the fetch
     // must happen BEFORE removeJob.
@@ -410,12 +419,60 @@ describe('makeOscClipRunner', () => {
       "Opening 'https://minio.example/src?X-Amz-Signature=deadbeef' for reading"
     );
 
-    const err = await makeOscClipRunner(api)('https://minio/src?sig=get', 'clips/a.mp4', 1, 4).catch(
-      (e: unknown) => e as Error
-    );
+    const err = (await makeOscClipRunner(api)(
+      'https://minio/src?sig=get',
+      'clips/a.mp4',
+      1,
+      4
+    ).catch((e: unknown) => e)) as Error & { jobLog?: string };
+    // Redaction applies to the captured text itself, because that text reaches
+    // the server log — a live presigned signature does not belong there either.
+    expect(err.jobLog).not.toContain('X-Amz-Signature');
+    expect(err.jobLog).not.toContain('deadbeef');
+    expect(err.jobLog).toContain('?<redacted>');
     expect(err.message).not.toContain('X-Amz-Signature');
     expect(err.message).not.toContain('deadbeef');
-    expect(err.message).toContain('?<redacted>');
+  });
+
+  // Issue #786 round-2 review: the ffmpeg log is produced by a service we do not
+  // control and can name storage endpoints, buckets and container paths. It must
+  // stay out of `message`, because routes/assets.ts returns `message` verbatim in
+  // the 502 body.
+  it('keeps the third-party job log out of the error message', async () => {
+    const api = fakeApi();
+    (api.getJob as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'Failed' });
+    (api.getLogsForInstance as ReturnType<typeof vi.fn>).mockResolvedValue([
+      'internal-storage.svc.cluster.local:9000',
+      'S3_SECRET_KEY=super-secret',
+      'Output file is empty, nothing was encoded'
+    ]);
+
+    const err = (await makeOscClipRunner(api)(
+      'https://minio/src?sig=get',
+      'clips/a.mp4',
+      1,
+      4
+    ).catch((e: unknown) => e)) as Error & { jobLog?: string };
+
+    expect(err.message).not.toContain('internal-storage.svc.cluster.local');
+    expect(err.message).not.toContain('super-secret');
+    expect(err.message).not.toContain('Output file is empty');
+    expect(err.message).not.toContain('ffmpeg log');
+    // ...but an operator can still read all of it from the server-side log.
+    expect(oscClipJobLog(err)).toContain('super-secret');
+    expect(oscClipJobLog(err)).toContain('Output file is empty');
+  });
+
+  it('exposes no job log when none could be captured', async () => {
+    const api = fakeApi();
+    (api.getJob as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'Failed' });
+    (api.getLogsForInstance as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('gone'));
+
+    const err = (await makeOscClipRunner(api)('https://minio/src', 'clips/a.mp4', 1, 4).catch(
+      (e: unknown) => e
+    )) as Error;
+    expect(err.message).toMatch(/non-success status "Failed"/);
+    expect(oscClipJobLog(err)).toBeUndefined();
   });
 
   it('does not fetch logs on success', async () => {
