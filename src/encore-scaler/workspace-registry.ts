@@ -17,7 +17,10 @@ import type { Redis } from 'ioredis';
 import type { Context } from '@osaas/client-core';
 import type { EncoreClient, EncoreSubmitInput, EncoreSubmitResult } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
-import { EncoreScalerLoop } from './scaler-loop.js';
+import {
+  DEFAULT_ORPHAN_REAP_INTERVAL_MS,
+  EncoreScalerLoop
+} from './scaler-loop.js';
 import { makeScalingEncoreClient } from './index.js';
 import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance-pool.js';
 import { keys } from './types.js';
@@ -44,6 +47,14 @@ export type WorkspaceEncoreScalerConfig = {
   // completing within this window is not re-raised as silently dropped.
   // Undefined uses the loop's built-in default (DEFAULT_RECONCILE_GRACE_MS).
   reconcileGraceMs?: number;
+  // #778: how often (ms) each per-workspace loop sweeps OSC for scaler-owned
+  // Encore instances with no pool record and destroys the ones that have stayed
+  // orphaned past the grace window. Undefined enables the sweep at
+  // DEFAULT_ORPHAN_REAP_INTERVAL_MS; set to 0 to disable it entirely.
+  orphanReapIntervalMs?: number;
+  // #778: how long (ms) an instance must be continuously observed orphaned
+  // before it is reaped. Undefined uses DEFAULT_ORPHAN_GRACE_MS (instance-pool).
+  orphanGraceMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   // Optional per-stack Valkey resolver (issue #615). When supplied, called once
@@ -210,6 +221,13 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       idleTimeoutMs: this.config.idleTimeoutMs,
       callbackTrustTimeoutMs: this.config.callbackTrustTimeoutMs,
       reconcileGraceMs: this.config.reconcileGraceMs,
+      // #778: enable the orphan sweep for every live loop. Instances that never
+      // made it into (or were lost from) the pool hash are invisible to every
+      // other teardown path, so without this they bill until an operator spots
+      // them by hand.
+      orphanReapIntervalMs:
+        this.config.orphanReapIntervalMs ?? DEFAULT_ORPHAN_REAP_INTERVAL_MS,
+      orphanGraceMs: this.config.orphanGraceMs,
       oscContext: this.config.oscContext,
       redis,
       redisUrl,

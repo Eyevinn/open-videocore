@@ -94,7 +94,82 @@ describe('webhook registration CRUD (issue #13)', () => {
       events: ['asset.ready'],
       secret: 's3cret'
     });
+    // createdRegistrationSchema (src/routes/webhooks.ts) keeps `secret` on the
+    // 201 only — the documented one-time echo.
+    expect(res.statusCode).toBe(201);
     expect(res.json().secret).toBe('s3cret');
+    expect(res.json().hasSecret).toBe(true);
+  });
+
+  // Issue #821: the list route reused the create response schema, so any caller
+  // who could list registrations could read every signing secret in plaintext
+  // and forge X-Webhook-Signature deliveries.
+  describe('secret is write-only after creation (issue #821)', () => {
+    it('does not expose the secret through the list route', async () => {
+      const { app } = await buildApp();
+      const created = await register(app, A, {
+        url: 'https://example.com/hook',
+        events: ['asset.ready'],
+        secret: 'platform-test-secret'
+      });
+      expect(created.json().secret).toBe('platform-test-secret');
+
+      const list = await app.inject({ method: 'GET', url: '/api/v1/webhooks', headers: A });
+      expect(list.statusCode).toBe(200);
+      const [listed] = list.json().webhooks;
+      expect(Object.keys(listed)).not.toContain('secret');
+      expect(listed.secret).toBeUndefined();
+      // Belt and braces: the value must not appear anywhere in the body, under
+      // any key or nesting.
+      expect(list.body).not.toContain('platform-test-secret');
+    });
+
+    it('reports hasSecret so a caller can tell signing is configured', async () => {
+      const { app } = await buildApp();
+      await register(app, A, {
+        url: 'https://signed.example/hook',
+        events: ['asset.ready'],
+        secret: 's3cret'
+      });
+      await register(app, A, { url: 'https://plain.example/hook', events: ['asset.ready'] });
+
+      const list = await app.inject({ method: 'GET', url: '/api/v1/webhooks', headers: A });
+      const byUrl = Object.fromEntries(
+        (list.json().webhooks as { url: string; hasSecret: boolean }[]).map((w) => [
+          w.url,
+          w.hasSecret
+        ])
+      );
+      expect(byUrl['https://signed.example/hook']).toBe(true);
+      expect(byUrl['https://plain.example/hook']).toBe(false);
+    });
+
+    it('still signs deliveries with the secret it no longer discloses', async () => {
+      // The stored secret must survive the response-shape change — the
+      // dispatcher reads it straight off the repository record.
+      const { app, repo } = await buildApp();
+      await register(app, A, {
+        url: 'https://hit.example',
+        events: ['asset.ready'],
+        secret: 'topsecret'
+      });
+
+      let headers: Record<string, string> = {};
+      let body = '';
+      const dispatcher = new WebhookDispatcher({
+        repository: repo,
+        fetchImpl: (async (_url: string, init: RequestInit) => {
+          headers = init.headers as Record<string, string>;
+          body = String(init.body);
+          return new Response(null, { status: 200 });
+        }) as unknown as typeof fetch
+      });
+
+      await dispatcher.dispatch({ type: 'asset.ready', payload: {} });
+      expect(headers['x-webhook-signature']).toBe(
+        `sha256=${createHmac('sha256', 'topsecret').update(body).digest('hex')}`
+      );
+    });
   });
 
   it('rejects an invalid URL', async () => {

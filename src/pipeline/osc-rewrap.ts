@@ -87,7 +87,12 @@ export function makeOscRewrapRunner(api: OscJobApi): RewrapRunner {
       s3EndpointUrl: api.s3Endpoint
     });
     try {
-      const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat);
+      // failFastOnUnknownStatus: the export/re-wrap route awaits this runner
+      // (routes/assets.ts), so an unclassifiable status must not hold the
+      // request open for the full poll timeout. See osc-job-poll.ts:PollOptions.
+      const status = await pollOscJobUntilDone(api, FFPROBE_SERVICE_ID, name, sat, {
+        failFastOnUnknownStatus: true
+      });
       if (status === 'Failed' || status === 'Error') throw new Error(`OSC job "${name}" failed with status "${status}"`);
     } finally {
       try {

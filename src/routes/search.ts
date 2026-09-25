@@ -20,6 +20,12 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { TamsFlowIdSchema, TamsTimerangeSchema } from '../data/asset-document.js';
+import { ASSET_STATUSES } from '../data/asset-repo.js';
+import {
+  CreatedFromSchema,
+  CreatedToSchema,
+  resolveCreatedRange
+} from '../data/created-range.js';
 import { MAX_PAGE_SIZE, type SearchRepository } from '../data/search-repo.js';
 import { authGate } from '../auth/middleware.js';
 
@@ -153,6 +159,26 @@ const searchQuerySchema = z
       ),
     tags: tagsSchema,
     mimeType: z.string().min(1).max(128).optional(),
+    // Lifecycle status (issue #833). Reuses the SAME enum the assets endpoint
+    // accepts — `ASSET_STATUSES` from data/asset-repo.ts, which is what
+    // `openapi.json` -> `paths./api/v1/assets/.get.parameters[name=status]`
+    // renders as `enum: [uploading, processing, ready, failed, archived]` —
+    // rather than re-declaring the list, so the two surfaces cannot drift. The
+    // match is exact and is applied independently of `q`.
+    status: z
+      .enum(ASSET_STATUSES)
+      .optional()
+      .describe(
+        'Exact-match lifecycle status filter, identical in accepted values and ' +
+          'match semantics to `GET /api/v1/assets/?status=`. Applied ' +
+          'independently of `q`, so the same status answers the same asset set ' +
+          'with or without a free-text term. Asset-only: supplying it excludes ' +
+          'all collection hits, since a collection has no lifecycle status.'
+      ),
+    // Inclusive created-at range (issue #833). Shared grammar/semantics with
+    // `GET /api/v1/assets/` (data/created-range.ts).
+    from: CreatedFromSchema.optional(),
+    to: CreatedToSchema.optional(),
     // TAMS address lookup (issue #168, epic #116). Reuse the field validation
     // from the asset model (asset-document.ts) rather than re-declaring it:
     // `tamsFlowId` is a single flow UUID and `tamsTimerange` the ADR-008 TAI
@@ -224,19 +250,31 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
           'are returned in separate arrays and each carries a `type` discriminator ' +
           "(`'asset'` | `'collection'`) so they are unambiguously distinguishable. " +
           'Results are paginated via `page`/`pageSize` and returned as ' +
-          '`{ assets, collections, total, collectionTotal, page }`.',
+          '`{ assets, collections, total, collectionTotal, page }`. The ' +
+          'exact-filter tier also carries `status` (exact lifecycle match, ' +
+          'asset-only) and an inclusive created-at range `from`/`to` (issue ' +
+          '#833); both are applied to the whole matched set before pagination, ' +
+          'so they narrow `total` and every page rather than the page in hand.',
         querystring: searchQuerySchema,
         response: { 200: searchResultSchema, 400: errorSchema }
       }
     },
-    async (request) => {
-      const { q, tags, mimeType, tamsFlowId, tamsTimerange, page, pageSize } = request.query;
+    async (request, reply) => {
+      const { q, tags, mimeType, status, from, to, tamsFlowId, tamsTimerange, page, pageSize } =
+        request.query;
       const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
+      // An inverted range is a caller mistake, not an empty result (issue #833).
+      const created = resolveCreatedRange({ from, to });
+      if (!created.ok) {
+        return reply.code(400).send({ error: 'invalid_created_range', message: created.message });
+      }
       const result = await repo.search({
         q,
         tags,
         mimeType,
         metadata,
+        status,
+        ...created.range,
         tamsFlowId,
         tamsTimerange,
         page,
