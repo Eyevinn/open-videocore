@@ -55,6 +55,18 @@
  *   These are page-scoped refinements, not new search paths — the URL-state
  *      contract still round-trips them so the view is shareable.
  *
+ * INTERIM HONESTY MEASURE (issue #835 — NOT the destination). Gap 2 above has two
+ * separate defects: (1) the narrowing itself is page-scoped, and (2) the pager
+ * reported a system-wide `total` that did not describe the rows it was showing.
+ * Until the server-side status/date-range params land, this module closes defect
+ * (2) only: whenever a client-side narrow is actually applied to the page, the
+ * `total` handed to the pager is the NARROWED row count for that page, and the
+ * affected filter control is visibly labelled "current page only". Defect (1)
+ * stays open by design — a page-scoped `total` also means the pager cannot page
+ * past the current page while such a filter is active, which the caveat states
+ * outright. When the backend grows the params, delete this measure rather than
+ * building on it.
+ *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
  */
@@ -202,12 +214,51 @@ function isPageScopedNarrowingActive(filters) {
   return hasDateRange || hasSearchStatus;
 }
 
+// Wording for that caveat. Split so the pre-fetch (loading) state can show the
+// generic tail and the post-fetch state can quote the actual counts.
+const CAVEAT_PREFIX =
+  'Date-range and search+status filters narrow the current page only — the ' +
+  'backend has no matching parameter.';
+const CAVEAT_GENERIC_TAIL =
+  'While one is active the count beside the pager is page-scoped, so there ' +
+  'are no further pages to step through.';
+
+// Post-fetch caveat: state exactly what the (now page-scoped) count means and
+// what was given up, quoting the backend's own un-narrowed count so the
+// operator can see the size of what is being hidden (issue #835).
+function narrowingCaveatText(shownCount, serverTotal) {
+  const rowWord = shownCount === 1 ? 'row' : 'rows';
+  let text =
+    CAVEAT_PREFIX +
+    ' The count beside the pager is the ' +
+    shownCount +
+    ' matching ' +
+    rowWord +
+    ' on this page, not a system-wide total, so paging stops here until the ' +
+    'filter is cleared.';
+  if (typeof serverTotal === 'number' && Number.isFinite(serverTotal)) {
+    text +=
+      ' The backend reports ' +
+      serverTotal +
+      ' before narrowing; clear the filter to page through all of them.';
+  }
+  return text;
+}
+
 // ─── Data-source router: choose the FTS tier or the exact/range list tier ─────
 //
 // Given the primitive's current interaction state, build and run the correct
-// request. Returns { rows, total } where `total` is the backend's match count
-// for offset paging. This is the ONLY place that talks to the network; it never
-// invents an endpoint — both branches use verified paths/params.
+// request. Returns { rows, total, serverTotal, pageScoped }:
+//   rows        the page after client-side narrowing/sorting
+//   serverTotal the backend's own match count (verified `total` field on both
+//               envelopes) — the honest count of the UN-narrowed result set
+//   pageScoped  true when a client-side narrow was actually applied to this page
+//   total       what the pager is allowed to display: `serverTotal` normally,
+//               but `rows.length` when `pageScoped` — because once rows are
+//               dropped client-side, `serverTotal` no longer counts what is on
+//               screen and no honest system-wide count exists (issue #835).
+// This is the ONLY place that talks to the network; it never invents an
+// endpoint — both branches use verified paths/params.
 //
 // `deps.apiFetch(path)` is injected (app.js owns auth headers / stack scoping),
 // which also keeps this module unit-testable without a live server.
@@ -221,6 +272,11 @@ async function fetchAssetsPage(snap, deps) {
   const limit = snap.pageSize;
   const offset = snap.offset;
 
+  // Was a narrow that the backend cannot do applied to THIS page? Computed from
+  // the same predicate that drives the operator-facing caveat, so the displayed
+  // total and the disclosure can never disagree (issue #835).
+  const pageScoped = isPageScopedNarrowingActive(filters);
+
   if (q) {
     // ── Tier 2: free-text FTS via the canonical GET /api/v1/search/ path. ──
     // Paged by page/pageSize (page is 1-based). Envelope: { assets, total, page }.
@@ -231,12 +287,20 @@ async function fetchAssetsPage(snap, deps) {
     params.set('pageSize', String(limit));
     const res = await apiFetch('/search?' + params.toString());
     const assets = (res && (res.assets || res.items)) || [];
-    const total = res && typeof res.total === 'number' ? res.total : assets.length;
+    const serverTotal =
+      res && typeof res.total === 'number' ? res.total : assets.length;
     // The FTS endpoint has no status/date params — narrow the page client-side.
     let rows = applyStatusNarrow(assets, status);
     rows = applyDateRangeNarrow(rows, from, to);
     rows = applyClientSort(rows, snap.sort);
-    return { rows, total };
+    // Honest total: once either narrow ran, `serverTotal` counts rows this page
+    // no longer shows, so report what is actually on the page (issue #835).
+    return {
+      rows,
+      total: pageScoped ? rows.length : serverTotal,
+      serverTotal,
+      pageScoped,
+    };
   }
 
   // ── Tier 1: exact/range list via GET /api/v1/assets/ (Mango-style). ──
@@ -247,12 +311,20 @@ async function fetchAssetsPage(snap, deps) {
   if (status) params.set('status', status); // server-side exact status filter
   const res = await apiFetch('/assets?' + params.toString());
   const items = (res && (res.items || res.assets)) || (Array.isArray(res) ? res : []);
-  const total =
+  const serverTotal =
     res && typeof res.total === 'number' ? res.total : items.length;
   // Date-range has no server param — narrow this page client-side.
   let rows = applyDateRangeNarrow(items, from, to);
   rows = applyClientSort(rows, snap.sort);
-  return { rows, total };
+  // Honest total: `status` was filtered server-side and is still counted by
+  // `serverTotal`, but a date-range narrow is page-scoped, so fall back to the
+  // on-page row count whenever one was applied (issue #835).
+  return {
+    rows,
+    total: pageScoped ? rows.length : serverTotal,
+    serverTotal,
+    pageScoped,
+  };
 }
 
 // ─── Filter controls (slot-based) ─────────────────────────────────────────────
@@ -261,6 +333,20 @@ async function fetchAssetsPage(snap, deps) {
 // wires its native events to the supplied `onChange(value)` (the primitive maps
 // that to state.setFilter(name, value), which resets paging). Initial values come
 // from the decoded URL state so a shared link reconstructs the controls.
+
+// Visible "current page only" marker for a filter control the backend cannot
+// apply (issue #835). The table-level caveat explains the consequence; this
+// badge names WHICH control is responsible, right next to it, so an operator
+// reading the filter bar can see it without correlating two bits of UI.
+// `reason` becomes the tooltip and the accessible description.
+function pageScopeBadge(reason) {
+  const badge = document.createElement('span');
+  badge.className = 'ops-filter-page-scope';
+  badge.textContent = 'current page only';
+  badge.title = reason;
+  badge.setAttribute('aria-label', reason);
+  return badge;
+}
 
 function statusFilterControl(initial) {
   return function () {
@@ -283,6 +369,15 @@ function statusFilterControl(initial) {
     if (initial) sel.value = initial;
     wrap.appendChild(span);
     wrap.appendChild(sel);
+    // Status IS a verified server param on GET /api/v1/assets/ but NOT on
+    // GET /api/v1/search/, so this badge is conditional: reload() unhides it
+    // only while a free-text term routes the table to the FTS tier.
+    const badge = pageScopeBadge(
+      'The free-text search endpoint has no status parameter, so while a ' +
+        'search term is active this filter narrows the current page only.'
+    );
+    badge.hidden = true;
+    wrap.appendChild(badge);
     return { el: wrap, input: sel, event: 'change', read: () => sel.value };
   };
 }
@@ -316,6 +411,14 @@ function dateFilterControl(name, labelText, initial) {
     if (initial) input.value = initial.length >= 10 ? initial.slice(0, 10) : initial;
     wrap.appendChild(span);
     wrap.appendChild(input);
+    // Unconditional: neither endpoint accepts a created-date range param, so a
+    // date bound always narrows the current page only.
+    wrap.appendChild(
+      pageScopeBadge(
+        'Neither the asset list nor the search endpoint accepts a created-date ' +
+          'range parameter, so this filter narrows the current page only.'
+      )
+    );
     return { el: wrap, input, event: 'change', read: () => input.value };
   };
 }
@@ -486,22 +589,28 @@ export function createAssetsTable(deps) {
   // Operator-facing caveat for page-scoped narrowing (blocking review finding).
   // Because date-range and search+status refinements run against the current
   // page only (the backend has no such params — see the friction log referenced
-  // in the header), the pager can report a system-wide total it is not actually
-  // paging through. Disclose that in the UI, not just in code comments. The note
-  // is inserted just below the shared filter bar and toggled on every reload().
+  // in the header), the count beside the pager describes THIS PAGE and nothing
+  // wider. Disclose that in the UI, not just in code comments. The note is
+  // inserted just below the shared filter bar and its text is rewritten after
+  // every load so it can quote the real numbers (issue #835).
   const caveat = document.createElement('div');
   caveat.className = 'ops-table-caveat';
   caveat.setAttribute('role', 'note');
   caveat.hidden = true;
-  caveat.textContent =
-    'Date-range and search+status filters apply to the current page only — ' +
-    'the total count and paging reflect the full unfiltered result set.';
+  caveat.textContent = CAVEAT_PREFIX + ' ' + CAVEAT_GENERIC_TAIL;
   const filterBarEl = table.el.querySelector('.ops-table-filters');
   if (filterBarEl && filterBarEl.parentNode) {
     filterBarEl.parentNode.insertBefore(caveat, filterBarEl.nextSibling);
   } else {
     table.el.insertBefore(caveat, table.el.firstChild);
   }
+
+  // Handle on the status control's conditional "current page only" badge. The
+  // primitive mounts each filter into a slot tagged with its `name`, so this
+  // reads back the one control whose page-scoped-ness depends on the tier.
+  const statusScopeBadge = table.el.querySelector(
+    '.ops-filter-slot[data-filter="status"] .ops-filter-page-scope'
+  );
 
   // Guard so the URL sync we do inside the state subscription does not itself
   // re-enter as a "user change" (it does not — applyTableState only touches the
@@ -515,8 +624,17 @@ export function createAssetsTable(deps) {
 
     // Show/hide the operator-facing page-scoped-narrowing caveat for the current
     // filter state (see isPageScopedNarrowingActive). Toggled every reload so it
-    // tracks filter changes exactly.
-    caveat.hidden = !isPageScopedNarrowingActive(snap.filters);
+    // tracks filter changes exactly. The text is refined with the real counts
+    // once the page comes back; until then it carries the generic wording.
+    const narrowingActive = isPageScopedNarrowingActive(snap.filters);
+    caveat.hidden = !narrowingActive;
+    if (narrowingActive) caveat.textContent = CAVEAT_PREFIX + ' ' + CAVEAT_GENERIC_TAIL;
+
+    // Label the status control as page-scoped only on the tier where it really
+    // is: the FTS endpoint has no status param, the list endpoint does. The date
+    // controls carry their badge unconditionally (neither endpoint has a range
+    // param), so they need no toggling here.
+    if (statusScopeBadge) statusScopeBadge.hidden = !(snap.filters.q || '').trim();
 
     // 3) Mirror the current interaction state into the URL (shared contract) so a
     //    refresh/share reproduces the view. Replace (not push) — control changes
@@ -538,9 +656,15 @@ export function createAssetsTable(deps) {
 
     table.setStatus('loading');
     try {
-      const { rows, total } = await fetchAssetsPage(snap, { apiFetch: d.apiFetch });
+      const { rows, total, serverTotal, pageScoped } = await fetchAssetsPage(snap, {
+        apiFetch: d.apiFetch,
+      });
+      // `total` is already the honest figure for this page (see fetchAssetsPage):
+      // the backend count normally, the narrowed row count when a client-side
+      // narrow was applied. The pager renders and bounds itself from it.
       table.state.setPageInfo({ total });
       table.setRows(rows);
+      if (pageScoped) caveat.textContent = narrowingCaveatText(rows.length, serverTotal);
       wireRowHandlers();
     } catch (err) {
       table.setStatus('error', 'Failed to load assets: ' + (err && err.message ? err.message : err));

@@ -311,6 +311,191 @@ describe('page-scoped narrowing caveat (operator-facing disclosure)', () => {
   });
 });
 
+describe('honest page-scoped total (issue #835 stopgap)', () => {
+  // Interim measure: while a filter the backend cannot apply is active, the
+  // pager must NOT report the backend's system-wide count — it must report the
+  // narrowed row count for the page actually on screen. Verified contract: the
+  // `total` field on both envelopes (openapi.json GET /api/v1/assets/ ->
+  // { items, limit, offset, total }; GET /api/v1/search/ -> { assets, total,
+  // page }) counts UN-narrowed matches, because neither endpoint exposes a
+  // created-date range param and /search/ exposes no status param.
+  const indicatorOf = (t: { el: HTMLElement }) =>
+    t.el.querySelector<HTMLElement>('.page-indicator')!.textContent;
+
+  const page = (n: number, status = 'ready', createdAt = '2026-01-01T00:00:00Z') =>
+    Array.from({ length: n }, (_v, i) => ({
+      id: 'a' + i,
+      name: 'n' + i,
+      status,
+      createdAt,
+    }));
+
+  it('reports the backend total verbatim when nothing was narrowed client-side', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: page(ASSETS_PAGE_SIZE), total: 500 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    expect(t.state.getState().total).toBe(500);
+    expect(indicatorOf(t)).toBe('1–20 of 500');
+  });
+
+  it('reports the narrowed row count when a date range narrows the list tier', async () => {
+    // 20 rows come back, only 2 fall inside the range; the backend says 500.
+    const { apiFetch } = fakeApi({
+      assets: () => ({
+        items: [
+          ...page(2, 'ready', '2026-03-05T00:00:00Z'),
+          ...page(18, 'ready', '2020-01-01T00:00:00Z').map((r, i) => ({
+            ...r,
+            id: 'old' + i,
+          })),
+        ],
+        total: 500,
+      }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('from', '2026-03-01');
+    await tick();
+
+    expect(t.el.querySelectorAll('tbody tr[data-row-key]').length).toBe(2);
+    expect(t.state.getState().total).toBe(2); // NOT 500
+    expect(indicatorOf(t)).toBe('1–2 of 2');
+  });
+
+  it('reports the narrowed row count even when the range drops no rows', async () => {
+    // Every row on the page matches, but the backend total still counts rows on
+    // other pages that were never tested against the range — so 500 would lie.
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: page(3, 'ready', '2026-03-05T00:00:00Z'), total: 500 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('from', '2026-03-01');
+    await tick();
+
+    expect(t.state.getState().total).toBe(3);
+  });
+
+  it('reports the narrowed row count when status narrows the search (q) tier', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [], total: 0 }),
+      search: () => ({
+        assets: [...page(1, 'ready'), ...page(4, 'failed').map((r, i) => ({ ...r, id: 'f' + i }))],
+        total: 300,
+        page: 1,
+      }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('q', 'hello');
+    await tick();
+    // q alone is a real backend param — the backend total stands.
+    expect(t.state.getState().total).toBe(300);
+
+    t.state.setFilter('status', 'ready');
+    await tick();
+    // q + status narrows client-side => the count describes this page only.
+    expect(t.state.getState().total).toBe(1);
+    expect(indicatorOf(t)).toBe('1–1 of 1');
+  });
+
+  it('keeps the backend total for a status filter on the list tier (server-side param)', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: page(ASSETS_PAGE_SIZE), total: 120 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('status', 'processing');
+    await tick();
+
+    expect(t.state.getState().total).toBe(120);
+  });
+
+  it('states in the caveat what the page-scoped count means and what the backend reports', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: page(2, 'ready', '2026-03-05T00:00:00Z'), total: 500 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('from', '2026-03-01');
+    await tick();
+
+    const note = t.el.querySelector<HTMLElement>('.ops-table-caveat')!;
+    expect(note.hidden).toBe(false);
+    expect(note.textContent).toContain('2 matching rows on this page');
+    expect(note.textContent).toContain('not a system-wide total');
+    expect(note.textContent).toContain('500 before narrowing');
+  });
+});
+
+describe('page-scoped filter control labels (issue #835)', () => {
+  const badgeIn = (t: { el: HTMLElement }, filter: string) =>
+    t.el.querySelector<HTMLElement>(
+      '.ops-filter-slot[data-filter="' + filter + '"] .ops-filter-page-scope'
+    );
+
+  it('labels both created-date controls unconditionally (no backend range param)', async () => {
+    const { apiFetch } = fakeApi({ assets: () => ({ items: [], total: 0 }) });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    for (const name of ['from', 'to']) {
+      const badge = badgeIn(t, name);
+      expect(badge, name).not.toBeNull();
+      expect(badge!.hidden).toBe(false);
+      expect(badge!.textContent).toMatch(/current page only/i);
+      expect(badge!.title).toMatch(/created-date range parameter/i);
+    }
+  });
+
+  it('labels the status control only while the search (q) tier is active', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [], total: 0 }),
+      search: () => ({ assets: [], total: 0, page: 1 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    // List tier: status IS a verified server param, so no page-scoped label.
+    expect(badgeIn(t, 'status')!.hidden).toBe(true);
+
+    t.state.setFilter('q', 'hello');
+    await tick();
+    // Search tier: no status param on /search/, so the control says so.
+    expect(badgeIn(t, 'status')!.hidden).toBe(false);
+    expect(badgeIn(t, 'status')!.textContent).toMatch(/current page only/i);
+
+    t.state.setFilter('q', '');
+    await tick();
+    expect(badgeIn(t, 'status')!.hidden).toBe(true);
+  });
+
+  it('does not label the free-text control (q is a verified backend param)', async () => {
+    const { apiFetch } = fakeApi({ assets: () => ({ items: [], total: 0 }) });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    expect(badgeIn(t, 'q')).toBeNull();
+  });
+});
+
 describe('shared table states', () => {
   it('renders an error row when the backend fetch rejects', async () => {
     const apiFetch = vi.fn(async () => {
