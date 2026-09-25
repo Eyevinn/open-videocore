@@ -7,8 +7,16 @@
 // drop-classification site it must emit keys.jobInstance, the reconciled
 // instance, the pool instance(s) where the externalId is actually still active,
 // and whether the job had been re-dispatched — enough to confirm or refute the
-// stale-mapping hypothesis for a real drop event. This issue adds NO decision
-// change, so the dropped signal itself must be identical to today.
+// stale-mapping hypothesis for a real drop event.
+//
+// #769 UPDATE: the stale-mapping case is no longer classified dropped at all —
+// reconcile now checks the externalId across every pool instance first, so a job
+// still active elsewhere is left running (see
+// pool-wide-drop-resolution.test.ts). The diagnostic therefore fires only for a
+// job active on NO confirmed pool instance, and its foundActiveOnPoolInstances
+// field is the assertion that made the drop decision. The first test below was
+// inverted accordingly: it now pins the DECISION change plus the "not dropped"
+// log, not a dropped signal.
 //
 // Contract sources verified before writing (CLAUDE.md rule 7):
 //   - EncoreScalerLoop.reconcile() drop-classification loop + the diagnostic
@@ -134,9 +142,8 @@ describe('#768: drop-classification stale keys.jobInstance diagnostic', () => {
     vi.restoreAllMocks();
   });
 
-  it('logs where the "dropped" externalId is actually still active and that it was re-dispatched', async () => {
+  it('does not classify a job dropped when Encore reports it active on another pool instance (#769)', async () => {
     const redis = new FakeRedis();
-    // inst-old is seeded first so it is reconciled + indexed before inst-new.
     await seedInstance(redis, 'inst-old', 'https://old.encore.example');
     await seedInstance(redis, 'inst-new', 'https://new.encore.example');
 
@@ -164,21 +171,24 @@ describe('#768: drop-classification stale keys.jobInstance diagnostic', () => {
       })
     ).reconcile();
 
-    // Decision behaviour is unchanged: job-x is still classified dropped.
-    expect(dropped).toEqual([{ encoreJobId: 'job-x', reason: undefined }]);
+    // #769: job-x is active on inst-old, so it is NOT dropped and the
+    // drop-classification diagnostic never runs for it.
+    expect(dropped).toEqual([]);
+    expect(
+      warn.mock.calls.find((c) => String(c[0]).includes('drop-diagnostic (#768)'))
+    ).toBeUndefined();
 
-    // The diagnostic captures the stale-mapping evidence.
-    const diag = warn.mock.calls.find((c) =>
-      String(c[0]).includes('drop-diagnostic (#768)')
+    // The stale-mapping evidence is surfaced by the "NOT dropped" log instead.
+    const notDropped = warn.mock.calls.find((c) =>
+      String(c[0]).includes('is NOT dropped')
     );
-    expect(diag).toBeDefined();
+    expect(notDropped).toBeDefined();
     // console.warn is called with a format string + positional args; assert the
     // load-bearing fields are present as arguments.
-    const args = diag!.map((a) => String(a));
+    const args = notDropped!.map((a) => String(a));
     expect(args).toContain('job-x'); // externalId
-    expect(args).toContain('inst-new'); // keys.jobInstance mapping + reconciled instance
+    expect(args).toContain('inst-new'); // keys.jobInstance mapping
     expect(args).toContain('inst-old'); // where the externalId is ACTUALLY active
-    expect(args).toContain('true'); // reDispatched (attempts > 1)
   });
 
   it('reports reDispatched=false and no active instance for a first-attempt genuine drop', async () => {

@@ -625,6 +625,14 @@ export class EncoreScalerLoop {
   // full. Runs once per tick, is a no-op when the pool is empty, and skips
   // instances already at zero (nothing to correct downward). Each instance is
   // handled in isolation: one unreachable instance never breaks the tick.
+  //
+  // #769: the pass runs in TWO phases. Phase 1 fetches the real active set of
+  // EVERY pool instance and indexes it by instanceId; phase 2 then corrects
+  // counts and classifies drops against that COMPLETE pool-wide index. Drop
+  // classification must be able to ask "is this externalId active anywhere in
+  // the pool?", which is only answerable once every instance has been fetched —
+  // see reconcile's phase-1 comment for why the previous single-pass shape could
+  // not answer it (issue #839).
   async reconcile(): Promise<void> {
     const { redis, workspaceId } = this.config;
 
@@ -642,41 +650,89 @@ export class EncoreScalerLoop {
     // write is owned by the reconciler/main.ts repo layer.
     const droppedJobs: DroppedJob[] = [];
 
-    // #768 (diagnostic-only): index of instanceId -> the externalIds Encore
-    // actually reports active on that instance, accumulated as this pass fetches
-    // each instance's real state below. Used solely to log, at each
-    // drop-classification, whether a job flagged as dropped off ITS
-    // keys.jobInstance-mapped instance is in fact still active on a DIFFERENT
-    // pool instance — the signature of the stale-mapping hypothesis. It does not
-    // feed any decision; the classification logic below is unchanged.
+    // PHASE 1 (#769) — build the pool-wide active index BEFORE any drop
+    // classification runs.
+    //
+    // index: instanceId -> the externalIds Encore actually reports
+    // QUEUED/IN_PROGRESS on that instance (fetchRealActiveState). Phase 2 uses it
+    // to answer "is this externalId active ANYWHERE in the pool?" before calling a
+    // job dropped, which is the fix for #769: a job's owning instance was resolved
+    // solely from keys.jobInstance — a single value OVERWRITTEN on each
+    // re-dispatch (dispatch: redis.hset(keys.jobInstance, jobId, instanceId)) — so
+    // a stale mapping made reconcile flag a job dropped off the mapped instance
+    // while Encore still had it running on a different one.
+    //
+    // #839: this index was previously populated INCREMENTALLY inside the same loop
+    // that classified drops, so at classification time it held only the instances
+    // iterated so far. Pool-hash iteration order is uncontrolled, which made the
+    // cross-instance answer order-dependent (a false "active nowhere" whenever the
+    // mapped instance sorted before the instance actually holding the job). It is
+    // now a complete, order-independent pre-pass.
+    //
+    // Unlike phase 2 this pass deliberately does NOT skip idle-tracked instances
+    // (record.activeJobs === 0): a stale mapping goes hand in hand with stale
+    // counts, so the instance genuinely holding the job may itself be tracked at
+    // zero. Instances whose real state cannot be confirmed are recorded in
+    // `unresolvedInstances` rather than silently dropped from the index — they are
+    // "unknown", not "empty", and phase 2 logs them at each classification so a
+    // drop decided while part of the pool was unreachable stays auditable.
     const poolActiveByInstance = new Map<string, Set<string>>();
-
-    for (const [instanceId, instanceJson] of entries) {
-      try {
-        let record: EncoreInstanceRecord;
-        try {
-          record = JSON.parse(instanceJson) as EncoreInstanceRecord;
-        } catch {
-          continue; // corrupt entry — leave it for the loop to skip elsewhere
-        }
-        // Nothing to correct downward on an already-idle instance.
-        if (record.activeJobs === 0) continue;
-
+    const unresolvedInstances: string[] = [];
+    const poolRecords = new Map<
+      string,
+      {
+        record: EncoreInstanceRecord;
         // Fetch both QUEUED and IN_PROGRESS documents (not just counts) — a
         // freshly dispatched job sits in QUEUED until Encore picks it up, so
-        // counting only IN_PROGRESS would make the instance look idle
-        // immediately after dispatch and trigger a spurious scale-up on the next
-        // tick. fetchRealActiveState reads each active job's externalId so we can
-        // tell WHICH tracked jobs (if any) have silently vanished — the
-        // dropped-job signal for #449.
-        const real = await this.fetchRealActiveState(record);
+        // counting only IN_PROGRESS would make the instance look idle immediately
+        // after dispatch and trigger a spurious scale-up on the next tick.
+        // fetchRealActiveState reads each active job's externalId so we can tell
+        // WHICH tracked jobs (if any) have silently vanished — the dropped-job
+        // signal for #449. undefined => real state could not be confirmed.
+        real: { count: number; activeExternalIds: Set<string> } | undefined;
+      }
+    >();
+
+    for (const [instanceId, instanceJson] of entries) {
+      let record: EncoreInstanceRecord;
+      try {
+        record = JSON.parse(instanceJson) as EncoreInstanceRecord;
+      } catch {
+        continue; // corrupt entry — leave it for the loop to skip elsewhere
+      }
+      // fetchRealActiveState already swallows its own errors (returns undefined),
+      // but keep the per-instance guard so one instance can never break the pass.
+      let real: { count: number; activeExternalIds: Set<string> } | undefined;
+      try {
+        real = await this.fetchRealActiveState(record);
+      } catch {
+        real = undefined;
+      }
+      poolRecords.set(instanceId, { record, real });
+      if (real) poolActiveByInstance.set(instanceId, real.activeExternalIds);
+      else unresolvedInstances.push(instanceId);
+    }
+
+    // Every pool instance on which Encore currently reports `externalId` active.
+    // Non-empty => the job is NOT gone from the pool, whatever keys.jobInstance
+    // claims. Only answers over instances phase 1 could confirm; unresolved ones
+    // are unknown and are reported alongside any classification.
+    const instancesActiveFor = (externalId: string): string[] => {
+      const found: string[] = [];
+      for (const [otherInstanceId, otherActive] of poolActiveByInstance) {
+        if (otherActive.has(externalId)) found.push(otherInstanceId);
+      }
+      return found;
+    };
+
+    // PHASE 2 — correct counts and classify drops against the complete index.
+    for (const [instanceId, { record, real }] of poolRecords) {
+      try {
+        // Nothing to correct downward on an already-idle instance.
+        if (record.activeJobs === 0) continue;
         if (!real) continue; // could not confirm — leave the record as-is
         const actualCount = real.count;
         const activeExternalIds = real.activeExternalIds;
-        // #768 (diagnostic-only): record what Encore reports active on THIS
-        // instance so a later drop-classification in this same pass can report
-        // where else in the pool a "dropped" externalId is in fact still live.
-        poolActiveByInstance.set(instanceId, activeExternalIds);
 
         if (record.activeJobs !== actualCount) {
           // eslint-disable-next-line no-console
@@ -717,6 +773,33 @@ export class EncoreScalerLoop {
               const st = (trackedStatuses[jobId] ?? '').toUpperCase();
               if (st !== 'RUNNING' && st !== 'QUEUED') continue;
               if (activeExternalIds.has(jobId)) continue; // still live on Encore
+
+              // #769: the job is gone from THIS instance's active set, but
+              // keys.jobInstance is a single value overwritten on every
+              // re-dispatch — so "gone from the mapped instance" is NOT the same
+              // as "gone from the pool". Before concluding the job dropped, ask
+              // the phase-1 pool-wide index whether Encore still reports this
+              // externalId QUEUED/IN_PROGRESS on ANY instance. If it does, the
+              // job is running (the mapping is just stale): leave it alone. Not
+              // classifying it dropped also keeps it out of droppedForInstance,
+              // so the drop-reason recovery below no longer chases a FAILED
+              // document that cannot exist and no longer warns "no reason
+              // recovered" for a job that never failed (#704/#728 wording).
+              const activeElsewhere = instancesActiveFor(jobId);
+              if (activeElsewhere.length > 0) {
+                // eslint-disable-next-line no-console
+                console.warn(
+                  '[encore-scaler] reconcile: job %s is NOT dropped — ' +
+                    'keys.jobInstance maps it to instance %s (reconciled this ' +
+                    'pass) but Encore reports it active on pool instance(s) %s; ' +
+                    'the mapping is stale (#769). Leaving the job running.',
+                  jobId,
+                  mappedInstanceId,
+                  activeElsewhere.join(',')
+                );
+                continue;
+              }
+
               // #708: skip a job the poller recorded completing within the grace
               // window — it is settling terminally, not silently dropped. Fail
               // OPEN: a read error on this one key must never SUPPRESS a genuine
@@ -736,24 +819,25 @@ export class EncoreScalerLoop {
               }
               droppedForInstance.push(jobId);
 
-              // #768 (diagnostic-only): capture enough state at the exact
-              // drop-classification site to confirm or refute the hypothesis
-              // that a stale keys.jobInstance mapping (a single value overwritten
-              // on each re-dispatch, scaler-loop.ts dispatch:
-              // redis.hset(keys.jobInstance, jobId, instanceId)) causes a false
-              // drop. For this job we record: the instance keys.jobInstance maps
-              // it to (mappedInstanceId — equals instanceId here precisely
-              // BECAUSE we filtered mismatches out above, so logging it documents
-              // what the mapping claimed), the pool instances whose real active
-              // set we checked this pass, the instance(s) where the externalId is
-              // ACTUALLY still active (if any — a non-empty list on a job we are
-              // about to flag dropped is the stale-mapping signature), and
-              // whether the job had already been re-dispatched (attempts > 1).
-              // This changes no decision; droppedForInstance already holds jobId.
-              const foundActiveOn: string[] = [];
-              for (const [otherInstanceId, otherActive] of poolActiveByInstance) {
-                if (otherActive.has(jobId)) foundActiveOn.push(otherInstanceId);
-              }
+              // #768: capture enough state at the exact drop-classification site
+              // to attribute a real drop event. For this job we record: the
+              // instance keys.jobInstance maps it to (mappedInstanceId — equals
+              // instanceId here precisely BECAUSE we filtered mismatches out
+              // above, so logging it documents what the mapping claimed), the
+              // pool instances whose real active set phase 1 confirmed, the ones
+              // it could NOT confirm, and whether the job had already been
+              // re-dispatched (attempts > 1).
+              //
+              // #769: foundActiveOnPoolInstances is now necessarily empty here —
+              // a non-empty pool-wide answer short-circuits to the "NOT dropped"
+              // branch above instead of reaching this point. It is kept because
+              // that is now the load-bearing assertion of the drop decision: this
+              // job is active on NONE of the instances phase 1 could confirm.
+              // poolInstancesUnresolvedThisPass is the honest caveat on it — an
+              // instance whose real state could not be fetched is unknown, not
+              // empty, so a drop logged with a non-empty unresolved list was
+              // decided without full pool visibility.
+              const foundActiveOn = instancesActiveFor(jobId);
               let reDispatched: boolean | 'unknown' = 'unknown';
               try {
                 const attemptsRaw = await redis.get(keys.jobAttempts(jobId));
@@ -767,12 +851,13 @@ export class EncoreScalerLoop {
                 '[encore-scaler] drop-diagnostic (#768): classifying job %s as ' +
                   'dropped — keys.jobInstance=%s reconciledInstance=%s ' +
                   'foundActiveOnPoolInstances=%s poolInstancesCheckedThisPass=%s ' +
-                  'reDispatched=%s',
+                  'poolInstancesUnresolvedThisPass=%s reDispatched=%s',
                 jobId,
                 mappedInstanceId,
                 instanceId,
                 foundActiveOn.length ? foundActiveOn.join(',') : '(none)',
                 [...poolActiveByInstance.keys()].join(',') || '(none)',
+                unresolvedInstances.join(',') || '(none)',
                 String(reDispatched)
               );
 
