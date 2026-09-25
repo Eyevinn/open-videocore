@@ -22,7 +22,11 @@ export type StoredService = { serviceId: string; instanceName: string };
 //   not_found  — instance did not exist (already gone / never created) — this
 //                is a success from an idempotency standpoint
 //   failed     — the OSC call errored; the operation should be retried
-export type TeardownStatus = 'removed' | 'not_found' | 'failed';
+//   skipped    — the caller asked for this serviceId to be KEPT (selective
+//                teardown, issue #738). No OSC call was made and the instance
+//                is still running. Distinct from `failed` on purpose: the
+//                instance is intentionally alive, not stranded by an error.
+export type TeardownStatus = 'removed' | 'not_found' | 'failed' | 'skipped';
 
 export type ServiceTeardownResult = {
   serviceId: string;
@@ -34,8 +38,9 @@ export type ServiceTeardownResult = {
 // Aggregate stack-level status.
 //   removed     — every service was removed this call
 //   not_found   — every service was already absent (nothing to do)
-//   partial     — a mix of removed/not_found, but at least one removal happened
-//                 and no failures
+//   partial     — the stack is not fully gone but nothing failed: a mix of
+//                 removed/not_found, and/or at least one service the caller
+//                 asked to KEEP (skipped, issue #738)
 //   failed      — at least one service failed to tear down (retryable)
 export type StackTeardownStatus =
   | 'removed'
@@ -48,6 +53,25 @@ export type StackTeardownResult = {
   status: StackTeardownStatus;
   services: ServiceTeardownResult[];
 };
+
+// Selective teardown (issue #738): the serviceIds the caller asked to KEEP.
+// Matching is by OSC serviceId (e.g. 'minio-minio'), the same identifier
+// recorded in StackConfig.services[].serviceId, NOT by role — a stored service
+// whose serviceId is absent from STACK_SERVICES resolves to role 'unknown'
+// (orderStoredServices below), so role is not a reliable key. An id that no
+// enumerated service carries simply matches nothing: teardown proceeds as if it
+// had not been passed.
+export type SelectiveTeardownOptions = {
+  skipServiceIds?: readonly string[];
+};
+
+// Normalise the opt-in skip list into a Set for membership tests. An absent or
+// empty list yields an empty Set, i.e. the default whole-stack teardown.
+export function skipSetFrom(
+  skipServiceIds: readonly string[] | undefined
+): ReadonlySet<string> {
+  return new Set(skipServiceIds ?? []);
+}
 
 // Tear down a single OSC service instance, tolerating the already-removed case.
 // We probe with getInstance first (returns undefined on 404) so a retry of a
@@ -112,15 +136,21 @@ function aggregate(
 ): StackTeardownResult {
   const anyFailed = services.some((s) => s.status === 'failed');
   const anyRemoved = services.some((s) => s.status === 'removed');
+  // Issue #738: a kept service means the stack is deliberately NOT fully gone.
+  const anySkipped = services.some((s) => s.status === 'skipped');
 
   let status: StackTeardownStatus;
   if (anyFailed) {
     status = 'failed';
-  } else if (!anyRemoved) {
+  } else if (!anyRemoved && !anySkipped) {
+    // Nothing removed and nothing kept: every service was already absent (or
+    // there were none at all). Unchanged pre-#738 behaviour.
     status = 'not_found';
   } else if (services.every((s) => s.status === 'removed')) {
     status = 'removed';
   } else {
+    // Mix of removed/not_found, and/or at least one kept service. A stack with
+    // kept services can never report `removed`: instances are still running.
     status = 'partial';
   }
 
@@ -132,15 +162,30 @@ function aggregate(
 // every service is attempted so a single transient error does not strand the
 // rest of the stack. The whole operation is safe to retry (idempotent) because
 // each step probes for existence first and treats a missing instance as success.
+//
+// Selective teardown (issue #738): serviceIds listed in
+// `options.skipServiceIds` are reported `skipped` and never touched — no
+// getInstance probe, no removeInstance — so the rest of the stack is removed
+// around them. Omitting the option is the unchanged whole-stack behaviour.
 export async function deprovisionStack(
   osc: Context,
-  name: string
+  name: string,
+  options?: SelectiveTeardownOptions
 ): Promise<StackTeardownResult> {
   const services: ServiceTeardownResult[] = [];
+  const skip = skipSetFrom(options?.skipServiceIds);
 
   // Sequential teardown: respecting dependency order requires that a consumer
   // is fully removed before the producer it depends on, so we do not parallelise.
   for (const service of TEARDOWN_ORDER) {
+    if (skip.has(service.serviceId)) {
+      services.push({
+        serviceId: service.serviceId,
+        role: service.role,
+        status: 'skipped'
+      });
+      continue;
+    }
     services.push(await teardownService(osc, service, name));
   }
 
@@ -205,11 +250,22 @@ function optionalStoredServices(
 // sort ahead of the known producers in orderStoredServices) and torn down early.
 // Idempotency is unchanged: a not-found optional instance during a retry reports
 // not_found rather than erroring, so a partial teardown converges on retry.
+//
+// Selective teardown (issue #738): `options.skipServiceIds` names serviceIds to
+// KEEP. Every stored (and merged optional) entry whose serviceId is in that list
+// is reported `skipped` — no getInstance probe, no removeInstance — while the
+// rest of the stack is torn down around it in the same dependency-safe order.
+// Skipping is per-serviceId, so if a stack somehow recorded two instances of the
+// same serviceId, both are kept. Omitting the option preserves the unchanged
+// whole-stack behaviour. The caller is responsible for what it does with a
+// `partial` result: a kept instance is still running and still billable, so the
+// stored config entry must NOT be discarded (see routes/provision.ts DELETE).
 export async function deprovisionStackFromConfig(
   osc: Context,
   name: string,
   stored: readonly StoredService[],
-  optional?: OptionalStackInstances
+  optional?: OptionalStackInstances,
+  options?: SelectiveTeardownOptions
 ): Promise<StackTeardownResult> {
   // Merge the optional instances into the stored list, deduped by
   // serviceId+instanceName so an instance recorded in BOTH places (services[]
@@ -226,8 +282,17 @@ export async function deprovisionStackFromConfig(
   }
 
   const services: ServiceTeardownResult[] = [];
+  const skip = skipSetFrom(options?.skipServiceIds);
 
   for (const { service, instanceName } of orderStoredServices(merged)) {
+    if (skip.has(service.serviceId)) {
+      services.push({
+        serviceId: service.serviceId,
+        role: service.role,
+        status: 'skipped'
+      });
+      continue;
+    }
     services.push(await teardownService(osc, service, instanceName));
   }
 

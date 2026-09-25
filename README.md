@@ -131,6 +131,24 @@ curl https://<your-instance>/api/v1/provision/mystack
 curl -X DELETE https://<your-instance>/api/v1/provision/mystack
 ```
 
+#### Keeping a service while tearing down the rest
+
+`DELETE /api/v1/provision/:name` removes the whole stack by default. To keep
+one or more backing services — retaining object storage while everything else
+goes away, for example — name their OSC service IDs in `skipServiceIds`
+(repeat the parameter or pass a comma-separated list):
+
+```bash
+curl -X DELETE "https://<your-instance>/api/v1/provision/mystack?skipServiceIds=minio-minio"
+```
+
+Poll the returned operation to see what happened. Kept services are reported as
+`status: "skipped"` in `result.services[]`, so you can tell them apart from a
+service that failed to be removed, and the stack reports `status: "partial"`.
+Because instances survive, the stack's stored coordinates are retained — the
+stack still appears in `GET /api/v1/provision`, and a later `DELETE` without
+`skipServiceIds` removes what is left.
+
 #### On-demand packaging provisioning
 
 The packaging service (`eyevinn-encore-packager`) is **not** provisioned when you provision a stack. It is provisioned **lazily**, on the first pipeline execution that includes a packaging step, wired to the stack's shared Valkey queue and packaged-output storage, and reused by every subsequent packaging execution. It is torn down automatically when you deprovision the stack (`DELETE /api/v1/provision/:name`).

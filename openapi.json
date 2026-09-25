@@ -653,6 +653,25 @@
         "parameters": [
           {
             "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "in": "query",
+            "name": "skipServiceIds",
+            "required": false,
+            "description": "OSC serviceIds to KEEP while the rest of the stack is torn down (e.g. minio-minio to retain object storage). Repeat the parameter or pass a comma-separated list. Kept services are reported status=\"skipped\" in the operation result and the stack reports status=\"partial\"; its stored coordinates are retained so a later DELETE can remove what is left. Omit for a full teardown."
+          },
+          {
+            "schema": {
               "type": "string",
               "minLength": 1,
               "maxLength": 63,
