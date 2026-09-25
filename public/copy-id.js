@@ -1,0 +1,130 @@
+/**
+ * open-videocore ops dashboard — copy-id.js
+ *
+ * Issue #851: a table column headed "ID" must carry the value the API accepts
+ * as an asset id, and that value must be copyable without hovering for a
+ * `title` tooltip.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CONTRACT GROUNDING (fetch-the-contract-before-writing-any-call rule)
+ *
+ * What the API accepts as an asset id, verified against the route source in
+ * this repo (not guessed):
+ *   - `PUT /api/v1/collections/:id/assets/:assetId` (openapi.json path key
+ *     "/api/v1/collections/{id}/assets/{assetId}") resolves the member with
+ *     `assets.get(request.params.assetId)` — src/routes/collections.ts:493-510.
+ *     That is the plain ULID repository read (`AssetRepository.get`,
+ *     src/data/asset-repo.ts:841); there is NO slug fallback on this path, so a
+ *     slug entered here 422s with `asset_not_found`.
+ *   - Only `GET /api/v1/assets/:id` is slug-tolerant, via `resolveAsset()` /
+ *     `isUlid()` — src/routes/assets.ts:2807-2814 and src/data/asset-repo.ts:834.
+ * The ULID `id` is therefore the one value accepted everywhere an asset id is
+ * taken, and it is what a column headed "ID" must show.
+ *
+ * The asset list item carries both fields: `id` (string, always present) and
+ * `slug` (string, OPTIONAL — pre-slug assets have none; see
+ * src/data/asset-document.ts:286 and the `slug?: string` field on `Asset`,
+ * src/data/asset-repo.ts:455). So the slug cell must tolerate an absent slug.
+ *
+ * SECURITY: every dynamic value written into an HTML string passes through
+ * escHtml (the app.js/ops-ui-table.js convention).
+ */
+
+import { escHtml } from './ops-ui-table.js';
+
+// Placeholder shown where a value is absent (matches the app's existing em-dash
+// convention for empty cells).
+const EMPTY = '—';
+
+// Marker class the wiring below binds to. Exported so tests and callers can
+// query for the button without restating the string.
+export const COPY_ID_BTN_CLASS = 'copy-id-btn';
+
+/**
+ * HTML for an identifier cell: the full value as selectable text plus an
+ * always-visible click-to-copy button. No hover-only `title` carries the value
+ * — the text IS the value.
+ *
+ * @param {string} value  the identifier to display and copy (e.g. an asset ULID)
+ * @param {string} [label] accessible label for the button ("Copy asset id")
+ * @returns {string} escaped HTML
+ */
+export function copyableIdCellHtml(value, label) {
+  const v = value == null ? '' : String(value);
+  if (!v) return '<span class="cell-id">' + EMPTY + '</span>';
+  const aria = label || 'Copy id';
+  return (
+    '<span class="cell-id cell-id-value" data-copy-id-value="' + escHtml(v) + '">' +
+    escHtml(v) +
+    '</span>' +
+    '<button type="button" class="' + COPY_ID_BTN_CLASS + '" ' +
+    'data-copy-id="' + escHtml(v) + '" ' +
+    'aria-label="' + escHtml(aria) + '">Copy</button>'
+  );
+}
+
+/**
+ * HTML for a slug cell — the human-readable handle, labelled as the slug by its
+ * column header, never as "ID". Falls back to an em-dash for slug-less assets.
+ *
+ * @param {string|undefined} slug
+ * @returns {string} escaped HTML
+ */
+export function slugCellHtml(slug) {
+  const s = slug == null ? '' : String(slug);
+  return '<span class="cell-id">' + (s ? escHtml(s) : EMPTY) + '</span>';
+}
+
+/**
+ * Bind the click-to-copy behaviour for every copy button inside `root`.
+ *
+ * Idempotent: a button already wired is skipped, so this is safe to call after
+ * every re-render (rows are rebuilt on each table load).
+ *
+ * The click is stopped from propagating so copying inside a clickable table row
+ * does not also open that row's detail panel.
+ *
+ * Mirrors the existing copy-to-clipboard affordance in app.js (the manifest-URL
+ * "Copy URL" button): navigator.clipboard when available, transient button-label
+ * feedback either way, never a thrown error into the render path.
+ *
+ * @param {ParentNode} root
+ * @param {object} [opts]
+ * @param {Navigator} [opts.nav] injectable navigator (tests)
+ */
+export function wireCopyIdButtons(root, opts) {
+  if (!root || typeof root.querySelectorAll !== 'function') return;
+  const options = opts || {};
+  const nav =
+    options.nav || (typeof navigator !== 'undefined' ? navigator : undefined);
+
+  root.querySelectorAll('.' + COPY_ID_BTN_CLASS).forEach(function (btn) {
+    if (btn.dataset.copyIdWired === '1') return;
+    btn.dataset.copyIdWired = '1';
+    btn.addEventListener('click', function (event) {
+      if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+      const value = btn.dataset.copyId || '';
+      const previous = btn.textContent;
+      const restore = function (text) {
+        btn.textContent = text;
+        setTimeout(function () {
+          btn.textContent = previous;
+        }, 1500);
+      };
+      if (value && nav && nav.clipboard && nav.clipboard.writeText) {
+        nav.clipboard.writeText(value).then(
+          function () {
+            restore('Copied');
+          },
+          function () {
+            restore('Copy failed');
+          }
+        );
+      } else {
+        // No clipboard API (insecure origin / old browser): the value is still
+        // plain selectable text in the cell, so nothing is lost.
+        restore('Select to copy');
+      }
+    });
+  });
+}
