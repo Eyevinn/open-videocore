@@ -138,14 +138,14 @@ type PollerDeps = {
   // src/routes/internal.ts POST /encore-callback and settleFailedTranscode in
   // src/pipeline/failed-transcode-reconciler.ts — enumerated in full in
   // src/pipeline/transcode-completion-events.ts), and until #829 the callback
-  // route was the only one with a dispatcher — so on a deployment whose completions arrive
-  // through this poller (the callback listener's fire-and-forget zAdd dropping a
-  // message, or a failure Encore never calls back on, both of which the sweep
-  // below exists to cover), subscribers to `transcode.complete`, `asset.ready`,
-  // `transcode.failed` and `asset.failed` silently received nothing. Optional:
-  // absent on deployments with webhooks disabled, in which case emission is a
-  // no-op exactly as before. Fire-and-forget — a delivery failure never affects
-  // the completion flow.
+  // route was the only one with a dispatcher — so on a deployment whose
+  // completions arrive through this poller (the callback listener's
+  // fire-and-forget zAdd dropping a message, or a failure Encore never calls
+  // back on, both of which the sweep below exists to cover), subscribers to
+  // `transcode.complete`, `asset.ready`, `transcode.failed` and `asset.failed`
+  // silently received nothing. Optional: absent on deployments with webhooks
+  // disabled, in which case emission is a no-op exactly as before.
+  // Fire-and-forget — a delivery failure never affects the completion flow.
   webhookDispatcher?: WebhookDispatcher;
   logger: Logger;
 };
