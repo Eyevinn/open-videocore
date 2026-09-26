@@ -33,6 +33,13 @@ import { InMemoryJobRepository, encodeEncoreJobId } from '../data/job-repo.js';
 import { InMemoryAssetRepository } from '../data/asset-repo.js';
 import { InMemoryPipelineRepository } from '../data/pipeline-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { InMemoryWebhookRepository } from '../data/inmemory-webhook-repo.js';
+import { WEBHOOK_EVENT_TYPES } from '../data/webhook-repo.js';
+import { WebhookDispatcher } from '../services/webhook-dispatcher.js';
+import {
+  ENCODE_COMPLETION_EVENT_TYPE,
+  encodeCompletionEventSchema
+} from './encode-completion-event.js';
 
 // Parse a ZRANGEBYSCORE score bound the way Valkey does: '-inf'/'+inf' and the
 // exclusive '(' prefix (e.g. '(1700000000000'). Kept alongside FakeRedis so its
@@ -1048,5 +1055,292 @@ describe('encore-callback-poller — stale packaging-job purge (#498)', () => {
     expect(zremSpy.mock.invocationCallOrder[ghostZremIdx]!).toBeLessThan(
       zaddSpy.mock.invocationCallOrder[freshZaddIdx]!
     );
+  });
+});
+
+// #829: webhook dispatch on the POLLER completion path.
+//
+// Webhook delivery used to depend on WHICH code path detected a job's terminal
+// state: every dispatch call lived in src/routes/internal.ts (the HTTP
+// encode-completion callback), and this module — the path that completes
+// transcodes whenever Encore's callback does not reach that route, plus every
+// completion recovered by the sweep above — had none. So a deployment whose
+// completions arrive here delivered `package.complete`/`package.failed` but
+// silently never `transcode.complete`, `asset.ready`, `transcode.failed` or
+// `asset.failed`. The existing tests could not catch it: they exercise the
+// callback route, where dispatch does happen.
+//
+// Contract sources verified before writing (per CLAUDE.md rule 7):
+//   - Event-type vocabulary WEBHOOK_EVENT_TYPES — src/data/webhook-repo.ts:28-36;
+//     the same enum POST /api/v1/webhooks validates against
+//     (createBodySchema.events — src/routes/webhooks.ts:40).
+//   - Delivery envelope { event, payload, timestamp } and the injectable
+//     `fetchImpl` — WebhookDispatcher.deliver/post,
+//     src/services/webhook-dispatcher.ts:85-89, :37-45.
+//   - Payload shapes emitted at a transcode terminal state —
+//     dispatchTranscodeCompletionEvents, src/pipeline/transcode-completion-events.ts,
+//     which is the SAME function src/routes/internal.ts now calls.
+//   - encodeCompletionEventSchema / ENCODE_COMPLETION_EVENT_TYPE —
+//     src/pipeline/encode-completion-event.ts:72, :133.
+describe('encore-callback-poller — webhook dispatch on the poller completion path (#829)', () => {
+  let redis: FakeRedis;
+  let jobs: InMemoryJobRepository;
+  let assets: InMemoryAssetRepository;
+  let pipelines: InMemoryPipelineRepository;
+
+  beforeEach(() => {
+    redis = new FakeRedis();
+    jobs = new InMemoryJobRepository();
+    assets = new InMemoryAssetRepository();
+    pipelines = new InMemoryPipelineRepository();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function findLocalJobId(externalId: string): string {
+    const sep = externalId.indexOf('__');
+    return externalId.slice(sep + 2);
+  }
+
+  // A real WebhookDispatcher over the in-memory registration repo, subscribed to
+  // every event type the API accepts, with its own fetch stub (injected, so it is
+  // independent of the global fetch stub standing in for the Encore HTTP API).
+  // Records the delivered { event, payload } envelopes.
+  async function makeDispatcher(): Promise<{
+    dispatcher: WebhookDispatcher;
+    delivered: { event: string; payload: any }[];
+  }> {
+    const repo = new InMemoryWebhookRepository();
+    await repo.create({ url: 'https://hook.example/webhook', events: [...WEBHOOK_EVENT_TYPES] });
+    const delivered: { event: string; payload: any }[] = [];
+    const fetchImpl = async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { event: string; payload: unknown };
+      delivered.push({ event: body.event, payload: body.payload });
+      return { ok: true, status: 200 } as Response;
+    };
+    return {
+      dispatcher: new WebhookDispatcher({
+        repository: repo,
+        fetchImpl: fetchImpl as unknown as typeof fetch
+      }),
+      delivered
+    };
+  }
+
+  function deps(fetchFn: ReturnType<typeof vi.fn>, dispatcher: WebhookDispatcher) {
+    vi.stubGlobal('fetch', fetchFn);
+    return {
+      redis: redis as unknown as import('ioredis').Redis,
+      jobRepository: jobs,
+      assetRepository: assets,
+      pipelineRepository: pipelines,
+      oscContext: OSC_CONTEXT_STUB,
+      queueKey: QUEUE_KEY,
+      webhookDispatcher: dispatcher,
+      logger: NOOP_LOGGER
+    };
+  }
+
+  // Drain one completion message through the live poller and wait for the job to
+  // reach the expected terminal state.
+  async function runCompletion(
+    d: ReturnType<typeof deps>,
+    encoreUuid: string,
+    localJobId: string,
+    terminal: 'done' | 'failed'
+  ): Promise<void> {
+    const message = JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
+    await redis.zadd(QUEUE_KEY, Date.now(), message);
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(localJobId))?.status === terminal);
+    } finally {
+      stop();
+    }
+  }
+
+  it('dispatches transcode.complete and asset.ready when a transcode completes via the poller', async () => {
+    const encoreUuid = 'uuid-webhook-success';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    // The scaler advances a dispatched job queued->running (main.ts onDispatched);
+    // completeTranscode only settles a running job to done.
+    await jobs.update(localId, { status: 'running' });
+
+    const { dispatcher, delivered } = await makeDispatcher();
+    const fetchFn = makeFetch({
+      jobDocs: {
+        [encoreUuid]: {
+          externalId,
+          status: 'SUCCESSFUL',
+          output: [
+            { type: 'VideoFile', file: 'out/1080p.mp4', videoStreams: [{ width: 1920, height: 1080 }], overallBitrate: 5_000_000 }
+          ]
+        }
+      }
+    });
+
+    await runCompletion(deps(fetchFn, dispatcher), encoreUuid, localId, 'done');
+    await waitFor(() => delivered.some((d) => d.event === 'asset.ready'));
+
+    const events = delivered.map((d) => d.event);
+    expect(events).toContain('transcode.complete');
+    expect(events).toContain('asset.ready');
+    // No failure events on a successful completion.
+    expect(events).not.toContain('transcode.failed');
+    expect(events).not.toContain('asset.failed');
+
+    // Both carry the source asset the completion applied to.
+    expect(delivered.find((d) => d.event === 'transcode.complete')!.payload.assetId).toBe(assetId);
+    expect(delivered.find((d) => d.event === 'asset.ready')!.payload).toEqual({ assetId });
+    // And the asset genuinely reached `ready` on this path.
+    expect((await assets.get(assetId))?.status).toBe('ready');
+  });
+
+  it('dispatches transcode.failed and asset.failed when a transcode fails via the poller', async () => {
+    const encoreUuid = 'uuid-webhook-failure';
+    // A deterministic (non-transport) failure message so the #295 retry gate
+    // settles terminal instead of re-dispatching.
+    const errorMsg = 'Error parsing ProbeResult from output';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+
+    const { dispatcher, delivered } = await makeDispatcher();
+    const fetchFn = makeFetch({
+      jobDocs: { [encoreUuid]: { externalId, status: 'FAILED', message: errorMsg } }
+    });
+
+    await runCompletion(deps(fetchFn, dispatcher), encoreUuid, localId, 'failed');
+    await waitFor(() => delivered.some((d) => d.event === 'asset.failed'));
+
+    const events = delivered.map((d) => d.event);
+    expect(events).toContain('transcode.failed');
+    expect(events).toContain('asset.failed');
+    expect(events).not.toContain('transcode.complete');
+    expect(events).not.toContain('asset.ready');
+
+    // The failure payloads carry the asset and Encore's own error message —
+    // identical to what routes/internal.ts emits on its callback path.
+    for (const type of ['transcode.failed', 'asset.failed']) {
+      const event = delivered.find((d) => d.event === type)!;
+      expect(event.payload).toEqual({ assetId, error: errorMsg });
+    }
+  });
+
+  // Payload parity AC: the events a poller-detected completion produces must be
+  // byte-identical to the callback route's, since both now go through
+  // dispatchTranscodeCompletionEvents.
+  it('emits the same payload shapes as the callback route, including encode.completed', async () => {
+    const encoreUuid = 'uuid-webhook-parity';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    await jobs.update(localId, { status: 'running', profile: 'program' });
+    // One settled encode attempt so the billing-oriented event has real timing.
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+
+    const { dispatcher, delivered } = await makeDispatcher();
+    const fetchFn = makeFetch({
+      jobDocs: {
+        [encoreUuid]: {
+          externalId,
+          status: 'SUCCESSFUL',
+          output: [
+            { type: 'VideoFile', file: 'out/1080p.mp4', videoStreams: [{ width: 1920, height: 1080 }], overallBitrate: 5_000_000 },
+            { type: 'VideoFile', file: 'out/720p.mp4', videoStreams: [{ width: 1280, height: 720 }], overallBitrate: 3_000_000 }
+          ]
+        }
+      }
+    });
+
+    await runCompletion(deps(fetchFn, dispatcher), encoreUuid, localId, 'done');
+    await waitFor(() => delivered.some((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE));
+
+    // transcode.complete: { assetId, renditionCount } (internal.ts parity).
+    const complete = delivered.find((d) => d.event === 'transcode.complete')!;
+    expect(complete.payload).toEqual({ assetId, renditionCount: 2 });
+
+    // asset.ready: { assetId }.
+    const ready = delivered.find((d) => d.event === 'asset.ready')!;
+    expect(ready.payload).toEqual({ assetId });
+
+    // encode.completed: a schema-valid ADR-022 payload derived from the SAME
+    // rendition list that was persisted.
+    const encode = delivered.find((d) => d.event === ENCODE_COMPLETION_EVENT_TYPE)!;
+    const parsed = encodeCompletionEventSchema.parse(encode.payload);
+    expect(parsed.jobId).toBe(localId);
+    expect(parsed.assetId).toBe(assetId);
+    expect(parsed.renditionCount).toBe(2);
+    expect(parsed.height).toBe(1080);
+    expect(parsed.width).toBe(1920);
+    expect(parsed.resolutionTier).toBe('fhd');
+    expect(parsed.profile).toBe('program');
+  });
+
+  // Idempotency: the sweep re-observing an already-settled job runs the same
+  // handleMessage path, but completeTranscode no-ops (applied === false), so no
+  // event may be re-delivered.
+  it('does not dispatch when the completion no-ops on an already-terminal job', async () => {
+    const encoreUuid = 'uuid-webhook-duplicate';
+    const { externalId } = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid,
+      jobStatus: 'done'
+    });
+    const localId = findLocalJobId(externalId);
+
+    const { dispatcher, delivered } = await makeDispatcher();
+    const fetchFn = makeFetch({
+      jobDocs: { [encoreUuid]: { externalId, status: 'SUCCESSFUL', output: [] } }
+    });
+    const d = deps(fetchFn, dispatcher);
+
+    const message = JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
+    await redis.zadd(QUEUE_KEY, Date.now(), message);
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(QUEUE_KEY).length === 0);
+      // Give any (erroneous) detached delivery a chance to land before asserting.
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      stop();
+    }
+
+    expect((await jobs.get(localId))?.status).toBe('done');
+    expect(delivered).toEqual([]);
+  });
+
+  // Webhooks are optional (absent dispatcher => emission is a no-op). The
+  // completion flow must be unchanged on such a deployment.
+  it('completes normally when no dispatcher is wired (webhooks disabled)', async () => {
+    const encoreUuid = 'uuid-webhook-disabled';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    await jobs.update(localId, { status: 'running' });
+
+    const fetchFn = makeFetch({
+      jobDocs: { [encoreUuid]: { externalId, status: 'SUCCESSFUL', output: [] } }
+    });
+    vi.stubGlobal('fetch', fetchFn);
+    const d = {
+      redis: redis as unknown as import('ioredis').Redis,
+      jobRepository: jobs,
+      assetRepository: assets,
+      pipelineRepository: pipelines,
+      oscContext: OSC_CONTEXT_STUB,
+      queueKey: QUEUE_KEY,
+      logger: NOOP_LOGGER
+    };
+
+    const message = JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` });
+    await redis.zadd(QUEUE_KEY, Date.now(), message);
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(localId))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    expect((await assets.get(assetId))?.status).toBe('ready');
   });
 });

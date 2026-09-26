@@ -39,12 +39,11 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
-import {
-  ENCODE_COMPLETION_EVENT_TYPE,
-  encodeDurationMsFromAttempt,
-  resolutionTierForHeight,
-  type EncodeCompletionEvent
-} from '../pipeline/encode-completion-event.js';
+// #829: the terminal-transcode webhook events are owned by the shared module so
+// this route and the completion poller (src/pipeline/encore-callback-poller.ts)
+// — the two paths that can apply a transcode completion — emit identical
+// payloads from one place.
+import { dispatchTranscodeCompletionEvents } from '../pipeline/transcode-completion-events.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -221,59 +220,6 @@ function normaliseRenditions(
       bitrateBps: o.overallBitrate
     };
   });
-}
-
-// Build the encode-completion event payload (issue #693, ADR-022) from the data
-// in scope at the applied-success completion boundary. Grounded entirely in the
-// #691 schema's contract notes (src/pipeline/encode-completion-event.ts):
-//   - jobId          <- Job.id (job-repo.ts:85)
-//   - assetId        <- Job.assetId (job-repo.ts:88)
-//   - encodeDurationMs <- last EncodeAttempt endedAt-startedAt via
-//     encodeDurationMsFromAttempt (ADR-012 D3, job-repo.ts:124). undefined when
-//     no measurable attempt exists (no encodeAttemptLog / in-flight timing), in
-//     which case we omit the event's optional fields tied to it and fall back to
-//     0 for the REQUIRED encodeDurationMs — the schema requires a non-negative
-//     integer, and 0 explicitly signals "no measured encode time" rather than a
-//     misleading value.
-//   - resolutionTier <- resolutionTierForHeight(producedVariant.height)
-//   - codec/height/width/bitrateBps <- the produced variant Rendition
-//     (asset-repo.ts:394-399), present only when Encore reported them.
-//   - profile        <- Job.profile (job-repo.ts:111)
-//   - renditionCount <- the recorded rendition count.
-// The "produced variant" is the first recorded rendition (the ladder's primary
-// rung); its dimensions drive the tier. All optional companions are omitted
-// (not defaulted) when their source value is absent, per the schema's
-// required/optional split.
-function buildEncodeCompletionEvent(
-  job: { id: string; assetId: string; profile?: string; encodeAttemptLog?: { startedAt: string; endedAt?: string }[] },
-  renditions: { codec?: string; height?: number; width?: number; bitrateBps?: number }[],
-  renditionCount: number
-): EncodeCompletionEvent {
-  const lastAttempt = job.encodeAttemptLog?.[job.encodeAttemptLog.length - 1];
-  const encodeDurationMs = encodeDurationMsFromAttempt(lastAttempt);
-  const variant = renditions[0];
-  const height = variant && typeof variant.height === 'number' && variant.height > 0 ? variant.height : undefined;
-  const width = variant && typeof variant.width === 'number' && variant.width > 0 ? variant.width : undefined;
-  const bitrateBps =
-    variant && typeof variant.bitrateBps === 'number' && variant.bitrateBps >= 0 ? variant.bitrateBps : undefined;
-
-  const event: EncodeCompletionEvent = {
-    eventType: ENCODE_COMPLETION_EVENT_TYPE,
-    jobId: job.id,
-    assetId: job.assetId,
-    // encodeDurationMs is REQUIRED (schema: non-negative int). Fall back to 0
-    // when no attempt timing is available (see note above).
-    encodeDurationMs: encodeDurationMs ?? 0,
-    resolutionTier: resolutionTierForHeight(height),
-    occurredAt: new Date().toISOString(),
-    renditionCount
-  };
-  if (variant?.codec) event.codec = variant.codec;
-  if (height !== undefined) event.height = height;
-  if (width !== undefined) event.width = width;
-  if (bitrateBps !== undefined) event.bitrateBps = bitrateBps;
-  if (job.profile) event.profile = job.profile;
-  return event;
 }
 
 export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (fastify, opts) => {
@@ -649,43 +595,16 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       // Notify subscribers (issue #13). Fire-and-forget; only emitted when the
       // callback actually applied (not a duplicate/late no-op) so a redelivered
       // Encore callback never double-fires events. A delivery failure never
-      // affects this 200 response.
-      if (result.applied && opts.webhookDispatcher) {
-        const assetId = found.job.assetId;
-        if (success) {
-          void opts.webhookDispatcher.dispatch({
-            type: 'transcode.complete',
-            payload: { assetId, renditionCount: result.renditionCount }
-          });
-          // The source asset returns to `ready` once its renditions exist.
-          void opts.webhookDispatcher.dispatch({
-            type: 'asset.ready',
-            payload: { assetId }
-          });
-          // Billing-oriented encode-completion event (issue #693, ADR-022).
-          // Emitted IN ADDITION TO transcode.complete over the same outbound-
-          // webhook transport, gated by the identical `result.applied` guard so a
-          // redelivered Encore callback never double-meters. Built from the #691
-          // schema + helpers (src/pipeline/encode-completion-event.ts): the
-          // required fields are always derivable here; the optional companions are
-          // filled best-effort from the produced variant / job when available.
-          const encodeEvent = buildEncodeCompletionEvent(found.job, result.renditions, result.renditionCount);
-          void opts.webhookDispatcher.dispatch({
-            type: ENCODE_COMPLETION_EVENT_TYPE,
-            payload: encodeEvent
-          });
-        } else {
-          const error = message ?? `encore status: ${status}`;
-          void opts.webhookDispatcher.dispatch({
-            type: 'transcode.failed',
-            payload: { assetId, error }
-          });
-          void opts.webhookDispatcher.dispatch({
-            type: 'asset.failed',
-            payload: { assetId, error }
-          });
-        }
-      }
+      // affects this 200 response. #829: the emission itself lives in
+      // src/pipeline/transcode-completion-events.ts, shared with the completion
+      // poller so both terminal-state paths produce identical payloads.
+      dispatchTranscodeCompletionEvents({
+        dispatcher: opts.webhookDispatcher,
+        job: found.job,
+        success,
+        error: message ?? `encore status: ${status}`,
+        result
+      });
 
       return reply.code(200).send(result);
     }

@@ -24,6 +24,9 @@
 //   - Encore job document fields externalId/status/output — src/routes/internal.ts
 //     encoreCallbackSchema (SMOKE TEST CONFIRMED 2026-06-01).
 //   - completeTranscode signature — src/pipeline/transcode.ts:138.
+//   - WebhookDispatcher.dispatch({ type, payload }) — WebhookEvent,
+//     src/services/webhook-dispatcher.ts:23-26/:67; event-type vocabulary
+//     WEBHOOK_EVENT_TYPES — src/data/webhook-repo.ts:28-36 (#829).
 //   - JobRepository.findByEncoreJobId — src/data/job-repo.ts:129 (workspace-scoped
 //     via PerWorkspaceJobRepository, which decodes the {workspaceId}__{jobId}
 //     externalId — src/data/per-workspace-repos.ts:92).
@@ -35,6 +38,8 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from './transcode.js';
+import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
+import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
@@ -138,6 +143,20 @@ type PollerDeps = {
   // isn't active, or a test pre-wires packaging) the handoff proceeds as before.
   // Throwing fails the `package` step with a diagnostic instead of enqueueing.
   ensurePackaging?: () => Promise<void>;
+  // Webhook event dispatcher (issue #13, wired here by #829). This module is one
+  // of the THREE paths that can apply a transcode terminal state (the others are
+  // src/routes/internal.ts POST /encore-callback and settleFailedTranscode in
+  // src/pipeline/failed-transcode-reconciler.ts — enumerated in full in
+  // src/pipeline/transcode-completion-events.ts), and until #829 the callback
+  // route was the only one with a dispatcher — so on a deployment whose
+  // completions arrive through this poller (the callback listener's
+  // fire-and-forget zAdd dropping a message, or a failure Encore never calls
+  // back on, both of which the sweep below exists to cover), subscribers to
+  // `transcode.complete`, `asset.ready`, `transcode.failed` and `asset.failed`
+  // silently received nothing. Optional: absent on deployments with webhooks
+  // disabled, in which case emission is a no-op exactly as before.
+  // Fire-and-forget — a delivery failure never affects the completion flow.
+  webhookDispatcher?: WebhookDispatcher;
   logger: Logger;
 };
 
@@ -594,6 +613,25 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
     },
     { jobs: deps.jobRepository, assets: deps.assetRepository }
   );
+
+  // #829: notify webhook subscribers that this transcode reached a terminal
+  // state. Emitted IMMEDIATELY behind the shared completion-application step
+  // (completeTranscode above) rather than at the end of this function, so no
+  // later early return on the pipeline-advance / packaging-handoff path (e.g.
+  // the ensurePackaging failure below) can swallow an event for a transcode that
+  // genuinely completed. The payloads come from the SAME helper
+  // src/routes/internal.ts uses, so they are identical whichever path detected
+  // the completion. The `result.applied` guard inside the helper keeps a sweep
+  // that re-observes an already-settled job from double-firing. Fire-and-forget:
+  // the dispatcher swallows its own delivery errors, so this cannot throw into
+  // (or slow down) the completion flow below.
+  dispatchTranscodeCompletionEvents({
+    dispatcher: deps.webhookDispatcher,
+    job: found.job,
+    success,
+    error: job.message ?? `encore status: ${status}`,
+    result
+  });
 
   // #525 pt.2: on a successful completion, pin the instance that ran this job
   // against premature scale-down BEFORE decrementActiveJobs below — that call

@@ -1163,6 +1163,13 @@ function activateScaler(redisUrl: string): void {
         // assigned below (encore = scalerRegistry) before any tick fires.
         encore: scalerRegistry!,
         stallTimeoutMs: encoreStallTimeoutMs,
+        // #829: this sweep is one of the three paths that apply a transcode
+        // terminal state, and the only one that can see a job whose Encore
+        // record was garbage-collected (404 past the stall timeout) — the
+        // completion poller's sweep cannot, since it only reconciles jobs Encore
+        // still reports. Same dispatcher instance the internal router and the
+        // poller get, so the failure events are identical whichever path noticed.
+        webhookDispatcher,
         logger: {
           info: (...a: unknown[]) => app.log.info(a),
           warn: (...a: unknown[]) => app.log.warn(a)
@@ -1350,6 +1357,15 @@ function activateScaler(redisUrl: string): void {
               jobs: jobRepository,
               assets: assetRepository,
               pipeline: pipelineRepository,
+              // #829: the scaler's dropped-job settle is the third path that
+              // applies a transcode terminal state, and it is invisible to both
+              // the poller's sweep and the #273 sweep (the job is gone from the
+              // instance's active set, so Encore no longer reports it). Without a
+              // dispatcher here the job goes `failed`, the asset goes `failed`,
+              // and the subscriber is told nothing. This settle is CONDITIONAL
+              // (#709) — see the documented failed -> complete correction
+              // sequence at the dispatch site in failed-transcode-reconciler.ts.
+              webhookDispatcher,
               logger: {
                 info: (...a: unknown[]) => app.log.info(a),
                 warn: (...a: unknown[]) => app.log.warn(a)
@@ -1592,6 +1608,15 @@ function activateScaler(redisUrl: string): void {
     // deactivateScaler clears independently). undefined when the packager secrets
     // are absent, exactly as for the manual path, so the handoff is a no-op then.
     ensurePackaging,
+    // #829: webhook delivery for transcode terminal states. The poller is the
+    // path that completes transcodes on any deployment where Encore's callback
+    // does not reach POST /api/v1/internal/encore-callback (and on every
+    // completion recovered by its sweep), so without this the four events
+    // `transcode.complete` / `asset.ready` / `transcode.failed` / `asset.failed`
+    // were never dispatched. Same dispatcher instance the internal router gets
+    // (see the internalRouter registration below), so both terminal-state paths
+    // deliver identical payloads to the same registrations.
+    webhookDispatcher,
     logger: app.log
   });
 
