@@ -255,6 +255,40 @@ function buildConnectionsFromStack(
   };
 }
 
+// True when the explicit env-var override builder (`buildEnvConnections`) is the
+// active source of WorkspaceConnections — i.e. when COUCHDB_URL or MINIO_URL is
+// set, in which case `resolve()` returns env-built connections for ALL
+// workspaces and never consults the parameter store. This predicate MUST stay in
+// lockstep with `buildEnvConnections`'s own `if (!couchUrl && !minioUrl)` guard
+// below; it exists so callers can tell "this endpoint came from a provisioned
+// stack record" from "this endpoint is a local/ops override", which the
+// WorkspaceConnections shape itself does not distinguish (`s3Config.endpoint` is
+// populated from `StackConfig.minioEndpoint` on one path and verbatim from
+// MINIO_URL on the other).
+export function envOverrideConnectionsActive(): boolean {
+  return Boolean(process.env['COUCHDB_URL']) || Boolean(process.env['MINIO_URL']);
+}
+
+// The MinIO endpoint of a PROVISIONED stack (`StackConfig.minioEndpoint`, carried
+// on `s3Config.endpoint` by `buildConnectionsFromStack`), or undefined when the
+// resolved connections did not come from a stack record — the env-override path
+// (MINIO_URL, used verbatim) and the no-storage in-memory path (`s3Config:
+// undefined`).
+//
+// Consumed by the delivery/files routes to derive the packaged bucket's PUBLIC
+// origin (issue #859). That derivation is deliberately restricted to
+// stack-resolved connections: the anonymous-read bucket policy that makes the
+// derived URL fetchable is applied only when THIS codebase provisions the stack
+// (routes/provision.ts, issue #199). A local or ops-override MinIO gets no such
+// policy from us, so deriving a public origin there would advertise a URL that
+// very likely 403s in place of the working authorized proxy URL.
+export function stackResolvedMinioEndpoint(
+  connections: { s3Config?: { endpoint: string } | undefined } | null | undefined
+): string | undefined {
+  if (envOverrideConnectionsActive()) return undefined;
+  return connections?.s3Config?.endpoint;
+}
+
 // Build connections from explicit environment variables (local dev / ops
 // override). Returns undefined when no override env vars are set. When either
 // COUCHDB_URL or MINIO_URL is present this path wins for ALL workspaces,
