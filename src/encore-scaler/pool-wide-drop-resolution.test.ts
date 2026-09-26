@@ -308,9 +308,12 @@ describe('#769: drop resolution checks externalId across all pool instances', ()
       String(c[0]).includes('drop-diagnostic (#768)')
     );
     expect(diag).toBeDefined();
-    expect(String(diag![0])).toContain('poolInstancesUnresolvedThisPass=%s');
+    expect(String(diag![0])).toContain('poolInstancesUncheckedThisPass=%s');
     const args = diag!.map((a) => String(a));
-    expect(args).toContain('inst-b'); // the instance we could not confirm
+    // The unchecked list names the instance AND why it could not be confirmed:
+    // scaler-loop.ts pushes `${instanceId}(unreachable)` / `(unparseable)` /
+    // `(truncated)` rather than the bare id, so the reason survives into the log.
+    expect(args).toContain('inst-b(unreachable)'); // the instance we could not confirm
     expect(args).toContain('inst-a'); // the instance we did confirm
     expect(args).toContain('(none)'); // foundActiveOnPoolInstances
   });
