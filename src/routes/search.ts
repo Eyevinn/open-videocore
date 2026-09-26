@@ -26,7 +26,12 @@ import {
   CreatedToSchema,
   resolveCreatedRange
 } from '../data/created-range.js';
-import { MAX_PAGE_SIZE, type SearchRepository } from '../data/search-repo.js';
+import {
+  MAX_PAGE_SIZE,
+  isUnmatchableMimeTypeFilter,
+  supportedMimeTypeFilters,
+  type SearchRepository
+} from '../data/search-repo.js';
 import { authGate } from '../auth/middleware.js';
 
 const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
@@ -158,7 +163,27 @@ const searchQuerySchema = z
           'ingest `title` field or the legacy `name` alias (issue #347).'
       ),
     tags: tagsSchema,
-    mimeType: z.string().min(1).max(128).optional(),
+    mimeType: z
+      .string()
+      // Trim BEFORE the length check so a whitespace-only value is a 400 rather
+      // than a filter the matcher has to interpret (it would otherwise pass
+      // `.min(1)` and the repo would have to decide what a blank filter means).
+      .trim()
+      .min(1)
+      .max(128)
+      .optional()
+      .describe(
+        'Container-format filter, matched against the probe-extracted ' +
+          '`technicalMetadata.containerFormat`. Accepts either a bare container ' +
+          'token (`mp4`, `mov`, `webm`, `matroska`) or a common media MIME type ' +
+          '(`video/mp4`), which is resolved onto the ffprobe container family it ' +
+          'names — so `video/mp4` matches an asset stored as `mov,mp4,m4a` ' +
+          '(issue #822). Matching is case-insensitive and per family token. A ' +
+          'MIME-shaped value that neither maps to a container family nor names a ' +
+          'content type this API accepts on upload can never match any asset, ' +
+          'and is rejected with 400 `unsupported_mime_type` rather than silently ' +
+          'returning an empty result set.'
+      ),
     // Lifecycle status (issue #833). Reuses the SAME enum the assets endpoint
     // accepts — `ASSET_STATUSES` from data/asset-repo.ts, which is what
     // `openapi.json` -> `paths./api/v1/assets/.get.parameters[name=status]`
@@ -249,6 +274,9 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
           '`tamsTimerange`) never match a collection. Asset hits and collection hits ' +
           'are returned in separate arrays and each carries a `type` discriminator ' +
           "(`'asset'` | `'collection'`) so they are unambiguously distinguishable. " +
+          '`mimeType` filters on the extracted container format and accepts either ' +
+          'a container token (`mp4`) or a common media MIME type (`video/mp4`), ' +
+          'which is resolved onto the container family it names (issue #822). ' +
           'Results are paginated via `page`/`pageSize` and returned as ' +
           '`{ assets, collections, total, collectionTotal, page }`. The ' +
           'exact-filter tier also carries `status` (exact lifecycle match, ' +
@@ -262,6 +290,24 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
     async (request, reply) => {
       const { q, tags, mimeType, status, from, to, tamsFlowId, tamsTimerange, page, pageSize } =
         request.query;
+      // Reject a `mimeType` that can never match any asset here (issue #822):
+      // MIME-shaped, no container family resolves it, AND it is not a content
+      // type this API accepts on upload. The filter compares against ffprobe's
+      // format_name, which never contains `/`, so such a value would return an
+      // empty page indistinguishable from "no assets match"; failing at the
+      // boundary names the problem instead. A type the API DOES ingest is
+      // excluded from this gate — a real asset can carry it, so it gets an
+      // ordinary result rather than being called unsupported.
+      if (mimeType !== undefined && isUnmatchableMimeTypeFilter(mimeType)) {
+        return reply.code(400).send({
+          error: 'unsupported_mime_type',
+          message:
+            `Unsupported mimeType filter "${mimeType}". This filter matches the ` +
+            'container format extracted from the media, so it accepts a container ' +
+            'token (e.g. "mp4", "mov", "webm", "matroska") or one of these MIME ' +
+            `types: ${supportedMimeTypeFilters().join(', ')}.`
+        });
+      }
       const metadata = extractMetadataFilter(request.query as Record<string, unknown>);
       // An inverted range is a caller mistake, not an empty result (issue #833).
       const created = resolveCreatedRange({ from, to });

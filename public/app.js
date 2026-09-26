@@ -2787,6 +2787,17 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
 
 // ─── SEARCH TAB ──────────────────────────────────────────────────────────────
 
+// The format filter on the Search tab (issue #822). GET /api/v1/search's
+// `mimeType` parameter matches the asset's extracted container format
+// (src/data/search-repo.ts matchesMimeTypeFilter -> technicalMetadata
+// .containerFormat), and now resolves common media MIME types onto that
+// container family server-side. The field is therefore labelled for BOTH
+// vocabularies, and its placeholder is a value that can actually match.
+const SEARCH_FORMAT_LABEL = 'MIME type or container format';
+const SEARCH_FORMAT_PLACEHOLDER = 'video/mp4';
+const SEARCH_FORMAT_HINT =
+  'Matches the extracted container format — "video/mp4", "mp4" and "mov" all match an MP4.';
+
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
@@ -2807,8 +2818,10 @@ async function renderSearchTab(container) {
     '    <input type="text" id="search-tags" placeholder="news,sports" />',
     '  </div>',
     '  <div class="form-field">',
-    '    <label for="search-mime">MIME type</label>',
-    '    <input type="text" id="search-mime" placeholder="video/mp4" />',
+    '    <label for="search-mime">' + escHtml(SEARCH_FORMAT_LABEL) + '</label>',
+    '    <input type="text" id="search-mime" placeholder="' + escHtml(SEARCH_FORMAT_PLACEHOLDER) + '"',
+    '      aria-describedby="search-mime-hint" />',
+    '    <div class="form-hint" id="search-mime-hint">' + escHtml(SEARCH_FORMAT_HINT) + '</div>',
     '  </div>',
     '  <button id="search-btn">Search</button>',
     '</div>',
@@ -2860,14 +2873,18 @@ async function renderSearchTab(container) {
           '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
           '<td>' + renderBadge(a.status) + '</td>' +
           '<td>' + renderTags(a.tags) + '</td>' +
-          '<td>' + escHtml(a.mimeType || '—') + '</td>' +
+          // Search hits carry the probe block, not a `mimeType` field: the
+          // response schema is technicalMetadata.containerFormat
+          // (src/routes/search.ts assetSchema -> technicalMetadataSchema).
+          // Reading a.mimeType rendered '—' for every row (issue #822).
+          '<td>' + escHtml((a.technicalMetadata && a.technicalMetadata.containerFormat) || '—') + '</td>' +
           '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
           '</tr>';
       }).join('');
       const tableWrap = document.createElement('div');
       tableWrap.className = 'table-wrap';
       tableWrap.innerHTML = '<table>' +
-        '<thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>MIME type</th><th>Created</th></tr></thead>' +
+        '<thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>Container</th><th>Created</th></tr></thead>' +
         '<tbody>' + rows + '</tbody>' +
         '</table>';
       resultsEl.appendChild(tableWrap);
@@ -5225,6 +5242,12 @@ export {
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
   renderAssetsTab,
+  // Search-tab format filter (issue #822). Exported so a DOM/unit test can
+  // drive the real Search tab against a stubbed fetch and assert the field's
+  // own placeholder is a value the API can match.
+  renderSearchTab,
+  SEARCH_FORMAT_LABEL,
+  SEARCH_FORMAT_PLACEHOLDER,
   // Exported so a DOM/unit test can prove every rendered tab button is
   // routable — i.e. present in the allowlist AND backed by a renderer — and
   // that an unroutable one is reported rather than silently dropped (#823).
