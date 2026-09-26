@@ -85,6 +85,12 @@ import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
+import {
+  runnerFactory,
+  resolveRunnerOption,
+  runnerS3Config,
+  RunnerFactoryUnresolvedError
+} from './pipeline/runner-option.js';
 import { registerPrincipal } from './auth/principal.js';
 import { registerAuth } from './auth/middleware.js';
 import { internalRouter } from './routes/internal.js';
@@ -713,26 +719,29 @@ const probe: ProbeRunner | undefined = storageAvailable
 // to MinIO via a presigned PUT URL. Like the probe runner it needs both an OSC
 // context and object storage; when either is missing the thumbnail routes
 // respond 501.
-// Thumbnail extractor: a factory so the route can supply the workspace's MinIO
-// credentials (resolved from the stack config) at request time. The route
-// unwraps it if s3Config is available, otherwise falls back to a direct call
-// which uses env-var credentials (local dev / env-override path).
+// Thumbnail extractor: a TAGGED factory (issue #838) so the route can supply
+// the workspace's MinIO credentials (resolved from the stack config) at request
+// time. The tag is what lets the route tell a factory from a plain runner; a
+// factory reaching a stack with no s3Config is an explicit 501 rather than a
+// call that dispatches no job.
 const thumbnailExtractor = storageAvailable
-  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): FrameExtractor =>
-      // Output goes to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so
-      // the runner needs the MinIO credentials + bucket in the job body. A
-      // presigned PUT URL does NOT work with the image2 muxer (issue #92).
-      makeOscThumbnailExtractor({
-        context: oscContext,
-        createJob,
-        getJob,
-        getLogsForInstance,
-        removeJob,
-        s3Endpoint: s3.endpoint,
-        s3AccessKey: s3.accessKey,
-        s3SecretKey: s3.secretKey,
-        s3Bucket: s3.bucket
-      })
+  ? runnerFactory(
+      (s3): FrameExtractor =>
+        // Output goes to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so
+        // the runner needs the MinIO credentials + bucket in the job body. A
+        // presigned PUT URL does NOT work with the image2 muxer (issue #92).
+        makeOscThumbnailExtractor({
+          context: oscContext,
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket
+        })
+    )
   : undefined;
 
 // Export / re-wrap (issue #19) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to
@@ -745,41 +754,47 @@ const thumbnailExtractor = storageAvailable
 // work with ffmpeg's output muxer (issue #316). When object storage is missing
 // POST /:id/export responds 501.
 const rewrapRunner = storageAvailable
-  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): RewrapRunner =>
-      makeOscRewrapRunner({
-        context: oscContext,
-        createJob,
-        getJob,
-        getLogsForInstance,
-        removeJob,
-        s3Endpoint: s3.endpoint,
-        s3AccessKey: s3.accessKey,
-        s3SecretKey: s3.secretKey,
-        s3Bucket: s3.bucket
-      })
+  ? runnerFactory(
+      (s3): RewrapRunner =>
+        makeOscRewrapRunner({
+          context: oscContext,
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket
+        })
+    )
   : undefined;
 
 // Clip / trim (issue #17) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to seek
 // to a window and stream-copy it into a new child asset. Like the thumbnail
-// extractor and the re-wrap runner it is a factory so the route can supply the
-// workspace's MinIO credentials (resolved from the stack config) at request
-// time: the clip is written to `s3://bucket/key` via the ffmpeg-s3 native S3
-// writer, because ffmpeg cannot mux an MP4 to a presigned HTTPS PUT URL
-// (issue #786 — the job "succeeded" and no object was written). When object
-// storage is missing POST /:id/clip responds 501.
+// extractor and the re-wrap runner it is a TAGGED factory (issue #838) so the
+// route can supply the workspace's MinIO credentials (resolved from the stack
+// config) at request time: the clip is written to `s3://bucket/key` via the
+// ffmpeg-s3 native S3 writer, because ffmpeg cannot mux an MP4 to a presigned
+// HTTPS PUT URL (issue #786 — the job "succeeded" and no object was written).
+// The tag is what lets the route tell a factory from a plain runner; a factory
+// reaching a stack with no s3Config is an explicit 501 rather than a call that
+// dispatches no job. When object storage is missing POST /:id/clip responds 501.
 const clipRunner = storageAvailable
-  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): ClipRunner =>
-      makeOscClipRunner({
-        context: oscContext,
-        createJob,
-        getJob,
-        getLogsForInstance,
-        removeJob,
-        s3Endpoint: s3.endpoint,
-        s3AccessKey: s3.accessKey,
-        s3SecretKey: s3.secretKey,
-        s3Bucket: s3.bucket
-      })
+  ? runnerFactory(
+      (s3): ClipRunner =>
+        makeOscClipRunner({
+          context: oscContext,
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket
+        })
+    )
   : undefined;
 
 // Auto-subtitles (issue #114) and scene detection (issue #115) are OPTIONAL,
@@ -1863,18 +1878,30 @@ const onObjectStored =
           // Read s3Config from the already-warm resolver cache. The upload
           // preHandler called resolve() so resolveCached() is valid here.
           const conns = stackResolver.resolveCached();
-          const s3Cfg = conns?.s3Config;
           const bucket = conns?.sourceBucket ?? sourceBucket;
-          const extractor = s3Cfg
-            ? (thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)(
-                { ...s3Cfg, bucket }
-              )
-            : undefined;
-          if (extractor) {
+          // Same resolution helper the asset routes use (issue #838). This path
+          // is fire-and-forget on upload, so an unresolvable factory is logged
+          // at error level and skipped rather than thrown at the uploader — but
+          // it is logged, not silently treated as "no thumbnails configured".
+          try {
+            const extractor = resolveRunnerOption(
+              thumbnailExtractor,
+              runnerS3Config(conns?.s3Config, bucket),
+              'thumbnailExtractor'
+            );
             void extractThumbnails(
               { assetId, objectKey, timecodes: [1] },
               { assets: assetRepository, storage: effectiveStorage, extractor }
             ).catch(() => { /* failures recorded on asset */ });
+          } catch (err) {
+            if (err instanceof RunnerFactoryUnresolvedError) {
+              app.log.error(
+                { err, assetId },
+                'skipping post-upload thumbnail extraction: runner factory could not be resolved'
+              );
+            } else {
+              throw err;
+            }
           }
         }
       }

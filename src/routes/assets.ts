@@ -140,6 +140,12 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
+import {
+  resolveRunnerOption,
+  runnerS3Config,
+  RunnerFactoryUnresolvedError,
+  type RunnerOption
+} from '../pipeline/runner-option.js';
 import { oscClipJobLog } from '../pipeline/osc-clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
@@ -185,6 +191,11 @@ import {
   externalPublicBaseUrl,
   externalObjectUrl
 } from '../pipeline/packaging.js';
+
+// Fallback source bucket for runner-factory resolution when the request carries
+// no resolved stack. Mirrors the default in WorkspaceConnections.sourceBucket
+// (src/services/workspace-stack.ts:369) and MINIO_SOURCE_BUCKET (main.ts:900).
+const DEFAULT_SOURCE_BUCKET = 'openvideocore-source';
 
 const statusSchema = z.enum(ASSET_STATUSES);
 
@@ -925,10 +936,11 @@ type AssetsRouterOptions = {
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
-  // Thumbnail / poster-frame extraction (issue #7). Factory receives the
+  // Thumbnail / poster-frame extraction (issue #7). Either a ready FrameExtractor
+  // or a tagged factory (`runnerFactory(...)`, issue #838) that receives the
   // workspace's s3Config so the OSC ffmpeg job can write directly to the right
   // MinIO bucket. When absent (or no object storage), the thumbnail routes respond 501.
-  thumbnailExtractor?: FrameExtractor | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor);
+  thumbnailExtractor?: RunnerOption<FrameExtractor>;
   // Injectable extractor runner + extra deps (tests stub the extractor/TTL).
   // Defaults to the real awaited extractor.
   extractThumbnails?: typeof extractThumbnails;
@@ -940,20 +952,24 @@ type AssetsRouterOptions = {
   thumbnailPublicBaseUrl?: string;
   // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
   // job (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
-  // extractor it may be a factory that receives the workspace's s3Config so the
-  // OSC job can write the output directly to the right MinIO bucket via
-  // `s3://bucket/key` (a presigned PUT URL does NOT work — issue #316). When
-  // absent (or no object storage), POST /:id/export responds 501.
-  rewrapRunner?: RewrapRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner);
+  // extractor it may be a tagged factory (`runnerFactory(...)`, issue #838) that
+  // receives the workspace's s3Config so the OSC job can write the output
+  // directly to the right MinIO bucket via `s3://bucket/key` (a presigned PUT
+  // URL does NOT work — issue #316). When absent (or no object storage),
+  // POST /:id/export responds 501.
+  rewrapRunner?: RunnerOption<RewrapRunner>;
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
   // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
   // (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
-  // extractor / rewrap runner it may be a factory that receives the workspace's
-  // s3Config so the OSC job can write the clip directly to the right MinIO
-  // bucket via `s3://bucket/key` (a presigned PUT URL does NOT work —
-  // issue #786). When absent (or no object storage), POST /:id/clip responds 501.
-  clipRunner?: ClipRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner);
+  // extractor and the re-wrap runner it may be a tagged factory
+  // (`runnerFactory(...)`, issue #838) that receives the workspace's s3Config so
+  // the OSC job can write the clip directly to the right MinIO bucket via
+  // `s3://bucket/key` — a presigned PUT URL does NOT work here either
+  // (issue #786: the job "succeeded" and no object was written). All three sites
+  // share one resolution helper so they cannot drift apart again. When absent
+  // (or no object storage), POST /:id/clip responds 501.
+  clipRunner?: RunnerOption<ClipRunner>;
   clip?: typeof runClip;
   clipDeps?: Partial<ClipDeps>;
   // HLS/DASH packaging (issue #9). When present, POST /:id/package is enabled.
@@ -1809,20 +1825,71 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   }
 
+  // MinIO coordinates a runner factory is built from, assembled from the stack
+  // this request resolved to (WorkspaceConnections.s3Config / .sourceBucket,
+  // src/services/workspace-stack.ts:118/116). Undefined when the stack carries
+  // no s3Config, which only matters for a factory option.
+  function requestRunnerS3Config(request: import('fastify').FastifyRequest) {
+    return runnerS3Config(
+      request.connections?.s3Config,
+      request.connections?.sourceBucket ?? DEFAULT_SOURCE_BUCKET
+    );
+  }
+
+  // Single resolution point for the thumbnail / re-wrap / clip runner options
+  // (issue #838). A plain injected runner passes straight through; a tagged
+  // factory is built from this request's s3Config. When the option is a factory
+  // and the stack resolved no s3Config there is nothing to build a runner from,
+  // so the route answers 501 not_configured rather than calling the factory as
+  // if it were the runner and dispatching no OSC job at all.
+  //
+  // Returns undefined once the 501 has been sent, matching the
+  // `requireSourceObject(asset, reply)` convention used above.
+  function resolveConfiguredRunner<T extends (...args: never[]) => unknown>(
+    option: RunnerOption<T>,
+    optionName: string,
+    request: import('fastify').FastifyRequest,
+    reply: import('fastify').FastifyReply
+  ): T | undefined {
+    try {
+      return resolveRunnerOption(option, requestRunnerS3Config(request), optionName);
+    } catch (err) {
+      if (err instanceof RunnerFactoryUnresolvedError) {
+        request.log.error({ err, option: optionName }, 'runner factory could not be resolved');
+        void reply.code(501).send({ error: 'not_configured', message: err.message });
+        return undefined;
+      }
+      throw err;
+    }
+  }
+
   // Fire-and-forget thumbnail extraction for a pipeline step. Uses a default
   // poster-frame timecode (1s in). No-op when thumbnails are not configured.
+  //
+  // Returns false (step recorded as not started) when the extractor is a
+  // factory the stack cannot supply credentials for — the same explicit failure
+  // the thumbnail route turns into a 501. It is logged at error level rather
+  // than thrown because this is a fire-and-forget pipeline step: throwing here
+  // would fail the whole execution, which an unconfigured optional step must
+  // never do.
   function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
     if (!opts.thumbnailExtractor || !storageFor) {
       return false;
     }
-    const s3Cfg = request.connections?.s3Config;
-    const resolvedExtractor =
-      typeof opts.thumbnailExtractor === 'function' && s3Cfg
-        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
-            ...s3Cfg,
-            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-          })
-        : (opts.thumbnailExtractor as FrameExtractor);
+    let resolvedExtractor: FrameExtractor;
+    try {
+      resolvedExtractor = resolveRunnerOption(
+        opts.thumbnailExtractor,
+        requestRunnerS3Config(request),
+        'thumbnailExtractor'
+      );
+    } catch (err) {
+      if (err instanceof RunnerFactoryUnresolvedError) {
+        request.log.error({ err, assetId }, 'skipping pipeline thumbnail step: runner factory could not be resolved');
+        return false;
+      }
+      throw err;
+    }
     void thumbnailRunner(
       { assetId, objectKey, timecodes: [1] },
       { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
@@ -4385,15 +4452,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'thumbnail extraction is not configured'
         });
       }
-      // Resolve the extractor: if it's a factory, call it with the workspace's
-      // s3Config so the ffmpeg job can write to the right MinIO bucket.
-      const s3Cfg = request.connections?.s3Config;
-      const resolvedExtractor = typeof opts.thumbnailExtractor === 'function' && s3Cfg
-        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
-            ...s3Cfg,
-            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-          })
-        : opts.thumbnailExtractor as FrameExtractor;
+      // Resolve the extractor: if it's a tagged factory, build it from the
+      // workspace's s3Config so the ffmpeg job can write to the right MinIO
+      // bucket; if it's a plain runner, use it directly. A factory with no
+      // s3Config is a 501, sent by the helper (issue #838).
+      const resolvedExtractor = resolveConfiguredRunner(
+        opts.thumbnailExtractor,
+        'thumbnailExtractor',
+        request,
+        reply
+      );
+      if (!resolvedExtractor) return reply; // 501 already sent
       try {
         const thumbnails = await thumbnailRunner(
           {
@@ -4458,19 +4527,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'export / re-wrap is not configured'
         });
       }
-      // Resolve the injected runner. In production it is a factory that needs
-      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the
+      // Resolve the injected runner. In production it is a tagged factory that
+      // needs the workspace's s3Config + bucket so the OSC ffmpeg job writes the
       // output to `s3://bucket/key` natively (issue #316); tests inject a plain
-      // RewrapRunner and no s3Config, so fall back to using it directly. Mirrors
-      // the thumbnail extractor resolution above.
-      const s3Cfg = request.connections?.s3Config;
-      const resolvedRewrapRunner =
-        typeof opts.rewrapRunner === 'function' && s3Cfg
-          ? (opts.rewrapRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner)({
-              ...s3Cfg,
-              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-            })
-          : (opts.rewrapRunner as RewrapRunner);
+      // RewrapRunner and no s3Config, which passes through untouched. Same
+      // helper as the thumbnail and clip routes (issue #838).
+      const resolvedRewrapRunner = resolveConfiguredRunner(
+        opts.rewrapRunner,
+        'rewrapRunner',
+        request,
+        reply
+      );
+      if (!resolvedRewrapRunner) return reply; // 501 already sent
       try {
         const child = await rewrapRunner(
           {
@@ -4525,19 +4593,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'clip extraction is not configured'
         });
       }
-      // Resolve the injected runner. In production it is a factory that needs
-      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the clip
-      // to `s3://bucket/key` natively (issue #786); tests inject a plain
-      // ClipRunner and no s3Config, so fall back to using it directly. Mirrors
-      // the rewrap runner resolution above.
-      const clipS3Cfg = request.connections?.s3Config;
-      const resolvedClipRunner =
-        typeof opts.clipRunner === 'function' && clipS3Cfg
-          ? (opts.clipRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner)({
-              ...clipS3Cfg,
-              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-            })
-          : (opts.clipRunner as ClipRunner);
+      // Same resolution helper as thumbnail and re-wrap (issue #838). In
+      // production the option is a tagged factory that needs the workspace's
+      // s3Config + bucket so the OSC ffmpeg job writes the clip to
+      // `s3://bucket/key` natively (issue #786); tests inject a plain ClipRunner,
+      // which passes through untouched. A factory with no resolvable s3Config is
+      // a 501 here rather than a call that dispatches no job at all.
+      const resolvedClipRunner = resolveConfiguredRunner(
+        opts.clipRunner,
+        'clipRunner',
+        request,
+        reply
+      );
+      if (!resolvedClipRunner) return reply; // 501 already sent
       try {
         const child = await clipRunnerOrchestrator(
           {
