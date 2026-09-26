@@ -71,6 +71,10 @@ import {
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
+// Presigned thumbnail loading (issue #801). The thumbnail cell is rendered
+// src-less and filled in after each render — see hydrateThumbnails() below and
+// the contract grounding in public/thumbnail-url.js.
+import { applyThumbnail } from './thumbnail-url.js';
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
 
 // ─── Contract constants (verified above) ─────────────────────────────────────
@@ -351,11 +355,19 @@ function buildColumns(renderCtx) {
       key: 'thumb',
       label: '',
       width: '52px',
+      // Rendered WITHOUT a src (issue #801): pointing an <img> at the API's
+      // thumbnail byte route can never work, because the browser's <img> GET
+      // carries no Authorization header for the router's bearer gate. The src is
+      // filled in after render by hydrateThumbnails(), which asks the API for a
+      // signed URL over the authenticated apiFetch. Until it arrives — and if it
+      // never does — the element carries `thumb-placeholder` and shows the same
+      // empty box as an asset with no thumbnails, never a broken-image icon.
       render: (a) =>
         a.thumbnails && a.thumbnails.length
-          ? '<img src="/api/v1/assets/' +
+          ? '<img class="thumb-xs thumb-placeholder" alt="" loading="lazy"' +
+            ' data-thumb-asset-id="' +
             escHtml(a.id) +
-            '/thumbnails/0" class="thumb-xs" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+            '" data-thumb-index="0">'
           : '<div class="thumb-xs thumb-placeholder"></div>',
     },
     // Issue #851: the column headed "ID" carries the ULID `id` — the value every
@@ -435,6 +447,33 @@ function buildColumns(renderCtx) {
       },
     },
   ];
+}
+
+// ─── Thumbnail hydration (issue #801) ─────────────────────────────────────────
+//
+// Fill in the src of every thumbnail <img> on the page of rows just rendered.
+// The cell renderer above cannot do this itself: it returns a synchronous HTML
+// string, while obtaining a loadable URL needs an authenticated round-trip to
+// GET /assets/:id/thumbnails/:index/url (contract in public/thumbnail-url.js).
+//
+// Cost is bounded by the page size — at most one request per visible row that
+// actually has a thumbnail, issued once per render, never per repaint (a second
+// request follows only for a row whose signed URL could not be issued or loaded,
+// which then falls back to the authenticated byte route). Failures are silent by
+// design: the row keeps its placeholder box (applyThumbnail re-applies
+// `thumb-placeholder`) rather than turning a storage hiccup into a table-wide
+// error. A response that arrives after the rows were replaced lands on a
+// detached element and is discarded with it.
+function hydrateThumbnails(tbodyEl, apiFetch) {
+  if (!tbodyEl || typeof apiFetch !== 'function') return;
+  tbodyEl.querySelectorAll('img[data-thumb-asset-id]').forEach(function (img) {
+    void applyThumbnail(img, {
+      apiFetch,
+      assetId: img.getAttribute('data-thumb-asset-id'),
+      index: img.getAttribute('data-thumb-index'),
+      placeholderClass: 'thumb-placeholder',
+    });
+  });
 }
 
 // ─── Public factory ───────────────────────────────────────────────────────────
@@ -566,6 +605,9 @@ export function createAssetsTable(deps) {
   function wireRowHandlers() {
     const tbody = table.el.querySelector('tbody');
     if (!tbody) return;
+
+    // Thumbnails are rendered src-less and resolved here (issue #801).
+    hydrateThumbnails(tbody, d.apiFetch);
 
     // Click-to-copy for the asset id cell (issue #851). Bound before the row
     // handler below; the copy handler stops propagation so copying an id does

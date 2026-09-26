@@ -22,6 +22,10 @@ import { createLogsTable } from './logs-table.js';
 // but push medium/large files straight to MinIO via the presigned single-part
 // and multipart routes so they never hit the proxy's request-body limit.
 import { uploadAssetFile, describeUploadFailure } from './upload.js';
+// Presigned thumbnail loading (issue #801). An <img> GET carries no
+// Authorization header, so thumbnails are resolved to a short-lived signed URL
+// over apiFetch first. Contract grounding lives in public/thumbnail-url.js.
+import { applyThumbnail } from './thumbnail-url.js';
 // Copyable identifier cells (issue #851). A column headed "ID" shows the ULID
 // the API accepts as an asset id, as selectable text with a click-to-copy
 // button; slugs are shown under their own "Slug" header. Contract grounding for
@@ -178,7 +182,13 @@ function uiAuthHeader() {
 
 const API_BASE = window.location.origin + '/api/v1';
 
-async function apiFetch(path, options = {}) {
+// `options.raw` (issue #801): resolve with the Response itself instead of a
+// parsed JSON body, for routes that serve bytes rather than JSON — e.g.
+// GET /api/v1/assets/:id/thumbnails/:index, which streams image/jpeg
+// (src/routes/assets.ts:4391-4405). Non-ok handling is unchanged, so a caller
+// still sees the same thrown Error for 404/501. `raw` is stripped before the
+// options reach fetch(); it is not a fetch init field.
+async function apiFetch(path, { raw = false, ...options } = {}) {
   const stack = stackOverride || getActiveStack();
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
@@ -211,6 +221,7 @@ async function apiFetch(path, options = {}) {
     err.body = body;
     throw err;
   }
+  if (raw) return res;
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
     return res.json();
@@ -2050,9 +2061,9 @@ async function renderAssetDetailBody(id, bodyEl) {
       // First fetch existing thumbnails; if none, extract at 0s, 25%, 50%, 75%
       try {
         var existing = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails');
-        var existingUrls = existing && existing.thumbnails ? existing.thumbnails : [];
-        if (existingUrls.length) {
-          renderThumbnailStrip(thumbArea, existingUrls);
+        var existingThumbs = existing && existing.thumbnails ? existing.thumbnails : [];
+        if (existingThumbs.length) {
+          renderThumbnailStrip(thumbArea, id, existingThumbs.length);
           return;
         }
         // Extract using duration from technicalMetadata if available
@@ -2063,9 +2074,13 @@ async function renderAssetDetailBody(id, bodyEl) {
         var r = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails',
           { method: 'POST', body: JSON.stringify({ timecodes: timecodes }) });
         actionMsg.innerHTML = '';
-        var urls = r && r.thumbnails ? r.thumbnails : [];
-        if (urls.length) {
-          renderThumbnailStrip(thumbArea, urls);
+        // POST returns the object keys it just stored, and the runner replaces the
+        // asset's whole `thumbnails` array with exactly that list
+        // (src/pipeline/thumbnail.ts:164), so position i here is position i on the
+        // asset — the index the presigned-URL route is keyed by.
+        var extracted = r && r.thumbnails ? r.thumbnails : [];
+        if (extracted.length) {
+          renderThumbnailStrip(thumbArea, id, extracted.length);
         } else {
           showMsg(actionMsg, 'Thumbnails extracted.', 'success');
         }
@@ -2074,19 +2089,48 @@ async function renderAssetDetailBody(id, bodyEl) {
       }
     });
 
-    function renderThumbnailStrip(container, urls) {
+    // Render `count` thumbnails for `assetId`, addressed by their position in the
+    // asset's `thumbnails` array — the key both the listing route and the
+    // presigned-URL route use (see public/thumbnail-url.js for the contract).
+    //
+    // The <img> elements are created up front, in order, but WITHOUT a src: the
+    // API's thumbnail byte route sits behind the bearer gate and a browser's
+    // <img> GET sends no Authorization header (issue #801). Each src is then
+    // filled in from the presigned-URL endpoint over the authenticated apiFetch,
+    // so the browser's GET to storage carries the signature in the URL itself.
+    // Creating the elements first keeps the strip in index order regardless of
+    // which signature is issued first; one whose URL cannot be issued falls back
+    // to the authenticated byte route's bytes, and one that neither source can
+    // resolve is dropped rather than left as a broken-image icon.
+    function renderThumbnailStrip(container, assetId, count) {
+      if (!count) return;
+      var strip = document.createElement('div');
+      strip.className = 'thumbnails';
+      // The "Thumbnails" heading is added by the FIRST image that actually
+      // resolves, not up front: an image that cannot be resolved removes itself,
+      // so a heading written in advance can end up labelling an empty strip.
       var titleEl = document.createElement('div');
       titleEl.className = 'section-title mt12';
       titleEl.textContent = 'Thumbnails';
-      container.appendChild(titleEl);
-      var strip = document.createElement('div');
-      strip.className = 'thumbnails';
-      urls.forEach(function(u) {
+      function showTitle() {
+        if (titleEl.parentNode) return;
+        if (strip.parentNode === container) container.insertBefore(titleEl, strip);
+        else container.appendChild(titleEl);
+      }
+      for (var i = 0; i < count; i++) {
         var img = document.createElement('img');
-        img.src = u;
         img.alt = 'thumbnail';
         strip.appendChild(img);
-      });
+        applyThumbnail(img, {
+          apiFetch: apiFetch,
+          assetId: assetId,
+          index: i,
+          onSuccess: showTitle,
+          onFailure: (function(el) {
+            return function() { el.remove(); };
+          })(img)
+        });
+      }
       container.appendChild(strip);
     }
 

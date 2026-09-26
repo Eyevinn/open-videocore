@@ -4680,10 +4680,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // the cluster (#113). That no longer reproduces — re-verified 2026-09-25 from
   // outside the cluster: presigned anonymous GET → 200 image/jpeg, unsigned →
   // 403 AccessDenied, tampered → 403 SignatureDoesNotMatch, expired → 403
-  // AccessDenied. So `/:id/thumbnails/:index/url` below is now the browser path
-  // (see #800), and this route stays for server-to-server callers that already
-  // hold a token and for deployments whose object store is not reachable from
-  // the client. Coverage: test/thumbnail-unauthenticated-fetch.test.ts.
+  // AccessDenied (docs/osc-feedback/incoming-presigned-get-thumbnails.md). So
+  // `/:id/thumbnails/:index/url` below is now the browser path (see #800), and
+  // this route stays for server-to-server callers that already hold a token and
+  // for deployments whose object store is not reachable from the client — it is
+  // also the fallback the ops UI drops back to when a deployment cannot presign
+  // (public/thumbnail-url.js, issue #801). Coverage:
+  // test/thumbnail-unauthenticated-fetch.test.ts.
   //   200 — image/jpeg stream
   //   404 — unknown asset or out-of-range index
   //   501 — storage not configured
