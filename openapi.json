@@ -8410,6 +8410,7 @@
                     "enum": [
                       "transcode",
                       "abr-vod",
+                      "package",
                       "ingest",
                       "subtitles",
                       "scene-detect",
