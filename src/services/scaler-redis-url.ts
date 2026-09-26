@@ -19,10 +19,15 @@
 // Contract sources verified (CLAUDE.md rule 7):
 //   - WorkspaceStackResolver.resolveStackConfig(stackName?):
 //     Promise<StackConfig | undefined> — src/services/workspace-stack.ts.
-//     It derives the namespace via deriveWorkspaceId(oscContext)
-//     (workspace-stack.ts:403) and reads through
+//     It resolves the namespace via resolveNamespace() and reads through
 //     loadStackConfigWithLegacyFallback / listStackNamesWithLegacyFallback
-//     (workspace-stack.ts:481,524 — the #751/#733 helpers).
+//     (the #751/#733 helpers).
+//     NOTE (#804): this used to say `deriveWorkspaceId(oscContext)`. It no
+//     longer does. resolveStackConfig now shares resolveNamespace() with the
+//     rest of the resolver, so it honours the credential-derived tenant, the
+//     persisted pin and the seeded-from-stored-stacks namespace — where
+//     deriveWorkspaceId consulted none of those. Same namespace as every other
+//     consumer, which is the whole point of routing through the resolver.
 //   - StackConfig.redisUrl: string — src/services/param-store.ts:63.
 //   - ParamStore.loadStackConfig / listStackNames — src/services/param-store.ts:108-125.
 
