@@ -25,11 +25,21 @@
 //     source? }, resolution?, expiresAt }. Loadable URL field for a
 //     `<video>`/`<source>`: `urls.source` — the presigned GET on the stored
 //     source object (src/routes/assets.ts:3256).
+//   - GET /api/v1/assets/{id}/stream/{*} (issue #201) — the shape the helper's
+//     backstop must REFUSE, not consume.
+//     openapi.json .paths["/api/v1/assets/{id}/stream/{*}"].get → 200 only;
+//     src/routes/assets.ts:3287 (`'/:id/stream/*'`), behind the router-wide
+//     bearer gate `authGate` (:1573). Under DELIVERY_MODE=proxy this is exactly
+//     what `urls.hls`/`urls.dash` point at, as an ABSOLUTE URL
+//     (`proxyManifestUrlsFor`, src/pipeline/packaging.ts:269, over a base the
+//     route has already checked is absolute, src/routes/assets.ts:3151).
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   applyPresignedMediaSrc,
   assignMediaSrc,
+  clearMediaSrc,
+  isBearerGatedStreamUrl,
   isLoadableMediaUrl,
   readMediaUrl,
 } from '../public/media-src.js';
@@ -77,6 +87,59 @@ describe('isLoadableMediaUrl', () => {
   it('refuses script-bearing and inline-data schemes', () => {
     expect(isLoadableMediaUrl('javascript:alert(1)')).toBe(false);
     expect(isLoadableMediaUrl('data:image/png;base64,AAAA')).toBe(false);
+  });
+});
+
+describe('isBearerGatedStreamUrl', () => {
+  // The relative gated path above is already refused by the `^https?://` scheme
+  // check, so it does not exercise this backstop at all. The form that DOES need
+  // it is the ABSOLUTE one, which is the only form a caller can actually receive:
+  // under DELIVERY_MODE=proxy the delivery route early-returns
+  // `notConfiguredDelivery` unless the proxy base is absolute
+  // (src/routes/assets.ts:3151), and `proxyManifestUrlsFor`
+  // (src/pipeline/packaging.ts:269) appends `<id>/stream/index.m3u8`
+  // (`proxyStreamPrefix`, :259) to that absolute base. The resulting URL is the
+  // bearer-gated `'/:id/stream/*'` route (src/routes/assets.ts:3287, behind the
+  // router-wide `authGate` at :1573; openapi.json
+  // → .paths["/api/v1/assets/{id}/stream/{*}"].get, 200 only), which an inline
+  // element can never authenticate against — the #785/#802 failure itself.
+  it('refuses the ABSOLUTE gated stream URLs the delivery route can emit', () => {
+    const proxyHls = 'https://api.example/api/v1/assets/a1/stream/index.m3u8';
+    const proxyDash = 'https://api.example/api/v1/assets/a1/stream/manifest.mpd';
+
+    expect(isBearerGatedStreamUrl(proxyHls)).toBe(true);
+    expect(isBearerGatedStreamUrl(proxyDash)).toBe(true);
+    // ...and therefore never loadable, despite passing every other check.
+    expect(/^https?:\/\//i.test(proxyHls)).toBe(true);
+    expect(isLoadableMediaUrl(proxyHls)).toBe(false);
+    expect(isLoadableMediaUrl(proxyDash)).toBe(false);
+
+    // The bare prefix (trailing-segment anchor) and a differently-cased origin.
+    expect(isLoadableMediaUrl('https://api.example/api/v1/assets/a1/stream')).toBe(false);
+    expect(isLoadableMediaUrl('https://API.EXAMPLE/API/V1/ASSETS/a1/STREAM/index.m3u8')).toBe(
+      false
+    );
+  });
+
+  it('does not over-match the presigned storage URLs the pattern depends on', () => {
+    // Anchoring pin: if the guard is ever widened, these must keep passing.
+    // Object keys we mint live under `packaged/` (`outputPrefix`,
+    // src/pipeline/packaging.ts:63), `sources/`, `ingest/`, `thumbnails/` and
+    // `subtitles/` — none can produce an `assets/<one segment>/stream` run.
+    expect(isLoadableMediaUrl('https://storage.example/packaged/a1/index.m3u8?sig=x')).toBe(true);
+    expect(isLoadableMediaUrl(SIGNED_VIDEO)).toBe(true);
+    expect(isLoadableMediaUrl(SIGNED_IMAGE)).toBe(true);
+    // Matched on the PATH only: a query value that merely mentions the gated
+    // shape (a signature, a redirect hint) must not trip it.
+    expect(
+      isLoadableMediaUrl(
+        'https://storage.example/packaged/a1/index.m3u8?next=/assets/a1/stream/index.m3u8'
+      )
+    ).toBe(true);
+    // The anchor does not eat a longer path segment.
+    expect(isLoadableMediaUrl('https://api.example/api/v1/assets/a1/streaming/x.mp4')).toBe(true);
+    expect(isBearerGatedStreamUrl('')).toBe(false);
+    expect(isBearerGatedStreamUrl(undefined)).toBe(false);
   });
 });
 
@@ -129,6 +192,34 @@ describe('assignMediaSrc', () => {
     const video = document.createElement('video');
     expect(assignMediaSrc(video, '/api/v1/assets/a1/stream/index.m3u8')).toBe(false);
     expect(video.hasAttribute('src')).toBe(false);
+    // ...including the absolute form of the same gated route.
+    expect(assignMediaSrc(video, 'https://api.example/api/v1/assets/a1/stream/index.m3u8')).toBe(
+      false
+    );
+    expect(video.hasAttribute('src')).toBe(false);
+  });
+});
+
+describe('clearMediaSrc', () => {
+  it('drops the src of a plain element', () => {
+    const img = document.createElement('img');
+    img.setAttribute('src', SIGNED_IMAGE);
+    expect(clearMediaSrc(img)).toBe(true);
+    expect(img.hasAttribute('src')).toBe(false);
+  });
+
+  it('re-selects the parent after clearing a <source>', () => {
+    // The clearing direction of the same asymmetry `assignMediaSrc` handles.
+    const video = document.createElement('video');
+    const load = vi.fn();
+    (video as unknown as { load: unknown }).load = load;
+    const source = document.createElement('source');
+    source.setAttribute('src', SIGNED_VIDEO);
+    video.appendChild(source);
+
+    expect(clearMediaSrc(source)).toBe(true);
+    expect(source.hasAttribute('src')).toBe(false);
+    expect(load).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -218,6 +309,126 @@ describe('applyPresignedMediaSrc', () => {
 
     expect(ok).toBe(false);
     expect(video.hasAttribute('src')).toBe(false);
+    expect(onFailure).toHaveBeenCalledTimes(1);
+  });
+
+  it('never assigns a src when delivery issues an ABSOLUTE gated stream URL', async () => {
+    // The end-to-end form of the backstop above, and the exact call a contributor
+    // might reach for: `urlField: 'urls.hls'` against a proxy-mode delivery
+    // response. `urls.hls` there is an absolute URL on the bearer-gated
+    // `/assets/:id/stream/*` route, so assigning it would 401 in the element.
+    // The helper must refuse it locally instead (openapi.json
+    // → .paths["/api/v1/assets/{id}/delivery"].get, `urls: { hls?, dash?, source? }`,
+    // all optional; src/routes/assets.ts:520 `deliveryUrlsSchema`).
+    const video = document.createElement('video');
+    const proxyDelivery = vi.fn(async () => ({
+      assetId: 'a1',
+      status: 'ready',
+      urls: {
+        hls: 'https://api.example/api/v1/assets/a1/stream/index.m3u8',
+        dash: 'https://api.example/api/v1/assets/a1/stream/manifest.mpd',
+      },
+      expiresAt: '2026-01-01T01:00:00Z',
+    }));
+    const onFailure = vi.fn();
+
+    const ok = await applyPresignedMediaSrc(video, {
+      apiFetch: proxyDelivery,
+      urlPath: '/assets/a1/delivery',
+      urlField: 'urls.hls',
+      onFailure,
+    });
+
+    expect(ok).toBe(false);
+    expect(video.hasAttribute('src')).toBe(false);
+    expect(onFailure).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the LAST call win on a reused element, without accumulating listeners', async () => {
+    // Elements are reused: a re-rendered row, a thumbnail strip repopulated for
+    // another asset. A superseded in-flight call must not win by resolving last,
+    // must not strip the newer healthy src, and must not report a failure.
+    const img = document.createElement('img');
+    const addSpy = vi.spyOn(img, 'addEventListener');
+    const removeSpy = vi.spyOn(img, 'removeEventListener');
+
+    let releaseFirst: (body: unknown) => void = () => {};
+    const pending = new Promise((resolve) => {
+      releaseFirst = resolve;
+    });
+    const slow = vi.fn(async () => pending);
+    const SECOND_URL = 'https://storage.example/thumbnails/a2/thumb_0s.jpg?sig=two';
+    const fast = vi.fn(async () => ({ ...thumbnailUrlBody, assetId: 'a2', url: SECOND_URL }));
+
+    const staleSuccess = vi.fn();
+    const staleFailure = vi.fn();
+    const first = applyPresignedMediaSrc(img, {
+      apiFetch: slow,
+      urlPath: '/assets/a1/thumbnails/0/url',
+      onSuccess: staleSuccess,
+      onFailure: staleFailure,
+    });
+
+    const second = await applyPresignedMediaSrc(img, {
+      apiFetch: fast,
+      urlPath: '/assets/a2/thumbnails/0/url',
+    });
+
+    expect(second).toBe(true);
+    expect(img.getAttribute('src')).toBe(SECOND_URL);
+
+    // The superseded call now resolves, late, with the FIRST asset's URL.
+    releaseFirst(thumbnailUrlBody);
+    await expect(first).resolves.toBe(false);
+
+    expect(img.getAttribute('src')).toBe(SECOND_URL);
+    expect(staleSuccess).not.toHaveBeenCalled();
+    expect(staleFailure).not.toHaveBeenCalled();
+
+    // Two invocations, two registrations, one retirement — exactly one live
+    // `error` listener, so handlers cannot pile up across re-renders.
+    const added = addSpy.mock.calls.filter(([type]) => type === 'error');
+    const removed = removeSpy.mock.calls.filter(([type]) => type === 'error');
+    expect(added).toHaveLength(2);
+    expect(removed).toHaveLength(1);
+
+    // And a single error event now runs only the surviving invocation's teardown.
+    img.dispatchEvent(new Event('error'));
+    await settle();
+    expect(img.hasAttribute('src')).toBe(false);
+    expect(staleFailure).not.toHaveBeenCalled();
+  });
+
+  it("re-selects the parent <video> when a <source>'s signed URL fails to load", async () => {
+    // A `<source>` never unloads anything itself: the parent has already SELECTED
+    // that resource, so clearing the child's src is invisible until `load()`
+    // re-runs selection over the now-empty candidate list. Without it the parent
+    // stays bound to the resource that just failed.
+    const video = document.createElement('video');
+    const load = vi.fn();
+    (video as unknown as { load: unknown }).load = load;
+    const source = document.createElement('source');
+    video.appendChild(source);
+    const onFailure = vi.fn();
+
+    const ok = await applyPresignedMediaSrc(source, {
+      apiFetch,
+      urlPath: '/assets/a1/delivery',
+      urlField: 'urls.source',
+      onFailure,
+    });
+
+    expect(ok).toBe(true);
+    expect(source.getAttribute('src')).toBe(SIGNED_VIDEO);
+    expect(load).toHaveBeenCalledTimes(1);
+
+    // The signature expires (or storage refuses the signed GET) while the element
+    // is showing it: that arrives as the `<source>`'s own `error` event.
+    source.dispatchEvent(new Event('error'));
+    await settle();
+
+    expect(source.hasAttribute('src')).toBe(false);
+    expect(load).toHaveBeenCalledTimes(2);
     expect(onFailure).toHaveBeenCalledTimes(1);
   });
 
