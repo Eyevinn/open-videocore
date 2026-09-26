@@ -191,6 +191,13 @@ interaction model (single synchronous call vs create-then-poll), and a response 
 the service never produces. Left unchanged here deliberately — #797 is confirmation
 only; #798 is the fix.
 
+**Update (#798, 2026-09-26):** the first three — path, field name and interaction
+model — are now fixed in `src/pipeline/osc-scene-detect.ts`, which POSTs
+`{ medialocator }` to `/api/v1` and polls the `status` endpoint the response hands
+back. The fourth is not fixable at this layer: a completed job yields zero
+boundaries, so `sceneMetadata` is written empty. Point 3 above (what `sceneMetadata`
+should actually carry) is still open and still an architect/ux decision.
+
 ## What OSC tooling could and could not tell us
 
 `get-service-schema(eyevinn-function-scenes)` returns only the **deployment** config

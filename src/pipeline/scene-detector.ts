@@ -26,8 +26,8 @@
 //
 // The OSC call itself is injected as a `SceneDetector` so it can be stubbed in
 // tests and swapped without touching the orchestration logic, and — crucially —
-// so the un-contract-verified runtime wire shape stays isolated in exactly one
-// place (osc-scene-detect.ts).
+// so the runtime wire shape stays isolated in exactly one place
+// (osc-scene-detect.ts).
 //
 // Contract sources (runtime shape confirmed 2026-09-25, issue #797):
 //   - eyevinn-function-scenes ("Scene Detect Media Function"), get-service-schema:
@@ -36,17 +36,22 @@
 //     config, NOT the runtime endpoint's request/response wire shape.
 //   - The runtime shape was instead confirmed from the upstream service source
 //     `Eyevinn/function-scenes` @ 492a18f23e253194c27800563ea0c96bef187aef —
-//     `api.json` (`#/model/request.medialocator`, `#/model/createJobResponse`) and
-//     the `index.js` route table. It is an ASYNC JOB API rooted at `/api/v1`, and
-//     it returns only keyframe image URIs — see
+//     `api.json` (`#/model/request.medialocator`, `#/model/createJobResponse`,
+//     `#/model/job.state`) and the `index.js` route table. It is an ASYNC JOB API
+//     rooted at `/api/v1`, and it returns only keyframe image URIs — see
 //     docs/investigations/797-function-scenes-runtime-contract.md.
 //   - services/stack.ts SCENE_DETECT_SERVICE_ID.
 //
-// NOTE (#798): the confirmed service returns NO scene-boundary timecodes, so the
-// `scenes`/`cuts` result modelled below cannot be populated from it as things
-// stand. `sceneMetadata` needs re-scoping (keyframe URIs, or a different source
-// for cut timecodes) before this step can work end to end; the types are left
-// unchanged here because #797 is contract-confirmation only.
+// NOTE (#798): osc-scene-detect.ts now speaks that confirmed contract (POST
+// /api/v1 + `medialocator`, then poll the returned status endpoint), so runs no
+// longer 405. But the service still returns NO scene-boundary timecodes, so the
+// `scenes`/`cuts` result modelled below cannot be populated from it: a successful
+// run writes `sceneMetadata` with ZERO boundaries, and that is reported as success
+// rather than as `sceneDetectionError`, which is reserved for genuine detection
+// failures. Making the step useful end to end needs `sceneMetadata` re-scoped
+// (keyframe URIs, which is an openapi.json change) or a different source for cut
+// timecodes — an architect/ux decision, not an implementation detail, so the types
+// are left unchanged here.
 
 import type { AssetRepository, SceneMetadata, SceneBoundary } from '../data/asset-repo.js';
 import type { WorkspaceStorage } from '../data/storage.js';
