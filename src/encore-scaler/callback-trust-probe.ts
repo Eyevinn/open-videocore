@@ -28,10 +28,11 @@
 //   - EncoreInstanceRecord.callbackListenerUrl?: string — the paired listener's
 //     HTTP base URL, undefined until the listener is ready
 //     (src/encore-scaler/types.ts:88-89, set in instance-pool.ts:259).
-//   - The dispatch-time callback URI is `${callbackListenerUrl}/encoreCallback`
-//     (src/encore-scaler/scaler-loop.ts:272-273). We probe the ingress ORIGIN,
-//     not a specific route, so a 404 from the listener still proves the TLS
-//     trust path is established (the handshake completed).
+//   - The dispatch-time callback URI is
+//     `${inst.callbackListenerUrl.replace(/\/$/, '')}/encoreCallback`
+//     (src/encore-scaler/scaler-loop.ts, dispatch(): the `progressCallbackUri`
+//     assignment). The probe targets that EXACT URL — see the #814 note below
+//     for why probing the bare ingress origin was not enough.
 //   - Node global fetch + AbortSignal.timeout for the bounded wait: same
 //     fetch(...) usage the scaler already relies on in scaler-loop.ts:275 and
 //     reconcile() (scaler-loop.ts:214-220), with a bounded timeout added.
@@ -48,6 +49,48 @@
 // TLS layer, but not usable. Every other status (404/405 from a HEAD on `/`,
 // 5xx while the listener finishes booting) still means "trusted" — those prove
 // the handshake without proving anything about authorisation.
+//
+// PROBE THE CALLBACK PATH, NOT THE ORIGIN (issue #814)
+// ----------------------------------------------------
+// Grading 401/403 as unusable only helps if the URL we grade is the URL Encore
+// actually POSTs to. It was not: this probe used to rewrite the target to
+// `new URL(callbackListenerUrl).origin`, and on a freshly created listener the
+// origin starts answering BEFORE the callback path does. Measured live against
+// two throwaway `eyevinn-encore-callback-listener` instances created and
+// destroyed for this change (2026-09-26, tenant `oscaidev`), polling from
+// instance creation:
+//
+//   run A (diag814a)              run B (diag814b, ~1s resolution)
+//   t+25s origin 200,             t+29s GET /encoreCallback 401 (nginx HTML)
+//         /encoreCallback 401     t+30s origin 200, /encoreCallback 401
+//   t+41s origin 404 (Fastify),   t+43s origin 200, /encoreCallback 401
+//         POST /encoreCallback    t+44s origin 404 (Fastify),
+//         200                           GET /encoreCallback 404,
+//                                       POST /encoreCallback 200
+//
+// So for ~14s the origin answers 200 while `/encoreCallback` is still behind
+// the ingress auth wall. A 200 is not in CALLBACK_REJECTED_STATUSES, so the
+// origin-targeted probe returned 'trusted', `callbackTrustReady` was latched
+// (it is sticky), and the instance's first job was dispatched straight into the
+// 401 window — the failure reported in #811/#812. Targeting `/encoreCallback`
+// makes the 401/403 grading reachable in exactly that window.
+//
+// Two live facts this relies on, both verified rather than assumed:
+//   - In steady state `HEAD`/`GET /encoreCallback` returns Fastify's own 404
+//     (`{"message":"Route GET:/encoreCallback not found",...}`), NOT a 401 —
+//     checked unauthenticated on three warm instances on 2026-09-26. 404 is not
+//     a rejected status, so a healthy listener still grades as 'trusted'.
+//   - During the window the ingress verdict is method-independent: `GET`,
+//     `HEAD` and `POST` on `/encoreCallback` returned 401 together in run B and
+//     flipped together at t+44s. (#812's finding could only infer this and
+//     asked #814 to confirm it directly. Now confirmed.)
+//
+// The probe deliberately stays on HEAD. A POST would be graded identically but
+// would enqueue a synthetic progress callback into the listener's Redis queue.
+//
+// Why this is a mitigation and not a fix at the real layer: Encore cannot be
+// given a credential for this leg at all — see the #814 note in
+// docs/osc-feedback/incoming-callback-listener-ingress-auth-window-fresh-instance.md.
 
 // Result of a single probe attempt.
 //   - state 'trusted'          — handshake completed AND the ingress did not
@@ -122,20 +165,38 @@ export type FetchLike = (
   init?: { method?: string; signal?: AbortSignal }
 ) => Promise<{ status: number }>;
 
-// Perform ONE bounded trust/usability probe against the callback-listener
-// ingress origin. Resolves to state 'trusted' when the HTTPS request completes
-// a handshake and the ingress did not reject it, 'callback-unusable' on a
-// 401/403 (issue #813), else classifies the transport failure. Never throws.
+// The path Encore POSTs its progress callbacks to, appended to the paired
+// listener's base URL. Must stay byte-identical to the `progressCallbackUri`
+// the scaler injects at dispatch time (scaler-loop.ts), because the whole point
+// of the probe is to grade the URL Encore will actually use (#814).
+export const CALLBACK_PATH = '/encoreCallback';
+
+// Build the exact URL Encore will POST to (strip one trailing slash, append the
+// callback path). Used by BOTH the dispatch-time `progressCallbackUri`
+// injection and this probe, so the two can never drift apart — a probe of a
+// different URL than Encore uses is what #814 was about. Throws if
+// `callbackListenerUrl` is not a valid URL.
+export function buildCallbackUri(callbackListenerUrl: string): string {
+  // Parse for validation only — we keep the caller's base URL rather than
+  // reducing it to `origin`, so a listener published under a sub-path still
+  // resolves to the same URI the scaler injects.
+  new URL(callbackListenerUrl);
+  return `${callbackListenerUrl.replace(/\/$/, '')}${CALLBACK_PATH}`;
+}
+
+// Perform ONE bounded trust/usability probe against the callback-listener's
+// `/encoreCallback` path — the exact URI Encore is told to POST to (#814).
+// Resolves to state 'trusted' when the HTTPS request completes a handshake and
+// the ingress did not reject it, 'callback-unusable' on a 401/403 (issue #813),
+// else classifies the transport failure. Never throws.
 export async function probeCallbackTrust(
   callbackListenerUrl: string,
   timeoutMs: number,
   fetchImpl: FetchLike = fetch as unknown as FetchLike
 ): Promise<CallbackTrustProbeResult> {
-  let origin: string;
+  let target: string;
   try {
-    // Probe the ingress ORIGIN — the handshake is to the hostname, so the exact
-    // path is irrelevant; a 404 still proves the cert is trusted.
-    origin = new URL(callbackListenerUrl).origin;
+    target = buildCallbackUri(callbackListenerUrl);
   } catch {
     return {
       ok: false,
@@ -146,21 +207,25 @@ export async function probeCallbackTrust(
   }
 
   try {
-    // A HEAD keeps the probe cheap; we only need the handshake to complete and
-    // the ingress's answer to it.
-    const res = await fetchImpl(origin, {
+    // A HEAD keeps the probe cheap and, unlike a POST, does not enqueue a
+    // synthetic progress callback: the listener has no GET/HEAD route for this
+    // path, so a healthy instance answers Fastify's own 404 (verified live,
+    // see the header note). We only need the handshake to complete and the
+    // ingress's answer to it.
+    const res = await fetchImpl(target, {
       method: 'HEAD',
       signal: AbortSignal.timeout(timeoutMs)
     });
     // A 401/403 means the handshake succeeded but the ingress is rejecting
-    // requests: Encore's callback POST to this same origin will be rejected the
-    // same way, so the callback path is NOT usable (issue #813).
+    // requests on the callback path itself: Encore's callback POST to this
+    // exact URI will be rejected the same way, so the path is NOT usable
+    // (issue #813, aimed at the right URL by #814).
     if (CALLBACK_REJECTED_STATUSES.has(res.status)) {
       return {
         ok: false,
         state: 'callback-unusable',
         status: res.status,
-        detail: `callback-listener ingress rejected the probe with HTTP ${res.status} — the callback path is reachable but not usable`
+        detail: `callback-listener ingress rejected the probe of ${target} with HTTP ${res.status} — the callback path is reachable but not usable`
       };
     }
     // Any other HTTP response — including 404/405 — means the TLS handshake

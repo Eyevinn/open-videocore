@@ -102,14 +102,72 @@ the ingress did require one — the only available lever is *when* we dispatch.
    (`@osaas/client-core@0.24.0` `lib/context.js:24-31`); the 500 makes an auth
    mistake look like a platform outage.
 
-## Workaround in this repo
+## Workaround in this repo — now implemented (`#814`, 2026-09-26)
 
-Probe the callback path itself rather than the ingress origin, and keep a
-poll-based backstop for terminal job state
-(`src/pipeline/encore-callback-poller.ts` `sweepTerminalJobs`) so a missed
-callback degrades to slower completion rather than a stuck job. Tracked as `#814`.
-No OSC change is required to unblock that fix — this log is about the platform
-gap that makes the workaround necessary, not a blocker on it.
+`#814` was filed as "give Encore a credential to authenticate its progress
+callback". That is **not implementable**, and re-verifying it live is what
+selected the workaround below. Per the issue's own second direction bullet
+("if the 401 originates from an OSC platform-level ingress policy Encore cannot
+satisfy: this is an OSC capability gap … log it alongside a description of the
+workaround/mitigation chosen here"), this section is that description.
+
+**Why the credential framing has no landing zone** (both re-fetched live
+2026-09-26, not inherited from the earlier session):
+
+- Encore cannot carry one. `GET <encore-instance>/v3/api-docs` →
+  `components.schemas.EncoreJobRequestBody.properties.progressCallbackUri` is
+  `{"type":"string"}`, and the full property set contains no auth/token/
+  credential/header/secret/bearer/apiKey field. `components` has only `schemas`
+  (**no `securitySchemes`**), there is no top-level `security`, and
+  `POST /encoreJobs` declares no header parameters.
+- The listener cannot validate one. `availableServiceInstanceOptions` is still
+  exactly `["name","RedisUrl","EncoreUrl","RedisQueue"]`.
+
+**Mitigation shipped instead:** the readiness gate now probes the callback path
+rather than the ingress origin. `probeCallbackTrust()` targets
+`${callbackListenerUrl}/encoreCallback` — built by the shared
+`buildCallbackUri()` helper that the dispatch-time `progressCallbackUri`
+injection also uses, so the URL we grade and the URL Encore POSTs to cannot
+drift. The existing `#813`/`#818` grading (401/403 → `callback-unusable`) then
+fires during the window, holding the instance ineligible for its first job until
+the window closes, and `sweepTerminalJobs`
+(`src/pipeline/encore-callback-poller.ts`) stays as the completion backstop.
+
+The mitigation is timing-only. It does not make the callback leg authenticated —
+it cannot, per the two contracts above — so requested capabilities 1 and 2 below
+still stand.
+
+### Two facts confirmed for the first time while implementing this
+
+Two throwaway instances (`diag814a`, `diag814b`) were created and destroyed
+(both `DELETE` → 204; instance list re-read afterwards, no residue) on
+2026-09-26, polling from creation:
+
+1. **The ingress verdict during the window is method-independent.**
+   `docs/findings/callback-401-812.md` could only *infer* this and asked `#814`
+   to confirm it directly. Confirmed: in `diag814b`, `GET`, `HEAD` and `POST` on
+   `/encoreCallback` all returned 401 together from t+29 s to t+43 s and all
+   flipped together at t+44 s. A `HEAD` probe is therefore a faithful proxy for
+   the `POST` Encore makes, without enqueuing a synthetic callback.
+2. **The phase-2 `200` on `/` is not the application.** It is served while
+   `/encoreCallback` is still 401 and disappears the moment the application
+   comes up, at which point `/` flips to Fastify's 404 — in `diag814b`, `origin`
+   went 200 → 404 at exactly the t+44 s tick that `POST /encoreCallback` went
+   401 → 200. This narrows, but does not fully settle, the "not determined"
+   question in §1 above: whatever answers `/` with a 200 during phase 2 stops
+   doing so once the app is live, which is consistent with reading (b) (an
+   ingress-level placeholder) and not with `/` being served by the application.
+   The mechanism inside the ingress remains unobservable from outside.
+
+Measured window, both runs (t = seconds from instance creation):
+
+| | origin `/` 200 from | `/encoreCallback` 401 until | window length |
+|---|---|---|---|
+| `diag814a` | t+25 s | t+38–41 s | ~14 s |
+| `diag814b` | t+30 s | t+43 s | ~14 s |
+
+This reproduces the ~13–18 s window recorded in §1 from the `#812` session, on a
+different day, so the behaviour is stable rather than a one-off.
 
 ## Contract sources verified (this session, live)
 
@@ -137,6 +195,40 @@ gap that makes the workaround necessary, not a blocker on it.
   status callback should be directed", nullable: true}`; a repo-wide grep of that
   contract for `securitySchemes`, top-level `security`, `authorization`, `bearer`,
   `apiKey`, `token`, `secret`, `credential` returns **no matches**.
-- Fresh-instance phase timings are from the two timed create/destroy runs recorded
-  in `docs/findings/callback-401-812.md` §2 (2026-09-25 session); they were not
-  re-run for this log.
+- Fresh-instance phase timings in §1 are from the two timed create/destroy runs
+  recorded in `docs/findings/callback-401-812.md` §2 (2026-09-25 session). They
+  were independently reproduced on 2026-09-26 for `#814` (runs `diag814a` /
+  `diag814b`, tabulated above).
+
+Additionally verified live 2026-09-26 while implementing `#814`:
+
+- `GET https://catalog.svc.prod.osaas.io/mysubscriptions` (`x-pat-jwt: Bearer <PAT>`)
+  → `eyevinn-encore-callback-listener`: `availableServiceInstanceOptions` =
+  `["name","RedisUrl","EncoreUrl","RedisQueue"]`, unchanged; all four
+  `serviceInstanceOptions` entries re-read, none auth/token/credential-shaped.
+- `POST https://token.svc.prod.osaas.io/servicetoken` (`x-pat-jwt: Bearer <PAT>`,
+  body `{"serviceId":"encore"}`) → `{ token }`, used as `x-jwt: Bearer <SAT>` below.
+- `GET https://oscaidev-scalerqa2609160604mu3piiqh.encore.auto.prod-se.osaas.io/v3/api-docs`
+  → HTTP 200, 22 949 bytes, `openapi: 3.1.0`, `info.title: "Encore OpenAPI"`.
+  `components` keys = `["schemas"]` only; top-level `security` absent;
+  `paths./encoreJobs.post.parameters` = none.
+  `components.schemas.EncoreJobRequestBody.properties` =
+  `baseName, completedDate, createdDate, debugOverlay, duration, externalId, id,
+  inputs, logContext, message, output, outputFolder, priority, profile,
+  profileParams, progress, progressCallbackUri, seekTo, segmentLength, speed,
+  startedDate, status, thumbnailTime` — regex scan for
+  `auth|token|credential|header|secret|bearer|apikey` over that property list
+  returns **no matches**.
+- Unauthenticated probes of three warm instances (`ovc`,
+  `scalerqabeta0911mtwkc5fu`, `scalerqa2609160604mu3piiqh`): `HEAD /` → 404,
+  `HEAD /encoreCallback` → 404, `GET /encoreCallback` → 404 with body
+  `{"message":"Route GET:/encoreCallback not found","error":"Not Found","statusCode":404}`,
+  `HEAD /healthcheck` → 401. Confirms a `HEAD` probe of `/encoreCallback` grades
+  a healthy listener as `trusted` (404 ∉ the rejected-status set), i.e. the
+  `#814` change does not regress the steady-state path.
+- In-repo call sites re-read before editing: `src/encore-scaler/scaler-loop.ts`
+  `dispatch()` (`progressCallbackUri` assignment) and `ensureCallbackTrust()`;
+  `src/encore-scaler/callback-trust-probe.ts` `probeCallbackTrust()` /
+  `CALLBACK_REJECTED_STATUSES`; `src/encore-scaler/instance-pool.ts:440-442`
+  (listener created with exactly `RedisUrl` / `EncoreUrl` / `RedisQueue`, matching
+  the catalog options).

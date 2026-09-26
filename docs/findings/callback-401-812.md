@@ -349,8 +349,12 @@ the origin is open and only the callback path is not.
 
 With #818 merged, **step 1 below is the sole remaining code change.**
 
-1. **Probe the real callback path, not the origin.** *(still outstanding — this
-   is #814)*
+1. **Probe the real callback path, not the origin.** ✅ **Landed 2026-09-26 as
+   #814.** `probeCallbackTrust()` now targets
+   `${callbackListenerUrl}/encoreCallback` via a shared `buildCallbackUri()`
+   helper that the dispatch-time `progressCallbackUri` injection also uses, so
+   the probed URL and the dispatched URL cannot drift. The §5b(2) verb question
+   was settled empirically at the same time — see the note under step 2.
    Change `probeCallbackTrust()` (`src/encore-scaler/callback-trust-probe.ts:129-192`)
    to target `${callbackListenerUrl.replace(/\/$/, '')}/encoreCallback` instead
    of `new URL(callbackListenerUrl).origin` (line 138), matching the URI the
@@ -372,10 +376,18 @@ With #818 merged, **step 1 below is the sole remaining code change.**
    `HEAD`/`GET` reaches the app without invoking the callback handler, and a
    404-from-Fastify proves both TLS trust *and* that the path is no longer
    auth-walled. Do **not** probe with `POST`, which would enqueue a synthetic
-   callback. Note the behaviour of a `HEAD`/`GET` on `/encoreCallback` *during*
-   the window was **not directly observed** — the two timed runs probed `POST`.
-   It is inferred from §1c, where the ingress's verdict is method-independent on
-   every path tested. #814 should confirm it on a fresh instance.
+   callback.
+
+   ✅ **The inference flagged here was confirmed directly by #814 on
+   2026-09-26.** Two more throwaway instances (`diag814a`, `diag814b`, both
+   created and destroyed, `DELETE` → 204) were polled with `GET`, `HEAD` and
+   `POST` on `/encoreCallback` simultaneously from creation: in `diag814b` all
+   three returned 401 together from t+29 s to t+43 s and all flipped together at
+   t+44 s. A `HEAD` probe is therefore a faithful proxy for Encore's `POST`.
+   The same runs also narrowed the "not determined" question in §2 — `/` went
+   200 → Fastify-404 on the *same* tick that `POST /encoreCallback` went
+   401 → 200, so the phase-2 200 is definitely not the application. Details in
+   `docs/osc-feedback/incoming-callback-listener-ingress-auth-window-fresh-instance.md`.
 
 3. **Keep the bounded wait, and make sure it is long enough.**
    `ensureCallbackTrust()` already re-probes on later ticks within
