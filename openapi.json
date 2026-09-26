@@ -20166,7 +20166,7 @@
         "tags": [
           "search"
         ],
-        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`. The exact-filter tier also carries `status` (exact lifecycle match, asset-only) and an inclusive created-at range `from`/`to` (issue #833); both are applied to the whole matched set before pagination, so they narrow `total` and every page rather than the page in hand.",
+        "description": "The single canonical search endpoint. Combines an exact-filter tier (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text tier (`q`, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its `name`/`description`/`tags` and its open `custom` bag (via `metadata.<key>`). Asset-only filters (`mimeType`, `tamsFlowId`, `tamsTimerange`) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a `type` discriminator (`'asset'` | `'collection'`) so they are unambiguously distinguishable. `mimeType` filters on the extracted container format and accepts either a container token (`mp4`) or a common media MIME type (`video/mp4`), which is resolved onto the container family it names (issue #822). Results are paginated via `page`/`pageSize` and returned as `{ assets, collections, total, collectionTotal, page }`. The exact-filter tier also carries `status` (exact lifecycle match, asset-only) and an inclusive created-at range `from`/`to` (issue #833); both are applied to the whole matched set before pagination, so they narrow `total` and every page rather than the page in hand.",
         "parameters": [
           {
             "schema": {
@@ -20205,7 +20205,8 @@
             },
             "in": "query",
             "name": "mimeType",
-            "required": false
+            "required": false,
+            "description": "Container-format filter, matched against the probe-extracted `technicalMetadata.containerFormat`. Accepts either a bare container token (`mp4`, `mov`, `webm`, `matroska`) or a common media MIME type (`video/mp4`), which is resolved onto the ffprobe container family it names \u2014 so `video/mp4` matches an asset stored as `mov,mp4,m4a` (issue #822). Matching is case-insensitive and per family token. A MIME-shaped value that neither maps to a container family nor names a content type this API accepts on upload can never match any asset, and is rejected with 400 `unsupported_mime_type` rather than silently returning an empty result set."
           },
           {
             "schema": {

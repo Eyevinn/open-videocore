@@ -41,6 +41,7 @@ import { collectionsRouter } from './routes/collections.js';
 import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
 import { exportDestinationsRouter } from './routes/export-destinations.js';
+import { UPLOAD_CONTENT_TYPES } from './data/media-types.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { couchServer, StackCouch } from './data/couchdb.js';
 import {
@@ -208,14 +209,11 @@ app.addHook('onRoute', (routeOptions) => {
 
 // Pass binary/media upload bodies through as a stream for PUT /:id/upload.
 // Registered before plugins so child scopes inherit these parsers.
-// The route handler reads request.body as a Readable and pipes it to MinIO.
-for (const ct of [
-  'application/octet-stream',
-  'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
-  'video/webm', 'video/mpeg', 'video/ogg', 'video/3gpp',
-  'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/flac',
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-]) {
+// The route handler reads request.body as a Readable and pipes it to storage.
+// The list itself lives in data/media-types.ts because the search `mimeType`
+// filter has to agree with it about which media types can enter the system
+// (issue #822) — one array, no restatement to drift out of step.
+for (const ct of UPLOAD_CONTENT_TYPES) {
   app.addContentTypeParser(ct, (_req, payload, done) => {
     done(null, payload);
   });

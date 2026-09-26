@@ -3738,7 +3738,7 @@ One endpoint covers both free text and exact filters, ANDed together and paginat
 Request
 curl "https://<your-instance>/api/v1/search?q=keynote&tags=stage-a&page=1&pageSize=20"
 
-Exact-filter fields: tags, mimeType, metadata.<key>, tamsFlowId, tamsTimerange. Free text (q) matches over name and description. Full shape in the Search reference.
+Exact-filter fields: tags, mimeType, metadata.<key>, tamsFlowId, tamsTimerange. Free text (q) matches over name and description. mimeType matches the container format extracted from the media and accepts either a container token (mp4) or a common media MIME type (video/mp4), which is resolved onto the container family it names. Full shape in the Search reference.
 
 GET /api/v1/assets/search is a deprecated, free-text-only alias kept for backward compatibility — new integrations should use /api/v1/search above.
 
