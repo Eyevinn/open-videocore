@@ -488,12 +488,8 @@ export function createAssetsTable(deps) {
     emptyText: 'No assets found.',
   });
 
-  // NOTE (issue #834): there is deliberately no page-scoped-narrowing caveat in
-  // this table any more. The note that used to sit under the filter bar disclosed
-  // that date-range and search+status filters applied to the current page only
-  // while the pager reported the full unfiltered total. Both filters are now
-  // server-side on both tiers (issue #833) and the reported total counts exactly
-  // the filtered set, so that disclosure would state something untrue.
+  // No page-scoped-narrowing caveat here by design: status and from/to are
+  // server-side on both tiers (#833), so the reported total is exact (#834).
 
   // Guard so the URL sync we do inside the state subscription does not itself
   // re-enter as a "user change" (it does not — applyTableState only touches the
