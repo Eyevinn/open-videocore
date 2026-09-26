@@ -66,6 +66,14 @@
  *            `'ready'` when the asset's own lifecycle failed (#810).
  *          - neither packaged output nor source object: 404 `no_delivery`
  *            (:3264), which `apiFetch` throws.
+ *        documented failures: 404 unknown asset / `no_delivery` (:3264),
+ *          501 `not_configured` when the asset HAS packaged output but
+ *          `PACKAGED_PUBLIC_BASE_URL` is set to something that is not an
+ *          absolute URL — the packaged branch throws
+ *          `PublicManifestBaseUrlError` (src/pipeline/packaging.ts:346) and the
+ *          route converts it to a 501 with no `urls` at all (:3215-3218).
+ *          Both are thrown by `apiFetch`, so a caller needs its own catch
+ *          (CONTRIBUTING.md → "Inline media elements" has the full table).
  *        So `urlField: 'urls.source'` resolves falsy for EVERY packaged asset,
  *        and this helper then returns false having assigned nothing. A caller
  *        must branch on WHICH key is present (or on `status`) rather than
