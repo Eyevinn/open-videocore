@@ -7394,6 +7394,15 @@
                         },
                         "masterDashKey": {
                           "type": "string"
+                        },
+                        "missingConfiguration": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "reason": {
+                          "type": "string"
                         }
                       },
                       "additionalProperties": false
