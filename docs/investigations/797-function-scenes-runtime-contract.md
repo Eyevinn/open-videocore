@@ -191,6 +191,25 @@ interaction model (single synchronous call vs create-then-poll), and a response 
 the service never produces. Left unchanged here deliberately — #797 is confirmation
 only; #798 is the fix.
 
+**Update (#798, 2026-09-26):** the first three — path, field name and interaction
+model — are now fixed in `src/pipeline/osc-scene-detect.ts`, which POSTs
+`{ medialocator }` to `/api/v1` and polls the `status` endpoint the response hands
+back (resolved against the instance URL and pinned to its origin, so a
+server-supplied endpoint cannot redirect our service access token off-host).
+
+The fourth is not fixable at this layer. A completed job yields no boundaries, and
+the runner now says so **explicitly**: it returns `boundariesUnavailable`, and
+`detectScenes` declines to write anything rather than persisting
+`{ boundaries: [], sceneCount: 0 }`. That empty record would have asserted "this
+video has no scene cuts" — indistinguishable to an API consumer from a genuine
+single-shot video, and wrong for every input. It is not reported as
+`sceneDetectionError` either, because the job genuinely succeeded.
+
+So the scene-detect step now runs cleanly but produces no `sceneMetadata`, and
+#798's acceptance criterion 1 ("a run completes and writes `sceneMetadata`") remains
+unmet. Point 3 above — what `sceneMetadata` should actually carry — is still open and
+still an architect/ux decision; it is now tracked as its own issue, **#883**.
+
 ## What OSC tooling could and could not tell us
 
 `get-service-schema(eyevinn-function-scenes)` returns only the **deployment** config
