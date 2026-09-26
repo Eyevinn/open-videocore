@@ -41,6 +41,7 @@ import { collectionsRouter } from './routes/collections.js';
 import { auditRouter } from './routes/audit.js';
 import { storageRouter } from './routes/storage.js';
 import { exportDestinationsRouter } from './routes/export-destinations.js';
+import { UPLOAD_CONTENT_TYPES } from './data/media-types.js';
 import { WorkspaceStorage } from './data/storage.js';
 import { couchServer, StackCouch } from './data/couchdb.js';
 import {
@@ -84,6 +85,12 @@ import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
+import {
+  runnerFactory,
+  resolveRunnerOption,
+  runnerS3Config,
+  RunnerFactoryUnresolvedError
+} from './pipeline/runner-option.js';
 import { registerPrincipal } from './auth/principal.js';
 import { registerAuth } from './auth/middleware.js';
 import { internalRouter } from './routes/internal.js';
@@ -124,6 +131,7 @@ import {
   watchFolderMisconfiguredMessage
 } from './pipeline/watch-folder.js';
 import { healthRouter } from './routes/health.js';
+import { resolveBuildInfo } from './build-info.js';
 import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
@@ -170,12 +178,18 @@ declare module 'fastify' {
 // the cap so the part-url / complete / abort routes accept real upload IDs.
 const app = Fastify({ logger: true, maxParamLength: 500 });
 
-// Single source of truth for the API version: read package.json's version at
-// startup rather than hardcoding it in the OpenAPI info block (issue #542).
+// Single source of truth for the API RELEASE LINE: read package.json's version
+// at startup rather than hardcoding it in the OpenAPI info block (issue #542).
 // The spec served at /api-docs, the /api-docs/json document, and the committed
 // openapi.json (generated from that document by generate-openapi.sh) all flow
 // from info.version below, so pinning it to the package version keeps the docs
 // badge and the live Swagger UI from drifting away from the real release.
+//
+// This is deliberately NOT the build identity (issue #827): package.json is
+// only bumped at release, so every build between two tags carries the earlier
+// tag's number and two different images report the same string here. The build
+// identity is injected by the image build and reported on GET /health as
+// `build` — see src/build-info.ts and the Dockerfile.
 const PACKAGE_VERSION: string = (() => {
   const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
   try {
@@ -201,14 +215,11 @@ app.addHook('onRoute', (routeOptions) => {
 
 // Pass binary/media upload bodies through as a stream for PUT /:id/upload.
 // Registered before plugins so child scopes inherit these parsers.
-// The route handler reads request.body as a Readable and pipes it to MinIO.
-for (const ct of [
-  'application/octet-stream',
-  'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska',
-  'video/webm', 'video/mpeg', 'video/ogg', 'video/3gpp',
-  'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/flac',
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-]) {
+// The route handler reads request.body as a Readable and pipes it to storage.
+// The list itself lives in data/media-types.ts because the search `mimeType`
+// filter has to agree with it about which media types can enter the system
+// (issue #822) — one array, no restatement to drift out of step.
+for (const ct of UPLOAD_CONTENT_TYPES) {
   app.addContentTypeParser(ct, (_req, payload, done) => {
     done(null, payload);
   });
@@ -284,7 +295,14 @@ const resolverHealth = new ResolverHealthSignal();
 // actually active — programmatically, without reading server logs. The signals
 // are read at request time (via closures) so the report always reflects the
 // current storage + watch-folder configuration.
+//
+// The `build` field (issue #827) reports the build identity injected by the
+// image build, so two instances running different images are distinguishable
+// from the outside even when they carry the same package.json version. Resolved
+// once at startup: the values are baked into the image and cannot change while
+// the process runs.
 await app.register(healthRouter, {
+  buildInfo: resolveBuildInfo(process.env, PACKAGE_VERSION),
   resolverSnapshot: () => resolverHealth.snapshot(),
   ingestSignals: () => ({
     storageAvailable,
@@ -701,26 +719,29 @@ const probe: ProbeRunner | undefined = storageAvailable
 // to MinIO via a presigned PUT URL. Like the probe runner it needs both an OSC
 // context and object storage; when either is missing the thumbnail routes
 // respond 501.
-// Thumbnail extractor: a factory so the route can supply the workspace's MinIO
-// credentials (resolved from the stack config) at request time. The route
-// unwraps it if s3Config is available, otherwise falls back to a direct call
-// which uses env-var credentials (local dev / env-override path).
+// Thumbnail extractor: a TAGGED factory (issue #838) so the route can supply
+// the workspace's MinIO credentials (resolved from the stack config) at request
+// time. The tag is what lets the route tell a factory from a plain runner; a
+// factory reaching a stack with no s3Config is an explicit 501 rather than a
+// call that dispatches no job.
 const thumbnailExtractor = storageAvailable
-  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): FrameExtractor =>
-      // Output goes to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so
-      // the runner needs the MinIO credentials + bucket in the job body. A
-      // presigned PUT URL does NOT work with the image2 muxer (issue #92).
-      makeOscThumbnailExtractor({
-        context: oscContext,
-        createJob,
-        getJob,
-        getLogsForInstance,
-        removeJob,
-        s3Endpoint: s3.endpoint,
-        s3AccessKey: s3.accessKey,
-        s3SecretKey: s3.secretKey,
-        s3Bucket: s3.bucket
-      })
+  ? runnerFactory(
+      (s3): FrameExtractor =>
+        // Output goes to `s3://bucket/key` via the ffmpeg-s3 native S3 writer, so
+        // the runner needs the MinIO credentials + bucket in the job body. A
+        // presigned PUT URL does NOT work with the image2 muxer (issue #92).
+        makeOscThumbnailExtractor({
+          context: oscContext,
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket
+        })
+    )
   : undefined;
 
 // Export / re-wrap (issue #19) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to
@@ -733,41 +754,47 @@ const thumbnailExtractor = storageAvailable
 // work with ffmpeg's output muxer (issue #316). When object storage is missing
 // POST /:id/export responds 501.
 const rewrapRunner = storageAvailable
-  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): RewrapRunner =>
-      makeOscRewrapRunner({
-        context: oscContext,
-        createJob,
-        getJob,
-        getLogsForInstance,
-        removeJob,
-        s3Endpoint: s3.endpoint,
-        s3AccessKey: s3.accessKey,
-        s3SecretKey: s3.secretKey,
-        s3Bucket: s3.bucket
-      })
+  ? runnerFactory(
+      (s3): RewrapRunner =>
+        makeOscRewrapRunner({
+          context: oscContext,
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket
+        })
+    )
   : undefined;
 
 // Clip / trim (issue #17) reuses the OSC eyevinn-ffmpeg-s3 ephemeral job to seek
 // to a window and stream-copy it into a new child asset. Like the thumbnail
-// extractor and the re-wrap runner it is a factory so the route can supply the
-// workspace's MinIO credentials (resolved from the stack config) at request
-// time: the clip is written to `s3://bucket/key` via the ffmpeg-s3 native S3
-// writer, because ffmpeg cannot mux an MP4 to a presigned HTTPS PUT URL
-// (issue #786 — the job "succeeded" and no object was written). When object
-// storage is missing POST /:id/clip responds 501.
+// extractor and the re-wrap runner it is a TAGGED factory (issue #838) so the
+// route can supply the workspace's MinIO credentials (resolved from the stack
+// config) at request time: the clip is written to `s3://bucket/key` via the
+// ffmpeg-s3 native S3 writer, because ffmpeg cannot mux an MP4 to a presigned
+// HTTPS PUT URL (issue #786 — the job "succeeded" and no object was written).
+// The tag is what lets the route tell a factory from a plain runner; a factory
+// reaching a stack with no s3Config is an explicit 501 rather than a call that
+// dispatches no job. When object storage is missing POST /:id/clip responds 501.
 const clipRunner = storageAvailable
-  ? (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }): ClipRunner =>
-      makeOscClipRunner({
-        context: oscContext,
-        createJob,
-        getJob,
-        getLogsForInstance,
-        removeJob,
-        s3Endpoint: s3.endpoint,
-        s3AccessKey: s3.accessKey,
-        s3SecretKey: s3.secretKey,
-        s3Bucket: s3.bucket
-      })
+  ? runnerFactory(
+      (s3): ClipRunner =>
+        makeOscClipRunner({
+          context: oscContext,
+          createJob,
+          getJob,
+          getLogsForInstance,
+          removeJob,
+          s3Endpoint: s3.endpoint,
+          s3AccessKey: s3.accessKey,
+          s3SecretKey: s3.secretKey,
+          s3Bucket: s3.bucket
+        })
+    )
   : undefined;
 
 // Auto-subtitles (issue #114) and scene detection (issue #115) are OPTIONAL,
@@ -1548,6 +1575,12 @@ function activateScaler(redisUrl: string): void {
     sweepMaxInstances: process.env['ENCORE_SWEEP_MAX_INSTANCES']
       ? parseInt(process.env['ENCORE_SWEEP_MAX_INSTANCES'], 10)
       : undefined,
+    // #830: minimum gap between two persisted progress writes for the same
+    // transcode job, as the sweep copies Encore's reported `progress` off the
+    // IN_PROGRESS page it already fetches. Unset => the poller's own 10s default.
+    progressWriteIntervalMs: process.env['ENCORE_PROGRESS_WRITE_INTERVAL_MS']
+      ? parseInt(process.env['ENCORE_PROGRESS_WRITE_INTERVAL_MS'], 10)
+      : undefined,
     // #708: grace window the poller uses for the keys.jobCompletionSeen PX TTL so
     // reconcile's dropped-job diff can skip a just-completed job. Uses the SAME
     // value forwarded to the scaler loop (ENCORE_RECONCILE_GRACE_MS) so the write
@@ -1845,18 +1878,30 @@ const onObjectStored =
           // Read s3Config from the already-warm resolver cache. The upload
           // preHandler called resolve() so resolveCached() is valid here.
           const conns = stackResolver.resolveCached();
-          const s3Cfg = conns?.s3Config;
           const bucket = conns?.sourceBucket ?? sourceBucket;
-          const extractor = s3Cfg
-            ? (thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)(
-                { ...s3Cfg, bucket }
-              )
-            : undefined;
-          if (extractor) {
+          // Same resolution helper the asset routes use (issue #838). This path
+          // is fire-and-forget on upload, so an unresolvable factory is logged
+          // at error level and skipped rather than thrown at the uploader — but
+          // it is logged, not silently treated as "no thumbnails configured".
+          try {
+            const extractor = resolveRunnerOption(
+              thumbnailExtractor,
+              runnerS3Config(conns?.s3Config, bucket),
+              'thumbnailExtractor'
+            );
             void extractThumbnails(
               { assetId, objectKey, timecodes: [1] },
               { assets: assetRepository, storage: effectiveStorage, extractor }
             ).catch(() => { /* failures recorded on asset */ });
+          } catch (err) {
+            if (err instanceof RunnerFactoryUnresolvedError) {
+              app.log.error(
+                { err, assetId },
+                'skipping post-upload thumbnail extraction: runner factory could not be resolved'
+              );
+            } else {
+              throw err;
+            }
           }
         }
       }

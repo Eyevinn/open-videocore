@@ -49,6 +49,7 @@ import type { AuditEmitter } from '../data/audit-emit.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
+import { resolvePackagingInstanceId } from '../encore-scaler/packaging-target.js';
 import type { Redis } from 'ioredis';
 
 // Packager callback schemas (verified from encore-packager callbackListener.ts 2026-07-07).
@@ -329,9 +330,19 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
               const encoreJobId =
                 execution.steps.find((s) => s.name === 'transcode')?.encoreJobId ??
                 execution.steps.find((s) => s.name === 'package')?.encoreJobId;
-              const decoded = encoreJobId ? decodeEncoreJobId(encoreJobId) : undefined;
-              if (encoreJobId && decoded) {
-                const instanceId = await opts.redis.hget(keys.jobInstance(decoded.workspaceId), encoreJobId);
+              if (encoreJobId) {
+                // Resolve the pinned instance through the shared resolver
+                // (CONTRACT: `resolvePackagingInstanceId(redis, encoreJobId)`,
+                // src/encore-scaler/packaging-target.ts) rather than reading
+                // keys.jobInstance directly. By the time a packager success
+                // callback arrives, the transcode it followed has succeeded —
+                // and the callback poller hdel's keys.jobInstance on exactly
+                // that event (encore-callback-poller.ts), so the direct read
+                // resolved null and the unpin was silently skipped, holding an
+                // idle instance out of scale-down for the pin's full TTL. The
+                // resolver reads keys.jobTerminalInstance, which is retained
+                // past terminal for precisely this.
+                const instanceId = await resolvePackagingInstanceId(opts.redis, encoreJobId);
                 if (instanceId) {
                   await unpinInstanceForPackaging(opts.redis, instanceId, encoreJobId);
                 }

@@ -43,14 +43,28 @@ function fakeStorage(): WorkspaceStorage {
   } as unknown as WorkspaceStorage;
 }
 
+// `minioEndpoint` populates the resolved stack's own MinIO endpoint on
+// request.connections.s3Config exactly as src/main.ts's preHandler does
+// (services/workspace-stack.ts buildConnectionsFromStack sets
+// s3Config.endpoint = StackConfig.minioEndpoint) — the coordinate issue #859
+// derives the packaged public origin from. Omitted => no stack resolved.
 async function buildApp(
-  opts: { withStorage?: boolean } = {}
+  opts: { withStorage?: boolean; minioEndpoint?: string } = {}
 ): Promise<{ app: FastifyInstance; repo: InMemoryAssetRepository }> {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
   const repo = new InMemoryAssetRepository();
+  if (opts.minioEndpoint) {
+    const endpoint = opts.minioEndpoint;
+    app.decorateRequest('connections', null);
+    app.addHook('preHandler', async (request) => {
+      request.connections = {
+        s3Config: { endpoint, accessKey: 'admin', secretKey: 'x' }
+      } as unknown as NonNullable<typeof request.connections>;
+    });
+  }
   await app.register(assetsRouter, {
     prefix: '/api/v1/assets',
     repository: repo,
@@ -263,6 +277,120 @@ describe('GET /:id/delivery', () => {
     const body = res.json();
     expect(body.urls.hls).toBe('https://cdn.example/packaged/x/index.m3u8');
     expect(body.urls.dash).toBe('https://cdn.example/packaged/x/manifest.mpd');
+  });
+
+  // Issue #859: on a DEFAULT (zero-config) stack nothing sets
+  // PACKAGED_PUBLIC_BASE_URL, but the stack's own MinIO endpoint IS the public
+  // origin for its packaged bucket. Delivery must advertise absolute URLs on
+  // that origin instead of routing the manifest through the authorized
+  // `/stream/*` proxy (which requires a bearer token).
+  describe('zero-config stack public base URL (issue #859)', () => {
+    const MINIO = 'https://stack-abc.minio.example';
+
+    it('derives absolute MinIO-origin URLs, not proxy URLs, when the env var is unset', async () => {
+      // PUBLIC_BASE_URL is set so the proxy fallback WOULD be resolvable —
+      // proving the MinIO origin is preferred rather than merely available.
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.status).toBe('ready');
+      expect(body.urls.hls).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/index.m3u8`);
+      expect(body.urls.dash).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/manifest.mpd`);
+      expect(body.urls.hls).not.toContain('/stream/');
+      // The manifest's relative child references resolve against this same
+      // origin + directory, so a player fetches segments anonymously too.
+      expect(new URL('seg-1.m4s', body.urls.hls).toString()).toBe(
+        `${MINIO}/openvideocore-packaged/${id}/abc/seg-1.m4s`
+      );
+    });
+
+    it('is absolute even when PUBLIC_BASE_URL is unset (no proxy base at all)', async () => {
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.status).toBe('ready');
+      expect(body.urls.hls).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/index.m3u8`);
+    });
+
+    it('lets an explicit PACKAGED_PUBLIC_BASE_URL win over the stack MinIO origin', async () => {
+      process.env['PACKAGED_PUBLIC_BASE_URL'] = 'https://cdn.example';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: { hls: `/openvideocore-packaged/${id}/abc/index.m3u8` }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.urls.hls).toBe(
+        `https://cdn.example/openvideocore-packaged/${id}/abc/index.m3u8`
+      );
+    });
+
+    it('leaves DELIVERY_MODE=proxy proxying through the authorized stream route', async () => {
+      process.env['DELIVERY_MODE'] = 'proxy';
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+      const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/delivery`, headers: A });
+      const body = res.json();
+      expect(body.urls.hls).toBe(
+        `https://api.example.test/api/v1/assets/${id}/stream/index.m3u8`
+      );
+      expect(body.urls.dash).toBe(
+        `https://api.example.test/api/v1/assets/${id}/stream/manifest.mpd`
+      );
+    });
+
+    // GET /:id/files documents that fileGroups[].manifestUrl matches what
+    // /:id/delivery advertises, so both must resolve against the same origin.
+    it('matches fileGroups[].manifestUrl on GET /:id/files', async () => {
+      process.env['PUBLIC_BASE_URL'] = 'https://api.example.test';
+      const { app, repo } = await buildApp({ minioEndpoint: MINIO });
+      const id = await createAsset(app);
+      await repo.update(id, {
+        manifestUrls: {
+          hls: `/openvideocore-packaged/${id}/abc/index.m3u8`,
+          dash: `/openvideocore-packaged/${id}/abc/manifest.mpd`
+        }
+      });
+
+      const delivery = await app.inject({
+        method: 'GET',
+        url: `/api/v1/assets/${id}/delivery`,
+        headers: A
+      });
+      const files = await app.inject({
+        method: 'GET',
+        url: `/api/v1/assets/${id}/files`,
+        headers: A
+      });
+      expect(files.statusCode).toBe(200);
+      const groups = files.json().fileGroups as { id: string; manifestUrl: string }[];
+      const byId = (gid: string) => groups.find((g) => g.id === gid)?.manifestUrl;
+      expect(byId('hls')).toBe(delivery.json().urls.hls);
+      expect(byId('dash')).toBe(delivery.json().urls.dash);
+      expect(byId('hls')).toBe(`${MINIO}/openvideocore-packaged/${id}/abc/index.m3u8`);
+    });
   });
 
   // Issue #506: a configured + packaged asset must return a fully-resolvable

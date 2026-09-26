@@ -39,7 +39,7 @@ export type PipelineStepName = (typeof PIPELINE_STEPS)[number];
 // runnable exactly while a completed transcode's Encore job is still resolvable;
 // packaging an asset transcoded long ago (whose instance is gone) needs a
 // packager-side capability that does not exist yet — logged as OSC friction in
-// docs/osc-feedback/incoming-encore-packager-contract.md finding 6.
+// docs/osc-feedback/incoming-packager-input-encore-job-url-only.md.
 //
 // Because `package` is the FIRST (and only) step, the execute path pre-flights
 // BOTH conditions before creating an execution and 409s with the specific reason

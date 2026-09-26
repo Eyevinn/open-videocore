@@ -224,6 +224,14 @@ export type PackagingDeps = {
   auditLog?: AuditErrorLog;
 };
 
+// The base the packaging pipeline WRITES manifest URLs against. Stays
+// origin-agnostic (a bucket-relative `/<packagedBucket>` path) when
+// PACKAGED_PUBLIC_BASE_URL is unset: packaging runs from the packager callback,
+// which has no resolved stack connections, and a stored relative path keeps the
+// record portable. The public origin is resolved at READ time instead, from the
+// resolved stack's own MinIO endpoint — see `packagedPublicOrigin()` /
+// `stackPackagedPublicOrigin()` (issue #859), which also upgrades assets that
+// were packaged before an origin was known.
 export function packagingPublicBaseUrl(): string {
   return process.env['PACKAGED_PUBLIC_BASE_URL'] ?? `/${packagedBucket()}`;
 }
@@ -287,15 +295,81 @@ export class PublicManifestBaseUrlError extends Error {
   }
 }
 
-// The configured public-facing origin for the packaged bucket (MinIO/CDN), or
-// undefined when `PACKAGED_PUBLIC_BASE_URL` is unset. Unlike
+// The resolved stack's OWN public origin for its packaged objects (issue #859).
+//
+// On a default, zero-config deployment nothing sets PACKAGED_PUBLIC_BASE_URL, yet
+// the stack already HAS a public origin: the per-stack MinIO endpoint it was
+// provisioned with. `minioEndpoint` is a REQUIRED field of the persisted stack
+// config (services/param-store.ts StackConfig.minioEndpoint) and is resolved per
+// request onto `connections.s3Config.endpoint`
+// (services/workspace-stack.ts buildConnectionsFromStack), so a caller holding
+// resolved connections can derive the origin without a global env read.
+//
+// Callers MUST source the argument from
+// `services/workspace-stack.ts stackResolvedMinioEndpoint(connections)`, NOT from
+// `s3Config.endpoint` directly: that same field is also populated verbatim from
+// MINIO_URL on the env-override path, where no anonymous-read bucket policy has
+// been applied by this codebase and a derived "public" URL would 403.
+//
+// Returns the endpoint WITHOUT a bucket path segment: a stored manifest URL for
+// the zero-config case is already bucket-prefixed (`/<packagedBucket>/...`,
+// baked in by `packagingPublicBaseUrl()` at packaging time), and
+// `resolvePublicManifestUrl` joins that stored path onto the origin — appending
+// the bucket here too would duplicate it. Path-style addressing
+// (`<endpoint>/<bucket>/<key>`) is what MinIO serves, mirroring how
+// `externalPublicBaseUrl` derives an S3-compatible object URL above.
+//
+// Returns undefined when no endpoint is available (no PROVISIONED stack resolved —
+// callers pass `stackResolvedMinioEndpoint(connections)`, which is undefined on the
+// env-override and in-memory paths) or when the value is not an absolute http(s)
+// URL — a non-absolute origin is not usable and must fall through to the caller's
+// existing fallback rather than be handed to `resolvePublicManifestUrl` (which
+// would reject it as a misconfiguration).
+//
+// The returned origin is REBUILT from the parsed URL — scheme + host(+port) +
+// path only — so it can never carry userinfo (`https://user:pw@host` would
+// otherwise echo an operator credential into a public API response) and never
+// carries a query or fragment (either would make the `origin + '/' + key` join in
+// `resolvePublicManifestUrl` malformed). `minioEndpoint` is operator-writable via
+// the parameter store, so this is enforced here rather than assumed.
+export function stackPackagedPublicOrigin(
+  minioEndpoint: string | undefined
+): string | undefined {
+  const endpoint = minioEndpoint?.trim();
+  if (!endpoint) {
+    return undefined;
+  }
+  const parsed = tryParseUrl(endpoint);
+  if (!parsed || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+    return undefined;
+  }
+  const path = parsed.pathname.replace(/\/+$/, '');
+  return `${parsed.protocol}//${parsed.host}${path}`;
+}
+
+// The public-facing origin for the packaged bucket (MinIO/CDN), or undefined when
+// neither an explicit origin nor a resolved stack endpoint is available. Unlike
 // `packagingPublicBaseUrl()` this does NOT fall back to a relative bucket path:
 // callers that require a genuinely public origin (the delivery endpoint) must be
 // able to distinguish "configured" from "unset".
-export function packagedPublicOrigin(): string | undefined {
+//
+// Precedence (issue #859):
+//   1. `PACKAGED_PUBLIC_BASE_URL` — the explicit operator override — wins when
+//      set, verbatim (an operator-fronted CDN origin beats the raw MinIO host).
+//   2. the PROVISIONED stack's own `minioEndpoint` (see
+//      stackPackagedPublicOrigin), so a zero-config stack still has an ABSOLUTE
+//      public origin instead of degrading to a root-relative path.
+//   3. undefined — every other deployment shape: no provisioned stack resolved,
+//      the env-override path (COUCHDB_URL/MINIO_URL), or in-memory connections.
+//      The caller keeps its pre-#859 behaviour (relative value, then the
+//      authorized stream proxy). Only the explicit PACKAGED_PUBLIC_BASE_URL makes
+//      those deployments advertise a public origin.
+export function packagedPublicOrigin(
+  stackMinioEndpoint?: string
+): string | undefined {
   const raw = process.env['PACKAGED_PUBLIC_BASE_URL'];
   if (!raw || raw.trim().length === 0) {
-    return undefined;
+    return stackPackagedPublicOrigin(stackMinioEndpoint);
   }
   return raw;
 }

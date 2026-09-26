@@ -191,8 +191,49 @@ Key endpoints:
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness probe with service identity |
+| `GET` | `/health` | Liveness probe with service identity, build identity, resolver and ingest status |
 | `GET` | `/healthz` | Minimal liveness probe |
+
+### Which build is a deployment running?
+
+`GET /health` is the one endpoint that answers this, and it needs no
+authentication:
+
+```console
+$ curl -s https://<your-instance>/health | jq .build
+{
+  "version": "v1.5.0-56-g92a13cc",
+  "commit": "92a13cc4f0e1b2a3d5c7890fab12cd34ef567890",
+  "sourceDigest": "11cb8d5651d972cc",
+  "builtAt": "2026-09-25T06:11:02Z",
+  "packageVersion": "1.5.0"
+}
+```
+
+`packageVersion` is the release line, not the build — it only moves when a
+release is cut, so two instances on different images share it. The other fields
+identify the build:
+
+- `version` and `commit` come from `git describe --tags --always --dirty` and
+  `git rev-parse HEAD` at image build time, passed in as `--build-arg
+  BUILD_VERSION` / `BUILD_COMMIT` (see the `Dockerfile`). A builder with no git
+  metadata to pass reports `"unknown"` for both rather than guessing.
+- `sourceDigest` is always present. The image build computes it from the files
+  it ships, using `scripts/source-digest.mjs`. To turn a digest back into the
+  commit it was built from:
+
+  ```console
+  $ scripts/find-build-commit.sh 11cb8d5651d972cc
+  ```
+
+The full build string is served unauthenticated on purpose: this project is open
+source, so a commit identifier discloses nothing that is not already public, and
+the people who need it — an operator checking a stack after a channel switch,
+support asking what a customer is running, a probe asserting the expected build
+— are the least likely to hold a token.
+
+The OpenAPI document's `info.version` deliberately stays pinned to
+`packageVersion`, so the docs badge keeps tracking releases.
 
 **Assets**
 
@@ -265,11 +306,33 @@ in the ops UI.
 
 **Search**
 
-The single canonical search endpoint. It combines an exact-filter tier (`tags`,
-`mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with a free-text
-tier (`q`, over name and description) behind one contract; all filters are ANDed
-and results are paginated (`page`/`pageSize`, returned as `{ assets, total,
-page }`).
+The single canonical search endpoint. It combines an exact-filter tier (`status`,
+`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`, `from`/`to`)
+with a free-text tier (`q`, over name and description) behind one contract; all
+filters are ANDed and results are paginated (`page`/`pageSize`, returned as
+`{ assets, total, page }`).
+
+`mimeType` filters on the container format extracted from the media and takes
+either a container token (`mp4`, `webm`) or a common media MIME type
+(`video/mp4`), which is resolved onto the container family it names. A MIME type
+that neither resolves to a container family nor names a content type this API
+accepts on upload can never match anything, so it is rejected with `400
+unsupported_mime_type` rather than returning an empty page.
+
+`status` takes the same values and has the same exact-match semantics as
+`GET /api/v1/assets?status=`, and is applied independently of `q` — the same
+status answers the same asset set with or without a free-text term. It is
+asset-only: supplying it excludes collection hits, since a collection has no
+lifecycle status.
+
+`from` and `to` bound the asset creation timestamp and are accepted by **both**
+`GET /api/v1/search` and `GET /api/v1/assets`. Each takes either a calendar date
+(`YYYY-MM-DD`) or a full ISO 8601 date-time, and **both bounds are inclusive**: a
+bare `from` date means the first instant of that UTC day and a bare `to` date the
+last, so `?from=2026-03-01&to=2026-03-01` returns everything created during
+1 March. The range is applied to the whole result set before pagination, so it
+narrows `total` and every page rather than only the page returned. A `from` later
+than `to` is a `400`, not an empty page.
 
 | Method | Path | Description |
 |---|---|---|

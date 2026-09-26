@@ -766,40 +766,88 @@ export class EncoreScalerLoop {
     const droppedJobs: DroppedJob[] = [];
 
     // #768 (diagnostic-only): index of instanceId -> the externalIds Encore
-    // actually reports active on that instance, accumulated as this pass fetches
-    // each instance's real state below. Used solely to log, at each
+    // actually reports active on that instance. Used solely to log, at each
     // drop-classification, whether a job flagged as dropped off ITS
     // keys.jobInstance-mapped instance is in fact still active on a DIFFERENT
     // pool instance — the signature of the stale-mapping hypothesis. It does not
     // feed any decision; the classification logic below is unchanged.
+    //
+    // #839: this index used to be built INCREMENTALLY inside the classification
+    // loop below, so at each classification it held only the instances iterated
+    // before or at the current one. Pool-hash iteration order is uncontrolled,
+    // so whenever the mapped instance sorted before the instance actually
+    // holding the job, the diagnostic logged foundActiveOnPoolInstances=(none)
+    // — a false negative indistinguishable from a genuine drop, biasing the
+    // whole diagnostic toward REFUTING the very hypothesis it exists to test.
+    // Two skips compounded it: idle-tracked instances (activeJobs === 0) and
+    // unreachable ones were never indexed at all. The index is now built in a
+    // FULL pass over every pool entry BEFORE any classification runs, so the
+    // signal is order-independent.
     const poolActiveByInstance = new Map<string, Set<string>>();
+    // #839: instances whose real active set could NOT be established this pass
+    // (unreachable/unparseable). Absence of a job from the index is only
+    // evidence of absence over the instances we actually checked, so these are
+    // named in the diagnostic to keep a `(none)` line interpretable.
+    const poolUncheckedInstances: string[] = [];
+    // The parsed record + real state per instance, captured once by the full
+    // pass and reused by the classification loop below — so classification sees
+    // exactly the same snapshot the index was built from (no second fetch, no
+    // skew between the two).
+    const poolPass: Array<{
+      instanceId: string;
+      record: EncoreInstanceRecord;
+      real: { count: number; activeExternalIds: Set<string> } | undefined;
+    }> = [];
 
+    // Pass 1 (#839): index the whole pool. Every instance is fetched, including
+    // ones tracked idle (activeJobs === 0) and ones that turn out unreachable —
+    // a tracked count is precisely what is suspected of being stale, so an
+    // idle-tracked instance can still be the one really holding the job. Cost is
+    // bounded by the pool size (maxInstances) and the pass makes the same two
+    // findByStatus calls per instance reconcile already made for busy ones; the
+    // classification loop below no longer fetches at all, so only idle-tracked
+    // instances are net-new requests.
     for (const [instanceId, instanceJson] of entries) {
+      let record: EncoreInstanceRecord;
       try {
-        let record: EncoreInstanceRecord;
-        try {
-          record = JSON.parse(instanceJson) as EncoreInstanceRecord;
-        } catch {
-          continue; // corrupt entry — leave it for the loop to skip elsewhere
-        }
+        record = JSON.parse(instanceJson) as EncoreInstanceRecord;
+      } catch {
+        // Corrupt entry — cannot be fetched or classified; named as unchecked so
+        // it is visible rather than silently missing from the index.
+        poolUncheckedInstances.push(`${instanceId}(unparseable)`);
+        continue;
+      }
+      // Fetch both QUEUED and IN_PROGRESS documents (not just counts) — a
+      // freshly dispatched job sits in QUEUED until Encore picks it up, so
+      // counting only IN_PROGRESS would make the instance look idle immediately
+      // after dispatch and trigger a spurious scale-up on the next tick.
+      // fetchRealActiveState reads each active job's externalId so we can tell
+      // WHICH tracked jobs (if any) have silently vanished — the dropped-job
+      // signal for #449 — and, for the diagnostic, which instance a supposedly
+      // dropped job is really live on.
+      let real: { count: number; activeExternalIds: Set<string> } | undefined;
+      try {
+        real = await this.fetchRealActiveState(record);
+      } catch {
+        // fetchRealActiveState already swallows its own errors; belt-and-braces
+        // so one bad instance can never abort the index-building pass.
+        real = undefined;
+      }
+      if (real) poolActiveByInstance.set(instanceId, real.activeExternalIds);
+      else poolUncheckedInstances.push(`${instanceId}(unreachable)`);
+      poolPass.push({ instanceId, record, real });
+    }
+
+    // Pass 2: classification. Unchanged decision logic — it now reads the
+    // snapshot captured above instead of fetching inline, so the pool-wide index
+    // is already complete for every classification this pass makes.
+    for (const { instanceId, record, real } of poolPass) {
+      try {
         // Nothing to correct downward on an already-idle instance.
         if (record.activeJobs === 0) continue;
-
-        // Fetch both QUEUED and IN_PROGRESS documents (not just counts) — a
-        // freshly dispatched job sits in QUEUED until Encore picks it up, so
-        // counting only IN_PROGRESS would make the instance look idle
-        // immediately after dispatch and trigger a spurious scale-up on the next
-        // tick. fetchRealActiveState reads each active job's externalId so we can
-        // tell WHICH tracked jobs (if any) have silently vanished — the
-        // dropped-job signal for #449.
-        const real = await this.fetchRealActiveState(record);
         if (!real) continue; // could not confirm — leave the record as-is
         const actualCount = real.count;
         const activeExternalIds = real.activeExternalIds;
-        // #768 (diagnostic-only): record what Encore reports active on THIS
-        // instance so a later drop-classification in this same pass can report
-        // where else in the pool a "dropped" externalId is in fact still live.
-        poolActiveByInstance.set(instanceId, activeExternalIds);
 
         if (record.activeJobs !== actualCount) {
           // eslint-disable-next-line no-console
@@ -873,6 +921,11 @@ export class EncoreScalerLoop {
               // about to flag dropped is the stale-mapping signature), and
               // whether the job had already been re-dispatched (attempts > 1).
               // This changes no decision; droppedForInstance already holds jobId.
+              // #839: poolActiveByInstance is now the FULL pool index built
+              // before this loop, so this scan is order-independent; instances
+              // that could not be checked are reported separately so a
+              // foundActiveOnPoolInstances=(none) line cannot be mistaken for
+              // "confirmed active nowhere in the pool".
               const foundActiveOn: string[] = [];
               for (const [otherInstanceId, otherActive] of poolActiveByInstance) {
                 if (otherActive.has(jobId)) foundActiveOn.push(otherInstanceId);
@@ -890,12 +943,13 @@ export class EncoreScalerLoop {
                 '[encore-scaler] drop-diagnostic (#768): classifying job %s as ' +
                   'dropped — keys.jobInstance=%s reconciledInstance=%s ' +
                   'foundActiveOnPoolInstances=%s poolInstancesCheckedThisPass=%s ' +
-                  'reDispatched=%s',
+                  'poolInstancesUncheckedThisPass=%s reDispatched=%s',
                 jobId,
                 mappedInstanceId,
                 instanceId,
                 foundActiveOn.length ? foundActiveOn.join(',') : '(none)',
                 [...poolActiveByInstance.keys()].join(',') || '(none)',
+                poolUncheckedInstances.join(',') || '(none)',
                 String(reDispatched)
               );
 
