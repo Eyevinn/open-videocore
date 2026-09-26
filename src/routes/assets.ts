@@ -38,6 +38,15 @@ import {
   type PackagedOutput,
   type SubtitleTrack
 } from '../data/asset-repo.js';
+// Created-at range filtering (issue #833). The wire grammar, the inclusive
+// bound semantics and the normalisation to canonical UTC instants live in ONE
+// module shared with GET /api/v1/search/, so the two endpoints cannot answer a
+// differently-shaped range for the same query string.
+import {
+  CreatedFromSchema,
+  CreatedToSchema,
+  resolveCreatedRange
+} from '../data/created-range.js';
 // Collection membership (issue #570). The asset DELETE route blocks archiving an
 // asset that is still a member of one or more collections; the collection repo
 // owns the authoritative membership representation (the flat `assetIds` list,
@@ -95,7 +104,10 @@ import {
   type StorageBackendRegistry
 } from '../services/storage-backend-registry.js';
 import { InvalidPathTemplateError } from '../services/destination-path-template.js';
-import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+import {
+  STACK_CONFIG_NAMESPACE,
+  stackResolvedMinioEndpoint
+} from '../services/workspace-stack.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
@@ -131,6 +143,12 @@ import {
   type FrameExtractor
 } from '../pipeline/thumbnail.js';
 import { clip as runClip, type ClipDeps, type ClipRunner } from '../pipeline/clip.js';
+import {
+  resolveRunnerOption,
+  runnerS3Config,
+  RunnerFactoryUnresolvedError,
+  type RunnerOption
+} from '../pipeline/runner-option.js';
 import { oscClipJobLog } from '../pipeline/osc-clip.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
@@ -143,6 +161,7 @@ import {
   manifestUrlsForLocation,
   outputPrefix,
   packagedBucket,
+  packagedPublicOrigin,
   packagedRelocationOrigin,
   proxyManifestUrlsFor,
   resolvePackagedOutput,
@@ -176,6 +195,11 @@ import {
   externalPublicBaseUrl,
   externalObjectUrl
 } from '../pipeline/packaging.js';
+
+// Fallback source bucket for runner-factory resolution when the request carries
+// no resolved stack. Mirrors the default in WorkspaceConnections.sourceBucket
+// (src/services/workspace-stack.ts:369) and MINIO_SOURCE_BUCKET (main.ts:900).
+const DEFAULT_SOURCE_BUCKET = 'openvideocore-source';
 
 const statusSchema = z.enum(ASSET_STATUSES);
 
@@ -365,7 +389,13 @@ const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   offset: z.coerce.number().int().min(0).optional(),
   status: statusSchema.optional(),
-  parentId: z.string().min(1).optional()
+  parentId: z.string().min(1).optional(),
+  // Inclusive created-at range (issue #833). Same grammar and same match
+  // semantics as `GET /api/v1/search/?from=&to=` — both import the one
+  // definition in data/created-range.ts. Applied to the whole result set before
+  // `limit`/`offset`, so it narrows `total` and every page.
+  from: CreatedFromSchema.optional(),
+  to: CreatedToSchema.optional()
 });
 
 // TAMS-addressed lookup query params (issue #175, sub-task of #116; contract
@@ -910,10 +940,11 @@ type AssetsRouterOptions = {
   // S3 bucket names Encore reads the source from / writes renditions to.
   sourceBucket?: string;
   outputBucket?: string;
-  // Thumbnail / poster-frame extraction (issue #7). Factory receives the
+  // Thumbnail / poster-frame extraction (issue #7). Either a ready FrameExtractor
+  // or a tagged factory (`runnerFactory(...)`, issue #838) that receives the
   // workspace's s3Config so the OSC ffmpeg job can write directly to the right
   // MinIO bucket. When absent (or no object storage), the thumbnail routes respond 501.
-  thumbnailExtractor?: FrameExtractor | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor);
+  thumbnailExtractor?: RunnerOption<FrameExtractor>;
   // Injectable extractor runner + extra deps (tests stub the extractor/TTL).
   // Defaults to the real awaited extractor.
   extractThumbnails?: typeof extractThumbnails;
@@ -925,20 +956,24 @@ type AssetsRouterOptions = {
   thumbnailPublicBaseUrl?: string;
   // Export / re-wrap (issue #19). `rewrapRunner` runs the OSC ffmpeg `-c copy`
   // job (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
-  // extractor it may be a factory that receives the workspace's s3Config so the
-  // OSC job can write the output directly to the right MinIO bucket via
-  // `s3://bucket/key` (a presigned PUT URL does NOT work — issue #316). When
-  // absent (or no object storage), POST /:id/export responds 501.
-  rewrapRunner?: RewrapRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner);
+  // extractor it may be a tagged factory (`runnerFactory(...)`, issue #838) that
+  // receives the workspace's s3Config so the OSC job can write the output
+  // directly to the right MinIO bucket via `s3://bucket/key` (a presigned PUT
+  // URL does NOT work — issue #316). When absent (or no object storage),
+  // POST /:id/export responds 501.
+  rewrapRunner?: RunnerOption<RewrapRunner>;
   rewrap?: typeof rewrap;
   rewrapDeps?: Partial<RewrapDeps>;
   // Clip / trim (issue #17). `clipRunner` runs the OSC ffmpeg job
   // (eyevinn-ffmpeg-s3 in production, a stub in tests). Like the thumbnail
-  // extractor / rewrap runner it may be a factory that receives the workspace's
-  // s3Config so the OSC job can write the clip directly to the right MinIO
-  // bucket via `s3://bucket/key` (a presigned PUT URL does NOT work —
-  // issue #786). When absent (or no object storage), POST /:id/clip responds 501.
-  clipRunner?: ClipRunner | ((s3Config: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner);
+  // extractor and the re-wrap runner it may be a tagged factory
+  // (`runnerFactory(...)`, issue #838) that receives the workspace's s3Config so
+  // the OSC job can write the clip directly to the right MinIO bucket via
+  // `s3://bucket/key` — a presigned PUT URL does NOT work here either
+  // (issue #786: the job "succeeded" and no object was written). All three sites
+  // share one resolution helper so they cannot drift apart again. When absent
+  // (or no object storage), POST /:id/clip responds 501.
+  clipRunner?: RunnerOption<ClipRunner>;
   clip?: typeof runClip;
   clipDeps?: Partial<ClipDeps>;
   // HLS/DASH packaging (issue #9). When present, POST /:id/package is enabled.
@@ -1794,20 +1829,71 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   }
 
+  // MinIO coordinates a runner factory is built from, assembled from the stack
+  // this request resolved to (WorkspaceConnections.s3Config / .sourceBucket,
+  // src/services/workspace-stack.ts:118/116). Undefined when the stack carries
+  // no s3Config, which only matters for a factory option.
+  function requestRunnerS3Config(request: import('fastify').FastifyRequest) {
+    return runnerS3Config(
+      request.connections?.s3Config,
+      request.connections?.sourceBucket ?? DEFAULT_SOURCE_BUCKET
+    );
+  }
+
+  // Single resolution point for the thumbnail / re-wrap / clip runner options
+  // (issue #838). A plain injected runner passes straight through; a tagged
+  // factory is built from this request's s3Config. When the option is a factory
+  // and the stack resolved no s3Config there is nothing to build a runner from,
+  // so the route answers 501 not_configured rather than calling the factory as
+  // if it were the runner and dispatching no OSC job at all.
+  //
+  // Returns undefined once the 501 has been sent, matching the
+  // `requireSourceObject(asset, reply)` convention used above.
+  function resolveConfiguredRunner<T extends (...args: never[]) => unknown>(
+    option: RunnerOption<T>,
+    optionName: string,
+    request: import('fastify').FastifyRequest,
+    reply: import('fastify').FastifyReply
+  ): T | undefined {
+    try {
+      return resolveRunnerOption(option, requestRunnerS3Config(request), optionName);
+    } catch (err) {
+      if (err instanceof RunnerFactoryUnresolvedError) {
+        request.log.error({ err, option: optionName }, 'runner factory could not be resolved');
+        void reply.code(501).send({ error: 'not_configured', message: err.message });
+        return undefined;
+      }
+      throw err;
+    }
+  }
+
   // Fire-and-forget thumbnail extraction for a pipeline step. Uses a default
   // poster-frame timecode (1s in). No-op when thumbnails are not configured.
+  //
+  // Returns false (step recorded as not started) when the extractor is a
+  // factory the stack cannot supply credentials for — the same explicit failure
+  // the thumbnail route turns into a 501. It is logged at error level rather
+  // than thrown because this is a fire-and-forget pipeline step: throwing here
+  // would fail the whole execution, which an unconfigured optional step must
+  // never do.
   function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
     if (!opts.thumbnailExtractor || !storageFor) {
       return false;
     }
-    const s3Cfg = request.connections?.s3Config;
-    const resolvedExtractor =
-      typeof opts.thumbnailExtractor === 'function' && s3Cfg
-        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
-            ...s3Cfg,
-            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-          })
-        : (opts.thumbnailExtractor as FrameExtractor);
+    let resolvedExtractor: FrameExtractor;
+    try {
+      resolvedExtractor = resolveRunnerOption(
+        opts.thumbnailExtractor,
+        requestRunnerS3Config(request),
+        'thumbnailExtractor'
+      );
+    } catch (err) {
+      if (err instanceof RunnerFactoryUnresolvedError) {
+        request.log.error({ err, assetId }, 'skipping pipeline thumbnail step: runner factory could not be resolved');
+        return false;
+      }
+      throw err;
+    }
     void thumbnailRunner(
       { assetId, objectKey, timecodes: [1] },
       { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
@@ -2516,9 +2602,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
   app.get(
     '/',
-    { schema: { querystring: listQuerySchema, response: { 200: listSchema } } },
-    async (request) => {
-      return repo.list(request.query);
+    {
+      schema: {
+        querystring: listQuerySchema,
+        response: { 200: listSchema, 400: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const { from, to, ...rest } = request.query;
+      // An inverted range is a caller mistake, not an empty page (issue #833).
+      const created = resolveCreatedRange({ from, to });
+      if (!created.ok) {
+        return reply.code(400).send({ error: 'invalid_created_range', message: created.message });
+      }
+      return repo.list({ ...rest, ...created.range });
     }
   );
 
@@ -3076,10 +3173,28 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // For 'external' backends we emit URLs against the operator's public/CDN
       // origin (publicBaseUrl) or an endpointUrl-derived object URL. For 'minio'
       // (or unset) these resolve to undefined and the MinIO delivery-mode path
-      // (proxy/public, #200/#201) is kept unchanged — OSC MinIO blocks external
-      // presigned/public GETs.
+      // (proxy/public, #200/#201/#859) handles the per-stack backend below.
       const packagedBase = externalPublicBaseUrl(stackStorage?.packaged);
       const sourceBase = externalPublicBaseUrl(stackStorage?.source);
+      // Public origin for the DEFAULT per-stack MinIO backend (issue #859).
+      // PACKAGED_PUBLIC_BASE_URL wins when set; otherwise a PROVISIONED stack's
+      // OWN MinIO endpoint (StackConfig.minioEndpoint) IS the public origin for
+      // its packaged bucket, so a zero-config stack advertises absolute,
+      // anonymously fetchable manifest URLs instead of falling through to the
+      // authorized stream proxy below. That is sound precisely because this
+      // codebase applies the anonymous-read policy to the packaged bucket when it
+      // provisions the stack (routes/provision.ts, issue #199).
+      //
+      // The endpoint comes from `stackResolvedMinioEndpoint`, NOT from
+      // `s3Config.endpoint` directly: on the env-override path (COUCHDB_URL /
+      // MINIO_URL) that same field carries MINIO_URL verbatim for a MinIO we never
+      // policy-configured, so deriving an origin there would swap a working
+      // authorized proxy URL for one that 403s. It returns undefined for the
+      // env-override and in-memory paths, keeping their pre-#859
+      // relative-then-proxy behaviour unchanged.
+      const packagedPublicBase = packagedPublicOrigin(
+        stackResolvedMinioEndpoint(request.connections)
+      );
 
       // Preferred: packaged streaming manifests (issue #9 / #200 / #201 / #213).
       if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
@@ -3166,14 +3281,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           });
         }
         try {
-          // In the default `public` mode, `resolvePublicManifestUrl` returns a
-          // genuinely public absolute URL only when PACKAGED_PUBLIC_BASE_URL is
-          // configured. On the zero-config per-stack MinIO backend it hands back
-          // the stored value verbatim (issue #320), which is a bare object-key
-          // path (e.g. `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
-          // scheme/host and no signature — not fetchable by a player, and OSC
-          // MinIO blocks external presigned/public GETs. When the resolved value
-          // is still non-absolute, route the manifest through the authorized
+          // In the default `public` mode, `resolvePublicManifestUrl` resolves the
+          // stored manifest path against `packagedPublicBase` — the explicit
+          // PACKAGED_PUBLIC_BASE_URL when set, else the resolved stack's own
+          // MinIO origin (issue #859). The stored value itself is a bucket-
+          // prefixed object-key path (e.g.
+          // `/openvideocore-packaged/<id>/<uuid>/index.m3u8`) with no
+          // scheme/host, so it only becomes fetchable once joined onto that
+          // origin. When NO origin is resolvable at all (no stack on this
+          // deployment) the stored value is handed back verbatim (issue #320)
+          // and is still non-absolute: route the manifest through the authorized
           // stream proxy instead (issue #341), mirroring the DELIVERY_MODE=proxy
           // branch above so `delivery.hls`/`delivery.dash` are always absolute,
           // resolvable URLs — consistent with how `source` is emitted. The proxy
@@ -3190,7 +3307,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             proxyUrl: string | undefined
           ): string | undefined => {
             if (!stored) return undefined;
-            const resolved = resolvePublicManifestUrl(stored);
+            const resolved = resolvePublicManifestUrl(stored, packagedPublicBase);
             if (isAbsoluteUrl(resolved)) return resolved;
             // The stored value is a bare object-key path (zero-config MinIO). It
             // is only resolvable through the proxy when the proxy base itself is
@@ -3563,9 +3680,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // so the ops UI's "Open" link (public/app.js) was unclickable. Route
       // through the authorized stream proxy when the stored value doesn't
       // already resolve to something absolute.
+      //
+      // The origin resolved against is the SAME one /:id/delivery uses
+      // (issue #859): PACKAGED_PUBLIC_BASE_URL when set, else a PROVISIONED
+      // stack's own MinIO endpoint via `stackResolvedMinioEndpoint` (undefined on
+      // the env-override / in-memory paths, which therefore keep proxying).
+      // Keeping the two call sites on one origin — and on the same
+      // stack-only restriction — is what makes `manifestUrl` here match the
+      // `urls.hls`/`urls.dash` delivery advertises, as this endpoint's contract
+      // documents above.
+      const packagedPublicBase = packagedPublicOrigin(
+        stackResolvedMinioEndpoint(request.connections)
+      );
       const proxied = proxyManifestUrlsFor(asset.id, assetsBaseUrl(request.url));
       const toAbsoluteManifestUrl = (stored: string, proxyUrl: string | undefined): string => {
-        const resolved = resolvePublicManifestUrl(stored);
+        const resolved = resolvePublicManifestUrl(stored, packagedPublicBase);
         return isAbsoluteUrl(resolved) ? resolved : proxyUrl ?? resolved;
       };
 
@@ -4359,15 +4488,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'thumbnail extraction is not configured'
         });
       }
-      // Resolve the extractor: if it's a factory, call it with the workspace's
-      // s3Config so the ffmpeg job can write to the right MinIO bucket.
-      const s3Cfg = request.connections?.s3Config;
-      const resolvedExtractor = typeof opts.thumbnailExtractor === 'function' && s3Cfg
-        ? (opts.thumbnailExtractor as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => FrameExtractor)({
-            ...s3Cfg,
-            bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-          })
-        : opts.thumbnailExtractor as FrameExtractor;
+      // Resolve the extractor: if it's a tagged factory, build it from the
+      // workspace's s3Config so the ffmpeg job can write to the right MinIO
+      // bucket; if it's a plain runner, use it directly. A factory with no
+      // s3Config is a 501, sent by the helper (issue #838).
+      const resolvedExtractor = resolveConfiguredRunner(
+        opts.thumbnailExtractor,
+        'thumbnailExtractor',
+        request,
+        reply
+      );
+      if (!resolvedExtractor) return reply; // 501 already sent
       try {
         const thumbnails = await thumbnailRunner(
           {
@@ -4432,19 +4563,18 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'export / re-wrap is not configured'
         });
       }
-      // Resolve the injected runner. In production it is a factory that needs
-      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the
+      // Resolve the injected runner. In production it is a tagged factory that
+      // needs the workspace's s3Config + bucket so the OSC ffmpeg job writes the
       // output to `s3://bucket/key` natively (issue #316); tests inject a plain
-      // RewrapRunner and no s3Config, so fall back to using it directly. Mirrors
-      // the thumbnail extractor resolution above.
-      const s3Cfg = request.connections?.s3Config;
-      const resolvedRewrapRunner =
-        typeof opts.rewrapRunner === 'function' && s3Cfg
-          ? (opts.rewrapRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => RewrapRunner)({
-              ...s3Cfg,
-              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-            })
-          : (opts.rewrapRunner as RewrapRunner);
+      // RewrapRunner and no s3Config, which passes through untouched. Same
+      // helper as the thumbnail and clip routes (issue #838).
+      const resolvedRewrapRunner = resolveConfiguredRunner(
+        opts.rewrapRunner,
+        'rewrapRunner',
+        request,
+        reply
+      );
+      if (!resolvedRewrapRunner) return reply; // 501 already sent
       try {
         const child = await rewrapRunner(
           {
@@ -4499,19 +4629,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           message: 'clip extraction is not configured'
         });
       }
-      // Resolve the injected runner. In production it is a factory that needs
-      // the workspace's s3Config + bucket so the OSC ffmpeg job writes the clip
-      // to `s3://bucket/key` natively (issue #786); tests inject a plain
-      // ClipRunner and no s3Config, so fall back to using it directly. Mirrors
-      // the rewrap runner resolution above.
-      const clipS3Cfg = request.connections?.s3Config;
-      const resolvedClipRunner =
-        typeof opts.clipRunner === 'function' && clipS3Cfg
-          ? (opts.clipRunner as (s3: { endpoint: string; accessKey: string; secretKey: string; bucket: string }) => ClipRunner)({
-              ...clipS3Cfg,
-              bucket: request.connections?.sourceBucket ?? 'openvideocore-source'
-            })
-          : (opts.clipRunner as ClipRunner);
+      // Same resolution helper as thumbnail and re-wrap (issue #838). In
+      // production the option is a tagged factory that needs the workspace's
+      // s3Config + bucket so the OSC ffmpeg job writes the clip to
+      // `s3://bucket/key` natively (issue #786); tests inject a plain ClipRunner,
+      // which passes through untouched. A factory with no resolvable s3Config is
+      // a 501 here rather than a call that dispatches no job at all.
+      const resolvedClipRunner = resolveConfiguredRunner(
+        opts.clipRunner,
+        'clipRunner',
+        request,
+        reply
+      );
+      if (!resolvedClipRunner) return reply; // 501 already sent
       try {
         const child = await clipRunnerOrchestrator(
           {
@@ -4578,9 +4708,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // Proxy a single thumbnail image through the API. OSC MinIO blocks anonymous
-  // presigned URL access, so the browser cannot load MinIO URLs directly.
-  // This endpoint fetches the object using admin credentials and streams it.
+  // Proxy a single thumbnail image through the API: fetches the object with the
+  // deployment's storage credentials and streams it to a bearer-carrying caller.
+  //
+  // Originally this was the ONLY option, because anonymous presigned GETs
+  // against the hosted object store were observed returning 403 from outside
+  // the cluster (#113). That no longer reproduces — re-verified 2026-09-25 from
+  // outside the cluster: presigned anonymous GET → 200 image/jpeg, unsigned →
+  // 403 AccessDenied, tampered → 403 SignatureDoesNotMatch, expired → 403
+  // AccessDenied (docs/osc-feedback/incoming-presigned-get-thumbnails.md). So
+  // `/:id/thumbnails/:index/url` below is now the browser path (see #800), and
+  // this route stays for server-to-server callers that already hold a token and
+  // for deployments whose object store is not reachable from the client — it is
+  // also the fallback the ops UI drops back to when a deployment cannot presign
+  // (public/thumbnail-url.js, issue #801). Coverage:
+  // test/thumbnail-unauthenticated-fetch.test.ts.
   //   200 — image/jpeg stream
   //   404 — unknown asset or out-of-range index
   //   501 — storage not configured

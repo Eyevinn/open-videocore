@@ -332,3 +332,133 @@ describe('shared table states', () => {
     expect(t.el.querySelector('tr.ops-table-empty td')!.textContent).toBe('No assets found.');
   });
 });
+
+// ─── Thumbnails (issue #801) ──────────────────────────────────────────────────
+//
+// An <img> GET carries no Authorization header, so the list cell can never point
+// at the bearer-gated byte route GET /api/v1/assets/:id/thumbnails/:index. The
+// table instead resolves a signed URL over the authenticated apiFetch.
+//
+// Verified contract: GET /api/v1/assets/{id}/thumbnails/{index}/url
+//   openapi.json .paths["/api/v1/assets/{id}/thumbnails/{index}/url"].get
+//   src/routes/assets.ts:4438 (route), :611 (`thumbnailUrlSchema`)
+//   200 body: { assetId, index, objectKey, url, expiresAt, expiresInSeconds }.
+// The table reads exactly one field: `url`.
+describe('thumbnail cells resolve a presigned URL (issue #801)', () => {
+  const PRESIGNED = 'https://storage.example/thumbnails/a1/thumb_0s.jpg?sig=abc';
+
+  const rowWithThumb = {
+    id: 'a1',
+    name: 'One',
+    status: 'ready',
+    createdAt: '2026-01-01T00:00:00Z',
+    thumbnails: ['thumbnails/a1/thumb_0s.jpg'],
+  };
+
+  // Routes the list call and the thumbnail-URL call apart; `onUrlCall` decides
+  // what the URL endpoint does (resolve, reject, or hang).
+  function thumbApi(onUrlCall: (path: string) => unknown, row: unknown = rowWithThumb) {
+    const calls: string[] = [];
+    const apiFetch = vi.fn(async (path: string) => {
+      calls.push(path);
+      if (path.includes('/thumbnails/')) return onUrlCall(path);
+      return { items: row ? [row] : [], total: row ? 1 : 0 };
+    });
+    return { apiFetch, calls };
+  }
+
+  // One tick settles the row fetch; the second settles the thumbnail hydration
+  // kicked off after the rows render.
+  const settle = async () => {
+    await tick();
+    await tick();
+  };
+
+  it('renders the cell with no src at all, so no <img> points at the gated API path', async () => {
+    // URL endpoint never answers: the cell must still be safe to display.
+    const { apiFetch } = thumbApi(() => new Promise(() => {}));
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await settle();
+
+    const img = t.el.querySelector('tbody img') as HTMLImageElement;
+    expect(img).not.toBeNull();
+    expect(img.hasAttribute('src')).toBe(false);
+    expect(img.classList.contains('thumb-placeholder')).toBe(true);
+    expect(t.el.innerHTML).not.toContain('/api/v1/assets');
+  });
+
+  it('requests the URL by asset id + array index and assigns the returned url to img.src', async () => {
+    const { apiFetch, calls } = thumbApi(() => ({
+      assetId: 'a1',
+      index: 0,
+      objectKey: 'thumbnails/a1/thumb_0s.jpg',
+      url: PRESIGNED,
+      expiresAt: '2026-01-01T00:05:00Z',
+      expiresInSeconds: 300,
+    }));
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await settle();
+
+    expect(calls).toContain('/assets/a1/thumbnails/0/url');
+    const img = t.el.querySelector('tbody img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toBe(PRESIGNED);
+    expect(img.classList.contains('thumb-placeholder')).toBe(false);
+  });
+
+  it('falls back to the authenticated byte route when no signed URL can be issued', async () => {
+    // Contract: GET /api/v1/assets/{id}/thumbnails/{index} streams image/jpeg
+    // from behind the bearer gate (src/routes/assets.ts:4391), so the table
+    // reads it with apiFetch and shows the bytes as a blob URL.
+    const objectUrl = 'blob:ops-ui/row-thumb';
+    (URL as unknown as { createObjectURL: unknown }).createObjectURL = vi.fn(() => objectUrl);
+    const { apiFetch, calls } = thumbApi((path) => {
+      if (path.endsWith('/url')) throw new Error('object storage failed to sign');
+      return {
+        blob: async () => new Blob([new Uint8Array([0xff, 0xd8])], { type: 'image/jpeg' }),
+      };
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await settle();
+    await settle();
+
+    expect(calls).toContain('/assets/a1/thumbnails/0');
+    const img = t.el.querySelector('tbody img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toBe(objectUrl);
+    expect(img.getAttribute('src')).not.toContain('/api/v1/');
+  });
+
+  it('keeps the placeholder — not a broken image — when neither route answers', async () => {
+    // e.g. 501 not_configured / 502 storage_error, which apiFetch throws.
+    const { apiFetch } = thumbApi(() => {
+      throw new Error('object storage is not configured');
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await settle();
+
+    const img = t.el.querySelector('tbody img') as HTMLImageElement;
+    expect(img.hasAttribute('src')).toBe(false);
+    expect(img.classList.contains('thumb-placeholder')).toBe(true);
+    // A decorative thumbnail must not escalate into a table-wide error state.
+    expect(t.el.querySelector('tr.ops-table-error')).toBeNull();
+  });
+
+  it('makes no thumbnail request for an asset that has none', async () => {
+    const { apiFetch, calls } = thumbApi(
+      () => {
+        throw new Error('should not be called');
+      },
+      { id: 'a2', name: 'Two', status: 'ready', createdAt: '2026-01-01T00:00:00Z', thumbnails: [] }
+    );
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await settle();
+
+    expect(calls.some((c) => c.includes('/thumbnails/'))).toBe(false);
+    expect(t.el.querySelector('tbody img')).toBeNull();
+    expect(t.el.querySelector('tbody .thumb-placeholder')).not.toBeNull();
+  });
+});

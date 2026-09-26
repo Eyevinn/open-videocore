@@ -28,6 +28,7 @@ import {
 import {
   destroyInstance,
   listInstances,
+  reapOrphanedInstances,
   spawnInstance,
   updateInstance
 } from './instance-pool.js';
@@ -38,6 +39,10 @@ import {
 } from './retry-store.js';
 import { probeCallbackTrust } from './callback-trust-probe.js';
 import { hasPendingPackaging } from './packaging-pin.js';
+import {
+  fetchEncoreActiveState,
+  type EncoreActiveState
+} from './encore-active-state.js';
 
 // Default bounded wait for the outbound callback-listener TLS-trust probe
 // (issue #463) when EncoreScalerConfig.callbackTrustTimeoutMs is unset.
@@ -50,9 +55,78 @@ export const DEFAULT_CALLBACK_TRUST_TIMEOUT_MS = 60_000;
 // the finished job from its active set and the poller decrementing activeJobs.
 export const DEFAULT_RECONCILE_GRACE_MS = 10_000;
 
+// #778: how often the tick sweeps OSC for scaler-owned instances with no pool
+// record when EncoreScalerConfig.orphanReapIntervalMs is left to the registry's
+// default. The sweep costs one OSC list call plus a pool SCAN, so it runs on a
+// much coarser cadence than the 10s tick.
+export const DEFAULT_ORPHAN_REAP_INTERVAL_MS = 5 * 60_000;
+
+// #778 (review finding 6): minimum interval between "no usable idle timestamp"
+// warnings for the SAME instance. The condition is re-evaluated every tick (10s)
+// and persists until the instance is torn down, so the warning has to be
+// throttled to stay useful rather than drowning the log.
+export const MISSING_IDLE_STAMP_WARN_INTERVAL_MS = 30 * 60_000;
+
+// Resolve the epoch-ms an instance's idle clock should be measured from (#778).
+//
+// `lastIdleAt` is only advanced when a job COMPLETES (the callback poller's
+// decrement — encore-callback-poller.ts:320, routes/internal.ts:194). An
+// instance that is spawned and never dispatched a job therefore has no
+// completion behind it, and any record whose `lastIdleAt` was lost or written
+// as a non-number makes `now - lastIdleAt > idleTimeoutMs` evaluate to NaN >
+// number, i.e. false, forever: the instance is never a teardown candidate and
+// bills indefinitely.
+//
+// Order of preference:
+//   1. lastIdleAt — a real completion timestamp when there is one.
+//   2. readyAt    — the moment the instance entered the pool ready for work, so
+//                   a never-dispatched instance is idle from readiness.
+//   3. undefined  — nothing usable; callers FAIL CLOSED (see below).
+//
+// Numeric strings are accepted because the record round-trips through JSON in
+// Valkey and may have been repaired out of band.
+export function resolveIdleSince(record: EncoreInstanceRecord): number | undefined {
+  for (const candidate of [record.lastIdleAt, record.readyAt] as unknown[]) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+    if (typeof candidate === 'string' && candidate.trim() !== '') {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+// Whether an instance's idle age exceeds idleTimeoutMs (#778).
+//
+// Fails CLOSED: when no usable idle timestamp exists the instance is treated as
+// eligible (idle age unknown => assume aged) rather than held forever. Eligible
+// only means "candidate": the scale-down path still runs the authoritative
+// Encore real-work check and the packaging-pin check before anything is
+// destroyed (#513/#525 pt.2), so an unknown timestamp can never kill an
+// instance that has in-flight work or a pending packaging handoff — such an
+// instance is drained, exactly as before.
+export function isIdlePastTimeout(
+  record: EncoreInstanceRecord,
+  now: number,
+  idleTimeoutMs: number
+): boolean {
+  const idleSince = resolveIdleSince(record);
+  if (idleSince === undefined) return true;
+  return now - idleSince > idleTimeoutMs;
+}
+
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
+  // #778: epoch ms of the last orphan sweep, so the sweep runs on its own
+  // (much coarser) cadence than the tick. 0 = never swept, so the first tick
+  // after start-up sweeps immediately — that is when a pool lost to a restart
+  // is most likely to have left instances behind.
+  private lastOrphanSweepAt = 0;
+  // #778 review finding 6: instanceId -> epoch ms this loop last warned that the
+  // instance has no usable idle timestamp, so the per-tick warning is throttled
+  // instead of repeating every 10s until teardown.
+  private readonly missingIdleStampWarnedAt = new Map<string, number>();
 
   constructor(private config: EncoreScalerConfig) {}
 
@@ -156,7 +230,16 @@ export class EncoreScalerLoop {
     const survivors: EncoreInstanceRecord[] = [];
     let activeCount = instances.length;
     for (const inst of instances) {
-      const idlePastTimeout = now - inst.lastIdleAt > idleTimeoutMs;
+      // #778: idle age is measured from the last COMPLETION if there is one,
+      // else from the moment the instance became ready (readyAt) — so an
+      // instance that was spawned and never dispatched a job ages out normally.
+      // A record with neither usable timestamp fails closed (eligible), never
+      // "hold forever"; the real-work + packaging-pin checks below still decide
+      // whether it is destroyed or drained.
+      const idlePastTimeout = isIdlePastTimeout(inst, now, idleTimeoutMs);
+      if (inst.activeJobs === 0 && resolveIdleSince(inst) === undefined) {
+        this.warnMissingIdleStampThrottled(inst, now);
+      }
       // A candidate for teardown is either an instance the tracked count already
       // considers idle-and-aged, or one already marked draining (which is being
       // held only until its real work clears — see below).
@@ -234,6 +317,23 @@ export class EncoreScalerLoop {
     }
     instances = survivors;
 
+    // Prune the warn-throttle map for instances that have left the pool so it
+    // cannot grow unbounded over the life of the loop (#778 review finding 6).
+    if (this.missingIdleStampWarnedAt.size > 0) {
+      const live = new Set(instances.map((i) => i.instanceId));
+      for (const id of [...this.missingIdleStampWarnedAt.keys()]) {
+        if (!live.has(id)) this.missingIdleStampWarnedAt.delete(id);
+      }
+    }
+
+    // 4b. Reap instances OSC is still running for this workspace that have no
+    //     pool record at all (#778). Scale-down above can only ever consider
+    //     what is in the pool hash, so an instance orphaned by a spawn that died
+    //     before the pool write, a wiped Valkey, or a deleted deployment has
+    //     nothing else that can remove it. Opt-in (the registry enables it in
+    //     production) and throttled to its own cadence; never fatal to the tick.
+    await this.reapOrphansIfDue();
+
     // 5. Dispatch pending jobs to instances with spare capacity.
     for (const inst of instances) {
       // A draining instance (issue #513) is being torn down: it must receive no
@@ -296,6 +396,60 @@ export class EncoreScalerLoop {
     }
   }
 
+  // Report an instance whose record carries no usable idle timestamp — at most
+  // once per instance per MISSING_IDLE_STAMP_WARN_INTERVAL_MS (#778 review
+  // finding 6). The condition is evaluated on every 10s tick and persists until
+  // the instance is torn down, so an unthrottled warn emitted ~6 times a minute
+  // per affected instance and buried everything else in the log. Throttling keeps
+  // the signal (it is still reported, with the elapsed-since-first-seen) without
+  // the spam. The map is pruned of instances no longer in the pool so it cannot
+  // grow unbounded across a long-lived loop.
+  private warnMissingIdleStampThrottled(
+    inst: EncoreInstanceRecord,
+    now: number
+  ): void {
+    const lastWarnedAt = this.missingIdleStampWarnedAt.get(inst.instanceId);
+    if (
+      lastWarnedAt !== undefined &&
+      now - lastWarnedAt < MISSING_IDLE_STAMP_WARN_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.missingIdleStampWarnedAt.set(inst.instanceId, now);
+    console.warn(
+      '[encore-scaler] instance %s has no usable idle timestamp ' +
+        '(lastIdleAt=%o readyAt=%o); treating it as idle-aged rather than ' +
+        'holding it indefinitely (#778). This message is throttled to once ' +
+        'every %dms per instance.',
+      inst.instanceId,
+      inst.lastIdleAt,
+      inst.readyAt,
+      MISSING_IDLE_STAMP_WARN_INTERVAL_MS
+    );
+  }
+
+  // Run the orphan sweep (#778) when its own interval has elapsed. Disabled
+  // unless EncoreScalerConfig.orphanReapIntervalMs is a positive number, so a
+  // caller that has not opted in (tests, embedders) makes no extra OSC calls.
+  // Swallows every error: a sweep failure must never break the tick's
+  // scaling/dispatch work, exactly like the other best-effort hooks above.
+  private async reapOrphansIfDue(): Promise<void> {
+    const intervalMs = this.config.orphanReapIntervalMs;
+    if (typeof intervalMs !== 'number' || !(intervalMs > 0)) return;
+    const now = Date.now();
+    if (now - this.lastOrphanSweepAt < intervalMs) return;
+    this.lastOrphanSweepAt = now;
+    try {
+      await reapOrphanedInstances(this.config);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] orphan reap error (workspace=%s):',
+        this.config.workspaceId,
+        err
+      );
+    }
+  }
+
   // Fetch an instance's AUTHORITATIVE real active-job state directly from Encore:
   // the live QUEUED + IN_PROGRESS job documents. This is the single source of
   // truth the scaler reconciles its tracked activeJobs against (both the periodic
@@ -312,49 +466,26 @@ export class EncoreScalerLoop {
   //     scale-down that means "do not destroy" — we never terminate an instance
   //     whose real in-flight state we could not confirm is empty.
   //
+  // `truncated` (#769 review finding 2) says `activeExternalIds` is only PART of
+  // what Encore reports active (more than one page of 100 for a status). `count`
+  // is still exact, so a count correction is safe, but no diff may conclude a
+  // tracked job vanished from a truncated instance.
+  //
   // Contract: Encore /encoreJobs/search/findByStatus returns Spring HATEOAS pages
   // { _embedded: { encoreJobs: [{ id, externalId, ... }] }, page: { totalElements } }
   // (verified in encore-callback-poller.ts:505-508, SVT Encore, 2026-07-07).
+  //
+  // The query itself now lives in encore-active-state.ts so the orphan reaper
+  // (instance-pool.ts reapOrphanedInstances) runs the IDENTICAL check before it
+  // destroys anything (#778 review finding 2) — there is one definition of "does
+  // this instance have work", not two that can drift.
   private async fetchRealActiveState(
     record: EncoreInstanceRecord
-  ): Promise<{ count: number; activeExternalIds: Set<string> } | undefined> {
+  ): Promise<EncoreActiveState | undefined> {
     const { getToken } = this.config;
     try {
       const token = await getToken();
-      const base = record.url.replace(/\/$/, '');
-      const [resQ, resP] = await Promise.all([
-        fetch(`${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=100`, {
-          headers: { authorization: `Bearer ${token}` }
-        }),
-        fetch(`${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=100`, {
-          headers: { authorization: `Bearer ${token}` }
-        })
-      ]);
-      if (!resQ.ok || !resP.ok) return undefined;
-
-      type EncoreJobPage = {
-        _embedded?: { encoreJobs?: Array<{ externalId?: string }> };
-        page?: { totalElements?: number };
-      };
-      const [bodyQ, bodyP] = await Promise.all([
-        resQ.json().catch(() => ({})) as Promise<EncoreJobPage>,
-        resP.json().catch(() => ({})) as Promise<EncoreJobPage>
-      ]);
-      const queuedCount = bodyQ.page?.totalElements;
-      const inProgressCount = bodyP.page?.totalElements;
-      if (typeof queuedCount !== 'number' || typeof inProgressCount !== 'number') {
-        return undefined;
-      }
-
-      const activeExternalIds = new Set<string>();
-      for (const j of bodyQ._embedded?.encoreJobs ?? []) {
-        if (j.externalId) activeExternalIds.add(j.externalId);
-      }
-      for (const j of bodyP._embedded?.encoreJobs ?? []) {
-        if (j.externalId) activeExternalIds.add(j.externalId);
-      }
-
-      return { count: queuedCount + inProgressCount, activeExternalIds };
+      return await fetchEncoreActiveState(record.url, token);
     } catch {
       // Any error means we could not confirm the real state — surface undefined
       // so callers stay conservative (never destroy on an unconfirmed count).
@@ -622,17 +753,22 @@ export class EncoreScalerLoop {
   // Reconcile each instance's tracked activeJobs against its real IN_PROGRESS
   // job count. Corrects drift (e.g. a completion callback that never freed the
   // slot) so the pool can never get permanently stuck thinking every slot is
-  // full. Runs once per tick, is a no-op when the pool is empty, and skips
-  // instances already at zero (nothing to correct downward). Each instance is
-  // handled in isolation: one unreachable instance never breaks the tick.
+  // full. Runs once per tick and is a no-op when the pool is empty. Each
+  // instance is handled in isolation: one unreachable instance never breaks the
+  // tick.
   //
-  // #769: the pass runs in TWO phases. Phase 1 fetches the real active set of
-  // EVERY pool instance and indexes it by instanceId; phase 2 then corrects
-  // counts and classifies drops against that COMPLETE pool-wide index. Drop
-  // classification must be able to ask "is this externalId active anywhere in
-  // the pool?", which is only answerable once every instance has been fetched —
-  // see reconcile's phase-1 comment for why the previous single-pass shape could
-  // not answer it (issue #839).
+  // The pass runs in TWO passes (#839). Pass 1 fetches the real active set of
+  // EVERY pool instance — including ones tracked idle — and indexes it by
+  // instanceId; pass 2 then corrects counts and classifies drops against that
+  // COMPLETE pool-wide index. #769 is why the index must be complete before any
+  // classification: drop classification asks "is this externalId active anywhere
+  // in the pool?", which is only answerable once every instance has been
+  // fetched, and an incomplete answer is indistinguishable from a genuine drop.
+  //
+  // A third, targeted step then corrects the tracked count of any instance this
+  // pass proved is the real owner of a job keys.jobInstance had mapped elsewhere
+  // — suppressing the false drop without repairing the mapping and the holder's
+  // count would leave the divergence to recur every tick (#769 review finding 3).
   async reconcile(): Promise<void> {
     const { redis, workspaceId } = this.config;
 
@@ -650,73 +786,118 @@ export class EncoreScalerLoop {
     // write is owned by the reconciler/main.ts repo layer.
     const droppedJobs: DroppedJob[] = [];
 
-    // PHASE 1 (#769) — build the pool-wide active index BEFORE any drop
-    // classification runs.
+    // #768/#839/#769: index of instanceId -> the externalIds Encore actually
+    // reports QUEUED/IN_PROGRESS on that instance.
     //
-    // index: instanceId -> the externalIds Encore actually reports
-    // QUEUED/IN_PROGRESS on that instance (fetchRealActiveState). Phase 2 uses it
-    // to answer "is this externalId active ANYWHERE in the pool?" before calling a
-    // job dropped, which is the fix for #769: a job's owning instance was resolved
-    // solely from keys.jobInstance — a single value OVERWRITTEN on each
-    // re-dispatch (dispatch: redis.hset(keys.jobInstance, jobId, instanceId)) — so
-    // a stale mapping made reconcile flag a job dropped off the mapped instance
-    // while Encore still had it running on a different one.
+    // #768 built this to LOG, at each drop-classification, whether a job flagged
+    // as dropped off ITS keys.jobInstance-mapped instance was in fact still
+    // active on a DIFFERENT pool instance — the signature of the stale-mapping
+    // hypothesis. #769 makes that same answer DECIDE: a job Encore still reports
+    // active somewhere in the pool is not dropped, whatever the mapping claims.
     //
-    // #839: this index was previously populated INCREMENTALLY inside the same loop
-    // that classified drops, so at classification time it held only the instances
-    // iterated so far. Pool-hash iteration order is uncontrolled, which made the
-    // cross-instance answer order-dependent (a false "active nowhere" whenever the
-    // mapped instance sorted before the instance actually holding the job). It is
-    // now a complete, order-independent pre-pass.
-    //
-    // Unlike phase 2 this pass deliberately does NOT skip idle-tracked instances
-    // (record.activeJobs === 0): a stale mapping goes hand in hand with stale
-    // counts, so the instance genuinely holding the job may itself be tracked at
-    // zero. Instances whose real state cannot be confirmed are recorded in
-    // `unresolvedInstances` rather than silently dropped from the index — they are
-    // "unknown", not "empty", and phase 2 logs them at each classification so a
-    // drop decided while part of the pool was unreachable stays auditable.
+    // #839: this index used to be built INCREMENTALLY inside the classification
+    // loop below, so at each classification it held only the instances iterated
+    // before or at the current one. Pool-hash iteration order is uncontrolled,
+    // so whenever the mapped instance sorted before the instance actually
+    // holding the job, the diagnostic logged foundActiveOnPoolInstances=(none)
+    // — a false negative indistinguishable from a genuine drop, biasing the
+    // whole diagnostic toward REFUTING the very hypothesis it exists to test.
+    // Two skips compounded it: idle-tracked instances (activeJobs === 0) and
+    // unreachable ones were never indexed at all. The index is now built in a
+    // FULL pass over every pool entry BEFORE any classification runs, so the
+    // signal is order-independent — and, since #769 now decides on it, so is the
+    // decision.
     const poolActiveByInstance = new Map<string, Set<string>>();
-    const unresolvedInstances: string[] = [];
-    const poolRecords = new Map<
-      string,
-      {
-        record: EncoreInstanceRecord;
+    // #839: instances whose real active set could NOT be established this pass.
+    // Absence of a job from the index is only evidence of absence over the
+    // instances we actually checked, so these are named in the diagnostic to keep
+    // a `(none)` line interpretable. Three ways an instance lands here:
+    //   (unparseable) — its pool-hash entry is not valid JSON,
+    //   (unreachable) — fetchRealActiveState could not confirm its state,
+    //   (truncated)   — Encore reported more active jobs than the one page of 100
+    //                   per status we fetch, so the returned externalIds are a
+    //                   PARTIAL set (#769 review finding 2). A truncated instance
+    //                   is still indexed — an externalId Encore DID return is
+    //                   proof the job is alive — but its silence proves nothing,
+    //                   so it counts as unchecked for any "active nowhere" claim.
+    const poolUncheckedInstances: string[] = [];
+    // The parsed record + real state per instance, captured once by the full
+    // pass and reused by the classification loop below — so classification sees
+    // exactly the same snapshot the index was built from (no second fetch, no
+    // skew between the two).
+    const poolPass: Array<{
+      instanceId: string;
+      record: EncoreInstanceRecord;
+      real: EncoreActiveState | undefined;
+    }> = [];
+
+    // Pass 1 (#839): index the whole pool. Every instance is fetched, including
+    // ones tracked idle (activeJobs === 0) and ones that turn out unreachable —
+    // a tracked count is precisely what is suspected of being stale, so an
+    // idle-tracked instance can still be the one really holding the job.
+    //
+    // The probes run CONCURRENTLY (#769 review finding 6): each is independent
+    // and self-isolating (fetchRealActiveState swallows its own errors), and
+    // reconcile is tick step 0 — serialising a getToken() plus two HTTP requests
+    // per instance would put 2N round-trips at the head of every tick now that
+    // idle-tracked and draining instances are probed too. Fan-out is bounded by
+    // the pool size, which is bounded by maxInstances. Results are folded back in
+    // pool-hash order so the pass stays deterministic.
+    const probed = await Promise.all(
+      entries.map(async ([instanceId, instanceJson]): Promise<{
+        instanceId: string;
+        record: EncoreInstanceRecord | undefined;
+        real: EncoreActiveState | undefined;
+      }> => {
+        let record: EncoreInstanceRecord;
+        try {
+          record = JSON.parse(instanceJson) as EncoreInstanceRecord;
+        } catch {
+          // Corrupt entry — cannot be fetched or classified; reported as
+          // unchecked below so it is visible rather than silently missing.
+          return { instanceId, record: undefined, real: undefined };
+        }
         // Fetch both QUEUED and IN_PROGRESS documents (not just counts) — a
         // freshly dispatched job sits in QUEUED until Encore picks it up, so
         // counting only IN_PROGRESS would make the instance look idle immediately
         // after dispatch and trigger a spurious scale-up on the next tick.
         // fetchRealActiveState reads each active job's externalId so we can tell
         // WHICH tracked jobs (if any) have silently vanished — the dropped-job
-        // signal for #449. undefined => real state could not be confirmed.
-        real: { count: number; activeExternalIds: Set<string> } | undefined;
-      }
-    >();
+        // signal for #449 — and which instance a supposedly dropped job is
+        // really live on (#768/#769).
+        let real: EncoreActiveState | undefined;
+        try {
+          real = await this.fetchRealActiveState(record);
+        } catch {
+          // fetchRealActiveState already swallows its own errors; belt-and-braces
+          // so one bad instance can never abort the index-building pass.
+          real = undefined;
+        }
+        return { instanceId, record, real };
+      })
+    );
 
-    for (const [instanceId, instanceJson] of entries) {
-      let record: EncoreInstanceRecord;
-      try {
-        record = JSON.parse(instanceJson) as EncoreInstanceRecord;
-      } catch {
-        continue; // corrupt entry — leave it for the loop to skip elsewhere
+    for (const { instanceId, record, real } of probed) {
+      if (!record) {
+        poolUncheckedInstances.push(`${instanceId}(unparseable)`);
+        continue;
       }
-      // fetchRealActiveState already swallows its own errors (returns undefined),
-      // but keep the per-instance guard so one instance can never break the pass.
-      let real: { count: number; activeExternalIds: Set<string> } | undefined;
-      try {
-        real = await this.fetchRealActiveState(record);
-      } catch {
-        real = undefined;
+      if (real) {
+        poolActiveByInstance.set(instanceId, real.activeExternalIds);
+        // Positive evidence from a truncated page is still evidence; its silence
+        // is not (#769 review finding 2).
+        if (real.truncated) poolUncheckedInstances.push(`${instanceId}(truncated)`);
+      } else {
+        poolUncheckedInstances.push(`${instanceId}(unreachable)`);
       }
-      poolRecords.set(instanceId, { record, real });
-      if (real) poolActiveByInstance.set(instanceId, real.activeExternalIds);
-      else unresolvedInstances.push(instanceId);
+      poolPass.push({ instanceId, record, real });
     }
 
     // Every pool instance on which Encore currently reports `externalId` active.
     // Non-empty => the job is NOT gone from the pool, whatever keys.jobInstance
-    // claims. Only answers over instances phase 1 could confirm; unresolved ones
-    // are unknown and are reported alongside any classification.
+    // claims. It answers only over instances pass 1 could confirm, so it can
+    // never suppress a drop on ABSENCE of information — only on the positive
+    // "Encore reports this externalId QUEUED/IN_PROGRESS here" evidence.
     const instancesActiveFor = (externalId: string): string[] => {
       const found: string[] = [];
       for (const [otherInstanceId, otherActive] of poolActiveByInstance) {
@@ -725,10 +906,21 @@ export class EncoreScalerLoop {
       return found;
     };
 
-    // PHASE 2 — correct counts and classify drops against the complete index.
-    for (const [instanceId, { record, real }] of poolRecords) {
+    // Instances this pass PROVED own a tracked job that keys.jobInstance had
+    // mapped elsewhere (#769 review finding 3). Their tracked activeJobs is
+    // corrected after pass 2 — see the targeted correction below.
+    const mappingRepairedOnto = new Set<string>();
+
+    // Pass 2: correct counts and classify drops against the complete index,
+    // reading the snapshot captured above instead of fetching inline.
+    for (const { instanceId, record, real } of poolPass) {
       try {
-        // Nothing to correct downward on an already-idle instance.
+        // Nothing to correct downward on an already-idle instance. An
+        // idle-tracked instance that is really running work is corrected by the
+        // targeted pass below (#769 review finding 3) rather than here: the
+        // generic idle-but-busy divergence is scale-down's to handle (#513
+        // drain-don't-kill marks such an instance draining instead of destroying
+        // it), and taking it over here would pre-empt that path.
         if (record.activeJobs === 0) continue;
         if (!real) continue; // could not confirm — leave the record as-is
         const actualCount = real.count;
@@ -749,7 +941,26 @@ export class EncoreScalerLoop {
           // (jobStatus hash, scaler-loop.ts:291) — against the externalIds
           // Encore still reports active. Anything tracked-running for this
           // instance that Encore no longer lists is dropped.
-          if (actualCount < record.activeJobs) {
+          //
+          // #769 review finding 2: NOT when this instance's active page was
+          // truncated. fetchRealActiveState asks for one page of 100 per status,
+          // so an instance with more than 100 QUEUED or 100 IN_PROGRESS jobs
+          // returns a partial externalId set; diffing against it would classify
+          // every tracked job sitting off page 0 as dropped. `count` comes from
+          // Encore's totalElements and is still exact, so the count correction
+          // below still runs — only the drop diff is withheld.
+          if (actualCount < record.activeJobs && real.truncated) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[encore-scaler] reconcile: instance %s returned a TRUNCATED active ' +
+                'page (Encore reports %d active, one page of 100 per status was ' +
+                'fetched) — skipping drop classification for it this pass; its ' +
+                'tracked count is still corrected (#769)',
+              instanceId,
+              actualCount
+            );
+          }
+          if (actualCount < record.activeJobs && !real.truncated) {
             // #708: grace window for jobs the callback poller just saw complete.
             // reconcile can diff Encore's active set AFTER Encore drops a finished
             // job but BEFORE the poller has decremented record.activeJobs
@@ -787,15 +998,78 @@ export class EncoreScalerLoop {
               // recovered" for a job that never failed (#704/#728 wording).
               const activeElsewhere = instancesActiveFor(jobId);
               if (activeElsewhere.length > 0) {
+                // #768 required three fields to attribute the stale-mapping
+                // signature: the mapped instance, where the externalId is really
+                // active, and whether a re-dispatch preceded the check. With
+                // #769 in place this branch is the ONLY place that signature can
+                // still surface — the drop-diagnostic line below is now
+                // unreachable for it — so it carries the same field set (#769
+                // review findings 1 and 5). Best-effort: a read failure must
+                // never affect the decision.
+                let reDispatched: boolean | 'unknown' = 'unknown';
+                try {
+                  const attemptsRaw = await redis.get(keys.jobAttempts(jobId));
+                  reDispatched = (Number(attemptsRaw ?? '0') || 0) > 1;
+                } catch {
+                  reDispatched = 'unknown';
+                }
+
+                // #769 review finding 3: detecting the divergence is not enough —
+                // repair it, or it recurs every tick for the job's lifetime.
+                // keys.jobInstance is written only at dispatch (see dispatch's
+                // redis.hset below), so nothing else corrects a mapping that has
+                // gone stale. When exactly ONE instance is confirmed running the
+                // job, that instance IS the owner: point the mapping at it, so
+                // the next pass reconciles the job against its real holder and
+                // this branch does not re-fire. When more than one instance
+                // reports it active the mapping is left alone and the ambiguity
+                // is reported — two instances running the same externalId is a
+                // duplicate dispatch, a different bug, and guessing an owner
+                // would hide it. The holder's own tracked activeJobs is corrected
+                // upward by this same pass (pass 2 no longer skips idle-tracked
+                // instances), so the pool accounting converges too.
+                let jobInstanceRepairedTo = '(not-repaired)';
+                if (activeElsewhere.length === 1) {
+                  try {
+                    await redis.hset(
+                      keys.jobInstance(workspaceId),
+                      jobId,
+                      activeElsewhere[0]
+                    );
+                    jobInstanceRepairedTo = activeElsewhere[0];
+                    mappingRepairedOnto.add(activeElsewhere[0]);
+                  } catch {
+                    // A failed repair must not affect the decision: the job is
+                    // still confirmed alive, so it still must not be dropped.
+                    jobInstanceRepairedTo = '(repair-failed)';
+                  }
+                } else {
+                  // eslint-disable-next-line no-console
+                  console.warn(
+                    '[encore-scaler] reconcile: job %s is active on MORE THAN ONE ' +
+                      'pool instance (%s) — keys.jobInstance left pointing at %s; ' +
+                      'this is a duplicate dispatch, not a stale mapping (#769)',
+                    jobId,
+                    activeElsewhere.join(','),
+                    mappedInstanceId
+                  );
+                }
+
                 // eslint-disable-next-line no-console
                 console.warn(
-                  '[encore-scaler] reconcile: job %s is NOT dropped — ' +
-                    'keys.jobInstance maps it to instance %s (reconciled this ' +
-                    'pass) but Encore reports it active on pool instance(s) %s; ' +
-                    'the mapping is stale (#769). Leaving the job running.',
+                  '[encore-scaler] stale-mapping-diagnostic (#768/#769): job %s is ' +
+                    'NOT dropped — keys.jobInstance=%s reconciledInstance=%s ' +
+                    'foundActiveOnPoolInstances=%s poolInstancesCheckedThisPass=%s ' +
+                    'poolInstancesUncheckedThisPass=%s reDispatched=%s ' +
+                    'jobInstanceRepairedTo=%s',
                   jobId,
                   mappedInstanceId,
-                  activeElsewhere.join(',')
+                  instanceId,
+                  activeElsewhere.join(','),
+                  [...poolActiveByInstance.keys()].join(',') || '(none)',
+                  poolUncheckedInstances.join(',') || '(none)',
+                  String(reDispatched),
+                  jobInstanceRepairedTo
                 );
                 continue;
               }
@@ -819,24 +1093,25 @@ export class EncoreScalerLoop {
               }
               droppedForInstance.push(jobId);
 
-              // #768: capture enough state at the exact drop-classification site
-              // to attribute a real drop event. For this job we record: the
+              // #768: capture enough state at the exact drop-classification
+              // site to attribute a real drop event. For this job we record: the
               // instance keys.jobInstance maps it to (mappedInstanceId — equals
               // instanceId here precisely BECAUSE we filtered mismatches out
               // above, so logging it documents what the mapping claimed), the
-              // pool instances whose real active set phase 1 confirmed, the ones
+              // pool instances whose real active set pass 1 confirmed, the ones
               // it could NOT confirm, and whether the job had already been
               // re-dispatched (attempts > 1).
               //
               // #769: foundActiveOnPoolInstances is now necessarily empty here —
               // a non-empty pool-wide answer short-circuits to the "NOT dropped"
-              // branch above instead of reaching this point. It is kept because
-              // that is now the load-bearing assertion of the drop decision: this
-              // job is active on NONE of the instances phase 1 could confirm.
-              // poolInstancesUnresolvedThisPass is the honest caveat on it — an
-              // instance whose real state could not be fetched is unknown, not
-              // empty, so a drop logged with a non-empty unresolved list was
-              // decided without full pool visibility.
+              // branch above instead of reaching this point (the stale-mapping
+              // signature moved to the stale-mapping-diagnostic line there). It
+              // is kept because it is now the load-bearing assertion of the drop
+              // decision: this job is active on NONE of the instances pass 1
+              // could confirm. poolInstancesUncheckedThisPass is the honest
+              // caveat on it — an unreachable, unparseable or page-truncated
+              // instance is unknown, not empty, so a drop logged with a non-empty
+              // unchecked list was decided without full pool visibility.
               const foundActiveOn = instancesActiveFor(jobId);
               let reDispatched: boolean | 'unknown' = 'unknown';
               try {
@@ -851,13 +1126,13 @@ export class EncoreScalerLoop {
                 '[encore-scaler] drop-diagnostic (#768): classifying job %s as ' +
                   'dropped — keys.jobInstance=%s reconciledInstance=%s ' +
                   'foundActiveOnPoolInstances=%s poolInstancesCheckedThisPass=%s ' +
-                  'poolInstancesUnresolvedThisPass=%s reDispatched=%s',
+                  'poolInstancesUncheckedThisPass=%s reDispatched=%s',
                 jobId,
                 mappedInstanceId,
                 instanceId,
                 foundActiveOn.length ? foundActiveOn.join(',') : '(none)',
                 [...poolActiveByInstance.keys()].join(',') || '(none)',
-                unresolvedInstances.join(',') || '(none)',
+                poolUncheckedInstances.join(',') || '(none)',
                 String(reDispatched)
               );
 
@@ -906,6 +1181,51 @@ export class EncoreScalerLoop {
       } catch {
         // Swallow per-instance errors so one unreachable instance does not
         // break reconciliation (or the tick) for the rest of the pool.
+        continue;
+      }
+    }
+
+    // Targeted count repair for the instances this pass proved are the real
+    // owner of a tracked job (#769 review finding 3). Suppressing the false drop
+    // and repointing keys.jobInstance is only half the repair: the holder's
+    // tracked activeJobs was written for whatever the pool thought it was
+    // running, so an instance that silently picked up a re-dispatched job can
+    // still be credited with spare capacity it does not have — dispatch then
+    // over-subscribes it and scale-down victim selection keeps treating it as
+    // idle. Encore's own count for it is authoritative, so adopt it.
+    //
+    // Deliberately narrow: only instances named by a mapping repair this pass,
+    // not every idle-tracked instance found busy (that divergence belongs to
+    // scale-down's drain-don't-kill path, #513). Runs after pass 2 so it is
+    // independent of pool-hash iteration order — the holder may have been
+    // visited before the repair that named it. Truncated pages are fine here:
+    // `count` comes from Encore's totalElements and stays exact.
+    for (const instanceId of mappingRepairedOnto) {
+      const entry = poolPass.find((p) => p.instanceId === instanceId);
+      if (!entry || !entry.real) continue;
+      if (entry.record.activeJobs === entry.real.count) continue;
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[encore-scaler] reconcile: correcting activeJobs for instance %s to ' +
+            'Encore’s real count after a keys.jobInstance repair: tracked=%d ' +
+            'actual=%d (#769)',
+          instanceId,
+          entry.record.activeJobs,
+          entry.real.count
+        );
+        entry.record.activeJobs = entry.real.count;
+        // lastIdleAt is deliberately NOT touched, for the same reason as the
+        // correction in pass 2: the idle clock must only advance on a confirmed
+        // completion (decrementActiveJobs), never on a reconciliation.
+        await redis.hset(
+          keys.pool(workspaceId),
+          instanceId,
+          JSON.stringify(entry.record)
+        );
+      } catch {
+        // Best-effort: a failed count repair must never break the tick. The job
+        // is already confirmed alive and its mapping already repaired.
         continue;
       }
     }

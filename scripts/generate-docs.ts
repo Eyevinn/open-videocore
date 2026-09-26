@@ -117,7 +117,8 @@ const GROUP_META: Record<string, [string, string]> = {
 // summary/description fields, so these are authored here, grounded in each
 // operation's own request/response schema (verified against openapi.json).
 const DESCRIPTIONS: Record<string, string> = {
-  'GET /health': 'Liveness probe that also reports service identity.',
+  'GET /health':
+    'Liveness probe that also reports service identity, the build identity of the running image (`build`), resolver health, and per-method ingest availability.',
   'GET /healthz': 'Minimal liveness probe.',
   'POST /api/v1/provision/':
     'Provision a full OSC media stack (object storage, metadata store, queue) for a new workspace. Asynchronous — returns an operation to poll.',
@@ -499,7 +500,7 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/assets
 <h2 id="search">4. Search</h2>
 <p>One endpoint covers both free text and exact filters, ANDed together and paginated:</p>
 ${renderCurlBlock('Request', 'curl "https://<your-instance>/api/v1/search?q=keynote&tags=stage-a&page=1&pageSize=20"')}
-<p>Exact-filter fields: <code>tags</code>, <code>mimeType</code>, <code>metadata.&lt;key&gt;</code>, <code>tamsFlowId</code>, <code>tamsTimerange</code>. Free text (<code>q</code>) matches over name and description. Full shape in the <a href="ref-search.html">Search reference</a>.</p>
+<p>Exact-filter fields: <code>tags</code>, <code>mimeType</code>, <code>metadata.&lt;key&gt;</code>, <code>tamsFlowId</code>, <code>tamsTimerange</code>. Free text (<code>q</code>) matches over name and description. <code>mimeType</code> matches the container format extracted from the media and accepts either a container token (<code>mp4</code>) or a common media MIME type (<code>video/mp4</code>), which is resolved onto the container family it names. Full shape in the <a href="ref-search.html">Search reference</a>.</p>
 <div class="callout warn"><code>GET /api/v1/assets/search</code> is a deprecated, free-text-only alias kept for backward compatibility — new integrations should use <code>/api/v1/search</code> above.</div>
 
 <h2 id="tracks">5. Audio and subtitle tracks</h2>

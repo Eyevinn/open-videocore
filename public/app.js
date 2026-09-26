@@ -22,6 +22,15 @@ import { createLogsTable } from './logs-table.js';
 // but push medium/large files straight to MinIO via the presigned single-part
 // and multipart routes so they never hit the proxy's request-body limit.
 import { uploadAssetFile, describeUploadFailure } from './upload.js';
+// Presigned thumbnail loading (issue #801). An <img> GET carries no
+// Authorization header, so thumbnails are resolved to a short-lived signed URL
+// over apiFetch first. Contract grounding lives in public/thumbnail-url.js.
+import { applyThumbnail } from './thumbnail-url.js';
+// Copyable identifier cells (issue #851). A column headed "ID" shows the ULID
+// the API accepts as an asset id, as selectable text with a click-to-copy
+// button; slugs are shown under their own "Slug" header. Contract grounding for
+// which value each endpoint accepts lives in public/copy-id.js.
+import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -173,7 +182,13 @@ function uiAuthHeader() {
 
 const API_BASE = window.location.origin + '/api/v1';
 
-async function apiFetch(path, options = {}) {
+// `options.raw` (issue #801): resolve with the Response itself instead of a
+// parsed JSON body, for routes that serve bytes rather than JSON — e.g.
+// GET /api/v1/assets/:id/thumbnails/:index, which streams image/jpeg
+// (src/routes/assets.ts:4391-4405). Non-ok handling is unchanged, so a caller
+// still sees the same thrown Error for 404/501. `raw` is stripped before the
+// options reach fetch(); it is not a fetch init field.
+async function apiFetch(path, { raw = false, ...options } = {}) {
   const stack = stackOverride || getActiveStack();
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
@@ -206,6 +221,7 @@ async function apiFetch(path, options = {}) {
     err.body = body;
     throw err;
   }
+  if (raw) return res;
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
     return res.json();
@@ -1156,7 +1172,13 @@ function openDetailWindow(type, id) {
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
 
-const TABS = ['assets', 'jobs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+// Routing allowlist. This MUST stay in step with the `.tab-btn[data-tab]`
+// buttons rendered by public/index.html and with the TAB_RENDERERS registry
+// below. `logs` was rendered and had a registered renderer but was never added
+// here, so switchTab dropped every click on it (issue #823). The list is kept
+// explicit rather than derived from the DOM so a stray/injected button cannot
+// become routable; auditTabWiring() below is what keeps the three in step.
+const TABS = ['assets', 'jobs', 'logs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -1171,8 +1193,53 @@ function isTabAllowed(name) {
   return typeof gate === 'function' ? gate() : true;
 }
 
+// Report — rather than silently ignore — any rendered tab button that is not
+// routable (issue #823 acceptance criterion 3). A button with no allowlist
+// entry is inert; a button in the allowlist with no registered renderer would
+// throw in switchTab. Both are wiring mistakes that must be loud at startup.
+// Pure: takes the root to scan and returns the problems, so a test can assert
+// on the result without capturing console output.
+function auditTabWiring(root) {
+  const scope = root || document;
+  const problems = [];
+  scope.querySelectorAll('.tab-btn[data-tab]').forEach(function (btn) {
+    const name = btn.dataset.tab;
+    const inAllowlist = TABS.includes(name);
+    const hasRenderer = typeof TAB_RENDERERS[name] === 'function';
+    if (!inAllowlist || !hasRenderer) {
+      problems.push({ tab: name, inAllowlist: inAllowlist, hasRenderer: hasRenderer });
+    }
+  });
+  // Also catch the inverse: an allowlisted tab with no renderer would throw the
+  // moment anything routed to it (including a stale persisted TAB_KEY).
+  TABS.forEach(function (name) {
+    if (typeof TAB_RENDERERS[name] !== 'function' && !problems.some(function (p) { return p.tab === name; })) {
+      problems.push({ tab: name, inAllowlist: true, hasRenderer: false });
+    }
+  });
+  return problems;
+}
+
+function reportTabWiring(root) {
+  const problems = auditTabWiring(root);
+  problems.forEach(function (p) {
+    const reasons = [];
+    if (!p.inAllowlist) reasons.push('missing from the TABS allowlist');
+    if (!p.hasRenderer) reasons.push('has no registered renderer in TAB_RENDERERS');
+    console.error('[ops-ui] tab "' + p.tab + '" is not routable: ' + reasons.join(' and ') + '.');
+  });
+  return problems;
+}
+
 function switchTab(name) {
-  if (!TABS.includes(name)) return;
+  // Never fail silently on an unroutable name: a bare `return` here left the
+  // previous view on screen with no error, which is exactly what hid #823. It
+  // also blanked the page on boot from a stale persisted TAB_KEY. Report and
+  // fall back to the always-available default instead.
+  if (!TABS.includes(name)) {
+    console.error('[ops-ui] switchTab("' + name + '"): unknown tab, falling back to "assets".');
+    name = 'assets';
+  }
   // Fail closed: never render a role-gated view for a role that may not see it,
   // even if an old persisted TAB_KEY or a manual call names it.
   if (!isTabAllowed(name)) name = 'assets';
@@ -1188,6 +1255,9 @@ function switchTab(name) {
 }
 
 function setupTabs() {
+  // Startup wiring check (issue #823): surface any rendered-but-unroutable tab
+  // before the operator discovers it by clicking a dead button.
+  reportTabWiring(document);
   document.querySelectorAll('.tab-btn').forEach(function(btn) {
     // Hide the sidebar entry for any role-gated tab the current role may not
     // access. Acceptance criterion #680: the Storage link renders only for
@@ -1608,13 +1678,24 @@ async function renderAssetDetailBody(id, bodyEl) {
 
     // Build KV grid with escaped values
     const kvRows = [
-      ['ID', '<span class="text-mono">' + escHtml(asset.slug || asset.id) + '</span>'],
+      // Issue #851: "ID" carries the ULID unconditionally — never the slug, and
+      // never a value that varies per asset. It is the one value every asset-id
+      // endpoint accepts (the collections membership route resolves it with a
+      // plain repo.get — no slug fallback), and it matches the ID column of the
+      // Assets table this pane opens from, so the two never disagree about what
+      // "ID" means. The copy button is here because a 26-character ULID should
+      // never have to be retyped into a form.
+      //
+      // Contract: openapi.json .paths["/api/v1/assets/{id}"].get 200 schema —
+      // `id` is in `required`, `slug` is an optional property.
+      ['ID', copyableIdCellHtml(asset.id, 'Copy asset id')],
     ];
-    // When a human-friendly slug is present, keep the raw ULID visible too so it
-    // stays discoverable in the detail pane. If there is no slug, the "ID" row
-    // above already shows the ULID — avoid a duplicate/empty row.
+    // The slug keeps its place as the human-readable handle (issues #131/#132/
+    // #133) — under its own honest label, never as "ID". Omitted entirely for
+    // pre-slug assets, which have no slug at all (optional in the contract
+    // above, and `slug?: string` on `Asset`, src/data/asset-repo.ts:455).
     if (asset.slug) {
-      kvRows.push(['ULID', '<span class="text-mono text-muted">' + escHtml(asset.id) + '</span>']);
+      kvRows.push(['Slug', '<span class="text-mono">' + escHtml(asset.slug) + '</span>']);
     }
     // Status cell; when the scene-detect pipeline recorded a failure
     // (asset.sceneDetectionError, a plain string per src/routes/assets.ts:381),
@@ -1668,6 +1749,8 @@ async function renderAssetDetailBody(id, bodyEl) {
     kvDiv.className = 'kv-grid';
     kvDiv.innerHTML = kvHtml;
     body.appendChild(kvDiv);
+    // Bind the ULID copy affordance (issue #851).
+    wireCopyIdButtons(kvDiv);
 
     if (asset.metadata) {
       const metaDiv = document.createElement('div');
@@ -1978,9 +2061,9 @@ async function renderAssetDetailBody(id, bodyEl) {
       // First fetch existing thumbnails; if none, extract at 0s, 25%, 50%, 75%
       try {
         var existing = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails');
-        var existingUrls = existing && existing.thumbnails ? existing.thumbnails : [];
-        if (existingUrls.length) {
-          renderThumbnailStrip(thumbArea, existingUrls);
+        var existingThumbs = existing && existing.thumbnails ? existing.thumbnails : [];
+        if (existingThumbs.length) {
+          renderThumbnailStrip(thumbArea, id, existingThumbs.length);
           return;
         }
         // Extract using duration from technicalMetadata if available
@@ -1991,9 +2074,13 @@ async function renderAssetDetailBody(id, bodyEl) {
         var r = await apiFetch('/assets/' + encodeURIComponent(id) + '/thumbnails',
           { method: 'POST', body: JSON.stringify({ timecodes: timecodes }) });
         actionMsg.innerHTML = '';
-        var urls = r && r.thumbnails ? r.thumbnails : [];
-        if (urls.length) {
-          renderThumbnailStrip(thumbArea, urls);
+        // POST returns the object keys it just stored, and the runner replaces the
+        // asset's whole `thumbnails` array with exactly that list
+        // (src/pipeline/thumbnail.ts:164), so position i here is position i on the
+        // asset — the index the presigned-URL route is keyed by.
+        var extracted = r && r.thumbnails ? r.thumbnails : [];
+        if (extracted.length) {
+          renderThumbnailStrip(thumbArea, id, extracted.length);
         } else {
           showMsg(actionMsg, 'Thumbnails extracted.', 'success');
         }
@@ -2002,19 +2089,48 @@ async function renderAssetDetailBody(id, bodyEl) {
       }
     });
 
-    function renderThumbnailStrip(container, urls) {
+    // Render `count` thumbnails for `assetId`, addressed by their position in the
+    // asset's `thumbnails` array — the key both the listing route and the
+    // presigned-URL route use (see public/thumbnail-url.js for the contract).
+    //
+    // The <img> elements are created up front, in order, but WITHOUT a src: the
+    // API's thumbnail byte route sits behind the bearer gate and a browser's
+    // <img> GET sends no Authorization header (issue #801). Each src is then
+    // filled in from the presigned-URL endpoint over the authenticated apiFetch,
+    // so the browser's GET to storage carries the signature in the URL itself.
+    // Creating the elements first keeps the strip in index order regardless of
+    // which signature is issued first; one whose URL cannot be issued falls back
+    // to the authenticated byte route's bytes, and one that neither source can
+    // resolve is dropped rather than left as a broken-image icon.
+    function renderThumbnailStrip(container, assetId, count) {
+      if (!count) return;
+      var strip = document.createElement('div');
+      strip.className = 'thumbnails';
+      // The "Thumbnails" heading is added by the FIRST image that actually
+      // resolves, not up front: an image that cannot be resolved removes itself,
+      // so a heading written in advance can end up labelling an empty strip.
       var titleEl = document.createElement('div');
       titleEl.className = 'section-title mt12';
       titleEl.textContent = 'Thumbnails';
-      container.appendChild(titleEl);
-      var strip = document.createElement('div');
-      strip.className = 'thumbnails';
-      urls.forEach(function(u) {
+      function showTitle() {
+        if (titleEl.parentNode) return;
+        if (strip.parentNode === container) container.insertBefore(titleEl, strip);
+        else container.appendChild(titleEl);
+      }
+      for (var i = 0; i < count; i++) {
         var img = document.createElement('img');
-        img.src = u;
         img.alt = 'thumbnail';
         strip.appendChild(img);
-      });
+        applyThumbnail(img, {
+          apiFetch: apiFetch,
+          assetId: assetId,
+          index: i,
+          onSuccess: showTitle,
+          onFailure: (function(el) {
+            return function() { el.remove(); };
+          })(img)
+        });
+      }
       container.appendChild(strip);
     }
 
@@ -2458,6 +2574,17 @@ async function renderPipelineDetailBody(id, bodyEl) {
 
 // ─── COLLECTIONS TAB ─────────────────────────────────────────────────────────
 
+// A collection hit clicked in the Search tab (issue #849). The Collections tab
+// has no deep link, and switchTab() re-renders it from scratch with an async
+// renderer, so stash the id here and let renderCollectionsTab open the detail
+// panel once its list has loaded.
+let pendingCollectionFocusId = null;
+
+function openCollectionFromSearch(id) {
+  pendingCollectionFocusId = id;
+  switchTab('collections');
+}
+
 async function renderCollectionsTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
@@ -2575,6 +2702,15 @@ async function renderCollectionsTab(container) {
 
   listSection.querySelector('#coll-refresh').addEventListener('click', loadCollections);
   await loadCollections();
+
+  // Arrived here from a collection hit in the Search tab (issue #849): open that
+  // collection's detail straight away, then clear the hand-off so a later manual
+  // visit to this tab opens nothing.
+  if (pendingCollectionFocusId) {
+    const focusId = pendingCollectionFocusId;
+    pendingCollectionFocusId = null;
+    await showCollectionDetail(focusId, detailPanel, loadCollections);
+  }
 }
 
 async function showCollectionDetail(id, detailPanel, onRefresh) {
@@ -2622,6 +2758,10 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
       '  </div>',
       '  <button id="add-asset-btn">Add</button>',
       '</div>',
+      // Issue #851: say which of the two asset handles this field takes. The
+      // membership endpoint resolves the ULID only (src/routes/collections.ts
+      // PUT /:id/assets/:assetId -> assets.get), so a slug is rejected here.
+      '<div class="text-muted" style="font-size:12px;margin-top:4px;">Takes the asset ID (26-character ULID), not the slug — copy it from the ID column in the Assets tab.</div>',
       '<div id="add-asset-msg"></div>',
     ].join('');
     body.appendChild(addDiv);
@@ -2654,9 +2794,28 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
       empty.textContent = 'No assets in this collection.';
       assetsDiv.appendChild(empty);
     } else {
+      // Issue #851: the "ID" column carries the ULID the membership endpoints
+      // take, copyable straight into the add-asset field above. The slug gets
+      // its own labelled column.
+      //
+      // Contract, precisely: PUT /collections/:id/assets/:assetId resolves the
+      // asset with a plain `assets.get()` — no slug fallback, so a slug 422s
+      // (src/routes/collections.ts:501-510). DELETE does not resolve the asset
+      // at all; it removes by exact id, so a slug is a silent 200 no-op rather
+      // than a rejection (src/routes/collections.ts:542-547). Either way the
+      // ULID is the only value that works.
+      //
+      // The member objects here are full assets — GET /collections/:id sends
+      // `{ ...collection, assets: liveAssets }` where liveAssets is `Asset[]`
+      // (src/routes/collections.ts:342-346) — so `slug` is available, optional
+      // per `slug?: string` on `Asset` (src/data/asset-repo.ts:455). The
+      // response schema itself is `z.record(z.unknown())` passthrough
+      // (collectionWithAssetsSchema, src/routes/collections.ts:96-98), so it
+      // does not strip it.
       const rows = assets.map(function(a) {
         return '<tr>' +
-          '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
+          '<td>' + copyableIdCellHtml(a.id, 'Copy asset id') + '</td>' +
+          '<td>' + slugCellHtml(a.slug) + '</td>' +
           '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
           '<td>' + renderBadge(a.status) + '</td>' +
           '<td><button class="btn-danger remove-asset-btn" data-asset-id="' + escHtml(a.id) + '" style="font-size:12px;padding:3px 8px;">Remove</button></td>' +
@@ -2665,10 +2824,11 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
       const tableWrap = document.createElement('div');
       tableWrap.className = 'table-wrap';
       tableWrap.innerHTML = '<table>' +
-        '<thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Actions</th></tr></thead>' +
+        '<thead><tr><th>ID</th><th>Slug</th><th>Name</th><th>Status</th><th>Actions</th></tr></thead>' +
         '<tbody>' + rows + '</tbody>' +
         '</table>';
       assetsDiv.appendChild(tableWrap);
+      wireCopyIdButtons(tableWrap);
 
       tableWrap.querySelectorAll('.remove-asset-btn').forEach(function(btn) {
         btn.addEventListener('click', async function() {
@@ -2690,6 +2850,157 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
 }
 
 // ─── SEARCH TAB ──────────────────────────────────────────────────────────────
+//
+// Verified contract (CLAUDE.md rule 7) — GET /api/v1/search:
+//   src/routes/search.ts `searchResultSchema` (the 200 response schema) returns
+//   `{ assets, collections, total, collectionTotal, page }`, all five required.
+//   - `assets`:          asset hits, each stamped `type: 'asset'`
+//                        (`assetSchema.extend({ type: z.literal('asset') })`,
+//                        stamped in the route handler's return).
+//   - `collections`:     collection hits (`collectionHitSchema`), each carrying
+//                        `type: 'collection'` plus id / name / description? /
+//                        tags? / custom? / createdAt / updatedAt (issue #561).
+//   - `total`:           count of matching ASSETS only.
+//   - `collectionTotal`: count of matching COLLECTIONS, reported separately.
+//   Mirrored in openapi.json at "/api/v1/search/".get.responses.200 (same five
+//   required properties; `type` is an enum of the single literal on each side).
+// Note the asset hit contract has no `tags`/`mimeType` field, so those columns
+// stay '—' for asset rows (pre-existing behaviour); collection hits do carry
+// `tags`, which the shared Tags column renders.
+
+// Flatten one search response into a single ordered row list plus both counts.
+// Asset hits come first, then collection hits. Each row keeps the `type`
+// discriminator the server already stamped on the hit — the kind is never
+// inferred from which fields happen to be present (see hitType below).
+function normaliseSearchResults(res) {
+  const envelope = res && typeof res === 'object' && !Array.isArray(res) ? res : {};
+  // `assets` is the contract field; `items`/`results` are tolerated only so an
+  // older/proxied envelope still lists something rather than nothing.
+  const assetHits = Array.isArray(res) ? res
+    : (Array.isArray(envelope.assets) ? envelope.assets
+      : (Array.isArray(envelope.items) ? envelope.items
+        : (Array.isArray(envelope.results) ? envelope.results : [])));
+  const collectionHits = Array.isArray(envelope.collections) ? envelope.collections : [];
+
+  const rows = assetHits.map(function(a) { return { type: hitType(a, 'asset'), item: a }; })
+    .concat(collectionHits.map(function(c) { return { type: hitType(c, 'collection'), item: c }; }));
+
+  const assetTotal = typeof envelope.total === 'number' ? envelope.total : assetHits.length;
+  const collectionTotal = typeof envelope.collectionTotal === 'number'
+    ? envelope.collectionTotal
+    : collectionHits.length;
+
+  return { rows: rows, assetTotal: assetTotal, collectionTotal: collectionTotal, total: assetTotal + collectionTotal };
+}
+
+// Read the discriminator off a hit. The server stamps `type` on every hit, so
+// it is authoritative. `fallback` is the array the hit arrived in, used only if
+// a hit somehow lacks the field (e.g. an older server): still provenance, not a
+// guess at the shape.
+function hitType(hit, fallback) {
+  const t = hit && hit.type;
+  return t === 'asset' || t === 'collection' ? t : fallback;
+}
+
+// "3 results (2 assets, 1 collection)" — the reported count covers both kinds.
+function searchResultSummary(counts) {
+  const plural = function(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); };
+  return plural(counts.total, 'result') +
+    ' (' + plural(counts.assetTotal, 'asset') + ', ' + plural(counts.collectionTotal, 'collection') + ')';
+}
+
+// Build the results view for one search response. Pure: takes the already-fetched
+// envelope, performs no network call, returns a detached element.
+// `opts.onOpenAsset(id)` / `opts.onOpenCollection(id)` handle a row click.
+function renderSearchResults(res, opts) {
+  opts = opts || {};
+  const counts = normaliseSearchResults(res);
+  const wrap = document.createElement('div');
+
+  if (counts.rows.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    // "No results." only when BOTH counts are genuinely zero (issue #849).
+    empty.textContent = (counts.assetTotal === 0 && counts.collectionTotal === 0)
+      ? 'No results.'
+      : 'No results on this page.';
+    wrap.appendChild(empty);
+    return wrap;
+  }
+
+  const summary = document.createElement('div');
+  summary.className = 'text-muted search-result-summary';
+  summary.textContent = searchResultSummary(counts);
+  wrap.appendChild(summary);
+
+  // Issue #851: the ID column carries the identifier every id-taking endpoint
+  // accepts, as copyable text rather than a hover-only `title` tooltip.
+  //
+  // No Slug column here: the search projection does not return one. Verified
+  // against `assetSchema` in src/routes/search.ts:73-100 (the shape wrapped by
+  // `searchResultSchema.assets`, :118-131) and the generated spec — openapi.json
+  // .paths["/api/v1/search/"].get...assets.items.properties has no `slug`,
+  // unlike the list item schema on GET /api/v1/assets/ which does. Fastify
+  // serializes against that schema, so a slug would be stripped even if the
+  // repository returned it. `collectionHitSchema` (the collection side of the
+  // same envelope, issue #561 — src/routes/search.ts:107-119) has no slug either. Widening either projection is
+  // an API-contract change owned outside this UI fix and is NOT tracked by an
+  // issue yet — do not read this comment as a filed follow-up.
+  const rows = counts.rows.map(function(row) {
+    const isCollection = row.type === 'collection';
+    const hit = row.item || {};
+    const id = hit.id == null ? '' : String(hit.id);
+    const label = hit.title || hit.name || '—';
+    const link = '<a href="#" class="search-hit-link" data-hit-type="' + escHtml(row.type) + '"' +
+      ' data-hit-id="' + escHtml(id) + '" style="color:var(--accent)">' + escHtml(label) + '</a>';
+    return '<tr class="search-hit" data-hit-type="' + escHtml(row.type) + '" data-hit-id="' + escHtml(id) + '">' +
+      '<td><span class="tag search-hit-type">' + (isCollection ? 'Collection' : 'Asset') + '</span></td>' +
+      '<td>' + copyableIdCellHtml(id, isCollection ? 'Copy collection id' : 'Copy asset id') + '</td>' +
+      '<td>' + link + '</td>' +
+      '<td>' + (isCollection ? '<span class="text-muted">—</span>' : renderBadge(hit.status)) + '</td>' +
+      '<td>' + renderTags(hit.tags) + '</td>' +
+      '<td>' + (isCollection ? '<span class="text-muted">—</span>' : escHtml((hit.technicalMetadata && hit.technicalMetadata.containerFormat) || '—')) + '</td>' +
+      '<td>' + escHtml(fmtDate(hit.createdAt)) + '</td>' +
+      '</tr>';
+  }).join('');
+
+  const tableWrap = document.createElement('div');
+  tableWrap.className = 'table-wrap mt8';
+  tableWrap.innerHTML = '<table>' +
+    '<thead><tr><th>Type</th><th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>Container</th><th>Created</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody>' +
+    '</table>';
+  wrap.appendChild(tableWrap);
+  // #851's click-to-copy behaviour for the ID cells rendered above. Idempotent
+  // and DOM-only, so it stays inside this pure renderer.
+  wireCopyIdButtons(tableWrap);
+
+  tableWrap.querySelectorAll('.search-hit-link').forEach(function(link) {
+    link.addEventListener('click', function(ev) {
+      ev.preventDefault();
+      const id = link.dataset.hitId;
+      if (!id) return;
+      if (link.dataset.hitType === 'collection') {
+        if (typeof opts.onOpenCollection === 'function') opts.onOpenCollection(id);
+      } else if (typeof opts.onOpenAsset === 'function') {
+        opts.onOpenAsset(id);
+      }
+    });
+  });
+
+  return wrap;
+}
+
+// The format filter on the Search tab (issue #822). GET /api/v1/search's
+// `mimeType` parameter matches the asset's extracted container format
+// (src/data/search-repo.ts matchesMimeTypeFilter -> technicalMetadata
+// .containerFormat), and now resolves common media MIME types onto that
+// container family server-side. The field is therefore labelled for BOTH
+// vocabularies, and its placeholder is a value that can actually match.
+const SEARCH_FORMAT_LABEL = 'MIME type or container format';
+const SEARCH_FORMAT_PLACEHOLDER = 'video/mp4';
+const SEARCH_FORMAT_HINT =
+  'Matches the extracted container format — "video/mp4", "mp4" and "mov" all match an MP4.';
 
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
@@ -2711,8 +3022,10 @@ async function renderSearchTab(container) {
     '    <input type="text" id="search-tags" placeholder="news,sports" />',
     '  </div>',
     '  <div class="form-field">',
-    '    <label for="search-mime">MIME type</label>',
-    '    <input type="text" id="search-mime" placeholder="video/mp4" />',
+    '    <label for="search-mime">' + escHtml(SEARCH_FORMAT_LABEL) + '</label>',
+    '    <input type="text" id="search-mime" placeholder="' + escHtml(SEARCH_FORMAT_PLACEHOLDER) + '"',
+    '      aria-describedby="search-mime-hint" />',
+    '    <div class="form-hint" id="search-mime-hint">' + escHtml(SEARCH_FORMAT_HINT) + '</div>',
     '  </div>',
     '  <button id="search-btn">Search</button>',
     '</div>',
@@ -2736,33 +3049,20 @@ async function renderSearchTab(container) {
 
     try {
       const res = await apiFetch('/search?' + params.toString());
-      const assets = Array.isArray(res) ? res :
-        (res && (res.items || res.results || res.assets) ? (res.items || res.results || res.assets) : []);
       loader.remove();
-      if (assets.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No results.';
-        resultsEl.appendChild(empty);
-        return;
-      }
-      const rows = assets.map(function(a) {
-        return '<tr>' +
-          '<td class="cell-id" title="' + escHtml(a.id) + '">' + escHtml(a.slug || a.id) + '</td>' +
-          '<td>' + escHtml(a.title || a.name || '—') + '</td>' +
-          '<td>' + renderBadge(a.status) + '</td>' +
-          '<td>' + renderTags(a.tags) + '</td>' +
-          '<td>' + escHtml(a.mimeType || '—') + '</td>' +
-          '<td>' + escHtml(fmtDate(a.createdAt)) + '</td>' +
-          '</tr>';
-      }).join('');
-      const tableWrap = document.createElement('div');
-      tableWrap.className = 'table-wrap';
-      tableWrap.innerHTML = '<table>' +
-        '<thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>MIME type</th><th>Created</th></tr></thead>' +
-        '<tbody>' + rows + '</tbody>' +
-        '</table>';
-      resultsEl.appendChild(tableWrap);
+      // The empty state, the row builder and the copyable ID column (#851) all
+      // live in renderSearchResults now, so this handler only fetches and hands
+      // the envelope over.
+      resultsEl.appendChild(renderSearchResults(res, {
+        // Same "switch tab, then open the detail panel" move the job → asset
+        // link makes (see showJobDetail's onAssetLink).
+        onOpenAsset: function(id) {
+          switchTab('assets');
+          const panel = document.getElementById('asset-detail');
+          if (panel) showAssetDetail(id, panel);
+        },
+        onOpenCollection: openCollectionFromSearch,
+      }));
     } catch (err) {
       loader.remove();
       showMsg(resultsEl, 'Error: ' + err.message, 'error');
@@ -5112,10 +5412,32 @@ export {
   // Exported so the add -> list -> edit -> list integration test can drive the
   // real Storage-tab flow against a stubbed fetch (issue #681).
   renderStorageTab,
+  // Search results view (issue #849). Exported so a DOM/unit test can exercise
+  // the pure envelope flattening + row rendering (asset AND collection hits,
+  // marked by the server's `type` discriminator) without a network call.
+  normaliseSearchResults,
+  searchResultSummary,
+  renderSearchResults,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
   renderAssetsTab,
+  // Search-tab format filter (issue #822). Exported so a DOM/unit test can
+  // drive the real Search tab against a stubbed fetch and assert the field's
+  // own placeholder is a value the API can match.
+  renderSearchTab,
+  SEARCH_FORMAT_LABEL,
+  SEARCH_FORMAT_PLACEHOLDER,
+  // Exported so a DOM/unit test can prove every rendered tab button is
+  // routable — i.e. present in the allowlist AND backed by a renderer — and
+  // that an unroutable one is reported rather than silently dropped (#823).
+  TABS,
+  TAB_RENDERERS,
+  TAB_KEY,
+  switchTab,
+  setupTabs,
+  auditTabWiring,
+  reportTabWiring,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────

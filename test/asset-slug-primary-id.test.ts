@@ -1,15 +1,24 @@
 // @vitest-environment happy-dom
 //
-// Issue #133 — show slug as the primary asset id with the ULID on hover.
+// Issue #133 — keep BOTH asset handles visible in the detail pane.
+//
+// SUPERSEDED IN PART BY #851: #133 originally put the slug under the label "ID"
+// with the ULID on a secondary "ULID" row. #851 established that a field labelled
+// ID must carry the value the API accepts as an id (the ULID — only
+// `GET /api/v1/assets/:id` tolerates a slug; the collections membership routes do
+// not), so the labels swapped: "ID" is the ULID, and the slug moved to its own
+// "Slug" row. What survives from #133 is the part that was never in dispute — the
+// human-readable slug keeps a place in the pane, and no empty or duplicate row is
+// emitted for an asset that has no slug. This suite now asserts that.
 //
 // The asset detail body renderer (renderAssetDetailBody in public/app.js) is
 // reused by both the embedded side panel and the detached pop-out window
 // (public/detail.js). This suite boots it directly against a mocked fetch and
-// asserts the slug-primary / ULID-secondary contract:
-//   1. When an asset has a `slug`, the primary "ID" row shows the slug and a
-//      separate "ULID" row keeps the raw ULID visible in the detail pane.
-//   2. When an asset has NO `slug`, the ULID is shown as the "ID" (fallback) and
-//      NO empty/duplicate "ULID" row is emitted.
+// asserts:
+//   1. When an asset has a `slug`, both values are visible, each under its own
+//      label: "ID" -> ULID, "Slug" -> slug. No "ULID" row remains.
+//   2. When an asset has NO `slug`, "ID" still carries the ULID (the label never
+//      changes meaning per asset) and NO empty/duplicate "Slug" row is emitted.
 //
 // This mirrors the pattern in test/detached-pane.test.ts (mount + mocked fetch +
 // vi.resetModules per case) but drives renderAssetDetailBody directly so the DOM
@@ -47,8 +56,8 @@ afterEach(() => {
   document.documentElement.innerHTML = '';
 });
 
-describe('asset detail — slug as primary id with ULID retained (issue #133)', () => {
-  it('shows the slug as the primary ID and keeps the ULID visible when a slug exists', async () => {
+describe('asset detail — both handles visible, each under its own label (issues #133, #851)', () => {
+  it('keeps the slug visible alongside the ULID when a slug exists', async () => {
     const asset = { id: ULID, slug: SLUG, title: 'My First Clip', status: 'ready', mimeType: 'video/mp4' };
     vi.stubGlobal('fetch', stubFetch({ ['/assets/' + ULID]: asset }));
 
@@ -62,16 +71,17 @@ describe('asset detail — slug as primary id with ULID retained (issue #133)', 
     });
 
     const text = body.textContent || '';
-    // Primary identifier is the slug; the raw ULID is still present in the pane.
+    // Both handles are present in the pane — the slug keeps its place (#133).
     expect(text).toContain(SLUG);
     expect(text).toContain(ULID);
-    // A dedicated "ULID" label row exposes the raw id alongside the slug.
+    // Each under its own label, and the old "ULID" row is gone (#851).
     const keyLabels = Array.from(body.querySelectorAll('.kv-key')).map((el) => el.textContent || '');
     expect(keyLabels).toContain('ID');
-    expect(keyLabels).toContain('ULID');
+    expect(keyLabels).toContain('Slug');
+    expect(keyLabels).not.toContain('ULID');
   });
 
-  it('falls back to the ULID as the ID and emits no separate ULID row when slug is absent', async () => {
+  it('keeps the ULID under "ID" and emits no separate Slug row when slug is absent', async () => {
     const asset = { id: ULID, title: 'Legacy Asset', status: 'ready', mimeType: 'video/mp4' };
     vi.stubGlobal('fetch', stubFetch({ ['/assets/' + ULID]: asset }));
 
@@ -85,11 +95,13 @@ describe('asset detail — slug as primary id with ULID retained (issue #133)', 
     });
 
     const text = body.textContent || '';
-    // ULID is shown (as the fallback ID), and never the literal string "undefined".
+    // ULID is shown (under "ID"), and never the literal string "undefined".
     expect(text).toContain(ULID);
     expect(text).not.toContain('undefined');
-    // No dedicated "ULID" label row when there is no slug (avoids duplicate rows).
+    // No "Slug" row for a slug-less asset (avoids an empty row), and no leftover
+    // "ULID" row either.
     const keyLabels = Array.from(body.querySelectorAll('.kv-key')).map((el) => el.textContent || '');
+    expect(keyLabels).not.toContain('Slug');
     expect(keyLabels).not.toContain('ULID');
     expect(keyLabels).toContain('ID');
   });

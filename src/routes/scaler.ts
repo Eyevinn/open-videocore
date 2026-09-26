@@ -45,11 +45,26 @@ type ScalerRouterOptions = {
 // spawn/destroy cycle (spawns take 60-120s). 10s is a defensible floor.
 const MIN_IDLE_TIMEOUT_MS = 10_000;
 
+// Mirrors EncoreInstanceRecord (src/encore-scaler/types.ts) for the fields an
+// operator needs to reason about scaling decisions.
+//
+// #778 (review finding 5):
+//   - `readyAt` is surfaced because it is the one field that makes "spawned but
+//     never dispatched a job" diagnosable — the leak this issue is about. Without
+//     it the response schema silently STRIPPED the field and the ops UI could not
+//     show it. Optional: records written before #778 do not carry it
+//     (EncoreInstanceRecord.readyAt is optional for the same reason).
+//   - `lastIdleAt` is optional rather than required, so a record whose idle
+//     timestamp was lost or written as a non-number — precisely the case
+//     resolveIdleSince()/isIdlePastTimeout() exist to tolerate — is REPORTED to
+//     the operator instead of failing response validation and hiding the whole
+//     workspace.
 const instanceSchema = z.object({
   instanceId: z.string(),
   url: z.string(),
   activeJobs: z.number(),
-  lastIdleAt: z.number()
+  lastIdleAt: z.number().optional(),
+  readyAt: z.number().optional()
 });
 
 const workspaceSchema = z.object({
@@ -65,6 +80,29 @@ const scalerStatusSchema = z.object({
   idleTimeoutMs: z.number(),
   scalerActive: z.boolean()
 });
+
+// Project a pool record onto the response shape, dropping any timestamp that is
+// not a usable number (#778 review finding 5). A record whose `lastIdleAt` was
+// lost or round-tripped as a non-number must still be REPORTED — it is the exact
+// record an operator needs to see — so the value is omitted rather than allowed
+// to fail response validation for the whole workspace.
+function toInstanceView(record: {
+  instanceId: string;
+  url: string;
+  activeJobs: number;
+  lastIdleAt?: unknown;
+  readyAt?: unknown;
+}): z.infer<typeof instanceSchema> {
+  const asNumber = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  return {
+    instanceId: record.instanceId,
+    url: record.url,
+    activeJobs: record.activeJobs,
+    lastIdleAt: asNumber(record.lastIdleAt),
+    readyAt: asNumber(record.readyAt)
+  };
+}
 
 // Scan for every pool hash key and extract the workspaceId. Uses SCAN (cursor
 // paging) rather than KEYS so it does not block Valkey on large keyspaces.
@@ -126,7 +164,12 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
             redis.llen(keys.inflight(workspaceId)),
             listInstances(redis, workspaceId)
           ]);
-          return { workspaceId, queueDepth, inflightDepth, instances };
+          return {
+            workspaceId,
+            queueDepth,
+            inflightDepth,
+            instances: instances.map(toInstanceView)
+          };
         })
       );
 
