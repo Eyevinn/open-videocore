@@ -685,6 +685,17 @@
             "schema": {
               "type": "string",
               "minLength": 1,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?:,[a-z0-9]+(?:-[a-z0-9]+)*)*$"
+            },
+            "in": "query",
+            "name": "skipServiceIds",
+            "required": false,
+            "description": "Opt-in selective teardown: comma-separated OSC service ids to KEEP (e.g. `minio-minio` to retain the stack storage). Each named service is left running and reported with status `skipped` in the operation result; every other service is removed. Ids must match services actually recorded for this stack, and the list may not cover the entire stack \u2014 an unknown id, or a list that would skip everything, fails the operation without removing anything. Omit for a full teardown."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
               "maxLength": 63,
               "pattern": "^[a-z0-9]+$"
             },
