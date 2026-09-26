@@ -459,6 +459,22 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       try {
         terminalInstanceId =
           (await deps.redis.hget(keys.jobInstance(decoded.workspaceId), externalId)) ?? undefined;
+        // Persist the mapping we are about to delete (issue #739). Threading
+        // `terminalInstanceId` only helps callers inside THIS function call;
+        // packaging dispatched later out of band — the package-only pipeline in
+        // src/routes/assets.ts, and the unpin on the packager's success callback
+        // in src/routes/internal.ts — has no such thread and previously re-read
+        // keys.jobInstance, which this hdel had already emptied. Same 24h TTL as
+        // keys.jobEncoreUrl (scaler-loop.ts:1250) so the job's URL and the
+        // instance that serves it expire together.
+        if (terminalInstanceId) {
+          await deps.redis.set(
+            keys.jobTerminalInstance(externalId),
+            terminalInstanceId,
+            'EX',
+            86_400
+          );
+        }
         await deps.redis.hset(keys.jobStatus(decoded.workspaceId), externalId, 'SUCCESSFUL');
         await deps.redis.hdel(keys.jobInstance(decoded.workspaceId), externalId);
       } catch (err) {

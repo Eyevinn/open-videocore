@@ -49,6 +49,7 @@ import type { AuditEmitter } from '../data/audit-emit.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
+import { resolvePackagingInstanceId } from '../encore-scaler/packaging-target.js';
 import type { Redis } from 'ioredis';
 
 // Packager callback schemas (verified from encore-packager callbackListener.ts 2026-07-07).
@@ -316,10 +317,32 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           // the safety net if this never runs.
           if (opts.redis) {
             try {
-              const encoreJobId = execution.steps.find((s) => s.name === 'transcode')?.encoreJobId;
-              const decoded = encoreJobId ? decodeEncoreJobId(encoreJobId) : undefined;
-              if (encoreJobId && decoded) {
-                const instanceId = await opts.redis.hget(keys.jobInstance(decoded.workspaceId), encoreJobId);
+              // Correlate via the `transcode` step, falling back to the
+              // `package` step (issue #739). A package-only execution has NO
+              // transcode step — its single `package` step carries the earlier
+              // transcode's Encore job id, stamped at dispatch
+              // (src/routes/assets.ts, package-only branch), which is the id the
+              // pin was taken under. Without the fallback the lookup resolves
+              // `undefined`, the unpin is skipped, and the pin holds an
+              // otherwise-idle instance out of scale-down for its full TTL.
+              // CONTRACT: `StepExecution.encoreJobId?: string`
+              // (src/data/pipeline-repo.ts:43-56, field at :47).
+              const encoreJobId =
+                execution.steps.find((s) => s.name === 'transcode')?.encoreJobId ??
+                execution.steps.find((s) => s.name === 'package')?.encoreJobId;
+              if (encoreJobId) {
+                // Resolve the pinned instance through the shared resolver
+                // (CONTRACT: `resolvePackagingInstanceId(redis, encoreJobId)`,
+                // src/encore-scaler/packaging-target.ts) rather than reading
+                // keys.jobInstance directly. By the time a packager success
+                // callback arrives, the transcode it followed has succeeded —
+                // and the callback poller hdel's keys.jobInstance on exactly
+                // that event (encore-callback-poller.ts), so the direct read
+                // resolved null and the unpin was silently skipped, holding an
+                // idle instance out of scale-down for the pin's full TTL. The
+                // resolver reads keys.jobTerminalInstance, which is retained
+                // past terminal for precisely this.
+                const instanceId = await resolvePackagingInstanceId(opts.redis, encoreJobId);
                 if (instanceId) {
                   await unpinInstanceForPackaging(opts.redis, instanceId, encoreJobId);
                 }

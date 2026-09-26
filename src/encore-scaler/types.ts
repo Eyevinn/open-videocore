@@ -276,6 +276,17 @@ export const keys = {
   // depending on the instance still being in the pool — the scaler may have
   // already torn down the instance by the time the transcode callback arrives.
   jobEncoreUrl: (encoreJobId: string) => `encore:job-url:${encoreJobId}`,
+  // The instance a job ran on, retained AFTER the job goes terminal (issue
+  // #739). `jobInstance` is the live mapping and is hdel'd the moment a
+  // transcode succeeds (encore-callback-poller.ts) so the finished job stops
+  // being a drop candidate — but two things still need to know which instance
+  // ran it once it is terminal: the packaging pin/unpin (#525 pt.2) and the
+  // package-only pipeline, which dispatches packaging for a transcode that
+  // completed minutes-to-hours ago. Written by the poller from the same read it
+  // uses for `terminalInstanceId`, immediately before the hdel, with the same
+  // 24h TTL as `jobEncoreUrl` so URL and instance stay resolvable for the same
+  // window. Keyed by our encoreJobId (externalId, globally unique).
+  jobTerminalInstance: (encoreJobId: string) => `encore:job-terminal-instance:${encoreJobId}`,
   // Original Encore job payload, stored at dispatch time with a 24h TTL so a
   // transport-class failure can be re-dispatched (#295) without the caller
   // re-submitting. Keyed by our externalId (encoreJobId), which is globally
