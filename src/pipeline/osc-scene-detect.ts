@@ -36,11 +36,16 @@
 // `/images/*` static mount is not a contract — both are decisions for the
 // architect/ux, tracked from
 // docs/investigations/797-function-scenes-runtime-contract.md ("Impact on
-// sceneMetadata"). This runner therefore reports a completed job HONESTLY as "no
-// boundaries" rather than inventing them, and reserves failure reporting (which
-// becomes `sceneDetectionError` upstream) for genuine detection failures:
-// transport errors, non-2xx responses, malformed payloads, a `failed`/`cancelled`
-// job, or a job that never reaches a terminal state inside the poll budget.
+// sceneMetadata").
+// Until that decision lands this runner reports the gap EXPLICITLY, as
+// `boundariesUnavailable`, rather than as an empty result: an empty result would be
+// normalized into `sceneMetadata` with `sceneCount: 0`, which claims "this video has
+// no scene cuts" and is indistinguishable to an API consumer from a genuine
+// single-shot video — a silent wrong answer for every input. It is NOT reported as a
+// detection failure either: the job genuinely succeeded, so `sceneDetectionError`
+// stays reserved for genuine detection failures — transport errors, non-2xx
+// responses, malformed payloads, a `failed`/`cancelled` job, or a job that never
+// reaches a terminal state inside the poll budget.
 //
 // Contract sources (verified from the service's own source, 2026-09-26):
 //   - Upstream service source `Eyevinn/function-scenes`
@@ -80,6 +85,15 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 // waiting on it.
 const DEFAULT_POLL_INTERVAL_MS = 3_000;
 const DEFAULT_POLL_TIMEOUT_MS = 15 * 60_000;
+
+// Why a completed job still yields no scene boundaries. Surfaced on the detector
+// result so the outcome is distinguishable from a genuine no-cut video (see the
+// KNOWN GAP in the file header, and the `boundariesUnavailable` handling in
+// scene-detector.ts).
+export const BOUNDARIES_UNAVAILABLE_REASON =
+  'eyevinn-function-scenes reports extracted keyframe images only; it exposes no ' +
+  'scene-boundary timecodes (cut times are written to a job-local time.txt that no ' +
+  'endpoint serves), so no cut timecodes can be read from this service';
 
 // Job states (api.json `#/model/job.state` enum; constants in
 // lib/scene_detect_job.js).
@@ -143,14 +157,32 @@ async function resolveInstanceUrl(api: OscSceneApi, token: string): Promise<stri
 // (`${BASE_PATH}/api/v1/${jobId}/status`) against the instance URL. Using the
 // returned value verbatim — rather than rebuilding `/api/v1/{id}/status` — is what
 // keeps us correct when the function runs under a BASE_PATH (index.js:21).
-function resolveAgainstInstance(baseUrl: string, reference: string): string {
+//
+// The resolved URL is PINNED to the instance origin. `new URL(reference, base)`
+// ignores the base entirely when `reference` is absolute, and the follow-up poll
+// carries our OSC service access token as a `Bearer` header. Upstream only ever
+// builds relative paths today (index.js:48-49), but a server-controlled value must
+// not be able to redirect a credentialed request to an arbitrary host, so an
+// off-origin reference is rejected rather than followed (defence in depth).
+export function resolveAgainstInstance(baseUrl: string, reference: string): string {
+  let base: URL;
+  let resolved: URL;
   try {
-    return new URL(reference, `${baseUrl}/`).toString();
+    base = new URL(`${baseUrl}/`);
+    resolved = new URL(reference, base);
   } catch {
     throw new Error(
       `scene-detect function returned an unusable endpoint reference: ${reference}`
     );
   }
+  if (resolved.origin !== base.origin) {
+    throw new Error(
+      `scene-detect function returned an off-origin endpoint reference ` +
+        `(${resolved.origin} is not ${base.origin}); refusing to send the service ` +
+        `access token off the instance origin`
+    );
+  }
+  return resolved.toString();
 }
 
 // Every call to the function is bounded: a detached pipeline step has no caller to
@@ -283,9 +315,15 @@ export function makeOscSceneDetector(api: OscSceneApi): SceneDetector {
 
     // The job completed. The function exposes keyframe image URIs only and no cut
     // timecodes at all (see the KNOWN GAP in the file header), so there is nothing
-    // to map onto `scenes`/`cuts` — an empty result is the truthful answer, and
-    // scene-detector.ts turns it into `sceneMetadata` with zero boundaries rather
-    // than an error.
-    return {};
+    // to map onto `scenes`/`cuts`.
+    //
+    // Reporting that as `{}` would be a SILENT WRONG ANSWER: scene-detector.ts
+    // would normalize it to `sceneMetadata: { boundaries: [], sceneCount: 0 }`,
+    // which asserts "this video has no scene cuts" — indistinguishable, to an API
+    // consumer, from a genuine single-shot video, and wrong for every input. So the
+    // structural gap is reported EXPLICITLY instead; `detectScenes` then declines to
+    // write a fabricated zero-boundary record. It is not an error either: the job
+    // really did succeed, so `sceneDetectionError` stays clear for genuine failures.
+    return { boundariesUnavailable: { reason: BOUNDARIES_UNAVAILABLE_REASON } };
   };
 }
