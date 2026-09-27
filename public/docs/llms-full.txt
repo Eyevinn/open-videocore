@@ -1079,7 +1079,11 @@ Response 200 (application/json)
     "packagedBucket": "string",
     "packagedPrefix": "string",
     "masterHlsKey": "string",
-    "masterDashKey": "string"
+    "masterDashKey": "string",
+    "missingConfiguration": [
+      "string"
+    ],
+    "reason": "string"
   }
 }
 

@@ -37,7 +37,7 @@ import {
   recordDispatch,
   requeueInterruptedByScaleDown
 } from './retry-store.js';
-import { probeCallbackTrust } from './callback-trust-probe.js';
+import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import { fetchEncoreActiveState } from './encore-active-state.js';
 
@@ -1047,7 +1047,14 @@ export class EncoreScalerLoop {
   //     (instanceId + ingress hostname) rather than throw into the tick loop.
   //   - A 401/403 from the listener ingress is NOT a transport failure and is
   //     NOT "trusted" either (issue #813): the callback path is reachable but
-  //     rejecting requests. Past the bounded wait that resolves to the degraded
+  //     rejecting requests. Since #814 the probe asks about `/encoreCallback`
+  //     itself rather than the bare ingress origin, so this branch now actually
+  //     fires during the ~14s window after a fresh listener's ingress starts
+  //     answering, in which the origin returns 200 while `/encoreCallback` is
+  //     still auth-walled (measured live; see callback-trust-probe.ts header).
+  //     That window is the #811/#812 failure, and it resolves on its own well
+  //     inside the bounded wait — the instance is simply held ineligible until
+  //     it does. Past the bounded wait it resolves to the degraded
   //     `callbackPathUnusableAt` state — persisted, logged, and dispatched to
   //     anyway so completion falls back to the terminal-job sweep instead of
   //     halting the pool. `callbackTrustReady` is never set for it, so
@@ -1167,10 +1174,27 @@ export class EncoreScalerLoop {
     try {
       const token = await getToken();
       // Inject the paired callback listener URL so Encore POSTs progress to the
-      // listener bound to this exact instance (ADR-006).
+      // listener bound to this exact instance.
+      //
+      // Contract (CLAUDE.md rule 7), verified live 2026-09-26 against
+      // `GET <encore-instance>/v3/api-docs` (openapi 3.1.0, "Encore OpenAPI"):
+      // `components.schemas.EncoreJobRequestBody.properties.progressCallbackUri`
+      // is `{"type":"string"}` — a bare URL with no companion auth/token/header
+      // field, and the document declares no `securitySchemes` and no `security`
+      // on `POST /encoreJobs`. There is therefore no way to hand Encore a
+      // credential for this leg (#814); readiness of the callback path is
+      // gated by ensureCallbackTrust() instead.
+      //
+      // Built via the shared helper so this URI and the one probeCallbackTrust
+      // grades are always the same string.
       const payload = { ...job.payload };
       if (inst.callbackListenerUrl) {
-        payload['progressCallbackUri'] = `${inst.callbackListenerUrl.replace(/\/$/, '')}/encoreCallback`;
+        try {
+          payload['progressCallbackUri'] = buildCallbackUri(inst.callbackListenerUrl);
+        } catch {
+          // Unparseable listener URL: dispatch without a callback URI rather
+          // than failing the job — completion falls back to sweepTerminalJobs.
+        }
       }
       const res = await fetch(`${inst.url.replace(/\/$/, '')}/encoreJobs`, {
         method: 'POST',

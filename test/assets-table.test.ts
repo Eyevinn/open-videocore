@@ -9,10 +9,17 @@
 //
 // Verified backend contract (openapi.json + route source), grounded in the module:
 //   - Tier 1 (no `q`):  GET /api/v1/assets/  params: limit(1..200), offset(>=0),
-//     status enum [uploading|processing|ready|failed|archived]; envelope
+//     status enum [uploading|processing|ready|failed|archived], parentId, from, to
+//     (`listQuerySchema`, src/routes/assets.ts); envelope
 //     { items, limit, offset, total }; server order = createdAt ASC / ULID id.
-//   - Tier 2 (`q` present): GET /api/v1/search/  params: q, page(>=1),
-//     pageSize(1..100); envelope { assets, total, page }.
+//   - Tier 2 (`q` present): GET /api/v1/search/  params: q, tags, mimeType, status,
+//     from, to, tamsFlowId, tamsTimerange, page(>=1), pageSize(1..100); envelope
+//     { assets, collections, total, collectionTotal, page } (`searchResultSchema`,
+//     src/routes/search.ts), where `total` counts matching ASSETS.
+// The inclusive created-at range (`from`/`to`, issue #833) is applied to the whole
+// result set BEFORE the page slice on both tiers, so it narrows `total` and every
+// page. That is why the client sends both refinements server-side and reports the
+// returned `total` verbatim, with no client-side page-scoped narrowing (issue #834).
 // The tests inject a fake apiFetch so no live server is required; they assert on
 // the exact path/params the module builds.
 
@@ -236,29 +243,146 @@ describe('URL-state round-trip (shared contract)', () => {
   });
 });
 
-describe('page-scoped narrowing caveat (operator-facing disclosure)', () => {
-  // The list/search endpoints have no server-side date-range param, and the
-  // search (q) tier has no status param, so those refinements narrow the current
-  // page client-side while the pager total still reflects the full server set.
-  // The table must DISCLOSE that to the operator with a visible note whenever
-  // such a filter is active — a code comment is not sufficient.
-  const caveatOf = (t: { el: HTMLElement }) =>
-    t.el.querySelector<HTMLElement>('.ops-table-caveat');
+describe('server-side status/date filtering — no client-side page narrowing (#834)', () => {
+  // Both refinements are real server params on BOTH tiers as of #833, verified
+  // against openapi.json:
+  //   .paths["/api/v1/assets/"].get.parameters  -> limit, offset, status, parentId, from, to
+  //   .paths["/api/v1/search/"].get.parameters  -> q, tags, mimeType, status, from, to,
+  //                                                tamsFlowId, tamsTimerange, page, pageSize
+  // So the table must SEND them and report the backend `total` verbatim; it must
+  // never re-filter the page in hand (which made `total` disagree with the rows).
 
-  it('hides the caveat when no page-scoped narrowing filter is active', async () => {
-    const { apiFetch } = fakeApi({
-      assets: () => ({ items: [{ id: 'a1', name: 'n', status: 'ready', createdAt: '2026-01-01T00:00:00Z' }], total: 1 }),
+  it('sends the created-at range as server-side from/to params on the list tier', async () => {
+    const { apiFetch, calls } = fakeApi({
+      assets: () => ({ items: [], total: 0 }),
     });
     const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
     document.body.appendChild(t.el);
     await tick();
 
-    const note = caveatOf(t);
-    expect(note).not.toBeNull();
-    expect(note!.hidden).toBe(true);
+    t.state.setFilter('from', '2026-01-01');
+    await tick();
+    t.state.setFilter('to', '2026-09-26');
+    await tick();
+
+    const params = lastCallParams(calls, '/assets');
+    // Passed through exactly as the date control emits them — the server expands
+    // a bare YYYY-MM-DD `to` to that UTC day's last instant, so the client must
+    // not do any end-of-day arithmetic of its own.
+    expect(params.get('from')).toBe('2026-01-01');
+    expect(params.get('to')).toBe('2026-09-26');
   });
 
-  it('shows the caveat when a created-date-range filter is active (list tier)', async () => {
+  it('sends status and the created-at range server-side on the search (q) tier', async () => {
+    const { apiFetch, calls } = fakeApi({
+      assets: () => ({ items: [], total: 0 }),
+      search: () => ({ assets: [], collections: [], total: 0, collectionTotal: 0, page: 1 }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('q', 'hello');
+    await tick();
+    t.state.setFilter('status', 'ready');
+    await tick();
+    t.state.setFilter('from', '2026-01-01');
+    await tick();
+    t.state.setFilter('to', '2026-09-26');
+    await tick();
+
+    const params = lastCallParams(calls, '/search');
+    expect(params.get('q')).toBe('hello');
+    expect(params.get('status')).toBe('ready');
+    expect(params.get('from')).toBe('2026-01-01');
+    expect(params.get('to')).toBe('2026-09-26');
+  });
+
+  it('reports the backend total verbatim with a filter active, not the row count', async () => {
+    // The regression this issue closes: the client used to narrow the 20-row page
+    // down to 1 row while the pager still read the unfiltered server total. Now
+    // the backend total IS the post-filter count, so it must be reported as-is —
+    // a page of 1 row against a total of 500 is a legitimate, faithful state.
+    const { apiFetch } = fakeApi({
+      assets: () => ({
+        items: [{ id: 'a1', name: 'n', status: 'ready', createdAt: '2026-01-01T00:00:00Z' }],
+        total: 500,
+      }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('from', '2026-01-01');
+    await tick();
+
+    expect(t.state.getState().total).toBe(500);
+    const indicator = t.el.querySelector<HTMLElement>('.page-indicator');
+    expect(indicator!.textContent).toBe('1–1 of 500');
+  });
+
+  it('reports the backend total verbatim on the search tier too', async () => {
+    const { apiFetch } = fakeApi({
+      assets: () => ({ items: [], total: 0 }),
+      search: () => ({
+        assets: [{ id: 's1', name: 'hit', status: 'ready', createdAt: '2026-02-02T00:00:00Z' }],
+        collections: [],
+        total: 40,
+        collectionTotal: 0,
+        page: 1,
+      }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('q', 'hello');
+    await tick();
+    t.state.setFilter('status', 'ready');
+    await tick();
+
+    // `total` on the search envelope is the count of matching ASSETS
+    // (searchResultSchema, src/routes/search.ts) — the right field for this
+    // assets-only table, and reported unchanged.
+    expect(t.state.getState().total).toBe(40);
+  });
+
+  it('keeps the filter params on every page so paging walks the filtered set', async () => {
+    // Acceptance criterion: paging over a filtered result set visits every
+    // matching asset exactly once. That only holds if the filter travels with
+    // each page request rather than being reapplied to whatever came back.
+    const { apiFetch, calls } = fakeApi({
+      assets: () => ({
+        items: Array.from({ length: ASSETS_PAGE_SIZE }, (_v, i) => ({
+          id: 'a' + i,
+          name: 'n' + i,
+          status: 'ready',
+          createdAt: '2026-01-01T00:00:00Z',
+        })),
+        total: 60,
+      }),
+    });
+    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+    document.body.appendChild(t.el);
+    await tick();
+
+    t.state.setFilter('status', 'ready');
+    await tick();
+    t.state.setFilter('from', '2026-01-01');
+    await tick();
+    t.state.nextPage();
+    await tick();
+
+    const params = lastCallParams(calls, '/assets');
+    expect(params.get('offset')).toBe(String(ASSETS_PAGE_SIZE));
+    expect(params.get('status')).toBe('ready');
+    expect(params.get('from')).toBe('2026-01-01');
+    expect(t.state.getState().total).toBe(60);
+  });
+
+  it('renders no page-scoped narrowing disclosure, because none applies', async () => {
+    // Guards against reintroducing the caveat note: with both filters server-side
+    // the reported total is exact, so there is nothing to disclose.
     const { apiFetch } = fakeApi({
       assets: () => ({ items: [{ id: 'a1', name: 'n', status: 'ready', createdAt: '2026-01-01T00:00:00Z' }], total: 500 }),
     });
@@ -269,45 +393,7 @@ describe('page-scoped narrowing caveat (operator-facing disclosure)', () => {
     t.state.setFilter('from', '2026-01-01');
     await tick();
 
-    const note = caveatOf(t);
-    expect(note!.hidden).toBe(false);
-    expect(note!.textContent).toMatch(/current page only/i);
-  });
-
-  it('shows the caveat when a status filter is active on the search (q) tier', async () => {
-    const { apiFetch } = fakeApi({
-      assets: () => ({ items: [], total: 0 }),
-      search: () => ({ assets: [{ id: 's1', name: 'hit', status: 'ready', createdAt: '2026-02-02T00:00:00Z' }], total: 40, page: 1 }),
-    });
-    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
-    document.body.appendChild(t.el);
-    await tick();
-
-    t.state.setFilter('q', 'hello');
-    await tick();
-    // q alone (no status) does not narrow client-side — caveat stays hidden.
-    expect(caveatOf(t)!.hidden).toBe(true);
-
-    t.state.setFilter('status', 'ready');
-    await tick();
-    // q + status => the FTS tier narrows status client-side => caveat shows.
-    expect(caveatOf(t)!.hidden).toBe(false);
-  });
-
-  it('does NOT show the caveat for a status filter on the list (no-q) tier', async () => {
-    // On the list tier, status IS a server-side param, so it does not narrow the
-    // page — the caveat must stay hidden.
-    const { apiFetch } = fakeApi({
-      assets: () => ({ items: [], total: 0 }),
-    });
-    const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
-    document.body.appendChild(t.el);
-    await tick();
-
-    t.state.setFilter('status', 'processing');
-    await tick();
-
-    expect(caveatOf(t)!.hidden).toBe(true);
+    expect(t.el.querySelector('.ops-table-caveat')).toBeNull();
   });
 });
 

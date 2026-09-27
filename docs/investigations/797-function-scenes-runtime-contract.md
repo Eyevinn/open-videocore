@@ -183,6 +183,17 @@ currently written:
 
 ## Current code vs confirmed contract
 
+> **Update (#799, 2026-09-26):** the paragraph below describes the code as it stood
+> when this note was written. The **request** side has since been corrected and
+> pinned: the call is built from `src/pipeline/function-scenes-contract.ts` (a
+> recording of the contract confirmed here, diffed in CI against the vendored
+> upstream document `docs/contracts/eyevinn-function-scenes-api.json` by
+> `test/scene-detect-contract.test.ts`), so it now sends
+> `POST <instanceUrl>/api/v1` with `{ "medialocator": <presigned> }`. The
+> **response** side is unchanged and still the open part: create-then-poll and the
+> `sceneMetadata` re-scope remain #798's, so a started job is reported as an
+> explicit error rather than as a successful detection of zero scenes.
+
 `src/pipeline/osc-scene-detect.ts` today sends `POST <instanceUrl>/` (path from
 `SCENE_DETECT_PATH`, default `/`) with body `{ "url": <presigned> }` and expects
 `{ scenes, cuts }` back. Against the confirmed contract that is wrong in four ways:

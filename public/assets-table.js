@@ -16,44 +16,62 @@
  *
  * Tier 1 — exact/range list (no free-text term), per ADR-005:
  *   Endpoint: GET /api/v1/assets/  (openapi.json path key "/api/v1/assets/").
- *   Verified query params (openapi.json .paths["/api/v1/assets/"].get.parameters
- *   and src/routes/assets.ts:283-288 `listQuerySchema`):
- *     limit   integer 1..200
- *     offset  integer >=0
- *     status  enum ['uploading','processing','ready','failed','archived']
+ *   Verified query params (openapi.json
+ *   .paths["/api/v1/assets/"].get.parameters and `listQuerySchema`,
+ *   src/routes/assets.ts:373):
+ *     limit    integer 1..200
+ *     offset   integer >=0
+ *     status   enum ['uploading','processing','ready','failed','archived']
  *     parentId string
+ *     from     string, created-at lower bound (inclusive)
+ *     to       string, created-at upper bound (inclusive)
  *   Response envelope (listSchema, top-level props): { items, limit, offset, total }.
  *   Item fields used here (verified present in the list item schema): id, slug,
  *   name (canonical title), status, tags, thumbnails, createdAt,
  *   technicalMetadataError.
  *   Ordering: the server ALWAYS returns createdAt-ascending with a ULID `id`
  *   tie-break (src/data/asset-repo.ts:937 — `createdAt.localeCompare … || id…`),
- *   i.e. ULID `_id` creation order per ADR-005. There is NO server `sort`, `q`,
- *   `from`, or `to` param on this endpoint (confirmed absent from the schema).
+ *   i.e. ULID `_id` creation order per ADR-005. There is NO server `sort` or `q`
+ *   param on this endpoint (confirmed absent from the schema).
  *
  * Tier 2 — free-text FTS (a `q` term is present), per ADR-005:
  *   Endpoint: GET /api/v1/search/  (the CANONICAL free-text path already used by
  *   the Search tab in app.js — we reuse it rather than adding a second search
  *   path, per the issue's explicit constraint).
  *   Verified query params (openapi.json .paths["/api/v1/search/"].get.parameters
- *   and src/routes/search.ts:130-140): q (string), page (int >=1),
+ *   and `searchQuerySchema`, src/routes/search.ts:146): q (string 1..512),
+ *   status (the SAME status enum as tier 1), from, to, page (int >=1),
  *   pageSize (int 1..100), plus tags/mimeType/tams* (unused here).
- *   Response envelope (searchResultSchema, src/routes/search.ts:95-99):
- *     { assets, total, page }.
+ *   Response envelope (searchResultSchema, src/routes/search.ts:118-131):
+ *     { assets, collections, total, collectionTotal, page }. `total` is the count
+ *     of matching ASSETS; `collectionTotal` counts collection hits separately and
+ *     this table (assets only) ignores it.
  *
- * KNOWN CONTRACT GAPS (logged as OSC/backend friction). The friction log lives
- * in the SEPARATE eng-open-videocore-agents repo at
- * `docs/osc-feedback/incoming-assets-table-server-sort-filter.md` — it is NOT in
- * this (customer) repo, so do not go looking for that path here:
+ * `status` / `from` / `to` ARE SERVER-SIDE ON BOTH TIERS (issue #833, merged).
+ * Both endpoints share ONE definition of the created-at range grammar and match
+ * semantics — `CreatedFromSchema`/`CreatedToSchema`/`resolveCreatedRange` in
+ * src/data/created-range.ts — so the two surfaces cannot drift. Each bound
+ * accepts either `YYYY-MM-DD` (what the `<input type="date">` controls below
+ * emit) or a full ISO instant, and BOTH bounds are inclusive: a bare `to` date
+ * is expanded server-side to that UTC day's last instant, so the client must NOT
+ * do its own end-of-day arithmetic. Every filter is applied to the WHOLE matched
+ * set before the page slice, so the reported `total` already counts exactly the
+ * filtered rows (src/data/asset-repo.ts:1502-1508 for the list tier,
+ * src/data/search-repo.ts:49-54 for the FTS tier). We therefore pass the filters
+ * through and report the backend's `total` verbatim — no client-side narrowing
+ * (issue #834). An inverted range (`from` > `to`) is a 400
+ * `invalid_created_range` from both routes, surfaced as a normal table error.
+ *
+ * KNOWN CONTRACT GAP — one left, and it is an ORDERING gap only. (The previous
+ * revision of this header pointed at a friction log in the separate
+ * eng-open-videocore-agents repo; no such file exists in either repo, so the gap
+ * is documented here instead of behind a dangling pointer.)
  *   1. Neither endpoint accepts a server-side `sort` param; the list endpoint is
  *      fixed to createdAt-ascending. So created-date DESC and the status/title
  *      sorts are applied to the CURRENT PAGE client-side. Created-date ASC is the
  *      native server order (true ULID creation-order paging, no client sort).
- *   2. Neither endpoint accepts a created-date range (`from`/`to`) or a `status`
- *      filter on the FTS tier. Date-range narrowing (and status narrowing while a
- *      `q` term is active) is therefore applied to the current page client-side.
- *   These are page-scoped refinements, not new search paths — the URL-state
- *      contract still round-trips them so the view is shareable.
+ *      This is a page-scoped ORDERING refinement only — it never drops a row, so
+ *      it does not affect `total` or which rows paging reaches.
  *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
@@ -133,32 +151,12 @@ function tableSortToUrlSort(sort) {
   };
 }
 
-// ─── Client-side page refinements (documented contract gaps) ──────────────────
-
-// Narrow a page to a single status. Used ONLY on the FTS tier, where the search
-// endpoint has no `status` param (the list tier filters status server-side).
-function applyStatusNarrow(rows, status) {
-  if (!status) return rows;
-  return rows.filter((a) => a && a.status === status);
-}
-
-// Narrow a page to a created-date range [from, to] (inclusive). `from`/`to` are
-// ISO date strings from the URL contract; neither endpoint accepts them, so this
-// is a page-scoped refinement. Comparison is lexicographic on ISO timestamps,
-// which is correct for same-offset ISO-8601 strings (the API emits UTC ISO).
-function applyDateRangeNarrow(rows, from, to) {
-  if (!from && !to) return rows;
-  const lo = from ? from : null;
-  // Make `to` inclusive of the whole day when a bare YYYY-MM-DD is given.
-  const hi = to ? (to.length === 10 ? to + 'T23:59:59.999Z' : to) : null;
-  return rows.filter((a) => {
-    const c = a && a.createdAt;
-    if (!c) return false;
-    if (lo && c < lo) return false;
-    if (hi && c > hi) return false;
-    return true;
-  });
-}
+// ─── Client-side page refinement (the one remaining contract gap: ordering) ───
+//
+// Status and created-date-range filtering are BOTH server-side now (issue #833),
+// so this module no longer narrows a fetched page. The only refinement left is
+// ordering, for the axes the endpoints do not sort by — and re-ordering a page
+// never drops a row, so the backend's `total` stays exact.
 
 // Sort a page client-side for the axes the server does not sort by. Created-date
 // ASC is the server's native order so we never re-sort it here; created-date DESC
@@ -192,21 +190,6 @@ function applyClientSort(rows, sort) {
   return out;
 }
 
-// Decide whether the current filter state triggers a PAGE-SCOPED narrowing —
-// i.e. a refinement the backend cannot do, so we drop rows from the already-
-// fetched page client-side while the pager total still reflects the full,
-// un-narrowed server set. This is true when a created-date range is set on
-// either tier, or a status filter is active on the FTS (`q`) tier. When it is
-// true the pager's "of N" total overstates what is actually reachable through
-// paging, so we surface a visible caveat to the operator (not just a comment).
-function isPageScopedNarrowingActive(filters) {
-  const f = filters || {};
-  const q = (f.q || '').trim();
-  const hasDateRange = Boolean(f.from || f.to);
-  const hasSearchStatus = Boolean(q) && Boolean(f.status);
-  return hasDateRange || hasSearchStatus;
-}
-
 // ─── Data-source router: choose the FTS tier or the exact/range list tier ─────
 //
 // Given the primitive's current interaction state, build and run the correct
@@ -228,19 +211,24 @@ async function fetchAssetsPage(snap, deps) {
 
   if (q) {
     // ── Tier 2: free-text FTS via the canonical GET /api/v1/search/ path. ──
-    // Paged by page/pageSize (page is 1-based). Envelope: { assets, total, page }.
+    // Paged by page/pageSize (page is 1-based). Envelope:
+    // { assets, collections, total, collectionTotal, page }.
     const page = Math.floor(offset / limit) + 1;
     const params = new URLSearchParams();
     params.set('q', q);
     params.set('page', String(page));
     params.set('pageSize', String(limit));
+    // status/from/to are real server params here (issue #833) — send them so the
+    // filter narrows the whole matched set, not the page in hand.
+    if (status) params.set('status', status);
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
     const res = await apiFetch('/search?' + params.toString());
     const assets = (res && (res.assets || res.items)) || [];
+    // `total` is the backend's count of matching assets AFTER every filter, so
+    // it is reported verbatim (issue #834).
     const total = res && typeof res.total === 'number' ? res.total : assets.length;
-    // The FTS endpoint has no status/date params — narrow the page client-side.
-    let rows = applyStatusNarrow(assets, status);
-    rows = applyDateRangeNarrow(rows, from, to);
-    rows = applyClientSort(rows, snap.sort);
+    const rows = applyClientSort(assets, snap.sort);
     return { rows, total };
   }
 
@@ -250,13 +238,17 @@ async function fetchAssetsPage(snap, deps) {
   params.set('limit', String(limit));
   params.set('offset', String(offset));
   if (status) params.set('status', status); // server-side exact status filter
+  // Inclusive created-at bounds, normalised and applied server-side before the
+  // page slice (issue #833). Passed through as the control emits them — the
+  // server expands a bare `YYYY-MM-DD` `to` to that UTC day's last instant.
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
   const res = await apiFetch('/assets?' + params.toString());
   const items = (res && (res.items || res.assets)) || (Array.isArray(res) ? res : []);
+  // Backend `total` already counts only the filtered set (issue #834).
   const total =
     res && typeof res.total === 'number' ? res.total : items.length;
-  // Date-range has no server param — narrow this page client-side.
-  let rows = applyDateRangeNarrow(items, from, to);
-  rows = applyClientSort(rows, snap.sort);
+  const rows = applyClientSort(items, snap.sort);
   return { rows, total };
 }
 
@@ -535,25 +527,8 @@ export function createAssetsTable(deps) {
     emptyText: 'No assets found.',
   });
 
-  // Operator-facing caveat for page-scoped narrowing (blocking review finding).
-  // Because date-range and search+status refinements run against the current
-  // page only (the backend has no such params — see the friction log referenced
-  // in the header), the pager can report a system-wide total it is not actually
-  // paging through. Disclose that in the UI, not just in code comments. The note
-  // is inserted just below the shared filter bar and toggled on every reload().
-  const caveat = document.createElement('div');
-  caveat.className = 'ops-table-caveat';
-  caveat.setAttribute('role', 'note');
-  caveat.hidden = true;
-  caveat.textContent =
-    'Date-range and search+status filters apply to the current page only — ' +
-    'the total count and paging reflect the full unfiltered result set.';
-  const filterBarEl = table.el.querySelector('.ops-table-filters');
-  if (filterBarEl && filterBarEl.parentNode) {
-    filterBarEl.parentNode.insertBefore(caveat, filterBarEl.nextSibling);
-  } else {
-    table.el.insertBefore(caveat, table.el.firstChild);
-  }
+  // No page-scoped-narrowing caveat here by design: status and from/to are
+  // server-side on both tiers (#833), so the reported total is exact (#834).
 
   // Guard so the URL sync we do inside the state subscription does not itself
   // re-enter as a "user change" (it does not — applyTableState only touches the
@@ -564,11 +539,6 @@ export function createAssetsTable(deps) {
     if (loading) return;
     loading = true;
     const snap = table.state.getState();
-
-    // Show/hide the operator-facing page-scoped-narrowing caveat for the current
-    // filter state (see isPageScopedNarrowingActive). Toggled every reload so it
-    // tracks filter changes exactly.
-    caveat.hidden = !isPageScopedNarrowingActive(snap.filters);
 
     // 3) Mirror the current interaction state into the URL (shared contract) so a
     //    refresh/share reproduces the view. Replace (not push) — control changes

@@ -7394,6 +7394,15 @@
                         },
                         "masterDashKey": {
                           "type": "string"
+                        },
+                        "missingConfiguration": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "reason": {
+                          "type": "string"
                         }
                       },
                       "additionalProperties": false
@@ -8410,6 +8419,7 @@
                     "enum": [
                       "transcode",
                       "abr-vod",
+                      "package",
                       "ingest",
                       "subtitles",
                       "scene-detect",
