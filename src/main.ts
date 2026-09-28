@@ -60,6 +60,7 @@ import {
   logScalerNotActivated,
   type StackRedisResolution
 } from './services/scaler-redis-url.js';
+import { resolveEncoreS3Config } from './services/encore-s3-config.js';
 import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
@@ -417,13 +418,14 @@ const stackResolver = new WorkspaceStackResolver({
   minioPassword: process.env['MINIO_ROOT_PASSWORD'] ?? '',
   couchPassword: process.env['COUCHDB_ADMIN_PASSWORD'] ?? '',
   optionalSteps: optionalStepBuilders,
-  // Deterministic parameter-store namespace (issue #776). The resolver resolves
-  // the workspace id from OVC_WORKSPACE_ID or from the value pinned in this
-  // deployment's own config service, NOT from the current OSC subscription list
-  // — so two boots of the same deployment read the same namespace even when the
-  // tenant's set of service instances changed in between. This is the SAME store
-  // handed to the provision router below, which is what writes the pin.
-  ...(backendKvStore ? { workspaceIdStore: backendKvStore } : {}),
+  // Key scanner for the BOUNDED one-shot migration of pre-#804 stack configs
+  // (issue #804). The namespace segment itself is now the constant
+  // STACK_CONFIG_NAMESPACE on both the read and the write side; this store only
+  // lets the resolver notice a stack config a PRE-#804 build left under a
+  // derived namespace segment in this deployment's own config service, adopt it
+  // once, and rewrite it under the constant. See the REMOVAL CONDITION block in
+  // services/workspace-stack.ts.
+  ...(backendKvStore ? { staleNamespaceScanner: backendKvStore } : {}),
   // Aggregate degraded-resolution signal (issue #422): the resolver emits on
   // every no-storage / stale fallback so /health reports a degraded-but-not-
   // crashed instance without reading logs.
@@ -495,10 +497,6 @@ await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
   osc: oscContext,
   paramStore,
-  // Same pin store the resolver above reads (issue #776): the first provision
-  // PINS this deployment's workspace id, and every later boot of either side
-  // reads that pinned value back instead of re-deriving it.
-  ...(backendKvStore ? { workspaceIdStore: backendKvStore } : {}),
   operationStore,
   publicBaseUrl: resolvePublicBaseUrl(),
   // Invalidate the resolver cache after a successful provision/teardown so the
@@ -967,12 +965,16 @@ const commentRepository = new InMemoryCommentRepository();
 // classified reason why none could be resolved. Self-discovered: there is no
 // REDIS_URL env var — the URL only exists once POST /api/v1/provision has run.
 //
-// Issue #780: this used to read the LITERAL `default` namespace
-// (STACK_CONFIG_NAMESPACE) and bypass the #733/#751 legacy fallback, so on any
-// deployment whose derived namespace is a real tenant id it resolved nothing
+// Issue #780: this used to open-code its own parameter-store read, which
+// disagreed with the namespace the rest of the app used, so it resolved nothing
 // and the scaler silently never activated. It now goes through
-// stackResolver.resolveStackConfig() — the same derived namespace + legacy
-// fallback every other consumer uses — so the two paths cannot diverge again.
+// stackResolver.resolveStackConfig() — the SAME read path every other consumer
+// uses — so the two cannot diverge again.
+//
+// Since #804 that read path is the CONSTANT STACK_CONFIG_NAMESPACE on both the
+// read and the write side (there is no derived namespace and no legacy fallback
+// any more), plus a bounded one-shot migration that adopts a pre-#804 stack
+// config written under a derived namespace and rewrites it under the constant.
 // See services/scaler-redis-url.ts.
 async function resolveStackRedis(): Promise<StackRedisResolution> {
   return resolveStackRedisUrl(stackResolver);
@@ -1095,28 +1097,29 @@ function activateScaler(redisUrl: string): void {
     // env-override deployment, which is not itself a stack name) do we fall back
     // to the first provisioned stack — so single-stack behaviour is unchanged
     // while a named stack is never mis-resolved to the first-provisioned one.
-    resolveS3Config: async (stackKey: string) => {
-      if (!paramStore || !encoreS3SecretKey) return undefined;
-      try {
-        let config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
-        if (!config) {
-          const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-          if (names.length > 0) {
-            config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
-          }
-        }
-        if (config?.minioEndpoint) {
-          return {
-            endpoint: config.minioEndpoint,
-            accessKeyId: 'admin',
-            secretAccessKey: encoreS3SecretKey
-          };
-        }
-      } catch (err) {
-        app.log.warn({ err, stackKey }, 'encore-scaler: failed to resolve MinIO s3Config from parameter store');
-      }
-      return undefined;
-    },
+    //
+    // FAIL LOUD (issue #804). Delegated to resolveEncoreS3Config
+    // (services/encore-s3-config.ts), which reads the stack config under the
+    // CONSTANT namespace — the same segment the provision route writes under —
+    // and THROWS rather than returning undefined when no endpoint is resolvable
+    // and no static ENCORE_S3_ENDPOINT fallback is configured. Returning
+    // undefined there is what turned a config miss into an Encore instance with
+    // no s3Endpoint (instance-pool.ts:368-372), an `s3://` input resolved
+    // against the wrong endpoint, and an unexplained 404.
+    resolveS3Config: (stackKey: string) =>
+      resolveEncoreS3Config(
+        {
+          paramStore,
+          secretAccessKey: encoreS3SecretKey,
+          // A configured static endpoint is a complete, intentional
+          // configuration: defer to it (the registry reads undefined as "use
+          // the static s3Config", workspace-registry.ts:206-209) instead of
+          // throwing.
+          staticFallbackConfigured: Boolean(encoreS3Endpoint && encoreS3SecretKey),
+          log: app.log
+        },
+        stackKey
+      ),
     // When the scaler dispatches a queued job to an Encore instance, advance the
     // Job record queued->running and the source asset to `processing`. The
     // scaler has no repositories of its own, so we resolve the job here by the
@@ -1636,8 +1639,12 @@ function activateScaler(redisUrl: string): void {
   // Start loops for any workspaces that had pool entries from a previous run.
   // This triggers reconcile() on the first tick, correcting stale activeJobs
   // counts left by jobs that completed while the server was down.
+  // The per-workspace callback logs a stack that could not be resumed (e.g. one
+  // whose object-store endpoint no longer resolves, which now throws) without
+  // aborting the resume for the others. The outer .catch stays for a failure of
+  // the discovery scan itself, which is not per-workspace.
   void scalerRegistry
-    .resumeExistingWorkspaces()
+    .resumeExistingWorkspaces((msg, err) => app.log.warn({ err }, msg))
     .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
 
   app.log.info({ redisUrl }, 'encore-scaler: activated against provisioned stack Valkey');

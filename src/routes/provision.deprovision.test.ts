@@ -9,8 +9,10 @@ const getInstance = vi.fn();
 const removeInstance = vi.fn();
 
 // These routes are not caller-authenticated: the OSC SDK authenticates to OSC
-// with the deployment's own OSC_ACCESS_TOKEN, and the parameter store is scoped
-// by the deployment's own tenant id, derived via listSubscriptions.
+// with the deployment's own OSC_ACCESS_TOKEN. Parameter-store keys use the
+// CONSTANT namespace segment STACK_CONFIG_NAMESPACE (issue #804) — one
+// deployment is one tenant (ADR-018/ADR-020), so there is no tenant id to derive
+// and listSubscriptions is never consulted for it.
 vi.mock('@osaas/client-core', () => ({
   // createInstance/waitForInstanceReady are imported by provision.ts but the
   // DELETE path under test does not invoke them.
@@ -18,9 +20,9 @@ vi.mock('@osaas/client-core', () => ({
   getInstance: (...args: unknown[]) => getInstance(...args),
   removeInstance: (...args: unknown[]) => removeInstance(...args),
   getPortsForInstance: vi.fn(),
-  listSubscriptions: vi.fn(async () => [
-    { serviceId: 'minio-minio', tenantId: 'workspace-a' }
-  ]),
+  listSubscriptions: vi.fn(async () => {
+    throw new Error('listSubscriptions must never be called for namespace resolution (#804)');
+  }),
   waitForInstanceReady: vi.fn(),
   saveSecret: vi.fn(),
   Context: class {}
@@ -33,6 +35,7 @@ process.env['COUCHDB_ADMIN_PASSWORD'] = 'test-couchdb-password';
 
 import { provisionRouter } from './provision.js';
 import type { ParamStore } from '../services/param-store.js';
+import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { OperationStore, type Operation } from '../services/operation-store.js';
 
 const getServiceAccessToken = vi.fn(async () => 'test-sat');
@@ -95,8 +98,8 @@ beforeEach(() => {
   getServiceAccessToken.mockClear();
 });
 
-// A StackConfig as it would be returned from the parameter store for a stack
-// owned by workspace-a. The services[] list drives teardown (issue #29).
+// A StackConfig as it would be returned from the parameter store. The
+// services[] list drives teardown (issue #29).
 const STORED_CONFIG = {
   minioEndpoint: 'https://minio.example.osaas.io',
   couchdbUrl: 'https://couch.example.osaas.io',
@@ -135,14 +138,16 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
 
     expect(op.status).toBe('done');
     expect(op.result.status).toBe('removed');
-    // Ownership scoping: looked up under the caller's workspace.
+    // Key shape (issue #804): looked up under the CONSTANT namespace segment —
+    // the same one the runtime resolver reads — with the stack NAME as the
+    // discriminator.
     expect(paramStore.loadStackConfig).toHaveBeenCalledWith(
-      'workspace-a',
+      STACK_CONFIG_NAMESPACE,
       'mystack'
     );
     // Param store entry removed on successful teardown.
     expect(paramStore.deleteStackConfig).toHaveBeenCalledWith(
-      'workspace-a',
+      STACK_CONFIG_NAMESPACE,
       'mystack'
     );
     // Teardown removed every stored service.
@@ -257,7 +262,7 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
     ]
   };
 
-  it('returns 200 with stored coordinates, scoped to the workspace', async () => {
+  it('returns 200 with stored coordinates, read under the constant namespace', async () => {
     const loadStackConfig = vi.fn(async () => storedConfig);
     const paramStore = {
       storeStackConfig: vi.fn(),
@@ -272,7 +277,7 @@ describe('GET /api/v1/provision/:name (issue #31)', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual(storedConfig);
-    expect(loadStackConfig).toHaveBeenCalledWith('workspace-a', 'mystack');
+    expect(loadStackConfig).toHaveBeenCalledWith(STACK_CONFIG_NAMESPACE, 'mystack');
   });
 
   // Issue #338: readiness reflects packaging capability, not the raw stored

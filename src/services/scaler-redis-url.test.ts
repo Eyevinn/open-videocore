@@ -1,59 +1,64 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// Unit coverage for issue #780: the Encore auto-scaler's Valkey URL resolution
-// must use the deployment's DERIVED parameter-store namespace (with the #733
-// legacy fallback), not the literal `default` namespace.
+// Unit coverage for the Encore auto-scaler's Valkey URL resolution (issues #780,
+// #804).
 //
-// Before this fix, main.ts's resolveStackRedisUrl read
-// `listStackNames(STACK_CONFIG_NAMESPACE)` / `loadStackConfig(STACK_CONFIG_NAMESPACE, ...)`
-// — the literal string `default`. #712 moved both sides of the read/write
-// contract onto the tenant-scoped namespace derived by deriveWorkspaceId, so on
-// any deployment whose tenant id is not `default` that read found nothing, the
-// scaler never activated, and NOTHING was logged: the only symptom was
-// `GET /api/v1/scaler/status` reporting `scalerActive:false` while no transcode
-// could ever be dispatched.
+// #780 fixed main.ts's resolveStackRedisUrl reading a namespace that disagreed
+// with the write side; the symptom was `GET /api/v1/scaler/status` reporting
+// `scalerActive:false` with nothing logged, and no transcode ever dispatched.
 //
-// The cases below are the #780 acceptance criteria:
-//   (a) a stack whose derived namespace is NOT `default` (post-#712) resolves a
-//       Valkey URL — the scaler activates;
-//   (b) a stack whose config lives only under `default` (pre-#712) still
-//       resolves, via the same one-shot legacy fallback;
-//   (c) a resolved stack config that carries no Valkey URL is reported as a
+// #804 settles what that namespace IS: the CONSTANT `STACK_CONFIG_NAMESPACE`,
+// on both the read and the write side. There is nothing to derive — the
+// parameter store is one eyevinn-app-config-svc instance per deployment
+// (DEFAULT_PARAM_STORE_INSTANCE_NAME = 'ovcconfig', param-store.ts:704) and one
+// deployment is one tenant (ADR-018 "One deployed stack == one tenant's
+// workspace"; ADR-020 Decision 1), so the middle key segment can only ever hold
+// one value. Stacks stay separated by the LAST segment, the stack name.
+//
+// Cases below:
+//   (a) a stack written under the constant namespace resolves a Valkey URL, and
+//       the resolver lists/reads ONLY the constant — no derivation, no scan;
+//   (b) several stacks in one store still resolve independently by name (the
+//       collapse does not reintroduce a collision);
+//   (c) a pre-#804 stack whose config exists ONLY under a stale derived
+//       namespace still resolves, via the bounded one-shot migration, and is
+//       rewritten under the constant;
+//   (d) a resolved stack config that carries no Valkey URL is reported as a
 //       fault and logged at warn (never silent);
-//   (d) a parameter-store failure is reported and logged at warn;
-//   (e) no provisioned stack is reported as such and logged (at info — ordinary
+//   (e) a parameter-store failure is reported and logged at warn;
+//   (f) no provisioned stack is reported as such and logged (at info — ordinary
 //       pre-provision state, but still visible).
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - WorkspaceStackResolver.resolveStackConfig(stackName?):
 //     Promise<StackConfig | undefined> (src/services/workspace-stack.ts), which
-//     derives the namespace via deriveWorkspaceId (workspace-stack.ts:403) and
-//     reads through loadStackConfigWithLegacyFallback /
-//     listStackNamesWithLegacyFallback (workspace-stack.ts:481,524).
+//     reads through loadStackConfigWithMigration / listStackNamesWithMigration.
+//   - WorkspaceStackResolver constructor option
+//     `staleNamespaceScanner?: StackConfigKeyScanner` and
+//     `StackConfigKeyScanner = { listByPrefix(prefix: string):
+//     Promise<Array<{ key: string; value: string }>> }`
+//     (src/services/workspace-stack.ts), structurally satisfied by
+//     ConfigKvStore.listByPrefix (src/services/param-store.ts:602-608).
 //   - ParamStore interface (storeStackConfig / loadStackConfig /
 //     deleteStackConfig / listStackNames) and the physical key layout
 //     stackConfigKey(workspaceId, name) = `openvideocore/{ws}/{name}`
 //     (src/services/param-store.ts:108-133).
 //   - StackConfig.redisUrl: string (src/services/param-store.ts:63).
-//   - Subscription = { serviceId, tenantId } / listSubscriptions(context)
-//     (@osaas/client-core admin.d.ts:2-5,42, as cited in workspace-stack.ts:395-397).
 
-const TENANT = 'workspace-tenant-a';
-
-// Mock @osaas/client-core so deriveWorkspaceId derives a controllable namespace
-// from the Context: a real tenant id by default (the post-#712 deployment this
-// bug broke), reprogrammed per test to an empty subscription list when the
-// `default` fallback is wanted (workspace-stack.ts:411).
+// @osaas/client-core is mocked only so constructing a Context stub costs
+// nothing. Nothing in the namespace path calls into it any more (#804 removed
+// the listSubscriptions tenant scan entirely) — asserted explicitly below.
 vi.mock('@osaas/client-core', () => ({
-  listSubscriptions: vi.fn(async () => [
-    { serviceId: 'minio-minio', tenantId: TENANT }
-  ]),
+  listSubscriptions: vi.fn(async () => {
+    throw new Error('listSubscriptions must never be called for namespace resolution (#804)');
+  }),
   Context: class {}
 }));
 
 import {
   WorkspaceStackResolver,
-  STACK_CONFIG_NAMESPACE
+  STACK_CONFIG_NAMESPACE,
+  type StackConfigKeyScanner
 } from './workspace-stack.js';
 import {
   stackConfigKey,
@@ -69,8 +74,10 @@ import { listSubscriptions, type Context } from '@osaas/client-core';
 
 const mockedListSubscriptions = vi.mocked(listSubscriptions);
 
-// The deployment's own authenticated Context; deriveWorkspaceId reads its
-// tenant through the mocked listSubscriptions above, so a bare stub suffices.
+// A namespace value a PRE-#804 build could have written under. Deliberately not
+// `default` so a read that still derived would diverge from a read that does not.
+const STALE_NAMESPACE = 'workspace-tenant-a';
+
 const oscContext = {} as unknown as Context;
 
 // The resolver must take the parameter-store path, not the env override
@@ -84,9 +91,7 @@ const SAVED = {
 beforeEach(() => {
   delete process.env['COUCHDB_URL'];
   delete process.env['MINIO_URL'];
-  mockedListSubscriptions.mockImplementation(async () => [
-    { serviceId: 'minio-minio', tenantId: TENANT }
-  ]);
+  mockedListSubscriptions.mockClear();
 });
 afterEach(() => {
   if (SAVED.couch === undefined) delete process.env['COUCHDB_URL'];
@@ -112,11 +117,15 @@ function readyConfig(overrides: Partial<StackConfig> = {}): StackConfig {
 // Namespace-AWARE in-memory ParamStore keyed by the same physical key the real
 // HTTP store uses (stackConfigKey, param-store.ts:131), so a write under one
 // namespace is only visible when read under that SAME namespace — which is what
-// makes the literal-`default` regression reproducible here.
+// makes a namespace regression reproducible here. `scanner` is the
+// StackConfigKeyScanner view over the same backing map, mirroring how main.ts
+// hands the resolver the ConfigKvStore built against the same config service.
 function makeNamespacedParamStore(): {
   store: ParamStore;
+  scanner: StackConfigKeyScanner;
   reads: string[];
   lists: string[];
+  keys(): string[];
 } {
   const byKey = new Map<string, StackConfig>();
   const reads: string[] = [];
@@ -140,15 +149,26 @@ function makeNamespacedParamStore(): {
         .map((k) => k.slice(prefix.length));
     }
   };
-  return { store, reads, lists };
+  const scanner: StackConfigKeyScanner = {
+    async listByPrefix(prefix) {
+      return [...byKey.entries()]
+        .filter(([k]) => k.startsWith(prefix))
+        .map(([key, value]) => ({ key, value: JSON.stringify(value) }));
+    }
+  };
+  return { store, scanner, reads, lists, keys: () => [...byKey.keys()] };
 }
 
-function makeResolver(paramStore: ParamStore | undefined): WorkspaceStackResolver {
+function makeResolver(
+  paramStore: ParamStore | undefined,
+  scanner?: StackConfigKeyScanner
+): WorkspaceStackResolver {
   return new WorkspaceStackResolver({
     paramStore,
     oscContext,
     minioPassword: 'not-used',
-    couchPassword: 'not-used'
+    couchPassword: 'not-used',
+    ...(scanner ? { staleNamespaceScanner: scanner } : {})
   });
 }
 
@@ -160,58 +180,95 @@ function makeLog() {
   return { log, info, warn };
 }
 
-describe('scaler Valkey URL resolution (#780)', () => {
-  it('resolves the Valkey URL when the derived namespace is NOT "default" (post-#712 stack)', async () => {
-    const { store, lists } = makeNamespacedParamStore();
-    // Exactly the production layout from the issue: the stack config exists
-    // ONLY under the tenant-scoped key, nothing under `default`.
-    await store.storeStackConfig(TENANT, 'mediastack', readyConfig());
+describe('scaler Valkey URL resolution (#780, #804)', () => {
+  it('resolves the Valkey URL from the CONSTANT namespace, with no derivation and no cross-namespace scan', async () => {
+    const { store, scanner, reads, lists } = makeNamespacedParamStore();
+    await store.storeStackConfig(STACK_CONFIG_NAMESPACE, 'mediastack', readyConfig());
 
-    const resolution = await resolveStackRedisUrl(makeResolver(store));
+    const resolution = await resolveStackRedisUrl(makeResolver(store, scanner));
 
     expect(resolution).toEqual({
       outcome: 'resolved',
       redisUrl: 'redis://stack-valkey.example.test:6379'
     });
-    // Regression guard: the derived tenant namespace is what was listed. A read
-    // of the literal `default` would have listed nothing and left the scaler
-    // inactive, which is the bug.
-    expect(lists).toContain(TENANT);
-    expect(TENANT).not.toBe(STACK_CONFIG_NAMESPACE);
+    // Every list and every read used the constant — nothing else was touched.
+    expect(lists).toEqual([STACK_CONFIG_NAMESPACE]);
+    expect(
+      reads.every((k) => k.startsWith(stackConfigKey(STACK_CONFIG_NAMESPACE, '')))
+    ).toBe(true);
+    // #804: the namespace is a constant, so no OSC round-trip happens at all.
+    expect(mockedListSubscriptions).not.toHaveBeenCalled();
   });
 
-  it('activates from the tenant-scoped key without reading the legacy namespace', async () => {
-    const { store, reads, lists } = makeNamespacedParamStore();
-    await store.storeStackConfig(TENANT, 'mediastack', readyConfig());
+  it('keeps several stacks in ONE store separated by name (collapsing the middle segment reintroduces no collision)', async () => {
+    const { store, scanner } = makeNamespacedParamStore();
+    await store.storeStackConfig(
+      STACK_CONFIG_NAMESPACE,
+      'alpha',
+      readyConfig({ redisUrl: 'redis://alpha-valkey.example.test:6379' })
+    );
+    await store.storeStackConfig(
+      STACK_CONFIG_NAMESPACE,
+      'beta',
+      readyConfig({ redisUrl: 'redis://beta-valkey.example.test:6379' })
+    );
 
-    const resolution = await resolveStackRedisUrl(makeResolver(store));
-
-    expect(resolution.outcome).toBe('resolved');
-    // #733 acceptance carried over: a post-#712 stack takes NO fallback read.
-    expect(lists).not.toContain(STACK_CONFIG_NAMESPACE);
-    expect(reads.every((k) => !k.startsWith(stackConfigKey(STACK_CONFIG_NAMESPACE, '')))).toBe(true);
+    const resolver = makeResolver(store, scanner);
+    expect((await resolver.resolveStackConfig('alpha'))?.redisUrl).toBe(
+      'redis://alpha-valkey.example.test:6379'
+    );
+    expect((await resolver.resolveStackConfig('beta'))?.redisUrl).toBe(
+      'redis://beta-valkey.example.test:6379'
+    );
   });
 
-  it('still resolves a pre-#712 stack whose config lives only under "default" (legacy fallback)', async () => {
+  it('still resolves a pre-#804 stack whose config lives only under a stale derived namespace, and rewrites it under the constant', async () => {
+    const { store, scanner, keys } = makeNamespacedParamStore();
+    // Exactly the production layout issue #804 describes: a pre-#804 build wrote
+    // the stack under its derived namespace, and nothing exists under `default`.
+    await store.storeStackConfig(STALE_NAMESPACE, 'legacystack', readyConfig());
+    expect(STALE_NAMESPACE).not.toBe(STACK_CONFIG_NAMESPACE);
+
+    const resolution = await resolveStackRedisUrl(makeResolver(store, scanner));
+
+    expect(resolution).toEqual({
+      outcome: 'resolved',
+      redisUrl: 'redis://stack-valkey.example.test:6379'
+    });
+    // One-shot migration: the config now also lives under the constant, so the
+    // next read is a direct hit and the fallback is never taken again.
+    expect(keys()).toContain(stackConfigKey(STACK_CONFIG_NAMESPACE, 'legacystack'));
+    expect(await store.loadStackConfig(STACK_CONFIG_NAMESPACE, 'legacystack')).toBeDefined();
+  });
+
+  it('does NOT migrate when the store holds stack configs under SEVERAL stale namespaces (refuses to guess)', async () => {
+    const { store, scanner, keys } = makeNamespacedParamStore();
+    await store.storeStackConfig('tenant-one', 'ambiguous', readyConfig());
+    await store.storeStackConfig('tenant-two', 'ambiguous', readyConfig());
+
+    const resolution = await resolveStackRedisUrl(makeResolver(store, scanner));
+
+    expect(resolution).toEqual({ outcome: 'no-stack' });
+    expect(keys()).not.toContain(stackConfigKey(STACK_CONFIG_NAMESPACE, 'ambiguous'));
+  });
+
+  it('does NOT migrate when no scanner is wired (a plain miss stays a miss)', async () => {
     const { store } = makeNamespacedParamStore();
-    // Written before the tenant-scoped namespace existed.
-    await store.storeStackConfig(STACK_CONFIG_NAMESPACE, 'legacystack', readyConfig());
+    await store.storeStackConfig(STALE_NAMESPACE, 'legacystack', readyConfig());
 
     const resolution = await resolveStackRedisUrl(makeResolver(store));
-
-    expect(resolution).toEqual({
-      outcome: 'resolved',
-      redisUrl: 'redis://stack-valkey.example.test:6379'
-    });
-    // Migrate-on-read (#733): the config is now also under the tenant key.
-    expect(await store.loadStackConfig(TENANT, 'legacystack')).toBeDefined();
+    expect(resolution).toEqual({ outcome: 'no-stack' });
   });
 
   it('reports and logs at warn when a resolved stack config carries no Valkey URL', async () => {
-    const { store } = makeNamespacedParamStore();
-    await store.storeStackConfig(TENANT, 'mediastack', readyConfig({ redisUrl: '' }));
+    const { store, scanner } = makeNamespacedParamStore();
+    await store.storeStackConfig(
+      STACK_CONFIG_NAMESPACE,
+      'mediastack',
+      readyConfig({ redisUrl: '' })
+    );
 
-    const resolution = await resolveStackRedisUrl(makeResolver(store));
+    const resolution = await resolveStackRedisUrl(makeResolver(store, scanner));
     expect(resolution).toEqual({ outcome: 'no-redis-url' });
 
     const { log, info, warn } = makeLog();
@@ -240,9 +297,9 @@ describe('scaler Valkey URL resolution (#780)', () => {
   });
 
   it('reports no-stack (and logs it) when nothing is provisioned', async () => {
-    const { store } = makeNamespacedParamStore();
+    const { store, scanner } = makeNamespacedParamStore();
 
-    const resolution = await resolveStackRedisUrl(makeResolver(store));
+    const resolution = await resolveStackRedisUrl(makeResolver(store, scanner));
     expect(resolution).toEqual({ outcome: 'no-stack' });
 
     const { log, info, warn } = makeLog();
@@ -255,20 +312,5 @@ describe('scaler Valkey URL resolution (#780)', () => {
   it('reports no-stack when no parameter store is configured', async () => {
     const resolution = await resolveStackRedisUrl(makeResolver(undefined));
     expect(resolution).toEqual({ outcome: 'no-stack' });
-  });
-
-  it('still resolves when the derived namespace IS "default" (no subscriptions)', async () => {
-    // deriveWorkspaceId falls back to STACK_CONFIG_NAMESPACE when the
-    // subscription list is empty (workspace-stack.ts:411) — the single-stack /
-    // offline case must keep working.
-    mockedListSubscriptions.mockImplementation(async () => []);
-    const { store } = makeNamespacedParamStore();
-    await store.storeStackConfig(STACK_CONFIG_NAMESPACE, 'mediastack', readyConfig());
-
-    const resolution = await resolveStackRedisUrl(makeResolver(store));
-    expect(resolution).toEqual({
-      outcome: 'resolved',
-      redisUrl: 'redis://stack-valkey.example.test:6379'
-    });
   });
 });
