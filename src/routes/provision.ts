@@ -1625,9 +1625,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             return;
           }
 
-          // Discovery: the stored config is namespaced by the deployment's own
-          // workspace (tenant). A miss means the stack never existed under this
-          // deployment, or was already deprovisioned.
+          // Discovery: the stored config is namespaced by the CONSTANT
+          // STACK_CONFIG_NAMESPACE (issue #804) — one deployment is one tenant
+          // with one config-service instance, so stacks are separated by the
+          // last key segment, the stack name, not by a per-tenant segment.
+          // A miss therefore means exactly one of two things: this stack was
+          // never provisioned by this deployment, or it has already been torn
+          // down.
           const workspaceId = STACK_CONFIG_NAMESPACE;
           const config = await paramStore.loadStackConfig(workspaceId, name);
           if (!config) {

@@ -965,12 +965,16 @@ const commentRepository = new InMemoryCommentRepository();
 // classified reason why none could be resolved. Self-discovered: there is no
 // REDIS_URL env var — the URL only exists once POST /api/v1/provision has run.
 //
-// Issue #780: this used to read the LITERAL `default` namespace
-// (STACK_CONFIG_NAMESPACE) and bypass the #733/#751 legacy fallback, so on any
-// deployment whose derived namespace is a real tenant id it resolved nothing
+// Issue #780: this used to open-code its own parameter-store read, which
+// disagreed with the namespace the rest of the app used, so it resolved nothing
 // and the scaler silently never activated. It now goes through
-// stackResolver.resolveStackConfig() — the same derived namespace + legacy
-// fallback every other consumer uses — so the two paths cannot diverge again.
+// stackResolver.resolveStackConfig() — the SAME read path every other consumer
+// uses — so the two cannot diverge again.
+//
+// Since #804 that read path is the CONSTANT STACK_CONFIG_NAMESPACE on both the
+// read and the write side (there is no derived namespace and no legacy fallback
+// any more), plus a bounded one-shot migration that adopts a pre-#804 stack
+// config written under a derived namespace and rewrites it under the constant.
 // See services/scaler-redis-url.ts.
 async function resolveStackRedis(): Promise<StackRedisResolution> {
   return resolveStackRedisUrl(stackResolver);
@@ -1635,8 +1639,12 @@ function activateScaler(redisUrl: string): void {
   // Start loops for any workspaces that had pool entries from a previous run.
   // This triggers reconcile() on the first tick, correcting stale activeJobs
   // counts left by jobs that completed while the server was down.
+  // The per-workspace callback logs a stack that could not be resumed (e.g. one
+  // whose object-store endpoint no longer resolves, which now throws) without
+  // aborting the resume for the others. The outer .catch stays for a failure of
+  // the discovery scan itself, which is not per-workspace.
   void scalerRegistry
-    .resumeExistingWorkspaces()
+    .resumeExistingWorkspaces((msg, err) => app.log.warn({ err }, msg))
     .catch((err) => app.log.warn({ err }, 'encore-scaler: failed to resume existing workspaces'));
 
   app.log.info({ redisUrl }, 'encore-scaler: activated against provisioned stack Valkey');

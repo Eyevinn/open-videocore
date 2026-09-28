@@ -22,6 +22,40 @@
 //      so a config miss surfaces as a failed transcode submission that names
 //      the cause instead of an unexplained 404 from the transcoder.
 //
+// ORDERING INVARIANT — read this before wiring resolveEncoreS3Config onto a
+// NEW call path.
+//
+// This resolver reads paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, …)
+// DIRECTLY. It deliberately does NOT go through the #804 migration helpers
+// (WorkspaceStackResolver.loadStackConfigWithMigration /
+// listStackNamesWithMigration, src/services/workspace-stack.ts), which adopt a
+// pre-#804 stack config written under a derived namespace and rewrite it under
+// the constant.
+//
+// That is safe TODAY only because of an ordering invariant spanning three
+// modules, not because of anything this module enforces:
+//
+//   1. main.ts resolves the stack's Valkey URL via resolveStackRedisUrl
+//      (services/scaler-redis-url.ts), which goes through
+//      WorkspaceStackResolver.resolveStackConfig() and therefore RUNS the
+//      migration — rewriting any stale config under STACK_CONFIG_NAMESPACE.
+//   2. Only if that resolves does main.ts call activateScaler(redisUrl), which
+//      constructs the scaler registry that owns `resolveS3Config`.
+//   3. resolveEncoreS3Config is reachable ONLY as that registry's
+//      `resolveS3Config` callback, so by the time it runs, step 1 has already
+//      migrated the key it reads.
+//
+// In other words: the scaler activation path migrates BEFORE this function is
+// ever invoked, so a direct constant-namespace read cannot miss a config the
+// migration would have found.
+//
+// If you call this from anywhere that is NOT downstream of scaler activation —
+// a route handler, a CLI script, a sweep, a new background worker — that
+// invariant no longer holds, and on a not-yet-migrated deployment this read
+// will MISS and now THROW (fail-loud, below) instead of silently degrading.
+// In that case, resolve through the migration helpers first, or take a
+// resolver-backed read path rather than paramStore directly.
+//
 // Contract sources verified (per CLAUDE.md rule 7):
 //   - ParamStore.loadStackConfig(workspaceId, name): Promise<StackConfig |
 //     undefined> and .listStackNames(workspaceId): Promise<string[]>

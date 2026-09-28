@@ -12,6 +12,7 @@
 import nano from 'nano';
 import { Client as MinioClient } from 'minio';
 import {
+  CONFIG_LIST_PAGE_LIMIT,
   isReadyStack,
   type ParamStore,
   type StackConfig,
@@ -460,7 +461,13 @@ const RESERVED_KEY_SEGMENTS = new Set(['_meta', 'storagebackends']);
 // `listByPrefix` signature copied verbatim from ConfigKvStore.listByPrefix
 // (param-store.ts:607 —
 //   listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>
-// ), implemented against GET /api/v1/config?limit=N (param-store.ts:684-697).
+// ), implemented against GET /api/v1/config?limit=N (param-store.ts).
+//
+// BOUNDED. That implementation fetches ONE page of at most
+// CONFIG_LIST_PAGE_LIMIT entries — the service's schema maximum for `limit` —
+// and filters client-side, so a scan through this seam is a subset of the key
+// space, never a proof of absence. See the truncation check in
+// scanStaleNamespacedStacks.
 export type StackConfigKeyScanner = {
   listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>;
 };
@@ -509,6 +516,16 @@ type StaleNamespacedStack = { namespace: string; stackName: string };
 //   (b) a scan of the fleet's config-service instances for keys matching
 //       `openvideocore/<ns>/<name>` with `ns !== 'default'` returns nothing.
 //
+// CAVEAT ON (b): criterion (b) is itself subject to list truncation. The config
+// service caps `limit` at CONFIG_LIST_PAGE_LIMIT (param-store.ts) and this
+// client fetches a single page, so "the scan returned nothing" is only
+// authoritative for a store whose key count fits in one page.
+// scanStaleNamespacedStacks warns when a page comes back full; treat (b) as
+// UNSATISFIED for any store that logged that warning, and enumerate that store
+// exhaustively (paginating with `offset`, or inspecting it directly) before
+// counting it as clean. Do not remove this block on the strength of an empty
+// scan that may have been cut off.
+//
 // This is BOUNDED by construction, not open-ended: ADR-018/ADR-020 fix one
 // deployment to one tenant and one store, so each affected store contains
 // exactly ONE stale namespace value — never an unbounded set. If a store somehow
@@ -555,6 +572,41 @@ async function scanStaleNamespacedStacks(
     return [];
   }
   if (!Array.isArray(entries)) return [];
+
+  // TRUNCATION CHECK (review follow-up on #804).
+  //
+  // listByPrefix reads ONE page of at most CONFIG_LIST_PAGE_LIMIT entries and
+  // filters by prefix client-side (param-store.ts). The config service caps
+  // `limit` at that value by schema and this client does not paginate, so a
+  // store holding more keys than one page cannot be fully enumerated here.
+  //
+  // `entries` is already prefix-filtered, so its length is <= the page size.
+  // That makes `length === CONFIG_LIST_PAGE_LIMIT` a SUFFICIENT but not
+  // NECESSARY signal: reaching the cap proves the page was full (and therefore
+  // that keys may have been cut off), while a shorter result does not prove the
+  // page was short. The check is deliberately one-directional — it can
+  // under-warn, but it never warns about a scan that was actually complete.
+  //
+  // Why this matters: every conclusion this migration draws from an EMPTY or
+  // PARTIAL scan ("nothing stale to adopt") is only as authoritative as the
+  // scan. Without this warning, a deployment whose stale key sits past the page
+  // boundary would never converge and would look identical in the logs to one
+  // with nothing to migrate. With it, a non-converging deployment is
+  // diagnosable from logs alone.
+  if (entries.length >= CONFIG_LIST_PAGE_LIMIT) {
+    log.warn(
+      {
+        prefix: OVC_KEY_PREFIX,
+        returned: entries.length,
+        pageLimit: CONFIG_LIST_PAGE_LIMIT
+      },
+      'stale-namespace migration: config-key scan filled the config service\'s maximum page ' +
+        'size, so it may be TRUNCATED and this migration result is NOT authoritative — a ' +
+        'reported "nothing to migrate" may simply be a stale key past the page boundary. ' +
+        'If a stack is still unresolvable, enumerate the store manually before concluding ' +
+        'the migration is complete.'
+    );
+  }
 
   const found: StaleNamespacedStack[] = [];
   for (const entry of entries) {

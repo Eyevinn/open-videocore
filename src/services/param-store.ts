@@ -318,6 +318,32 @@ function backoffDelay(attempt: number, cfg: Required<ParamStoreRetryConfig>): nu
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+// Page size requested from the config service's list endpoint, and the ONLY
+// bound on how much of the key space a single list call can observe.
+//
+// 100 is not an arbitrary choice: it is the schema maximum the service enforces
+// on `limit`. Contract verified (CLAUDE.md rule 7) against the service's own
+// source — Eyevinn/app-config-svc, `src/api_config.ts` on `main`
+// (commit c1538c0e88), route `GET /config` registered under the `/api/v1`
+// prefix:
+//
+//   PageQuery = Type.Object({
+//     match:  Type.Optional(Type.String()),
+//     offset: Type.Optional(Type.Number({ minimum: 0 })),
+//     limit:  Type.Optional(Type.Number({ minimum: 1, maximum: 100 }))   // ← cap
+//   })
+//   ConfigObjectList = { offset: number; limit: number; total: number;
+//                        items: ConfigObject[]; skippedKeys?: number }
+//   ConfigObject     = { key: string; value: string; secret?: boolean }
+//
+// Requesting more than 100 is rejected by schema validation, so a store holding
+// more than 100 keys CANNOT be enumerated by one call. The service does accept
+// an `offset`, so a paginating consumer is possible — this client does not
+// paginate today, which is why every caller of a list method must treat a full
+// page as "possibly truncated". See
+// docs/osc-feedback/incoming-issue804-config-svc-list-pagination.md.
+export const CONFIG_LIST_PAGE_LIMIT = 100 as const;
+
 // HTTP-backed parameter store client for eyevinn-app-config-svc.
 //
 // SMOKE TEST CONFIRMED (2026-06-01) — real API contract:
@@ -556,15 +582,17 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 
     async listStackNames(workspaceId) {
       const prefix = `openvideocore/${workspaceId}/`;
-      // The app-config-svc list endpoint returns { items: [{ key, value }], total }
-      // with a configurable limit. We fetch up to 100 to cover realistic use.
+      // The app-config-svc list endpoint returns { offset, limit, total, items }
+      // (ConfigObjectList). CONFIG_LIST_PAGE_LIMIT is the schema maximum for
+      // `limit`, so this single page is also the most one call can observe; a
+      // store holding more keys than that is silently truncated here.
       // This GET is the stack-resolver refresh round-trip (issue #421): wrap it
       // in bounded retry-with-backoff so a boot-time TLS blip or timeout does not
       // turn into a full storage outage for the instance.
       return withRetry('listStackNames', async () => {
         const h = await buildHeaders();
         const res = await withTimeout((signal) =>
-          doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+          doFetch(`${base}/api/v1/config?limit=${CONFIG_LIST_PAGE_LIMIT}`, { method: 'GET', headers: h, signal })
         );
         if (!res.ok) {
           const text = await res.text().catch(() => '');
@@ -595,7 +623,7 @@ export function makeHttpParamStore(config: HttpParamStoreConfig): ParamStore {
 //   POST   /api/v1/config          { key, value }  → 200
 //   GET    /api/v1/config/{key}    → 200 { key, value } | 404
 //   DELETE /api/v1/config/{key}    → 200 | 404
-//   GET    /api/v1/config?limit=N  → 200 { items: [{ key, value }] }
+//   GET    /api/v1/config?limit=N  → 200 { offset, limit, total, items: [{ key, value }] }
 // SECURITY: callers MUST NOT write secret material here — same discipline as the
 // StackConfig path (assertNoCredentials). The registry writes only non-secret
 // records; the access key + secret go to OSC secrets via saveSecret.
@@ -603,7 +631,15 @@ export interface ConfigKvStore {
   set(key: string, value: string): Promise<void>;
   get(key: string): Promise<string | undefined>;
   delete(key: string): Promise<void>;
-  // List all { key, value } pairs whose key begins with `prefix`.
+  // List { key, value } pairs whose key begins with `prefix`.
+  //
+  // BOUNDED, NOT EXHAUSTIVE. The implementation fetches a single page of at
+  // most CONFIG_LIST_PAGE_LIMIT entries (the service's schema maximum for
+  // `limit`) and filters by prefix client-side, so the result is a subset, not
+  // a guaranteed-complete enumeration. Callers that draw a conclusion from an
+  // EMPTY result ("nothing matches") must account for truncation: a returned
+  // count equal to CONFIG_LIST_PAGE_LIMIT means the page was full and matches
+  // may have been cut off. See scanStaleNamespacedStacks in workspace-stack.ts.
   listByPrefix(prefix: string): Promise<Array<{ key: string; value: string }>>;
 }
 
@@ -684,7 +720,7 @@ export function makeHttpConfigKvStore(config: HttpParamStoreConfig): ConfigKvSto
     async listByPrefix(prefix) {
       const h = await buildHeaders();
       const res = await withTimeout((signal) =>
-        doFetch(`${base}/api/v1/config?limit=100`, { method: 'GET', headers: h, signal })
+        doFetch(`${base}/api/v1/config?limit=${CONFIG_LIST_PAGE_LIMIT}`, { method: 'GET', headers: h, signal })
       );
       if (!res.ok) {
         const text = await res.text().catch(() => '');

@@ -31,7 +31,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 //   (f) a failed rewrite still serves the adopted config for this call;
 //   (g) keys that merely share the `openvideocore/` prefix but are not stack
 //       configs (storage-backend records, `_meta`, non-JSON values) are never
-//       mistaken for a stale stack.
+//       mistaken for a stale stack;
+//   (h) a scan whose page came back FULL is warned about as possibly truncated
+//       (the scan reads one page of at most CONFIG_LIST_PAGE_LIMIT entries), and
+//       a short page is NOT — so the warning stays meaningful.
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - `export const STACK_CONFIG_NAMESPACE = "default"` and
@@ -60,6 +63,7 @@ import {
   type StackConfigKeyScanner
 } from './workspace-stack.js';
 import {
+  CONFIG_LIST_PAGE_LIMIT,
   stackConfigKey,
   type ParamStore,
   type StackConfig
@@ -235,6 +239,63 @@ describe('pre-#804 stale-namespace migration', () => {
 
     await expect(resolver.resolveStackConfig('mediastack')).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalled();
+  });
+
+  // (h) TRUNCATION. listByPrefix reads ONE page of at most
+  // CONFIG_LIST_PAGE_LIMIT entries (the config service's schema maximum for
+  // `limit`) and filters client-side, so an empty/partial scan is not proof of
+  // absence. A non-converging deployment must be diagnosable from logs alone.
+  it('warns that the scan may be TRUNCATED when the page comes back full', async () => {
+    const { store } = makeStore();
+    // A full page of plausible-but-irrelevant neighbours: no stale stack config
+    // among them, so the migration reports a miss — which is exactly the case
+    // that is indistinguishable from "the stale key is past the page boundary".
+    const saturated: StackConfigKeyScanner = {
+      async listByPrefix(prefix) {
+        return Array.from({ length: CONFIG_LIST_PAGE_LIMIT }, (_unused, i) => ({
+          key: `${prefix}storagebackends/tenant/backend-${i}`,
+          value: JSON.stringify({ id: `backend-${i}` })
+        }));
+      }
+    };
+
+    const warn = vi.fn();
+    const resolver = makeResolver(store, saturated, {
+      info: vi.fn(),
+      warn,
+      error: vi.fn()
+    });
+
+    await expect(resolver.resolveStackConfig('mediastack')).resolves.toBeUndefined();
+
+    const truncationWarning = warn.mock.calls.find(([, msg]) =>
+      typeof msg === 'string' && msg.includes('TRUNCATED')
+    );
+    expect(truncationWarning).toBeDefined();
+    // The warning carries the numbers an operator needs to act on it.
+    expect(truncationWarning?.[0]).toMatchObject({
+      returned: CONFIG_LIST_PAGE_LIMIT,
+      pageLimit: CONFIG_LIST_PAGE_LIMIT
+    });
+  });
+
+  it('does NOT warn about truncation when the page came back short', async () => {
+    const { store, scanner } = makeStore();
+    await store.storeStackConfig(STALE_NAMESPACE, 'mediastack', readyConfig('adopted'));
+
+    const warn = vi.fn();
+    const resolver = makeResolver(store, scanner, {
+      info: vi.fn(),
+      warn,
+      error: vi.fn()
+    });
+
+    await expect(resolver.resolveStackConfig('mediastack')).resolves.toBeDefined();
+    // One short page is a complete scan; claiming otherwise would train
+    // operators to ignore the warning.
+    expect(
+      warn.mock.calls.some(([, msg]) => typeof msg === 'string' && msg.includes('TRUNCATED'))
+    ).toBe(false);
   });
 
   it('still serves the adopted config for this call when the rewrite fails', async () => {
