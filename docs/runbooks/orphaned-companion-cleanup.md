@@ -104,9 +104,10 @@ The lifecycle `status` field on the stored config
 - Storage key: `` `openvideocore/${workspaceId}/${name}` ``
   (`stackConfigKey`, `src/services/param-store.ts:131-133`).
 - `workspaceId` for this deployment is the constant `STACK_CONFIG_NAMESPACE =
-  "default"` (`src/services/workspace-stack.ts:343`), returned by
-  `deriveWorkspaceId` (`src/routes/provision.ts:319-321`). Provision and the
-  resolver deliberately agree on this namespace.
+  "default"` (`src/services/workspace-stack.ts`). Nothing is derived (issue
+  #804): one deployment is one tenant with one config-service instance
+  (ADR-018, ADR-020), so provision and the resolver use the same literal and
+  stacks are separated by the LAST key segment, the stack name.
 - Backing store: the `eyevinn-app-config-svc` OSC service instance
   (`PARAM_STORE_SERVICE_ID`, `src/services/param-store.ts:585`), whose instance
   name defaults to `ovcconfig` (`src/services/param-store.ts:588`) or
@@ -337,8 +338,8 @@ operators know to re-run (idempotent) provision for those names afterward.
 - StackConfig shape + `status` field: `src/services/param-store.ts:52-95`;
   `isReadyStack` `src/services/param-store.ts:97-104`.
 - Storage key + namespace: `stackConfigKey` `src/services/param-store.ts:131-133`;
-  `STACK_CONFIG_NAMESPACE = "default"` `src/services/workspace-stack.ts:343`;
-  `deriveWorkspaceId` `src/routes/provision.ts:319-321`.
+  `STACK_CONFIG_NAMESPACE = "default"` `src/services/workspace-stack.ts` (a
+  constant on both the read and the write side since issue #804).
 - Param-store HTTP contract: `src/services/param-store.ts:330-363`,
   list `src/services/param-store.ts:554-580`, delete
   `src/services/param-store.ts:542-552`.
