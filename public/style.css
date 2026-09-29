@@ -1431,6 +1431,28 @@ pre.code-block {
   margin-top: 16px;
 }
 
+/* Action-failure dialog (issue #918). The message itself reuses .msg/.msg-error
+   above, so only the surrounding lines need rules here. */
+.error-dialog .error-action {
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+.error-dialog .msg-error {
+  margin-top: 0;
+}
+.error-dialog .error-detail {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+.error-dialog .modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
 /* Storage-backend remove confirmation dialog (issue #682) */
 .storage-remove-dialog .storage-remove-prompt {
   margin: 0 0 12px;

@@ -1215,6 +1215,107 @@ function nameOrFallback() {
   return '';
 }
 
+// ─── Action-failure dialog (issue #918) ────────────────────────────────────────
+//
+// The shared way to report a FAILED operator action, and the counterpart to
+// confirmModal() above: confirmModal gates the action, errorToast reports it
+// going wrong. It is the replacement for native `alert('Error: ' + err.message)`,
+// which rendered outside the app's own styling, froze the whole tab, and gave the
+// operator a bare line with no indication of WHICH action had failed.
+//
+// Named `errorToast` for continuity with the issue, but it is deliberately a
+// modal built on openModal, not a transient toast: a failed destructive action
+// must be dismissed on purpose, not time out unread while the operator is
+// looking elsewhere. Transient, non-blocking status still belongs in showMsg().
+//
+// errorToast(message, opts) -> close fn
+//   Returns openModal's close handle, so a caller can dismiss the dialog
+//   programmatically (e.g. when a retry succeeds behind it).
+//
+//   message       — the human-readable failure text. Usually `err.message`, which
+//                   apiFetch (app.js:259-275) has already resolved through the
+//                   server's human `message`, then its machine `error` code, then
+//                   the `HTTP <status>` line. An absent/blank message falls back
+//                   to a plain sentence rather than opening an empty dialog.
+//   opts.title    — dialog heading (default 'Something went wrong').
+//   opts.action   — optional short phrase naming what failed, e.g.
+//                   'Delete collection'. Rendered above the message so the
+//                   operator does not have to infer it from the message text.
+//   opts.detail   — optional secondary line (an object key, id, or next step).
+//   opts.closeLabel — dismiss button text (default 'Close').
+//   opts.onClose  — optional callback; fires exactly once, on whichever route
+//                   dismissed the dialog (Close, ×, Escape, backdrop click),
+//                   via openModal's onClose hook.
+//
+// The message carries the app's own `.msg .msg-error` classes (style.css:670 and
+// :677, the same pair showMsg() applies) so a failure looks identical whether it
+// lands inline or in this dialog, and `role="alert"` so a screen reader announces
+// it on open — the heading alone is static, the message is the part that differs
+// between failures (WCAG 2.1 AA 4.1.3 Status Messages).
+//
+// Everything is written with textContent: error messages embed server and tenant
+// data (object keys, asset names, webhook URLs) and must never be parsed as HTML.
+function errorToast(message, opts) {
+  const o = opts || {};
+  const text = (message == null || String(message).trim() === '')
+    ? 'The action failed, and the server did not say why.'
+    : String(message);
+
+  // Held so focus can be set AFTER openModal has attached the backdrop —
+  // focus() on a still-detached element is a no-op (same reason as confirmModal).
+  let dismissRef = null;
+
+  const close = openModal(
+    o.title || 'Something went wrong',
+    function (body, closeDialog) {
+      body.classList.add('error-dialog');
+
+      if (o.action) {
+        const action = document.createElement('p');
+        action.className = 'error-action';
+        action.textContent = String(o.action) + ' failed.';
+        body.appendChild(action);
+      }
+
+      const msg = document.createElement('div');
+      msg.className = 'msg msg-error';
+      msg.setAttribute('role', 'alert');
+      msg.textContent = text;
+      body.appendChild(msg);
+
+      if (o.detail) {
+        const detail = document.createElement('p');
+        detail.className = 'error-detail';
+        detail.textContent = String(o.detail);
+        body.appendChild(detail);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'modal-actions';
+
+      const dismissBtn = document.createElement('button');
+      dismissBtn.type = 'button';
+      dismissBtn.className = 'btn-sm error-dismiss';
+      dismissBtn.textContent = o.closeLabel || 'Close';
+      dismissBtn.addEventListener('click', function () { closeDialog(); });
+      actions.appendChild(dismissBtn);
+
+      body.appendChild(actions);
+
+      dismissRef = dismissBtn;
+    },
+    {
+      onClose: typeof o.onClose === 'function' ? o.onClose : undefined,
+    }
+  );
+
+  // Dismiss is the only control, so focusing it is both the safe default and the
+  // fastest route out. Done here, after openModal has attached the backdrop.
+  if (dismissRef) dismissRef.focus();
+
+  return close;
+}
+
 // ─── Storage-backend remove confirmation (issue #682) ──────────────────────────
 // Format the human-readable in-use error for a 409 body. The authoritative
 // contract (branch issue-679/storage-backend-api-endpoints,
@@ -3444,7 +3545,21 @@ async function renderCollectionsTab(container) {
           await apiFetch('/collections/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
           loadCollections();
         } catch (err) {
-          alert('Error: ' + err.message);
+          // Smoke-test call site for errorToast (issue #918). Chosen because it
+          // already sits directly behind a confirmModal, so this one flow now
+          // exercises both primitives end to end: confirm -> act -> report.
+          // The remaining native alert() sites are migrated separately.
+          //
+          // DELETE /api/v1/collections/{id} (openapi.json) answers 204 | 404 |
+          // 409. The 409 body is { error: 'delete_blocked', message, reason:
+          // 'referenced_by_job'|'member_of_collection'|'delete_protected',
+          // blockedBy }, and apiFetch (app.js:259-275) has already reduced that
+          // to the server's human `message`, so err.message is the right text to
+          // show verbatim — it explains WHY the delete was refused.
+          errorToast(err.message, {
+            action: 'Delete collection',
+            detail: 'Collection "' + label + '" was not deleted.',
+          });
         }
       });
     });
@@ -6441,6 +6556,10 @@ export {
   // lists, and resolves true/false on exactly one route per action.
   confirmModal,
   nameOrFallback,
+  // Action-failure dialog primitive (issue #918). Exported so a DOM/unit test can
+  // assert it renders in app styling, announces via role="alert", and dismisses
+  // through every openModal route.
+  errorToast,
   openModal,
   // Per-row test-connection action (issue #683). Exported so a DOM/unit test can
   // exercise the shared probe helper + the pure spinner/result row renderers
