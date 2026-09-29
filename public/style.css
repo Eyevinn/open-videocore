@@ -189,6 +189,21 @@ main {
   margin-bottom: 12px;
 }
 
+/* Visually hidden but exposed to assistive technology (WCAG 2.1 AA). Used for
+   table captions and other labels that are obvious sighted-only from layout. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Tables */
 .table-wrap {
   overflow-x: auto;

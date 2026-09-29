@@ -1971,6 +1971,62 @@ async function renderAssetDetailBody(id, bodyEl) {
     // Bind the ULID copy affordance (issue #851).
     wireCopyIdButtons(kvDiv);
 
+    // ── Status history (issue #889) ──
+    // The audited lifecycle trail. Rendered here so a status transition an
+    // operator triggers from this pane (notably Restore, below) is VISIBLE as a
+    // transition and not just as a changed badge.
+    //
+    // Contract — openapi.json .paths["/api/v1/assets/{id}"].get and
+    // .paths["/api/v1/assets/{id}/restore"].post, 200 schema property
+    // `statusHistory` (also in that schema's `required` list):
+    //   array of { at: string, from: <status>|null, to: <status> },
+    //   each item `required: ["at","from","to"]`, additionalProperties: false;
+    //   status enum = uploading|processing|ready|failed|archived.
+    // Mirrored in source by statusHistory on assetSchema (src/routes/assets.ts:855).
+    // Entries are APPENDED, never rewritten (ADR-005; applyRestore,
+    // src/data/asset-repo.ts:1022-1030), so the newest transition is last.
+    // `from` is null only for the very first entry (asset creation).
+    var lifecycleHistory = Array.isArray(asset.statusHistory) ? asset.statusHistory : [];
+    if (lifecycleHistory.length > 0) {
+      const histDiv = document.createElement('div');
+      histDiv.className = 'mt12';
+      histDiv.id = 'status-history';
+
+      const histTitle = document.createElement('div');
+      histTitle.className = 'section-title';
+      histTitle.textContent = 'Status history';
+      histDiv.appendChild(histTitle);
+
+      // Newest first: the transition just performed is the one an operator is
+      // looking for, and it is the last element on the wire.
+      var histRows = lifecycleHistory
+        .slice()
+        .reverse()
+        .map(function (h) {
+          var from = h && h.from ? h.from : null;
+          var to = h && h.to ? h.to : '—';
+          var transition = from
+            ? renderBadge(from) + ' <span aria-hidden="true">→</span> ' + renderBadge(to)
+            : '<span class="text-muted">created</span> <span aria-hidden="true">→</span> ' + renderBadge(to);
+          return (
+            '<tr>' +
+            '<td class="text-mono">' + escHtml(fmtDate(h && h.at)) + '</td>' +
+            '<td>' + transition + '</td>' +
+            '</tr>'
+          );
+        })
+        .join('');
+
+      var hwrap = document.createElement('div');
+      hwrap.className = 'table-wrap';
+      hwrap.innerHTML =
+        '<table><caption class="visually-hidden">Audited status transitions, newest first</caption>' +
+        '<thead><tr><th scope="col">At</th><th scope="col">Transition</th></tr></thead>' +
+        '<tbody>' + histRows + '</tbody></table>';
+      histDiv.appendChild(hwrap);
+      body.appendChild(histDiv);
+    }
+
     if (asset.metadata) {
       const metaDiv = document.createElement('div');
       metaDiv.className = 'mt12';
@@ -2170,14 +2226,48 @@ async function renderAssetDetailBody(id, bodyEl) {
     // returns the settled status (200), so label it accordingly and refresh the
     // detail afterwards to reflect the status change.
     var wedgedDetail = isAssetWedged(asset);
+    // Restore is offered for, and ONLY for, an asset currently in `archived`
+    // (issue #889). `archived` is terminal on the ordinary state machine
+    // (ALLOWED_TRANSITIONS.archived = [], src/data/asset-repo.ts:39), so this
+    // endpoint is the single way back — and the API answers 404 for a restore
+    // of anything that is not archived, so showing the control on a live asset
+    // would only offer a guaranteed failure.
+    var isArchived = asset.status === 'archived';
     const actionsDiv = document.createElement('div');
     actionsDiv.className = 'mt12 flex-gap';
     actionsDiv.innerHTML = [
+      isArchived
+        ? '<button id="btn-restore-asset" class="btn-primary" aria-describedby="restore-note">Restore</button>'
+        : '',
       '<button id="btn-extract-meta" class="' + (wedgedDetail ? 'btn-primary' : 'btn-ghost') + '">' +
         (wedgedDetail ? 'Re-drive extraction' : 'Extract Metadata') + '</button>',
       '<button id="btn-thumbnails" class="btn-ghost">Thumbnails</button>',
     ].join('');
     body.appendChild(actionsDiv);
+
+    // Plain-language note for the restore control, verified against the route
+    // rather than assumed (see the handler below for the full citation list):
+    //   - the target status is the pre-archive one when it was `ready`,
+    //     otherwise `failed` (restoreTargetStatus, src/data/asset-repo.ts:1006-1014)
+    //   - restore moves the LIFECYCLE axis only; `storageTiering` is untouched
+    //     (src/routes/assets.ts:5640-5644), so bytes on a cold tier stay cold.
+    // Deliberately NOT claimed: any remaining-retention countdown. No such field
+    // exists on the asset or the restore response
+    // (docs/findings/asset-restore-contract-888.md §4), so the UI does not
+    // invent one.
+    if (isArchived) {
+      const restoreNote = document.createElement('div');
+      restoreNote.id = 'restore-note';
+      restoreNote.className = 'mt8 text-muted';
+      restoreNote.style.fontSize = '12px';
+      restoreNote.textContent =
+        'This asset is archived. Restore returns it to the status it held before ' +
+        'archiving (“ready”, or “failed” if it was not ready) and records the ' +
+        'transition in its status history. It restores the lifecycle status only — ' +
+        'stored bytes are not moved between storage tiers. Once the retention ' +
+        'sweep has purged the asset, restore is no longer possible.';
+      body.appendChild(restoreNote);
+    }
 
     var runBtn = runDiv.querySelector('#btn-run-pipeline');
     runBtn.addEventListener('click', async function() {
@@ -2237,6 +2327,111 @@ async function renderAssetDetailBody(id, bodyEl) {
       filesArea.id = 'files-area';
       body.appendChild(filesArea);
       await renderAssetFiles(id, filesArea);
+    }
+
+    // ── Restore an archived asset (issue #889) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7):
+    //   openapi.json .paths["/api/v1/assets/{id}/restore"] — the only key is
+    //   `post`; its `responses` keys are exactly 200 / 404 / 410; the single
+    //   parameter is path `id` (string, required); there is NO requestBody.
+    //   Source of truth: src/routes/assets.ts:5645-5690 (`app.post('/:id/restore')`,
+    //   schema `{ 200: assetSchema, 404: errorSchema, 410: errorSchema }` at :5650),
+    //   mounted under the `/api/v1/assets` prefix.
+    //   200 — the FULL updated asset (same schema as GET /assets/{id}): `status`
+    //         has flipped out of `archived` to `ready`|`failed`, and exactly one
+    //         `{ at, from: "archived", to: <status> }` entry is APPENDED to
+    //         `statusHistory`. One `asset.restored` audit entry is emitted
+    //         (src/routes/assets.ts:5677-5687).
+    //   410 — { "error": "gone", "message": "asset has been purged" }
+    //         (src/routes/assets.ts:5662) — the retention sweep tombstoned the
+    //         document. Unrecoverable: no later retry can succeed.
+    //   404 — { "error": "not_found" } (src/routes/assets.ts:5667) for BOTH an
+    //         unknown id AND an asset that is not currently archived. The two
+    //         causes are not machine-distinguishable
+    //         (docs/findings/asset-restore-contract-888.md §3, gap G1), so the
+    //         message below does not pretend to tell them apart.
+    // The path param must be the ULID: unlike GET /:id, the restore handler does
+    // NOT resolve a slug (it passes the raw param to repo.restore), so a slug
+    // would 404. `asset.id` is the ULID even when this pane was opened by slug.
+    var restoreBtn = body.querySelector('#btn-restore-asset');
+    if (restoreBtn) {
+      // Re-render from the server after a state change, then report the outcome
+      // in the freshly built #action-msg (the re-render replaces the old one).
+      var rerenderThenMsg = async function (text, kind) {
+        try {
+          await renderAssetDetailBody(id, bodyEl);
+        } catch (_) {
+          // The re-read itself failed (e.g. the asset is now a tombstone). The
+          // renderer has already written its own error into bodyEl; don't mask it.
+          return;
+        }
+        var host = bodyEl.querySelector('#action-msg') || bodyEl;
+        showMsg(host, text, kind);
+      };
+
+      restoreBtn.addEventListener('click', async function () {
+        actionMsg.innerHTML = '';
+        var prevLabel = restoreBtn.textContent;
+        restoreBtn.disabled = true;
+        restoreBtn.textContent = 'Restoring…';
+        try {
+          var restored = await apiFetch(
+            '/assets/' + encodeURIComponent(asset.id) + '/restore',
+            { method: 'POST' }
+          );
+          // Keep the assets table in step with the lifecycle change; harmless in
+          // the detached detail window, which has no table.
+          if (assetsTable) assetsTable.reload();
+          // Re-render so the status badge AND the appended `archived -> …`
+          // statusHistory row both come from a fresh read of the asset.
+          await rerenderThenMsg(
+            'Restored — status is now “' + ((restored && restored.status) || 'unknown') + '”.',
+            'success'
+          );
+          return;
+        } catch (err) {
+          if (err && err.status === 410) {
+            // Terminal: the document is a tombstone, so no retry can ever work.
+            // Rendered as a PERSISTENT notice (showMsg auto-dismisses after 6s)
+            // and the control is retired rather than left inviting a retry.
+            restoreBtn.disabled = true;
+            restoreBtn.textContent = 'Restore unavailable';
+            var gone = document.createElement('div');
+            gone.id = 'restore-gone-notice';
+            gone.className = 'msg msg-error';
+            gone.setAttribute('role', 'alert');
+            gone.textContent =
+              'This asset has already been purged by the retention sweep (HTTP 410) — ' +
+              'its record is a tombstone and it can no longer be restored.';
+            actionMsg.appendChild(gone);
+            if (assetsTable) assetsTable.reload();
+            return;
+          }
+          if (err && err.status === 404) {
+            // Either the id is unknown or the asset is no longer archived; the
+            // API returns the same body for both (gap G1). Re-read and let the
+            // refreshed view show whichever it is.
+            await rerenderThenMsg(
+              'Restore failed (404 not_found): the API reports nothing to restore — ' +
+                'either this asset is no longer archived, or the id is unknown. ' +
+                'The view has been re-read from the API.',
+              'error'
+            );
+            return;
+          }
+          // Anything else (401/403 from the auth gate, transport failure, 5xx):
+          // report the server's own message via the shared error pattern.
+          showMsg(actionMsg, 'Restore failed: ' + err.message, 'error');
+        } finally {
+          // Only revive the control if this render is still on screen and the
+          // button was not deliberately retired by the 410 path above.
+          if (body.querySelector('#btn-restore-asset') === restoreBtn && restoreBtn.textContent === 'Restoring…') {
+            restoreBtn.disabled = false;
+            restoreBtn.textContent = prevLabel;
+          }
+        }
+      });
     }
 
     body.querySelector('#btn-extract-meta').addEventListener('click', async function() {
