@@ -38,6 +38,14 @@ import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.j
 // for PUT/DELETE /assets/{id}/lock is in the latter's header.
 import { mountDeleteProtection } from './lock-detail.js';
 
+// Blocked-archive explanation (issue #896), implementing
+// docs/ux/asset-lock-state-spec.md §5. Classifies the 409 from
+// DELETE /api/v1/assets/{id} — whose body is an anyOf, so `error ===
+// 'delete_blocked'` is checked before `reason`/`blockedBy` are read — and builds
+// the blocked confirmModal variant. Full contract grounding, including why
+// `?force=true` can never defeat a delete lock, is in that module's header.
+import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete-blocked.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -987,6 +995,28 @@ function openModal(title, buildBody, opts) {
 //                       change. Same verification bar.
 //   spec.confirmLabel — confirm button text (default 'Confirm').
 //
+// ── Blocked variant (issue #896, docs/ux/asset-lock-state-spec.md §5.2) ──
+// Additive; every field below is optional and existing callers are unchanged.
+//   spec.blocked      — when truthy the dialog explains a refusal instead of
+//                       asking for one. NO confirm button is rendered, the
+//                       dismiss button is labelled `Close` (spec.closeLabel),
+//                       and the promise always resolves `false`. There is
+//                       nothing to confirm: the API has already refused and
+//                       nothing changed. An empty `spec.affected` is omitted
+//                       rather than rendered as an empty list, because in this
+//                       variant "nothing is affected" is the whole point and the
+//                       detail line says so in words.
+//   spec.closeLabel   — dismiss button text in the blocked variant.
+//   spec.blockedBy    — optional { heading, items[] } list of the ids that
+//                       caused the refusal (job ids, collection ids). Rendered
+//                       through the same textContent-only impactList.
+//   spec.resolution   — optional sentence under the lists telling the operator
+//                       what WOULD unblock the action.
+//   spec.secondary    — optional { label, onActivate } non-destructive action
+//                       (e.g. `Open detail`, the route to the Unlock control).
+//                       Closes the dialog, resolves `false`, then invokes
+//                       onActivate.
+//
 // Resolves `true` only when the operator activates the confirm button, and
 // `false` for every dismissal route (Cancel, ×, Escape, backdrop click) via
 // openModal's onClose hook. It resolves EXACTLY ONCE, so a caller can await it
@@ -1036,10 +1066,33 @@ function confirmModal(spec) {
           body.appendChild(detail);
         }
 
-        body.appendChild(impactList('What this affects', 'confirm-affected', s.affected));
+        const blocked = !!s.blocked;
+        const affected = Array.isArray(s.affected) ? s.affected : [];
+        // The blocked variant drops an empty "What this affects" list rather
+        // than rendering a heading over nothing.
+        if (!blocked || affected.length > 0) {
+          body.appendChild(impactList('What this affects', 'confirm-affected', s.affected));
+        }
         body.appendChild(
           impactList('What this does not affect', 'confirm-unaffected', s.unaffected)
         );
+
+        // The ids that caused a refusal (job ids, collection ids). Server data,
+        // so it goes through impactList's textContent path like everything else.
+        if (blocked && s.blockedBy && Array.isArray(s.blockedBy.items) && s.blockedBy.items.length) {
+          body.appendChild(
+            impactList(String(s.blockedBy.heading || ''), 'confirm-blocked-by', s.blockedBy.items)
+          );
+        }
+
+        // What would unblock the action. Sits under the lists because it is the
+        // operator's next step, not a description of this one.
+        if (blocked && s.resolution) {
+          const resolution = document.createElement('p');
+          resolution.className = 'confirm-resolution';
+          resolution.textContent = String(s.resolution);
+          body.appendChild(resolution);
+        }
 
         const actions = document.createElement('div');
         actions.className = 'modal-actions';
@@ -1047,23 +1100,43 @@ function confirmModal(spec) {
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button';
         cancelBtn.className = 'btn-sm confirm-cancel';
-        cancelBtn.textContent = 'Cancel';
-
-        const confirmBtn = document.createElement('button');
-        confirmBtn.type = 'button';
-        confirmBtn.className = 'btn-sm btn-danger confirm-accept';
-        confirmBtn.textContent = s.confirmLabel || 'Confirm';
+        cancelBtn.textContent = blocked ? String(s.closeLabel || 'Close') : 'Cancel';
 
         actions.appendChild(cancelBtn);
-        actions.appendChild(confirmBtn);
+
+        // Optional non-destructive secondary action, blocked variant only.
+        if (blocked && s.secondary && s.secondary.label) {
+          const secondaryBtn = document.createElement('button');
+          secondaryBtn.type = 'button';
+          secondaryBtn.className = 'btn-sm confirm-secondary';
+          secondaryBtn.textContent = String(s.secondary.label);
+          secondaryBtn.addEventListener('click', function () {
+            settle(false);
+            closeDialog();
+            if (typeof s.secondary.onActivate === 'function') s.secondary.onActivate();
+          });
+          actions.appendChild(secondaryBtn);
+        }
+
+        // No confirm button in the blocked variant: the action already failed
+        // and re-issuing it would fail identically (spec §5.3 — no "force",
+        // "delete anyway" or "retry" affordance).
+        if (!blocked) {
+          const confirmBtn = document.createElement('button');
+          confirmBtn.type = 'button';
+          confirmBtn.className = 'btn-sm btn-danger confirm-accept';
+          confirmBtn.textContent = s.confirmLabel || 'Confirm';
+          confirmBtn.addEventListener('click', function () {
+            settle(true);
+            closeDialog();
+          });
+          actions.appendChild(confirmBtn);
+        }
+
         body.appendChild(actions);
 
         cancelBtn.addEventListener('click', function () {
           settle(false);
-          closeDialog();
-        });
-        confirmBtn.addEventListener('click', function () {
-          settle(true);
           closeDialog();
         });
 
@@ -1518,7 +1591,35 @@ async function renderAssetsTab(container) {
     onRowClick: function (id) {
       showAssetDetail(id, detailPanel);
     },
-    onDelete: async function (id, name) {
+    onDelete: async function (id, name, rowState) {
+      const label = nameOrFallback(name, 'this asset');
+      // Route the operator from a blocked archive to the place the block can be
+      // resolved. For a delete lock that is the detail view's Unlock control
+      // (#895); the side panel is exactly what a row click opens.
+      const openDetail = function () {
+        showAssetDetail(id, detailPanel);
+      };
+
+      // ── Pre-flight: the row already knows it is delete-locked (issue #896,
+      // docs/ux/asset-lock-state-spec.md §5.1). The Archive button stays ENABLED
+      // and focusable — a `disabled` button cannot say why, the free-text search
+      // tier cannot know lock state at all (its projection omits `deleteLock`),
+      // and the lock is only one of four guards, so an enabled Archive must
+      // never be read as a promise that the archive will succeed. The
+      // explanation point is this dialog, and it is the SAME dialog the 409 path
+      // below opens, so the two cannot drift apart.
+      if (rowState && rowState.locked) {
+        await showDeleteBlocked({
+          block: protectedBlock(),
+          name: label,
+          confirmModal,
+          onOpenDetail: openDetail,
+        });
+        // No reload: the row already carries the Locked badge, so the client
+        // learned nothing new.
+        return false;
+      }
+
       // Archive confirmation (issue #919). Impact wording verified against the
       // real semantics, NOT assumed:
       //   - DELETE /api/v1/assets/{id} is a SOFT delete: it sets status to
@@ -1550,7 +1651,6 @@ async function renderAssetsTab(container) {
       // Deliberately NOT claimed: that the asset disappears from lists or stops
       // playing back. The list endpoint applies no implicit status filter and no
       // delivery route gates on `ready`, so both would be false.
-      const label = nameOrFallback(name, 'this asset');
       const ok = await confirmModal({
         title: 'Archive asset',
         subject: label,
@@ -1570,9 +1670,36 @@ async function renderAssetsTab(container) {
       });
       if (!ok) return false;
       try {
+        // No `?force=true`. It is a real query parameter on this route
+        // (openapi.json .paths["/api/v1/assets/{id}"].delete.parameters) but it
+        // only relaxes the soft collection-membership guard, and it can never
+        // defeat a delete lock: the lock guard throws at
+        // src/routes/assets.ts:5499-5502, 31 lines before `request.query.force`
+        // is first read at :5533. Sending it would change nothing for a locked
+        // asset and would silently widen the blast radius for every other one.
         await apiFetch('/assets/' + encodeURIComponent(id), { method: 'DELETE' });
         return true;
       } catch (err) {
+        // A 409 is a refusal, not a fault: the API declined and nothing changed
+        // (all four guards run before `repo.remove`, assets.ts:5499-5542).
+        // Explain it instead of showing the bare server sentence in an `alert`
+        // (issue #896, spec §5.4). Covers the case the pre-flight check above
+        // cannot: a search-tier row whose projection carries no lock field, and
+        // a race where another client locked the asset a moment ago.
+        const block = classifyDeleteBlock(err);
+        if (block) {
+          await showDeleteBlocked({
+            block,
+            name: label,
+            confirmModal,
+            onOpenDetail: openDetail,
+          });
+          // Reload the table: the client has just learned the true state, so the
+          // Locked badge should appear on the row it was refused for. Returning
+          // `true` triggers the table's reload — it means "refresh", not
+          // "deleted"; the asset is demonstrably still there.
+          return true;
+        }
         alert('Error: ' + err.message);
         return false;
       }

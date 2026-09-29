@@ -490,10 +490,25 @@ function buildColumns(renderCtx) {
           // column renders (a.name || a.slug) so the archive confirmation can
           // name its subject without a second lookup (issue #919). Empty when the
           // asset has neither; the caller supplies its own fallback phrase.
+          //
+          // `data-locked` (issue #896, spec §5.1) carries the lock state the
+          // Status cell just derived, so the archive handler can explain the
+          // protection BEFORE issuing a request that is certain to be refused.
+          // It is the same `isAssetLocked` derivation, so the badge and the
+          // dialog cannot disagree, and it is `"true"` only for a row whose
+          // projection actually carries `deleteLock` — an UNKNOWN row (free-text
+          // search tier) falls through to the 409 path instead of guessing.
+          //
+          // The button is deliberately NOT `disabled`: a disabled control is
+          // unfocusable and carries no explanation, which is precisely what this
+          // issue asks the UI to provide (spec §5.1).
           '<button class="btn-danger asset-delete-btn" data-id="' +
           escHtml(a.id) +
           '" data-name="' +
           escHtml(a.name || a.slug || '') +
+          (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })
+            ? '" data-locked="true'
+            : '') +
           '" style="font-size:12px;padding:3px 8px;">Archive</button>'
         );
       },
@@ -539,10 +554,16 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //   fmtDate(val) -> string
 //   isAssetWedged(asset) -> boolean
 //   onRowClick(asset, tr)               — open the detail panel for a row.
-//   onDelete(id, name) -> Promise       — archive action; table reloads after.
+//   onDelete(id, name, rowState) -> Promise
+//                                       — archive action; the table reloads
+//                                         unless the handler resolves `false`.
 //                                         `name` is the row's human-readable
 //                                         label (issue #919) so the caller's
 //                                         confirmation can name the subject.
+//                                         `rowState` is `{ locked }` (issue
+//                                         #896) — the lock state this row could
+//                                         derive, so the handler can explain a
+//                                         guaranteed refusal pre-flight.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
 //   win (optional)                      — injectable window for URL sync (tests).
 //
@@ -680,7 +701,14 @@ export function createAssetsTable(deps) {
       btn.addEventListener('click', async function (e) {
         e.stopPropagation();
         if (typeof d.onDelete !== 'function') return;
-        const ok = await d.onDelete(btn.dataset.id, btn.dataset.name || '');
+        // Third argument (issue #896): the row's known lock state, so the
+        // handler can open the blocked-archive dialog pre-flight instead of
+        // waiting for the 409. `locked: false` means "not locked OR not
+        // knowable" — never "safe to archive" — which is why the handler still
+        // classifies the 409 afterwards.
+        const ok = await d.onDelete(btn.dataset.id, btn.dataset.name || '', {
+          locked: btn.dataset.locked === 'true',
+        });
         if (ok !== false) reload();
       });
     });
