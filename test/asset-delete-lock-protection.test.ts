@@ -668,7 +668,10 @@ describe('Assets tab archive flow (issues #896, #919)', () => {
     expect(alertSpy).not.toHaveBeenCalled();
   });
 
-  it('leaves non-409 failures on the existing error path', async () => {
+  it('reports a non-409 failure in the app-styled error dialog, not a native alert', async () => {
+    // Issue #920: this path used to end in `alert('Error: ' + err.message)`. It
+    // is not a refusal classifyDeleteBlock explains, so it goes to
+    // reportActionFailure -> errorToast instead.
     const alertSpy = vi.fn();
     vi.stubGlobal('alert', alertSpy);
     const { container } = await renderTab([PLAIN], {
@@ -680,7 +683,16 @@ describe('Assets tab archive flow (issues #896, #919)', () => {
     (dialog()!.querySelector('.confirm-accept') as HTMLButtonElement).click();
     await flush();
 
+    // Not the blocked-delete confirm dialog...
     expect(dialog()).toBeNull();
-    expect(alertSpy).toHaveBeenCalledTimes(1);
+    expect(alertSpy).not.toHaveBeenCalled();
+    // ...but the shared action-failure dialog, in app styling.
+    const err = document.querySelector('.error-dialog') as HTMLElement | null;
+    expect(err).toBeTruthy();
+    expect(err!.querySelector('.error-action')!.textContent).toBe('Archive asset failed.');
+    // 404 body is `{ error: 'not_found' }` with no message and no reason, so
+    // apiFetch's machine-code fallback (public/app.js:268) is what shows.
+    expect(err!.querySelector('.msg-error')!.textContent).toBe('not_found');
+    expect(err!.querySelector('.error-detail')!.textContent).toContain('was not archived');
   });
 });

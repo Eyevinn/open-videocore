@@ -287,6 +287,8 @@ function searchControl(initial) {
 //   renderBadge(status)     -> escaped HTML   (app.js status badge)
 //   onSelect(jobId)         -> void           (row click -> open detail panel)
 //   onCancel(jobId)         -> Promise|void   (cancel button click)
+//   onCancelError(err,id)   -> void           (a failed cancel; app.js renders it
+//                                              in app styling — issue #920)
 //   win                     -> Window|null    (for URL state; defaults to window)
 //
 // The consumer mounts `el`, then the table self-loads. Sort/filter/page changes
@@ -300,6 +302,13 @@ export function createJobsTable(deps) {
     : (s) => escHtml(s ?? '');
   const onSelect = typeof d.onSelect === 'function' ? d.onSelect : () => {};
   const onCancel = typeof d.onCancel === 'function' ? d.onCancel : () => {};
+  // A failed cancel is reported by the consumer, which owns the app's error
+  // rendering (app.js reportActionFailure -> errorToast). This module cannot
+  // import it — app.js imports this file, so the dependency is injected, the
+  // same pattern delete-blocked.js and lock-detail.js use. Absent it, the
+  // failure is surfaced on the table's own status line rather than silently
+  // swallowed; either way no native alert() is used (issue #920).
+  const onCancelError = typeof d.onCancelError === 'function' ? d.onCancelError : null;
   const win = 'win' in d ? d.win : (typeof window !== 'undefined' ? window : null);
 
   if (typeof apiFetch !== 'function') {
@@ -555,9 +564,16 @@ export function createJobsTable(deps) {
           await fetchWorkingSet();
         } catch (err) {
           btn.disabled = false;
-          // Surface via alert to match app.js's existing cancel-error UX.
-          if (typeof win !== 'undefined' && win && typeof win.alert === 'function') {
-            win.alert('Error: ' + (err && err.message ? err.message : String(err)));
+          // App-styled reporting, never a native alert (issue #920). The
+          // consumer's handler owns the copy; without one the table says so on
+          // its own status line rather than failing silently.
+          if (onCancelError) {
+            onCancelError(err, btn.dataset.id);
+          } else {
+            table.setStatus(
+              'error',
+              'Failed to cancel job: ' + (err && err.message ? err.message : String(err))
+            );
           }
         }
       });
