@@ -5631,9 +5631,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // audited `archived -> <target>` statusHistory entry (ADR-005: append, never
   // rewrite). Target status is the pre-archive status when it was `ready`,
   // otherwise `failed` (see restoreTargetStatus).
-  //   200 — restored asset (now `ready` or `failed`)
-  //   404 — unknown id, OR not currently `archived` (nothing to restore)
-  //   410 — the asset was already purged (its document is now a tombstone)
+  //   200 — restored asset (now `ready` or `failed`), state persisted, one
+  //         `asset.restored` audit entry emitted
+  //   404 — unknown id, OR not currently `archived` (nothing to restore) — no
+  //         state change and no audit entry
+  //   410 — the asset was already purged (its document is now a tombstone) — the
+  //         tombstone is NOT revived and no audit entry is emitted
+  // Restore moves the LIFECYCLE status only. The orthogonal `storageTiering`
+  // axis is untouched (see the storageTiering schema above: representation only,
+  // this API does not relocate bytes), so a restored asset whose bytes were
+  // relocated to the `archive` tier reports `ready` while those bytes are still
+  // cold — the response never claims otherwise.
   app.post(
     '/:id/restore',
     {
@@ -5658,6 +5666,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!restored) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Audit: the restore lifecycle transition (issue #930, instrumentation
+      // convention of #564). The inverse operation (DELETE -> `asset.archived`
+      // above) and every ordinary PATCH transition (`asset.status_changed`) each
+      // record one entry, so without this the queryable audit trail
+      // (GET /api/v1/audit) showed the archive and NEVER the revival — the API
+      // reported success for a state change nothing was accountable for. Emitted
+      // only on a real restore: a 404 (unknown/not archived — no state change)
+      // and a 410 (tombstoned) both return above and produce no entry.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.restored',
+          targetType: 'asset',
+          targetId: restored.id,
+          detail: { from: 'archived', to: restored.status }
+        },
+        request.log
+      );
       return reply.code(200).send(restored);
     }
   );
