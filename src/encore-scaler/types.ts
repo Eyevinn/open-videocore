@@ -306,6 +306,21 @@ export const keys = {
   // over the grace window so the key self-expires; the poller also deletes it on
   // the same completion path once the decrement is durably applied.
   jobCompletionSeen: (encoreJobId: string) => `encore:job-completion-seen:${encoreJobId}`,
+  // #769 review finding 4: how many CONSECUTIVE reconcile passes have classified
+  // this job as dropped while pool visibility was PARTIAL (at least one pool
+  // instance unreachable, unparseable, or returning a truncated active page).
+  // Stored as a decimal string keyed by our externalId (encoreJobId, globally
+  // unique like jobUuid/jobCompletionSeen), with a PX TTL so an abandoned
+  // counter self-expires rather than leaking a field forever.
+  //
+  // A drop decided on a partial view of the pool cannot distinguish "gone" from
+  // "running on the instance we could not read" — the exact false-drop class
+  // #769 exists to fix. reconcile() therefore withholds such a drop until this
+  // counter reaches PARTIAL_VISIBILITY_DROP_PASSES, and deletes the key the
+  // moment the job is seen active anywhere or the drop finally lands. A
+  // full-visibility pass never consults it.
+  partialVisibilityDropPasses: (encoreJobId: string) =>
+    `encore:partial-visibility-drop:${encoreJobId}`,
   // #525 pt.2: set of encoreJobIds (externalIds) whose packaging has been
   // handed off but not yet confirmed complete, keyed per Encore instance. The
   // scaler's teardown eligibility check treats a non-empty set here as real

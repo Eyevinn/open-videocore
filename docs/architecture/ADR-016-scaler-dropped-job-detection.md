@@ -222,9 +222,69 @@ So: **detection lives in `reconcile()` (scaler-loop.ts); the terminal write
 lives in the reconciler/`main.ts` repo-owning layer.** No new terminal-write
 site is introduced.
 
+### Point 5 — what "gone" means when the pool is only partially visible (added by #769)
+
+**A drop decided without full pool visibility is withheld and re-examined, and
+becomes terminal only after `PARTIAL_VISIBILITY_DROP_PASSES` consecutive passes
+that still classify it dropped.**
+
+The detection above is a diff: a job we track as running is no longer in the
+instance's live QUEUED/IN_PROGRESS set. #768/#839/#769 established that the
+instance a job is diffed against comes from `keys.jobInstance`, a single value
+overwritten on every re-dispatch, so the diff has to be taken **pool-wide** —
+"gone from the mapped instance" is not "gone from the pool". `reconcile()` now
+indexes every instance's active set before classifying anything.
+
+That index can be incomplete. An instance may be unreachable, its pool-hash entry
+unparseable, or its active page truncated (Encore returns one page per status and
+reports more jobs than it returned). Such an instance contributes no positive
+evidence, so a job genuinely running on it looks active nowhere — and would be
+written FAILED. That is the **same false-drop class #769 exists to fix**, moved
+from a stale mapping to a blind spot, and it is strictly worse than the original:
+the job keeps running, produces output nobody is waiting for, and the caller is
+told it failed.
+
+Three policies were weighed:
+
+1. **Fail toward drop** (the pre-#769 behaviour). Rejected: it leaves the headline
+   defect live whenever pool visibility is degraded, which is exactly when an
+   operator is least able to notice.
+2. **Never drop while any instance is unchecked.** Rejected: a permanently
+   unreachable pool entry would strand every job mapped elsewhere in `running`
+   forever — no terminal state, no retry, no `stallTimeoutMs` interaction. Trading
+   a false FAILED for permanent limbo is not an improvement.
+3. **Withhold, then bound** — chosen. A partial-visibility drop is withheld and
+   the job re-examined next tick; only after
+   `PARTIAL_VISIBILITY_DROP_PASSES` consecutive partial-visibility passes does it
+   settle terminally. The common case (one transient pass — an instance
+   mid-spawn, a 5xx, a briefly oversized page) resolves itself on the next tick
+   with the job correctly left alone, and the pathological case still terminates.
+
+Two consequences worth stating, because they are deliberate:
+
+- **The tracked `activeJobs` correction is deferred for an instance with a
+  withheld drop.** `actual < tracked` is the only condition that re-enters the
+  classification block, so adopting the corrected count immediately would make
+  the next pass skip classification and strand the withheld job. The instance
+  therefore stays tracked high for at most the gate's duration. The error is
+  one-directional and safe: an over-counted instance is treated as busier than it
+  is, so dispatch under-subscribes it and scale-down leaves it alone.
+- **The gate is consulted only on the partial-visibility path.** A pass that read
+  the whole pool decides immediately, exactly as before.
+
+The counter lives in Valkey at `keys.partialVisibilityDropPasses(encoreJobId)`
+with a PX TTL, and is deleted the moment the job is observed active anywhere or
+the drop finally lands. The proper fix is to stop needing the gate at all: if the
+deployed Encore exposes `GET /encoreJobs/search/findByExternalId`, a truncated
+instance can be asked about one job directly instead of being written off as
+unreadable. That is blocked on the catalog not publishing the deployed service
+version — logged in `docs/osc-feedback/incoming-issue769-encore-findbystatus-paging.md`.
+
 ## Consequences
 
-- Fast settle (tick-scale, ~10 s) for the common in-pool drop; the 30-minute
+- Fast settle (tick-scale, ~10 s) for the common in-pool drop **when the whole
+  pool was readable**; one extra tick per withheld pass when it was not (Point 5).
+  The 30-minute
   `stallTimeoutMs` backstop is retained unchanged for the residual
   scaled-down/process-down cases. No behaviour is removed.
 - No new HTTP fan-out: reuses the two `findByStatus` calls `reconcile()`
