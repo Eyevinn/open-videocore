@@ -883,7 +883,13 @@ function showMsg(container, text, type) {
 // ─── Modal dialog helper ───────────────────────────────────────────────────────
 // Opens a centered modal with a backdrop. `title` is a plain string (set via
 // textContent). `buildBody(bodyEl, close)` populates the body. Returns a close fn.
-function openModal(title, buildBody) {
+//
+// `opts.onClose` (optional, issue #919) fires exactly once when the dialog is
+// removed, whichever route removed it — the × button, Escape, a backdrop click,
+// or the caller invoking the returned/handed-in `close()`. confirmModal() needs
+// this to resolve `false` on a dismissal it did not initiate; without it the
+// three built-in dismissal routes are invisible to the caller.
+function openModal(title, buildBody, opts) {
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
 
@@ -910,9 +916,15 @@ function openModal(title, buildBody) {
   dialog.appendChild(body);
   backdrop.appendChild(dialog);
 
+  let closed = false;
   function close() {
+    // Idempotent: a caller that calls close() after Escape already fired must
+    // not double-invoke onClose.
+    if (closed) return;
+    closed = true;
     document.removeEventListener('keydown', onKey);
     backdrop.remove();
+    if (opts && typeof opts.onClose === 'function') opts.onClose();
   }
   function onKey(e) { if (e.key === 'Escape') close(); }
 
@@ -925,6 +937,164 @@ function openModal(title, buildBody) {
   buildBody(body, close);
   document.body.appendChild(backdrop);
   return close;
+}
+
+// ─── Destructive-action confirmation dialog (issue #919) ───────────────────────
+//
+// The single confirmation primitive for every destructive operator-facing action
+// in this UI. It replaces native `confirm()`, which could only render one line of
+// text and in practice identified its subject by an opaque id ("Delete collection
+// col_01J8…?") while saying nothing about blast radius.
+//
+// confirmModal(spec) -> Promise<boolean>
+//   spec.title        — dialog heading, e.g. 'Archive asset'.
+//   spec.subject      — the HUMAN-READABLE name of the thing being acted on
+//                       (asset name, collection name, profile name, webhook URL,
+//                       object filename, stack name, instance name). NEVER an
+//                       opaque id. Required and non-empty; see nameOrFallback().
+//   spec.subjectLabel — optional qualifier rendered before the subject, e.g.
+//                       'collection', 'stack'.
+//   spec.question     — optional full question line. When omitted it is built as
+//                       `<title> "<subject>"?`.
+//   spec.detail       — optional secondary line (e.g. the full object key when
+//                       the subject is just the filename).
+//   spec.affected     — REQUIRED non-empty array of strings: what this action
+//                       DOES change. Each entry must be verified against the
+//                       route handler, never assumed.
+//   spec.unaffected   — REQUIRED non-empty array of strings: what it does NOT
+//                       change. Same verification bar.
+//   spec.confirmLabel — confirm button text (default 'Confirm').
+//
+// Resolves `true` only when the operator activates the confirm button, and
+// `false` for every dismissal route (Cancel, ×, Escape, backdrop click) via
+// openModal's onClose hook. It resolves EXACTLY ONCE, so a caller can await it
+// as the single gate for the action — one dialog per action, never a second
+// nested confirmation.
+//
+// Everything is written with textContent: subject names are operator/tenant data
+// (asset names, webhook URLs, object keys) and must never be parsed as HTML.
+function confirmModal(spec) {
+  const s = spec || {};
+  const subject = s.subject == null ? '' : String(s.subject);
+  const question = s.question
+    ? String(s.question)
+    : (s.title || 'Confirm') + ' ' + (s.subjectLabel ? String(s.subjectLabel) + ' ' : '') +
+      '"' + subject + '"?';
+
+  return new Promise(function (resolve) {
+    // Guard so the promise settles once no matter which route fires first: the
+    // confirm handler calls close(), which triggers onClose immediately after.
+    let settled = false;
+    function settle(value) {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    }
+
+    // Held so focus can be set AFTER openModal has attached the backdrop —
+    // focus() on a still-detached element is a no-op.
+    let cancelRef = null;
+
+    // The returned close handle is deliberately not bound: this dialog closes
+    // through the `closeDialog` callback openModal passes into the body builder.
+    openModal(
+      s.title || 'Confirm',
+      function (body, closeDialog) {
+        body.classList.add('confirm-dialog');
+
+        const prompt = document.createElement('p');
+        prompt.className = 'confirm-question';
+        prompt.textContent = question;
+        body.appendChild(prompt);
+
+        if (s.detail) {
+          const detail = document.createElement('p');
+          detail.className = 'confirm-detail';
+          detail.textContent = String(s.detail);
+          body.appendChild(detail);
+        }
+
+        body.appendChild(impactList('What this affects', 'confirm-affected', s.affected));
+        body.appendChild(
+          impactList('What this does not affect', 'confirm-unaffected', s.unaffected)
+        );
+
+        const actions = document.createElement('div');
+        actions.className = 'modal-actions';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'btn-sm confirm-cancel';
+        cancelBtn.textContent = 'Cancel';
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.type = 'button';
+        confirmBtn.className = 'btn-sm btn-danger confirm-accept';
+        confirmBtn.textContent = s.confirmLabel || 'Confirm';
+
+        actions.appendChild(cancelBtn);
+        actions.appendChild(confirmBtn);
+        body.appendChild(actions);
+
+        cancelBtn.addEventListener('click', function () {
+          settle(false);
+          closeDialog();
+        });
+        confirmBtn.addEventListener('click', function () {
+          settle(true);
+          closeDialog();
+        });
+
+        cancelRef = cancelBtn;
+      },
+      {
+        // Escape / × / backdrop click — and the confirm+cancel paths above, which
+        // have already settled. Any unsettled close is a dismissal.
+        onClose: function () { settle(false); },
+      }
+    );
+
+    // Focus Cancel, not the destructive control: a stray Enter/Space on a freshly
+    // opened destructive dialog must not perform the action. Done here, after
+    // openModal has attached the backdrop to the document.
+    if (cancelRef) cancelRef.focus();
+  });
+}
+
+// Render one labelled impact list for confirmModal. Lists are plain <ul>s so a
+// screen reader announces the item count; the heading is a <div> rather than a
+// heading element so it does not compete with the dialog's own <h3> title.
+function impactList(heading, className, items) {
+  const wrap = document.createElement('div');
+  wrap.className = 'confirm-impact ' + className;
+
+  const head = document.createElement('div');
+  head.className = 'confirm-impact-heading';
+  head.textContent = heading;
+  wrap.appendChild(head);
+
+  const ul = document.createElement('ul');
+  (Array.isArray(items) ? items : []).forEach(function (item) {
+    const li = document.createElement('li');
+    li.textContent = String(item);
+    ul.appendChild(li);
+  });
+  wrap.appendChild(ul);
+  return wrap;
+}
+
+// Resolve a human-readable subject name for a confirmation dialog, falling back
+// through a list of candidates. Used so a dialog never degrades to naming its
+// subject by an opaque id when a name field happens to be empty: the LAST
+// candidate is a descriptive phrase (e.g. 'this collection'), not an id.
+function nameOrFallback() {
+  for (let i = 0; i < arguments.length; i++) {
+    const candidate = arguments[i];
+    if (candidate == null) continue;
+    const text = String(candidate).trim();
+    if (text.length > 0) return text;
+  }
+  return '';
 }
 
 // ─── Storage-backend remove confirmation (issue #682) ──────────────────────────
@@ -1326,8 +1496,57 @@ async function renderAssetsTab(container) {
     onRowClick: function (id) {
       showAssetDetail(id, detailPanel);
     },
-    onDelete: async function (id) {
-      if (!confirm('Archive asset ' + id + '?')) return false;
+    onDelete: async function (id, name) {
+      // Archive confirmation (issue #919). Impact wording verified against the
+      // real semantics, NOT assumed:
+      //   - DELETE /api/v1/assets/{id} is a SOFT delete: it sets status to
+      //     `archived` and destroys nothing (src/routes/assets.ts:5474-5560 —
+      //     "Soft delete: archive rather than destroy"; file header :10-11;
+      //     ASSET_STATUSES / ALLOWED_TRANSITIONS.archived = []
+      //     src/data/asset-repo.ts:28,39 — archived is terminal).
+      //   - It is reversible: POST /api/v1/assets/{id}/restore revives an
+      //     archived asset that has not yet been purged (src/routes/assets.ts:
+      //     5626-5660; 410 once purged).
+      //   - Files are deleted only later, by the retention purge sweep
+      //     (src/pipeline/archived-asset-purge-sweep.ts header + per-asset purge
+      //     steps), and only when a window is configured — ARCHIVE_RETENTION_MS
+      //     unset/0 means never purge (RETENTION_DISABLED_MS,
+      //     src/routes/retention.ts:36 + archiveRetentionMsFromEnv :42-44).
+      //   - The archive is audited as `asset.archived` (assets.ts:5546-5558).
+      //   - It can also be REFUSED outright. Four guards run BEFORE the archive
+      //     (assets.ts:5499-5540 — the archive itself is `repo.remove` at :5542),
+      //     in this fixed precedence:
+      //       1. deleteLock.locked -> DeleteProtectedError (HARD, :5500-5502)
+      //       2. an active job referencing the asset -> ReferencedByJobError
+      //          (HARD, :5512-5518)
+      //       3. countChildren() > 0 -> HasChildrenError (HARD, :5520-5523)
+      //       4. membership of any collection -> AssetMemberOfCollectionError
+      //          (SOFT, overridable by `?force=true`, :5533-5540)
+      //     This UI sends no `force`, so guard 4 fires for any asset that sits in
+      //     a collection. All four answer 409 and leave the asset untouched, so
+      //     the dialog states the refusal instead of promising the archive.
+      // Deliberately NOT claimed: that the asset disappears from lists or stops
+      // playing back. The list endpoint applies no implicit status filter and no
+      // delivery route gates on `ready`, so both would be false.
+      const label = nameOrFallback(name, 'this asset');
+      const ok = await confirmModal({
+        title: 'Archive asset',
+        subject: label,
+        question: 'Archive "' + label + '"?',
+        confirmLabel: 'Archive',
+        affected: [
+          'If the asset is delete-locked, referenced by a running job, still has renditions, or belongs to a collection, the API refuses the archive and nothing changes.',
+          'Otherwise the asset’s status becomes "archived" and the change is recorded in the audit log.',
+          'Archived is a terminal state: no ordinary status update moves the asset out of it — only Restore does.',
+          'If this deployment has an archive retention window configured, a background sweep will eventually delete the stored files for good and replace the record with a tombstone.',
+        ],
+        unaffected: [
+          'Nothing is erased right now. The source file, renditions, packaged output, subtitles, thumbnails and all metadata stay in storage.',
+          'You can Restore the asset at any point before that retention sweep purges it.',
+          'Other assets, collections and jobs are left exactly as they are.',
+        ],
+      });
+      if (!ok) return false;
       try {
         await apiFetch('/assets/' + encodeURIComponent(id), { method: 'DELETE' });
         return true;
@@ -2649,6 +2868,24 @@ async function renderCollectionsTab(container) {
 
     const rows = collections.map(function(c) {
       const assetCount = c.assets ? c.assets.length : (c.assetCount != null ? c.assetCount : '—');
+      // Authoritative member count for the delete confirmation (issue #919):
+      // GET /api/v1/collections returns `assetIds` (collectionSchema,
+      // src/routes/collections.ts:80-91) — `assets` is only present on GET
+      // /collections/{id} (collectionWithAssetsSchema, :96-98). Empty string when
+      // neither is present, so the dialog degrades to count-free wording rather
+      // than asserting a number it cannot know.
+      const memberCount = Array.isArray(c.assetIds)
+        ? c.assetIds.length
+        : (Array.isArray(c.assets) ? c.assets.length : '');
+      // Explicit delete-lock, carried alongside the member count because the
+      // lock decides the delete outcome BEFORE emptiness does: DELETE
+      // /api/v1/collections/{id} throws CollectionDeleteProtectedError on a
+      // locked collection (src/routes/collections.ts:404-406) ahead of the
+      // member check (:407-414), and `?force=true` is never consulted for it.
+      // `deleteLock` is part of collectionSchema (collections.ts:80-91, field at
+      // :90) and is
+      // returned by GET /collections (:315-324), so the list already knows.
+      const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
       return '<tr data-id="' + escHtml(c.id) + '">' +
         '<td class="cell-id">' + escHtml(c.id) + '</td>' +
         '<td>' + escHtml(c.name || '—') + '</td>' +
@@ -2656,7 +2893,7 @@ async function renderCollectionsTab(container) {
         '<td>' + escHtml(fmtDate(c.createdAt)) + '</td>' +
         '<td>' +
           '<button class="btn-ghost coll-view-btn" data-id="' + escHtml(c.id) + '" style="font-size:12px;padding:3px 8px;">View</button>' +
-          '<button class="btn-danger coll-delete-btn" data-id="' + escHtml(c.id) + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Delete</button>' +
+          '<button class="btn-danger coll-delete-btn" data-id="' + escHtml(c.id) + '" data-name="' + escHtml(c.name || '') + '" data-members="' + escHtml(String(memberCount)) + '" data-locked="' + (deleteLocked ? '1' : '') + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Delete</button>' +
         '</td>' +
         '</tr>';
     }).join('');
@@ -2674,7 +2911,79 @@ async function renderCollectionsTab(container) {
     });
     tableWrap.querySelectorAll('.coll-delete-btn').forEach(function(btn) {
       btn.addEventListener('click', async function() {
-        if (!confirm('Delete collection ' + btn.dataset.id + '?')) return;
+        // Collection delete confirmation (issue #919). Impact wording verified
+        // against DELETE /api/v1/collections/{id}
+        // (src/routes/collections.ts:383-436), NOT assumed:
+        //   - The handler calls `repo.delete(id)` only. There is NO cascade into
+        //     assets: a collection stores a flat list of member ids
+        //     (`assetIds`, src/data/collection-repo.ts:19-25), so deleting it
+        //     removes the grouping, never the media.
+        //   - It is audited as `collection.deleted` (collections.ts:418-433).
+        //   - A delete-locked collection is REFUSED with 409 `delete_blocked` /
+        //     reason `delete_protected` (collections.ts:404-406,
+        //     CollectionDeleteProtectedError; envelope deleteBlockedSchema
+        //     :62-70; handler mapping :257-265). This guard is HARD and runs
+        //     FIRST — before the member check — and `?force=true` is never
+        //     consulted for it, so a locked collection can never be deleted from
+        //     here. The only way out is DELETE /collections/{id}/lock
+        //     (collections.ts:478-491, "the only way to lift protection").
+        //     Hence the lock branch below must not promise the delete lands.
+        //   - A collection that still holds member ids is REFUSED with 409
+        //     `delete_blocked` / reason `member_of_collection` unless
+        //     `?force=true` (collections.ts:407-414, CollectionInUseError;
+        //     ADR-020 decision 2 marks this block SOFT/overridable). This UI
+        //     deliberately does not send `force`, so a non-empty collection is a
+        //     no-op the operator is told about up front.
+        //   - There is no restore path for a deleted collection (the router
+        //     exposes no equivalent of the asset `/restore` route).
+        const label = nameOrFallback(btn.dataset.name, 'this collection');
+        const members = btn.dataset.members;
+        const hasCount = members !== '' && members != null && !Number.isNaN(Number(members));
+        const count = hasCount ? Number(members) : null;
+        const locked = btn.dataset.locked === '1';
+        // The delete outcome is NOT seeded unconditionally: in a refused branch
+        // BOTH of its clauses are false. The lock guard throws
+        // CollectionDeleteProtectedError BEFORE `repo.delete(id)` is reached
+        // (collections.ts:404-406 vs :417), and the `collection.deleted` audit
+        // emit sits AFTER the delete inside `if (existing)` (:418-433), so a
+        // refused delete writes no audit entry either. Same construction as the
+        // asset archive dialog above (app.js:1538-1539): refusal bullet first,
+        // outcome only where the delete can actually land — or as an
+        // "Otherwise …" clause when the branch cannot tell in advance.
+        const affected = [];
+        // Lock first: it mirrors the handler's guard order, and it is the only
+        // refusal that holds whether or not the collection is empty.
+        if (locked) {
+          affected.push(
+            'This collection is delete-locked, so the API will refuse the delete and nothing will change. ' +
+            'The lock has to be cleared first (DELETE /collections/{id}/lock) — it cannot be forced.'
+          );
+        } else if (hasCount && count === 0) {
+          affected.push('This collection is empty, so the delete will go through.');
+          affected.push('The collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
+        } else if (hasCount) {
+          affected.push(
+            'This collection still holds ' + count + ' asset' + (count === 1 ? '' : 's') +
+            ', so the API will refuse the delete and nothing will change. Remove its members first.'
+          );
+          affected.push('Otherwise — once its members are removed — the collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
+        } else {
+          affected.push('If the collection still holds assets, the API refuses the delete and nothing changes — remove its members first.');
+          affected.push('Otherwise the collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
+        }
+        affected.push('There is no undo: unlike an archived asset, a deleted collection cannot be restored.');
+        const ok = await confirmModal({
+          title: 'Delete collection',
+          subject: label,
+          question: 'Delete collection "' + label + '"?',
+          confirmLabel: 'Delete collection',
+          affected: affected,
+          unaffected: [
+            'No assets are deleted. Every asset that was in this collection keeps its files, renditions and metadata.',
+            'Those assets stay in any other collection they belong to, and any running or finished jobs are untouched.',
+          ],
+        });
+        if (!ok) return;
         try {
           await apiFetch('/collections/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
           loadCollections();
@@ -3190,7 +3499,43 @@ async function renderProfilesTab(container) {
 
     tableWrap.querySelectorAll('.pf-delete-btn').forEach(function(btn) {
       btn.addEventListener('click', async function() {
-        if (!confirm('Delete profile ' + btn.dataset.name + '?')) return;
+        // Profile delete confirmation (issue #919). The profile NAME is the
+        // resource's own human-readable identifier — profiles are addressed by
+        // name, not by an opaque id (DELETE /api/v1/profiles/{name},
+        // src/routes/profiles.ts:300-312), so naming the subject here is the name.
+        // Impact wording verified, NOT assumed:
+        //   - The handler calls `repo.delete(name)` and answers 204. No cascade,
+        //     no children check, no soft-delete/restore path exists.
+        //   - The deleted name also leaves GET /api/v1/profiles/index.yml, the
+        //     public index the transcoder instances read (profiles.ts:19-20,
+        //     :127-...).
+        //   - A transcode naming a profile the store does not know is NOT
+        //     rejected here: unrunnableProfileReason / uncarriableColourReason
+        //     both return undefined for an unknown name and the name is
+        //     "forwarded verbatim" to the transcoder (src/routes/assets.ts:
+        //     1757-1764 and :1777-1786), which then fails the job.
+        //   - Built-in profiles are re-created by every bootstrap run, including
+        //     on server start (ensureBuiltinProfiles,
+        //     src/services/profile-bootstrap.ts:76-91; startup call
+        //     src/main.ts:1762).
+        const label = nameOrFallback(btn.dataset.name, 'this profile');
+        const ok = await confirmModal({
+          title: 'Delete profile',
+          subject: label,
+          question: 'Delete transcoding profile "' + label + '"?',
+          confirmLabel: 'Delete profile',
+          affected: [
+            'The profile’s YAML is removed from the store and drops out of the profile index the transcoders read.',
+            'New transcodes that name "' + label + '" are no longer checked here; they are handed to the transcoder as-is and fail there.',
+            'There is no undo and no restore for a deleted profile — re-adding it means pasting its YAML back in.',
+          ],
+          unaffected: [
+            'Jobs that already ran with this profile keep their results: renditions, packaged output and job history are untouched.',
+            'Assets, collections and every other profile are left alone.',
+            'Profiles that ship built-in with this API are re-created automatically on the next server start.',
+          ],
+        });
+        if (!ok) return;
         try {
           await apiFetch('/profiles/' + encodeURIComponent(btn.dataset.name), { method: 'DELETE' });
           listSection.querySelector('#pf-yaml-view').innerHTML = '';
@@ -3223,7 +3568,49 @@ async function renderProfilesTab(container) {
   listSection.querySelector('#pf-bootstrap').addEventListener('click', async function() {
     const msgEl = listSection.querySelector('#pf-bootstrap-msg');
     msgEl.innerHTML = '';
-    if (!confirm('Seed profiles from the default Encore profile index?')) return;
+    // Seed confirmation (issue #919). This is a bulk WRITE over the profile
+    // store, so it gets the same treatment as the deletes. Impact wording
+    // verified against POST /api/v1/profiles/bootstrap
+    // (src/routes/profiles.ts:184-206) and bootstrapProfiles
+    // (src/services/profile-bootstrap.ts:128-183), NOT assumed:
+    //   - This UI sends NO `?force=true`, so `force` is false.
+    //   - Built-ins are ensured on EVERY run, unconditionally and BEFORE the
+    //     skip guard: `const builtinSeeded = await ensureBuiltinProfiles(...)`
+    //     (profile-bootstrap.ts:148, helper at :75-91). So a built-in that is
+    //     currently MISSING is re-created even on the skip path — the skip
+    //     return carries that count: `{ seeded: 0, skipped: true, builtinSeeded }`
+    //     (:159, field documented at :50-53). This run is therefore never a
+    //     guaranteed no-op, which is why it is stated under "what this affects".
+    //   - An existing profile whose name matches a built-in is left untouched by
+    //     that step, so an operator edit to a built-in survives (:82-84).
+    //   - With force false, if any NON-built-in profile already exists the
+    //     REMOTE seed is skipped: no index fetch, no create, no update
+    //     (countNonBuiltinProfiles :66-69, skip guard :150-160).
+    //   - When the remote seed does run, an index entry whose name already
+    //     exists is OVERWRITTEN via `repository.update(entry.name, yaml)`
+    //     (loop :166-179, update at :171). Since the skip guard means the store
+    //     then holds only built-ins, the profile that can be overwritten is an
+    //     edited built-in.
+    //   - An unreachable index is a 502 `bootstrap_failed` (profiles.ts:201-204),
+    //     so nothing is half-written from a failed fetch of the index itself.
+    // The subject is the profile index, named for what it is rather than by an id.
+    const seedOk = await confirmModal({
+      title: 'Seed transcoding profiles',
+      subject: 'the default transcoding profile index',
+      question: 'Seed transcoding profiles from the default profile index?',
+      confirmLabel: 'Seed profiles',
+      affected: [
+        'Every profile named in the default index is fetched and stored, so the profile list and the index the transcoders read both grow.',
+        'If the only profiles stored right now are the ones that ship built-in with this API, a built-in whose name also appears in the index is overwritten — including any edit you made to it.',
+        'Any profile that ships built-in with this API and is currently missing is re-created, on every run — including the runs where the remote seed is skipped. So this is never a guaranteed no-op.',
+      ],
+      unaffected: [
+        'Nothing is deleted. Profiles that are not named in the index stay exactly as they are.',
+        'If any profile you or an earlier seed added is already stored, the remote seed is skipped and no profile from the index is fetched or overwritten.',
+        'No assets, collections or jobs are touched, and jobs that already ran keep their results.',
+      ],
+    });
+    if (!seedOk) return;
     try {
       const res = await apiFetch('/profiles/bootstrap', { method: 'POST' });
       if (res && res.skipped) {
@@ -3318,7 +3705,16 @@ async function renderWebhooksTab(container) {
         '<td style="word-break:break-all;">' + escHtml(wh.url || wh.endpoint || '—') + '</td>' +
         '<td>' + evTags + '</td>' +
         '<td>' + escHtml(fmtDate(wh.createdAt)) + '</td>' +
-        '<td><button class="btn-danger wh-delete-btn" data-id="' + escHtml(wh.id) + '" style="font-size:12px;padding:3px 8px;">Delete</button></td>' +
+        // `data-url` / `data-events` / `data-has-secret` feed the delete
+        // confirmation (issue #919). A registration has NO name field — the
+        // authoritative read shape is { id, url, events, hasSecret, createdAt }
+        // (registrationBaseSchema, src/routes/webhooks.ts:43-49) — so its URL is
+        // the human-readable identifier a dialog can name it by.
+        '<td><button class="btn-danger wh-delete-btn" data-id="' + escHtml(wh.id) +
+          '" data-url="' + escHtml(wh.url || wh.endpoint || '') +
+          '" data-events="' + escHtml((wh.events || []).join(', ')) +
+          '" data-has-secret="' + (wh.hasSecret ? 'true' : 'false') +
+          '" style="font-size:12px;padding:3px 8px;">Delete</button></td>' +
         '</tr>';
     }).join('');
     const tableWrap = document.createElement('div');
@@ -3331,7 +3727,43 @@ async function renderWebhooksTab(container) {
 
     tableWrap.querySelectorAll('.wh-delete-btn').forEach(function(btn) {
       btn.addEventListener('click', async function() {
-        if (!confirm('Delete webhook ' + btn.dataset.id + '?')) return;
+        // Webhook delete confirmation (issue #919). Impact wording verified
+        // against DELETE /api/v1/webhooks/{id}
+        // (src/routes/webhooks.ts:143-158), NOT assumed:
+        //   - The handler calls `repo.delete(id)` and is idempotent; 204 either
+        //     way. No cascade, no restore path.
+        //   - The registration is workspace-scoped, so only this workspace stops
+        //     notifying that URL (router header :3-8).
+        //   - A signing secret is never readable back: "There is deliberately no
+        //     read-back path: a caller who loses a secret re-registers"
+        //     (:25-26); the list shape has no `secret` field at all
+        //     (listedRegistrationSchema, :59).
+        const url = nameOrFallback(btn.dataset.url, 'this webhook');
+        const events = btn.dataset.events || '';
+        const affected = [
+          'This workspace stops sending event notifications to ' + url + '.',
+        ];
+        if (events) {
+          affected.push('The events it was subscribed to — ' + events + ' — are no longer delivered to that URL.');
+        }
+        if (btn.dataset.hasSecret === 'true') {
+          affected.push('Its signing secret goes with it. Secrets cannot be read back, so re-registering means issuing a new one.');
+        }
+        affected.push('The delete takes effect immediately and cannot be undone.');
+        const ok = await confirmModal({
+          title: 'Delete webhook',
+          subject: url,
+          question: 'Stop sending events to ' + url + '?',
+          detail: 'Registration id: ' + (btn.dataset.id || '—'),
+          confirmLabel: 'Delete webhook',
+          affected: affected,
+          unaffected: [
+            'Nothing that produces the events changes: assets, jobs and pipelines carry on exactly as before.',
+            'Notifications already delivered are not recalled, and your other webhook registrations keep receiving events.',
+            'The receiving service itself is untouched — this only removes the registration here.',
+          ],
+        });
+        if (!ok) return;
         try {
           await apiFetch('/webhooks/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
           loadWebhooks();
@@ -3904,7 +4336,11 @@ async function openBucketBrowser(browser, bucket, prefix) {
       '<td>' + escHtml(display) + '</td>' +
       '<td>' + escHtml(fmtBytes(o.size)) + '</td>' +
       '<td>' + escHtml(fmtDate(o.lastModified)) + '</td>' +
-      '<td><button class="btn-danger storage-delete-btn" data-key="' + escHtml(o.key) + '" style="font-size:12px;padding:3px 8px;">Delete</button></td>' +
+      // `data-name` is the same prefix-relative filename the Name column shows —
+      // the human-readable subject for the delete confirmation (issue #919). The
+      // full workspace-local key stays on `data-key` because that is what the
+      // request path is built from.
+      '<td><button class="btn-danger storage-delete-btn" data-key="' + escHtml(o.key) + '" data-name="' + escHtml(display) + '" style="font-size:12px;padding:3px 8px;">Delete</button></td>' +
       '</tr>';
   }).join('');
 
@@ -3925,7 +4361,34 @@ async function openBucketBrowser(browser, bucket, prefix) {
 
   tableWrap.querySelectorAll('.storage-delete-btn').forEach(function(btn) {
     btn.addEventListener('click', async function() {
-      if (!confirm('Delete object ' + btn.dataset.key + '?')) return;
+      // Object delete confirmation (issue #919). Impact wording verified against
+      // DELETE /api/v1/storage/buckets/{bucket}/objects/*
+      // (src/routes/storage.ts:711-746), NOT assumed:
+      //   - The handler calls `conns.storageClient.removeObject(bucket, localKey)`
+      //     and answers 204. That is the ONLY thing it does: it touches no asset
+      //     document, so an asset that references this object keeps pointing at a
+      //     key that no longer exists.
+      //   - Exactly one object is removed. There is no recursive/prefix variant
+      //     on this route, so sibling objects under the same folder survive.
+      //   - There is no soft delete and no restore path here — unlike an archived
+      //     asset, a removed object is simply gone.
+      const label = nameOrFallback(btn.dataset.name, btn.dataset.key, 'this object');
+      const ok = await confirmModal({
+        title: 'Delete object',
+        subject: label,
+        question: 'Delete the file "' + label + '" from bucket "' + bucket + '"?',
+        detail: 'Full object key: ' + (btn.dataset.key || '—'),
+        confirmLabel: 'Delete object',
+        affected: [
+          'This one object is removed from the bucket straight away. There is no soft delete and no undo — you would have to re-upload the file.',
+          'Any asset that still references this object keeps its reference, so downloading, playing back or re-running a pipeline for that asset will fail until the file is put back.',
+        ],
+        unaffected: [
+          'No asset record, rendition list or job is updated — this is a raw bucket operation, not an asset delete.',
+          'Every other object in the bucket, including anything else in this folder, is left alone.',
+        ],
+      });
+      if (!ok) return;
       try {
         const path = btn.dataset.key.split('/').map(encodeURIComponent).join('/');
         await apiFetch('/storage/buckets/' + encodeURIComponent(bucket) + '/objects/' + path, { method: 'DELETE' });
@@ -4151,8 +4614,42 @@ async function renderProvisionTab(container) {
       removeBtn.textContent = 'Remove';
       const statusSpan = document.createElement('span');
       statusSpan.style.cssText = 'margin-left:8px;font-size:12px;';
-      removeBtn.addEventListener('click', function() {
-        if (!confirm('Remove stack "' + name + '"? This will destroy all OSC services in the stack.')) return;
+      removeBtn.addEventListener('click', async function() {
+        // Stack removal confirmation (issue #919). This is the most destructive
+        // action in the UI, so the wording is grounded line by line in the real
+        // teardown, NOT assumed:
+        //   - DELETE /api/v1/provision/{name} (src/routes/provision.ts:1578-1760)
+        //     returns 202 and tears the stack down in the background.
+        //   - The stack's static services are storage, database and queue
+        //     (STACK_SERVICES, src/services/stack.ts:32-36); teardown order
+        //     prepends the on-demand packager (TEARDOWN_ORDER, :120-123).
+        //   - The store-backed path additionally tears down the auto-scaled
+        //     transcoder instances first (scaler teardown, provision.ts:1650-1665)
+        //     and any optional auto-subtitles / scene-detect instance recorded on
+        //     the stack config (deprovisionStackFromConfig call, :1703-1719).
+        //   - Because the object store and the database ARE stack services, every
+        //     asset record and every stored file in this stack go with them.
+        //   - The stored stack coordinates are deleted only after teardown
+        //     succeeds; a failed teardown deliberately keeps them so a retry can
+        //     finish the job (:1721-1743). Teardown is idempotent per service
+        //     (teardownService probes first, src/services/deprovision.ts:56-74).
+        const label = nameOrFallback(name, 'this stack');
+        const ok = await confirmModal({
+          title: 'Remove stack',
+          subject: label,
+          question: 'Remove stack "' + label + '" and destroy everything in it?',
+          confirmLabel: 'Remove stack',
+          affected: [
+            'Every service instance in this stack is destroyed: its object storage, its database and its shared queue, plus any on-demand packager, auto-scaled transcoders and optional subtitle or scene-detection instances recorded for it.',
+            'Because the storage and the database are part of the stack, all asset records and all media files held in this stack go with them. This cannot be undone and there is no restore.',
+            'Removal runs in the background — the row shows its progress and it also appears under Active Operations.',
+          ],
+          unaffected: [
+            'Other stacks and their services are left completely alone.',
+            'This API keeps running, and its stored coordinates for the stack are cleared only once every instance is actually gone, so a partial failure can be retried safely.',
+          ],
+        });
+        if (!ok) return;
         removeBtn.disabled = true;
         statusSpan.textContent = 'removing…';
         apiFetch('/provision/' + encodeURIComponent(name), { method: 'DELETE' }).then(function(res) {
@@ -4300,8 +4797,46 @@ async function renderProvisionTab(container) {
       const deprovBtn = document.createElement('button');
       deprovBtn.className = 'btn-danger';
       deprovBtn.textContent = 'Deprovision';
-      deprovBtn.addEventListener('click', function() {
-        if (!confirm('Deprovision the scene-detect instance "' + status.instanceName + '"?')) return;
+      deprovBtn.addEventListener('click', async function() {
+        // Scene-detect deprovision confirmation (issue #919). Impact wording
+        // verified against DELETE /api/v1/optional-services/{key}
+        // (src/routes/optional-services.ts:316-380), NOT assumed:
+        //   - The handler reads the instance name from the descriptor's
+        //     instanceNameEnvVar (:336) and, after probing, calls
+        //     `removeInstance(osc, serviceId, name, sat)` (:369). That is the only
+        //     mutation: the env var is NOT cleared and no asset is touched.
+        //   - It returns 202 + operationId; the removal runs in the background.
+        //   - Teardown is idempotent: an already-absent instance resolves
+        //     `not_found`, which is a success (:357-365).
+        //   - `state` therefore falls back from `active` to `configured` — the env
+        //     var is still set but no live instance exists under that name
+        //     (statusSchema state docs, :50-58).
+        //   - The subject's human-readable name is the registry displayName
+        //     ('Scene Detect Media Function', src/services/optional-services.ts:86-88)
+        //     plus the operator-chosen instance name; neither is an opaque id.
+        const serviceLabel = nameOrFallback(status && status.displayName, 'Scene detection');
+        const instanceLabel = nameOrFallback(status && status.instanceName, 'the configured instance');
+        const envVar = nameOrFallback(
+          status && status.instanceNameEnvVar,
+          'SCENE_DETECT_INSTANCE_NAME'
+        );
+        const ok = await confirmModal({
+          title: 'Deprovision scene detection',
+          subject: serviceLabel,
+          question: 'Deprovision ' + serviceLabel + ' instance "' + instanceLabel + '"?',
+          confirmLabel: 'Deprovision',
+          affected: [
+            'The service instance is destroyed, so the scene-detection step stops running on any pipeline execution from now on.',
+            'Removal runs in the background and the card will drop from "active" to "configured" — ' + envVar + ' keeps its value, it just no longer points at a live instance.',
+            'Provisioning again creates a brand-new instance; nothing is carried over from this one.',
+          ],
+          unaffected: [
+            'Keyframes and scene data already produced stay attached to the assets that hold them.',
+            'No assets, collections or jobs are removed, and jobs already running finish as they are.',
+            'The rest of the stack — storage, database, queue, transcoders — is untouched.',
+          ],
+        });
+        if (!ok) return;
         deprovisionScene(deprovBtn);
       });
       controls.appendChild(deprovBtn);
@@ -4711,9 +5246,47 @@ async function renderProvisionTab(container) {
         delBtn.textContent = 'Deprovision';
         const delStatus = document.createElement('span');
         delStatus.style.cssText = 'margin-left:8px;font-size:12px;';
-        delBtn.addEventListener('click', function() {
+        delBtn.addEventListener('click', async function() {
           const nm = (status && status.instanceName) || OPTIONAL_KEY;
-          if (!confirm('Deprovision the auto-subtitles instance "' + nm + '"? This destroys the OSC instance.')) return;
+          // Auto-subtitles deprovision confirmation (issue #919). Same endpoint
+          // and therefore the same verified semantics as the scene-detect card:
+          // DELETE /api/v1/optional-services/{key}
+          // (src/routes/optional-services.ts:316-380) probes then calls
+          // `removeInstance` (:369) and nothing else — the instance-name env var
+          // is left set, so `state` falls back from `active` to `configured`
+          // (statusSchema state docs, :50-58). 202 + background operation.
+          // Subtitle tracks already generated live on the asset document
+          // (`subtitleTracks[].objectKey`, enumerated by the purge sweep at
+          // src/pipeline/archived-asset-purge-sweep.ts step 4), so they survive
+          // the instance being destroyed.
+          // The human-readable subject is the registry displayName ('Subtitle
+          // Generator', src/services/optional-services.ts:68-70) plus the
+          // operator-chosen instance name.
+          const serviceLabel = nameOrFallback(
+            status && status.displayName,
+            'Subtitle generation'
+          );
+          const envVar = nameOrFallback(
+            status && status.instanceNameEnvVar,
+            'AUTO_SUBTITLES_INSTANCE_NAME'
+          );
+          const ok = await confirmModal({
+            title: 'Deprovision subtitle generation',
+            subject: serviceLabel,
+            question: 'Deprovision ' + serviceLabel + ' instance "' + nm + '"?',
+            confirmLabel: 'Deprovision',
+            affected: [
+              'The service instance is destroyed, so the automatic-subtitle step stops running on any pipeline execution from now on.',
+              'Removal runs in the background and the card will drop from "active" to "configured" — ' + envVar + ' keeps its value, it just no longer points at a live instance.',
+              'Provisioning again creates a brand-new instance and needs its API key supplied afresh.',
+            ],
+            unaffected: [
+              'Subtitle tracks already generated stay attached to their assets and keep playing back as before.',
+              'No assets, collections or jobs are removed, and jobs already running finish as they are.',
+              'The rest of the stack — storage, database, queue, transcoders — is untouched.',
+            ],
+          });
+          if (!ok) return;
           delBtn.disabled = true;
           delStatus.textContent = 'removing…';
           apiFetch('/optional-services/' + OPTIONAL_KEY, { method: 'DELETE' }).then(function(res) {
@@ -5407,6 +5980,12 @@ export {
   // exercise the confirmation dialog + the 409 in-use message formatter.
   openStorageBackendRemoveDialog,
   describeBackendInUse,
+  // Destructive-action confirmation primitive (issue #919). Exported so a
+  // DOM/unit test can assert the dialog names its subject, states both impact
+  // lists, and resolves true/false on exactly one route per action.
+  confirmModal,
+  nameOrFallback,
+  openModal,
   // Per-row test-connection action (issue #683). Exported so a DOM/unit test can
   // exercise the shared probe helper + the pure spinner/result row renderers
   // without a live probe.
