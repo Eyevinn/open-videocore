@@ -3693,6 +3693,272 @@ async function renderCollectionsTab(container) {
   }
 }
 
+// ─── Collection asset picker (issue #915) ────────────────────────────────────
+//
+// Adding a member used to mean hand-typing a 26-character ULID, which is
+// unusable now that the Assets table shows the slug in its ID column (#851).
+// This picker searches assets by name, lets several be selected, and adds them
+// in one interaction. The raw-id field stays as a fallback.
+//
+// Verified contract (CLAUDE.md rule 7):
+//   - Search: GET /api/v1/search/ — src/routes/search.ts:260 (`app.get('/')`,
+//     mounted at prefix `/api/v1/search`). Query params come from
+//     `searchQuerySchema` (src/routes/search.ts:152-219): `q` — free text,
+//     1..512 chars, matched case-insensitively against the asset's canonical
+//     `name` (persisted at `descriptive.title`) and description
+//     (src/routes/search.ts:154-164) — and `pageSize` (int, 1..MAX_PAGE_SIZE,
+//     src/routes/search.ts:215). There is NO `type=asset` query parameter; the
+//     response separates the two kinds instead, so "assets only" here means
+//     reading the `assets` array of the envelope
+//     `{ assets, collections, total, collectionTotal, page }`
+//     (`searchResultSchema`, src/routes/search.ts:123-135). Asset hits are
+//     `assetSchema.extend({ type: z.literal('asset') })`
+//     (src/routes/search.ts:78-105, :127); the fields used below are `id`,
+//     `name` and `status`. This projection carries no `slug`, so the picker
+//     never claims to show one.
+//   - Membership add: PUT /api/v1/collections/:id/assets/:assetId —
+//     src/routes/collections.ts:492-531. Its schema declares `params:
+//     z.object({ id: z.string(), assetId: z.string() })` and no body schema
+//     (:497); responses are 200 | 404 | 422 (:498). There is no batch/multi
+//     member endpoint on that router (the only other membership route is
+//     DELETE /:id/assets/:assetId, :533), so "add several" is one PUT per
+//     asset, issued from a single user interaction.
+const ASSET_PICKER_DEBOUNCE_MS = 250;
+const ASSET_PICKER_PAGE_SIZE = 20;
+
+// Build the search request path for a picker query. `q` is the only filter:
+// the picker's job is "find an asset by name", and `pageSize` bounds the list.
+function assetPickerSearchPath(q) {
+  const params = new URLSearchParams();
+  params.set('q', q);
+  params.set('pageSize', String(ASSET_PICKER_PAGE_SIZE));
+  return '/search?' + params.toString();
+}
+
+// Asset hits only, normalised to what the picker renders. Collection hits
+// arrive in their own array and are dropped here — a collection cannot be a
+// member of a collection through this endpoint.
+function assetPickerHits(res) {
+  const hits = res && Array.isArray(res.assets) ? res.assets : [];
+  return hits.map(function(a) {
+    return {
+      id: a && a.id != null ? String(a.id) : '',
+      name: (a && a.name) || '',
+      status: (a && a.status) || '',
+    };
+  }).filter(function(a) { return a.id !== ''; });
+}
+
+// Add several assets to one collection. One PUT per asset (the contract has no
+// batch route); resolves with the ids that landed and the ones that did not,
+// so a partial failure is reported rather than swallowed.
+async function addAssetsToCollection(collectionId, assetIds) {
+  const added = [];
+  const failed = [];
+  for (const assetId of assetIds) {
+    try {
+      await apiFetch(
+        '/collections/' + encodeURIComponent(collectionId) + '/assets/' + encodeURIComponent(assetId),
+        { method: 'PUT', body: JSON.stringify({}) }
+      );
+      added.push(assetId);
+    } catch (err) {
+      failed.push({ id: assetId, message: err.message });
+    }
+  }
+  return { added: added, failed: failed };
+}
+
+// "Added 3 assets." / "Added 2 of 3 assets. Failed: 01H… (asset not found)."
+function addAssetsSummary(result) {
+  const total = result.added.length + result.failed.length;
+  if (result.failed.length === 0) {
+    return 'Added ' + result.added.length + ' asset' + (result.added.length === 1 ? '' : 's') + '.';
+  }
+  const detail = result.failed.map(function(f) { return f.id + ' (' + f.message + ')'; }).join('; ');
+  return 'Added ' + result.added.length + ' of ' + total + ' assets. Failed: ' + detail;
+}
+
+// The add-to-collection control: name search + multi-select, with the raw-id
+// field kept behind a disclosure as a fallback. Returns a detached element;
+// `onAdded()` (optional) fires after at least one membership add succeeds.
+function renderCollectionAssetPicker(collectionId, opts) {
+  opts = opts || {};
+  const wrap = document.createElement('div');
+  wrap.className = 'mt12';
+  wrap.innerHTML = [
+    '<div class="section-title">Add assets to collection</div>',
+    '<div class="form-row mt8">',
+    '  <div class="form-field grow">',
+    '    <label for="add-asset-search">Find assets by name</label>',
+    '    <input type="search" id="add-asset-search" placeholder="Type part of an asset name…"',
+    '      role="combobox" aria-expanded="false" aria-controls="add-asset-results"',
+    '      aria-describedby="add-asset-search-hint" autocomplete="off" />',
+    '    <div class="form-hint" id="add-asset-search-hint">Matches the asset name and description. Tick every asset you want, then add them together.</div>',
+    '  </div>',
+    '  <button id="add-asset-search-btn">Search</button>',
+    '</div>',
+    '<div id="add-asset-results" class="checkbox-group mt8" role="group" aria-label="Matching assets"></div>',
+    '<div class="form-row mt8">',
+    '  <div class="grow" id="add-asset-selected" aria-live="polite">Nothing selected.</div>',
+    '  <button id="add-asset-selected-btn" disabled>Add selected</button>',
+    '</div>',
+    '<details class="mt8" id="add-asset-fallback">',
+    '  <summary>Add by asset ID instead</summary>',
+    '  <div class="form-row mt8">',
+    '    <div class="form-field grow">',
+    '      <label for="add-asset-id">Asset ID</label>',
+    '      <input type="text" id="add-asset-id" placeholder="Asset ID" />',
+    '    </div>',
+    '    <button id="add-asset-btn">Add</button>',
+    '  </div>',
+    // Issue #851: say which of the two asset handles this field takes. The
+    // membership endpoint resolves the ULID only (src/routes/collections.ts
+    // PUT /:id/assets/:assetId -> assets.get), so a slug is rejected here.
+    '  <div class="text-muted" style="font-size:12px;margin-top:4px;">Takes the asset ID (26-character ULID), not the slug — copy it from the ID column in the Assets tab.</div>',
+    '</details>',
+    '<div id="add-asset-msg" aria-live="polite"></div>',
+  ].join('');
+
+  const searchInput = wrap.querySelector('#add-asset-search');
+  const resultsEl = wrap.querySelector('#add-asset-results');
+  const selectedEl = wrap.querySelector('#add-asset-selected');
+  const selectedBtn = wrap.querySelector('#add-asset-selected-btn');
+  const msgEl = wrap.querySelector('#add-asset-msg');
+
+  // Selection survives re-searching: an asset ticked under one query stays
+  // ticked when the result list is replaced by the next one.
+  const selected = new Map();
+
+  function renderSelected() {
+    const ids = [...selected.keys()];
+    selectedBtn.disabled = ids.length === 0;
+    selectedBtn.textContent = ids.length === 0
+      ? 'Add selected'
+      : 'Add ' + ids.length + ' selected asset' + (ids.length === 1 ? '' : 's');
+    if (ids.length === 0) {
+      selectedEl.textContent = 'Nothing selected.';
+      return;
+    }
+    selectedEl.innerHTML = ids.map(function(id) {
+      return '<span class="tag add-asset-chip">' + escHtml(selected.get(id) || id) +
+        ' <button type="button" class="btn-ghost add-asset-deselect" data-asset-id="' + escHtml(id) +
+        '" aria-label="Remove ' + escHtml(selected.get(id) || id) + ' from selection">×</button></span>';
+    }).join(' ');
+    selectedEl.querySelectorAll('.add-asset-deselect').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        selected.delete(btn.dataset.assetId);
+        // Untick the matching hit if it is still on screen. Matched by value in
+        // a loop rather than an attribute selector so no id needs escaping.
+        resultsEl.querySelectorAll('.add-asset-hit').forEach(function(box) {
+          if (box.value === btn.dataset.assetId) box.checked = false;
+        });
+        renderSelected();
+      });
+    });
+  }
+
+  function renderHits(hits) {
+    searchInput.setAttribute('aria-expanded', hits.length > 0 ? 'true' : 'false');
+    if (hits.length === 0) {
+      resultsEl.innerHTML = '<div class="empty">No assets match.</div>';
+      return;
+    }
+    resultsEl.innerHTML = hits.map(function(hit) {
+      return '<label class="checkbox-label">' +
+        '<input type="checkbox" class="add-asset-hit" value="' + escHtml(hit.id) + '"' +
+        (selected.has(hit.id) ? ' checked' : '') +
+        ' data-asset-name="' + escHtml(hit.name || hit.id) + '" />' +
+        '<span>' + escHtml(hit.name || '(untitled)') + '</span>' +
+        (hit.status ? ' ' + renderBadge(hit.status) : '') +
+        ' <span class="text-mono text-muted">' + escHtml(hit.id) + '</span>' +
+        '</label>';
+    }).join('');
+    resultsEl.querySelectorAll('.add-asset-hit').forEach(function(box) {
+      box.addEventListener('change', function() {
+        if (box.checked) {
+          selected.set(box.value, box.dataset.assetName);
+        } else {
+          selected.delete(box.value);
+        }
+        renderSelected();
+      });
+    });
+  }
+
+  let searchSeq = 0;
+  async function runSearch() {
+    const q = searchInput.value.trim();
+    if (!q) {
+      resultsEl.innerHTML = '';
+      searchInput.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    const seq = ++searchSeq;
+    resultsEl.innerHTML = '';
+    const loader = loadingEl();
+    resultsEl.appendChild(loader);
+    try {
+      const res = await apiFetch(assetPickerSearchPath(q));
+      if (seq !== searchSeq) return; // a newer keystroke already won
+      renderHits(assetPickerHits(res));
+    } catch (err) {
+      if (seq !== searchSeq) return;
+      resultsEl.innerHTML = '';
+      showMsg(resultsEl, 'Search failed: ' + err.message, 'error');
+    }
+  }
+
+  let debounceTimer = null;
+  searchInput.addEventListener('input', function() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(runSearch, ASSET_PICKER_DEBOUNCE_MS);
+  });
+  searchInput.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      if (debounceTimer) clearTimeout(debounceTimer);
+      runSearch();
+    }
+  });
+  wrap.querySelector('#add-asset-search-btn').addEventListener('click', function() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    runSearch();
+  });
+
+  selectedBtn.addEventListener('click', async function() {
+    const ids = [...selected.keys()];
+    msgEl.innerHTML = '';
+    if (ids.length === 0) { showMsg(msgEl, 'Select at least one asset.', 'error'); return; }
+    selectedBtn.disabled = true;
+    const result = await addAssetsToCollection(collectionId, ids);
+    result.added.forEach(function(id) { selected.delete(id); });
+    renderSelected();
+    showMsg(msgEl, addAssetsSummary(result), result.failed.length === 0 ? 'success' : 'error');
+    if (result.added.length > 0 && typeof opts.onAdded === 'function') opts.onAdded();
+  });
+
+  // Fallback: the original raw-id path, unchanged in behaviour.
+  wrap.querySelector('#add-asset-btn').addEventListener('click', async function() {
+    const assetId = wrap.querySelector('#add-asset-id').value.trim();
+    msgEl.innerHTML = '';
+    if (!assetId) { showMsg(msgEl, 'Asset ID required.', 'error'); return; }
+    try {
+      await apiFetch(
+        '/collections/' + encodeURIComponent(collectionId) + '/assets/' + encodeURIComponent(assetId),
+        { method: 'PUT', body: JSON.stringify({}) }
+      );
+      showMsg(msgEl, 'Asset added.', 'success');
+      if (typeof opts.onAdded === 'function') opts.onAdded();
+    } catch (err) {
+      showMsg(msgEl, 'Error: ' + err.message, 'error');
+    }
+  });
+
+  renderSelected();
+  return wrap;
+}
+
 async function showCollectionDetail(id, detailPanel, onRefresh) {
   detailPanel.style.display = 'block';
   detailPanel.className = 'detail-panel';
@@ -3727,40 +3993,38 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
     ].join('');
     body.appendChild(kvDiv);
 
-    // Add asset form
-    const addDiv = document.createElement('div');
-    addDiv.className = 'mt12';
-    addDiv.innerHTML = [
-      '<div class="section-title">Add asset to collection</div>',
-      '<div class="form-row mt8">',
-      '  <div class="form-field grow">',
-      '    <input type="text" id="add-asset-id" placeholder="Asset ID" />',
-      '  </div>',
-      '  <button id="add-asset-btn">Add</button>',
-      '</div>',
-      // Issue #851: say which of the two asset handles this field takes. The
-      // membership endpoint resolves the ULID only (src/routes/collections.ts
-      // PUT /:id/assets/:assetId -> assets.get), so a slug is rejected here.
-      '<div class="text-muted" style="font-size:12px;margin-top:4px;">Takes the asset ID (26-character ULID), not the slug — copy it from the ID column in the Assets tab.</div>',
-      '<div id="add-asset-msg"></div>',
-    ].join('');
-    body.appendChild(addDiv);
-
-    addDiv.querySelector('#add-asset-btn').addEventListener('click', async function() {
-      const assetId = addDiv.querySelector('#add-asset-id').value.trim();
-      const msgEl = addDiv.querySelector('#add-asset-msg');
-      msgEl.innerHTML = '';
-      if (!assetId) { showMsg(msgEl, 'Asset ID required.', 'error'); return; }
-      try {
-        await apiFetch('/collections/' + encodeURIComponent(id) + '/assets/' + encodeURIComponent(assetId), { method: 'PUT', body: JSON.stringify({}) });
-        showMsg(msgEl, 'Asset added.', 'success');
-        showCollectionDetail(id, detailPanel, onRefresh);
-      } catch (err) {
-        showMsg(msgEl, 'Error: ' + err.message, 'error');
-      }
-    });
+    // Add-asset control: searchable multi-select picker with the raw-id field
+    // kept as a fallback (issue #915). Adding refreshes only the member list
+    // below, so the picker keeps its "Added N assets." result and whatever the
+    // operator still has selected instead of being torn down mid-interaction.
+    body.appendChild(renderCollectionAssetPicker(id, { onAdded: refreshMembers }));
 
     // Asset list
+    const membersHost = document.createElement('div');
+    membersHost.id = 'coll-members';
+    body.appendChild(membersHost);
+    renderMembers(assets, membersHost);
+
+  } catch (err) {
+    body.innerHTML = '';
+    showMsg(body, 'Failed: ' + err.message, 'error');
+  }
+
+  // Re-read the collection and redraw just the membership table.
+  async function refreshMembers() {
+    const host = detailPanel.querySelector('#coll-members');
+    if (!host) return;
+    try {
+      const fresh = await apiFetch('/collections/' + encodeURIComponent(id));
+      renderMembers(fresh.assets || [], host);
+    } catch (err) {
+      showMsg(host, 'Failed to refresh members: ' + err.message, 'error');
+    }
+    if (typeof onRefresh === 'function') onRefresh();
+  }
+
+  function renderMembers(assets, host) {
+    host.innerHTML = '';
     const assetsDiv = document.createElement('div');
     assetsDiv.className = 'mt12';
     const assetsTitle = document.createElement('div');
@@ -3814,7 +4078,7 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
         btn.addEventListener('click', async function() {
           try {
             await apiFetch('/collections/' + encodeURIComponent(id) + '/assets/' + encodeURIComponent(btn.dataset.assetId), { method: 'DELETE' });
-            showCollectionDetail(id, detailPanel, onRefresh);
+            refreshMembers();
           } catch (err) {
             reportActionFailure(err, {
               action: 'Remove asset from collection',
@@ -3824,11 +4088,7 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
         });
       });
     }
-    body.appendChild(assetsDiv);
-
-  } catch (err) {
-    body.innerHTML = '';
-    showMsg(body, 'Failed: ' + err.message, 'error');
+    host.appendChild(assetsDiv);
   }
 }
 
@@ -6696,6 +6956,16 @@ export {
   normaliseSearchResults,
   searchResultSummary,
   renderSearchResults,
+  // Searchable multi-select asset picker for collection membership (issue
+  // #915). Exported so a DOM test can drive the real picker against the real
+  // search + collections routers: find by name, tick several hits, add them in
+  // one interaction, and fall back to the raw-id field.
+  renderCollectionAssetPicker,
+  assetPickerSearchPath,
+  assetPickerHits,
+  addAssetsToCollection,
+  addAssetsSummary,
+  ASSET_PICKER_DEBOUNCE_MS,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
