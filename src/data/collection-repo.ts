@@ -60,34 +60,43 @@ export type CreateCollectionInput = {
   custom?: Record<string, unknown>;
 };
 
-// Partial editorial update of a collection's descriptive metadata (issue #560).
-// PATCH semantics: only the keys PRESENT here are written; an ABSENT key leaves
-// the current value untouched. Membership (`assetIds`) is deliberately NOT part
-// of this shape — it stays on the dedicated PUT/DELETE /:id/assets/:assetId
-// endpoints — nor are `name`, `deleteLock`, or timestamps, which have their own
-// paths. `description`, `tags`, and `custom` are each replaced WHOLESALE when
-// present (mirroring the asset editorial PATCH for `tags`/`description`, which
-// replace rather than merge — see UpdateAssetInput in asset-repo.ts). To clear a
-// field, pass an explicit empty value (`''`, `[]`, or `{}`); omit the key to
-// leave it unchanged.
+// Partial editorial update of a collection's name and descriptive metadata
+// (issue #560; `name` added in issue #926). PATCH semantics: only the keys
+// PRESENT here are written; an ABSENT key leaves the current value untouched.
+// Membership (`assetIds`) is deliberately NOT part of this shape — it stays on
+// the dedicated PUT/DELETE /:id/assets/:assetId endpoints — nor are
+// `deleteLock` or timestamps, which have their own paths. `name`,
+// `description`, `tags`, and `custom` are each replaced WHOLESALE when present
+// (mirroring the asset editorial PATCH for `name`/`tags`/`description`, which
+// replace rather than merge — see UpdateAssetInput in asset-repo.ts). To clear
+// an optional field, pass an explicit empty value (`''`, `[]`, or `{}`); omit
+// the key to leave it unchanged. `name` is required on a collection, so a
+// present `name` must be non-empty (enforced at the route schema).
 export type UpdateCollectionInput = {
+  // Rename (issue #926). Mirrors the asset rename already available on PATCH
+  // /api/v1/assets/:id (UpdateAssetInput.name) so the two resources are
+  // editorially symmetric.
+  name?: string;
   description?: string;
   tags?: string[];
   custom?: Record<string, unknown>;
 };
 
-// Pure computation of a descriptive-metadata PATCH (issue #560). Given the
-// current collection and a partial patch, produce the next collection with only
-// the present keys applied (wholesale per field) and `updatedAt` bumped. No side
-// effects, so it is safe to re-run inside the CouchDB conflict-retry loop
-// (updateWithRetry) exactly as the asset editorial write does. Never touches
-// `assetIds`, `name`, or `deleteLock`.
+// Pure computation of a name + descriptive-metadata PATCH (issue #560; `name`
+// added in issue #926). Given the current collection and a partial patch,
+// produce the next collection with only the present keys applied (wholesale per
+// field) and `updatedAt` bumped. No side effects, so it is safe to re-run inside
+// the CouchDB conflict-retry loop (updateWithRetry) exactly as the asset
+// editorial write does. Never touches `assetIds` or `deleteLock`.
 export function applyCollectionUpdate(
   existing: Collection,
   patch: UpdateCollectionInput,
   now: string
 ): Collection {
   const next: Collection = { ...existing, updatedAt: now };
+  if (patch.name !== undefined) {
+    next.name = patch.name;
+  }
   if (patch.description !== undefined) {
     next.description = patch.description;
   }
@@ -112,11 +121,12 @@ export interface CollectionRepository {
   // `member_of_collection`). Read-only: it never mutates a collection. Returns
   // `[]` when the asset is a member of no collection.
   collectionsContainingAsset(assetId: string): Promise<string[]>;
-  // Partial editorial update of descriptive metadata (issue #560). Applies the
-  // present keys of `patch` (description/tags/custom) wholesale and returns the
-  // updated collection. Throws CollectionNotFoundError (-> 404) for an
-  // unknown/foreign id. Deliberately CANNOT mutate membership (`assetIds`) — that
-  // stays on addAsset/removeAsset — nor the delete-lock (setDeleteLock).
+  // Partial editorial update of the name and descriptive metadata (issue #560;
+  // `name` added in issue #926). Applies the present keys of `patch`
+  // (name/description/tags/custom) wholesale and returns the updated
+  // collection. Throws CollectionNotFoundError (-> 404) for an unknown/foreign
+  // id. Deliberately CANNOT mutate membership (`assetIds`) — that stays on
+  // addAsset/removeAsset — nor the delete-lock (setDeleteLock).
   update(id: string, patch: UpdateCollectionInput): Promise<Collection>;
   addAsset(id: string, assetId: string): Promise<Collection>;
   removeAsset(id: string, assetId: string): Promise<Collection>;

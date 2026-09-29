@@ -82,7 +82,8 @@ export class CouchCollectionRepository implements CollectionRepository {
       .map((c) => c.id);
   }
 
-  // Partial editorial update of descriptive metadata (issue #560). Routed through
+  // Partial editorial update of the name and descriptive metadata (issue #560;
+  // `name` added in issue #926). Routed through
   // the shared conflict-retry wrapper (updateWithRetry) — the same `_rev`
   // merge-retry the asset editorial write uses (ADR-005 / issue #278, see
   // couch-asset-repo.ts `update`). A concurrent writer racing the same `_rev`
