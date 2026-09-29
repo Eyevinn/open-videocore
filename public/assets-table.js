@@ -28,7 +28,15 @@
  *   Response envelope (listSchema, top-level props): { items, limit, offset, total }.
  *   Item fields used here (verified present in the list item schema): id, slug,
  *   name (canonical title), status, tags, thumbnails, createdAt,
- *   technicalMetadataError.
+ *   technicalMetadataError, deleteLock.
+ *   `deleteLock` (issue #894) is
+ *   openapi.json .paths["/api/v1/assets/"].get.responses["200"]
+ *   .content["application/json"].schema.properties.items.items.properties
+ *   .deleteLock — an object { locked, reason?, lockedAt, lockedBy? } with
+ *   required ["locked","lockedAt"] and additionalProperties:false
+ *   (`deleteLockSchema`, src/routes/assets.ts:528; `DeleteLock`,
+ *   src/data/asset-repo.ts:441). Only `locked` is read here; the derivation
+ *   lives in public/lock-state.js.
  *   Ordering: the server ALWAYS returns createdAt-ascending with a ULID `id`
  *   tie-break (src/data/asset-repo.ts:937 — `createdAt.localeCompare … || id…`),
  *   i.e. ULID `_id` creation order per ADR-005. There is NO server `sort` or `q`
@@ -62,6 +70,17 @@
  * (issue #834). An inverted range (`from` > `to`) is a 400
  * `invalid_created_range` from both routes, surfaced as a normal table error.
  *
+ * TIER-2 PROJECTION GAP (delete-lock, issue #894). The search projection
+ * (`assetSchema`, src/routes/search.ts:78 — Fastify serializes against it) has NO
+ * `deleteLock` property, so a locked asset carries no lock field while a
+ * free-text `q` is active. That is lock state UNKNOWN, not unlocked, and the
+ * difference matters: rendering "unlocked" there would be a promise the payload
+ * does not support. The table therefore shows no lock flag on tier-2 rows and
+ * makes no counter-claim either (there is no "Unlocked" badge to contradict),
+ * and the Archive control is left alone so the 409 `delete_protected` path stays
+ * the authority. Tracked as gap H1 in docs/ux/asset-lock-state-spec.md §9; the
+ * fix is a server-side one — add `deleteLock` to the search projection.
+ *
  * KNOWN CONTRACT GAP — one left, and it is an ORDERING gap only. (The previous
  * revision of this header pointed at a friction log in the separate
  * eng-open-videocore-agents repo; no such file exists in either repo, so the gap
@@ -94,6 +113,10 @@ import {
 // the contract grounding in public/thumbnail-url.js.
 import { applyThumbnail } from './thumbnail-url.js';
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Explicit delete-lock indicator (issue #894). Derivation, copy and markup all
+// live in one module so the list, the detail panel (#895) and the protected-
+// delete flow (#896) ship one pattern — see docs/ux/asset-lock-state-spec.md §2.
+import { isAssetLocked, lockBadgeHtml, ROW_LOCKED_CLASS } from './lock-state.js';
 
 // ─── Contract constants (verified above) ─────────────────────────────────────
 
@@ -229,7 +252,12 @@ async function fetchAssetsPage(snap, deps) {
     // it is reported verbatim (issue #834).
     const total = res && typeof res.total === 'number' ? res.total : assets.length;
     const rows = applyClientSort(assets, snap.sort);
-    return { rows, total };
+    // This projection has NO `deleteLock` property (verified: openapi.json
+    // .paths["/api/v1/search/"].get...assets.items.properties, and `assetSchema`
+    // in src/routes/search.ts which Fastify serializes against). Every row here
+    // is therefore lock-state UNKNOWN, not unlocked — see the lock note in the
+    // header block and docs/ux/asset-lock-state-spec.md §2 (L0) and gap H1.
+    return { rows, total, projectionCarriesLock: false };
   }
 
   // ── Tier 1: exact/range list via GET /api/v1/assets/ (Mango-style). ──
@@ -249,7 +277,10 @@ async function fetchAssetsPage(snap, deps) {
   const total =
     res && typeof res.total === 'number' ? res.total : items.length;
   const rows = applyClientSort(items, snap.sort);
-  return { rows, total };
+  // This projection DOES carry `deleteLock` (verified: openapi.json
+  // .paths["/api/v1/assets/"].get...items.items.properties.deleteLock), so an
+  // absent field on a row genuinely means "not locked".
+  return { rows, total, projectionCarriesLock: true };
 }
 
 // ─── Filter controls (slot-based) ─────────────────────────────────────────────
@@ -341,6 +372,10 @@ function buildColumns(renderCtx) {
   const renderTags = renderCtx.renderTags;
   const fmtDate = renderCtx.fmtDate;
   const isAssetWedged = renderCtx.isAssetWedged;
+  // Mutable holder, written by the fetch layer before each setRows() and read by
+  // the Status renderer below. It cannot go stale: the only writer is the fetch
+  // that produced the very rows being rendered.
+  const projection = renderCtx.projection;
 
   return [
     {
@@ -405,6 +440,25 @@ function buildColumns(renderCtx) {
             '" title="' +
             escHtml(a.technicalMetadataError) +
             '">Needs attention</span>';
+        }
+        // Explicit delete-lock flag (issue #894, spec §3.1-§3.3). It shares the
+        // Status cell with the attention flag rather than claiming an eighth
+        // column: a lock is a rare, secondary attribute. Order in the cell is
+        // status, "Needs attention", "Locked" — fault first, then policy; a row
+        // can legitimately be both.
+        //
+        // Unlocked rows render NOTHING — no badge, no placeholder. Absence is
+        // the signal (§3.2).
+        //
+        // Rows from the free-text tier render nothing either, because their
+        // projection omits the field: isAssetLocked() answers false for the
+        // UNKNOWN state so the table never asserts a lock it cannot see. It also
+        // never asserts the opposite — there is no "Unlocked" badge anywhere, so
+        // an unknown row makes no false promise (§3.2 L0, §1 copy rule 3). The
+        // Archive control is unaffected by design: it stays enabled and the 409
+        // path explains the refusal (§5.1, §5.4 — #896).
+        if (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })) {
+          cell += ' ' + lockBadgeHtml();
         }
         return cell;
       },
@@ -510,11 +564,19 @@ export function createAssetsTable(deps) {
   if (urlState.from) initialFilters.from = urlState.from;
   if (urlState.to) initialFilters.to = urlState.to;
 
+  // Whether the rows currently in hand came from a projection that carries
+  // `deleteLock` (issue #894). Tier 1 does; tier 2 (free-text search) does not.
+  // Written by reload() from the fetch result immediately before setRows(), so
+  // the Status renderer always reads the flag belonging to the rows it renders.
+  // Starts true because the first load is tier 1 unless the URL seeds a `q`.
+  const projection = { carriesLock: !initialFilters.q };
+
   const columns = buildColumns({
     renderBadge: d.renderBadge,
     renderTags: d.renderTags,
     fmtDate: d.fmtDate,
     isAssetWedged: d.isAssetWedged,
+    projection,
   });
 
   const filters = [
@@ -569,7 +631,11 @@ export function createAssetsTable(deps) {
 
     table.setStatus('loading');
     try {
-      const { rows, total } = await fetchAssetsPage(snap, { apiFetch: d.apiFetch });
+      const page1 = await fetchAssetsPage(snap, { apiFetch: d.apiFetch });
+      const { rows, total } = page1;
+      // Record which tier produced these rows BEFORE they are rendered — the
+      // Status column's lock flag reads it (issue #894).
+      projection.carriesLock = page1.projectionCarriesLock !== false;
       table.state.setPageInfo({ total });
       table.setRows(rows);
       wireRowHandlers();
@@ -595,6 +661,14 @@ export function createAssetsTable(deps) {
 
     tbody.querySelectorAll('tr[data-row-key]').forEach(function (tr) {
       const id = tr.getAttribute('data-row-key');
+      // Row accent for a delete-locked row (issue #894, spec §3.1). Derived from
+      // the flag the Status cell just rendered rather than from the row data a
+      // second time, so the accent and the badge cannot drift apart. It is
+      // decorative — indigo `--accent`, deliberately not the wedged flag's amber
+      // — and never carries meaning the badge does not also carry (§6, WCAG
+      // 1.4.1). Its job is to survive horizontal scrolling of a seven-column
+      // table.
+      if (tr.querySelector('.asset-lock-flag')) tr.classList.add(ROW_LOCKED_CLASS);
       tr.addEventListener('click', function () {
         tbody.querySelectorAll('tr').forEach((r) => r.classList.remove('row-selected'));
         tr.classList.add('row-selected');
