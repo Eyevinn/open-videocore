@@ -1331,6 +1331,23 @@ pre.code-block {
 .confirm-dialog .confirm-affected .confirm-impact-heading {
   color: var(--danger, #c0392b);
 }
+/* Blocked-archive variant (issue #896, docs/ux/asset-lock-state-spec.md §5.2).
+   The ids that caused the refusal, and the sentence that says what would clear
+   it. Indigo like the lock badge, not amber or red: a refused archive is policy
+   working as designed, not a fault. */
+.confirm-dialog .confirm-blocked-by .confirm-impact-heading {
+  color: var(--accent);
+}
+.confirm-dialog .confirm-blocked-by li {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  word-break: break-all;
+}
+.confirm-dialog .confirm-resolution {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
 .confirm-dialog .modal-actions {
   display: flex;
   gap: 8px;
