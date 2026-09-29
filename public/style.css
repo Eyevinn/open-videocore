@@ -397,6 +397,82 @@ tr.row-locked td:first-child {
   font-size: 11px;
 }
 
+/* ── Editorial review state (issue #901) ────────────────────────────────────
+   The review axis is INDEPENDENT of the lifecycle `status`
+   (src/data/asset-repo.ts) and must never read as the same control. So the
+   review badge is NOT a member of the `.badge` family: square corners instead of
+   a pill, its own teal accent, and it is always preceded by the words "Review
+   state". Shape + wording carry the distinction, so it survives monochrome and
+   colour-blind rendering (WCAG 1.4.1). */
+.review-block {
+  border-left: 3px solid var(--review-accent, #2dd4bf);
+  padding-left: 10px;
+}
+
+.review-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid transparent;
+}
+
+.review-badge--draft {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-muted);
+  border-color: rgba(148, 163, 184, 0.45);
+}
+
+.review-badge--in-review {
+  background: rgba(45, 212, 191, 0.15);
+  color: var(--review-accent, #2dd4bf);
+  border-color: rgba(45, 212, 191, 0.45);
+}
+
+.review-badge--approved {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--success);
+  border-color: rgba(34, 197, 94, 0.45);
+}
+
+.review-badge--rejected {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
+/* A state this build does not recognise is still rendered, verbatim. */
+.review-badge--unknown {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--text-muted);
+  border-color: rgba(148, 163, 184, 0.45);
+}
+
+.review-state-key {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+
+.review-state-line,
+.review-axis-note,
+.review-moves-note,
+.review-role-note {
+  margin-top: 2px;
+}
+
+.review-moves-note,
+.review-role-note {
+  margin-top: 6px;
+}
+
+.review-actions {
+  flex-wrap: wrap;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;

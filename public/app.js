@@ -46,6 +46,14 @@ import { mountDeleteProtection } from './lock-detail.js';
 // `?force=true` can never defeat a delete lock, is in that module's header.
 import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete-blocked.js';
 
+// Editorial review-state block (issue #901, broken out of #792): the current
+// review state rendered distinctly from the lifecycle `status` badge (#134), and
+// a transition control built ONLY from the `allowedTransitions` the API
+// advertises on GET /assets/{id}/review-state (#897) — so an illegal move has no
+// control to originate from. The state machine is never re-derived client-side;
+// full contract grounding is in that module's header.
+import { mountReviewState } from './review-state.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -119,6 +127,21 @@ function canManageStorage() {
 // (`AUTHZ_FORBIDDEN_ERROR = 'forbidden_insufficient_role'`, :99) is still
 // handled when it arrives (docs/ux/asset-lock-state-spec.md §4.4).
 function canChangeDeleteLock() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may apply an editorial review transition
+// (issue #901). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only, and
+// `methodToAction` (:79-93) maps POST -> write, so POST /assets/{id}/review-state
+// is refused to a `viewer` with 403 by
+// `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1718). GET on the same sub-resource is `read`, which a
+// viewer DOES hold — hence a viewer still sees the state and its legal moves,
+// read-only (docs/findings/review-state-contract-897.md §4). Client-side mirror
+// only: the 403 is still handled if it arrives.
+function canChangeReviewState() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2523,6 +2546,38 @@ async function renderAssetDetailBody(id, bodyEl) {
       var host = bodyEl.querySelector('#action-msg') || bodyEl;
       showMsg(host, text, kind);
     };
+
+    // ── Editorial review state + legal transitions (issue #901) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/review-state.js:
+    //   GET  /api/v1/assets/{id}/review-state — 200
+    //        { reviewState, allowedTransitions } (both `required`), 404 { error }.
+    //        (openapi.json .paths["/api/v1/assets/{id}/review-state"].get;
+    //        src/routes/assets.ts:5437-5457, schema :223-241)
+    //   POST /api/v1/assets/{id}/review-state — body REQUIRED
+    //        { reviewState } (the only property); 200 = the full asset,
+    //        404 { error }, 422 { error: 'invalid_review_transition', message }.
+    //        (…].post; src/routes/assets.ts:5470-5484, 422 mapping :2663-2664)
+    //
+    // The block is mounted ABOVE "Delete protection" and renders its own badge
+    // class, because the review axis is INDEPENDENT of the lifecycle `status`
+    // shown in the KV grid above (src/data/asset-repo.ts:55-61) — the two must
+    // not read as one control (#134). The transition buttons are built only from
+    // the server's `allowedTransitions`, so an illegal move has no control to
+    // originate from; the asset's own `reviewState` field is deliberately NOT
+    // used to gate anything, since it carries the state but not the graph.
+    //
+    // Sub-resource paths take the ULID (`asset.id`), which this pane holds even
+    // when it was opened by slug.
+    await mountReviewState({
+      assetId: asset.id,
+      anchorEl: actionsDiv,
+      host: body,
+      canChange: canChangeReviewState(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
 
     // ── Delete protection: lock / unlock (issue #895) ──
     //
