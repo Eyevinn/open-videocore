@@ -69,15 +69,29 @@ Identical for assets and collections (`src/routes/assets.ts:5582-5587`,
 
 ```
 PUT /:id/lock
-body (optional, defaults to {}):
+body (REQUIRED — send {} when you have nothing to say):
   reason?:   string, max 1024   // operator note
   lockedBy?: string, max 256    // actor label
 ```
 
-`additionalProperties: false` (generated: `openapi.json` →
-`paths["/api/v1/assets/{id}/lock"].put.requestBody`). Note the spec marks
-`requestBody.required: true` because of the Zod `.default({})`, but every property
-is optional — `{}` is a valid body.
+**The body is required even though every property in it is optional.** The Zod
+`.default({})` only applies once a JSON object is present; it does *not* rescue an
+absent body. A `PUT /:id/lock` sent with **no body at all** is rejected before the
+handler runs with HTTP **400**
+`{"statusCode":400,"code":"FST_ERR_VALIDATION","error":"Bad Request","message":"body/ Expected object, received null"}`.
+`{}` is accepted (200). Verified by injecting both shapes against the real routers
+(assets and collections behave identically). This is why the generated spec marks
+`requestBody.required: true` — that flag is accurate, not an artefact.
+
+The property caps are enforced at runtime: `reason` longer than 1024 chars and
+`lockedBy` longer than 256 chars are both rejected with 400 `FST_ERR_VALIDATION`
+(`body/reason String must contain at most 1024 character(s)`).
+
+`additionalProperties: false` is present in the **generated spec** (`openapi.json` →
+`paths["/api/v1/assets/{id}/lock"].put.requestBody.content["application/json"].schema`)
+but is **not** what the runtime does: the Zod object is in default *strip* mode, so an
+unknown key is silently dropped and the call returns **200**, not the 400 a
+spec-generated client would expect. See gap G7.
 
 `DELETE /:id/lock` takes **no body and no query parameters**
 (`src/routes/assets.ts:5612-5615` declares only `params`). In particular there is no
@@ -88,7 +102,8 @@ is optional — `{}` is a valid body.
 | Status | Body | Source |
 |---|---|---|
 | `200` | the **full asset** (`assetSchema`) / **full collection** (`collectionSchema`) | `src/routes/assets.ts:5588`, `:5614`; `src/routes/collections.ts:460`, `:483` |
-| `404` | `{ error: "not_found" }` (base envelope `{ error, message? }`) | `src/routes/assets.ts:5598`, `:5620`; `errorSchema` at `src/routes/assets.ts:503` |
+| `400` | `{ statusCode, code: "FST_ERR_VALIDATION", error: "Bad Request", message }` — `PUT` with **no body**, or `reason`/`lockedBy` over the length cap. Not the `{ error, message? }` envelope, and **not declared in the spec** (the generated `responses` for both `put` operations list only `200` and `404`). | Fastify validation against the `body` schema, `src/routes/assets.ts:5582-5587` / `src/routes/collections.ts:454-459` |
+| `404` | assets: bare `{ error: "not_found" }`. Collections: `{ error: "not_found", message: "collection not found: <id>" }` — the collections path throws `CollectionNotFoundError` (`src/data/collection-repo.ts:201-207`) and the router's error handler copies `err.message` into the body (`src/routes/collections.ts:253-255`), so a UI parsing the two 404s must treat `message` as present-for-collections / absent-for-assets. | `src/routes/assets.ts:5598`, `:5620`; `errorSchema` at `src/routes/assets.ts:503` |
 
 After `PUT` the returned asset carries `deleteLock` populated; after `DELETE` the
 field is **absent** (not `locked: false`) — `applyDeleteLock` returns
@@ -194,13 +209,21 @@ object (lockedAt / lockedBy)").
 
 **No — `force` makes no difference at all. The response is byte-identical.**
 
-- `force` is declared only on the asset delete route:
-  `querystring: z.object({ force: z.coerce.boolean().optional() })`,
-  `src/routes/assets.ts:5484`.
-- The lock guard is **unconditional and runs first**, before `force` is ever read:
-  `src/routes/assets.ts:5499-5502` (`if (existing?.deleteLock?.locked) throw new DeleteProtectedError(...)`).
-  `request.query.force` is consulted only much later, for the *soft*
-  member-of-collection block (`src/routes/assets.ts:5533`).
+- `force` is declared on **both** delete routes — the asset one
+  (`src/routes/assets.ts:5484`) and the collection one
+  (`src/routes/collections.ts:393`) — with the identical declaration
+  `querystring: z.object({ force: z.coerce.boolean().optional() })`. It is *not*
+  asset-only. (Confirmed in the generated spec:
+  `openapi.json` → `paths["/api/v1/collections/{id}"].delete.parameters` carries a
+  `force` query parameter.)
+- On **neither** route does it defeat a lock, because the lock guard is
+  **unconditional and runs first**, before `force` is ever read:
+  `src/routes/assets.ts:5499-5502` and `src/routes/collections.ts:403-406`
+  (`if (existing?.deleteLock?.locked) throw new …DeleteProtectedError(...)`).
+  `request.query.force` is consulted only afterwards, and only for the *soft*
+  in-use block — member-of-collection for assets
+  (`src/routes/assets.ts:5533`), non-empty `assetIds` for collections
+  (`src/routes/collections.ts:412`).
 - Both with and without `force` the caller gets HTTP **409** with the shared
   `delete_blocked` envelope (`deleteBlockedSchema`, `src/routes/assets.ts:542-549`;
   mapped from `DeleteProtectedError` at `src/routes/assets.ts:2666-2673`;
@@ -235,11 +258,18 @@ to lift protection is `DELETE /:id/lock`.
 
 ## Gaps flagged (for the sub-issues / whoever owns the docs)
 
-- **G1 — Two divergent ADR series.** The product repo and the agents repo both
-  number ADRs from 001 with different content (`ADR-003` is the delivery/stream
-  contract here, the auth model there). Any cross-repo "ADR-0NN" citation is
-  ambiguous. Cross-references should name the repo, or the series should be
-  reconciled.
+- **G1 — ADR numbers are not unique, across repos *or* within this one.** The
+  product repo and the agents repo both number ADRs from 001 with different content
+  (`ADR-003` is the delivery/stream contract here, the auth model there), so any
+  cross-repo "ADR-0NN" citation is ambiguous. Worse, the collision also exists
+  **inside this repo**: `docs/architecture/` currently holds two ADR-018s
+  (`ADR-018-authorisation-model.md`, `ADR-018-export-destination-vs-storage-backend.md`),
+  two ADR-019s (`-external-identifier-namespace-placement`, `-storage-tiering`),
+  two ADR-020s (`-delete-protection-contract`, `-quota-deployment-model-and-metering-source`)
+  and two ADR-021s (`-audit-log-retention`, `-external-s3-endpoint-source-and-packaged`).
+  So "ADR-020" is ambiguous even with the repo named — this note means
+  `ADR-020-delete-protection-contract.md` throughout. Citations should use the full
+  filename, and the numbering should be reconciled.
 - **G2 — Stale "ADR-003 auth model" citations.** Issue #892's "see ADR-003 auth
   model" points at the *agents* repo. For this codebase the authority is ADR-018
   (this repo), which itself records that the old `src/auth`/`src/data` "ADR-003"
@@ -269,3 +299,17 @@ to lift protection is `DELETE /:id/lock`.
   method→action (`src/auth/authorize.ts:76-90`) it is authorised as `delete`. It is
   harmless today (`editor`/`admin` hold both), but it means the matrix can never
   express "may lock, may not unlock" without a route-level action override.
+- **G7 — The spec promises `additionalProperties: false`; the runtime strips
+  instead.** `openapi.json` →
+  `paths["/api/v1/assets/{id}/lock"].put.requestBody.content["application/json"].schema`
+  carries `additionalProperties: false`, but the route's Zod object
+  (`src/routes/assets.ts:5582-5587`, `src/routes/collections.ts:454-459`) is in
+  default *strip* mode, so an unknown key is silently dropped and the request
+  succeeds with 200. A client generated from the spec will expect a 400 for a typo'd
+  field name and instead get a silent partial write — e.g. `{"reasn": "legal hold"}`
+  locks the asset with **no** reason recorded. The length caps, by contrast, are
+  real (over-long `reason`/`lockedBy` do yield 400). Decide whether to tighten the
+  schema (`.strict()`) or to stop emitting `additionalProperties: false`; the two
+  must not disagree. Same class of divergence as G3–G6: contract documented one
+  way, shipped another. The undeclared 400 in §3 is the mirror image of the same
+  problem — the spec omits a status the runtime really returns.
