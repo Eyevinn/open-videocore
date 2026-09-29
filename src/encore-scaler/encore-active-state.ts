@@ -11,47 +11,31 @@
 //     the pool hash.
 //
 // CONTRACT SOURCE VERIFIED (CLAUDE.md rule 7)
-//   Primary source — the Encore service's own OpenAPI document, fetched live from
-//   a catalog instance: GET {instanceUrl}/v3/api-docs (openapi 3.1.0,
-//   info.title "Encore OpenAPI"). Symbols verified there:
-//     - path /encoreJobs/search/findByStatus, operationId
-//       `executeSearch-encorejob-get`; query params `status`
-//       (enum NEW|QUEUED|IN_PROGRESS|SUCCESSFUL|FAILED|CANCELLED), `page`
-//       (integer, minimum 0), `size` (integer, minimum 1, default 20);
-//       200 -> application/hal+json `PagedModelEntityModelEncoreJob`.
-//     - schema PagedModelEntityModelEncoreJob:
-//         { _embedded: { encoreJobs: EntityModelEncoreJob[] }, _links: Links,
-//           page: PageMetadata }
-//     - schema PageMetadata: { size, totalElements, totalPages, number }
-//       (all int64).
-//     - schema EncoreJobRequestBody/EntityModelEncoreJob: `externalId`
-//       ("External id - for external backreference").
-//   Bearer auth: the OSC service access token, exactly as
-//   src/pipeline/encore-client.ts sends it.
-//   Consistent with the identical readers already in this repo
-//   (src/pipeline/encore-callback-poller.ts sweepTerminalJobs,
-//   src/routes/internal.ts encoreCallbackSchema).
+//   The endpoint, its parameters, the response envelope, the meaning of
+//   `page.totalElements` and the `_links.next` truncation rule are all RECORDED
+//   AS DATA in ./encore-paging-contract.ts and pinned by
+//   test/encore-findbystatus-contract.test.ts against the vendored artefact
+//   docs/contracts/encore-findbystatus-paging.json (#769 review finding 2). Read
+//   that module's header for the full provenance — upstream
+//   svt/encore@8dd7c596 file:line citations plus the 2026-09-26 live capture —
+//   including why a live /v3/api-docs fetch was not possible at the time of
+//   writing. Nothing about the wire shape is stated twice: this file builds its
+//   URLs with `buildFindByStatusUrl` and reads its bodies with
+//   `readEncoreJobPage` / `isTruncatedPage`, so the contract has exactly one
+//   definition and exactly one place a test has to pin.
 //
-// PAGING SEMANTICS — EMPIRICALLY CONFIRMED, NOT ASSUMED (#769 review finding 4)
-//   The OpenAPI document names the PageMetadata fields but does not state whether
-//   `totalElements` counts the whole result set or just the returned page, and the
-//   whole truncation guard below depends on the answer. Confirmed against a live
-//   catalog Encore instance by seeding two jobs with a known externalId prefix and
-//   reading the same page back at two sizes (jobs deleted again afterwards):
-//     GET /encoreJobs/search/findByStatus?status=FAILED&page=0&size=1
-//       -> _embedded.encoreJobs.length = 1
-//          page = { size: 1, totalElements: 2, totalPages: 2, number: 0 }
-//          _links = first, self, next, last
-//     GET /encoreJobs/search/findByStatus?status=FAILED&page=0&size=100
-//       -> _embedded.encoreJobs.length = 2
-//          page = { size: 100, totalElements: 2, totalPages: 1, number: 0 }
-//          _links = self
-//   So `page.totalElements` is the total across ALL pages, and
-//   `totalElements > _embedded.encoreJobs.length` really does identify a
-//   truncated page. Also confirmed: `size` is silently clamped to 1000
-//   (size=2000 and size=5000 both echoed page.size = 1000), which is why we ask
-//   for the clamp value rather than a larger number that would be quietly
-//   reduced.
+//   Bearer auth: the OSC service access token, exactly as
+//   src/pipeline/encore-client.ts sends it. Consistent with the identical
+//   readers already in this repo (src/pipeline/encore-callback-poller.ts
+//   sweepTerminalJobs, src/routes/internal.ts encoreCallbackSchema).
+
+import {
+  ENCORE_ACTIVE_STATUSES,
+  ENCORE_MAX_PAGE_SIZE,
+  buildFindByStatusUrl,
+  isTruncatedPage,
+  readEncoreJobPage
+} from './encore-paging-contract.js';
 
 export type EncoreActiveState = {
   // QUEUED + IN_PROGRESS count. A freshly dispatched job sits in QUEUED until
@@ -62,9 +46,9 @@ export type EncoreActiveState = {
   activeExternalIds: Set<string>;
   // True when Encore reports MORE active jobs than this query returned documents
   // for — i.e. `page.totalElements` exceeds the number of encoreJobs on the
-  // single page 0 we request for either status (#769 review finding 2). The
-  // `totalElements` reading this depends on is confirmed in the header note, not
-  // assumed (#769 review finding 4).
+  // single page 0 we request for either status, or the page carries a `next`
+  // link (#769 review finding 2). The `totalElements` reading this depends on is
+  // pinned by the contract module, not assumed.
   //
   // `count` stays exact either way (it comes from totalElements), but
   // `activeExternalIds` is then a PARTIAL set: a job sitting off page 0 is
@@ -75,16 +59,12 @@ export type EncoreActiveState = {
   truncated: boolean;
 };
 
-// Encore's effective maximum page size. Asking for more is silently clamped to
-// this value (verified live: size=2000 and size=5000 both came back with
-// page.size = 1000), so requesting the clamp value is the largest single-request
-// answer available and keeps the page-0 blind spot as small as the service allows.
-const ACTIVE_PAGE_SIZE = 1000;
-
-type EncoreJobPage = {
-  _embedded?: { encoreJobs?: Array<{ externalId?: string }> };
-  page?: { totalElements?: number };
-};
+// Encore's effective maximum page size — the largest single-request answer
+// available, which keeps the page-0 blind spot as small as the service allows.
+// Re-exported (rather than redeclared) so the operator logs in scaler-loop.ts
+// interpolate the real value instead of a literal that has already drifted once
+// (#769 review finding 5).
+export const ACTIVE_PAGE_SIZE = ENCORE_MAX_PAGE_SIZE;
 
 // Returns undefined when the real state could NOT be determined (network error,
 // non-2xx, unparseable page). Callers MUST treat undefined conservatively: never
@@ -94,50 +74,54 @@ export async function fetchEncoreActiveState(
   token: string
 ): Promise<EncoreActiveState | undefined> {
   try {
-    const base = instanceUrl.replace(/\/+$/, '');
+    const [queuedStatus, inProgressStatus] = ENCORE_ACTIVE_STATUSES;
+    const headers = { authorization: `Bearer ${token}` };
     const [resQ, resP] = await Promise.all([
       fetch(
-        `${base}/encoreJobs/search/findByStatus?status=QUEUED&page=0&size=${ACTIVE_PAGE_SIZE}`,
-        { headers: { authorization: `Bearer ${token}` } }
+        buildFindByStatusUrl(instanceUrl, queuedStatus, {
+          page: 0,
+          size: ACTIVE_PAGE_SIZE
+        }),
+        { headers }
       ),
       fetch(
-        `${base}/encoreJobs/search/findByStatus?status=IN_PROGRESS&page=0&size=${ACTIVE_PAGE_SIZE}`,
-        { headers: { authorization: `Bearer ${token}` } }
+        buildFindByStatusUrl(instanceUrl, inProgressStatus, {
+          page: 0,
+          size: ACTIVE_PAGE_SIZE
+        }),
+        { headers }
       )
     ]);
     if (!resQ.ok || !resP.ok) return undefined;
 
     const [bodyQ, bodyP] = await Promise.all([
-      resQ.json().catch(() => ({})) as Promise<EncoreJobPage>,
-      resP.json().catch(() => ({})) as Promise<EncoreJobPage>
+      resQ.json().catch(() => ({})),
+      resP.json().catch(() => ({}))
     ]);
-    const queuedCount = bodyQ.page?.totalElements;
-    const inProgressCount = bodyP.page?.totalElements;
-    if (typeof queuedCount !== 'number' || typeof inProgressCount !== 'number') {
-      return undefined;
-    }
+    const queued = readEncoreJobPage(bodyQ);
+    const inProgress = readEncoreJobPage(bodyP);
+    // readEncoreJobPage returns undefined when page.totalElements is missing or
+    // not a number — the single field every decision below derives from.
+    if (!queued || !inProgress) return undefined;
 
-    const queuedDocs = bodyQ._embedded?.encoreJobs ?? [];
-    const inProgressDocs = bodyP._embedded?.encoreJobs ?? [];
-
-    const activeExternalIds = new Set<string>();
-    for (const j of queuedDocs) {
-      if (j.externalId) activeExternalIds.add(j.externalId);
-    }
-    for (const j of inProgressDocs) {
-      if (j.externalId) activeExternalIds.add(j.externalId);
-    }
+    const activeExternalIds = new Set<string>([
+      ...queued.externalIds,
+      ...inProgress.externalIds
+    ]);
 
     // Page-0 truncation (#769 review finding 2): we ask for one page per status,
     // so an instance holding more than ACTIVE_PAGE_SIZE QUEUED or IN_PROGRESS
-    // jobs returns a complete-looking page that omits the rest. Comparing
-    // Encore's own totalElements against the documents we actually got is what
-    // makes a partial active set distinguishable from a complete one — and
-    // `totalElements` is the all-pages total, confirmed live (see header).
-    const truncated =
-      queuedCount > queuedDocs.length || inProgressCount > inProgressDocs.length;
+    // jobs returns a complete-looking page that omits the rest. `isTruncatedPage`
+    // is the recorded contract's own test for that (totalElements vs the
+    // documents actually returned, or a `next` link) — see
+    // encore-paging-contract.ts for why both readings are sound.
+    const truncated = isTruncatedPage(queued) || isTruncatedPage(inProgress);
 
-    return { count: queuedCount + inProgressCount, activeExternalIds, truncated };
+    return {
+      count: queued.totalElements + inProgress.totalElements,
+      activeExternalIds,
+      truncated
+    };
   } catch {
     // Any error means we could not confirm the real state.
     return undefined;

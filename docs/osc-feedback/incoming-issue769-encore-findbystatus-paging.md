@@ -84,25 +84,94 @@ unchecked for any "active nowhere" claim, and its drop classification is skipped
 for that pass. With question 1 now answered, that flag is known to fire correctly
 rather than being an assumption.
 
+## Update 2026-09-29 — pinned from upstream source, and two corrections
+
+Re-verified while turning the prose above into an executable contract
+(`docs/contracts/encore-findbystatus-paging.json` +
+`src/encore-scaler/encore-paging-contract.ts` +
+`test/encore-findbystatus-contract.test.ts`). Three things changed.
+
+**1. A live instance could not be reached this time, which is itself the
+friction.** The OSC personal access token available to the build is rejected:
+
+```
+GET https://catalog.svc.prod.osaas.io/mysubscriptions   ->  401
+{"message":"Authorization token is invalid: The token signature is invalid."}
+```
+
+So `/v3/api-docs` — the only place this contract is published — was
+unavailable, and no fixture could be recorded from it. A contract that is
+reachable only from a running instance, only via an unadvertised path, and only
+with a working tenant token is a contract that cannot be pinned in CI. That is
+the core ask below.
+
+**2. The contract IS pinnable from upstream source, and the source answers the
+question the OpenAPI document does not.** `svt/encore` at
+`8dd7c596c51a8c31bae805e31ff0969564f68229` (`master` HEAD, 2026-09-14):
+
+- `encore-common/.../redis/RedisService.kt:154-163` — `findByQuery` returns
+  `PageImpl(jobs, pageable, count)` where `count = searchReply.count` is the FULL
+  Redis `FT.SEARCH` match count and `jobs` is limited to the requested window by
+  `searchArgs.limit(offset, pageSize)`. **`page.totalElements` is therefore the
+  all-pages total by construction** — the empirical answer above, now proved
+  rather than observed.
+- `encore-web/.../controller/EncoreController.kt:101-111` — the endpoint,
+  `status`, and `@PageableDefault(size = 10)`.
+- Spring HATEOAS `PagedResourcesAssembler` adds the `next` link iff
+  `page.hasNext()`, which for page 0 is exactly
+  `totalElements > documents.length`. That independently explains the `_links`
+  rel sets recorded in the table above.
+
+**3. The 1000 clamp is not Encore's — it is framework/classpath-dependent, so
+the earlier note overstated it.** Encore configures no maximum page size
+anywhere. The effective clamp comes from whichever Spring pageable argument
+resolver is wired: Spring Data REST defaults to 1000 (and
+`spring-boot-starter-data-rest` is on `encore-web`'s classpath —
+`encore-web/build.gradle.kts:14`), while the plain Spring Data web resolver
+defaults to 2000. 1000 is what the 2026-09-26 capture observed, so we keep asking
+for 1000 — it can never be silently reduced. But a caller who treats 1000 as "the
+Encore limit" will be wrong on some deployment. Nothing about our correctness
+rests on the number; it rests on the `truncated` flag, which is derived from the
+response itself.
+
+**4. `findByExternalId` already exists upstream — the third ask below is
+partially answered.** `EncoreController.kt:115-125` exposes
+`GET /encoreJobs/search/findByExternalId?externalId=...`, and it is in the
+service's own `docs/api-guide.md`. That is exactly the bounded per-job query this
+log asked for: it would let the scaler ask "is job X alive here?" without paging
+an instance's whole active set, and would close the truncation blind spot
+outright. We have NOT adopted it, because we cannot tell which Encore version the
+catalog deploys and could not probe one (see 1). Which is the same discoverability
+problem wearing a different hat.
+
 ## Ask
 
-- **Link the OpenAPI document from the catalog entry.** `/v3/api-docs` exists and
-  is good, but nothing in the catalog listing points at it; we found it by
-  guessing a framework-conventional path. Every integrator will pay that cost.
-- **Document the silent `size` clamp at 1000**, ideally in the OpenAPI `size`
-  parameter description (or reject oversized `size` instead of clamping). A caller
-  that asks for 5000 and gets 1000 with no signal other than `page.size` will
-  believe it has the whole set.
-- **Expose a bounded "is this externalId active?" query** — either allow
-  `findByStatus` to be filtered by a set of externalIds, or add a
-  `findByExternalId` search. Today the only way to answer a question about one job
-  is to page the entire active set of every instance, which is what forces the
-  truncation workaround above to exist at all.
+- **Publish the service contract somewhere a CI job can reach without a tenant
+  token.** `/v3/api-docs` is good but it is instance-scoped, unadvertised, and
+  gated on a working PAT — none of which a contract test can rely on. A static
+  per-version OpenAPI artefact in the catalog (or even a link to the upstream tag
+  the image was built from) would let integrators pin the contract instead of
+  transcribing it.
+- **State the deployed Encore version in the catalog entry.** Without it we cannot
+  tell whether an endpoint we can see in upstream source (`findByExternalId`) or a
+  limit we measured once (the `size` clamp) applies to the instance we just
+  provisioned.
+- **Document the silent `size` clamp**, ideally in the OpenAPI `size` parameter
+  description, or reject an oversized `size` instead of clamping. A caller that
+  asks for 5000 and gets 1000 with no signal other than `page.size` will believe
+  it has the whole set. Note the clamp value is inherited from Spring defaults and
+  therefore varies (see update item 3) — publishing the effective value per
+  deployment matters more than the number itself.
 
 ## Verification status
 
-Verified 2026-09-26 against a live catalog Encore instance: OpenAPI document
-fetched from `{instanceUrl}/v3/api-docs`, paging semantics and the `size` clamp
-confirmed by the requests tabulated above. The two probe jobs created for the
-`totalElements` test were deleted afterwards (`DELETE /encoreJobs/{id}` -> 200)
-and the instance was confirmed back at `totalElements: 0`.
+- **2026-09-26** — verified against a live catalog Encore instance: OpenAPI
+  document fetched from `{instanceUrl}/v3/api-docs`, paging semantics and the
+  `size` clamp confirmed by the requests tabulated above. The two probe jobs
+  created for the `totalElements` test were deleted afterwards
+  (`DELETE /encoreJobs/{id}` -> 200) and the instance was confirmed back at
+  `totalElements: 0`.
+- **2026-09-29** — live instance NOT reachable (401, see update item 1). Contract
+  re-verified against upstream source at the pinned commit and recorded as an
+  executable artefact; the 2026-09-26 capture is carried forward as data inside
+  it (`recordedResponses`) and replayed by the contract test.
