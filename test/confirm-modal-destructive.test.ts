@@ -288,6 +288,28 @@ describe('Collections tab delete confirmation (issue #919)', () => {
     expect(affected).not.toContain('refuse the delete');
   });
 
+  // A delete-locked collection is refused whatever its member count: the lock
+  // guard (src/routes/collections.ts:404-406, CollectionDeleteProtectedError ->
+  // 409 delete_blocked / reason delete_protected) runs BEFORE the emptiness
+  // check (:407-414) and `?force=true` never applies to it. An EMPTY locked
+  // collection is the trap case, so that is what this pins.
+  it('says an empty but delete-locked collection will still be refused', async () => {
+    const { container } = await renderTab({
+      ...COLLECTION,
+      assetIds: [],
+      deleteLock: { locked: true, lockedAt: '2026-01-01T00:00:00.000Z' },
+    });
+    (container.querySelector('.coll-delete-btn') as HTMLButtonElement).click();
+    await flush();
+    const affected = dialog()!.querySelector('.confirm-affected')!.textContent || '';
+    expect(affected).toContain('delete-locked');
+    expect(affected).toContain('refuse the delete');
+    // Must NOT promise an outcome the lock guard will veto.
+    expect(affected).not.toContain('will go through');
+    // Names the only route that lifts the lock (collections.ts:478-491).
+    expect(affected).toContain('/collections/{id}/lock');
+  });
+
   it('DELETEs the collection once the operator confirms', async () => {
     const { container, calls } = await renderTab({ ...COLLECTION, assetIds: [] });
     (container.querySelector('.coll-delete-btn') as HTMLButtonElement).click();
@@ -359,6 +381,11 @@ describe('Assets tab archive confirmation (issue #919)', () => {
     expect(affected).toContain('retention');
     expect(unaffected).toContain('Restore');
     expect(unaffected).toContain('stay in storage');
+    // The archive is not guaranteed: four guards run ahead of it
+    // (src/routes/assets.ts:5499-5540 — delete lock, active job reference,
+    // countChildren, collection membership) and this UI sends no `force`, so the
+    // dialog must admit the archive can be refused with nothing changed.
+    expect(affected).toContain('refuses the archive and nothing changes');
 
     expect(calls.filter((c) => c.method === 'DELETE')).toEqual([]);
 

@@ -995,7 +995,9 @@ function confirmModal(spec) {
     // focus() on a still-detached element is a no-op.
     let cancelRef = null;
 
-    const close = openModal(
+    // The returned close handle is deliberately not bound: this dialog closes
+    // through the `closeDialog` callback openModal passes into the body builder.
+    openModal(
       s.title || 'Confirm',
       function (body, closeDialog) {
         body.classList.add('confirm-dialog');
@@ -1056,10 +1058,6 @@ function confirmModal(spec) {
     // opened destructive dialog must not perform the action. Done here, after
     // openModal has attached the backdrop to the document.
     if (cancelRef) cancelRef.focus();
-
-    // `close` is returned by openModal but the dialog owns its own lifecycle
-    // here; referencing it keeps the contract explicit for future callers.
-    void close;
   });
 }
 
@@ -1515,6 +1513,18 @@ async function renderAssetsTab(container) {
       //     unset/0 means never purge (RETENTION_DISABLED_MS,
       //     src/routes/retention.ts:36 + archiveRetentionMsFromEnv :42-44).
       //   - The archive is audited as `asset.archived` (assets.ts:5546-5558).
+      //   - It can also be REFUSED outright. Four guards run BEFORE the archive
+      //     (assets.ts:5499-5540 — the archive itself is `repo.remove` at :5542),
+      //     in this fixed precedence:
+      //       1. deleteLock.locked -> DeleteProtectedError (HARD, :5500-5502)
+      //       2. an active job referencing the asset -> ReferencedByJobError
+      //          (HARD, :5512-5518)
+      //       3. countChildren() > 0 -> HasChildrenError (HARD, :5520-5523)
+      //       4. membership of any collection -> AssetMemberOfCollectionError
+      //          (SOFT, overridable by `?force=true`, :5533-5540)
+      //     This UI sends no `force`, so guard 4 fires for any asset that sits in
+      //     a collection. All four answer 409 and leave the asset untouched, so
+      //     the dialog states the refusal instead of promising the archive.
       // Deliberately NOT claimed: that the asset disappears from lists or stops
       // playing back. The list endpoint applies no implicit status filter and no
       // delivery route gates on `ready`, so both would be false.
@@ -1525,7 +1535,8 @@ async function renderAssetsTab(container) {
         question: 'Archive "' + label + '"?',
         confirmLabel: 'Archive',
         affected: [
-          'The asset’s status becomes "archived" and the change is recorded in the audit log.',
+          'If the asset is delete-locked, referenced by a running job, still has renditions, or belongs to a collection, the API refuses the archive and nothing changes.',
+          'Otherwise the asset’s status becomes "archived" and the change is recorded in the audit log.',
           'Archived is a terminal state: no ordinary status update moves the asset out of it — only Restore does.',
           'If this deployment has an archive retention window configured, a background sweep will eventually delete the stored files for good and replace the record with a tombstone.',
         ],
@@ -2866,6 +2877,15 @@ async function renderCollectionsTab(container) {
       const memberCount = Array.isArray(c.assetIds)
         ? c.assetIds.length
         : (Array.isArray(c.assets) ? c.assets.length : '');
+      // Explicit delete-lock, carried alongside the member count because the
+      // lock decides the delete outcome BEFORE emptiness does: DELETE
+      // /api/v1/collections/{id} throws CollectionDeleteProtectedError on a
+      // locked collection (src/routes/collections.ts:404-406) ahead of the
+      // member check (:407-414), and `?force=true` is never consulted for it.
+      // `deleteLock` is part of collectionSchema (collections.ts:80-91, field at
+      // :90) and is
+      // returned by GET /collections (:315-324), so the list already knows.
+      const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
       return '<tr data-id="' + escHtml(c.id) + '">' +
         '<td class="cell-id">' + escHtml(c.id) + '</td>' +
         '<td>' + escHtml(c.name || '—') + '</td>' +
@@ -2873,7 +2893,7 @@ async function renderCollectionsTab(container) {
         '<td>' + escHtml(fmtDate(c.createdAt)) + '</td>' +
         '<td>' +
           '<button class="btn-ghost coll-view-btn" data-id="' + escHtml(c.id) + '" style="font-size:12px;padding:3px 8px;">View</button>' +
-          '<button class="btn-danger coll-delete-btn" data-id="' + escHtml(c.id) + '" data-name="' + escHtml(c.name || '') + '" data-members="' + escHtml(String(memberCount)) + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Delete</button>' +
+          '<button class="btn-danger coll-delete-btn" data-id="' + escHtml(c.id) + '" data-name="' + escHtml(c.name || '') + '" data-members="' + escHtml(String(memberCount)) + '" data-locked="' + (deleteLocked ? '1' : '') + '" style="font-size:12px;padding:3px 8px;margin-left:4px;">Delete</button>' +
         '</td>' +
         '</tr>';
     }).join('');
@@ -2899,6 +2919,15 @@ async function renderCollectionsTab(container) {
         //     (`assetIds`, src/data/collection-repo.ts:19-25), so deleting it
         //     removes the grouping, never the media.
         //   - It is audited as `collection.deleted` (collections.ts:418-433).
+        //   - A delete-locked collection is REFUSED with 409 `delete_blocked` /
+        //     reason `delete_protected` (collections.ts:404-406,
+        //     CollectionDeleteProtectedError; envelope deleteBlockedSchema
+        //     :62-70; handler mapping :257-265). This guard is HARD and runs
+        //     FIRST — before the member check — and `?force=true` is never
+        //     consulted for it, so a locked collection can never be deleted from
+        //     here. The only way out is DELETE /collections/{id}/lock
+        //     (collections.ts:478-491, "the only way to lift protection").
+        //     Hence the lock branch below must not promise the delete lands.
         //   - A collection that still holds member ids is REFUSED with 409
         //     `delete_blocked` / reason `member_of_collection` unless
         //     `?force=true` (collections.ts:407-414, CollectionInUseError;
@@ -2911,8 +2940,16 @@ async function renderCollectionsTab(container) {
         const members = btn.dataset.members;
         const hasCount = members !== '' && members != null && !Number.isNaN(Number(members));
         const count = hasCount ? Number(members) : null;
+        const locked = btn.dataset.locked === '1';
         const affected = ['The collection record and its list of members are deleted, and the deletion is recorded in the audit log.'];
-        if (hasCount && count === 0) {
+        // Lock first: it mirrors the handler's guard order, and it is the only
+        // outcome that holds whether or not the collection is empty.
+        if (locked) {
+          affected.push(
+            'This collection is delete-locked, so the API will refuse the delete and nothing will change. ' +
+            'The lock has to be cleared first (DELETE /collections/{id}/lock) — it cannot be forced.'
+          );
+        } else if (hasCount && count === 0) {
           affected.push('This collection is empty, so the delete will go through.');
         } else if (hasCount) {
           affected.push(
