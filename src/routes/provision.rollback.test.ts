@@ -43,9 +43,9 @@ vi.mock('@osaas/client-core', () => ({
   waitForInstanceReady: (...args: unknown[]) =>
     waitForInstanceReady(...(args as [])),
   saveSecret: (...args: unknown[]) => saveSecret(...(args as [])),
-  // deriveWorkspaceId() calls listSubscriptions and falls back to the default
-  // namespace when it throws (src/services/workspace-stack.ts:403-415), so the
-  // partial-config write below lands under the 'default' workspace here.
+  // The parameter-store namespace is the constant STACK_CONFIG_NAMESPACE
+  // (issue #804), so the partial-config write below lands under 'default'
+  // regardless of anything on the OSC Context.
   Context: class {}
 }));
 
