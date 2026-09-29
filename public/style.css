@@ -352,6 +352,51 @@ tr.row-locked td:first-child {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* "Delete protection" block on the asset detail view (issue #895). Text only —
+   the lock is never carried by colour or shape alone (WCAG 1.4.1). The left
+   accent is the same indigo as the list flag so the two surfaces read as one
+   feature. */
+.lock-block {
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+}
+
+.lock-status-line,
+.lock-consequence,
+.lock-reason {
+  margin-top: 2px;
+}
+
+/* `deleteLock.reason` is free operator text up to 1024 characters. Clamp it to
+   three lines so it cannot push the action row off the panel; the full value
+   stays available in the element's title. */
+.lock-reason {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.lock-role-note {
+  margin-top: 6px;
+}
+
+.lock-dialog-intro,
+.lock-dialog-warning {
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+
+.lock-dialog-warning {
+  color: var(--warning);
+}
+
+.lock-field-help {
+  font-size: 11px;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
