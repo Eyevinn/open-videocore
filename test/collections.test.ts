@@ -440,6 +440,114 @@ describe('collections (issue #11)', () => {
       expect(get.json()['assetIds']).toEqual([asset['id']]);
     });
 
+    // Rename through the editorial PATCH (issue #926). `name` joins
+    // description/tags/custom on the PATCH body schema with the SAME type/length
+    // rule as the asset rename (src/routes/assets.ts updateSchema `name`:
+    // z.string().min(1).max(256).optional()). The body stays `.strict()`, so
+    // `assetIds` and every other unknown key is still a 400.
+    it('PATCH /:id renames the collection and persists the new name', async () => {
+      const created = await createCollectionWith({
+        name: 'Before',
+        description: 'kept',
+        tags: ['a'],
+        custom: { k: 'v' }
+      });
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A,
+        payload: { name: 'After' }
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body['name']).toBe('After');
+      // Absent keys are untouched, exactly as for the metadata fields.
+      expect(body['description']).toBe('kept');
+      expect(body['tags']).toEqual(['a']);
+      expect(body['custom']).toEqual({ k: 'v' });
+      expect(body['assetIds']).toEqual([]);
+
+      // The rename is persisted: a fresh read and the list both show it.
+      const get = await app.inject({
+        method: 'GET',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A
+      });
+      expect(get.statusCode).toBe(200);
+      expect(get.json()['name']).toBe('After');
+      const list = await app.inject({ method: 'GET', url: '/api/v1/collections', headers: A });
+      const listed = (list.json()['collections'] as Record<string, unknown>[]).find(
+        (c) => c['id'] === created['id']
+      );
+      expect(listed?.['name']).toBe('After');
+    });
+
+    it('PATCH /:id renames alongside a metadata edit in one request', async () => {
+      const created = await createCollectionWith({ name: 'Before', description: 'original' });
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A,
+        payload: { name: 'After', description: 'edited' }
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()['name']).toBe('After');
+      expect(res.json()['description']).toBe('edited');
+    });
+
+    it('PATCH /:id rejects an empty or over-long name with 400', async () => {
+      const created = await createCollectionWith({ name: 'Keep' });
+      // A collection name is required, so '' is a validation error, not "clear".
+      const empty = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A,
+        payload: { name: '' }
+      });
+      expect(empty.statusCode).toBe(400);
+      // max(256), matching the asset rename rule.
+      const tooLong = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A,
+        payload: { name: 'n'.repeat(257) }
+      });
+      expect(tooLong.statusCode).toBe(400);
+
+      const get = await app.inject({
+        method: 'GET',
+        url: `/api/v1/collections/${created['id']}`,
+        headers: A
+      });
+      expect(get.json()['name']).toBe('Keep');
+    });
+
+    it('PATCH /:id rejects a rename smuggling assetIds, applying neither', async () => {
+      const collection = await createCollectionWith({ name: 'Guarded' });
+      const asset = await createAsset(app, { name: 'clip' });
+      await app.inject({
+        method: 'PUT',
+        url: `/api/v1/collections/${collection['id']}/assets/${asset['id']}`,
+        headers: A
+      });
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/v1/collections/${collection['id']}`,
+        headers: A,
+        payload: { name: 'Renamed', assetIds: [] }
+      });
+      // `.strict()` still rejects the unknown key even when a valid `name` rides
+      // along — the whole body fails, so neither change lands.
+      expect(res.statusCode).toBe(400);
+      const get = await app.inject({
+        method: 'GET',
+        url: `/api/v1/collections/${collection['id']}`,
+        headers: A
+      });
+      expect(get.json()['name']).toBe('Guarded');
+      expect(get.json()['assetIds']).toEqual([asset['id']]);
+    });
+
     it('leaves membership operations unaffected on a collection carrying metadata', async () => {
       const created = await createCollectionWith({
         name: 'WithMeta',

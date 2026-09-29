@@ -192,16 +192,24 @@ const createBodySchema = z.object({
   custom: z.record(z.unknown()).optional()
 });
 
-// PATCH /:id body (issue #560): a PARTIAL update of a collection's descriptive
-// metadata. Only description/tags/custom are editable here; every present key is
-// applied wholesale, an absent key leaves the current value untouched, and an
-// explicit empty value (`''`/`[]`/`{}`) clears the field. Membership (`assetIds`)
-// is deliberately NOT accepted — it stays on PUT/DELETE /:id/assets/:assetId —
-// and neither `name` nor `deleteLock` is editable through this path. `.strict()`
-// rejects any unknown key (including `assetIds`) with a 400 so callers cannot
-// smuggle a membership mutation through the metadata endpoint.
+// PATCH /:id body (issue #560): a PARTIAL update of a collection's name and
+// descriptive metadata. name/description/tags/custom are editable here; every
+// present key is applied wholesale, an absent key leaves the current value
+// untouched, and an explicit empty value (`''`/`[]`/`{}`) clears an optional
+// field. Membership (`assetIds`) is deliberately NOT accepted — it stays on
+// PUT/DELETE /:id/assets/:assetId — and `deleteLock` is not editable through
+// this path (PUT/DELETE /:id/lock). `.strict()` rejects any unknown key
+// (including `assetIds`) with a 400 so callers cannot smuggle a membership
+// mutation through the metadata endpoint.
 const updateBodySchema = z
   .object({
+    // Rename (issue #926). Same type/length rule as the asset rename on PATCH
+    // /api/v1/assets/:id (`name: z.string().min(1).max(256).optional()`,
+    // src/routes/assets.ts updateSchema) and as this router's own
+    // createBodySchema `name`, so create/rename/asset-rename cannot drift.
+    // `name` is required on a collection, so an empty string is rejected
+    // (min(1)) rather than treated as "clear".
+    name: z.string().min(1).max(256).optional(),
     description: z.string().optional(),
     tags: z.array(z.string()).optional(),
     custom: z.record(z.unknown()).optional()
