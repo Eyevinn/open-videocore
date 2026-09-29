@@ -3412,7 +3412,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //                      currentVersionId() in asset-repo.ts). Always names a
   //                      member of `versions`. Clients must read this field and
   //                      must NOT re-derive it as "the last array element" —
-  //                      archived members are skipped, so the two differ.
+  //                      the newest `ready` member wins, so archived, failed
+  //                      and still-in-flight members are skipped whenever a
+  //                      usable one exists, and the two differ. It names the
+  //                      head of the lineage, NOT a guarantee of `ready`:
+  //                      check the named member's own `status` before
+  //                      dereferencing it.
   //   - versions         the whole chain, oldest first (createdAt, then id).
   //                      Includes `archived` members: this is lineage history,
   //                      not a live-asset listing. Each member carries
@@ -3441,13 +3446,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!versions) {
         return reply.code(404).send({ error: 'not_found' });
       }
+      // Read the group off the TARGET asset rather than searching the returned
+      // page for it. The page is capped at MAX_LIMIT (couch-asset-repo.ts:624-627,
+      // ADR-024 D6), so on a truncated lineage the target can be absent from
+      // `versions` and a search would falsely report `versionGroupId: undefined`
+      // — i.e. "never versioned" — for an asset that is demonstrably versioned.
+      const target = await repo.get(request.params.id);
       // listVersions always includes the target itself, so the chain is
       // non-empty here and currentVersionId() cannot return undefined. The
       // fallback keeps the field non-optional in the contract regardless.
       const current = currentVersionId(versions) ?? request.params.id;
       return reply.code(200).send({
         assetId: request.params.id,
-        versionGroupId: versions.find((a) => a.id === request.params.id)?.versionGroupId,
+        versionGroupId: target?.versionGroupId,
         currentVersionId: current,
         versions
       });

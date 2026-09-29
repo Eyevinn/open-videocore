@@ -1238,15 +1238,35 @@ export function compareVersionOrder(a: Asset, b: Asset): number {
 // current version is derived server-side, deterministically, and returned as an
 // explicit `currentVersionId` field on the /versions response. Clients MUST read
 // that field rather than re-deriving it: "last element of the array" is NOT the
-// rule (see the archived carve-out below), and deriving it client-side would
-// bake today's heuristic into every consumer.
+// rule (archived, failed and in-flight members are all skipped while a usable
+// one exists — see the ladder below), and deriving it client-side would bake
+// today's heuristic into every consumer.
 //
-// Rule, in order:
-//   1. The newest member by `compareVersionOrder` whose status is not
-//      `archived`. Archived is this API's soft delete, so a soft-deleted edit
-//      must never be advertised as the current one.
-//   2. If EVERY member is archived, the newest member overall — the chain still
-//      has a well-defined head, it is simply an entirely archived lineage.
+// The rule is a PREFERENCE LADDER over lifecycle `status` (ASSET_STATUSES,
+// line 29), newest-first by `compareVersionOrder` within the highest non-empty
+// tier:
+//   1. `ready` — the only status a consumer can actually dereference (bytes
+//      present, delivery/playback resolvable). This is the answer in every
+//      healthy lineage.
+//   2. in-flight (`uploading` | `processing`) — the lineage has no servable
+//      member yet. Used only as a fallback: a version asset is moved to
+//      `processing` BEFORE its encode runs (src/pipeline/clip.ts:158-167), so
+//      preferring tier 1 is what stops a half-produced output from displacing
+//      the `ready` predecessor it was cut from for the duration of the job.
+//   3. `failed` — an ingest/encode that could not complete. `failed` is
+//      explicitly NON-terminal (line 26-27): an asset can sit there
+//      indefinitely until someone retries or archives it, so it must never
+//      outrank a member that is actually usable.
+//   4. `archived` — this API's soft delete, so it ranks last: an entirely
+//      archived lineage still reports a well-defined head rather than omitting
+//      the field.
+//
+// Only tier 1 is a positive assertion of usability. When the answer comes from
+// tiers 2-4 the lineage has nothing servable at all, and the field degrades to
+// "the most recent member" so it stays non-optional and always resolvable.
+// Clients that need "can I play this right now" MUST check the named member's
+// own `status` — `currentVersionId` names the head of the lineage, it does not
+// promise `ready`.
 //
 // A single-member chain (an asset that has never been versioned) returns that
 // asset's own id, so `currentVersionId` is always present and always names a
@@ -1257,9 +1277,20 @@ export function currentVersionId(versions: readonly Asset[]): string | undefined
     return undefined;
   }
   const ordered = [...versions].sort(compareVersionOrder);
-  const live = ordered.filter((a) => a.status !== 'archived');
-  const head = live.length > 0 ? live[live.length - 1] : ordered[ordered.length - 1];
-  return head.id;
+  // Highest-priority tier first; within a tier the newest member wins.
+  const tiers: readonly ((a: Asset) => boolean)[] = [
+    (a) => a.status === 'ready',
+    (a) => a.status === 'uploading' || a.status === 'processing',
+    (a) => a.status === 'failed'
+  ];
+  for (const inTier of tiers) {
+    const members = ordered.filter(inTier);
+    if (members.length > 0) {
+      return members[members.length - 1].id;
+    }
+  }
+  // Every member is archived: fall back to the newest member overall.
+  return ordered[ordered.length - 1].id;
 }
 
 // Deduplicate a tag list while preserving first-seen order (issue #11).

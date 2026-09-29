@@ -9,7 +9,8 @@
 //   - envelope is { assetId, versionGroupId?, currentVersionId, versions }
 //   - `versions` is oldest-first by createdAt, tie-broken by id
 //   - `currentVersionId` is SERVER-computed, always names a member, and is NOT
-//     simply the last array element (archived members are skipped)
+//     simply the last array element: the newest `ready` member wins, so
+//     archived, failed and still-in-flight heads are all skipped (ADR-024 D3)
 //   - a never-versioned asset is its own single-member chain with no group
 //   - chains BRANCH: two versions cut from one source share a group and both
 //     point at that source, and the endpoint returns the whole tree
@@ -23,7 +24,8 @@ import { assetsRouter } from './assets.js';
 import {
   InMemoryAssetRepository,
   resolveVersionLinkage,
-  type Asset
+  type Asset,
+  type AssetStatus
 } from '../data/asset-repo.js';
 
 type VersionsRead = {
@@ -74,6 +76,23 @@ async function createVersionOf(
     await repo.update(source.id, { versionGroupId: resolved.versionGroupId });
   }
   return output;
+}
+
+// Drive an asset from its freshly-created `uploading` status to `target` using
+// only legal state-machine moves (ALLOWED_TRANSITIONS, asset-repo.ts:34-40):
+// `ready` is reachable only via `processing`, while `processing` and `failed`
+// are direct moves from `uploading`. Going through repo.update (rather than
+// poking the store) keeps these tests honest about what the lifecycle permits.
+async function advanceTo(
+  repo: InMemoryAssetRepository,
+  id: string,
+  target: 'processing' | 'ready' | 'failed'
+): Promise<void> {
+  const path: AssetStatus[] = target === 'ready' ? ['processing', 'ready'] : [target];
+  for (const status of path) {
+    const updated = await repo.update(id, { status });
+    expect(updated?.status).toBe(status);
+  }
 }
 
 // createdAt is an ISO instant at millisecond resolution, so assets created in a
@@ -258,6 +277,82 @@ describe('GET /:id/versions — current-version identification', () => {
     // that makes "last element of the array" the wrong client-side heuristic.
     expect(body.versions[body.versions.length - 1].id).toBe(v2.id);
     expect(body.currentVersionId).toBe(v1.id);
+
+    await app.close();
+  });
+
+  it('skips a still-processing newest member, so an in-flight version never displaces the ready one', async () => {
+    const repo = new InMemoryAssetRepository();
+    const app = await buildApp(repo);
+
+    const source = await repo.create({ name: 'source' });
+    const v1 = await createVersionOf(repo, source.id, 'v1');
+    // Exactly what the clip pipeline does: create the version asset, then move
+    // it to `processing` BEFORE the encode runs (src/pipeline/clip.ts:158-167).
+    const v2 = await createVersionOf(repo, v1.id, 'v2-mid-encode');
+
+    await advanceTo(repo, source.id, 'ready');
+    await advanceTo(repo, v1.id, 'ready');
+    await advanceTo(repo, v2.id, 'processing');
+
+    await stampCreatedAt(repo, source.id, '2026-07-01T00:00:00.000Z');
+    await stampCreatedAt(repo, v1.id, '2026-07-02T00:00:00.000Z');
+    await stampCreatedAt(repo, v2.id, '2026-07-03T00:00:00.000Z');
+
+    const body = await readVersions(app, source.id);
+
+    // The in-flight member is part of the lineage...
+    expect(body.versions.map((v) => v.id)).toEqual([source.id, v1.id, v2.id]);
+    expect(body.versions[body.versions.length - 1].id).toBe(v2.id);
+    // ...but it has no bytes to serve yet, so the newest READY member stays
+    // current for the duration of the encode.
+    expect(body.currentVersionId).toBe(v1.id);
+
+    await app.close();
+  });
+
+  it('skips a failed newest member, which is non-terminal and could otherwise stay current forever', async () => {
+    const repo = new InMemoryAssetRepository();
+    const app = await buildApp(repo);
+
+    const source = await repo.create({ name: 'source' });
+    const v1 = await createVersionOf(repo, source.id, 'v1');
+    const v2 = await createVersionOf(repo, v1.id, 'v2-encode-failed');
+
+    await advanceTo(repo, source.id, 'ready');
+    await advanceTo(repo, v1.id, 'ready');
+    await advanceTo(repo, v2.id, 'failed');
+
+    await stampCreatedAt(repo, source.id, '2026-08-01T00:00:00.000Z');
+    await stampCreatedAt(repo, v1.id, '2026-08-02T00:00:00.000Z');
+    await stampCreatedAt(repo, v2.id, '2026-08-03T00:00:00.000Z');
+
+    const body = await readVersions(app, source.id);
+
+    expect(body.versions.map((v) => v.id)).toEqual([source.id, v1.id, v2.id]);
+    // `failed` is NOT terminal (asset-repo.ts:26-27) — nothing forces a retry
+    // or an archive — so a failed head must never be advertised as current.
+    expect(body.currentVersionId).toBe(v1.id);
+
+    await app.close();
+  });
+
+  it('degrades to the newest in-flight member when the lineage has nothing ready yet', async () => {
+    const repo = new InMemoryAssetRepository();
+    const app = await buildApp(repo);
+
+    const source = await repo.create({ name: 'source' });
+    const v1 = await createVersionOf(repo, source.id, 'v1');
+
+    await advanceTo(repo, source.id, 'processing');
+    await advanceTo(repo, v1.id, 'failed');
+
+    await stampCreatedAt(repo, source.id, '2026-09-01T00:00:00.000Z');
+    await stampCreatedAt(repo, v1.id, '2026-09-02T00:00:00.000Z');
+
+    // No member is `ready`, so the field degrades down the ladder rather than
+    // disappearing: in-flight outranks failed, and the answer is still a member.
+    expect((await readVersions(app, source.id)).currentVersionId).toBe(source.id);
 
     await app.close();
   });

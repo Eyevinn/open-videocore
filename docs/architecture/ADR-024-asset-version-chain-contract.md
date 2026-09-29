@@ -109,8 +109,9 @@ Consequences, all confirmed against the handlers:
 - **The result is identical for every entry point.** Querying any member
   returns the same set in the same order; only the echoed `assetId` differs.
 - **`archived` members are included.** This endpoint is lineage *history*; a
-  soft-deleted edit is still part of the record. (It is excluded from
-  `currentVersionId` — see D3.)
+  soft-deleted edit is still part of the record. (Archived members rank last
+  for `currentVersionId` — see D3. The same applies to `failed` and in-flight
+  members: present in `versions`, outranked as the current version.)
 
 This is **distinct from `?parentId=` listing**, which enumerates the
 rendition/child hierarchy. The two axes are independent: a version output is
@@ -126,14 +127,37 @@ There is no operator-facing "promote to current" action today, so the value is
 derived server-side by `currentVersionId()`
 (`src/data/asset-repo.ts:1255`, beside `resolveVersionLinkage`):
 
-1. The newest member by D4's ordering **whose status is not `archived`**.
-2. If every member is archived, the newest member overall — an entirely
-   archived lineage still reports a well-defined head rather than omitting the
-   field.
+The rule is a **preference ladder over lifecycle `status`**
+(`ASSET_STATUSES`, `asset-repo.ts:29`). Take the **newest member by D5's
+ordering** in the **highest non-empty tier**:
 
-Rule 1 is precisely why "last element of `versions`" is the wrong client-side
-heuristic: archiving the newest version must move the current pointer back, and
-a client applying the naive rule would keep pointing at a soft-deleted asset.
+| Tier | Statuses eligible | Why |
+| --- | --- | --- |
+| 1 | `ready` | The only status a consumer can actually dereference. This is the answer in every healthy lineage. |
+| 2 | `uploading`, `processing` | In-flight: the lineage has nothing servable yet. |
+| 3 | `failed` | Non-terminal error state (`asset-repo.ts:26-27`) — an asset can sit here indefinitely. |
+| 4 | `archived` | Soft delete. Reached only when *every* member is archived. |
+
+Two consequences are the point of the change:
+
+- **A newly cut version does not steal the pointer while it is still being
+  produced.** `clip`/`rewrap` create the output and move it to `processing`
+  *before* the encode runs (`src/pipeline/clip.ts:158-167`), so without tier 1
+  a half-produced asset would be advertised as current for the whole job.
+- **A `failed` head does not stick.** `failed` is explicitly non-terminal, so a
+  failed newest member would otherwise remain the advertised current version
+  indefinitely, until someone retried or archived it.
+
+**Tiers 2-4 are degraded answers, not assertions of usability.** They are
+reached only when the lineage contains no `ready` member at all, and exist so
+the field stays required and always resolvable within `versions`. Clients that
+need "can I play this right now" MUST check the named member's own `status`:
+`currentVersionId` names the head of the lineage, it does not promise `ready`.
+
+This ladder is precisely why "last element of `versions`" is the wrong
+client-side heuristic: archiving, failing, or re-cutting the newest version all
+move the current pointer, and a client applying the naive rule would point at a
+soft-deleted, broken, or not-yet-existent asset.
 
 Putting this behind a named field is deliberate: it means an explicit
 promotion mechanism can be added later (an operator-set marker that the
@@ -189,6 +213,16 @@ The chain is returned whole. The CouchDB query is bounded by `MAX_LIMIT`
 size; version chains are expected to be small (tens, not thousands). If a
 lineage ever approaches `MAX_LIMIT` this becomes silent truncation and must be
 revisited — flagged here as a known limit rather than left implicit.
+
+Truncation degrades the **derived fields too, not just `versions`**:
+`currentVersionId` is computed from the page that came back, so a truncated
+page can name a member that is not the lineage's true head. `versionGroupId` is
+therefore read from the target asset directly rather than searched for in the
+page (`src/routes/assets.ts`, the `/:id/versions` handler) — searching the page
+would report `undefined` (i.e. "never versioned") for a versioned asset whose
+own record fell outside the truncated window. That removes one failure mode;
+the `currentVersionId` skew remains inherent to returning a bounded page and is
+the concrete reason this limit must be revisited if lineages grow.
 
 ---
 
