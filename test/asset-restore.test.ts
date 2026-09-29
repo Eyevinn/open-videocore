@@ -8,7 +8,31 @@
 //       machine — no ordinary PATCH can leave `archived`);
 //   (c) POST /:id/restore on a tombstone (purged asset) returns 410 Gone;
 //   (d) repo-level `restore(id)` parity across the in-memory and CouchDB tiers.
+//
+// The final block (issue #930) is the outcome-HONESTY lock required before any UI
+// exposes this operation: every response the endpoint returns must match the state
+// it actually persisted — no 200 on a no-op, no silent mutation behind a 404, no
+// revived tombstone behind a 410, and one audit entry for the real transition.
+//
+// Contract grounding (verified before writing, contract-first):
+//   - Verb + path: `app.post('/:id/restore', ...)` — src/routes/assets.ts:5637-5638,
+//     mounted at prefix `/api/v1/assets` (src/main.ts:1780). POST, not PUT.
+//   - Declared responses: `{ 200: assetSchema, 404: errorSchema, 410: errorSchema }`
+//     — src/routes/assets.ts:5642; mirrored in openapi.json
+//     .paths["/api/v1/assets/{id}/restore"].post.responses (asserted at runtime below).
+//   - `statusHistory` is part of the wire contract (assetSchema, assets.ts:855);
+//     `provenance` is NOT exposed over HTTP, so statusHistory + the audit log are
+//     the only observable evidence of a restore.
+//   - Audit write contract: `RecordAuditInput` = { actor, action, targetType,
+//     targetId, detail? } with `action: z.string().min(1)` and the closed
+//     `AUDIT_TARGET_TYPES` ['asset','collection','job'] — src/data/audit-repo.ts:40,83-91;
+//     emission via the fire-and-forget `emitAudit(emitter, input, log)` —
+//     src/data/audit-emit.ts:59.
+//   - `AssetRepository.restore(id)` returns undefined for unknown/purged/not-archived
+//     — src/data/asset-repo.ts:996 (interface), :1728 (in-memory),
+//     src/data/couch-asset-repo.ts:653 (CouchDB).
 
+import { readFileSync } from 'node:fs';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
@@ -39,18 +63,40 @@ import {
 } from '../src/data/asset-repo.js';
 import { CouchAssetRepository } from '../src/data/couch-asset-repo.js';
 import type { StoredDoc, StackCouch } from '../src/data/couchdb.js';
+import type { AuditEmitter } from '../src/data/audit-emit.js';
+import type { RecordAuditInput } from '../src/data/audit-repo.js';
 
 const auth = (token: string) => ({ authorization: `Bearer ${token}` });
 const A = auth('token-a');
 
-async function buildApp(repo: InMemoryAssetRepository): Promise<FastifyInstance> {
+async function buildApp(
+  repo: InMemoryAssetRepository,
+  audit?: AuditEmitter
+): Promise<FastifyInstance> {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
   registerAuth(app);
-  await app.register(assetsRouter, { prefix: '/api/v1/assets', repository: repo });
+  await app.register(assetsRouter, { prefix: '/api/v1/assets', repository: repo, audit });
   await app.ready();
   return app;
+}
+
+// Records every emitted audit entry so a test can assert count + shape (mirrors
+// test/audit-mutation-instrumentation.test.ts's RecordingEmitter).
+class RecordingEmitter implements AuditEmitter {
+  readonly entries: RecordAuditInput[] = [];
+  async record(input: RecordAuditInput): Promise<unknown> {
+    this.entries.push(input);
+    return { id: `entry-${this.entries.length}` };
+  }
+}
+
+// emitAudit is fire-and-forget (detached microtask, src/data/audit-emit.ts:67),
+// so let the chain settle before asserting on the recorded entries.
+async function settle(): Promise<void> {
+  await new Promise((r) => setTimeout(r, 0));
+  await new Promise((r) => setTimeout(r, 0));
 }
 
 // Drive a freshly-created asset to `archived`, passing through `ready` (so the
@@ -340,5 +386,181 @@ describe('restore repo method — CouchDB tier (issue #328)', () => {
     };
     couch.seed(liveDoc);
     expect(await repo.restore('01LIVELIVELIVELIVELIVELIV')).toBeUndefined();
+  });
+});
+
+// -------------------------------------------------------------------------
+// Outcome honesty (issue #930, broken out of #787) — every response must match
+// the state actually persisted, and a real restore must leave an audit trail.
+// -------------------------------------------------------------------------
+
+describe('POST /:id/restore reports outcomes honestly (issue #930)', () => {
+  let repo: InMemoryAssetRepository;
+  let audit: RecordingEmitter;
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    repo = new InMemoryAssetRepository();
+    audit = new RecordingEmitter();
+    app = await buildApp(repo, audit);
+  });
+
+  const restore = (id: string) =>
+    app.inject({ method: 'POST', url: `/api/v1/assets/${id}/restore`, headers: A });
+
+  it('is POST at /:id/restore — the verb the spec declares, and no other', async () => {
+    const id = await createArchived(repo, 'ready');
+    // The contract source is src/routes/assets.ts:5637 `app.post('/:id/restore')`;
+    // assert no sibling verb answers the same path (a UI must not be able to
+    // "succeed" through an unrouted method).
+    for (const method of ['PUT', 'PATCH', 'DELETE', 'GET'] as const) {
+      const res = await app.inject({
+        method,
+        url: `/api/v1/assets/${id}/restore`,
+        headers: A
+      });
+      expect(res.statusCode).toBe(404);
+    }
+    expect((await restore(id)).statusCode).toBe(200);
+  });
+
+  it('the published spec documents the 200/404/410 outcomes for this path', () => {
+    // openapi.json is the contract the UI codes against: it must advertise the
+    // failure outcomes, not just the success one.
+    const spec = JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8')) as {
+      paths: Record<string, Record<string, { responses: Record<string, unknown> }>>;
+    };
+    const path = spec.paths['/api/v1/assets/{id}/restore'];
+    expect(path).toBeDefined();
+    expect(Object.keys(path)).toEqual(['post']);
+    expect(Object.keys(path.post.responses).sort()).toEqual(['200', '404', '410']);
+  });
+
+  it('a 200 body is the state that was actually persisted (no phantom success)', async () => {
+    const id = await createArchived(repo, 'ready');
+    const res = await restore(id);
+    expect(res.statusCode).toBe(200);
+
+    // Read the asset back through the independent read path: the response body
+    // must be exactly what the store now holds, not an optimistic projection.
+    const readBack = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
+    expect(readBack.statusCode).toBe(200);
+    expect(res.json()).toEqual(readBack.json());
+    expect(readBack.json().status).toBe('ready');
+
+    // And the store itself agrees (no longer archived, exactly one restore entry).
+    const state = await repo.getState(id);
+    expect(state.kind).toBe('asset');
+    if (state.kind === 'asset') {
+      expect(state.asset.status).toBe('ready');
+      const restoreEntries = state.asset.statusHistory.filter((h) => h.from === 'archived');
+      expect(restoreEntries).toHaveLength(1);
+      expect(restoreEntries[0].to).toBe('ready');
+    }
+  });
+
+  it('emits exactly one asset.restored audit entry for a real restore', async () => {
+    const id = await createArchived(repo, 'failed');
+    expect((await restore(id)).statusCode).toBe(200);
+    await settle();
+    const entries = audit.entries.filter((e) => e.action === 'asset.restored');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      actor: { principalId: null, origin: 'user' },
+      action: 'asset.restored',
+      targetType: 'asset',
+      targetId: id,
+      detail: { from: 'archived', to: 'failed' }
+    });
+  });
+
+  it('a 404 on a live asset changes nothing and emits no audit entry', async () => {
+    const created = await repo.create({ name: 'still-live' });
+    await repo.update(created.id, { status: 'processing' });
+    const before = await repo.get(created.id);
+
+    const res = await restore(created.id);
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: 'not_found' });
+
+    // Byte-for-byte unchanged: no status flip, no appended transition, no
+    // updatedAt bump behind the failure response.
+    expect(await repo.get(created.id)).toEqual(before);
+    await settle();
+    expect(audit.entries.filter((e) => e.action === 'asset.restored')).toHaveLength(0);
+  });
+
+  it('a repeated restore reports 404 the second time and does not re-audit', async () => {
+    const id = await createArchived(repo, 'ready');
+    expect((await restore(id)).statusCode).toBe(200);
+    const afterFirst = await repo.get(id);
+
+    // Double-click / retry: the asset is live now, so there is nothing to
+    // restore. The endpoint must not claim a second success.
+    const second = await restore(id);
+    expect(second.statusCode).toBe(404);
+    expect(await repo.get(id)).toEqual(afterFirst);
+
+    await settle();
+    expect(audit.entries.filter((e) => e.action === 'asset.restored')).toHaveLength(1);
+  });
+
+  it('a 404 on an unknown id emits no audit entry and creates nothing', async () => {
+    const res = await restore('01NOSUCHNOSUCHNOSUCHNOSUCH');
+    expect(res.statusCode).toBe(404);
+    expect((await repo.getState('01NOSUCHNOSUCHNOSUCHNOSUCH')).kind).toBe('not-found');
+    await settle();
+    expect(audit.entries).toHaveLength(0);
+  });
+
+  it('a 410 leaves the tombstone purged — it is never silently revived', async () => {
+    const id = await createArchived(repo, 'ready');
+    expect(repo.purgeToTombstone(id)).toBe(true);
+
+    const res = await restore(id);
+    expect(res.statusCode).toBe(410);
+    expect(res.json()).toMatchObject({ error: 'gone' });
+
+    // Still a tombstone afterwards, and the read path still reports 410 — the
+    // rejected restore had no side effect.
+    expect((await repo.getState(id)).kind).toBe('tombstone');
+    const readBack = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}`, headers: A });
+    expect(readBack.statusCode).toBe(410);
+
+    await settle();
+    expect(audit.entries).toHaveLength(0);
+  });
+});
+
+describe('restore honesty — CouchDB tier (issue #930)', () => {
+  it('reports no restore (undefined -> 404) when a concurrent writer left archived first', async () => {
+    const id = '01RACERACERACERACERACERACE';
+    const couch = new FakeCouch();
+    couch.seed(archivedAssetDoc(id, 'ready'));
+    // Simulate the interleaving the retry guard exists for: the preflight read
+    // (src/data/couch-asset-repo.ts:655) sees `archived`, but by the time
+    // updateWithRetry re-reads the document another writer has moved it out of
+    // `archived` (status is the `state` mirror, src/data/asset-document.ts:637).
+    const seen = { calls: 0 };
+    const rawGet = couch.get.bind(couch);
+    couch.get = async (localId: string) => {
+      const doc = await rawGet(localId);
+      seen.calls += 1;
+      if (seen.calls === 1 || !doc) {
+        return doc;
+      }
+      return { ...doc, state: 'ready' } as StoredDoc;
+    };
+
+    const repo = new CouchAssetRepository(() => couch as unknown as StackCouch);
+    // Must report "nothing restored" rather than fabricating a transition.
+    expect(await repo.restore(id)).toBeUndefined();
+
+    // And no restore entry was appended to the persisted history.
+    const raw = await rawGet(id);
+    const history = (
+      (raw as unknown as { administrative: { statusHistory: StatusTransition[] } }).administrative
+    ).statusHistory;
+    expect(history.some((h) => h.from === 'archived')).toBe(false);
   });
 });
