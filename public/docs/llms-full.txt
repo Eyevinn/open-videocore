@@ -2939,6 +2939,7 @@ idpathstringrequired
   Request
 Request body (application/json)
 {
+  "name": "string",
   "description": "string",
   "tags": [
     "string"
