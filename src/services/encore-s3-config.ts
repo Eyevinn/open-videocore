@@ -92,6 +92,14 @@ export type ResolveEncoreS3ConfigDeps = {
   // so this resolver defers to it by returning undefined rather than throwing.
   staticFallbackConfigured: boolean;
   log: EncoreS3ConfigLogger;
+  // Optional hook mapping the stack's PUBLIC MinIO endpoint to the endpoint the
+  // spawned Encore instance should use (the in-cluster Service, see
+  // internal-minio-endpoint.ts). It must never throw and returns the input
+  // unchanged when no better endpoint is usable. Only the endpoint handed to
+  // Encore changes: the stored stack config and every client-facing URL stay
+  // public. Not applied to a static ENCORE_S3_ENDPOINT, which is an explicit
+  // operator choice.
+  resolveEndpoint?: (publicEndpoint: string) => Promise<string>;
 };
 
 // `stackKey` is the EFFECTIVE stack identity the transcode request resolved to
@@ -105,7 +113,7 @@ export async function resolveEncoreS3Config(
   deps: ResolveEncoreS3ConfigDeps,
   stackKey: string
 ): Promise<EncoreS3Config | undefined> {
-  const { paramStore, secretAccessKey, staticFallbackConfigured, log } = deps;
+  const { paramStore, secretAccessKey, staticFallbackConfigured, log, resolveEndpoint } = deps;
 
   if (!secretAccessKey) {
     if (staticFallbackConfigured) return undefined;
@@ -145,7 +153,9 @@ export async function resolveEncoreS3Config(
 
   if (config?.minioEndpoint) {
     return {
-      endpoint: config.minioEndpoint,
+      endpoint: resolveEndpoint
+        ? await resolveEndpoint(config.minioEndpoint)
+        : config.minioEndpoint,
       accessKeyId: MINIO_ROOT_USER,
       secretAccessKey
     };

@@ -61,6 +61,7 @@ import {
   type StackRedisResolution
 } from './services/scaler-redis-url.js';
 import { resolveEncoreS3Config } from './services/encore-s3-config.js';
+import { makeInternalEndpointResolver } from './services/internal-minio-endpoint.js';
 import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
@@ -993,6 +994,19 @@ function activateScaler(redisUrl: string): void {
   const encoreS3Endpoint = process.env['ENCORE_S3_ENDPOINT'];
   const encoreS3AccessKey = process.env['ENCORE_S3_ACCESS_KEY'] ?? process.env['MINIO_ACCESS_KEY'] ?? 'admin';
   const encoreS3SecretKey = process.env['ENCORE_S3_SECRET_KEY'] ?? process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'];
+  // Optional. ENCORE_S3_INTERNAL_ENDPOINT=off opts out of handing Encore the
+  // in-cluster MinIO Service (default: on, verified by a live health probe and
+  // falling back to the public endpoint if unusable). ENCORE_S3_INTERNAL_PORT
+  // overrides the MinIO Service port (default 8080). A malformed port keeps the
+  // default rather than failing startup.
+  const encoreInternalPortRaw = Number(process.env['ENCORE_S3_INTERNAL_PORT']);
+  const encoreInternalEndpointResolver = makeInternalEndpointResolver({
+    enabled: (process.env['ENCORE_S3_INTERNAL_ENDPOINT'] ?? '').trim().toLowerCase() !== 'off',
+    ...(Number.isInteger(encoreInternalPortRaw) && encoreInternalPortRaw > 0 && encoreInternalPortRaw < 65536
+      ? { port: encoreInternalPortRaw }
+      : {}),
+    log: app.log
+  });
 
   const redis = new IORedis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
   sharedRedis = redis;
@@ -1116,7 +1130,11 @@ function activateScaler(redisUrl: string): void {
           // the static s3Config", workspace-registry.ts:206-209) instead of
           // throwing.
           staticFallbackConfigured: Boolean(encoreS3Endpoint && encoreS3SecretKey),
-          log: app.log
+          log: app.log,
+          // Hand Encore the in-cluster MinIO Service instead of the public
+          // ingress URL (long transfers through the ingress get severed, #294).
+          // Fails soft to the public endpoint; see internal-minio-endpoint.ts.
+          resolveEndpoint: encoreInternalEndpointResolver
         },
         stackKey
       ),
