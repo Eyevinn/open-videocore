@@ -2150,6 +2150,150 @@ async function renderAssetFiles(assetId, container) {
   }
 }
 
+// Fetch and render an asset's track list into `container` (issue #902).
+// READ-ONLY: this panel lists tracks; it has no add/remove controls. Adding or
+// removing a track is a write path (POST/DELETE) that is deliberately out of
+// scope here.
+//
+// Contract, fetched before this call was written (CLAUDE.md rule 7):
+//   openapi.json .paths["/api/v1/assets/{id}/tracks"] — the ONLY key is `get`;
+//   one required path parameter `id` (string); responses 200 / 404. The source
+//   of truth is `app.get('/:id/tracks')` in src/routes/assets.ts:5210-5229 with
+//   `response: { 200: tracksSchema, 404: errorSchema }`.
+//
+//   200 body — tracksSchema (src/routes/assets.ts:831-834), both keys REQUIRED
+//   and each an array that may be empty (the handler defaults a missing list to
+//   `[]`, src/routes/assets.ts:5224-5227):
+//     audioTracks[]    audioTrackOutSchema, src/routes/assets.ts:794-801
+//                      required: id (string), language (string)
+//                      optional: codec (string), channels (number),
+//                                label (string), default (boolean)
+//     subtitleTracks[] subtitleTrackOutSchema, src/routes/assets.ts:805-812
+//                      required: id (string), language (string),
+//                                format (enum 'vtt'|'srt'|'ttml')
+//                      optional: objectKey (string), label (string),
+//                                default (boolean)
+//   No other per-track attributes exist on either kind, and there is NO video
+//   track in this (or any other) contract: the sibling paths
+//   /api/v1/assets/{id}/audio-tracks and /api/v1/assets/{id}/subtitle-tracks
+//   expose only `post` (+ `delete` on /{trackId}), so `GET /:id/tracks` is the
+//   single read endpoint for tracks. The asset's video characteristics are
+//   carried by `technicalMetadata` (codec/width/height/bitrateBps) and are
+//   already rendered in the KV grid above — they are not modelled as tracks, so
+//   no video-track section is invented here.
+//
+// All server-provided text flows through escHtml before interpolation.
+async function renderAssetTracks(assetId, container) {
+  container.innerHTML = '';
+
+  var title = document.createElement('div');
+  title.className = 'section-title';
+  title.textContent = 'Tracks';
+  container.appendChild(title);
+
+  var data;
+  try {
+    data = await apiFetch('/assets/' + encodeURIComponent(assetId) + '/tracks');
+  } catch (err) {
+    // A transient failure here must not blank the whole detail panel; surface it
+    // inline and leave the rest of the panel intact (same as renderAssetFiles).
+    var e = document.createElement('div');
+    e.className = 'text-muted';
+    e.textContent = 'Could not load tracks: ' + err.message;
+    container.appendChild(e);
+    return;
+  }
+
+  var audioTracks = (data && Array.isArray(data.audioTracks)) ? data.audioTracks : [];
+  var subtitleTracks = (data && Array.isArray(data.subtitleTracks)) ? data.subtitleTracks : [];
+
+  // Optional fields render as an em dash rather than being dropped, so the
+  // columns line up across rows regardless of which optionals the server set.
+  var opt = function(v) {
+    return (v === undefined || v === null || v === '')
+      ? '<span class="text-muted">—</span>'
+      : escHtml(String(v));
+  };
+  // `default` is an optional boolean: absent is NOT the same claim as false, so
+  // only a literal true is badged.
+  var defaultCell = function(t) {
+    return t.default === true
+      ? '<span class="badge">default</span>'
+      : '<span class="text-muted">—</span>';
+  };
+
+  var section = function(kind, heading, emptyText, headerCells, rowsHtml, count) {
+    var h = document.createElement('div');
+    h.className = 'section-title mt12';
+    h.textContent = heading + ' (' + count + ')';
+    container.appendChild(h);
+
+    if (count === 0) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.setAttribute('data-empty', kind);
+      empty.textContent = emptyText;
+      container.appendChild(empty);
+      return;
+    }
+    var wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    wrap.innerHTML =
+      '<table><caption class="visually-hidden">' + heading + ' on this asset</caption>' +
+      '<thead><tr>' + headerCells + '</tr></thead>' +
+      '<tbody>' + rowsHtml + '</tbody></table>';
+    container.appendChild(wrap);
+  };
+
+  // ── Audio tracks ─────────────────────────────────────────────────────────
+  // Columns are exactly audioTrackOutSchema's fields: language, label, codec,
+  // channels, default, id.
+  var audioRows = audioTracks.map(function(t) {
+    return '<tr>' +
+      '<td>' + escHtml(t.language) + '</td>' +
+      '<td>' + opt(t.label) + '</td>' +
+      '<td>' + opt(t.codec) + '</td>' +
+      '<td>' + opt(t.channels) + '</td>' +
+      '<td>' + defaultCell(t) + '</td>' +
+      '<td class="text-mono cell-id" title="' + escHtml(t.id) + '">' + escHtml(t.id) + '</td>' +
+      '</tr>';
+  }).join('');
+  section(
+    'audio-tracks',
+    'Audio tracks',
+    'No audio tracks.',
+    '<th scope="col">Language</th><th scope="col">Label</th><th scope="col">Codec</th>' +
+      '<th scope="col">Channels</th><th scope="col">Default</th><th scope="col">Track ID</th>',
+    audioRows,
+    audioTracks.length
+  );
+
+  // ── Subtitle tracks ──────────────────────────────────────────────────────
+  // Columns are exactly subtitleTrackOutSchema's fields: language, label,
+  // format, objectKey, default, id. `objectKey` is the storage location of the
+  // subtitle file; it is absent when object storage was not configured at the
+  // time the track was added.
+  var subtitleRows = subtitleTracks.map(function(t) {
+    return '<tr>' +
+      '<td>' + escHtml(t.language) + '</td>' +
+      '<td>' + opt(t.label) + '</td>' +
+      '<td>' + escHtml(t.format) + '</td>' +
+      '<td class="text-mono cell-id" title="' + escHtml(t.objectKey || '') + '">' + opt(t.objectKey) + '</td>' +
+      '<td>' + defaultCell(t) + '</td>' +
+      '<td class="text-mono cell-id" title="' + escHtml(t.id) + '">' + escHtml(t.id) + '</td>' +
+      '</tr>';
+  }).join('');
+  section(
+    'subtitle-tracks',
+    'Subtitle tracks',
+    'No subtitle tracks.',
+    '<th scope="col">Language</th><th scope="col">Label</th><th scope="col">Format</th>' +
+      '<th scope="col">Object key</th><th scope="col">Default</th><th scope="col">Track ID</th>',
+    subtitleRows,
+    subtitleTracks.length
+  );
+}
+
 // Populate an asset detail view into `bodyEl` from a freshly-fetched asset.
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
@@ -2313,6 +2457,16 @@ async function renderAssetDetailBody(id, bodyEl) {
       metaDiv.appendChild(pre);
       body.appendChild(metaDiv);
     }
+
+    // Tracks (issue #902). Read-only listing of the asset's audio + subtitle
+    // tracks from GET /assets/:id/tracks. Rendered for every asset regardless of
+    // status — both lists are always present in the contract, and a kind with no
+    // tracks shows its own empty state rather than the section disappearing.
+    const tracksArea = document.createElement('div');
+    tracksArea.className = 'mt12';
+    tracksArea.id = 'tracks-area';
+    body.appendChild(tracksArea);
+    await renderAssetTracks(id, tracksArea);
 
     // Scene/shot-detection metadata (issue #197). Shape verified against
     // src/data/asset-repo.ts: SceneMetadata { boundaries: SceneBoundary[];
@@ -6526,6 +6680,10 @@ export {
   filterWedgedAssets,
   renderAssetDetailBody,
   renderAssetFiles,
+  // Read-only tracks panel (issue #902). Exported so a DOM test can exercise the
+  // render + per-kind empty states against a stubbed GET /assets/:id/tracks, and
+  // so the detached detail window shares the identical renderer.
+  renderAssetTracks,
   renderJobDetailBody,
   renderPipelineDetailBody,
   openDetailWindow,
