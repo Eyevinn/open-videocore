@@ -12,6 +12,9 @@
 //   GET    /api/v1/collections/:id                   — get one, with resolved asset list
 //   PATCH  /api/v1/collections/:id                   — partial update of descriptive metadata (#560)
 //   DELETE /api/v1/collections/:id                   — delete a collection
+//                                                      (`?confirmMemberCount=N`
+//                                                       to delete a non-empty
+//                                                       one, #922)
 //   PUT    /api/v1/collections/:id/assets/:assetId   — add an asset to a collection
 //   DELETE /api/v1/collections/:id/assets/:assetId   — remove an asset from a collection
 //
@@ -59,6 +62,14 @@ const deleteLockSchema = z.object({
 // existing `{ error, message? }` shape with the required `reason` enum and
 // `blockedBy` object. For the explicit-lock case reason is `delete_protected`
 // and both id arrays are empty.
+//
+// `memberCount` (issue #922) is an ADDITIVE, OPTIONAL field carried only on the
+// `member_of_collection` block: the number of asset ids the collection still
+// holds. It is the value a caller echoes back as `?confirmMemberCount=` to
+// delete the collection in one follow-up call. Every previously-emitted field
+// keeps its name, type and required-ness, so existing consumers of the 409 are
+// unaffected; the enum is deliberately NOT widened (a stale confirmation is the
+// same `member_of_collection` block, just with a different message).
 const deleteBlockedSchema = z.object({
   error: z.literal('delete_blocked'),
   message: z.string().optional(),
@@ -66,7 +77,8 @@ const deleteBlockedSchema = z.object({
   blockedBy: z.object({
     jobIds: z.array(z.string()),
     collectionIds: z.array(z.string())
-  })
+  }),
+  memberCount: z.number().int().nonnegative().optional()
 });
 
 // Descriptive metadata (issue #559), mirroring the asset `descriptive`
@@ -276,12 +288,20 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     // blocking reference is the collection's own id (it still holds members),
     // reported in `blockedBy.collectionIds`. Soft block — overridable by
     // `?force=true` at the route (ADR-020 decision 2).
+    //
+    // `memberCount` (issue #922) reports the collection's CURRENT member count
+    // so the caller can re-issue the delete as
+    // `?confirmMemberCount=<memberCount>`. It is the authoritative number on
+    // both paths — the plain in-use block and the stale-confirmation rejection —
+    // so a client that raced a membership change always gets the count it must
+    // confirm next.
     if (err instanceof CollectionInUseError) {
       return reply.code(409).send({
         error: 'delete_blocked',
         message: err.message,
         reason: 'member_of_collection',
-        blockedBy: { jobIds: [], collectionIds: [err.id] }
+        blockedBy: { jobIds: [], collectionIds: [err.id] },
+        memberCount: err.assetIds.length
       });
     }
     throw err;
@@ -398,8 +418,28 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
         // member_of_collection in-use block. It never defeats the HARD explicit
         // lock. `z.coerce.boolean()` matches the established force convention
         // (cf. profiles.ts POST /seed).
-        querystring: z.object({ force: z.coerce.boolean().optional() }),
-        response: { 204: z.null(), 404: errorSchema, 409: deleteBlockedSchema }
+        //
+        // `?confirmMemberCount=N` (issue #922, design decision for #854 option
+        // 1) is the explicit, non-blind way to delete a NON-EMPTY collection:
+        // the caller asserts how many members it believes the collection has,
+        // and the delete proceeds only if that matches the current count.
+        // Carried as a query param rather than a request body because DELETE
+        // bodies are unevenly supported across proxies and clients, and because
+        // the sibling override on this very route (`force`) is already a query
+        // param. Omitting it preserves the existing safe default exactly.
+        querystring: z.object({
+          force: z.coerce.boolean().optional(),
+          confirmMemberCount: z.coerce.number().int().nonnegative().optional()
+        }),
+        // 400 covers the framework's own zod rejection of a malformed
+        // `confirmMemberCount` (non-numeric / negative / fractional), which
+        // serializes against the permissive `errorSchema` (see its comment).
+        response: {
+          204: z.null(),
+          400: errorSchema,
+          404: errorSchema,
+          409: deleteBlockedSchema
+        }
       }
     },
     async (request, reply) => {
@@ -412,16 +452,52 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
       if (existing?.deleteLock?.locked) {
         throw new CollectionDeleteProtectedError(request.params.id);
       }
+      // Explicit member-count confirmation (issue #922; design decision for
+      // #854, option 1). Runs AFTER the hard lock guard above and BEFORE the
+      // soft in-use block below, so the precedence delete_protected >
+      // member_of_collection is untouched: a locked collection still 409s
+      // `delete_protected` no matter what count is confirmed.
+      //
+      // Validated against the collection's CURRENT membership:
+      //   - matches  -> fall through and delete in this same call.
+      //   - mismatch -> 409 `member_of_collection` carrying the real count. A
+      //     stale confirmation means the caller is acting on a set it has not
+      //     seen (someone added/removed members since it read the collection),
+      //     so it must never resolve to a silent delete — not even alongside
+      //     `?force=true`, which is why this check is deliberately not gated on
+      //     `force`. Existing consumers send no confirmation at all and are
+      //     therefore unaffected by that ordering.
+      const confirmMemberCount = request.query.confirmMemberCount;
+      if (existing && confirmMemberCount !== undefined) {
+        if (confirmMemberCount !== existing.assetIds.length) {
+          throw new CollectionInUseError(
+            request.params.id,
+            existing.assetIds,
+            confirmMemberCount
+          );
+        }
+      }
       // Reference/usage check (issue #570): a collection still holding member
       // asset ids is IN USE and must not be silently torn down. This SOFT block
       // is overridable by `?force=true` (ADR-020 decision 2 — collection
-      // membership is a loose grouping). Runs only when the collection resolves,
-      // so it never leaks existence for an unknown/foreign id.
-      if (!request.query.force && existing && existing.assetIds.length > 0) {
+      // membership is a loose grouping) and, since #922, by a matching
+      // `?confirmMemberCount=` (validated immediately above). Absent BOTH, the
+      // safe default is unchanged: 409 `member_of_collection` with the count.
+      // Runs only when the collection resolves, so it never leaks existence for
+      // an unknown/foreign id.
+      const confirmed = confirmMemberCount !== undefined;
+      if (!request.query.force && !confirmed && existing && existing.assetIds.length > 0) {
         throw new CollectionInUseError(request.params.id, existing.assetIds);
       }
       // Delete is idempotent and never leaks existence across workspaces: an
       // unknown / foreign id is a silent no-op that still answers 204.
+      //
+      // Membership lives INSIDE the collection document as the flat `assetIds`
+      // list (collection-repo.ts:31 / couch-collection-repo.ts:172), and
+      // `delete()` removes only that document — there is no join table to sweep
+      // and no call into the asset repository on this path. Deleting a confirmed
+      // non-empty collection therefore unlinks its members and nothing more: the
+      // member assets themselves survive untouched, exactly as required.
       await repo.delete(request.params.id);
       // Audit: collection deleted (issue #564). Emitted ONLY when a collection
       // actually existed (resolved above), so an idempotent no-op on an unknown
@@ -434,7 +510,16 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
             action: 'collection.deleted',
             targetType: 'collection',
             targetId: existing.id,
-            detail: { name: existing.name }
+            // `memberCount` records how many memberships this delete dropped;
+            // `confirmedMemberCount` (issue #922) is present only when the
+            // caller explicitly confirmed the count, so the audit trail
+            // distinguishes a confirmed teardown of a non-empty collection from
+            // a plain empty-collection delete or a `?force=true` override.
+            detail: {
+              name: existing.name,
+              memberCount: existing.assetIds.length,
+              ...(confirmed ? { confirmedMemberCount: confirmMemberCount } : {})
+            }
           },
           request.log
         );

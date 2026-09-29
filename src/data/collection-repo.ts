@@ -161,13 +161,29 @@ export class CollectionDeleteProtectedError extends Error {
 // SOFT block: `?force=true` overrides it (ADR-020 decision 2 —
 // member_of_collection is a loose, non-authoritative grouping, so an explicit
 // force may proceed and simply drops the grouping).
+//
+// It is ALSO raised for a STALE member-count confirmation (issue #922): when the
+// caller passes `?confirmMemberCount=N` on DELETE and N does not match the
+// collection's current member count, the delete is refused rather than silently
+// performed against a set the caller has not actually seen. `confirmedCount`
+// carries the (wrong) number the caller asserted so the message can name both
+// sides; the wire envelope is identical either way — reason
+// `member_of_collection` plus the AUTHORITATIVE current `memberCount`, which is
+// exactly what the caller needs to re-confirm.
 export class CollectionInUseError extends Error {
   readonly statusCode = 409;
   constructor(
     readonly id: string,
-    readonly assetIds: readonly string[]
+    readonly assetIds: readonly string[],
+    // Present only on the stale-confirmation path; undefined = no confirmation
+    // was supplied (the original, unchanged in-use block).
+    readonly confirmedCount?: number
   ) {
-    super(`collection ${id} is in use (${assetIds.length} member asset(s))`);
+    super(
+      confirmedCount === undefined
+        ? `collection ${id} is in use (${assetIds.length} member asset(s))`
+        : `collection ${id} has ${assetIds.length} member asset(s), not the confirmed ${confirmedCount}`
+    );
     this.name = 'CollectionInUseError';
   }
 }
