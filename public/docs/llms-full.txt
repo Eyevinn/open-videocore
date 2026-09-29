@@ -2212,6 +2212,7 @@ idpathstringrequired
 Response 200 (application/json)
 {
   "assetId": "string",
+  "currentVersionId": "string",
   "versions": [
     {
       "id": "string",
@@ -2247,7 +2248,8 @@ Response 200 (application/json)
       },
       "parentId": "string"
     }
-  ]
+  ],
+  "versionGroupId": "string"
 }
 
 ---

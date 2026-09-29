@@ -1220,6 +1220,48 @@ export function resolveVersionLinkage(source: Asset): {
   };
 }
 
+// Canonical ordering of a version chain (issue #905, ADR-024): `createdAt`
+// ascending, ties broken by `id` ascending. This is the SAME comparator both
+// repository implementations already apply inside `listVersions`
+// (couch-asset-repo.ts and InMemoryAssetRepository) — it is lifted here so the
+// ordering is stated once and the current-version selector below cannot drift
+// from the order the endpoint actually returns. Ids are ULIDs, so the `id`
+// tiebreak is itself time-ordered and total: two chain members can never
+// compare equal.
+export function compareVersionOrder(a: Asset, b: Asset): number {
+  return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+}
+
+// Identify the CURRENT version of a chain (issue #905, ADR-024).
+//
+// The version chain carries no operator-set "promote to current" marker, so the
+// current version is derived server-side, deterministically, and returned as an
+// explicit `currentVersionId` field on the /versions response. Clients MUST read
+// that field rather than re-deriving it: "last element of the array" is NOT the
+// rule (see the archived carve-out below), and deriving it client-side would
+// bake today's heuristic into every consumer.
+//
+// Rule, in order:
+//   1. The newest member by `compareVersionOrder` whose status is not
+//      `archived`. Archived is this API's soft delete, so a soft-deleted edit
+//      must never be advertised as the current one.
+//   2. If EVERY member is archived, the newest member overall — the chain still
+//      has a well-defined head, it is simply an entirely archived lineage.
+//
+// A single-member chain (an asset that has never been versioned) returns that
+// asset's own id, so `currentVersionId` is always present and always names a
+// member of `versions`. Returns undefined only for an empty list, which
+// `listVersions` never produces for an existing asset.
+export function currentVersionId(versions: readonly Asset[]): string | undefined {
+  if (versions.length === 0) {
+    return undefined;
+  }
+  const ordered = [...versions].sort(compareVersionOrder);
+  const live = ordered.filter((a) => a.status !== 'archived');
+  const head = live.length > 0 ? live[live.length - 1] : ordered[ordered.length - 1];
+  return head.id;
+}
+
 // Deduplicate a tag list while preserving first-seen order (issue #11).
 export function normalizeTags(tags: readonly string[]): string[] {
   const seen = new Set<string>();

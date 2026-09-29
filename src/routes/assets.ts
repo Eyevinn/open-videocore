@@ -29,6 +29,7 @@ import {
   STORAGE_BYTE_CLASSES,
   STORAGE_TIERS,
   allowedReviewTransitions,
+  currentVersionId,
   defaultStorageTiering,
   isUlid,
   normalizeTags,
@@ -3393,13 +3394,31 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
-  // Enumerate every version in an asset's version chain (issue #118).
+  // Enumerate every version in an asset's version chain (issue #118; contract
+  // documented by ADR-024, issue #905).
+  //
   // Workspace-scoped and behind `authenticate`. Returns all assets sharing the
   // target's `versionGroupId`, oldest first, so a client can "show all versions
   // of this asset", compare, or roll back. An asset that has never participated
   // in a clip/export/rewrap version chain returns just itself (single-member
   // chain). DISTINCT from ?parentId= listing, which enumerates rendition/child
   // hierarchy, not edit versions.
+  //
+  // Envelope (ADR-024):
+  //   - assetId          the id that was queried (echoed; always a member)
+  //   - versionGroupId   the lineage id shared by every member. Absent only for
+  //                      a never-versioned asset, which has no group yet.
+  //   - currentVersionId the current version, chosen SERVER-SIDE (see
+  //                      currentVersionId() in asset-repo.ts). Always names a
+  //                      member of `versions`. Clients must read this field and
+  //                      must NOT re-derive it as "the last array element" —
+  //                      archived members are skipped, so the two differ.
+  //   - versions         the whole chain, oldest first (createdAt, then id).
+  //                      Includes `archived` members: this is lineage history,
+  //                      not a live-asset listing. Each member carries
+  //                      `versionOfAssetId`, so the chain's TREE topology is
+  //                      reconstructible client-side (ADR-024: chains branch).
+  //
   //   200 — the version chain (always includes the target); 404 — unknown asset
   app.get(
     '/:id/versions',
@@ -3407,7 +3426,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       schema: {
         params: z.object({ id: z.string() }),
         response: {
-          200: z.object({ assetId: z.string(), versions: z.array(assetSchema) }),
+          200: z.object({
+            assetId: z.string(),
+            versionGroupId: z.string().optional(),
+            currentVersionId: z.string(),
+            versions: z.array(assetSchema)
+          }),
           404: errorSchema
         }
       }
@@ -3417,7 +3441,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!versions) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send({ assetId: request.params.id, versions });
+      // listVersions always includes the target itself, so the chain is
+      // non-empty here and currentVersionId() cannot return undefined. The
+      // fallback keeps the field non-optional in the contract regardless.
+      const current = currentVersionId(versions) ?? request.params.id;
+      return reply.code(200).send({
+        assetId: request.params.id,
+        versionGroupId: versions.find((a) => a.id === request.params.id)?.versionGroupId,
+        currentVersionId: current,
+        versions
+      });
     }
   );
 
