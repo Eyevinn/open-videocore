@@ -1472,6 +1472,27 @@ pre.code-block {
   justify-content: flex-end;
 }
 
+/* Rename-asset dialog (issue #956). Reuses the house form furniture
+   (.form-field, .msg.msg-error); only the two intro lines and the button row
+   need rules, and they follow the three dialogs above. */
+.rename-dialog .rename-dialog-intro,
+.rename-dialog .rename-dialog-stability {
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+.rename-dialog .rename-dialog-stability {
+  color: var(--text-muted);
+}
+.rename-dialog .rename-field-help {
+  font-size: 11px;
+}
+.rename-dialog .modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
 /* Utility */
 .mt8 { margin-top: 8px; }
 .mt12 { margin-top: 12px; }

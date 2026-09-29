@@ -54,6 +54,13 @@ import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete
 // full contract grounding is in that module's header.
 import { mountReviewState } from './review-state.js';
 
+// Asset rename affordance (issue #956): a control for the `name` field that
+// PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
+// could trigger. UI only — no route or schema changes. Full contract grounding,
+// including why a rename cannot move the asset's id, slug or stored object keys,
+// is in that module's header.
+import { mountAssetRename } from './asset-rename.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -142,6 +149,18 @@ function canChangeDeleteLock() {
 // read-only (docs/findings/review-state-contract-897.md §4). Client-side mirror
 // only: the 403 is still handled if it arrives.
 function canChangeReviewState() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may rename an asset (issue #956). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-93) maps
+// PATCH -> write, so PATCH /assets/{id} is refused to a `viewer` with 403 by
+// `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
+// if it arrives.
+function canRenameAsset() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2812,6 +2831,54 @@ async function renderAssetDetailBody(id, bodyEl) {
         // Keep the assets table's lock flag in step; harmless in the detached
         // detail window, which has no table.
         if (assetsTable) assetsTable.reload();
+        await rerenderThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
+    // ── Rename: edit the asset's editorial title (issue #956) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/asset-rename.js:
+    //   PATCH /api/v1/assets/{id} — body carries EXACTLY `name`
+    //        (`updateSchema.name = z.string().min(1).max(256).optional()`,
+    //        src/routes/assets.ts:411, wired at :5532-5541); 200 = the full
+    //        asset, 404 = { error }, 422 = { error } (the lifecycle state
+    //        machine, which a name-only patch cannot trigger).
+    // No API change is involved: this is the affordance for a field the route
+    // already accepted and round-tripped.
+    //
+    // The rename is deliberately name-ONLY. `slug` is minted once at creation
+    // (generateUniqueSlug, src/data/asset-repo.ts:1424) and neither update path
+    // assigns it (InMemoryAssetRepository.update :1620-1701;
+    // CouchAssetRepository.applyPatch, src/data/couch-asset-repo.ts:376-447 —
+    // both copy the existing asset and assign only the keys the patch carries),
+    // and object keys are derived from the ASSET ID, not the name
+    // (sourceObjectKey, src/routes/asset-upload.ts:96-98). So id, slug and
+    // stored files survive a rename untouched.
+    //
+    // The path param must be the ULID: PATCH /:id hands the raw param to
+    // repo.update with no slug fallback, so a slug would 404. `asset.id` is the
+    // ULID even when this pane was opened by slug.
+    mountAssetRename({
+      asset: asset,
+      actionsRow: actionsDiv,
+      // Sits after the lock control and before the pipeline actions:
+      // [Restore?] [Lock | Unlock] [Rename] [Extract Metadata] [Thumbnails].
+      beforeEl: actionsDiv.querySelector('#btn-extract-meta'),
+      canChange: canRenameAsset(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      showMsg: showMsg,
+      messageHost: function () { return bodyEl.querySelector('#action-msg') || bodyEl; },
+      onRenamed: async function (updated, message) {
+        // The list and the search tier both project the same `name` field from
+        // the live asset document, so one reload makes the new name appear in
+        // whichever tier the table is currently showing. Harmless in the
+        // detached detail window, which has no table.
+        if (assetsTable) assetsTable.reload();
+        // Re-read rather than patching the pane locally: the 200 carries the
+        // full asset, and re-rendering from the server is the only way a
+        // silently different stored value becomes visible.
         await rerenderThenMsg(message, updated ? 'success' : 'error');
       },
     });
@@ -6913,6 +6980,10 @@ export {
   getClientRole,
   setClientRole,
   canManageStorage,
+  // Client-side mirror of the ADR-018 write gate for PATCH /assets/{id}
+  // (issue #956). Exported so a DOM/unit test can assert the Rename control is
+  // offered to exactly the roles that hold `write`.
+  canRenameAsset,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
