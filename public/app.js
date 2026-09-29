@@ -2941,9 +2941,18 @@ async function renderCollectionsTab(container) {
         const hasCount = members !== '' && members != null && !Number.isNaN(Number(members));
         const count = hasCount ? Number(members) : null;
         const locked = btn.dataset.locked === '1';
-        const affected = ['The collection record and its list of members are deleted, and the deletion is recorded in the audit log.'];
+        // The delete outcome is NOT seeded unconditionally: in a refused branch
+        // BOTH of its clauses are false. The lock guard throws
+        // CollectionDeleteProtectedError BEFORE `repo.delete(id)` is reached
+        // (collections.ts:404-406 vs :417), and the `collection.deleted` audit
+        // emit sits AFTER the delete inside `if (existing)` (:418-433), so a
+        // refused delete writes no audit entry either. Same construction as the
+        // asset archive dialog above (app.js:1538-1539): refusal bullet first,
+        // outcome only where the delete can actually land — or as an
+        // "Otherwise …" clause when the branch cannot tell in advance.
+        const affected = [];
         // Lock first: it mirrors the handler's guard order, and it is the only
-        // outcome that holds whether or not the collection is empty.
+        // refusal that holds whether or not the collection is empty.
         if (locked) {
           affected.push(
             'This collection is delete-locked, so the API will refuse the delete and nothing will change. ' +
@@ -2951,13 +2960,16 @@ async function renderCollectionsTab(container) {
           );
         } else if (hasCount && count === 0) {
           affected.push('This collection is empty, so the delete will go through.');
+          affected.push('The collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
         } else if (hasCount) {
           affected.push(
             'This collection still holds ' + count + ' asset' + (count === 1 ? '' : 's') +
             ', so the API will refuse the delete and nothing will change. Remove its members first.'
           );
+          affected.push('Otherwise — once its members are removed — the collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
         } else {
           affected.push('If the collection still holds assets, the API refuses the delete and nothing changes — remove its members first.');
+          affected.push('Otherwise the collection record and its list of members are deleted, and the deletion is recorded in the audit log.');
         }
         affected.push('There is no undo: unlike an archived asset, a deleted collection cannot be restored.');
         const ok = await confirmModal({
