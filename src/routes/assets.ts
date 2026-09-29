@@ -28,6 +28,7 @@ import {
   ReferencedByJobError,
   STORAGE_BYTE_CLASSES,
   STORAGE_TIERS,
+  allowedReviewTransitions,
   defaultStorageTiering,
   isUlid,
   normalizeTags,
@@ -212,6 +213,30 @@ const statusSchema = z.enum(ASSET_STATUSES);
 
 // Editorial review state (issue #134), distinct from lifecycle `status`.
 const reviewStateSchema = z.enum(ASSET_REVIEW_STATES);
+
+// Read shape of the review-state sub-resource (issue #897): the asset's current
+// editorial review state plus the moves the review state machine allows from
+// it. `allowedTransitions` is derived server-side from the one transition table
+// that also drives the 422 gate (ALLOWED_REVIEW_TRANSITIONS,
+// src/data/asset-repo.ts), so a client gates on legal moves without keeping its
+// own copy of the graph.
+const reviewStateReadSchema = z.object({
+  reviewState: reviewStateSchema.describe(
+    'The current editorial review state. `draft` for assets that have never ' +
+      'been submitted (including ones stored before the field existed). ' +
+      'INDEPENDENT of the lifecycle `status`.'
+  ),
+  allowedTransitions: z
+    .array(reviewStateSchema)
+    .describe(
+      'The review states this asset may move to next, from its current ' +
+        '`reviewState`. Every value listed here is accepted by ' +
+        'POST /assets/{id}/review-state; every state NOT listed (other than ' +
+        '`reviewState` itself) is refused with 422. The current state is ' +
+        'never listed — re-sending it succeeds as an idempotent no-op but is ' +
+        'not a move. May be empty, which means the state is terminal.'
+    )
+});
 
 // Storage-tier state (ADR-019, issue #556), distinct from lifecycle `status`.
 // The physical byte-location axis (`hot` | `archive`) tracked per byte class,
@@ -5398,11 +5423,47 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
   );
 
+  // GET /:id/review-state — read the asset's editorial review state together
+  // with the moves that are legal from it (issue #897, prerequisite for the
+  // "only legal transitions offered" criterion in #792). The read sits beside
+  // the POST below so a client reads the state and its legal moves from the
+  // same sub-resource it writes to.
+  //
+  // `allowedTransitions` is computed by allowedReviewTransitions()
+  // (src/data/asset-repo.ts) from the SAME table the 422 gate validates
+  // against, so what the API advertises and what it accepts cannot diverge.
+  //   200 — current review state + allowed next states
+  //   404 — unknown/foreign asset (existence not leaked)
+  app.get(
+    '/:id/review-state',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        response: { 200: reviewStateReadSchema, 404: errorSchema }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // Absent reviewState reads as `draft` (the same default applyReviewState
+      // uses), so a pre-#134 asset reports a concrete state and its real moves
+      // rather than an empty one.
+      const current = asset.reviewState ?? 'draft';
+      return reply
+        .code(200)
+        .send({ reviewState: current, allowedTransitions: allowedReviewTransitions(current) });
+    }
+  );
+
   // Transition an asset's editorial review state (issue #134, sub-task of #117).
   // DISTINCT from the lifecycle `status`: this drives a human approval workflow
   // (draft -> in-review -> approved | rejected, with re-review paths) and never
   // touches `status`. Forward-only transitions are validated by the review state
   // machine; an illegal move returns 422 (same mapping as the status machine).
+  // A caller that wants to avoid the 422 reads the legal moves first from
+  // GET /:id/review-state (issue #897) rather than re-deriving them.
   //   200 — review state transitioned, full asset returned
   //   404 — unknown/foreign asset (existence not leaked)
   //   422 — invalid review-state transition
