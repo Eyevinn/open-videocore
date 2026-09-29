@@ -1316,6 +1316,80 @@ function errorToast(message, opts) {
   return close;
 }
 
+// ─── Machine-readable failure reasons (issue #920) ─────────────────────────────
+//
+// errorToast() shows whatever text it is handed, and apiFetch (app.js:260-269)
+// hands it `body.message` — which for a refusal is written for a developer, not
+// an operator: `collection 01J8… is in use (2 member asset(s))`
+// (CollectionInUseError, src/data/collection-repo.ts:160) or `asset 01J8… is
+// protected from deletion by an explicit lock` (DeleteProtectedError,
+// src/data/asset-repo.ts:830). Those internal sentences are what this issue
+// exists to stop showing.
+//
+// CONTRACT GROUNDING (CLAUDE.md rule 7 — read in the live tree, not assumed)
+//
+// The API's shared refusal envelope carries a machine-readable `reason` beside
+// the human `message`. Both routers that emit it declare the SAME closed enum:
+//     src/routes/assets.ts:570       deleteBlockedSchema
+//     src/routes/collections.ts:65   deleteBlockedSchema
+//         reason: z.enum(['referenced_by_job', 'member_of_collection',
+//                         'delete_protected'])
+// and the three values are emitted at:
+//     delete_protected      src/routes/assets.ts:2695, src/routes/collections.ts:262
+//     member_of_collection  src/routes/assets.ts:2707, src/routes/collections.ts:275
+//     referenced_by_job     src/routes/assets.ts:2720
+//
+// `reason` is OPTIONAL on the generic envelope (`reason: z.string().optional()`,
+// src/routes/collections.ts:46), so a body may carry none, or one this client
+// does not know — every lookup below is guarded and falls back to the server's
+// own `message`, then to errorToast's own generic sentence.
+//
+// DELIBERATELY NOT MAPPED: the collection metadata-cap reasons
+// (`description_too_long`, `too_many_tags`, `tag_too_long`, `custom_too_large`;
+// CollectionMetadataCapReason, src/routes/collections.ts:122-126). Their server
+// `message` is already operator-readable AND quotes the live limit
+// (collections.ts:148-177, e.g. "description exceeds the maximum length of 2048
+// characters"). Restating those numbers here would duplicate a server-owned
+// value that can change without this file.
+const ACTION_FAILURE_REASON_COPY = Object.freeze({
+  delete_protected:
+    'A delete lock is set on it, so the API refuses the delete. Clear the lock from the ' +
+    'item’s detail view first — the lock cannot be forced.',
+  member_of_collection:
+    'It is still a member of one or more collections. Remove it from those collections ' +
+    'first, then try again.',
+  referenced_by_job:
+    'A job that is still running references it. Wait for that job to finish or cancel it, ' +
+    'then try again.',
+});
+
+// Map an apiFetch rejection to operator-facing copy, or null when the body
+// carries no reason this client recognises.
+//
+// `err.body` is the parsed error body apiFetch attaches (app.js:271-274).
+// hasOwnProperty, not `in`, so a body whose `reason` is `constructor` or
+// `toString` cannot reach an inherited property.
+function humanizeErrorReason(err) {
+  const body = err && err.body;
+  if (!body || typeof body !== 'object') return null;
+  const reason = typeof body.reason === 'string' ? body.reason : null;
+  if (!reason) return null;
+  if (!Object.prototype.hasOwnProperty.call(ACTION_FAILURE_REASON_COPY, reason)) return null;
+  return ACTION_FAILURE_REASON_COPY[reason];
+}
+
+// Report a failed operator action in app styling (issue #920). The single
+// replacement for `alert('Error: ' + err.message)`: it prefers the humanized
+// reason when the API sent a structured one, falls back to the server's own
+// message, and — via errorToast — to a generic sentence when there is neither.
+//
+// `opts` is errorToast's (action / detail / title / closeLabel / onClose);
+// `action` and `detail` are what the native alert could never carry, so a caller
+// names WHICH action failed and what is consequently still true.
+function reportActionFailure(err, opts) {
+  return errorToast(humanizeErrorReason(err) || (err && err.message), opts);
+}
+
 // ─── Storage-backend remove confirmation (issue #682) ──────────────────────────
 // Format the human-readable in-use error for a 409 body. The authoritative
 // contract (branch issue-679/storage-backend-api-endpoints,
@@ -1824,7 +1898,12 @@ async function renderAssetsTab(container) {
           // "deleted"; the asset is demonstrably still there.
           return true;
         }
-        alert('Error: ' + err.message);
+        // Not a refusal classifyDeleteBlock explains (a 404, a 403, a network
+        // failure): report it in app styling rather than a native alert.
+        reportActionFailure(err, {
+          action: 'Archive asset',
+          detail: '"' + label + '" was not archived. Nothing has changed.',
+        });
         return false;
       }
     },
@@ -1838,7 +1917,14 @@ async function renderAssetsTab(container) {
         });
         return true;
       } catch (err) {
-        alert('Re-drive failed: ' + err.message);
+        // POST /assets/:id/extract-metadata answers 200 | 202 | 404 | 409 | 501,
+        // the failures all on the plain `{ error, message? }` envelope
+        // (src/routes/assets.ts:4059-4068), so there is no `reason` to humanize
+        // here — reportActionFailure falls back to the server's message.
+        reportActionFailure(err, {
+          action: 'Re-drive metadata extraction',
+          detail: 'Asset ' + id + ' is unchanged.',
+        });
         return false;
       }
     },
@@ -2977,6 +3063,15 @@ async function renderJobsTab(container) {
         if (jobId && detailPanel.style.display !== 'none') showJobDetail(jobId, detailPanel);
       });
     },
+    // A failed cancel from the table's own row button (issue #920). Reported
+    // with the same primitive, and the same copy, as the cancel button inside
+    // the detail panel, so one failure does not read two ways.
+    onCancelError: function(err, jobId) {
+      reportActionFailure(err, {
+        action: 'Cancel job',
+        detail: jobId ? 'Job ' + jobId + ' is unchanged.' : undefined,
+      });
+    },
   });
   jobsTableInstance = jobsTable;
   main.appendChild(jobsTable.el);
@@ -3232,7 +3327,10 @@ async function renderJobDetailBody(id, bodyEl, opts) {
           if (typeof opts.afterCancel === 'function') opts.afterCancel();
         } catch (err) {
           cancelBtn.disabled = false;
-          alert('Error: ' + err.message);
+          reportActionFailure(err, {
+            action: 'Cancel job',
+            detail: 'Job ' + job.id + ' is unchanged.',
+          });
         }
       });
       actions.appendChild(cancelBtn);
@@ -3545,18 +3643,20 @@ async function renderCollectionsTab(container) {
           await apiFetch('/collections/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
           loadCollections();
         } catch (err) {
-          // Smoke-test call site for errorToast (issue #918). Chosen because it
-          // already sits directly behind a confirmModal, so this one flow now
-          // exercises both primitives end to end: confirm -> act -> report.
-          // The remaining native alert() sites are migrated separately.
+          // First call site for errorToast (issue #918), now routed through
+          // reportActionFailure (issue #920) because this is the path that most
+          // often carries a structured reason.
           //
           // DELETE /api/v1/collections/{id} (openapi.json) answers 204 | 404 |
           // 409. The 409 body is { error: 'delete_blocked', message, reason:
           // 'referenced_by_job'|'member_of_collection'|'delete_protected',
-          // blockedBy }, and apiFetch (app.js:259-275) has already reduced that
-          // to the server's human `message`, so err.message is the right text to
-          // show verbatim — it explains WHY the delete was refused.
-          errorToast(err.message, {
+          // blockedBy } (deleteBlockedSchema, src/routes/collections.ts:62-70;
+          // emitted at :262 and :275). apiFetch reduces that body to the server's
+          // `message`, which for the in-use case is the internal sentence
+          // `collection <id> is in use (N member asset(s))`
+          // (src/data/collection-repo.ts:160) — so the reason is humanized here
+          // and only falls back to that message when no reason is recognised.
+          reportActionFailure(err, {
             action: 'Delete collection',
             detail: 'Collection "' + label + '" was not deleted.',
           });
@@ -3716,7 +3816,10 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
             await apiFetch('/collections/' + encodeURIComponent(id) + '/assets/' + encodeURIComponent(btn.dataset.assetId), { method: 'DELETE' });
             showCollectionDetail(id, detailPanel, onRefresh);
           } catch (err) {
-            alert('Error: ' + err.message);
+            reportActionFailure(err, {
+              action: 'Remove asset from collection',
+              detail: 'Asset ' + btn.dataset.assetId + ' is still a member of this collection.',
+            });
           }
         });
       });
@@ -4112,7 +4215,10 @@ async function renderProfilesTab(container) {
           listSection.querySelector('#pf-yaml-view').innerHTML = '';
           loadProfiles();
         } catch (err) {
-          alert('Error: ' + err.message);
+          reportActionFailure(err, {
+            action: 'Delete profile',
+            detail: 'Profile "' + label + '" was not deleted.',
+          });
         }
       });
     });
@@ -4339,7 +4445,10 @@ async function renderWebhooksTab(container) {
           await apiFetch('/webhooks/' + encodeURIComponent(btn.dataset.id), { method: 'DELETE' });
           loadWebhooks();
         } catch (err) {
-          alert('Error: ' + err.message);
+          reportActionFailure(err, {
+            action: 'Delete webhook',
+            detail: 'The registration for ' + url + ' is still in place.',
+          });
         }
       });
     });
@@ -4965,7 +5074,10 @@ async function openBucketBrowser(browser, bucket, prefix) {
         await apiFetch('/storage/buckets/' + encodeURIComponent(bucket) + '/objects/' + path, { method: 'DELETE' });
         openBucketBrowser(browser, bucket, prefix);
       } catch (err) {
-        alert('Error: ' + err.message);
+        reportActionFailure(err, {
+          action: 'Delete object',
+          detail: '"' + label + '" is still in bucket "' + bucket + '".',
+        });
       }
     });
   });
@@ -6561,6 +6673,12 @@ export {
   // through every openModal route.
   errorToast,
   openModal,
+  // App-styled action-failure reporting (issue #920). Exported so a DOM/unit
+  // test can assert a structured `reason` becomes operator-facing copy and that
+  // an unknown/absent one falls back to the server message.
+  reportActionFailure,
+  humanizeErrorReason,
+  ACTION_FAILURE_REASON_COPY,
   // Per-row test-connection action (issue #683). Exported so a DOM/unit test can
   // exercise the shared probe helper + the pure spinner/result row renderers
   // without a live probe.

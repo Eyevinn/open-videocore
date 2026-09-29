@@ -30,7 +30,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { errorToast, TAB_RENDERERS } from '../public/app.js';
+import { ACTION_FAILURE_REASON_COPY, errorToast, TAB_RENDERERS } from '../public/app.js';
 
 // Read from the repo root (vitest runs with cwd = project root). `import.meta.url`
 // is not a file: URL under the happy-dom environment, so it cannot be used here.
@@ -262,9 +262,13 @@ describe('Collections tab delete failure uses errorToast (issue #918 AC3)', () =
     expect(el).toBeTruthy();
     expect(el!.querySelector('.error-action')!.textContent)
       .toBe('Delete collection failed.');
-    // apiFetch reduces the 409 body to its human `message` (app.js:260-269), so
-    // the operator learns WHY the delete was refused, not just that it failed.
-    expect(el!.querySelector('.msg-error')!.textContent).toBe(BLOCKED.message);
+    // The 409 carries a structured `reason` (src/routes/collections.ts:275), so
+    // the operator gets the humanized copy for it — NOT the server's internal
+    // sentence (issue #920). The fallback to `message` is covered separately, in
+    // test/error-reason-rendering.test.ts.
+    expect(el!.querySelector('.msg-error')!.textContent)
+      .toBe(ACTION_FAILURE_REASON_COPY.member_of_collection);
+    expect(el!.querySelector('.msg-error')!.textContent).not.toBe(BLOCKED.message);
     // Names the collection by name, and says plainly that nothing changed.
     expect(el!.querySelector('.error-detail')!.textContent)
       .toBe('Collection "Summer campaign rushes" was not deleted.');
@@ -273,22 +277,17 @@ describe('Collections tab delete failure uses errorToast (issue #918 AC3)', () =
 
 // ─── Scope discipline (issue #918 AC2) ─────────────────────────────────────────
 
-describe('scope: no unrelated alert() sites were migrated (issue #918 AC2)', () => {
-  it('migrates exactly one native alert() site', () => {
+describe('no native alert() remains on an operator path (issue #920 AC1)', () => {
+  it('has migrated every native alert() site in app.js', () => {
     // Strip line comments so prose mentioning alert() cannot mask or fake a call.
     const code = APP_JS.split('\n')
       .map((line) => line.replace(/\/\/.*$/, ''))
       .join('\n');
-    const natives = code.match(/(^|[^\w.])alert\s*\(/g) || [];
-    // 8 native alert() sites existed before this change; exactly one (the
-    // Collections delete failure) was converted as the AC's smoke test. The
-    // remaining 7 are tracked separately and must not be touched here.
-    expect(natives.length).toBe(7);
+    // 8 native sites existed before #918; #918 migrated one and #920 the other 7.
+    expect(code.match(/(^|[^\w.])alert\s*\(/g) || []).toHaveLength(0);
 
-    // And the primitive is wired at exactly that one site: one definition plus
-    // one call, so exactly two `errorToast(` occurrences in live code.
-    const occurrences = code.match(/errorToast\s*\(/g) || [];
-    expect(occurrences.length).toBe(2);
+    // Every one of them now goes through the shared primitive.
     expect(code).toContain('function errorToast(');
+    expect(code).toContain('function reportActionFailure(');
   });
 });
