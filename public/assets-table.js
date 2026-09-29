@@ -432,8 +432,14 @@ function buildColumns(renderCtx) {
               escHtml(a.id) +
               '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
             : '') +
+          // `data-name` carries the SAME human-readable label the "Name / Title"
+          // column renders (a.name || a.slug) so the archive confirmation can
+          // name its subject without a second lookup (issue #919). Empty when the
+          // asset has neither; the caller supplies its own fallback phrase.
           '<button class="btn-danger asset-delete-btn" data-id="' +
           escHtml(a.id) +
+          '" data-name="' +
+          escHtml(a.name || a.slug || '') +
           '" style="font-size:12px;padding:3px 8px;">Archive</button>'
         );
       },
@@ -479,7 +485,10 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //   fmtDate(val) -> string
 //   isAssetWedged(asset) -> boolean
 //   onRowClick(asset, tr)               — open the detail panel for a row.
-//   onDelete(id) -> Promise             — archive action; table reloads after.
+//   onDelete(id, name) -> Promise       — archive action; table reloads after.
+//                                         `name` is the row's human-readable
+//                                         label (issue #919) so the caller's
+//                                         confirmation can name the subject.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
 //   win (optional)                      — injectable window for URL sync (tests).
 //
@@ -597,7 +606,7 @@ export function createAssetsTable(deps) {
       btn.addEventListener('click', async function (e) {
         e.stopPropagation();
         if (typeof d.onDelete !== 'function') return;
-        const ok = await d.onDelete(btn.dataset.id);
+        const ok = await d.onDelete(btn.dataset.id, btn.dataset.name || '');
         if (ok !== false) reload();
       });
     });
