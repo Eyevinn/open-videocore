@@ -13066,6 +13066,82 @@
       }
     },
     "/api/v1/assets/{id}/review-state": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "reviewState": {
+                      "type": "string",
+                      "enum": [
+                        "draft",
+                        "in-review",
+                        "approved",
+                        "rejected"
+                      ],
+                      "description": "The current editorial review state. `draft` for assets that have never been submitted (including ones stored before the field existed). INDEPENDENT of the lifecycle `status`."
+                    },
+                    "allowedTransitions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "draft",
+                          "in-review",
+                          "approved",
+                          "rejected"
+                        ]
+                      },
+                      "description": "The review states this asset may move to next, from its current `reviewState`. Every value listed here is accepted by POST /assets/{id}/review-state; every state NOT listed (other than `reviewState` itself) is refused with 422. The current state is never listed \u2014 re-sending it succeeds as an idempotent no-op but is not a move. May be empty, which means the state is terminal."
+                    }
+                  },
+                  "required": [
+                    "reviewState",
+                    "allowedTransitions"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "requestBody": {
           "required": true,

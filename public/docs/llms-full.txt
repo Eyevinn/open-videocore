@@ -1755,6 +1755,25 @@ Response 200 (application/json)
 }
 Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
 
+  GET /api/v1/assets/{id}/review-state
+
+  Get an asset's editorial review state and the transitions that are legal from it.
+
+  Parameters
+NameInTypeRequired
+idpathstringrequired
+
+  Response
+Response 200 (application/json)
+{
+  "reviewState": "draft",
+  "allowedTransitions": [
+    "draft"
+  ]
+}
+Field notes- reviewState — The current editorial review state. `draft` for assets that have never been submitted (including ones stored before the field existed). INDEPENDENT of the lifecycle `status`.
+- allowedTransitions — The review states this asset may move to next, from its current `reviewState`. Every value listed here is accepted by POST /assets/{id}/review-state; every state NOT listed (other than `reviewState` itself) is refused with 422. The current state is never listed — re-sending it succeeds as an idempotent no-op but is not a move. May be empty, which means the state is terminal.
+
   POST /api/v1/assets/{id}/review-state
 
   Transition an asset's editorial review state (draft / in-review / approved / rejected).
@@ -3511,7 +3530,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (117 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (118 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3521,7 +3540,7 @@ Optional services4
 Discover and provision add-on OSC services for a workspace.
 Profiles8
 Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
-Assets50
+Assets51
 Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
 Jobs3
 Background job status for asynchronous asset operations.
@@ -4372,7 +4391,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 117 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 118 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.
