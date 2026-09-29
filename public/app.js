@@ -31,6 +31,12 @@ import { applyThumbnail } from './thumbnail-url.js';
 // button; slugs are shown under their own "Slug" header. Contract grounding for
 // which value each endpoint accepts lives in public/copy-id.js.
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Delete-lock detail surface (issue #895): the "Delete protection" block and the
+// lock / unlock / edit-note actions on the asset detail view, implementing
+// docs/ux/asset-lock-state-spec.md §4. State derivation and copy live in
+// public/lock-state.js (#894) and public/lock-detail.js; the contract grounding
+// for PUT/DELETE /assets/{id}/lock is in the latter's header.
+import { mountDeleteProtection } from './lock-detail.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -89,6 +95,22 @@ function setClientRole(role) {
 // viewer is read-only and does not get the management surface. This is the
 // "operator/admin" gate from issue #680, expressed in the codebase's roles.
 function canManageStorage() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may set or clear an asset's delete lock
+// (issue #895). Bound to the SAME matrix, read before this was written:
+// `MATRIX` (src/auth/authorize.ts:54-58) gives `write` and `delete` to `editor`
+// and `admin` and neither to `viewer`; `methodToAction` (:79-93) maps
+// PUT -> write and DELETE -> delete, and `resourceAuthorizationPreHandler('asset')`
+// (:126, registered at src/routes/assets.ts:1718) applies it to both lock
+// routes. So the two roles that may lock are exactly editor and admin. There is
+// no scope/claim model and no capability endpoint in this API, so this is a
+// client-side MIRROR of the server rule, not a substitute for it: the 403
+// (`AUTHZ_FORBIDDEN_ERROR = 'forbidden_insufficient_role'`, :99) is still
+// handled when it arrives (docs/ux/asset-lock-state-spec.md §4.4).
+function canChangeDeleteLock() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2312,6 +2334,11 @@ async function renderAssetDetailBody(id, bodyEl) {
     const actionMsg = document.createElement('div');
     actionMsg.id = 'action-msg';
     actionMsg.className = 'mt8';
+    // One-line outcomes (lock set/cleared, restore, extraction) land here after
+    // the action completes. Announced politely so a change that does not move
+    // focus is still reported to assistive technology
+    // (docs/ux/asset-lock-state-spec.md §8).
+    actionMsg.setAttribute('aria-live', 'polite');
     body.appendChild(actionMsg);
 
     const thumbArea = document.createElement('div');
@@ -2354,22 +2381,74 @@ async function renderAssetDetailBody(id, bodyEl) {
     // The path param must be the ULID: unlike GET /:id, the restore handler does
     // NOT resolve a slug (it passes the raw param to repo.restore), so a slug
     // would 404. `asset.id` is the ULID even when this pane was opened by slug.
+    // Re-render from the server after a state change, then report the outcome in
+    // the freshly built #action-msg (the re-render replaces the old one). Shared
+    // by the restore action (#889) and the lock actions (#895), both of which
+    // must re-read rather than patch the view optimistically.
+    var rerenderThenMsg = async function (text, kind) {
+      try {
+        await renderAssetDetailBody(id, bodyEl);
+      } catch (_) {
+        // The re-read itself failed (e.g. the asset is now a tombstone). The
+        // renderer has already written its own error into bodyEl; don't mask it.
+        return;
+      }
+      var host = bodyEl.querySelector('#action-msg') || bodyEl;
+      showMsg(host, text, kind);
+    };
+
+    // ── Delete protection: lock / unlock (issue #895) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/lock-detail.js:
+    //   PUT  /api/v1/assets/{id}/lock — body REQUIRED ({} when empty), optional
+    //        `reason` (<=1024) and `lockedBy` (<=256); 200 = the full asset,
+    //        404 = { error }. (openapi.json .paths["/api/v1/assets/{id}/lock"].put;
+    //        src/routes/assets.ts:5575-5601)
+    //   DELETE /api/v1/assets/{id}/lock — no body, no query params; 200 = the
+    //        full asset with `deleteLock` ABSENT, 404 = { error }.
+    //        (…].delete; src/routes/assets.ts:5609-5623)
+    // Both write paths re-render from the returned asset rather than patching
+    // the view locally: that is the only way the UI learns the server-generated
+    // `lockedAt`, and the only way a silently dropped body key becomes visible
+    // (docs/ux/asset-lock-state-spec.md §4.4, gap H6).
+    //
+    // NOT implemented, because the contract does not support it: the issue's
+    // "records the provenance entry format" criterion. The repo appends the
+    // provenance entry itself — { at, by: 'user', op: 'lock'|'unlock',
+    // detail: reason } (applyDeleteLock, src/data/asset-repo.ts:1076-1085) —
+    // and nothing exposes it: `assetSchema` has no `provenance` property, so no
+    // endpoint returns it, and neither lock handler emits an audit entry
+    // (spec §9 gaps H4/H5). The client's only influence on it is the optional
+    // `reason` it sends, which becomes `detail`. No history timeline is built
+    // here and no copy claims one.
+    //
+    // The lock path takes the ULID (`asset.id`), which the detail pane holds
+    // even when it was opened by slug.
+    mountDeleteProtection({
+      asset: asset,
+      actionsRow: actionsDiv,
+      // Lock sits first among the always-present actions because it gates the
+      // destructive one: [Restore?] [Lock | Unlock] [Extract Metadata]
+      // [Thumbnails] (spec §4.1).
+      beforeEl: actionsDiv.querySelector('#btn-extract-meta'),
+      canChange: canChangeDeleteLock(),
+      fmtDate: fmtDate,
+      apiFetch: apiFetch,
+      openModal: openModal,
+      confirmModal: confirmModal,
+      showMsg: showMsg,
+      messageHost: function () { return bodyEl.querySelector('#action-msg') || bodyEl; },
+      onChanged: async function (updated, message) {
+        // Keep the assets table's lock flag in step; harmless in the detached
+        // detail window, which has no table.
+        if (assetsTable) assetsTable.reload();
+        await rerenderThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
     var restoreBtn = body.querySelector('#btn-restore-asset');
     if (restoreBtn) {
-      // Re-render from the server after a state change, then report the outcome
-      // in the freshly built #action-msg (the re-render replaces the old one).
-      var rerenderThenMsg = async function (text, kind) {
-        try {
-          await renderAssetDetailBody(id, bodyEl);
-        } catch (_) {
-          // The re-read itself failed (e.g. the asset is now a tombstone). The
-          // renderer has already written its own error into bodyEl; don't mask it.
-          return;
-        }
-        var host = bodyEl.querySelector('#action-msg') || bodyEl;
-        showMsg(host, text, kind);
-      };
-
       restoreBtn.addEventListener('click', async function () {
         actionMsg.innerHTML = '';
         var prevLabel = restoreBtn.textContent;
