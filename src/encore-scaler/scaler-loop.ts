@@ -40,6 +40,7 @@ import {
 import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
+  ACTIVE_PAGE_SIZE,
   fetchEncoreActiveState,
   type EncoreActiveState
 } from './encore-active-state.js';
@@ -54,6 +55,45 @@ export const DEFAULT_CALLBACK_TRUST_TIMEOUT_MS = 60_000;
 // re-raised as silently dropped, closing the ~4.4s race between Encore dropping
 // the finished job from its active set and the poller decrementing activeJobs.
 export const DEFAULT_RECONCILE_GRACE_MS = 10_000;
+
+// #769 review finding 4 — PARTIAL-VISIBILITY DROP POLICY.
+//
+// The defect #769 exists to fix is "the job is running on pool instance B, the
+// keys.jobInstance mapping says A, so reconcile fails a healthy job". The
+// pool-wide index fixes that whenever B's active set could be read. It does NOT
+// fix it when B could not be read — B unreachable, B's pool entry unparseable,
+// or B's active page truncated. In all three cases B contributes no positive
+// evidence, `instancesActiveFor` comes back empty, and the same healthy job is
+// failed. Refusing to diff a truncated instance against its OWN tracked jobs
+// (pass 2 below) does not help here: the job is being classified against A.
+//
+// POLICY CHOSEN (over "fail toward drop" and over "never drop under partial
+// visibility"): a drop decided WITHOUT full pool visibility is WITHHELD and
+// re-examined on the next pass, and only becomes terminal once the job has been
+// classified dropped on this many consecutive partial-visibility passes.
+//
+//   - It fixes the headline class. The overwhelmingly common case is one pass of
+//     partial visibility — an instance mid-spawn, a transient 5xx, a page that
+//     was briefly over the clamp. One more tick and B answers, the pool-wide
+//     index sees the job, and the drop is suppressed for good.
+//   - It is bounded, unlike "never drop under partial visibility". A pool entry
+//     that is permanently unreachable would otherwise strand every job that ever
+//     mapped to another instance in `running` forever, with no retry and no
+//     terminal state — trading a false FAILED for a permanent limbo, which is
+//     worse.
+//   - It is honest about what it costs: one extra reconcile interval of latency
+//     on a genuine drop, but only when visibility is already degraded.
+//
+// A full-visibility pass is unaffected and still decides immediately.
+export const PARTIAL_VISIBILITY_DROP_PASSES = 2;
+
+// TTL on the per-job counter behind the gate above. Long enough that consecutive
+// reconcile passes (tick interval, seconds) accumulate, short enough that a job
+// which stopped being a drop candidate and later becomes one again does not
+// inherit a stale count. The counter is also cleared explicitly whenever the job
+// is observed active, so this is a backstop against leaked keys, not the primary
+// reset.
+export const PARTIAL_VISIBILITY_DROP_TTL_MS = 10 * 60_000;
 
 // #778: how often the tick sweeps OSC for scaler-owned instances with no pool
 // record when EncoreScalerConfig.orphanReapIntervalMs is left to the registry's
@@ -467,13 +507,15 @@ export class EncoreScalerLoop {
   //     whose real in-flight state we could not confirm is empty.
   //
   // `truncated` (#769 review finding 2) says `activeExternalIds` is only PART of
-  // what Encore reports active (more than one page of 100 for a status). `count`
-  // is still exact, so a count correction is safe, but no diff may conclude a
-  // tracked job vanished from a truncated instance.
+  // what Encore reports active (more than one page of ACTIVE_PAGE_SIZE for a
+  // status). `count` is still exact, so a count correction is safe, but no diff
+  // may conclude a tracked job vanished from a truncated instance.
   //
-  // Contract: Encore /encoreJobs/search/findByStatus returns Spring HATEOAS pages
-  // { _embedded: { encoreJobs: [{ id, externalId, ... }] }, page: { totalElements } }
-  // (verified in encore-callback-poller.ts:505-508, SVT Encore, 2026-07-07).
+  // Contract: recorded as data in encore-paging-contract.ts and pinned by
+  // test/encore-findbystatus-contract.test.ts against
+  // docs/contracts/encore-findbystatus-paging.json — the endpoint, the
+  // `page.totalElements` all-pages semantics the truncation guard rests on, and
+  // the `_links.next` equivalence (#769 review finding 2).
   //
   // The query itself now lives in encore-active-state.ts so the orphan reaper
   // (instance-pool.ts reapOrphanedInstances) runs the IDENTICAL check before it
@@ -769,6 +811,11 @@ export class EncoreScalerLoop {
   // pass proved is the real owner of a job keys.jobInstance had mapped elsewhere
   // — suppressing the false drop without repairing the mapping and the holder's
   // count would leave the divergence to recur every tick (#769 review finding 3).
+  //
+  // When pass 1 could not read EVERY instance, the pool-wide answer is partial
+  // and a drop decided on it is WITHHELD for a pass rather than written
+  // terminally FAILED (#769 review finding 4) — the policy, and the alternatives
+  // weighed against it, are documented on PARTIAL_VISIBILITY_DROP_PASSES.
   async reconcile(): Promise<void> {
     const { redis, workspaceId } = this.config;
 
@@ -814,12 +861,18 @@ export class EncoreScalerLoop {
     // a `(none)` line interpretable. Three ways an instance lands here:
     //   (unparseable) — its pool-hash entry is not valid JSON,
     //   (unreachable) — fetchRealActiveState could not confirm its state,
-    //   (truncated)   — Encore reported more active jobs than the one page of 100
-    //                   per status we fetch, so the returned externalIds are a
-    //                   PARTIAL set (#769 review finding 2). A truncated instance
-    //                   is still indexed — an externalId Encore DID return is
-    //                   proof the job is alive — but its silence proves nothing,
-    //                   so it counts as unchecked for any "active nowhere" claim.
+    //   (truncated)   — Encore reported more active jobs than the one page of
+    //                   ACTIVE_PAGE_SIZE per status we fetch, so the returned
+    //                   externalIds are a PARTIAL set (#769 review finding 2). A
+    //                   truncated instance is still indexed — an externalId
+    //                   Encore DID return is proof the job is alive — but its
+    //                   silence proves nothing, so it counts as unchecked for any
+    //                   "active nowhere" claim.
+    //
+    // #769 review finding 4: this list is no longer only a log field. While it is
+    // non-empty the pool view is PARTIAL, and a drop decided on a partial view is
+    // withheld for a pass rather than written terminally FAILED — see
+    // PARTIAL_VISIBILITY_DROP_PASSES.
     const poolUncheckedInstances: string[] = [];
     // The parsed record + real state per instance, captured once by the full
     // pass and reused by the classification loop below — so classification sees
@@ -906,6 +959,63 @@ export class EncoreScalerLoop {
       return found;
     };
 
+    // #769 review finding 4: is this pass deciding on a COMPLETE view of the
+    // pool? `instancesActiveFor` can only ever answer over the instances pass 1
+    // confirmed, so while any instance is unreachable, unparseable or truncated,
+    // an empty answer means "not found on the instances we could read" — not
+    // "not running anywhere". See PARTIAL_VISIBILITY_DROP_PASSES for the policy
+    // this drives and why.
+    const poolVisibilityIsPartial = poolUncheckedInstances.length > 0;
+
+    // Clear a job's partial-visibility counter. Best-effort and deliberately
+    // total: any failure (including a redis stub without `del`) must never
+    // affect the decision that just ran.
+    const clearPartialVisibilityGate = async (jobId: string): Promise<void> => {
+      try {
+        await redis.del(keys.partialVisibilityDropPasses(jobId));
+      } catch {
+        // The key carries a TTL, so a failed delete self-heals.
+      }
+    };
+
+    // Count this pass against the job's consecutive partial-visibility drop
+    // classifications and report whether the drop may now become terminal.
+    // Returns the new count alongside the verdict so the log can say how far
+    // through the gate the job is.
+    const admitPartialVisibilityDrop = async (
+      jobId: string
+    ): Promise<{ admit: boolean; passes: number }> => {
+      let passes = 0;
+      try {
+        const raw = await redis.get(keys.partialVisibilityDropPasses(jobId));
+        passes = Number(raw ?? '0') || 0;
+      } catch {
+        // Unreadable counter => treat as the first pass. This biases toward
+        // WITHHOLDING, the conservative direction for this gate: the job stays
+        // `running` and is re-examined, rather than being written terminally
+        // FAILED on evidence we could not even count. (The #708 completion
+        // grace check fails the other way, OPEN, because there a read failure
+        // must not SUPPRESS a drop; here a read failure must not CAUSE one.)
+        passes = 0;
+      }
+      passes += 1;
+      if (passes >= PARTIAL_VISIBILITY_DROP_PASSES) {
+        return { admit: true, passes };
+      }
+      try {
+        await redis.set(
+          keys.partialVisibilityDropPasses(jobId),
+          String(passes),
+          'PX',
+          PARTIAL_VISIBILITY_DROP_TTL_MS
+        );
+      } catch {
+        // If the counter cannot be persisted the job simply gets re-examined
+        // from zero next pass — still withheld, never wrongly failed.
+      }
+      return { admit: false, passes };
+    };
+
     // Instances this pass PROVED own a tracked job that keys.jobInstance had
     // mapped elsewhere (#769 review finding 3). Their tracked activeJobs is
     // corrected after pass 2 — see the targeted correction below.
@@ -925,6 +1035,10 @@ export class EncoreScalerLoop {
         if (!real) continue; // could not confirm — leave the record as-is
         const actualCount = real.count;
         const activeExternalIds = real.activeExternalIds;
+        // #769 review finding 4: externalIds whose drop was WITHHELD this pass
+        // because pool visibility was partial. Declared out here because the
+        // tracked count correction at the end of the block has to see it.
+        const withheldForInstance: string[] = [];
 
         if (record.activeJobs !== actualCount) {
           // eslint-disable-next-line no-console
@@ -943,21 +1057,22 @@ export class EncoreScalerLoop {
           // instance that Encore no longer lists is dropped.
           //
           // #769 review finding 2: NOT when this instance's active page was
-          // truncated. fetchRealActiveState asks for one page of 100 per status,
-          // so an instance with more than 100 QUEUED or 100 IN_PROGRESS jobs
-          // returns a partial externalId set; diffing against it would classify
-          // every tracked job sitting off page 0 as dropped. `count` comes from
-          // Encore's totalElements and is still exact, so the count correction
-          // below still runs — only the drop diff is withheld.
+          // truncated. fetchRealActiveState asks for ONE page of ACTIVE_PAGE_SIZE
+          // per status, so an instance with more QUEUED or IN_PROGRESS jobs than
+          // that returns a partial externalId set; diffing against it would
+          // classify every tracked job sitting off page 0 as dropped. `count`
+          // comes from Encore's totalElements and is still exact, so the count
+          // correction below still runs — only the drop diff is withheld.
           if (actualCount < record.activeJobs && real.truncated) {
             // eslint-disable-next-line no-console
             console.warn(
               '[encore-scaler] reconcile: instance %s returned a TRUNCATED active ' +
-                'page (Encore reports %d active, one page of 100 per status was ' +
+                'page (Encore reports %d active, one page of %d per status was ' +
                 'fetched) — skipping drop classification for it this pass; its ' +
                 'tracked count is still corrected (#769)',
               instanceId,
-              actualCount
+              actualCount,
+              ACTIVE_PAGE_SIZE
             );
           }
           if (actualCount < record.activeJobs && !real.truncated) {
@@ -983,7 +1098,14 @@ export class EncoreScalerLoop {
               // callback poller / cancel already settled has a terminal status.
               const st = (trackedStatuses[jobId] ?? '').toUpperCase();
               if (st !== 'RUNNING' && st !== 'QUEUED') continue;
-              if (activeExternalIds.has(jobId)) continue; // still live on Encore
+              if (activeExternalIds.has(jobId)) {
+                // Still live on Encore, right here on its mapped instance. Any
+                // partial-visibility drop counter this job accumulated on an
+                // earlier pass is stale — "consecutive" means consecutive
+                // (#769 review finding 4).
+                await clearPartialVisibilityGate(jobId);
+                continue;
+              }
 
               // #769: the job is gone from THIS instance's active set, but
               // keys.jobInstance is a single value overwritten on every
@@ -1026,8 +1148,16 @@ export class EncoreScalerLoop {
                 // is reported — two instances running the same externalId is a
                 // duplicate dispatch, a different bug, and guessing an owner
                 // would hide it. The holder's own tracked activeJobs is corrected
-                // upward by this same pass (pass 2 no longer skips idle-tracked
-                // instances), so the pool accounting converges too.
+                // by the TARGETED post-pass-2 repair loop at the end of this
+                // method (`for (const instanceId of mappingRepairedOnto)`), not
+                // by pass 2 itself — pass 2 still skips instances tracked at
+                // activeJobs === 0, which is exactly the state a silently-adopted
+                // holder is usually in (#769 review finding 6).
+                //
+                // The job is demonstrably alive, so any partial-visibility drop
+                // counter it carries is void (#769 review finding 4).
+                await clearPartialVisibilityGate(jobId);
+
                 let jobInstanceRepairedTo = '(not-repaired)';
                 if (activeElsewhere.length === 1) {
                   try {
@@ -1091,6 +1221,52 @@ export class EncoreScalerLoop {
                   continue;
                 }
               }
+
+              // #769 review finding 4: the job is active on none of the
+              // instances pass 1 could READ — which is only the same thing as
+              // "active nowhere in the pool" when pass 1 could read all of them.
+              // With any instance unchecked, this job may be running right now
+              // on the one we could not see, and failing it here would be the
+              // very defect #769 exists to fix, merely relocated from a stale
+              // mapping to a blind spot. Withhold the drop and re-examine next
+              // tick; only a job that survives PARTIAL_VISIBILITY_DROP_PASSES
+              // consecutive such passes is failed, so a permanently unreachable
+              // pool entry cannot strand jobs in `running` forever.
+              if (poolVisibilityIsPartial) {
+                const gate = await admitPartialVisibilityDrop(jobId);
+                if (!gate.admit) {
+                  // eslint-disable-next-line no-console
+                  console.warn(
+                    '[encore-scaler] reconcile: WITHHOLDING drop of job %s — the ' +
+                      'pool was only PARTIALLY visible this pass (unchecked: %s). ' +
+                      'keys.jobInstance=%s reconciledInstance=%s ' +
+                      'consecutivePartialVisibilityPasses=%d/%d; re-examining next ' +
+                      'tick (#769)',
+                    jobId,
+                    poolUncheckedInstances.join(',') || '(none)',
+                    mappedInstanceId,
+                    instanceId,
+                    gate.passes,
+                    PARTIAL_VISIBILITY_DROP_PASSES
+                  );
+                  withheldForInstance.push(jobId);
+                  continue;
+                }
+                // eslint-disable-next-line no-console
+                console.warn(
+                  '[encore-scaler] reconcile: job %s has now been classified ' +
+                    'dropped on %d consecutive passes with only PARTIAL pool ' +
+                    'visibility (unchecked: %s) — treating the drop as terminal ' +
+                    '(#769)',
+                  jobId,
+                  gate.passes,
+                  poolUncheckedInstances.join(',') || '(none)'
+                );
+              }
+              // The drop is being raised, so the gate's counter has done its job
+              // — clear it rather than leaving it to age out.
+              await clearPartialVisibilityGate(jobId);
+
               droppedForInstance.push(jobId);
 
               // #768: capture enough state at the exact drop-classification
@@ -1165,18 +1341,44 @@ export class EncoreScalerLoop {
             }
           }
 
-          record.activeJobs = actualCount;
-          // Do NOT update lastIdleAt here. The idle clock must only advance when
-          // the callback poller confirms the completion (via decrementActiveJobs).
-          // Setting lastIdleAt during reconciliation would start the teardown
-          // countdown before the poller has had a chance to process the message,
-          // causing the instance to be destroyed while the poller is still
-          // fetching from it.
-          await redis.hset(
-            keys.pool(workspaceId),
-            instanceId,
-            JSON.stringify(record)
-          );
+          // #769 review finding 4: do NOT adopt Encore's lower count while a
+          // drop off this instance is being withheld. `actualCount <
+          // record.activeJobs` is the ONLY thing that brings this block back to
+          // life on the next pass; writing the corrected count here would make
+          // the very next pass see tracked === actual, skip classification
+          // entirely, and leave the withheld job stuck in `running` with the
+          // gate never able to advance — turning a one-pass delay into permanent
+          // limbo. The tracked count therefore stays deliberately high for the
+          // at-most PARTIAL_VISIBILITY_DROP_PASSES passes the gate runs for. The
+          // cost is bounded and one-directional: an over-counted instance is
+          // treated as busier than it is, so dispatch under-subscribes it and
+          // scale-down leaves it alone — never the reverse.
+          if (withheldForInstance.length > 0) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[encore-scaler] reconcile: leaving instance %s tracked at %d ' +
+                '(Encore reports %d) because the drop of %s is withheld pending ' +
+                'full pool visibility — the count is corrected once those jobs ' +
+                'resolve (#769)',
+              instanceId,
+              record.activeJobs,
+              actualCount,
+              withheldForInstance.join(',')
+            );
+          } else {
+            record.activeJobs = actualCount;
+            // Do NOT update lastIdleAt here. The idle clock must only advance when
+            // the callback poller confirms the completion (via decrementActiveJobs).
+            // Setting lastIdleAt during reconciliation would start the teardown
+            // countdown before the poller has had a chance to process the message,
+            // causing the instance to be destroyed while the poller is still
+            // fetching from it.
+            await redis.hset(
+              keys.pool(workspaceId),
+              instanceId,
+              JSON.stringify(record)
+            );
+          }
         }
       } catch {
         // Swallow per-instance errors so one unreachable instance does not

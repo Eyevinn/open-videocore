@@ -33,7 +33,10 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { EncoreScalerLoop } from './scaler-loop.js';
+import {
+  EncoreScalerLoop,
+  PARTIAL_VISIBILITY_DROP_PASSES
+} from './scaler-loop.js';
 import {
   keys,
   type DroppedJob,
@@ -73,9 +76,17 @@ class FakeRedis {
     return this.strings.get(key) ?? null;
   }
 
-  async set(key: string, value: string): Promise<'OK'> {
+  // reconcile writes the #769 partial-visibility counter with a PX TTL; the
+  // extra args are irrelevant to an in-memory stand-in but the signature has to
+  // accept them.
+  async set(key: string, value: string, ..._opts: unknown[]): Promise<'OK'> {
     this.strings.set(key, value);
     return 'OK';
+  }
+
+  async del(key: string): Promise<number> {
+    const had = this.strings.delete(key);
+    return had ? 1 : 0;
   }
 }
 
@@ -236,6 +247,12 @@ describe('#768: drop-classification stale keys.jobInstance diagnostic', () => {
 // diagnostic exists to rule out. The index is now built in a full pass over
 // every pool entry (including idle-tracked and unreachable ones, handled
 // explicitly) BEFORE any classification runs, so the signal is order-independent.
+//
+// #769 UPDATE: the order-independent index is no longer only a log input — it
+// DECIDES. An externalId found active on any confirmed pool instance is not
+// classified dropped at all, so both scenarios below now assert the same
+// order-independence through the "is NOT dropped" warn rather than through the
+// drop-diagnostic line (which a job active elsewhere can no longer reach).
 describe('#839: pool-active index is order-independent', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -244,7 +261,8 @@ describe('#839: pool-active index is order-independent', () => {
   // Same genuine stale-mapping scenario as the first #768 test, with the pool
   // seeded in the REVERSE order: the mapped instance (inst-new) is iterated
   // first, so under the incremental index inst-old had not been indexed yet and
-  // the diagnostic logged foundActiveOnPoolInstances=(none).
+  // the diagnostic logged foundActiveOnPoolInstances=(none) — and, post-#769,
+  // would have FAILED a job that was running fine.
   it('finds the externalId active on another instance when that instance is iterated LAST', async () => {
     const redis = new FakeRedis();
     // inst-new (the stale mapping target) seeded FIRST — reversed vs the #768 test.
@@ -271,21 +289,34 @@ describe('#839: pool-active index is order-independent', () => {
       })
     ).reconcile();
 
-    // Decision behaviour is still unchanged (#839 is diagnostic-only; #769's
-    // behavioural fix stays out of scope).
-    expect(dropped).toEqual([{ encoreJobId: 'job-x', reason: undefined }]);
+    // #769 inverts the DECISION this test used to pin. #839 made the pool-active
+    // index order-independent; #769 makes that index decide, so an externalId
+    // Encore still reports active on inst-old is no longer a drop whichever order
+    // the pool hash is iterated in. The order-independence #839 exists to protect
+    // is still what is under test — it is now observable as "not dropped, and the
+    // real holder named" instead of "dropped, and the real holder logged".
+    expect(dropped).toEqual([]);
 
-    const diag = warn.mock.calls.find((c) =>
-      String(c[0]).includes('drop-diagnostic (#768)')
+    // The drop-classification diagnostic is unreachable by construction for a job
+    // active elsewhere: the stale-mapping branch short-circuits above it.
+    expect(
+      warn.mock.calls.find((c) => String(c[0]).includes('drop-diagnostic (#768)'))
+    ).toBeUndefined();
+
+    // The stale-mapping evidence moved to the "is NOT dropped" warn, which carries
+    // the same attribution fields. console.warn is called with a format string +
+    // positional args: [format, jobId, keys.jobInstance, reconciledInstance,
+    // foundActiveOnPoolInstances, poolInstancesChecked, poolInstancesUnchecked,
+    // reDispatched, jobInstanceRepairedTo].
+    const notDropped = warn.mock.calls.find((c) =>
+      String(c[0]).includes('is NOT dropped')
     );
-    expect(diag).toBeDefined();
-    // console.warn is called with a format string + positional args:
-    // [format, jobId, keys.jobInstance, reconciledInstance,
-    //  foundActiveOnPoolInstances, poolInstancesChecked, poolInstancesUnchecked,
-    //  reDispatched].
-    const args = diag!.map((a) => String(a));
-    expect(args).toContain('job-x');
-    // The stale-mapping signature must be reported regardless of seeding order.
+    expect(notDropped).toBeDefined();
+    const args = notDropped!.map((a) => String(a));
+    expect(args[1]).toBe('job-x'); // the job
+    expect(args[2]).toBe('inst-new'); // the stale keys.jobInstance value
+    // The instance the job is REALLY active on, reported regardless of seeding
+    // order — the order-independence guarantee #839 landed.
     expect(args[4]).toBe('inst-old');
     // Both instances were checked before any classification ran.
     expect(args[5].split(',').sort()).toEqual(['inst-new', 'inst-old']);
@@ -329,20 +360,32 @@ describe('#839: pool-active index is order-independent', () => {
       })
     ).reconcile();
 
-    expect(dropped).toEqual([{ encoreJobId: 'job-z', reason: undefined }]);
+    // #769: the idle-tracked instance is not merely INDEXED, it now DECIDES —
+    // job-z is active there, so it is not dropped.
+    expect(dropped).toEqual([]);
+    expect(
+      warn.mock.calls.find((c) => String(c[0]).includes('drop-diagnostic (#768)'))
+    ).toBeUndefined();
 
-    const diag = warn.mock.calls.find((c) =>
-      String(c[0]).includes('drop-diagnostic (#768)')
+    const notDropped = warn.mock.calls.find((c) =>
+      String(c[0]).includes('is NOT dropped')
     );
-    expect(diag).toBeDefined();
-    const args = diag!.map((a) => String(a));
-    expect(args[4]).toBe('inst-idle-tracked'); // foundActiveOnPoolInstances
+    expect(notDropped).toBeDefined();
+    const args = notDropped!.map((a) => String(a));
+    expect(args[1]).toBe('job-z'); // the job
+    expect(args[2]).toBe('inst-mapped'); // the stale keys.jobInstance value
+    expect(args[4]).toBe('inst-idle-tracked'); // where it is REALLY active
   });
 
   // An instance whose real state could not be fetched is NOT evidence of
   // absence: "active nowhere in the pool" is only meaningful over the instances
   // we actually checked. The diagnostic must name the unchecked ones so a
   // foundActiveOnPoolInstances=(none) line is interpretable.
+  //
+  // #769 review finding 4: an unchecked instance is no longer only a log field —
+  // it withholds the drop for PARTIAL_VISIBILITY_DROP_PASSES passes, which is
+  // why this runs reconcile that many times before asserting on the drop. The
+  // diagnostic's content is unchanged.
   it('names instances whose real state could not be checked this pass', async () => {
     const redis = new FakeRedis();
     await seedInstance(redis, 'inst-mapped', 'https://mapped.encore.example');
@@ -365,11 +408,14 @@ describe('#839: pool-active index is order-independent', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const dropped: DroppedJob[] = [];
-    await new EncoreScalerLoop(
+    const loop = new EncoreScalerLoop(
       makeConfig(redis, async (drops) => {
         dropped.push(...drops);
       })
-    ).reconcile();
+    );
+    for (let pass = 0; pass < PARTIAL_VISIBILITY_DROP_PASSES; pass += 1) {
+      await loop.reconcile();
+    }
 
     expect(dropped).toEqual([{ encoreJobId: 'job-u', reason: undefined }]);
 
