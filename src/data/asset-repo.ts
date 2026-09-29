@@ -75,6 +75,16 @@ export type AssetReviewState = (typeof ASSET_REVIEW_STATES)[number];
 //                                          editorial need — while still barring
 //                                          direct approved -> rejected without a
 //                                          re-review step.
+//
+// RE-REVIEW PATHS, EXPLICITLY (issue #897): BOTH `approved` and `rejected`
+// return to `in-review`, and to NOTHING ELSE. Neither returns to `draft`:
+// `draft` is an ENTRY state only — once an asset has been submitted it can
+// never go back to `draft`, and no edge anywhere in the table targets `draft`.
+// There is also no direct `approved -> rejected` or `rejected -> approved`; a
+// verdict can only be changed by passing through `in-review` again. This table
+// is the single source of truth for the graph — `isValidReviewTransition()`
+// (the 422 gate) and `allowedReviewTransitions()` (what the API advertises)
+// both read it, so the enforced and the advertised graph cannot drift apart.
 const ALLOWED_REVIEW_TRANSITIONS: Record<AssetReviewState, readonly AssetReviewState[]> = {
   draft: ['in-review'],
   'in-review': ['approved', 'rejected'],
@@ -87,6 +97,22 @@ export function isValidReviewTransition(from: AssetReviewState, to: AssetReviewS
     return true; // idempotent no-op transitions are allowed
   }
   return ALLOWED_REVIEW_TRANSITIONS[from].includes(to);
+}
+
+// The legal next review states from `from` (issue #897), read from the same
+// ALLOWED_REVIEW_TRANSITIONS table `isValidReviewTransition()` validates
+// against. Exposed so a client can offer only the moves the machine permits
+// instead of offering all four states and discovering the illegal ones as 422s
+// — and so that gating is never a client-side copy of this graph.
+//
+// `from` defaults to `draft` for assets that have no reviewState yet, matching
+// applyReviewState(). Returns a fresh array (the table itself is readonly and
+// must not escape) and deliberately EXCLUDES `from` itself: re-sending the
+// current state is accepted as an idempotent no-op (see above), but it is not a
+// move, so advertising it as a transition would put a button on the screen that
+// changes nothing.
+export function allowedReviewTransitions(from: AssetReviewState | undefined): AssetReviewState[] {
+  return [...ALLOWED_REVIEW_TRANSITIONS[from ?? 'draft']];
 }
 
 export type StatusTransition = {

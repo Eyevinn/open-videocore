@@ -180,6 +180,8 @@ const DESCRIPTIONS: Record<string, string> = {
   'DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId}': 'Remove a subtitle track.',
   'POST /api/v1/assets/{id}/tags': 'Add a tag to an asset.',
   'DELETE /api/v1/assets/{id}/tags/{tag}': 'Remove a tag from an asset.',
+  'GET /api/v1/assets/{id}/review-state':
+    "Get an asset's editorial review state and the transitions that are legal from it.",
   'POST /api/v1/assets/{id}/review-state':
     "Transition an asset's editorial review state (draft / in-review / approved / rejected).",
   'POST /api/v1/assets/{id}/restore': "Restore a soft-deleted asset within its retention window.",
