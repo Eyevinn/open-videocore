@@ -327,10 +327,29 @@ tbody td {
   border: 1px solid rgba(245, 158, 11, 0.45);
 }
 
+/* Explicit delete-lock flag (issue #894). Indigo, not amber: a lock is a
+   deliberate operator state, not a fault. Distinct from .badge-attention above,
+   which means something went wrong, and from .badge-failed, which means an
+   error. The badge carries the word "Locked" plus a visually-hidden consequence
+   clause, so colour is never the only carrier of the state (WCAG 1.4.1). */
+.badge-locked {
+  background: rgba(99, 102, 241, 0.18);
+  color: var(--accent);
+  border: 1px solid rgba(99, 102, 241, 0.45);
+}
+
 /* Subtle left accent on rows for wedged assets so the operator can scan for
    them even when the status column is off-screen. */
 tr.row-wedged td:first-child {
   box-shadow: inset 3px 0 0 var(--warning);
+}
+
+/* The same treatment for a delete-locked row, in the lock's indigo, so the flag
+   survives horizontal scrolling of the seven-column assets table. Purely
+   decorative: it duplicates the .badge-locked flag and never appears without it
+   (issue #894). */
+tr.row-locked td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 /* "Needs attention" filter toggle in the assets header. */
