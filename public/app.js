@@ -3572,17 +3572,25 @@ async function renderProfilesTab(container) {
     // store, so it gets the same treatment as the deletes. Impact wording
     // verified against POST /api/v1/profiles/bootstrap
     // (src/routes/profiles.ts:184-206) and bootstrapProfiles
-    // (src/services/profile-bootstrap.ts:126-181), NOT assumed:
+    // (src/services/profile-bootstrap.ts:128-183), NOT assumed:
     //   - This UI sends NO `?force=true`, so `force` is false.
-    //   - With force false, if any NON-built-in profile already exists the whole
-    //     remote seed is skipped and returns { seeded: 0, skipped: true }
-    //     (countNonBuiltinProfiles :67-70, skip guard :148-158).
-    //   - Built-ins are ensured on EVERY run but an existing profile of the same
-    //     name is left untouched (ensureBuiltinProfiles :76-91).
-    //   - When the seed does run, an index entry whose name already exists is
-    //     OVERWRITTEN via `repository.update(entry.name, yaml)` (:165-171). Since
-    //     the skip guard means the store then holds only built-ins, the profile
-    //     that can be overwritten is an edited built-in.
+    //   - Built-ins are ensured on EVERY run, unconditionally and BEFORE the
+    //     skip guard: `const builtinSeeded = await ensureBuiltinProfiles(...)`
+    //     (profile-bootstrap.ts:148, helper at :75-91). So a built-in that is
+    //     currently MISSING is re-created even on the skip path — the skip
+    //     return carries that count: `{ seeded: 0, skipped: true, builtinSeeded }`
+    //     (:159, field documented at :50-53). This run is therefore never a
+    //     guaranteed no-op, which is why it is stated under "what this affects".
+    //   - An existing profile whose name matches a built-in is left untouched by
+    //     that step, so an operator edit to a built-in survives (:82-84).
+    //   - With force false, if any NON-built-in profile already exists the
+    //     REMOTE seed is skipped: no index fetch, no create, no update
+    //     (countNonBuiltinProfiles :66-69, skip guard :150-160).
+    //   - When the remote seed does run, an index entry whose name already
+    //     exists is OVERWRITTEN via `repository.update(entry.name, yaml)`
+    //     (loop :166-179, update at :171). Since the skip guard means the store
+    //     then holds only built-ins, the profile that can be overwritten is an
+    //     edited built-in.
     //   - An unreachable index is a 502 `bootstrap_failed` (profiles.ts:201-204),
     //     so nothing is half-written from a failed fetch of the index itself.
     // The subject is the profile index, named for what it is rather than by an id.
@@ -3594,10 +3602,11 @@ async function renderProfilesTab(container) {
       affected: [
         'Every profile named in the default index is fetched and stored, so the profile list and the index the transcoders read both grow.',
         'If the only profiles stored right now are the ones that ship built-in with this API, a built-in whose name also appears in the index is overwritten — including any edit you made to it.',
+        'Any profile that ships built-in with this API and is currently missing is re-created, on every run — including the runs where the remote seed is skipped. So this is never a guaranteed no-op.',
       ],
       unaffected: [
         'Nothing is deleted. Profiles that are not named in the index stay exactly as they are.',
-        'If any profile you or an earlier seed added is already stored, the seed is skipped outright and nothing changes.',
+        'If any profile you or an earlier seed added is already stored, the remote seed is skipped and no profile from the index is fetched or overwritten.',
         'No assets, collections or jobs are touched, and jobs that already ran keep their results.',
       ],
     });
