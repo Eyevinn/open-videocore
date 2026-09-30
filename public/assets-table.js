@@ -92,6 +92,16 @@
  *      This is a page-scoped ORDERING refinement only — it never drops a row, so
  *      it does not affect `total` or which rows paging reaches.
  *
+ * FILTER-BOX INTERACTION (issue #946). The free-text box is a FILTER, not a
+ * query form: it narrows the list as you type. It fires on a ~300ms trailing
+ * debounce, so one search term costs one request rather than one per keystroke,
+ * and it carries its own clear control plus a magnifier affordance so the box
+ * looks like the thing it is. Emptying it — by deleting the text or by pressing
+ * the clear control — dispatches immediately and unconditionally: "show me
+ * everything" is the cheap tier-1 list call and should never wait on a timer or
+ * on a minimum term length. Enter is a shortcut that flushes a debounce still in
+ * flight, never a requirement. See searchFilterControl() below.
+ *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
  */
@@ -139,6 +149,13 @@ export const ASSETS_PAGE_SIZE = 20;
 // URL-state namespace for THIS table (table-url-state prefixes params as
 // `<ns>.<key>`, e.g. `assets.sort`, `assets.status`, `assets.page`).
 export const ASSETS_NS = 'assets';
+
+// Trailing debounce for the free-text filter box (issue #946). Long enough that
+// a typed word coalesces into one request, short enough that the list still feels
+// like it is narrowing under the cursor. Sits between the sibling tables' lighter
+// 200ms/250ms text debounces (public/jobs-table.js, public/logs-table.js) because
+// this box can fan out to the heavier full-text tier.
+export const SEARCH_DEBOUNCE_MS = 300;
 
 // Sortable column keys. `created` maps to the ULID creation-order axis; `status`
 // and `title` are the additional axes the acceptance criteria require.
@@ -283,6 +300,25 @@ async function fetchAssetsPage(snap, deps) {
   return { rows, total, projectionCarriesLock: true };
 }
 
+// Everything about the interaction state that decides WHICH request to make:
+// sort, filters, and the page window. Used to tell a genuine user change from
+// reload()'s own setPageInfo() bookkeeping (see the reload guard below). Filter
+// keys are sorted so that reaching the same filter set by a different route does
+// not read as a different state.
+function stateSignature(snap) {
+  const filters = (snap && snap.filters) || {};
+  const sort = (snap && snap.sort) || {};
+  return JSON.stringify([
+    sort.columnKey || null,
+    sort.direction || null,
+    Object.keys(filters)
+      .sort()
+      .map((k) => [k, filters[k]]),
+    snap ? snap.offset : null,
+    snap ? snap.pageSize : null,
+  ]);
+}
+
 // ─── Filter controls (slot-based) ─────────────────────────────────────────────
 //
 // Each control is a factory the primitive mounts once into the filter bar; it
@@ -315,20 +351,134 @@ function statusFilterControl(initial) {
   };
 }
 
-function textFilterControl(name, labelText, placeholder, initial) {
+// The free-text filter box (issue #946). Unlike the status/date controls this one
+// owns its own event wiring — see the `wire` descriptor below and asSlot() — so it
+// can debounce, flush, and clear on the three different rhythms the interaction
+// needs.
+//
+// Layout is icon + input + clear, all inside one positioned wrapper so the two
+// affordances sit INSIDE the input's box rather than beside it (padding on the
+// input reserves the room; see `.ops-search-*` in public/style.css). The magnifier
+// is drawn in CSS from a bordered circle and a rotated handle: `public/` has no
+// icon set, no icon font and no inline SVG (see the note in public/lock-state.js),
+// and a filter affordance is not the right place to introduce one. It is purely
+// decorative — `aria-hidden`, not focusable — because the input already carries
+// its own accessible name.
+function searchFilterControl(initial) {
   return function () {
     const wrap = document.createElement('label');
-    wrap.className = 'ops-filter-' + name;
+    wrap.className = 'ops-filter-q';
     const span = document.createElement('span');
-    span.textContent = labelText;
+    span.textContent = 'Search';
+
+    const field = document.createElement('div');
+    field.className = 'ops-search-field';
+
+    const icon = document.createElement('span');
+    icon.className = 'ops-search-icon';
+    icon.setAttribute('aria-hidden', 'true');
+
     const input = document.createElement('input');
-    input.type = name === 'q' ? 'search' : 'text';
-    input.placeholder = placeholder || '';
-    input.setAttribute('aria-label', labelText);
+    input.type = 'search';
+    input.className = 'ops-search-input';
+    input.placeholder = 'Full-text search…';
+    input.setAttribute('aria-label', 'Search');
+    // Browser history/autofill on a live filter box just gets in the way of the
+    // list updating underneath it.
+    input.setAttribute('autocomplete', 'off');
     if (initial) input.value = initial;
+
+    // Our own clear control rather than the `type="search"` native one: that is
+    // absent in some engines, unstyleable in others, and invisible to the
+    // keyboard. This one is a real focusable button with a real accessible name.
+    // The stylesheet hides the native affordance so there is never a second x.
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'ops-search-clear';
+    clear.setAttribute('aria-label', 'Clear search');
+    clear.title = 'Clear search';
+    clear.textContent = '×'; // MULTIPLICATION SIGN — a glyph, not an icon font
+    // Hidden while the box is empty: there is nothing to clear, and an always-on
+    // x reads as a control that does nothing.
+    clear.hidden = !(initial && initial.length);
+
+    field.appendChild(icon);
+    field.appendChild(input);
+    field.appendChild(clear);
     wrap.appendChild(span);
-    wrap.appendChild(input);
-    return { el: wrap, input, event: 'change', read: () => input.value.trim() };
+    wrap.appendChild(field);
+
+    // Wire the three rhythms onto the primitive's single onChange(value).
+    function wire(onChange) {
+      let timer = null;
+      // The value most recently handed to the table. Lets the flush paths (Enter,
+      // blur) skip a second, identical request when the debounce already landed.
+      let dispatched = (initial || '').trim();
+
+      function cancel() {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      }
+
+      // Hand the box's current value to the table now. Trimmed, because the
+      // verified `q` param is a 1..512 string (openapi.json
+      // .paths["/api/v1/search/"].get.parameters) and a whitespace-only term is
+      // not a term — trimming it to '' is exactly what drops back to the tier-1
+      // list call.
+      function dispatch() {
+        cancel();
+        dispatched = input.value.trim();
+        onChange(dispatched);
+      }
+
+      function syncClear() {
+        clear.hidden = input.value === '';
+      }
+
+      input.addEventListener('input', function () {
+        syncClear();
+        // An emptied box restores the full list straight away: no debounce, no
+        // minimum-length gate, no dedupe.
+        if (input.value.trim() === '') {
+          dispatch();
+          return;
+        }
+        cancel();
+        timer = setTimeout(dispatch, SEARCH_DEBOUNCE_MS);
+      });
+
+      // Enter and blur both mean "I am done typing", so they flush a debounce
+      // that is still waiting instead of being the thing that starts the query.
+      // With nothing pending the term is already applied and they do nothing —
+      // holding Enter must not replay the same request.
+      function flush() {
+        if (input.value.trim() === dispatched) {
+          cancel();
+          return;
+        }
+        dispatch();
+      }
+
+      input.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Enter') return;
+        ev.preventDefault();
+        flush();
+      });
+      input.addEventListener('change', flush);
+
+      clear.addEventListener('click', function () {
+        input.value = '';
+        syncClear();
+        dispatch(); // immediate and unconditional — back to the full list
+        // Keep the caret where the user was working; clearing is a refinement of
+        // the search, not an exit from it.
+        input.focus();
+      });
+    }
+
+    return { el: wrap, input, clear, wire };
   };
 }
 
@@ -348,12 +498,20 @@ function dateFilterControl(name, labelText, initial) {
   };
 }
 
-// Adapt one of the {el,input,event,read} descriptors above into the primitive's
-// slot contract: `control(state, onChange) -> HTMLElement`. The primitive calls
-// onChange(value); we forward the control's read() on its native event.
+// Adapt one of the descriptors above into the primitive's slot contract:
+// `control(state, onChange) -> HTMLElement`. The primitive calls onChange(value).
+//
+// Two descriptor shapes are accepted. `{ input, event, read }` is the simple case
+// — forward read() on one native event — and covers the status/date controls.
+// `{ wire }` hands the control full responsibility for when it calls onChange,
+// which is what the debounced free-text box needs (issue #946).
 function asSlot(factory) {
   return function (_state, onChange) {
     const desc = factory();
+    if (typeof desc.wire === 'function') {
+      desc.wire(onChange);
+      return desc.el;
+    }
     desc.input.addEventListener(desc.event, function () {
       onChange(desc.read());
     });
@@ -604,7 +762,7 @@ export function createAssetsTable(deps) {
     { name: 'status', control: asSlot(statusFilterControl(initialFilters.status)) },
     { name: 'from', control: asSlot(dateFilterControl('from', 'Created from', initialFilters.from)) },
     { name: 'to', control: asSlot(dateFilterControl('to', 'Created to', initialFilters.to)) },
-    { name: 'q', control: asSlot(textFilterControl('q', 'Search', 'Full-text search…', initialFilters.q)) },
+    { name: 'q', control: asSlot(searchFilterControl(initialFilters.q)) },
   ];
 
   const table = createOpsTable({
@@ -622,15 +780,35 @@ export function createAssetsTable(deps) {
   // No page-scoped-narrowing caveat here by design: status and from/to are
   // server-side on both tiers (#833), so the reported total is exact (#834).
 
-  // Guard so the URL sync we do inside the state subscription does not itself
-  // re-enter as a "user change" (it does not — applyTableState only touches the
-  // URL — but the flag keeps intent explicit and future-proofs re-entrancy).
+  // Re-entrancy guard for the load cycle. `reload()` is driven by the state
+  // subscription, and it also touches state itself (setPageInfo), so it has to be
+  // able to tell its own bookkeeping apart from a real user change.
   let loading = false;
+  // A reload asked for while one was in flight FOR DIFFERENT STATE coalesces into
+  // a single re-run afterwards instead of being dropped (issue #946). Dropping it
+  // was harmless while every filter change needed a deliberate Enter, but a live
+  // filter box changes state while a request is open: clearing the box mid-flight
+  // used to leave the stale search results on screen for good. The last state the
+  // user asked for is always the one that ends up rendered.
+  let reloadQueued = false;
+  // The state signature the in-flight load is FOR, so a re-entrant call can tell
+  // "the user changed something" from "this load's own bookkeeping". The
+  // difference matters: setPageInfo() below emits from inside reload(), and the
+  // subscription turns every emit into a reload() — treating that self-emit as a
+  // new request would re-fetch forever.
+  let loadingSignature = null;
 
   async function reload() {
-    if (loading) return;
-    loading = true;
     const snap = table.state.getState();
+    if (loading) {
+      // Same sort/filters/page window as the load already running: there is
+      // nothing new to ask for.
+      if (stateSignature(snap) === loadingSignature) return;
+      reloadQueued = true;
+      return;
+    }
+    loading = true;
+    loadingSignature = stateSignature(snap);
 
     // 3) Mirror the current interaction state into the URL (shared contract) so a
     //    refresh/share reproduces the view. Replace (not push) — control changes
@@ -664,6 +842,10 @@ export function createAssetsTable(deps) {
       table.setStatus('error', 'Failed to load assets: ' + (err && err.message ? err.message : err));
     } finally {
       loading = false;
+      if (reloadQueued) {
+        reloadQueued = false;
+        void reload();
+      }
     }
   }
 
