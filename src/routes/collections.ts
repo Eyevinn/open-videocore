@@ -375,9 +375,10 @@ export const collectionsRouter: FastifyPluginAsync<CollectionsRouterOptions> = a
     }
   );
 
-  // Partial update of a collection's descriptive metadata (issue #560). PATCH
+  // Partial update of a collection's name and descriptive metadata (issue #560;
+  // `name` added in issue #926). PATCH
   // (not PUT) so callers send only the fields they intend to change; the body is
-  // `.strict()` so membership (`assetIds`), `name`, and `deleteLock` are all
+  // `.strict()` so membership (`assetIds`) and `deleteLock` are both
   // rejected (400) — membership stays on PUT/DELETE /:id/assets/:assetId. The
   // CouchDB backend routes this through the `_rev` merge-retry wrapper
   // (updateWithRetry, ADR-005 / issue #278), the same concurrency model the asset
