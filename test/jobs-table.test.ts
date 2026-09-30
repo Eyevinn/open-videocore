@@ -245,3 +245,120 @@ describe('createJobsTable composition', () => {
     expect(() => createJobsTable({} as never)).toThrow(/apiFetch/);
   });
 });
+
+// ─── unset filter controls look unset (issue #984) ────────────────────────────
+//
+// Contract grounding for the markers asserted here:
+//   - class names: public/jobs-table.js statusFilterControl() -> 'ops-filter-select',
+//     dateInput() -> 'ops-filter-date', searchControl() -> 'ops-filter-search'
+//   - the muted colour token: public/style.css :root -> `--text-muted: #94a3b8`
+//     (line 6; the only muted text token in the sheet)
+//   - the paint rules keyed off the marker: public/style.css
+//     `.ops-filter-select.is-unset, .ops-filter-date.is-unset { color: var(--text-muted) }`
+// happy-dom does not do layout or cascade resolution, so the assertions below
+// verify the DOM seam (the .is-unset marker on empty vs. filled controls), not the
+// resolved pixel colour. The search box needs no marker — it carries a native
+// placeholder, muted by `.ops-filter-search::placeholder`.
+
+describe('unset filter controls are marked muted', () => {
+  function controls(el: HTMLElement) {
+    return {
+      select: el.querySelector<HTMLSelectElement>('.ops-filter-select')!,
+      from: el.querySelector<HTMLInputElement>('#jobs-filter-from')!,
+      to: el.querySelector<HTMLInputElement>('#jobs-filter-to')!,
+      search: el.querySelector<HTMLInputElement>('.ops-filter-search')!,
+    };
+  }
+
+  it('marks the select and both date inputs unset on first render', () => {
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const c = controls(table.el);
+    expect(c.select.value).toBe('');
+    expect(c.select.classList.contains('is-unset')).toBe(true);
+    expect(c.from.classList.contains('is-unset')).toBe(true);
+    expect(c.to.classList.contains('is-unset')).toBe(true);
+    // The search box renders its own empty state via the native placeholder,
+    // which the stylesheet paints with the same --text-muted token.
+    expect(c.search.placeholder).toBe('Job id or asset id');
+    expect(c.search.value).toBe('');
+  });
+
+  it('does NOT mark controls unset when the URL state already carries values', () => {
+    const win = {
+      location: {
+        search: '?jobs.status=running&jobs.from=2026-01-02&jobs.to=2026-01-04&jobs.q=asset-a',
+        pathname: '/',
+        hash: '',
+      },
+      history: { replaceState: vi.fn(), pushState: vi.fn(), state: null },
+    } as unknown as Window;
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win,
+    });
+    document.body.appendChild(table.el);
+    const c = controls(table.el);
+    expect(c.select.value).toBe('running');
+    expect(c.select.classList.contains('is-unset')).toBe(false);
+    expect(c.from.value).toBe('2026-01-02');
+    expect(c.from.classList.contains('is-unset')).toBe(false);
+    expect(c.to.value).toBe('2026-01-04');
+    expect(c.to.classList.contains('is-unset')).toBe(false);
+    expect(c.search.value).toBe('asset-a');
+  });
+
+  it('drops the marker when a value is chosen and restores it when cleared', () => {
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const c = controls(table.el);
+
+    c.select.value = 'failed';
+    c.select.dispatchEvent(new Event('change'));
+    expect(c.select.classList.contains('is-unset')).toBe(false);
+
+    c.from.value = '2026-01-02';
+    c.from.dispatchEvent(new Event('change'));
+    expect(c.from.classList.contains('is-unset')).toBe(false);
+
+    c.to.value = '2026-01-04';
+    c.to.dispatchEvent(new Event('change'));
+    expect(c.to.classList.contains('is-unset')).toBe(false);
+
+    // Back to "All statuses" / cleared dates => muted again.
+    c.select.value = '';
+    c.select.dispatchEvent(new Event('change'));
+    expect(c.select.classList.contains('is-unset')).toBe(true);
+
+    c.from.value = '';
+    c.from.dispatchEvent(new Event('change'));
+    expect(c.from.classList.contains('is-unset')).toBe(true);
+
+    c.to.value = '';
+    c.to.dispatchEvent(new Event('input'));
+    expect(c.to.classList.contains('is-unset')).toBe(true);
+  });
+
+  it('keeps the placeholder option muted in the open list while real statuses stay full strength', () => {
+    // The paint lives in public/style.css:
+    //   .ops-filter-select option           { color: var(--text) }
+    //   .ops-filter-select option[value=''] { color: var(--text-muted) }
+    // The DOM contract those rules key off is the empty-valued placeholder entry
+    // being first, with every other option carrying a non-empty value.
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const opts = Array.from(controls(table.el).select.options);
+    expect(opts[0].value).toBe('');
+    expect(opts[0].textContent).toBe('All statuses');
+    expect(opts.slice(1).every((o) => o.value !== '')).toBe(true);
+  });
+});
