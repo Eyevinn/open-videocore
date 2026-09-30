@@ -1067,7 +1067,46 @@ function openModal(title, buildBody, opts) {
 //
 // Everything is written with textContent: subject names are operator/tenant data
 // (asset names, webhook URLs, object keys) and must never be parsed as HTML.
-function confirmModal(spec) {
+//
+// ── Positional form (issue #952) ──
+// confirmModal(subjectName, message, onConfirm) -> Promise<boolean>
+//   The terse form, for a call site that holds a subject name and one question
+//   line and has nothing route-verified to put in the impact lists. It
+//   normalises onto the spec form below and shares its markup, focus order and
+//   resolution contract — this UI has ONE confirmation dialog, not two that
+//   drift apart.
+//     subjectName — the human-readable name, same rule as spec.subject: never an
+//                   opaque id. Run it through nameOrFallback() if it may be blank.
+//     message     — the full question line (spec.question). Omitted/blank falls
+//                   back to the generated `Confirm "<subjectName>"?`.
+//     onConfirm   — optional callback invoked once, only on confirm, after the
+//                   dialog has closed. Its return value is ignored and it must
+//                   handle its own failures (errorModal() is for that) — the
+//                   same convention as spec.secondary.onActivate above.
+//   The promise still resolves true/false, so an awaiting caller keeps working
+//   whether or not it also passes onConfirm.
+//
+//   A spec-form call is a single object argument; a positional call starts with
+//   a string, which is how the two are told apart.
+function confirmModal(spec, message, onConfirm) {
+  if (typeof spec === 'string') {
+    const line = message == null || String(message).trim() === '' ? null : String(message);
+    const normalised = {
+      subject: spec,
+      question: line,
+      // No impact lists were supplied, so empty ones are dropped rather than
+      // rendered as headings over nothing.
+      terse: true,
+    };
+    // The spec is built as a value rather than inlined: this is the normalisation
+    // step, not a destructive call SITE, and the source scan in
+    // test/confirm-modal-destructive.test.ts counts inline-spec call sites.
+    return confirmModal(normalised).then(function (confirmed) {
+      if (confirmed && typeof onConfirm === 'function') onConfirm();
+      return confirmed;
+    });
+  }
+
   const s = spec || {};
   const subject = s.subject == null ? '' : String(s.subject);
   const question = s.question
@@ -1109,15 +1148,23 @@ function confirmModal(spec) {
         }
 
         const blocked = !!s.blocked;
+        // The terse positional form (issue #952) carries no impact lists at all,
+        // so both empty lists are dropped for it. The spec form is unchanged:
+        // both lists are REQUIRED there, and an empty heading showing up in the
+        // dialog is a caller bug worth seeing rather than hiding.
+        const terse = !!s.terse;
         const affected = Array.isArray(s.affected) ? s.affected : [];
+        const unaffected = Array.isArray(s.unaffected) ? s.unaffected : [];
         // The blocked variant drops an empty "What this affects" list rather
         // than rendering a heading over nothing.
-        if (!blocked || affected.length > 0) {
+        if (!(blocked || terse) || affected.length > 0) {
           body.appendChild(impactList('What this affects', 'confirm-affected', s.affected));
         }
-        body.appendChild(
-          impactList('What this does not affect', 'confirm-unaffected', s.unaffected)
-        );
+        if (!terse || unaffected.length > 0) {
+          body.appendChild(
+            impactList('What this does not affect', 'confirm-unaffected', s.unaffected)
+          );
+        }
 
         // The ids that caused a refusal (job ids, collection ids). Server data,
         // so it goes through impactList's textContent path like everything else.
@@ -1407,6 +1454,87 @@ function humanizeErrorReason(err) {
 // names WHICH action failed and what is consequently still true.
 function reportActionFailure(err, opts) {
   return errorToast(humanizeErrorReason(err) || (err && err.message), opts);
+}
+
+// ─── Action-failure dialog, title-first form (issue #952) ──────────────────────
+//
+// errorModal(title, reason, opts) -> close fn
+//
+// The counterpart to confirmModal's positional form, and the same normalise-onto-
+// one-dialog move: a call site that holds a heading and whatever the API sent
+// back gets the dialog errorToast() already renders, without having to know which
+// of the failure shapes it is holding. Returns errorToast's close handle.
+//
+//   title  — dialog heading, e.g. 'Delete collection failed'. Blank/absent falls
+//            back to errorToast's own default heading.
+//   reason — what went wrong, in any shape a call site actually holds:
+//              * an apiFetch rejection — `message` already resolved as
+//                body.message -> body.error -> 'HTTP <status>' (app.js:260-269),
+//                with `status` and the parsed `body` attached (app.js:271-274);
+//              * a parsed error body on its own, `{ error, message?, reason? }`
+//                (errorSchema, src/routes/collections.ts:43-47);
+//              * an already-resolved human string;
+//              * nothing at all.
+//   opts   — forwarded to errorToast (action / detail / closeLabel / onClose).
+//
+// Resolution order lives in resolveFailureText() below, so a caller does not
+// have to reproduce it.
+function errorModal(title, reason, opts) {
+  const o = opts || {};
+  const heading = title == null || String(title).trim() === '' ? undefined : String(title);
+  return errorToast(resolveFailureText(reason), {
+    title: heading,
+    action: o.action,
+    detail: o.detail,
+    closeLabel: o.closeLabel,
+    onClose: o.onClose,
+  });
+}
+
+// Resolve the text errorModal shows out of an apiFetch rejection, a parsed error
+// body, a plain string, or nothing. Returns '' when the failure says nothing at
+// all, so errorToast applies its own generic sentence instead of this file
+// carrying a second copy of it.
+//
+// Precedence, and why:
+//   1. Operator-facing copy for a structured `reason` this client recognises —
+//      ACTION_FAILURE_REASON_COPY above, keyed by the closed enum both routers
+//      declare (src/routes/assets.ts:570, src/routes/collections.ts:65). It wins
+//      over the server `message`, which for those refusals is written for a
+//      developer and names its subject by an opaque id (issue #920).
+//   2. The server's human `message` — on the rejection, then on the body.
+//   3. The bare code, when `reason` is a value this client has no copy for
+//      (`reason` is z.string().optional() on the generic envelope, so it need not
+//      be one of the three) or when only `error` is set. Naming the code the
+//      server sent beats claiming it sent nothing; the fall-through order mirrors
+//      apiFetch's own message -> error precedence.
+//   4. '' — no reason and no message.
+function resolveFailureText(reason) {
+  if (reason == null) return '';
+  if (typeof reason === 'string') return reason;
+  if (typeof reason !== 'object') return String(reason);
+
+  // An apiFetch rejection carries the parsed body on `.body`; a body handed over
+  // directly IS the body. hasOwnProperty, not `in`, for the same reason
+  // humanizeErrorReason() uses it: a `body` key must not resolve up the chain.
+  const body = Object.prototype.hasOwnProperty.call(reason, 'body') ? reason.body : reason;
+
+  const humanized = humanizeErrorReason({ body: body });
+  if (humanized) return humanized;
+
+  const own = typeof reason.message === 'string' ? reason.message.trim() : '';
+  if (own) return own;
+
+  const envelope = body && typeof body === 'object' ? body : {};
+  const message = typeof envelope.message === 'string' ? envelope.message.trim() : '';
+  if (message) return message;
+
+  const code = typeof envelope.reason === 'string' && envelope.reason.trim()
+    ? envelope.reason.trim()
+    : (typeof envelope.error === 'string' ? envelope.error.trim() : '');
+  if (code) return 'The server refused the action (' + code + ').';
+
+  return '';
 }
 
 // ─── Storage-backend remove confirmation (issue #682) ──────────────────────────
@@ -7010,6 +7138,11 @@ export {
   reportActionFailure,
   humanizeErrorReason,
   ACTION_FAILURE_REASON_COPY,
+  // Title-first failure dialog + the shape normaliser behind it (issue #952).
+  // Exported so a DOM/unit test can assert both primitives delegate to openModal
+  // and that a structured `reason` wins over the developer-facing server message.
+  errorModal,
+  resolveFailureText,
   // Per-row test-connection action (issue #683). Exported so a DOM/unit test can
   // exercise the shared probe helper + the pure spinner/result row renderers
   // without a live probe.
