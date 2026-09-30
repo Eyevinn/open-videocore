@@ -63,6 +63,7 @@ import {
 import { resolveEncoreS3Config } from './services/encore-s3-config.js';
 import {
   makeInternalEndpointResolver,
+  makeOscInternalEndpointLookup,
   resolveInternalEndpointSettings
 } from './services/internal-minio-endpoint.js';
 import {
@@ -1019,9 +1020,17 @@ function activateScaler(redisUrl: string): void {
   // logged warning (it never throws, and it cannot fail startup). Client-facing
   // URLs are untouched — see the sibling-path audit in
   // docs/investigations/991-internal-object-store-endpoint-paths.md.
+  // The in-cluster address comes from the platform's own contract first —
+  // `getInternalEndpoint(context, serviceId, instanceName, token)` returning
+  // `{ serviceDns, ports, publicAccess }` (@osaas/client-core
+  // lib/core.d.ts:130-148) — with derivation from the stored public endpoint
+  // kept only as the fallback (the platform reports `ports: []` for
+  // object-store, so the PORT still comes from ENCORE_S3_INTERNAL_PORT /
+  // the 8080 default).
   const internalEndpointSettings = resolveInternalEndpointSettings(process.env);
   const resolveTranscoderEndpoint = makeInternalEndpointResolver({
     enabled: internalEndpointSettings.enabled,
+    lookup: makeOscInternalEndpointLookup({ oscContext, log: app.log }),
     port: internalEndpointSettings.port,
     probeTimeoutMs: internalEndpointSettings.probeTimeoutMs,
     log: app.log
@@ -1154,9 +1163,13 @@ function activateScaler(redisUrl: string): void {
           // address for the TRANSCODER ONLY. Applied to BOTH scaler spawn paths,
           // because both take this one resolver
           // (workspace-registry.ts:206-209 getOrCreate and :346-351
-          // resumeExistingWorkspaces). Not applied when a static
-          // ENCORE_S3_ENDPOINT is configured — that operator override stays
-          // verbatim (see mapEndpointForTranscoder in encore-s3-config.ts).
+          // resumeExistingWorkspaces).
+          //
+          // This hook only ever sees an endpoint that came from the STACK
+          // CONFIG, so it always applies. A static ENCORE_S3_ENDPOINT never
+          // reaches it: in that case resolveEncoreS3Config returns undefined
+          // and the registry uses the `s3Config` above verbatim. See
+          // mapEndpointForTranscoder in encore-s3-config.ts.
           resolveEndpoint: resolveTranscoderEndpoint
         },
         stackKey

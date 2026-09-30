@@ -20,14 +20,62 @@
 // transcoder can address the object store's in-cluster Service directly and the
 // long transfer never touches the ingress.
 //
-// DERIVATION — verified against the live prod-se cluster, read-only, 2026-09-29
-// (recorded in issue #991's "Verified" section):
-//   - an object-store instance is a ClusterIP Service `<instance>` in the
+// HOW THE IN-CLUSTER ADDRESS IS RESOLVED — platform SDK first, derivation second
+//
+// PRIMARY: the platform SDK. `@osaas/client-core` (0.24.0, already a dependency)
+// exposes the in-cluster address of an instance as a first-class contract, so
+// this module asks the platform rather than inferring:
+//
+//   export interface InternalEndpointInfo {
+//     serviceDns: string;
+//     ports: Array<{ name: string; port: number; protocol: string }>;
+//     publicAccess: boolean;
+//   }
+//   export declare function getInternalEndpoint(
+//     context: Context, serviceId: string, name: string, token: string
+//   ): Promise<InternalEndpointInfo>;
+//
+//   — node_modules/@osaas/client-core/lib/core.d.ts:130-148, re-exported from
+//     lib/index.d.ts:6. Token via
+//     `Context.getServiceAccessToken(serviceId): Promise<string>`
+//     (lib/context.d.ts:25).
+//
+// `serviceDns` is authoritative and is used as-is. The Service PORT is taken
+// from `ports` WHEN THAT ARRAY IS NON-EMPTY; see the next paragraph for why a
+// fallback is still required.
+//
+// The instance name the SDK call needs is already stored: the stack config
+// carries `services: { serviceId, instanceName }[]`
+// (src/services/param-store.ts), and the object-store serviceId is
+// OBJECT_STORE_SERVICE_ID (src/services/stack.ts STACK_SERVICES). The caller
+// (services/encore-s3-config.ts) reads it from the config it has already
+// loaded, so this costs no extra parameter-store round trip.
+//
+// FALLBACK: derivation from the stored PUBLIC endpoint. Two distinct cases make
+// this necessary, so it is kept rather than deleted:
+//   1. PORT — verified live against prod-se on 2026-09-30, `getInternalEndpoint`
+//      returns `ports: []` for a RUNNING object-store instance, e.g.
+//        { serviceDns: '<tenant>-<instance>.minio-minio.svc.cluster.local',
+//          ports: [], publicAccess: true }
+//      so the platform does not currently expose the Service port for this
+//      service. The port therefore falls back to DEFAULT_INTERNAL_PORT (8080),
+//      overridable with ENCORE_S3_INTERNAL_PORT. Logged as OSC friction in
+//      `docs/osc-feedback/incoming-issue991-minio-internal-port-not-exposed.md`.
+//   2. HOST — the `internalEndpoint` link is resolved per instance and the SDK
+//      THROWS when the instance or that link is absent (lib/core.js
+//      getInstanceLink), and an instance may be missing from the stored
+//      `services[]` on an older stack config. Any such failure falls back to
+//      deriving the host from the public endpoint instead of giving up.
+//
+// The derivation itself, verified against the live prod-se cluster, read-only,
+// 2026-09-29 (recorded in issue #991's "Verified" section):
+//   - an object-store instance is a ClusterIP Service `<service>` in the
 //     namespace named after its serviceId, `minio-minio`; Service port `http`
 //     8080 -> container 8080 (the S3 API; the Deployment sets PORT=8080).
 //     Service port 80 (`proxy`) has NOTHING behind it — it must not be used.
-//   - the public host is `<instance>.minio-minio.auto.<env>.osaas.io`, i.e. its
-//     first two DNS labels are exactly `<service>.<namespace>`. The in-cluster
+//   - the public host is `<service>.minio-minio.auto.<env>.osaas.io`, i.e. its
+//     first two DNS labels are exactly `<service>.<namespace>`, and they match
+//     the first two labels of the `serviceDns` the SDK returns. The in-cluster
 //     name is therefore DERIVABLE from the stored public endpoint, with no new
 //     stack-config field and no data migration:
 //       http://<service>.minio-minio.svc.cluster.local:8080
@@ -47,6 +95,10 @@
 // host to `<instance>.<serviceId>.svc.cluster.local:6379`) — this one matches on
 // the leading `<service>.<namespace>` labels instead of a fixed public suffix, so
 // it works on every environment domain rather than only `.auto.prod.osaas.io`.
+//
+// EITHER WAY the candidate is PROBED before use (see SAFETY below), so a wrong
+// port or a stale DNS name degrades to the public endpoint rather than to a
+// broken transcode.
 //
 // SCOPE — what must stay PUBLIC
 //
@@ -82,8 +134,21 @@
 // the audit doc.
 //
 // CONTRACT SOURCES VERIFIED (CLAUDE.md rule 7):
-//   - `StackConfig.minioEndpoint: string` — the stored PUBLIC endpoint this
-//     derives from (src/services/param-store.ts:52-95).
+//   - `getInternalEndpoint(context: Context, serviceId: string, name: string,
+//     token: string): Promise<InternalEndpointInfo>` and
+//     `InternalEndpointInfo = { serviceDns: string; ports: Array<{ name: string;
+//     port: number; protocol: string }>; publicAccess: boolean }` —
+//     node_modules/@osaas/client-core/lib/core.d.ts:130-148 (package version
+//     0.24.0), re-exported from lib/index.d.ts:6.
+//   - `Context.getServiceAccessToken(serviceId: string): Promise<string>`
+//     (@osaas/client-core lib/context.d.ts:25).
+//   - `StackConfig.minioEndpoint: string` — the stored PUBLIC endpoint the
+//     fallback derives from, and `StackConfig.services: { serviceId: string;
+//     instanceName: string }[]` — where the caller finds the instance name for
+//     the SDK call (src/services/param-store.ts:52-95).
+//   - Object-store serviceId `OBJECT_STORE_SERVICE_ID = 'minio-minio'`
+//     (src/services/stack.ts, the single source of truth STACK_SERVICES is
+//     built from).
 //   - `EncoreS3Config = { endpoint, accessKeyId, secretAccessKey, region? }`
 //     (src/encore-scaler/types.ts:24-29) — `endpoint` is the field the spawn
 //     body's `s3Endpoint` is taken from (src/encore-scaler/instance-pool.ts:369).
@@ -93,9 +158,6 @@
 //     (workspace-registry.ts:206-209 getOrCreate, :346-351
 //     resumeExistingWorkspaces) — so hooking the single
 //     `resolveEncoreS3Config` seam covers both.
-//   - Object-store serviceId / namespace `minio-minio`
-//     (src/services/stack.ts STACK_SERVICES, quoted in
-//     docs/investigations/294-minio-ingress-longlived-connections.md).
 //   - Liveness path `/minio/health/live`: unauthenticated object-store liveness
 //     probe, observed returning 200 on the live Service in the #991
 //     verification. Unauthenticated on purpose — the probe carries no credential.
@@ -104,12 +166,21 @@
 //     (src/encore-scaler/job-throughput-cap.ts:90-98), and the injectable
 //     `FetchLike` probe seam mirrors `services/profiles-reachability.ts`.
 
-// Kubernetes namespace (== the OSC serviceId) every provisioned object-store
-// instance lives in, and the second DNS label of its public host.
-export const OBJECT_STORE_NAMESPACE = 'minio-minio';
+import { getInternalEndpoint, type Context, type InternalEndpointInfo } from '@osaas/client-core';
+import { OBJECT_STORE_SERVICE_ID } from './stack.js';
+
+// Kubernetes namespace every provisioned object-store instance lives in, and
+// the second DNS label of its public host. On the platform an instance's
+// namespace is named after its serviceId, so this IS OBJECT_STORE_SERVICE_ID —
+// re-exported under a name that says which role it plays here, from the single
+// source of truth in services/stack.ts rather than a second literal.
+export const OBJECT_STORE_NAMESPACE = OBJECT_STORE_SERVICE_ID;
 
 // Service port that maps to the S3 API container port (see the header: port 80
-// on the same Service is a dead `proxy` port — do not use it).
+// on the same Service is a dead `proxy` port — do not use it). Used when the
+// platform does not report a port for the instance, which is the case today:
+// `getInternalEndpoint` returns `ports: []` for a running object-store instance
+// (verified live 2026-09-30, see the header).
 export const DEFAULT_INTERNAL_PORT = 8080;
 
 // Unauthenticated liveness path used by the probe.
@@ -119,9 +190,18 @@ const DEFAULT_PROBE_TIMEOUT_MS = 3_000;
 
 // How long a probe outcome is reused. A burst of spawns must not turn into a
 // burst of probes, but a cluster that becomes reachable (or stops being
-// reachable) has to be noticed without a restart. The negative TTL is short so
-// recovery is fast; the positive TTL is long because the steady state is
-// "reachable".
+// reachable) should be noticed without redeploying. The negative TTL is short
+// and the positive TTL is long because the steady state is "reachable".
+//
+// SCOPE OF RECOVERY, precisely: this cache is consulted on every call into the
+// resolver, but the resolver is only CALLED when the scaler builds a workspace
+// loop — `resolveS3Config` runs at loop-creation time and the resulting
+// `EncoreS3Config` is then held by that loop (workspace-registry.ts). So a
+// recovered cluster path is picked up by NEWLY CREATED loops (a new workspace,
+// or any workspace whose loop is rebuilt) and after a restart; it does not
+// retro-fit an endpoint into a loop that is already running with the public
+// one. That is the intended trade-off — the fallback is correct, just slower —
+// and it is why the negative TTL is kept short rather than made adaptive.
 const DEFAULT_POSITIVE_TTL_MS = 5 * 60_000;
 const DEFAULT_NEGATIVE_TTL_MS = 30_000;
 
@@ -194,6 +274,110 @@ export function deriveInternalEndpoint(
   };
 }
 
+// ---------------------------------------------------------------------------
+// PRIMARY SOURCE: the platform SDK's internal-endpoint contract.
+// ---------------------------------------------------------------------------
+
+// Ask the platform for one instance's in-cluster endpoint info. Resolves
+// `undefined` rather than throwing when the instance, the `internalEndpoint`
+// link, or the call itself is unavailable — the caller then falls back to
+// deriving the host. The return type is the SDK's own `InternalEndpointInfo`
+// (@osaas/client-core lib/core.d.ts:130-136), so this seam cannot drift from
+// the contract without a type error.
+export type InternalEndpointLookup = (
+  instanceName: string
+) => Promise<InternalEndpointInfo | undefined>;
+
+// The subset of the SDK's `getInternalEndpoint` signature this module uses,
+// named so tests can substitute it without constructing a real Context
+// (@osaas/client-core lib/core.d.ts:148).
+export type GetInternalEndpointFn = (
+  context: Context,
+  serviceId: string,
+  name: string,
+  token: string
+) => Promise<InternalEndpointInfo>;
+
+/**
+ * Production lookup: mint a service access token for the object-store service
+ * and call the SDK's `getInternalEndpoint`.
+ *
+ * Contract (verified, CLAUDE.md rule 7):
+ *   - `Context.getServiceAccessToken(serviceId: string): Promise<string>`
+ *     (@osaas/client-core lib/context.d.ts:25)
+ *   - `getInternalEndpoint(context, serviceId, name, token):
+ *     Promise<InternalEndpointInfo>` (lib/core.d.ts:148)
+ *
+ * Fail-soft by construction: the SDK throws when the instance or its
+ * `internalEndpoint` link is missing (lib/core.js `getInstanceLink`), and this
+ * turns every such failure into `undefined`.
+ */
+export function makeOscInternalEndpointLookup(opts: {
+  oscContext: Context;
+  serviceId?: string;
+  getInternalEndpointImpl?: GetInternalEndpointFn;
+  log?: InternalEndpointLogger;
+}): InternalEndpointLookup {
+  const serviceId = opts.serviceId ?? OBJECT_STORE_SERVICE_ID;
+  const impl = opts.getInternalEndpointImpl ?? (getInternalEndpoint as GetInternalEndpointFn);
+  return async (instanceName) => {
+    try {
+      const token = await opts.oscContext.getServiceAccessToken(serviceId);
+      return await impl(opts.oscContext, serviceId, instanceName, token);
+    } catch (err) {
+      opts.log?.warn(
+        { err, serviceId, instanceName },
+        'encore-scaler: the platform internal-endpoint lookup failed — falling back to ' +
+          'deriving the in-cluster address from the stack\'s public endpoint (issue #991)'
+      );
+      return undefined;
+    }
+  };
+}
+
+// Ports the platform may report that must NOT be treated as the S3 API. The
+// object store's Service also exposes a `proxy` port with nothing behind it
+// (verified on the live cluster, see the header), so picking it would produce a
+// candidate that fails its probe and silently costs us the fix.
+const NON_S3_PORT_NAMES = new Set(['proxy']);
+
+/**
+ * Choose the Service port for the S3 API from what the platform reported.
+ *
+ * `ports` is EMPTY for object-store instances today (verified live 2026-09-30 —
+ * see the header and the OSC friction log), so `fallbackPort` is what is
+ * actually used in production right now. The selection logic exists so that the
+ * moment the platform does start reporting ports, they are preferred over the
+ * hard-coded default with no further change here.
+ *
+ * Preference order: a port explicitly named `http`, then the first port not on
+ * the known-dead list, then the first port, then `fallbackPort`.
+ */
+export function selectInternalPort(
+  ports: InternalEndpointInfo['ports'] | undefined,
+  fallbackPort: number
+): number {
+  if (!ports || ports.length === 0) return fallbackPort;
+  const named = ports.find((p) => p.name === 'http');
+  if (named) return named.port;
+  const usable = ports.find((p) => !NON_S3_PORT_NAMES.has(p.name));
+  return (usable ?? ports[0]!).port;
+}
+
+/**
+ * Build the in-cluster URL from a platform `InternalEndpointInfo`. Returns
+ * undefined when the platform reported no usable `serviceDns`, so the caller
+ * falls back to derivation rather than fabricating `http://:8080`.
+ */
+export function internalEndpointFromInfo(
+  info: InternalEndpointInfo | undefined,
+  fallbackPort: number
+): string | undefined {
+  const dns = info?.serviceDns?.trim();
+  if (!dns) return undefined;
+  return `http://${dns}:${selectInternalPort(info?.ports, fallbackPort)}`;
+}
+
 // Injectable fetch seam so the probe is unit-testable without network I/O.
 // Shape mirrors services/profiles-reachability.ts FetchLike; the global `fetch`
 // satisfies it. The probe target is plain http inside the cluster, so there is
@@ -238,15 +422,33 @@ export type InternalEndpointLogger = {
 
 // Maps a stack's PUBLIC object-store endpoint to the endpoint a spawned
 // transcoder should be given. ALWAYS resolves: the result is either the
-// in-cluster URL (derivable AND probed healthy) or the input, unchanged.
-export type EncoreEndpointResolver = (publicEndpoint: string) => Promise<string>;
+// in-cluster URL (resolved AND probed healthy) or the input, unchanged.
+//
+// `instanceName` is the stack's object-store instance name, read by the caller
+// from `StackConfig.services` (src/services/param-store.ts). It is OPTIONAL: it
+// is what lets the resolver ask the platform via `getInternalEndpoint`, and
+// without it the resolver falls back to deriving the host from the public
+// endpoint — which is also what happens for a stack config old enough not to
+// carry a `services[]` entry for the object store.
+export type EncoreEndpointResolver = (
+  publicEndpoint: string,
+  instanceName?: string
+) => Promise<string>;
 
 export type InternalEndpointResolverOptions = {
   // False when the operator opted out (ENCORE_S3_INTERNAL_ENDPOINT=off). When
-  // false the resolver is a pure pass-through and never probes.
+  // false the resolver is a pure pass-through and never probes and never calls
+  // the platform.
   enabled: boolean;
-  // Service port for the S3 API. Typed option, not read from the environment
-  // here: env vars are read only in the entrypoint (src/main.ts).
+  // PRIMARY source of the in-cluster address: the platform's own
+  // `getInternalEndpoint` contract, wrapped by makeOscInternalEndpointLookup.
+  // Optional so a deployment (or a test) with no OSC context still works —
+  // absent means "derive only".
+  lookup?: InternalEndpointLookup;
+  // Service port for the S3 API, used when the platform reports no port for the
+  // instance — which is the case for object-store today (`ports: []`). Typed
+  // option, not read from the environment here: env vars are read only in the
+  // entrypoint (src/main.ts).
   port?: number;
   // Injectable for tests; defaults to the live liveness probe above.
   probe?: EndpointProbe;
@@ -256,6 +458,10 @@ export type InternalEndpointResolverOptions = {
   negativeTtlMs?: number;
   now?: () => number;
 };
+
+// Where a candidate in-cluster endpoint came from. Carried into the logs so an
+// operator can tell "the platform told us" from "we inferred it".
+type CandidateSource = 'platform' | 'derived';
 
 /**
  * Build the fail-soft resolver wired into `resolveEncoreS3Config`
@@ -319,29 +525,90 @@ export function makeInternalEndpointResolver(
     }
   };
 
-  return async (publicEndpoint) => {
+  // Cache of the PLATFORM lookup, keyed by instance name, so a scale-up burst
+  // costs one `getInternalEndpoint` call rather than one per spawn. Holds the
+  // built URL (or undefined when the platform could not answer) with the same
+  // positive/negative TTLs as the probe.
+  const lookupCache = new Map<string, { endpoint: string | undefined; expiresAt: number }>();
+  const lookupInFlight = new Map<string, Promise<string | undefined>>();
+  const lookup = opts.lookup;
+
+  const lookupOnce = async (instanceName: string): Promise<string | undefined> => {
+    const cached = lookupCache.get(instanceName);
+    if (cached && cached.expiresAt > now()) return cached.endpoint;
+
+    const existing = lookupInFlight.get(instanceName);
+    if (existing) return existing;
+
+    const pending = (async () => {
+      let endpoint: string | undefined;
+      try {
+        // The lookup contract says it resolves undefined rather than throwing;
+        // this guard means a custom lookup that breaks that contract still
+        // fails soft to derivation.
+        endpoint = internalEndpointFromInfo(await lookup?.(instanceName), port);
+      } catch {
+        endpoint = undefined;
+      }
+      lookupCache.set(instanceName, {
+        endpoint,
+        expiresAt: now() + (endpoint ? positiveTtlMs : negativeTtlMs)
+      });
+      return endpoint;
+    })();
+    lookupInFlight.set(instanceName, pending);
+    try {
+      return await pending;
+    } finally {
+      lookupInFlight.delete(instanceName);
+    }
+  };
+
+  return async (publicEndpoint, instanceName) => {
     if (!opts.enabled) return publicEndpoint;
 
-    const derivation = deriveInternalEndpoint(publicEndpoint, port);
-    if (derivation.kind === 'already-internal') {
-      return publicEndpoint;
-    }
-    if (derivation.kind === 'not-derivable') {
-      opts.log.warn(
-        { publicEndpoint, reason: derivation.reason },
-        'encore-scaler: no in-cluster object-store endpoint could be derived for this stack — ' +
-          'spawning the transcoder against the public endpoint, where a long single-connection ' +
-          'read of a large source can be cut by the ingress (issue #991)'
-      );
+    // An endpoint that is ALREADY in-cluster is left alone — an operator may
+    // have pinned one deliberately, and there is nothing to resolve.
+    if (deriveInternalEndpoint(publicEndpoint, port).kind === 'already-internal') {
       return publicEndpoint;
     }
 
-    const internalEndpoint = derivation.endpoint;
+    // PRIMARY: ask the platform. `serviceDns` is authoritative; the port comes
+    // from `ports` when the platform reports any, and otherwise falls back to
+    // `port` (today's object-store reality — see the header).
+    let candidate: string | undefined;
+    let source: CandidateSource = 'platform';
+    if (lookup && instanceName) {
+      candidate = await lookupOnce(instanceName);
+    }
+
+    // FALLBACK: derive the host from the stored public endpoint. Reached when
+    // there is no lookup wired, no instance name in the stack config, or the
+    // platform could not answer for this instance.
+    if (!candidate) {
+      source = 'derived';
+      const derivation = deriveInternalEndpoint(publicEndpoint, port);
+      if (derivation.kind === 'not-derivable') {
+        opts.log.warn(
+          { publicEndpoint, instanceName, reason: derivation.reason },
+          'encore-scaler: no in-cluster object-store endpoint could be resolved for this stack — ' +
+            'the platform internal-endpoint lookup gave nothing usable and the public endpoint is ' +
+            'not of a derivable shape. Spawning the transcoder against the public endpoint, where ' +
+            'a long single-connection read of a large source can be cut by the ingress (issue #991)'
+        );
+        return publicEndpoint;
+      }
+      // `already-internal` is impossible here: it was handled above.
+      candidate = derivation.kind === 'derived' ? derivation.endpoint : undefined;
+      if (!candidate) return publicEndpoint;
+    }
+
+    const internalEndpoint = candidate;
     const wasHealthy = cache.get(internalEndpoint)?.healthy;
     const healthy = await probeOnce(internalEndpoint);
     if (!healthy) {
       opts.log.warn(
-        { internalEndpoint, publicEndpoint },
+        { internalEndpoint, publicEndpoint, source },
         'encore-scaler: the in-cluster object-store endpoint failed its health probe — ' +
           'spawning the transcoder against the public endpoint instead (issue #991). ' +
           'Expected when this API and the transcoders are not in the same cluster.'
@@ -350,10 +617,11 @@ export function makeInternalEndpointResolver(
     }
     // Log the adoption on the first pass and on any unhealthy -> healthy flip,
     // so an operator can confirm from the logs that transcodes stopped crossing
-    // the ingress, without a line per spawn.
+    // the ingress, without a line per spawn. `source` says whether the address
+    // came from the platform contract or from the fallback derivation.
     if (wasHealthy !== true) {
       opts.log.info(
-        { internalEndpoint },
+        { internalEndpoint, source },
         'encore-scaler: using the in-cluster object-store endpoint for transcoder ' +
           'reads/writes (issue #991); client-facing URLs stay public'
       );

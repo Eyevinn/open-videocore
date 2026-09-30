@@ -14,7 +14,24 @@ import { describe, it, expect, vi } from 'vitest';
 //      static ENCORE_S3_ENDPOINT override is honoured verbatim;
 //   6. client-facing presigned URLs are UNCHANGED — still on the public host.
 //
+//   7. the PLATFORM contract (`getInternalEndpoint`) is the primary source of
+//      the in-cluster address, with derivation kept only as the fallback;
+//   8. the endpoint-provenance gate: a stack-config endpoint is mapped even when
+//      a static ENCORE_S3_ENDPOINT pair is configured, while a value that truly
+//      originates from ENCORE_S3_ENDPOINT never reaches the hook.
+//
 // Contract sources verified before writing (per CLAUDE.md rule 7):
+//   - `getInternalEndpoint(context: Context, serviceId: string, name: string,
+//     token: string): Promise<InternalEndpointInfo>` with
+//     `InternalEndpointInfo = { serviceDns: string; ports: Array<{ name: string;
+//     port: number; protocol: string }>; publicAccess: boolean }` —
+//     node_modules/@osaas/client-core/lib/core.d.ts:130-148 (0.24.0),
+//     re-exported from lib/index.d.ts:6.
+//   - `Context.getServiceAccessToken(serviceId: string): Promise<string>`
+//     (@osaas/client-core lib/context.d.ts:25).
+//   - `StackConfig.services: { serviceId: string; instanceName: string }[]`
+//     (src/services/param-store.ts) and OBJECT_STORE_SERVICE_ID
+//     (src/services/stack.ts).
 //   - resolveEncoreS3Config(deps: ResolveEncoreS3ConfigDeps, stackKey: string):
 //     Promise<EncoreS3Config | undefined>, where ResolveEncoreS3ConfigDeps =
 //     { paramStore, secretAccessKey, staticFallbackConfigured, log,
@@ -38,11 +55,16 @@ import {
   INTERNAL_HEALTH_PATH,
   OBJECT_STORE_NAMESPACE,
   deriveInternalEndpoint,
+  internalEndpointFromInfo,
   makeInternalEndpointProbe,
   makeInternalEndpointResolver,
+  makeOscInternalEndpointLookup,
   resolveInternalEndpointSettings,
-  type FetchLike
+  selectInternalPort,
+  type FetchLike,
+  type GetInternalEndpointFn
 } from './internal-minio-endpoint.js';
+import { OBJECT_STORE_SERVICE_ID } from './stack.js';
 import { resolveEncoreS3Config } from './encore-s3-config.js';
 import { STACK_CONFIG_NAMESPACE } from './workspace-stack.js';
 import type { ParamStore, StackConfig } from './param-store.js';
@@ -286,6 +308,288 @@ describe('makeInternalEndpointResolver (issue #991)', () => {
   });
 });
 
+describe('platform internal-endpoint contract (issue #991)', () => {
+  // Shapes here mirror @osaas/client-core lib/core.d.ts:130-136 exactly.
+  const SERVICE_DNS = `tenant-mediastack.${OBJECT_STORE_NAMESPACE}.svc.cluster.local`;
+
+  describe('selectInternalPort', () => {
+    it('falls back when the platform reports no ports — the object-store reality today', () => {
+      expect(selectInternalPort([], 8080)).toBe(8080);
+      expect(selectInternalPort(undefined, 8080)).toBe(8080);
+    });
+
+    it('prefers a port explicitly named http when the platform does report ports', () => {
+      expect(
+        selectInternalPort(
+          [
+            { name: 'proxy', port: 80, protocol: 'TCP' },
+            { name: 'http', port: 8080, protocol: 'TCP' }
+          ],
+          9999
+        )
+      ).toBe(8080);
+    });
+
+    it('never picks the dead proxy port when another is available', () => {
+      expect(
+        selectInternalPort(
+          [
+            { name: 'proxy', port: 80, protocol: 'TCP' },
+            { name: 's3', port: 9000, protocol: 'TCP' }
+          ],
+          9999
+        )
+      ).toBe(9000);
+    });
+  });
+
+  describe('internalEndpointFromInfo', () => {
+    it('builds the URL from serviceDns and the fallback port when ports is empty', () => {
+      expect(
+        internalEndpointFromInfo(
+          { serviceDns: SERVICE_DNS, ports: [], publicAccess: true },
+          DEFAULT_INTERNAL_PORT
+        )
+      ).toBe(INTERNAL_ENDPOINT);
+    });
+
+    it('returns undefined rather than fabricating a URL when serviceDns is absent', () => {
+      expect(internalEndpointFromInfo(undefined, 8080)).toBeUndefined();
+      expect(
+        internalEndpointFromInfo({ serviceDns: '  ', ports: [], publicAccess: true }, 8080)
+      ).toBeUndefined();
+    });
+  });
+
+  describe('makeOscInternalEndpointLookup', () => {
+    it('mints a service access token for the object-store service and calls the SDK', async () => {
+      const getInternalEndpointImpl = vi.fn(async () => ({
+        serviceDns: SERVICE_DNS,
+        ports: [],
+        publicAccess: true
+      })) as unknown as GetInternalEndpointFn;
+      const oscContext = {
+        getServiceAccessToken: vi.fn(async () => 'sat-token')
+      } as unknown as Parameters<typeof makeOscInternalEndpointLookup>[0]['oscContext'];
+
+      const lookup = makeOscInternalEndpointLookup({ oscContext, getInternalEndpointImpl });
+      await expect(lookup('mediastack')).resolves.toEqual({
+        serviceDns: SERVICE_DNS,
+        ports: [],
+        publicAccess: true
+      });
+      expect(getInternalEndpointImpl).toHaveBeenCalledWith(
+        oscContext,
+        OBJECT_STORE_SERVICE_ID,
+        'mediastack',
+        'sat-token'
+      );
+    });
+
+    it('FAILS SOFT: an SDK throw (missing instance or internalEndpoint link) becomes undefined', async () => {
+      const log = makeLog();
+      const lookup = makeOscInternalEndpointLookup({
+        oscContext: {
+          getServiceAccessToken: async () => 'sat-token'
+        } as unknown as Parameters<typeof makeOscInternalEndpointLookup>[0]['oscContext'],
+        getInternalEndpointImpl: (async () => {
+          throw new Error('Instance mediastack of service minio-minio not found');
+        }) as unknown as GetInternalEndpointFn,
+        log
+      });
+
+      await expect(lookup('mediastack')).resolves.toBeUndefined();
+      expect(log.warn).toHaveBeenCalled();
+    });
+  });
+});
+
+describe('makeInternalEndpointResolver — platform lookup is primary (issue #991)', () => {
+  const PLATFORM_DNS = 'tenant-elsewhere.minio-minio.svc.cluster.local';
+  const PLATFORM_ENDPOINT = `http://${PLATFORM_DNS}:${DEFAULT_INTERNAL_PORT}`;
+
+  it('PRIMARY: uses serviceDns from the platform, not the string derivation', async () => {
+    const log = makeLog();
+    const lookup = vi.fn(async () => ({
+      serviceDns: PLATFORM_DNS,
+      ports: [],
+      publicAccess: true
+    }));
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup,
+      probe: async () => true,
+      log
+    });
+
+    // The derivation would have produced INTERNAL_ENDPOINT; the platform's
+    // answer wins, which is the whole point of the contract-first change.
+    await expect(resolve(PUBLIC_ENDPOINT, 'mediastack')).resolves.toBe(PLATFORM_ENDPOINT);
+    expect(lookup).toHaveBeenCalledWith('mediastack');
+    expect(log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'platform' }),
+      expect.any(String)
+    );
+  });
+
+  it('PRIMARY: takes the port from ports[] when the platform reports any', async () => {
+    const log = makeLog();
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup: async () => ({
+        serviceDns: PLATFORM_DNS,
+        ports: [{ name: 'http', port: 9000, protocol: 'TCP' }],
+        publicAccess: true
+      }),
+      probe: async () => true,
+      log
+    });
+
+    await expect(resolve(PUBLIC_ENDPOINT, 'mediastack')).resolves.toBe(`http://${PLATFORM_DNS}:9000`);
+  });
+
+  it('FALLBACK: derives when the platform returns no usable serviceDns', async () => {
+    const log = makeLog();
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup: async () => ({ serviceDns: '', ports: [], publicAccess: true }),
+      probe: async () => true,
+      log
+    });
+
+    await expect(resolve(PUBLIC_ENDPOINT, 'mediastack')).resolves.toBe(INTERNAL_ENDPOINT);
+    expect(log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'derived' }),
+      expect.any(String)
+    );
+  });
+
+  it('FALLBACK: derives when the lookup fails, and when no instance name is known', async () => {
+    const log = makeLog();
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup: async () => undefined,
+      probe: async () => true,
+      log
+    });
+
+    await expect(resolve(PUBLIC_ENDPOINT, 'mediastack')).resolves.toBe(INTERNAL_ENDPOINT);
+    // No instance name: the lookup cannot even be attempted.
+    await expect(resolve(PUBLIC_ENDPOINT)).resolves.toBe(INTERNAL_ENDPOINT);
+  });
+
+  it('FAILS SOFT: a lookup that throws its contract still derives rather than rejecting', async () => {
+    const log = makeLog();
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup: async () => {
+        throw new Error('lookup contract violated');
+      },
+      probe: async () => true,
+      log
+    });
+
+    await expect(resolve(PUBLIC_ENDPOINT, 'mediastack')).resolves.toBe(INTERNAL_ENDPOINT);
+  });
+
+  it('still PROBE-GATED: a platform-supplied endpoint that fails its probe falls back to public', async () => {
+    const log = makeLog();
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup: async () => ({ serviceDns: PLATFORM_DNS, ports: [], publicAccess: true }),
+      probe: async () => false,
+      log
+    });
+
+    await expect(resolve(PUBLIC_ENDPOINT, 'mediastack')).resolves.toBe(PUBLIC_ENDPOINT);
+    expect(log.warn).toHaveBeenCalled();
+  });
+
+  it('OPT-OUT: never calls the platform at all', async () => {
+    const log = makeLog();
+    const lookup = vi.fn(async () => ({
+      serviceDns: PLATFORM_DNS,
+      ports: [],
+      publicAccess: true
+    }));
+    const resolve = makeInternalEndpointResolver({ enabled: false, lookup, probe: async () => true, log });
+
+    await expect(resolve(PUBLIC_ENDPOINT, 'mediastack')).resolves.toBe(PUBLIC_ENDPOINT);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('looks the instance up once per TTL window, so a scale-up burst is not a lookup burst', async () => {
+    const log = makeLog();
+    const lookup = vi.fn(async () => ({
+      serviceDns: PLATFORM_DNS,
+      ports: [],
+      publicAccess: true
+    }));
+    let clock = 1_000;
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup,
+      probe: async () => true,
+      log,
+      positiveTtlMs: 60_000,
+      now: () => clock
+    });
+
+    await Promise.all([
+      resolve(PUBLIC_ENDPOINT, 'mediastack'),
+      resolve(PUBLIC_ENDPOINT, 'mediastack'),
+      resolve(PUBLIC_ENDPOINT, 'mediastack')
+    ]);
+    expect(lookup).toHaveBeenCalledTimes(1);
+
+    clock += 61_000;
+    await resolve(PUBLIC_ENDPOINT, 'mediastack');
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves an already-in-cluster endpoint alone without consulting the platform', async () => {
+    const log = makeLog();
+    const lookup = vi.fn(async () => ({
+      serviceDns: PLATFORM_DNS,
+      ports: [],
+      publicAccess: true
+    }));
+    const resolve = makeInternalEndpointResolver({ enabled: true, lookup, probe: async () => true, log });
+
+    await expect(resolve(INTERNAL_ENDPOINT, 'mediastack')).resolves.toBe(INTERNAL_ENDPOINT);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it('a non-derivable host with no platform answer still fails soft to the public endpoint', async () => {
+    const log = makeLog();
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup: async () => undefined,
+      probe: async () => true,
+      log
+    });
+
+    await expect(resolve('https://s3.example.com', 'mediastack')).resolves.toBe(
+      'https://s3.example.com'
+    );
+    expect(log.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a bring-your-own host IS still moved in-cluster when the platform knows the instance', async () => {
+    // Derivation refuses this host shape, but the platform contract is
+    // authoritative and does not depend on the public host at all.
+    const log = makeLog();
+    const resolve = makeInternalEndpointResolver({
+      enabled: true,
+      lookup: async () => ({ serviceDns: PLATFORM_DNS, ports: [], publicAccess: true }),
+      probe: async () => true,
+      log
+    });
+
+    await expect(resolve('https://s3.example.com', 'mediastack')).resolves.toBe(PLATFORM_ENDPOINT);
+  });
+});
+
 describe('resolveInternalEndpointSettings (issue #991)', () => {
   it('is enabled by default, on the S3 API port', () => {
     expect(resolveInternalEndpointSettings({})).toEqual({
@@ -412,14 +716,20 @@ describe('resolveEncoreS3Config endpoint hook (issue #991)', () => {
     expect(log.error).toHaveBeenCalled();
   });
 
-  it('STATIC OVERRIDE: a configured ENCORE_S3_ENDPOINT is never rewritten by the hook', async () => {
+  // PROVENANCE GATE (issue #991 review finding 3). The hook is applied to the
+  // endpoint that came from the STACK CONFIG, whatever else is configured. A
+  // leftover ENCORE_S3_ENDPOINT must not silently cost an operator the ingress
+  // fix while their static value goes unused — the previous
+  // `|| staticFallbackConfigured` gate did exactly that.
+  it('PROVENANCE: a stack-config endpoint is still mapped even when a static pair is configured', async () => {
     const log = makeLog();
     const resolveEndpoint = vi.fn(async () => INTERNAL_ENDPOINT);
     const config = await resolveEncoreS3Config(
       {
         paramStore: makeParamStore(makeStackConfig()),
         secretAccessKey: SECRET,
-        // A complete static ENCORE_S3_ENDPOINT + secret pair is configured.
+        // A complete static ENCORE_S3_ENDPOINT + secret pair is configured, but
+        // this stack HAS its own stored endpoint, so that is the one in play.
         staticFallbackConfigured: true,
         log,
         resolveEndpoint
@@ -427,12 +737,17 @@ describe('resolveEncoreS3Config endpoint hook (issue #991)', () => {
       STACK_NAME
     );
 
-    expect(config?.endpoint).toBe(PUBLIC_ENDPOINT);
-    expect(resolveEndpoint).not.toHaveBeenCalled();
+    expect(config?.endpoint).toBe(INTERNAL_ENDPOINT);
+    expect(resolveEndpoint).toHaveBeenCalledWith(PUBLIC_ENDPOINT, undefined);
   });
 
-  it('STATIC OVERRIDE with no stack config: still defers to the static endpoint (returns undefined)', async () => {
+  // The other half of the provenance rule: a value that genuinely originates
+  // from ENCORE_S3_ENDPOINT never passes through the hook, because this
+  // resolver returns undefined and the registry uses its own static s3Config
+  // verbatim (workspace-registry.ts:206-209).
+  it('STATIC OVERRIDE: the static endpoint is honoured verbatim and never reaches the hook', async () => {
     const log = makeLog();
+    const resolveEndpoint = vi.fn(async () => INTERNAL_ENDPOINT);
     await expect(
       resolveEncoreS3Config(
         {
@@ -440,11 +755,36 @@ describe('resolveEncoreS3Config endpoint hook (issue #991)', () => {
           secretAccessKey: SECRET,
           staticFallbackConfigured: true,
           log,
-          resolveEndpoint: async () => INTERNAL_ENDPOINT
+          resolveEndpoint
         },
         STACK_NAME
       )
     ).resolves.toBeUndefined();
+    expect(resolveEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('passes the object-store INSTANCE NAME from the stack config to the hook', async () => {
+    const log = makeLog();
+    const resolveEndpoint = vi.fn(async () => INTERNAL_ENDPOINT);
+    await resolveEncoreS3Config(
+      {
+        paramStore: makeParamStore(
+          makeStackConfig({
+            services: [
+              { serviceId: 'apache-couchdb', instanceName: STACK_NAME },
+              { serviceId: OBJECT_STORE_SERVICE_ID, instanceName: STACK_NAME }
+            ]
+          })
+        ),
+        secretAccessKey: SECRET,
+        staticFallbackConfigured: false,
+        log,
+        resolveEndpoint
+      },
+      STACK_NAME
+    );
+
+    expect(resolveEndpoint).toHaveBeenCalledWith(PUBLIC_ENDPOINT, STACK_NAME);
   });
 
   it('still FAILS LOUD (issue #804) when nothing resolves, hook or no hook', async () => {

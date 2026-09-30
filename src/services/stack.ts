@@ -29,8 +29,18 @@
 // means a freshly provisioned stack creates NO packager instance and mints no
 // packager secrets/tokens until packaging is actually used — the shared queue
 // (valkey-io-valkey), database and storage are unaffected.
+// The object-store serviceId. Exported as its own constant (rather than only
+// living inline in STACK_SERVICES below) because two other paths need to match
+// on it by identity rather than by position: the deprovision ordering, and the
+// #991 in-cluster endpoint lookup, which finds the stack's object-store
+// instance name in `StackConfig.services` (services/param-store.ts) to call
+// `getInternalEndpoint(context, serviceId, instanceName, token)`. On the
+// platform the Kubernetes namespace an instance runs in is named after its
+// serviceId, so this string is also the object store's namespace.
+export const OBJECT_STORE_SERVICE_ID = 'minio-minio' as const;
+
 export const STACK_SERVICES = [
-  { serviceId: 'minio-minio', role: 'storage' },
+  { serviceId: OBJECT_STORE_SERVICE_ID, role: 'storage' },
   { serviceId: 'apache-couchdb', role: 'database' },
   { serviceId: 'valkey-io-valkey', role: 'queue' }
 ] as const;

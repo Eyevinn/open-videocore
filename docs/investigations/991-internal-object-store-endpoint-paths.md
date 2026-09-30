@@ -15,19 +15,60 @@ read of a large source never crosses the ingress that was severing it
 investigation, which established the ingress timeout is not configurable and
 left retry as the only mitigation).
 
-Derivation, from the **stored public endpoint** — no new stack-config field, no
-data migration:
+### Where the in-cluster address comes from
+
+**Primary — the platform's own contract.** `@osaas/client-core` (0.24.0, already
+a dependency) exposes it directly:
+
+```ts
+export interface InternalEndpointInfo {
+  serviceDns: string;
+  ports: Array<{ name: string; port: number; protocol: string }>;
+  publicAccess: boolean;
+}
+export declare function getInternalEndpoint(
+  context: Context, serviceId: string, name: string, token: string
+): Promise<InternalEndpointInfo>;
+```
+
+— `node_modules/@osaas/client-core/lib/core.d.ts:130-148`, re-exported from
+`lib/index.d.ts:6`; token via `Context.getServiceAccessToken(serviceId)`
+(`lib/context.d.ts:25`). The instance name it needs is already stored in
+`StackConfig.services: { serviceId, instanceName }[]`, so the lookup costs no
+extra parameter-store round trip.
+
+`serviceDns` is used as-is. **The port is not available this way today**: verified
+live against prod-se on 2026-09-30, a running object-store instance returns
+
+```json
+{ "serviceDns": "<tenant>-<instance>.minio-minio.svc.cluster.local",
+  "ports": [], "publicAccess": true }
+```
+
+so the port falls back to `8080` (`ENCORE_S3_INTERNAL_PORT`). Logged as OSC
+friction. The selection logic prefers a reported `http` port the moment the
+platform starts reporting any.
+
+**Fallback — derivation from the stored public endpoint,** used when the platform
+cannot answer (no instance name in an older stored config, or the instance /
+`internalEndpoint` link is absent, which makes the SDK throw). No new
+stack-config field, no data migration:
 
 ```
 https://<instance>.minio-minio.auto.<env>.osaas.io
       -> http://<instance>.minio-minio.svc.cluster.local:8080
 ```
 
+Either way the candidate is **probed** before use, so a wrong port or a stale
+name degrades to the public endpoint rather than to a broken transcode.
+
 Implementation: `src/services/internal-minio-endpoint.ts`
-(`deriveInternalEndpoint`, `makeInternalEndpointProbe`,
-`makeInternalEndpointResolver`, `resolveInternalEndpointSettings`), wired into
-the single endpoint seam `resolveEncoreS3Config`
-(`src/services/encore-s3-config.ts`) from `activateScaler` in `src/main.ts`.
+(`makeOscInternalEndpointLookup`, `selectInternalPort`,
+`internalEndpointFromInfo`, `deriveInternalEndpoint`,
+`makeInternalEndpointProbe`, `makeInternalEndpointResolver`,
+`resolveInternalEndpointSettings`), wired into the single endpoint seam
+`resolveEncoreS3Config` (`src/services/encore-s3-config.ts`) from
+`activateScaler` in `src/main.ts`.
 
 It is **opt-out**, **probe-gated**, and **fails soft**: the in-cluster name is
 used only after a live liveness probe from this API's own pod succeeds; a
@@ -53,7 +94,7 @@ Every path that carries an object-store endpoint, and what it does now.
 | Transcoder spawn — lazy (per request) | `workspace-registry.ts:206-209` (`getOrCreate`) → `resolveS3Config` | **internal** (probe-gated) | **Updated.** This is the path the failing transcodes took. |
 | Transcoder spawn — restart resume | `workspace-registry.ts:346-351` (`resumeExistingWorkspaces`) → `resolveS3Config` | **internal** (probe-gated) | **Updated.** Same seam, so it was covered by construction rather than by a second edit. |
 | Transcoder **output writes** | `src/pipeline/transcode.ts:121` builds a bare `s3://<packagedBucket>/…` output URI; the transcoder resolves it against the endpoint it was spawned with (`instance-pool.ts:369`) | **internal** | **Updated** — implicitly and unavoidably: reads and writes share one endpoint. Path-style addressing (the public ingress serves only the exact host, no bucket wildcard) means the signed host and the fetched host stay equal as long as the endpoint is changed consistently, which it is. |
-| Static operator override | `ENCORE_S3_ENDPOINT` → registry `s3Config` | **verbatim** | **Deliberately untouched.** `mapEndpointForTranscoder` skips the hook when a complete static endpoint + secret pair is configured: an explicitly pinned endpoint must never be silently substituted. |
+| Static operator override | `ENCORE_S3_ENDPOINT` → registry `s3Config` | **verbatim** | **Deliberately untouched — by provenance, not by a flag.** A static value reaches the transcoder only via the registry's own `s3Config`, which `resolveEncoreS3Config` returns `undefined` to defer to. It never passes through `mapEndpointForTranscoder`, so there is nothing to skip. Conversely, an endpoint that came from the **stack config** is always mapped, even on a deployment that also has `ENCORE_S3_ENDPOINT` set — gating on `staticFallbackConfigured` there would have silently cost such an operator the fix while their static value went unused anyway. |
 | Presigned upload URLs | `WorkspaceStorage.presignedPut` / `presignedUploadPart` (`src/data/storage.ts:124-205`) | **public** | **Must stay public.** Handed to a browser; SigV4 signs the Host header and an in-cluster name does not resolve outside the cluster. Built from the storage client the resolver constructs from the stored public `StackConfig.minioEndpoint` — a path this change is not wired into. Asserted by test (`internal-minio-endpoint.test.ts`, "client-facing URLs stay public"). |
 | Playback / delivery / asset URLs, API responses | `src/pipeline/packaging.ts` public manifest URL, delivery routes, `src/routes/assets.ts` | **public** | **Must stay public.** Same reason. |
 | Ephemeral ffmpeg job runners: thumbnail, re-wrap, clip | `src/main.ts` `runnerFactory(...)` → `s3Endpoint: s3.endpoint` from `request.connections.s3Config` | **public** | **Intentionally left public.** Reachability from the job-runner namespace to the in-cluster Service was **not verified** by #991, and these jobs are short seeks / stream copies (plus a metadata probe over a presigned GET), not the multi-minute single-connection whole-source read that #294/#991 is about. Revisit when a runner-side probe exists; the derivation helper is already reusable. |
