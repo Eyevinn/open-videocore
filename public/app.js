@@ -7091,18 +7091,20 @@ function relativeTime(epochMs) {
   return day + ' day' + (day === 1 ? '' : 's') + ' ago';
 }
 
-// Derive per-instance job capacity from the pool records rather than hardcoding.
-// The scaler treats an instance as "busy" at JOBS_PER_INSTANCE (=1) but that
-// constant is not on the wire; instead we infer capacity as the highest
-// activeJobs observed across the pool, floored at 1 so a fully-idle pool still
-// reports a sane capacity of 1.
-function deriveInstanceCapacity(instances) {
-  let cap = 1;
-  (instances || []).forEach(function(inst) {
-    const a = Number(inst.activeJobs) || 0;
-    if (a > cap) cap = a;
-  });
-  return cap;
+// Per-instance job capacity, read from the status payload (issue #979).
+//
+// Contract: GET /api/v1/scaler/status -> `jobsPerInstance`
+// (scalerStatusSchema, src/routes/scaler.ts), the server's own
+// JOBS_PER_INSTANCE (src/encore-scaler/types.ts) — the count at which the scaler
+// loop treats an instance as busy. This used to be inferred from the pool's
+// highest observed activeJobs, which agreed with the truth only while the
+// constant was 1: the card showed "the busiest thing seen in this pool", not the
+// instance's capacity. Falls back to 1 (one job per instance, the scaler's own
+// default) when talking to a server that predates the field, rather than
+// resuming the guess.
+function resolveJobsPerInstance(status) {
+  const n = Number(status && status.jobsPerInstance);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 }
 
 // Green (idle) / amber (partial) / red (at capacity) load class for an instance.
@@ -7111,6 +7113,19 @@ function loadClass(activeJobs, capacity) {
   if (a <= 0) return 'load-idle';
   if (a >= capacity) return 'load-full';
   return 'load-partial';
+}
+
+// Operator-facing wording for each load class. Derived from the class rather
+// than re-deciding the same thresholds a second time, so the dot colour and the
+// tooltip can never disagree.
+const LOAD_CLASS_LABELS = {
+  'load-idle': 'idle',
+  'load-partial': 'partially loaded',
+  'load-full': 'at capacity',
+};
+
+function loadLabel(cls) {
+  return LOAD_CLASS_LABELS[cls] || cls;
 }
 
 async function renderTranscodersTab(container) {
@@ -7174,7 +7189,7 @@ async function renderTranscodersTab(container) {
       return;
     }
 
-    const capacity = deriveInstanceCapacity(flatInstances.map(function(f) { return f.inst; }));
+    const capacity = resolveJobsPerInstance(status);
 
     const grid = document.createElement('div');
     grid.className = 'tc-grid';
@@ -7182,7 +7197,7 @@ async function renderTranscodersTab(container) {
       const inst = f.inst;
       const active = Number(inst.activeJobs) || 0;
       const cls = loadClass(active, capacity);
-      const label = active <= 0 ? 'idle' : (active >= capacity ? 'at capacity' : 'partial');
+      const label = loadLabel(cls);
       return [
         '<div class="tc-card">',
         '  <div class="tc-card-head">',
@@ -7375,6 +7390,14 @@ export {
   renderSearchTab,
   SEARCH_FORMAT_LABEL,
   SEARCH_FORMAT_PLACEHOLDER,
+  // Per-instance capacity is read from the wire, not inferred (issue #979).
+  // Exported so a DOM/unit test can assert the card reports the server's
+  // `jobsPerInstance` and that an instance below it renders as partially loaded —
+  // the state that was unreachable while capacity was derived from observed load.
+  resolveJobsPerInstance,
+  loadClass,
+  loadLabel,
+  renderTranscodersTab,
   // Exported so a DOM/unit test can prove every rendered tab button is
   // routable — i.e. present in the allowlist AND backed by a renderer — and
   // that an unroutable one is reported rather than silently dropped (#823).

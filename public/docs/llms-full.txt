@@ -2565,7 +2565,7 @@ Response 200 (application/json)
 
   GET /api/v1/scaler/status
 
-  Current transcoder instance pool status (effective `maxInstances`, `idleTimeoutMs`).
+  Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).
 
   Response
 Response 200 (application/json)
@@ -2581,12 +2581,14 @@ Response 200 (application/json)
           "url": null,
           "activeJobs": null,
           "lastIdleAt": null,
-          "readyAt": null
+          "readyAt": null,
+          "draining": null
         }
       ]
     }
   ],
   "maxInstances": 0,
+  "jobsPerInstance": 0,
   "idleTimeoutMs": 0,
   "scalerActive": true
 }
