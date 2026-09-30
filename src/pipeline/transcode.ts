@@ -315,12 +315,30 @@ export async function completeTranscode(
     await deps.assets.update(params.sourceAssetId, { status: 'processing' });
     await deps.assets.update(params.sourceAssetId, { status: 'ready' });
   }
+  // #1023: the failure text the conditional drop settle wrote (if any), captured
+  // BEFORE it is cleared below so the audit entry can still carry it. On a job
+  // that never hit drop-detection this is undefined and nothing changes.
+  const clearedDropError = isConditionalDropFailed ? job.error : undefined;
   await deps.jobs.update(params.jobId, {
     status: 'done',
     progress: 100,
     // #709: a successful completion is a real terminal outcome — clear the
     // conditional-drop marker so the job is no longer flagged reversible.
-    droppedByScaler: false
+    droppedByScaler: false,
+    // #1023: ...and clear the failure text with it, in the SAME write. #709
+    // corrected the status but left `error` in place, so a job that recovered
+    // from a spurious drop settled `done` + `progress: 100` while still carrying
+    // "dropped by Encore: gone from active set with no completion". That is a
+    // terminal success that reads as a failure to every consumer of `error`, and
+    // it poisons "find jobs with an error" triage with drops that recovered.
+    // Applies to the whole success path, not just the correction: a job that ends
+    // `done` carries no error message, whatever happened on the way there. The
+    // drop itself stays diagnosable via the audit trail (the settle's
+    // `job.failed` entry, plus `correctedConditionalDrop` on the `job.completed`
+    // entry below) and the correction log line in the callback poller — so a
+    // too-short reconcile grace period is still detectable without leaving a
+    // success looking like a failure.
+    clearError: true
   });
 
   // Audit: transcode job reached terminal `done` (issue #564). One entry per
@@ -332,7 +350,25 @@ export async function completeTranscode(
       action: 'job.completed',
       targetType: 'job',
       targetId: job.id,
-      detail: { jobType: 'transcode', assetId: params.sourceAssetId, renditionCount: renditions.length }
+      detail: {
+        jobType: 'transcode',
+        assetId: params.sourceAssetId,
+        renditionCount: renditions.length,
+        // #1023: when this completion CORRECTED a conditional drop-detection
+        // failure (#709), record that on the audit entry — including the failure
+        // text just cleared off the job. A spurious drop is worth knowing about
+        // (it can mean the reconcile grace period is too short), so the
+        // diagnostic moves here rather than being lost with the cleared `error`.
+        // The audit detail bag is deliberately free-form (src/data/audit-repo.ts
+        // AuditDetailSchema), so these keys need no schema change. Omitted
+        // entirely on a normal completion.
+        ...(isConditionalDropFailed
+          ? {
+              correctedConditionalDrop: true,
+              ...(clearedDropError ? { clearedDropError } : {})
+            }
+          : {})
+      }
     },
     deps.auditLog
   );

@@ -232,6 +232,19 @@ export type UpdateJobInput = {
   // SUCCESSFUL callback corrects that conditional failure. Additive/optional so
   // existing callers are unaffected; carried through applyJobPatch unchanged.
   droppedByScaler?: boolean;
+  // Explicit REMOVAL of `error` (#1023). Every other field here is patched by
+  // presence (`!== undefined`), which by construction cannot express "unset this
+  // field": passing `error: undefined` is indistinguishable from not patching
+  // `error` at all, so a failure string written earlier in a job's life could
+  // never be taken back off the record. That is exactly the residue #709 left —
+  // a job corrected from a conditional drop-detection `failed` to `done` kept
+  // the drop's failure text forever (see completeTranscode's success write in
+  // src/pipeline/transcode.ts). This flag is the explicit clear: when true,
+  // applyJobPatch DELETES `error` from the resulting record, so the job reads
+  // exactly as one that never failed. Takes precedence over `error` in the same
+  // patch (a caller asking to clear and set at once is a bug; clearing wins so
+  // the record can never end up terminal-successful WITH a failure string).
+  clearError?: boolean;
 };
 
 // A conditional-drop `failed` state (#709) is reversible ONLY by a SUCCESSFUL
@@ -367,6 +380,13 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.interrupted !== undefined) next.interrupted = patch.interrupted;
   if (patch.interruptionReason !== undefined) next.interruptionReason = patch.interruptionReason;
   if (patch.droppedByScaler !== undefined) next.droppedByScaler = patch.droppedByScaler;
+  // #1023: explicit clear, applied LAST so it beats a same-patch `error` write.
+  // `delete` (not `= undefined`) so the field is genuinely absent: the CouchDB
+  // backend serialises the whole record (couch-job-repo.ts toDoc), where an
+  // absent key is dropped by JSON serialisation, and the in-memory backend hands
+  // the object straight back — both then read as a job with no `error` at all,
+  // which is what "filtering jobs by has-an-error" needs.
+  if (patch.clearError === true) delete next.error;
   return next;
 }
 
