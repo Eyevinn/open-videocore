@@ -282,7 +282,13 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
           'exact-filter tier also carries `status` (exact lifecycle match, ' +
           'asset-only) and an inclusive created-at range `from`/`to` (issue ' +
           '#833); both are applied to the whole matched set before pagination, ' +
-          'so they narrow `total` and every page rather than the page in hand.',
+          'so they narrow `total` and every page rather than the page in hand. ' +
+          'Results are ALWAYS CURRENT and there is no reindex step (issue #929): ' +
+          'this endpoint reads the stored assets and collections per request ' +
+          'rather than consulting a separately maintained index, so an edit made ' +
+          'through `PATCH /api/v1/assets/{id}` or `PATCH /api/v1/collections/{id}` ' +
+          '— a rename included — is reflected by the next search with nothing ' +
+          'called in between.',
         querystring: searchQuerySchema,
         response: { 200: searchResultSchema, 400: errorSchema }
       }

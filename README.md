@@ -333,6 +333,16 @@ last, so `?from=2026-03-01&to=2026-03-01` returns everything created during
 narrows `total` and every page rather than only the page returned. A `from` later
 than `to` is a `400`, not an empty page.
 
+**Search results are always current — there is no reindex step.** Search is a
+read-through projection over the stored documents, not a separately maintained
+index: every request reads the assets and collections back and filters them, so
+an edit is visible to the next search immediately. Rename an asset with
+`PATCH /api/v1/assets/{id}` (or a collection with
+`PATCH /api/v1/collections/{id}`) and the following `GET /api/v1/search` already
+answers with the new name, while the old name stops matching. Nothing has to be
+called in between, by a client or an operator, and nothing needs rebuilding after
+a restart.
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/search` | Full-text and metadata search (canonical) |
