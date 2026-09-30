@@ -77,6 +77,13 @@ import type {
   EncoreSubmitResult
 } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from './job-repo.js';
+import type {
+  AppendLogInput,
+  ListLogsOptions,
+  ListLogsResult,
+  LogRecord,
+  LogStore
+} from '../services/log-store.js';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
 import { currentRequestStackName } from '../services/request-stack-context.js';
 import type { AuditEmitter } from './audit-emit.js';
@@ -354,6 +361,28 @@ export class PerWorkspaceAuditRepository implements AuditRepository {
   }
   async query(query: AuditQuery): Promise<AuditQueryResult> {
     return (await this.repo()).query(query);
+  }
+}
+
+// Stack-delegating operational log store (issues #473, #996). Holds no
+// connection of its own: every append/read resolves the active stack and
+// delegates to that stack's log store — CouchLogStore on a Couch-backed stack
+// (durable across restarts), InMemoryLogStore on the env-no-couch / in-memory
+// fallback. Mirrors the other PerWorkspace* wrappers so the logs router keeps
+// receiving a single `LogStore` regardless of backend.
+export class PerWorkspaceLogStore implements LogStore {
+  constructor(private readonly resolver: WorkspaceStackResolver) {}
+  private async store(): Promise<LogStore> {
+    return (await this.resolver.resolve()).logs;
+  }
+  async append(input: AppendLogInput): Promise<LogRecord> {
+    return (await this.store()).append(input);
+  }
+  async list(opts?: ListLogsOptions): Promise<ListLogsResult> {
+    return (await this.store()).list(opts);
+  }
+  async size(): Promise<number> {
+    return (await this.store()).size();
   }
 }
 

@@ -80,7 +80,8 @@ import {
   PerWorkspaceCollectionRepository,
   PerWorkspaceAuditRepository,
   PerWorkspaceProfileRepository,
-  PerWorkspaceAuditEmitter
+  PerWorkspaceAuditEmitter,
+  PerWorkspaceLogStore
 } from './data/per-workspace-repos.js';
 import type { AssetRepository } from './data/asset-repo.js';
 import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
@@ -121,7 +122,6 @@ import {
   auditRetentionMsFromEnv
 } from './routes/retention.js';
 import { logsRouter } from './routes/logs.js';
-import { LogStore } from './services/log-store.js';
 import {
   ArchivedAssetPurgeLoop,
   archivePurgeIntervalMsFromEnv
@@ -508,12 +508,13 @@ registerPrincipal(app, {
 
 const operationStore = new OperationStore();
 
-// In-memory operational log store backing GET /api/v1/logs (issue #473). There
-// is no persistent log store today; this is the minimal append-only, sequence-
-// keyed source that satisfies cursor paging + the log record shape, modelled on
-// operationStore above. Registered by reference so future producers can append
-// to the same instance the router reads.
-const logStore = new LogStore();
+// Operational log store backing GET /api/v1/logs (issues #473, #996). Durable:
+// it delegates per call to the resolved stack's store — CouchLogStore on a
+// Couch-backed stack, so an appended entry survives a restart and is still
+// returned by GET /api/v1/logs afterwards, and InMemoryLogStore only on the
+// env-no-couch / in-memory fallback paths. Registered by reference so producers
+// append through the same instance the router reads.
+const logStore = new PerWorkspaceLogStore(stackResolver);
 
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
@@ -2284,7 +2285,7 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
 await app.register(retentionRouter, retentionRouterOptions);
 
 // Operational logs listing (issue #473). Cursor/sequence-paged, newest-first,
-// append-only log stream over the in-memory logStore. Offset paging is
+// append-only log stream over the persistent logStore (issue #996). Offset paging is
 // deliberately excluded (#371): only a bounded `limit` + opaque `cursor`, so
 // appended entries never shift an in-flight page.
 await app.register(logsRouter, { prefix: '/api/v1/logs', logStore });

@@ -1,6 +1,6 @@
 // Tests for GET /api/v1/logs (issue #473).
 //
-// Builds the logsRouter over a real in-memory LogStore, exactly as
+// Builds the logsRouter over a real InMemoryLogStore, exactly as
 // provision.deprovision.test.ts builds provisionRouter over a real
 // OperationStore, and drives it with app.inject(). Covers the acceptance
 // criteria: cursor paging with NO offset drift on newly appended entries,
@@ -13,7 +13,11 @@ import {
   validatorCompiler
 } from 'fastify-type-provider-zod';
 import { logsRouter } from './logs.js';
-import { LogStore, LOG_STORE_MAX_RECORDS } from '../services/log-store.js';
+import {
+  InMemoryLogStore,
+  LOG_STORE_MAX_RECORDS,
+  type LogStore
+} from '../services/log-store.js';
 import { registerAuth } from '../auth/middleware.js';
 
 async function buildApp(logStore: LogStore) {
@@ -40,15 +44,15 @@ function ts(i: number): string {
   return new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
 }
 
-let store: LogStore;
+let store: InMemoryLogStore;
 
 beforeEach(() => {
-  store = new LogStore();
+  store = new InMemoryLogStore();
 });
 
 describe('GET /api/v1/logs — envelope + record shape', () => {
   it('returns an { items, nextCursor } envelope with timestamp + message records', async () => {
-    store.append({ message: 'hello', level: 'info', category: 'ingest', timestamp: ts(1) });
+    await store.append({ message: 'hello', level: 'info', category: 'ingest', timestamp: ts(1) });
     const app = await buildApp(store);
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs' });
     expect(res.statusCode).toBe(200);
@@ -68,7 +72,7 @@ describe('GET /api/v1/logs — envelope + record shape', () => {
 
 describe('GET /api/v1/logs — sort order', () => {
   it('defaults to newest-first', async () => {
-    for (let i = 1; i <= 3; i++) store.append({ message: `m${i}`, timestamp: ts(i) });
+    for (let i = 1; i <= 3; i++) await store.append({ message: `m${i}`, timestamp: ts(i) });
     const app = await buildApp(store);
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs' });
     const body = res.json() as LogPage;
@@ -77,7 +81,7 @@ describe('GET /api/v1/logs — sort order', () => {
   });
 
   it('reverses to oldest-first with order=asc', async () => {
-    for (let i = 1; i <= 3; i++) store.append({ message: `m${i}`, timestamp: ts(i) });
+    for (let i = 1; i <= 3; i++) await store.append({ message: `m${i}`, timestamp: ts(i) });
     const app = await buildApp(store);
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs?order=asc' });
     const body = res.json() as LogPage;
@@ -88,7 +92,7 @@ describe('GET /api/v1/logs — sort order', () => {
 
 describe('GET /api/v1/logs — cursor paging (no offset drift)', () => {
   it('walks the whole stream via nextCursor without gaps or repeats', async () => {
-    for (let i = 1; i <= 5; i++) store.append({ message: `m${i}`, timestamp: ts(i) });
+    for (let i = 1; i <= 5; i++) await store.append({ message: `m${i}`, timestamp: ts(i) });
     const app = await buildApp(store);
 
     const p1 = (await app.inject({ method: 'GET', url: '/api/v1/logs?limit=2' })).json() as LogPage;
@@ -114,15 +118,15 @@ describe('GET /api/v1/logs — cursor paging (no offset drift)', () => {
     // hazard #371 calls out. With offset paging, appending after page 1 would
     // shift every offset and re-show an already-seen row. With a seq cursor,
     // page 2 must resume strictly after page 1's boundary regardless of appends.
-    for (let i = 1; i <= 3; i++) store.append({ message: `m${i}`, timestamp: ts(i) });
+    for (let i = 1; i <= 3; i++) await store.append({ message: `m${i}`, timestamp: ts(i) });
     const app = await buildApp(store);
 
     const p1 = (await app.inject({ method: 'GET', url: '/api/v1/logs?limit=2' })).json() as LogPage;
     expect(p1.items.map((r) => r.message)).toEqual(['m3', 'm2']);
 
     // Two new entries land at the head of the newest-first stream.
-    store.append({ message: 'm4', timestamp: ts(4) });
-    store.append({ message: 'm5', timestamp: ts(5) });
+    await store.append({ message: 'm4', timestamp: ts(4) });
+    await store.append({ message: 'm5', timestamp: ts(5) });
 
     const p2 = (
       await app.inject({ method: 'GET', url: `/api/v1/logs?limit=2&cursor=${encodeURIComponent(p1.nextCursor!)}` })
@@ -137,7 +141,7 @@ describe('GET /api/v1/logs — cursor paging (no offset drift)', () => {
 
 describe('GET /api/v1/logs — server-side filters', () => {
   it('filters by from/to time range', async () => {
-    for (let i = 1; i <= 5; i++) store.append({ message: `m${i}`, timestamp: ts(i) });
+    for (let i = 1; i <= 5; i++) await store.append({ message: `m${i}`, timestamp: ts(i) });
     const app = await buildApp(store);
     const res = await app.inject({
       method: 'GET',
@@ -150,9 +154,9 @@ describe('GET /api/v1/logs — server-side filters', () => {
   });
 
   it('filters by free-text q on message (case-insensitive)', async () => {
-    store.append({ message: 'transcode started', timestamp: ts(1) });
-    store.append({ message: 'INGEST started', timestamp: ts(2) });
-    store.append({ message: 'transcode done', timestamp: ts(3) });
+    await store.append({ message: 'transcode started', timestamp: ts(1) });
+    await store.append({ message: 'INGEST started', timestamp: ts(2) });
+    await store.append({ message: 'transcode done', timestamp: ts(3) });
     const app = await buildApp(store);
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs?q=TRANSCODE' });
     const body = res.json() as LogPage;
@@ -161,8 +165,8 @@ describe('GET /api/v1/logs — server-side filters', () => {
   });
 
   it('combines q with cursor paging', async () => {
-    for (let i = 1; i <= 4; i++) store.append({ message: `keep ${i}`, timestamp: ts(i) });
-    store.append({ message: 'drop', timestamp: ts(5) });
+    for (let i = 1; i <= 4; i++) await store.append({ message: `keep ${i}`, timestamp: ts(i) });
+    await store.append({ message: 'drop', timestamp: ts(5) });
     const app = await buildApp(store);
     const p1 = (await app.inject({ method: 'GET', url: '/api/v1/logs?q=keep&limit=2' })).json() as LogPage;
     expect(p1.items.map((r) => r.message)).toEqual(['keep 4', 'keep 3']);
@@ -184,7 +188,7 @@ describe('GET /api/v1/logs — validation', () => {
   });
 
   it('treats a garbage cursor as the first page rather than erroring', async () => {
-    for (let i = 1; i <= 2; i++) store.append({ message: `m${i}`, timestamp: ts(i) });
+    for (let i = 1; i <= 2; i++) await store.append({ message: `m${i}`, timestamp: ts(i) });
     const app = await buildApp(store);
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs?cursor=not-a-real-cursor' });
     expect(res.statusCode).toBe(200);
@@ -199,14 +203,14 @@ describe('GET /api/v1/logs — validation', () => {
 // so the array must not grow without bound. CONTRACT verified before writing:
 // `LogStoreOptions.maxRecords` / `LOG_STORE_MAX_RECORDS` and the oldest-first
 // eviction in `append()` — src/services/log-store.ts; `size()` reports records
-// HELD; the cursor is a `seq` boundary decoded by `decodeCursor`, never an offset.
+// HELD; the cursor is a `seq` boundary decoded by `decodeLogCursor`, never an offset.
 describe('LogStore — bounded retention (oldest-first eviction)', () => {
-  it('caps records held and drops the oldest first', () => {
-    const capped = new LogStore({ maxRecords: 3 });
-    for (let i = 1; i <= 6; i++) capped.append({ message: `m${i}`, timestamp: ts(i) });
+  it('caps records held and drops the oldest first', async () => {
+    const capped = new InMemoryLogStore({ maxRecords: 3 });
+    for (let i = 1; i <= 6; i++) await capped.append({ message: `m${i}`, timestamp: ts(i) });
 
-    expect(capped.size()).toBe(3);
-    const { items } = capped.list({ limit: 200 });
+    expect(await capped.size()).toBe(3);
+    const { items } = await capped.list({ limit: 200 });
     // Newest-first: only the final three survive; m1..m3 were evicted.
     expect(items.map((r) => r.message)).toEqual(['m6', 'm5', 'm4']);
     // Sequence numbers are NOT renumbered by eviction — they stay monotonic and
@@ -214,71 +218,71 @@ describe('LogStore — bounded retention (oldest-first eviction)', () => {
     expect(items.map((r) => r.seq)).toEqual([6, 5, 4]);
   });
 
-  it('applies the default cap without an explicit option', () => {
-    const capped = new LogStore();
-    for (let i = 0; i < LOG_STORE_MAX_RECORDS + 50; i++) capped.append({ message: `m${i}` });
-    expect(capped.size()).toBe(LOG_STORE_MAX_RECORDS);
+  it('applies the default cap without an explicit option', async () => {
+    const capped = new InMemoryLogStore();
+    for (let i = 0; i < LOG_STORE_MAX_RECORDS + 50; i++) await capped.append({ message: `m${i}` });
+    expect(await capped.size()).toBe(LOG_STORE_MAX_RECORDS);
   });
 
-  it('keeps `q`/from-to filtering and the listing envelope unchanged after eviction', () => {
-    const capped = new LogStore({ maxRecords: 3 });
-    capped.append({ message: 'keep 1', timestamp: ts(1) }); // evicted
-    capped.append({ message: 'drop 2', timestamp: ts(2) }); // evicted
-    capped.append({ message: 'keep 3', timestamp: ts(3) });
-    capped.append({ message: 'drop 4', timestamp: ts(4) });
-    capped.append({ message: 'keep 5', timestamp: ts(5) });
+  it('keeps `q`/from-to filtering and the listing envelope unchanged after eviction', async () => {
+    const capped = new InMemoryLogStore({ maxRecords: 3 });
+    await capped.append({ message: 'keep 1', timestamp: ts(1) }); // evicted
+    await capped.append({ message: 'drop 2', timestamp: ts(2) }); // evicted
+    await capped.append({ message: 'keep 3', timestamp: ts(3) });
+    await capped.append({ message: 'drop 4', timestamp: ts(4) });
+    await capped.append({ message: 'keep 5', timestamp: ts(5) });
 
-    const byQ = capped.list({ q: 'KEEP', limit: 200 });
+    const byQ = await capped.list({ q: 'KEEP', limit: 200 });
     expect(byQ.items.map((r) => r.message)).toEqual(['keep 5', 'keep 3']);
     expect(byQ.nextCursor).toBeNull();
 
     // from/to still filters on the held window only; the evicted ts(1) entry is
     // simply absent rather than erroring.
-    const byRange = capped.list({ from: ts(1), to: ts(4), limit: 200 });
+    const byRange = await capped.list({ from: ts(1), to: ts(4), limit: 200 });
     expect(byRange.items.map((r) => r.message)).toEqual(['drop 4', 'keep 3']);
   });
 
-  it('honours a cursor whose boundary record has aged out (desc and asc)', () => {
-    const capped = new LogStore({ maxRecords: 4 });
-    for (let i = 1; i <= 4; i++) capped.append({ message: `m${i}`, timestamp: ts(i) });
+  it('honours a cursor whose boundary record has aged out (desc and asc)', async () => {
+    const capped = new InMemoryLogStore({ maxRecords: 4 });
+    for (let i = 1; i <= 4; i++) await capped.append({ message: `m${i}`, timestamp: ts(i) });
 
     // Page 1 (newest-first, limit 2) anchors its cursor on m3 (seq 3).
-    const p1 = capped.list({ limit: 2 });
+    const p1 = await capped.list({ limit: 2 });
     expect(p1.items.map((r) => r.message)).toEqual(['m4', 'm3']);
     expect(p1.nextCursor).not.toBeNull();
 
     // Two appends evict m1 and m2 — including the records that page 2 would have
     // returned, and pushing the held window strictly newer than the cursor.
-    capped.append({ message: 'm5', timestamp: ts(5) });
-    capped.append({ message: 'm6', timestamp: ts(6) });
-    expect(capped.size()).toBe(4);
+    await capped.append({ message: 'm5', timestamp: ts(5) });
+    await capped.append({ message: 'm6', timestamp: ts(6) });
+    expect(await capped.size()).toBe(4);
 
     // Desc: resuming after the aged-out boundary yields an empty, terminal page —
     // no error, no re-showing of the newer entries that arrived since.
-    const p2 = capped.list({ limit: 2, cursor: p1.nextCursor! });
+    const p2 = await capped.list({ limit: 2, cursor: p1.nextCursor! });
     expect(p2.items).toEqual([]);
     expect(p2.nextCursor).toBeNull();
 
     // Asc from the same boundary returns the still-held records strictly newer
     // than it, in oldest-first order, with paging intact.
-    const asc1 = capped.list({ limit: 2, order: 'asc', cursor: p1.nextCursor! });
+    const asc1 = await capped.list({ limit: 2, order: 'asc', cursor: p1.nextCursor! });
     expect(asc1.items.map((r) => r.message)).toEqual(['m4', 'm5']);
     expect(asc1.nextCursor).not.toBeNull();
-    const asc2 = capped.list({ limit: 2, order: 'asc', cursor: asc1.nextCursor! });
+    const asc2 = await capped.list({ limit: 2, order: 'asc', cursor: asc1.nextCursor! });
     expect(asc2.items.map((r) => r.message)).toEqual(['m6']);
     expect(asc2.nextCursor).toBeNull();
   });
 
   it('serves a cursor from an evicted-boundary page over HTTP without erroring', async () => {
-    const capped = new LogStore({ maxRecords: 2 });
-    for (let i = 1; i <= 2; i++) capped.append({ message: `m${i}`, timestamp: ts(i) });
+    const capped = new InMemoryLogStore({ maxRecords: 2 });
+    for (let i = 1; i <= 2; i++) await capped.append({ message: `m${i}`, timestamp: ts(i) });
     const app = await buildApp(capped);
 
     const p1 = (await app.inject({ method: 'GET', url: '/api/v1/logs?limit=1' })).json() as LogPage;
     expect(p1.items.map((r) => r.message)).toEqual(['m2']);
 
-    capped.append({ message: 'm3', timestamp: ts(3) });
-    capped.append({ message: 'm4', timestamp: ts(4) });
+    await capped.append({ message: 'm3', timestamp: ts(3) });
+    await capped.append({ message: 'm4', timestamp: ts(4) });
 
     const p2res = await app.inject({
       method: 'GET',
@@ -310,7 +314,7 @@ describe('GET /api/v1/logs — 401 presence gate', () => {
   }
 
   it('rejects an anonymous request with 401', async () => {
-    store.append({ message: 'transcode done for asset a1', timestamp: ts(1) });
+    await store.append({ message: 'transcode done for asset a1', timestamp: ts(1) });
     const app = await buildGatedApp(store);
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs' });
     expect(res.statusCode).toBe(401);
@@ -319,7 +323,7 @@ describe('GET /api/v1/logs — 401 presence gate', () => {
   });
 
   it('serves the listing to an authenticated caller', async () => {
-    store.append({ message: 'transcode done for asset a1', timestamp: ts(1) });
+    await store.append({ message: 'transcode done for asset a1', timestamp: ts(1) });
     const app = await buildGatedApp(store);
     const res = await app.inject({
       method: 'GET',
@@ -334,7 +338,7 @@ describe('GET /api/v1/logs — 401 presence gate', () => {
   });
 
   it('still works un-gated when registerAuth was never called (isolated router)', async () => {
-    store.append({ message: 'm1', timestamp: ts(1) });
+    await store.append({ message: 'm1', timestamp: ts(1) });
     const app = await buildApp(store);
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs' });
     expect(res.statusCode).toBe(200);

@@ -4,9 +4,14 @@
 // log stream. #371 rules out offset paging for this surface (offset counts drift
 // as entries are appended to a high-volume append-only stream), so this endpoint
 // is cursor-only: a bounded `limit` plus an opaque `cursor`, returning
-// `{ items, nextCursor }`. There is no persistent log store in the repo, so the
-// endpoint is backed by the in-memory LogStore (src/services/log-store.ts),
-// modelled on the OperationStore that backs GET /api/v1/provision/operations.
+// `{ items, nextCursor }`.
+//
+// The endpoint is backed by the injected `LogStore` (src/services/log-store.ts).
+// #996 made that store PERSISTENT — CouchLogStore over the per-stack CouchDB
+// (src/data/log-repo.ts) on a provisioned stack, InMemoryLogStore only on the
+// env-no-couch / dev / test paths — so entries survive a restart. The store
+// surface is async as a result; this WIRE contract is unchanged by that switch:
+// same `{ items, nextCursor }` envelope, same record shape, same filters.
 //
 // Behind the 401 presence gate (issue #995 review). This endpoint is NOT the
 // aggregate-only surface it was when it shipped: the pipeline producer
@@ -29,8 +34,9 @@
 //     copied): src/routes/jobs.ts:91-99 (`{ items, total }`).
 //   - `{ items, nextCursor }` cursor envelope + `{ limit, cursor }` request the
 //     frontend table primitive sends: public/ops-ui-table.js:210-213, 262-268.
-//   - Injected in-memory store pattern (OperationStore into provisionRouter):
-//     src/main.ts:301-307; store contract: src/services/log-store.ts.
+//   - Injected store pattern (OperationStore into provisionRouter):
+//     src/main.ts:301-307; store contract: `LogStore` (append/list/size),
+//     src/services/log-store.ts.
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -109,7 +115,7 @@ export const logsRouter: FastifyPluginAsync<LogsRouterOptions> = async (fastify,
     },
     async (request) => {
       const { limit, cursor, from, to, q, order } = request.query;
-      return logStore.list({ limit, cursor, from, to, q, order });
+      return await logStore.list({ limit, cursor, from, to, q, order });
     }
   );
 };
