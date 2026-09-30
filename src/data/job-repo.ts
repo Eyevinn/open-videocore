@@ -70,10 +70,18 @@ export function isActiveJobStatus(status: JobStatus): boolean {
   return ACTIVE_JOB_STATUSES.includes(status);
 }
 
-// The kind of work a job performs. URL-pull ingest (issue #5) and ABR
-// transcoding (issue #8) share one repository + one observability endpoint
-// (GET /api/v1/jobs/:id), distinguished by `jobType`.
-export const JOB_TYPES = ['ingest-url', 'transcode'] as const;
+// The kind of work a job performs. URL-pull ingest (issue #5), ABR transcoding
+// (issue #8) and CMAF packaging (issue #976) share one repository + one
+// observability endpoint (GET /api/v1/jobs/:id), distinguished by `jobType`.
+//
+// `package` (issue #976) is the step that produces the artifact the caller
+// actually consumes (the HLS/DASH manifests) and was, until now, the ONLY
+// pipeline step with no observable object: packaging wrote `packagingError` on
+// the asset and left `steps[].jobId` empty, so `GET /api/v1/jobs` returned
+// nothing for work that really ran. Adding the value here is additive — no
+// existing job changes type, and the value flows into the API response contract
+// through `z.enum(JOB_TYPES)` (src/routes/jobs.ts jobSchema.type).
+export const JOB_TYPES = ['ingest-url', 'transcode', 'package'] as const;
 export type JobType = (typeof JOB_TYPES)[number];
 
 // A Job is the unit of observability for any async pipeline. The shape is a
@@ -97,7 +105,10 @@ export type Job = {
   bytesTransferred: number;
   // Total expected size in bytes when known (from Content-Length / S3 stat).
   totalBytes?: number;
-  // Number of pull attempts made so far (retry tracking).
+  // Number of attempts made so far (retry tracking). Ingest jobs count URL-pull
+  // attempts; package jobs (issue #976) count enqueues onto the packager queue,
+  // so a re-enqueue of the same asset's packaging is distinguishable from a slow
+  // first run. Transcode jobs leave this at 0 and use `encodeAttempts` instead.
   attempts: number;
   // Terminal error message when status === 'failed'.
   error?: string;
@@ -111,6 +122,19 @@ export type Job = {
   profile?: string;
   // Child asset ids created for each produced rendition on completion.
   renditionAssetIds?: string[];
+  // --- Package-job fields (issue #976) ---
+  // The packaging correlation id carried through the packager queue message and
+  // echoed back on the packager's success callback (`packagingId(assetId)`,
+  // src/pipeline/packaging.ts). It is to a package job exactly what
+  // `encoreJobId` above is to a transcode job: the external handle the
+  // completion signal is correlated by.
+  packagingId?: string;
+  // The deterministic packaged-output prefix this job's CMAF/HLS/DASH objects
+  // are written under (`outputPrefix(assetId)`, src/pipeline/packaging.ts), so
+  // an operator can go from the job record to the produced objects without
+  // re-deriving the path. The ACTUAL, job-nested location reported by the
+  // packager is persisted separately on the asset (`packagedOutput`).
+  outputPrefix?: string;
   // --- Durable encode-attempt capture (ADR-012, #380) ---
   // Count of Encore dispatches for this transcode job; 1 on the first dispatch,
   // incremented on each transport-class re-dispatch. Distinct from `attempts`
@@ -167,6 +191,10 @@ export type CreateJobInput = {
   encoreJobId?: string;
   encoreInternalJobId?: string;
   profile?: string;
+  // Package jobs only (issue #976). Mirrors how a transcode job carries its
+  // external correlation id at creation time.
+  packagingId?: string;
+  outputPrefix?: string;
 };
 
 // Fields the worker may patch as it makes progress. id/workspace/createdAt are
@@ -182,6 +210,11 @@ export type UpdateJobInput = {
   encoreInternalJobId?: string;
   profile?: string;
   renditionAssetIds?: string[];
+  // Package-job fields (issue #976), patchable for the same reason the
+  // transcode correlation fields above are: they are written just after the
+  // record exists, from the enqueue path.
+  packagingId?: string;
+  outputPrefix?: string;
   // Durable encode-attempt fields (ADR-012, #380). Normally written via the
   // dedicated appendEncodeAttempt() path, but exposed here so a full record can
   // be patched (and so applyJobPatch carries them through unchanged).
@@ -327,6 +360,8 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.encoreInternalJobId !== undefined) next.encoreInternalJobId = patch.encoreInternalJobId;
   if (patch.profile !== undefined) next.profile = patch.profile;
   if (patch.renditionAssetIds !== undefined) next.renditionAssetIds = patch.renditionAssetIds;
+  if (patch.packagingId !== undefined) next.packagingId = patch.packagingId;
+  if (patch.outputPrefix !== undefined) next.outputPrefix = patch.outputPrefix;
   if (patch.encodeAttempts !== undefined) next.encodeAttempts = patch.encodeAttempts;
   if (patch.encodeAttemptLog !== undefined) next.encodeAttemptLog = patch.encodeAttemptLog;
   if (patch.interrupted !== undefined) next.interrupted = patch.interrupted;
@@ -428,6 +463,8 @@ export class InMemoryJobRepository implements JobRepository {
       attempts: 0,
       encoreJobId: input.encoreJobId,
       profile: input.profile,
+      packagingId: input.packagingId,
+      outputPrefix: input.outputPrefix,
       createdAt: now,
       updatedAt: now
     };

@@ -32,6 +32,9 @@ import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.j
 import { InMemoryJobRepository, encodeEncoreJobId } from '../data/job-repo.js';
 import { InMemoryAssetRepository } from '../data/asset-repo.js';
 import { InMemoryPipelineRepository } from '../data/pipeline-repo.js';
+// #976: the deterministic packaging correlation id + output prefix a `package`
+// job carries (the counterparts of a transcode job's encoreJobId).
+import { outputPrefix, packagingId } from './packaging.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { InMemoryWebhookRepository } from '../data/inmemory-webhook-repo.js';
 import { WEBHOOK_EVENT_TYPES } from '../data/webhook-repo.js';
@@ -783,6 +786,43 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(1);
     const execution = await pipelines.get(pipelineId);
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // #976: the transcode->package handoff is the OSC-native enqueue path (it
+  // ZADDs the packager's input queue directly rather than going through
+  // PackagingService), so it must leave the SAME observable `package` Job
+  // behind: type `package`, carrying the packaging correlation id + the
+  // deterministic output prefix, with its id on the execution's `package` step.
+  // CONTRACT: `Job` / `JOB_TYPES` (src/data/job-repo.ts), `StepExecution.jobId`
+  // (src/data/pipeline-repo.ts), `packagingId`/`outputPrefix`
+  // (src/pipeline/packaging.ts).
+  it('records an observable `package` job and stamps steps[].jobId on the handoff (#976)', async () => {
+    const encoreUuid = 'uuid-handoff-package-job';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+    const d = baseDeps(successFetch(externalId, encoreUuid), undefined);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+    } finally {
+      stop();
+    }
+
+    const execution = await pipelines.get(pipelineId);
+    const step = execution?.steps.find((s) => s.name === 'package');
+    expect(step?.status).toBe('running');
+    await waitFor(async () => Boolean((await pipelines.get(pipelineId))?.steps.find((s) => s.name === 'package')?.jobId));
+
+    const packageStep = (await pipelines.get(pipelineId))!.steps.find((s) => s.name === 'package')!;
+    const listed = await jobs.list({ limit: 100 });
+    const pkg = listed.items.filter((j) => j.type === 'package');
+    expect(pkg).toHaveLength(1);
+    expect(packageStep.jobId).toBe(pkg[0].id);
+    expect(pkg[0].assetId).toBe(execution!.assetId);
+    expect(pkg[0].status).toBe('running');
+    expect(pkg[0].attempts).toBe(1);
+    expect(pkg[0].packagingId).toBe(packagingId(execution!.assetId));
+    expect(pkg[0].outputPrefix).toBe(outputPrefix(execution!.assetId));
   });
 
   // #525 regression: reproduces a bulk-cleanup-triggered dispatch gap where

@@ -2612,7 +2612,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               );
             }
           }
-          void opts.packaging!.triggerPackaging(asset.id, packageOnlyEncoreJobUrl);
+          // Awaited (was fire-and-forget) so the `package` Job it records (issue
+          // #976) is in hand before this step is persisted: a package-only
+          // execution's `package` step is still `pending` here, so the service
+          // cannot find it to stamp `steps[].jobId` itself — we stamp the
+          // returned id below, in the SAME write that marks the step running.
+          // triggerPackaging never throws (an enqueue failure is recorded on the
+          // asset and on the package job), so this cannot fail the step.
+          const packageJobId = await opts.packaging!.triggerPackaging(
+            asset.id,
+            packageOnlyEncoreJobUrl
+          );
           // Stamp the transcode's Encore job id on the `package` step. A
           // package-only execution has NO transcode step, and the packager's
           // success callback releases the pin by looking the job id up on the
@@ -2629,6 +2639,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           stepsCopy[i] = {
             ...step,
             status: 'running',
+            // `StepExecution.jobId` — the internal job repo id, already on the
+            // contract (CONTRACT: src/data/pipeline-repo.ts:43-56, field at :45)
+            // and until now only populated by transcode steps (issue #976).
+            ...(packageJobId ? { jobId: packageJobId } : {}),
             ...(packageOnlyEncoreJobId ? { encoreJobId: packageOnlyEncoreJobId } : {}),
             startedAt: now()
           };

@@ -46,6 +46,10 @@ import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
 import { pinInstanceForPackaging, unpinInstanceForPackaging } from '../encore-scaler/packaging-pin.js';
 import { DEFAULT_PACKAGE_STALL_TIMEOUT_MS } from './stalled-package-reconciler.js';
+// Package-step Job records (issue #976) — the same lifecycle module
+// PackagingService uses, so this OSC-native handoff leaves an identical
+// observable object behind.
+import { failPackageJob, startPackageJob } from './package-job.js';
 
 // Resolve the correct Encore job API URL using the reverse UUID mapping stored
 // at dispatch time. The callback listener always uses its own configured Encore
@@ -232,6 +236,14 @@ async function enqueuePackagingJob(
 ): Promise<void> {
   const queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
   const message = JSON.stringify({ jobId: assetId, url: encoreJobUrl });
+  // Record the observable `package` Job and stamp it onto the execution's
+  // running `package` step (issue #976) BEFORE the ZADD, so the packager cannot
+  // consume the entry and call back before the record exists. This is the same
+  // ordering PackagingService.triggerPackaging uses; both go through the one
+  // lifecycle module so the two handoff paths cannot drift. Best-effort — never
+  // throws (src/pipeline/package-job.ts).
+  const packageJobDeps = { jobs: deps.jobRepository, pipeline: deps.pipelineRepository, logger: deps.logger };
+  const packageJobId = await startPackageJob(packageJobDeps, assetId);
   // #498: purge stale ghost entries BEFORE our ZADD so the packager instance this
   // job's own on-demand provisioning (#496/#497) just brought up can never drain
   // an ancient job whose no-jobId failure callback would be misattributed to THIS
@@ -244,6 +256,13 @@ async function enqueuePackagingJob(
   } catch (err) {
     const emsg = err instanceof Error ? err.message : String(err);
     deps.logger.error({ msg: 'encore-callback-poller: failed to enqueue packaging job', queueKey, assetId, err });
+    // The enqueue never happened, so no packager callback can settle this job:
+    // fail it here with the same reason recorded on the asset (issue #976).
+    await failPackageJob(
+      packageJobDeps,
+      { jobId: packageJobId, assetId },
+      `failed to enqueue packaging job: ${emsg}`
+    );
     try {
       await deps.assetRepository.update(assetId, {
         packagingError: `failed to enqueue packaging job: ${emsg}`
