@@ -289,16 +289,19 @@ describe('asset detail — restore failures (issue #889)', () => {
 
     const notice = container.querySelector('#restore-gone-notice');
     expect(notice).not.toBeNull();
-    expect(notice?.className).toContain('msg-error');
+    // Presented as permanently unrecoverable, NOT as a generic/retryable error
+    // (issue #933) — see test/asset-restore-purged-unrecoverable.test.ts for the
+    // full treatment.
+    expect(notice?.className).toContain('msg-unrecoverable');
+    expect(notice?.className).not.toContain('msg-error');
     // Announced to assistive tech, since it appears without a page change.
     expect(notice?.getAttribute('role')).toBe('alert');
     expect(notice?.textContent).toContain('purged');
     expect(notice?.textContent).toContain('410');
 
-    // No retry is possible, so the button must not invite one.
-    const after = container.querySelector<HTMLButtonElement>('#btn-restore-asset')!;
-    expect(after.disabled).toBe(true);
-    expect(after.textContent).toBe('Restore unavailable');
+    // No retry is possible, so the control is gone entirely — a disabled button
+    // would still read as "unavailable for now".
+    expect(container.querySelector('#btn-restore-asset')).toBeNull();
   });
 
   it('reports a 404 without guessing which of its two causes applied', async () => {
