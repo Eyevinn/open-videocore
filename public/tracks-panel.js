@@ -9,7 +9,9 @@
  * READ-ONLY by construction. This module creates no form controls and issues no
  * POST/DELETE, so the add/remove routes that do exist
  * (`POST|DELETE /assets/{id}/audio-tracks`, `…/subtitle-tracks`) have nothing
- * here to originate from.
+ * here to originate from. It also issues no GET: every value it renders is
+ * already in the `GET /assets/{id}` body the detail view fetched, so the panel
+ * adds no round-trip to the render.
  *
  * Every operator-visible string is written with `textContent` / `createElement`
  * — no server value ever reaches `innerHTML`, including a subtitle `format` or
@@ -21,36 +23,42 @@
  *
  * Read from this repo's generated spec and route source on this branch. Nothing
  * is taken from the issue text — in particular the issue names three endpoints
- * as sources and only one of them is readable (see "What the API does NOT
- * expose" below).
+ * as sources and two of them have no GET at all (see "What the API does NOT
+ * expose" below). `openapi.json` declares no `operationId` on any operation, so
+ * operations are identified below by path + method, as the spec itself does.
  *
- *   AUDIO + SUBTITLE — `openapi.json .paths["/api/v1/assets/{id}/tracks"]`
- *     The ONLY key is `get`. parameters: exactly one — path `id` (string,
- *     required); no query params. responses: exactly `200` and `404`.
- *     200 schema: `{ audioTracks: […], subtitleTracks: […] }`,
- *       `required: ["audioTracks","subtitleTracks"]`,
- *       `additionalProperties: false` — so BOTH arrays are always present, and
- *       an empty array means "none", never "unknown".
- *     `audioTracks[]` items: `{ id: string, language: string, codec?: string,
- *       channels?: number, label?: string, default?: boolean }`,
- *       `required: ["id","language"]`, `additionalProperties: false`.
- *     `subtitleTracks[]` items: `{ id: string, language: string,
- *       format: "vtt"|"srt"|"ttml", objectKey?: string, label?: string,
- *       default?: boolean }`, `required: ["id","language","format"]`,
- *       `additionalProperties: false`.
- *     404 schema: `{ error: string, message?: string }`, required `["error"]`.
- *     Source of truth: `app.get('/:id/tracks', …)`, src/routes/assets.ts:5255-5273
- *       — `response: { 200: tracksSchema, 404: errorSchema }` (:5260), body built
- *       at :5269-5270 from `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []`.
- *       `tracksSchema` :832-835; `audioTrackOutSchema` :795-802;
- *       `subtitleTrackOutSchema` :806-813; the subtitle vocabulary is
- *       `SUBTITLE_FORMATS = ['vtt','srt','ttml']`, src/data/asset-repo.ts:449,
- *       reached via `subtitleFormatSchema` (src/routes/assets.ts:804).
- *     The handler calls `repo.get(request.params.id)` (:5266) with NO slug
- *       fallback, so this path must be given the ULID — never a slug.
+ *   EVERYTHING HERE COMES FROM ONE READ —
+ *   `openapi.json .paths["/api/v1/assets/{id}"].get`, 200 schema. That body
+ *   carries the editorial tracks AND the probe's technical metadata, so the
+ *   panel needs no call of its own.
  *
- *   VIDEO — `openapi.json .paths["/api/v1/assets/{id}"].get`, 200 schema
- *     property `technicalMetadata` (nullable object, NOT in `required`):
+ *   AUDIO + SUBTITLE (editorial) — properties `audioTracks` / `subtitleTracks`
+ *     of that same 200 schema. NEITHER is in `required`:
+ *       `audioTracks[]` items: `{ id: string, language: string, codec?: string,
+ *         channels?: number, label?: string, default?: boolean }`,
+ *         `required: ["id","language"]`, `additionalProperties: false`.
+ *       `subtitleTracks[]` items: `{ id: string, language: string,
+ *         format: "vtt"|"srt"|"ttml", objectKey?: string, label?: string,
+ *         default?: boolean }`, `required: ["id","language","format"]`,
+ *         `additionalProperties: false`.
+ *     Source of truth: `assetSchema` —
+ *       `audioTracks: z.array(audioTrackOutSchema).optional()`
+ *       (src/routes/assets.ts:907) and
+ *       `subtitleTracks: z.array(subtitleTrackOutSchema).optional()` (:908),
+ *       `audioTrackOutSchema` :795-802, `subtitleTrackOutSchema` :806-813; the
+ *       subtitle vocabulary is `SUBTITLE_FORMATS = ['vtt','srt','ttml']`,
+ *       src/data/asset-repo.ts:449, reached via `subtitleFormatSchema`
+ *       (src/routes/assets.ts:804).
+ *     ABSENT MEANS "NONE", NOT "UNKNOWN". The field is optional because the
+ *       arrays are "absent until the first track of the respective kind is
+ *       added" (src/routes/assets.ts:905-906); persistence only writes the
+ *       block when the array is non-empty (`doc.structural.editorialAudio` /
+ *       `editorialSubtitles`, src/data/asset-document.ts:553-557) and reads it
+ *       straight back (:693-694). So an omitted array is an empty one, and this
+ *       panel renders the kind's empty state — never an "unknown" state.
+ *
+ *   VIDEO — property `technicalMetadata` of the same 200 schema (nullable
+ *     object, NOT in `required`):
  *       `{ codec: string, width: number, height: number,
  *          durationSeconds: number, bitrateBps: number,
  *          containerFormat: string, audioTracks: […], extractedAt: string }`,
@@ -71,25 +79,31 @@
  *       stored `VideoTrackSchema` (src/data/asset-document.ts:51-58) but NO
  *       response schema exposes them, so there is nothing to read.
  *
- *   AUDIO, AS PROBED — the same `technicalMetadata.audioTracks[]` array:
+ *   AUDIO, AS PROBED — the nested `technicalMetadata.audioTracks[]` array:
  *     items `{ index: number, codec: string, channels: number,
  *     sampleRateHz: number }`, all four `required`,
  *     `additionalProperties: false` (`audioTrackSchema`,
  *     src/routes/assets.ts:745-750; persisted as `technical.audio`,
  *     src/data/asset-document.ts:405-410).
- *     This is a DIFFERENT set of objects from the editorial `audioTracks` on
- *     `GET /:id/tracks`: different fields, different lifecycle (one is written by
- *     the ffprobe extraction, the other by an operator), no shared id. They share
- *     only a name. The audio section therefore lists them as two labelled groups
- *     and never merges, correlates or de-duplicates them — the API publishes no
- *     key that would justify either.
+ *     This is a DIFFERENT set of objects from the editorial `audioTracks` at the
+ *     top level of the asset: different fields, different lifecycle (one is
+ *     written by the ffprobe extraction, the other by an operator), no shared
+ *     id. They share only a name. The audio section therefore lists them as two
+ *     labelled groups and never merges, correlates, de-duplicates or SUMS them —
+ *     the API publishes no key that would justify any of that, so each group
+ *     carries its own count and the `Audio` heading carries none.
  *
  * WHAT THE API DOES NOT EXPOSE (checked, not assumed):
  *   - There is no GET on `/api/v1/assets/{id}/audio-tracks` or
  *     `…/subtitle-tracks`. In `openapi.json` those paths carry only `post`, and
  *     `…/{trackId}` only `delete` (src/routes/assets.ts:5279, 5314, 5344, 5392).
- *     `GET /:id/tracks` is the ONLY read for either kind, so both sections below
- *     come from that single call.
+ *   - `GET /api/v1/assets/{id}/tracks` DOES exist and is the only *dedicated*
+ *     read for the two editorial kinds — but it is not a second source of truth:
+ *     its handler sends `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []`
+ *     from the very same document (src/routes/assets.ts:5268-5271, via
+ *     `repo.get(request.params.id)` at :5264). A caller that already holds the
+ *     asset — which the detail view always does — would be paying a round-trip
+ *     for bytes it has, so this panel does not call it.
  *   - There is no video-track endpoint and no video-track ARRAY in any response:
  *     no path in `openapi.json` contains "video", and `technicalMetadata` carries
  *     one flattened set of video attributes. So this panel can list at most one
@@ -113,7 +127,7 @@ export const TRACKS_COPY = Object.freeze({
 
   /** Sub-group labels inside the audio section (two distinct record sets). */
   audioEditorialGroup: 'Editorial tracks',
-  audioProbedGroup: 'Source streams (as probed)',
+  audioProbedGroup: 'Source streams',
 
   /** The one-video-track ceiling is the API's; say so instead of implying it. */
   videoNote:
@@ -123,7 +137,8 @@ export const TRACKS_COPY = Object.freeze({
   audioNote:
     'Editorial tracks are the ones registered against this asset; source ' +
     'streams are what the probe found in the file. The API publishes no link ' +
-    'between the two, so they are listed separately.',
+    'between the two, so they are counted and listed separately and never added ' +
+    'together.',
 
   /** Empty states — one per track kind (issue #902). */
   videoEmpty: 'No video tracks.',
@@ -141,16 +156,6 @@ export const TRACKS_COPY = Object.freeze({
   /** An empty sub-group shown alongside a non-empty one. */
   audioEditorialNone: 'No editorial audio tracks.',
   audioProbedNone: 'No audio streams reported by the probe.',
-  /** Stands in for a kind whose read FAILED — never the empty state above. */
-  audioUnreadable: 'Editorial audio tracks could not be read.',
-  subtitleUnreadable: 'Subtitle tracks could not be read.',
-
-  /** The `GET /:id/tracks` read failed — NOT the same as "none". */
-  unavailable: 'Audio and subtitle tracks unavailable.',
-  unavailableDetail:
-    'The API did not return a usable track list for this asset, so audio and ' +
-    'subtitle tracks are not shown. Video attributes come from the asset itself ' +
-    'and are unaffected.',
 
   /** Marks the track the API flagged `default: true`. Text, never colour alone. */
   defaultFlag: 'Default',
@@ -161,40 +166,33 @@ export const TRACKS_COPY = Object.freeze({
 // ─── Pure helpers ────────────────────────────────────────────────────────────
 
 /**
- * Read the `GET /:id/tracks` 200 body defensively.
+ * The asset's editorial audio + subtitle tracks, straight off the
+ * `GET /api/v1/assets/{id}` 200 body.
  *
- * Both arrays are `required` in the schema, so the happy path is trivial. This
- * exists so a malformed/garbled response renders "unavailable" rather than an
- * empty state — "the read failed" and "this asset has no tracks" are different
- * facts and the panel must not report the first as the second.
- *
- * `usable` is false unless BOTH properties are arrays. Empty arrays ARE usable:
- * the contract gives them a meaning (`asset.audioTracks ?? []`,
- * src/routes/assets.ts:5269) — no tracks of that kind.
+ * Both properties are `.optional()` in `assetSchema`
+ * (src/routes/assets.ts:907-908) and absent means the asset has none of that
+ * kind (:905-906) — not that the answer is unknown. An absent or non-array
+ * value therefore yields `[]`, which the sections render as their explicit
+ * empty state.
  *
  * Non-object entries are dropped (nothing the schema could have produced), and
  * entries missing a `required` field are kept: a server that omits one is
  * reported as it answered, with `—` in that cell, rather than silently hidden.
  *
- * @param {unknown} payload
- * @returns {{ audioTracks: object[], subtitleTracks: object[], usable: boolean }}
+ * @param {object} asset  a `GET /api/v1/assets/{id}` 200 body
+ * @returns {{ audioTracks: object[], subtitleTracks: object[] }}
  */
-export function normaliseTracksRead(payload) {
-  const p = payload && typeof payload === 'object' ? payload : {};
-  const audio = Array.isArray(p.audioTracks) ? p.audioTracks : null;
-  const subtitle = Array.isArray(p.subtitleTracks) ? p.subtitleTracks : null;
-  if (audio === null || subtitle === null) {
-    return { audioTracks: [], subtitleTracks: [], usable: false };
-  }
-  const objectsOnly = function (list) {
-    return list.filter(function (t) {
+export function editorialTracksFromAsset(asset) {
+  const a = asset && typeof asset === 'object' ? asset : {};
+  const objectsOnly = function (value) {
+    if (!Array.isArray(value)) return [];
+    return value.filter(function (t) {
       return t !== null && typeof t === 'object';
     });
   };
   return {
-    audioTracks: objectsOnly(audio),
-    subtitleTracks: objectsOnly(subtitle),
-    usable: true,
+    audioTracks: objectsOnly(a.audioTracks),
+    subtitleTracks: objectsOnly(a.subtitleTracks),
   };
 }
 
@@ -353,11 +351,20 @@ function renderEmpty(kind, text, detail) {
   return box;
 }
 
+/**
+ * A section heading, optionally counted.
+ *
+ * The count is part of the heading so "how many" is answerable without counting
+ * rows, and reads correctly under the browser's find-in-page. It is omitted
+ * where no single number is defensible — see `appendAudioSection`.
+ */
 function renderSectionTitle(text, count) {
-  // The count is part of the heading so "how many" is answerable without
-  // counting rows, and reads correctly when the section is collapsed by the
-  // browser's find-in-page.
-  return el('div', 'section-title', text + ' (' + count + ')');
+  return el('div', 'section-title', typeof count === 'number' ? text + ' (' + count + ')' : text);
+}
+
+/** A sub-group label inside a section, counted over that group alone. */
+function renderGroupTitle(text, count) {
+  return el('div', 'tracks-group-title', text + ' (' + count + ')');
 }
 
 // ─── Section builders ────────────────────────────────────────────────────────
@@ -387,26 +394,22 @@ function appendVideoSection(block, videoTracks, extractionError) {
   block.appendChild(el('div', 'tracks-note', TRACKS_COPY.videoNote));
 }
 
-function appendAudioSection(block, editorial, probed, usable) {
-  const total = editorial.length + probed.length;
-  block.appendChild(renderSectionTitle(TRACKS_COPY.audioHeading, total));
+function appendAudioSection(block, editorial, probed) {
+  // The `Audio` heading is deliberately UNCOUNTED. Editorial tracks and probed
+  // source streams are different objects with no shared id (see CONTRACT
+  // GROUNDING), so `editorial.length + probed.length` would be exactly the merge
+  // this module refuses to make elsewhere — a two-track asset probed with two
+  // streams is not a four-track asset. Each group carries its own count instead.
+  block.appendChild(renderSectionTitle(TRACKS_COPY.audioHeading));
 
-  if (usable && total === 0) {
-    // "No audio tracks" is only ever claimed when the track read SUCCEEDED: it
-    // asserts something about the asset, which a failed read cannot support.
+  if (editorial.length === 0 && probed.length === 0) {
     block.appendChild(
       renderEmpty('audio-tracks', TRACKS_COPY.audioEmpty, TRACKS_COPY.audioEmptyDetail)
     );
     return;
   }
-  if (!usable && probed.length === 0) {
-    // Nothing readable at all for this kind — say the read failed, not that the
-    // asset has none.
-    block.appendChild(el('div', 'tracks-none', TRACKS_COPY.audioUnreadable));
-    return;
-  }
 
-  block.appendChild(el('div', 'tracks-group-title', TRACKS_COPY.audioEditorialGroup));
+  block.appendChild(renderGroupTitle(TRACKS_COPY.audioEditorialGroup, editorial.length));
   if (editorial.length > 0) {
     const rows = editorial.map(function (t) {
       return [
@@ -426,12 +429,10 @@ function appendAudioSection(block, editorial, probed, usable) {
       )
     );
   } else {
-    block.appendChild(
-      el('div', 'tracks-none', usable ? TRACKS_COPY.audioEditorialNone : TRACKS_COPY.audioUnreadable)
-    );
+    block.appendChild(el('div', 'tracks-none', TRACKS_COPY.audioEditorialNone));
   }
 
-  block.appendChild(el('div', 'tracks-group-title', TRACKS_COPY.audioProbedGroup));
+  block.appendChild(renderGroupTitle(TRACKS_COPY.audioProbedGroup, probed.length));
   if (probed.length > 0) {
     const rows = probed.map(function (t) {
       return [attr(t.index), attr(t.codec), attr(t.channels), sampleRateLabel(t.sampleRateHz)];
@@ -446,15 +447,11 @@ function appendAudioSection(block, editorial, probed, usable) {
   block.appendChild(el('div', 'tracks-note', TRACKS_COPY.audioNote));
 }
 
-function appendSubtitleSection(block, subtitles, usable) {
+function appendSubtitleSection(block, subtitles) {
   block.appendChild(renderSectionTitle(TRACKS_COPY.subtitleHeading, subtitles.length));
   if (subtitles.length === 0) {
-    // Same rule as audio: the empty state is a claim about the asset, so it is
-    // only made from a successful read.
     block.appendChild(
-      usable
-        ? renderEmpty('subtitle-tracks', TRACKS_COPY.subtitleEmpty, TRACKS_COPY.subtitleEmptyDetail)
-        : el('div', 'tracks-none', TRACKS_COPY.subtitleUnreadable)
+      renderEmpty('subtitle-tracks', TRACKS_COPY.subtitleEmpty, TRACKS_COPY.subtitleEmptyDetail)
     );
     return;
   }
@@ -483,45 +480,31 @@ function appendSubtitleSection(block, subtitles, usable) {
 // ─── Block ───────────────────────────────────────────────────────────────────
 
 /**
- * Build the whole block for one read. PURE: no fetch, no listeners.
+ * Build the whole block for one asset read. PURE: no fetch, no listeners.
  *
  * @param {object} data
  * @param {object[]} data.video            from `videoTracksFromAsset`
- * @param {object[]} data.audioEditorial   `audioTracks` from `GET /:id/tracks`
+ * @param {object[]} data.audioEditorial   `asset.audioTracks`
  * @param {object[]} data.audioProbed      from `probedAudioStreamsFromAsset`
- * @param {object[]} data.subtitles        `subtitleTracks` from `GET /:id/tracks`
- * @param {boolean}  data.usable           was the track read usable?
+ * @param {object[]} data.subtitles        `asset.subtitleTracks`
  * @param {string}   [data.extractionError] `asset.technicalMetadataError`
  * @returns {HTMLElement}
  */
 export function renderTracksBlock(data) {
   const d = data || {};
-  const usable = d.usable === true;
   const video = Array.isArray(d.video) ? d.video : [];
-  const audioEditorial = usable && Array.isArray(d.audioEditorial) ? d.audioEditorial : [];
+  const audioEditorial = Array.isArray(d.audioEditorial) ? d.audioEditorial : [];
   const audioProbed = Array.isArray(d.audioProbed) ? d.audioProbed : [];
-  const subtitles = usable && Array.isArray(d.subtitles) ? d.subtitles : [];
+  const subtitles = Array.isArray(d.subtitles) ? d.subtitles : [];
 
   const block = el('div', 'mt12 tracks-block');
   block.id = 'asset-tracks';
   block.appendChild(el('div', 'section-title', TRACKS_COPY.heading));
   block.appendChild(el('div', 'tracks-note', TRACKS_COPY.intro));
 
-  if (!usable) {
-    // The read failed or came back unusable. The audio/subtitle sections say so
-    // rather than rendering an empty state that would assert the asset has no
-    // tracks — a claim this panel cannot make from a failed read. The probe's
-    // own numbers still render: they came from the asset, not from this call.
-    const note = el('div', 'tracks-unavailable');
-    note.id = 'tracks-unavailable';
-    note.appendChild(el('div', null, TRACKS_COPY.unavailable));
-    note.appendChild(el('div', 'tracks-note', TRACKS_COPY.unavailableDetail));
-    block.appendChild(note);
-  }
-
   appendVideoSection(block, video, d.extractionError);
-  appendAudioSection(block, audioEditorial, audioProbed, usable);
-  appendSubtitleSection(block, subtitles, usable);
+  appendAudioSection(block, audioEditorial, audioProbed);
+  appendSubtitleSection(block, subtitles);
 
   return block;
 }
@@ -531,75 +514,62 @@ export function renderTracksBlock(data) {
 /**
  * Render the "Tracks" block into the asset detail view.
  *
- * Audio + subtitle tracks come from ONE call — `GET /api/v1/assets/{id}/tracks`
- * — because that is the only read the API offers for either kind. Video
- * attributes come from the `asset` the caller already fetched, so no second read
- * of the asset is issued.
+ * Synchronous and network-free: all four record sets — the video attributes, the
+ * editorial audio and subtitle tracks, and the probed source streams — are
+ * properties of the `GET /assets/{id}` body the caller already holds, so the
+ * panel neither re-reads the asset nor calls `GET /assets/{id}/tracks` for
+ * bytes it was handed (see CONTRACT GROUNDING). It therefore adds no round-trip
+ * to the detail render, and there is no "tracks unavailable" state: an absent
+ * array is a known-empty kind, not a failed read.
  *
  * The block is inserted before `anchorEl` when given, else appended to `host`.
  *
  * @param {object} opts
- * @param {string}      opts.assetId    the ULID — `GET /:id/tracks` calls
- *                                      `repo.get()` with no slug fallback
- *                                      (src/routes/assets.ts:5266), so a slug
- *                                      would 404
  * @param {object}      opts.asset      the `GET /assets/{id}` 200 body already
  *                                      rendered by the caller
  * @param {HTMLElement} [opts.host]     container to append to
  * @param {HTMLElement} [opts.anchorEl] element to insert before, inside its parent
- * @param {Function}    opts.apiFetch
- * @returns {Promise<{ block: HTMLElement, refresh: () => Promise<void> }>}
+ * @returns {{ block: HTMLElement, update: (asset: object) => void }}
  */
-export async function mountAssetTracks(opts) {
+export function mountAssetTracks(opts) {
   const o = opts || {};
-  const apiFetch = o.apiFetch;
-  const path = '/assets/' + encodeURIComponent(String(o.assetId)) + '/tracks';
 
   let rendered = null;
-  let placed = false;
 
   function place(block) {
-    if (!placed) {
+    if (!rendered) {
       if (o.anchorEl && o.anchorEl.parentNode) {
         o.anchorEl.parentNode.insertBefore(block, o.anchorEl);
       } else if (o.host) {
         o.host.appendChild(block);
       }
-      placed = true;
       return;
     }
-    if (rendered && rendered.parentNode) {
+    if (rendered.parentNode) {
       rendered.parentNode.replaceChild(block, rendered);
     }
   }
 
-  async function refresh() {
-    let read;
-    try {
-      read = normaliseTracksRead(await apiFetch(path));
-    } catch (err) {
-      // A failed track read must not blank the detail panel, and must not be
-      // reported as "no tracks" — the block renders its own unavailable note.
-      read = { audioTracks: [], subtitleTracks: [], usable: false };
-    }
-    const asset = o.asset || {};
+  /** Re-render from a freshly read asset body, in place. */
+  function update(asset) {
+    const a = asset || {};
+    const editorial = editorialTracksFromAsset(a);
     const next = renderTracksBlock({
-      video: videoTracksFromAsset(asset),
-      audioEditorial: read.audioTracks,
-      audioProbed: probedAudioStreamsFromAsset(asset),
-      subtitles: read.subtitleTracks,
-      usable: read.usable,
-      extractionError: asset.technicalMetadataError,
+      video: videoTracksFromAsset(a),
+      audioEditorial: editorial.audioTracks,
+      audioProbed: probedAudioStreamsFromAsset(a),
+      subtitles: editorial.subtitleTracks,
+      extractionError: a.technicalMetadataError,
     });
     place(next);
     rendered = next;
   }
 
-  await refresh();
+  update(o.asset);
   return {
     get block() {
       return rendered;
     },
-    refresh: refresh,
+    update: update,
   };
 }

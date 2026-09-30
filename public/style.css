@@ -484,8 +484,7 @@ tr.row-locked td:first-child {
 }
 
 .tracks-note,
-.tracks-none,
-.tracks-unavailable {
+.tracks-none {
   font-size: 12px;
   color: var(--text-muted);
   margin-top: 6px;
@@ -495,10 +494,6 @@ tr.row-locked td:first-child {
    reads as the body of the group heading above it. */
 .tracks-none {
   padding-left: 2px;
-}
-
-.tracks-unavailable {
-  color: var(--text);
 }
 
 /* Inside the centred .empty box the detail line is secondary to the headline. */
