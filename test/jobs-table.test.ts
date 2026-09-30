@@ -25,11 +25,13 @@ import {
   filterJobs,
   sortJobs,
   pageJobs,
+  renderAssetCell,
   JOB_STATUSES,
   JOBS_NS,
   JOBS_PAGE_SIZE,
   JOBS_WORKING_SET_MAX,
 } from '../public/jobs-table.js';
+import { COPY_ID_BTN_CLASS } from '../public/copy-id.js';
 
 // A small deterministic fixture spanning statuses + dates.
 function makeJobs() {
@@ -79,6 +81,18 @@ describe('filterJobs', () => {
     expect(filterJobs(makeJobs(), { q: 'JOB-3' }).map((j) => j.id)).toEqual(['job-3']);
     // asset-a is shared by job-1 and job-3.
     expect(filterJobs(makeJobs(), { q: 'asset-a' }).map((j) => j.id)).toEqual(['job-1', 'job-3']);
+  });
+
+  it('text search also matches the asset NAME, tolerating rows without one (#988)', () => {
+    // Once the Asset column shows a name, searching that name has to work —
+    // otherwise the one value the operator can actually read is unsearchable.
+    const jobs = makeJobs();
+    jobs[0] = { ...jobs[0], assetName: 'Opening keynote' };
+    jobs[2] = { ...jobs[2], assetName: 'Opening keynote' };
+    // jobs[1], [3], [4] have NO assetName (deleted asset / unresolved) and must
+    // not throw or match.
+    expect(filterJobs(jobs, { q: 'opening KEY' }).map((j) => j.id)).toEqual(['job-1', 'job-3']);
+    expect(filterJobs(jobs, { q: 'nothing-matches-this' })).toEqual([]);
   });
 
   it('combines status + range + search (AND semantics)', () => {
@@ -246,6 +260,109 @@ describe('createJobsTable composition', () => {
   });
 });
 
+// ─── the Asset column names the asset (issue #988) ───────────────────────────
+//
+// Contract grounding for the fields read here:
+//   - `assetId`   string, ALWAYS present — jobSchema, src/routes/jobs.ts:54
+//   - `assetName` string, OPTIONAL — src/routes/jobs.ts:62; the route resolves
+//     it with `.catch(() => undefined)` (mirroring src/routes/pipelines.ts:98),
+//     so a deleted asset arrives as a row with an id and no name. Every
+//     assertion below therefore covers both shapes.
+
+describe('renderAssetCell', () => {
+  function html(job: unknown) {
+    const el = document.createElement('div');
+    el.innerHTML = renderAssetCell(job as never);
+    return el;
+  }
+
+  it('leads with the asset name and keeps the ULID beneath it', () => {
+    const el = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote' });
+    expect(el.querySelector('.job-asset-name')?.textContent).toBe('Opening keynote');
+    // The ULID is still on screen IN FULL — it is the value the API accepts.
+    expect(el.querySelector('.job-asset-id')?.textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+  });
+
+  it('falls back to the ULID when the asset resolved no name (deleted asset)', () => {
+    const el = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3' });
+    expect(el.textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    // No empty name element left behind above it.
+    expect(el.querySelector('.job-asset-name')).toBeNull();
+  });
+
+  it('offers a click-to-copy affordance for the ULID in both shapes', () => {
+    const named = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote' });
+    const bare = html({ assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3' });
+    for (const el of [named, bare]) {
+      const btn = el.querySelector<HTMLButtonElement>('.' + COPY_ID_BTN_CLASS);
+      expect(btn).not.toBeNull();
+      expect(btn?.dataset.copyId).toBe('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+      // Accessible name distinguishes this row's control from every other row's.
+      expect(btn?.getAttribute('aria-label')).toBe('Copy asset id 01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    }
+  });
+
+  it('renders an em-dash when the job references no asset at all', () => {
+    expect(html({}).textContent).toBe('—');
+    expect(html(null).textContent).toBe('—');
+  });
+
+  it('escapes a hostile asset name (no raw markup reaches the cell)', () => {
+    const el = html({ assetId: 'asset-x', assetName: '<img src=x onerror=alert(1)>' });
+    expect(el.querySelector('img')).toBeNull();
+    expect(el.querySelector('.job-asset-name')?.textContent).toBe('<img src=x onerror=alert(1)>');
+  });
+});
+
+describe('the Asset column in a rendered table', () => {
+  it('shows names where they resolved and the ULID where they did not', async () => {
+    const items = [
+      { id: 'job-1', type: 'transcode', status: 'running', assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote', progress: 10, createdAt: '2026-01-02T10:00:00.000Z', updatedAt: '2026-01-02T10:00:00.000Z' },
+      // Asset deleted: the row still lists, identified by its ULID.
+      { id: 'job-2', type: 'transcode', status: 'done', assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W4', progress: 100, createdAt: '2026-01-01T10:00:00.000Z', updatedAt: '2026-01-01T11:00:00.000Z' },
+    ];
+    const table = createJobsTable({ apiFetch: vi.fn().mockResolvedValue({ items, total: 2 }), win: null });
+    document.body.appendChild(table.el);
+    await table.refresh();
+
+    const headers = Array.from(table.el.querySelectorAll('thead th')).map((th) => th.textContent?.trim());
+    expect(headers).toContain('Asset');
+
+    const rows = Array.from(table.el.querySelectorAll('tbody tr[data-row-key]'));
+    expect(rows).toHaveLength(2);
+    const cellOf = (tr: Element) => tr.querySelectorAll('td')[3];
+    expect(cellOf(rows[0]).querySelector('.job-asset-name')?.textContent).toBe('Opening keynote');
+    expect(cellOf(rows[0]).textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    expect(cellOf(rows[1]).querySelector('.job-asset-name')).toBeNull();
+    expect(cellOf(rows[1]).textContent).toContain('01J8Z3K4M5N6P7Q8R9S0T1V2W4');
+  });
+
+  it('copying an asset id does not also open the row detail panel', async () => {
+    const onSelect = vi.fn();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const items = [
+      { id: 'job-1', type: 'transcode', status: 'running', assetId: '01J8Z3K4M5N6P7Q8R9S0T1V2W3', assetName: 'Opening keynote', progress: 10, createdAt: '2026-01-02T10:00:00.000Z', updatedAt: '2026-01-02T10:00:00.000Z' },
+    ];
+    vi.stubGlobal('navigator', { clipboard: { writeText } });
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items, total: 1 }),
+      onSelect,
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    await table.refresh();
+
+    const btn = table.el.querySelector<HTMLButtonElement>('.' + COPY_ID_BTN_CLASS)!;
+    btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    expect(writeText).toHaveBeenCalledWith('01J8Z3K4M5N6P7Q8R9S0T1V2W3');
+    expect(onSelect).not.toHaveBeenCalled();
+
+    // The row itself still opens the panel when clicked anywhere else.
+    table.el.querySelector<HTMLElement>('tbody tr[data-row-key]')!.click();
+    expect(onSelect).toHaveBeenCalledWith('job-1');
+  });
+});
+
 // ─── unset filter controls look unset (issue #984) ────────────────────────────
 //
 // Contract grounding for the markers asserted here:
@@ -283,7 +400,7 @@ describe('unset filter controls are marked muted', () => {
     expect(c.to.classList.contains('is-unset')).toBe(true);
     // The search box renders its own empty state via the native placeholder,
     // which the stylesheet paints with the same --text-muted token.
-    expect(c.search.placeholder).toBe('Job id or asset id');
+    expect(c.search.placeholder).toBe('Job id, asset id, or asset name');
     expect(c.search.value).toBe('');
   });
 

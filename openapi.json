@@ -15340,6 +15340,10 @@
                           "assetId": {
                             "type": "string"
                           },
+                          "assetName": {
+                            "type": "string",
+                            "description": "Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to `assetId`, which is always present."
+                          },
                           "sourceUrl": {
                             "type": "string"
                           },
@@ -15510,6 +15514,10 @@
                     },
                     "assetId": {
                       "type": "string"
+                    },
+                    "assetName": {
+                      "type": "string",
+                      "description": "Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to `assetId`, which is always present."
                     },
                     "sourceUrl": {
                       "type": "string"
@@ -15691,6 +15699,10 @@
                     },
                     "assetId": {
                       "type": "string"
+                    },
+                    "assetName": {
+                      "type": "string",
+                      "description": "Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to `assetId`, which is always present."
                     },
                     "sourceUrl": {
                       "type": "string"

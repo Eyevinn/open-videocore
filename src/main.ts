@@ -1898,7 +1898,11 @@ const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } =
   prefix: '/api/v1/jobs',
   repository: jobRepository,
   redis: sharedRedis,
-  pipelineRepository
+  pipelineRepository,
+  // Read-time `assetName` enrichment on the jobs listing + detail (issue #988).
+  // The SAME repository instance the pipelines router below resolves its own
+  // `assetName` from, so the two listings can never name an asset differently.
+  assetRepository
 };
 await app.register(jobsRouter, jobsRouterOptions);
 
