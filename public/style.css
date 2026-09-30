@@ -1959,6 +1959,100 @@ body.detail-standalone .assets-side {
   padding: 5px 8px;
 }
 
+/* Assets table free-text filter box (issue #946). The box reads as a filter, so
+   it carries a magnifier affordance on the left and a clear control on the right,
+   both sitting INSIDE the input's box. The wrapper is the positioning context and
+   the input's own padding reserves the room for them. */
+.ops-search-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.ops-table-filters .ops-search-input {
+  /* 26px left clears the magnifier, 26px right clears the x. */
+  padding: 5px 26px;
+  min-width: 220px;
+}
+
+/* The native type="search" affordance is suppressed so there is never a second,
+   unstyled, keyboard-invisible x next to ours. */
+.ops-search-input::-webkit-search-cancel-button,
+.ops-search-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+
+/* Magnifier, drawn in CSS: a bordered circle plus a handle rotated out of its
+   lower-right. public/ carries no icon font and no inline SVG, and a filter
+   affordance is not the place to introduce one. Decorative and click-through —
+   the input owns the accessible name. */
+.ops-search-icon {
+  position: absolute;
+  left: 8px;
+  width: 13px;
+  height: 13px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.ops-search-icon::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+}
+
+.ops-search-icon::after {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 7px;
+  width: 6px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 1px;
+  transform: rotate(45deg);
+  transform-origin: left center;
+}
+
+.ops-search-clear {
+  position: absolute;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.ops-search-clear:hover {
+  color: var(--text);
+  background: var(--border);
+}
+
+.ops-search-clear:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* `display: flex` above would otherwise beat the UA's [hidden] rule. */
+.ops-search-clear[hidden] {
+  display: none;
+}
+
 /* Logs table — level badges (issue #371). `level` is an OPTIONAL log field; the
    cell shows a coloured pill per severity when present, else a dash. */
 .log-level {
