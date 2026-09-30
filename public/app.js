@@ -4100,6 +4100,14 @@ async function renderCollectionsTab(container) {
 //     member endpoint on that router (the only other membership route is
 //     DELETE /:id/assets/:assetId, :533), so "add several" is one PUT per
 //     asset, issued from a single user interaction.
+//   - Result truncation: the envelope's `total` is the count of matching ASSETS
+//     across the WHOLE matched set, not the page in hand (`searchResultSchema`,
+//     src/routes/search.ts:130 — "Count of matching ASSETS (unchanged
+//     pagination contract)"; the page itself is `matched.slice(start, start +
+//     pageSize)` against `total: matched.length`,
+//     src/data/inmemory-search-repo.ts:53-57). So `total > assets.length` means
+//     the list on screen is cut short, and the picker says so rather than
+//     letting "not shown" read as "not there" (issue #949).
 const ASSET_PICKER_DEBOUNCE_MS = 250;
 const ASSET_PICKER_PAGE_SIZE = 20;
 
@@ -4124,6 +4132,23 @@ function assetPickerHits(res) {
       status: (a && a.status) || '',
     };
   }).filter(function(a) { return a.id !== ''; });
+}
+
+// Count of matching assets the search found in total, or null when the envelope
+// does not say. Read separately from the hits so `assetPickerHits` keeps its
+// one job (issue #949).
+function assetPickerTotal(res) {
+  return res && typeof res.total === 'number' ? res.total : null;
+}
+
+// The line above a truncated hit list. A one-page picker that shows 20 of 57
+// matches and says nothing makes an asset that exists look like an asset that
+// does not, and the operator has no way to tell which — so name the gap and say
+// what to do about it. Empty string when everything that matched is on screen.
+function assetPickerResultNote(shown, total) {
+  if (total === null || total === undefined || total <= shown) return '';
+  return 'Showing the first ' + shown + ' of ' + total +
+    ' matching assets. Add a word from the name to narrow the search.';
 }
 
 // Add several assets to one collection. One PUT per asset (the contract has no
@@ -4235,13 +4260,16 @@ function renderCollectionAssetPicker(collectionId, opts) {
     });
   }
 
-  function renderHits(hits) {
+  function renderHits(hits, total) {
     searchInput.setAttribute('aria-expanded', hits.length > 0 ? 'true' : 'false');
     if (hits.length === 0) {
       resultsEl.innerHTML = '<div class="empty">No assets match.</div>';
       return;
     }
-    resultsEl.innerHTML = hits.map(function(hit) {
+    const note = assetPickerResultNote(hits.length, total);
+    resultsEl.innerHTML = (note
+      ? '<div class="form-hint" id="add-asset-results-note">' + escHtml(note) + '</div>'
+      : '') + hits.map(function(hit) {
       return '<label class="checkbox-label">' +
         '<input type="checkbox" class="add-asset-hit" value="' + escHtml(hit.id) + '"' +
         (selected.has(hit.id) ? ' checked' : '') +
@@ -4278,7 +4306,7 @@ function renderCollectionAssetPicker(collectionId, opts) {
     try {
       const res = await apiFetch(assetPickerSearchPath(q));
       if (seq !== searchSeq) return; // a newer keystroke already won
-      renderHits(assetPickerHits(res));
+      renderHits(assetPickerHits(res), assetPickerTotal(res));
     } catch (err) {
       if (seq !== searchSeq) return;
       resultsEl.innerHTML = '';
@@ -7361,6 +7389,12 @@ export {
   addAssetsToCollection,
   addAssetsSummary,
   ASSET_PICKER_DEBOUNCE_MS,
+  // Truncation disclosure on the hit list (issue #949). Exported so a unit test
+  // can pin the "showing N of M" wording and the no-note case without going
+  // through a search round trip.
+  assetPickerTotal,
+  assetPickerResultNote,
+  ASSET_PICKER_PAGE_SIZE,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
