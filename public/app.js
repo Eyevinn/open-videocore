@@ -61,6 +61,16 @@ import { mountReviewState } from './review-state.js';
 // is in that module's header.
 import { mountAssetRename } from './asset-rename.js';
 
+// Read-only tracks panel (issue #902, broken out of #794): one section per track
+// kind — video, audio, subtitle — each listing only the attributes the API
+// exposes for that kind, each with an explicit empty state. All of it comes from
+// the GET /assets/{id} body this renderer already read: the editorial
+// `audioTracks` / `subtitleTracks` arrays and the probe's `technicalMetadata`
+// are all properties of that one response, so the panel issues no call of its
+// own. Full contract grounding, including what the API does NOT expose, is in
+// that module's header.
+import { mountAssetTracks } from './tracks-panel.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -2722,6 +2732,41 @@ async function renderAssetDetailBody(id, bodyEl) {
       sceneDiv.appendChild(swrap);
       body.appendChild(sceneDiv);
     }
+
+    // ── Tracks: video / audio / subtitle (issue #902) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and cited
+    // in full in public/tracks-panel.js. Every field comes from the ONE
+    // GET /api/v1/assets/{id} 200 body already awaited above — the panel adds no
+    // round-trip:
+    //   Editorial audio + subtitle: `audioTracks` / `subtitleTracks` on that
+    //        body. Item schemas { id, language, codec?, channels?, label?,
+    //        default? } and { id, language, format, objectKey?, label?,
+    //        default? } (audioTrackOutSchema src/routes/assets.ts:795-802,
+    //        subtitleTrackOutSchema :806-813). Both properties are `.optional()`
+    //        on assetSchema (:907, :908) and absent means the asset has none of
+    //        that kind (:905-906) — never "unknown" — so each renders its own
+    //        empty state.
+    //   Video: NO endpoint exposes a video-track array. The only video
+    //        attributes in any response are on `technicalMetadata`
+    //        (src/routes/assets.ts:884, schema :752-762) — the same four fields
+    //        the persistence layer writes into the document's video track,
+    //        `technical.video = [{ codec, width, height, bitrateBps }]`
+    //        (src/data/asset-document.ts:402-404).
+    //
+    // GET /api/v1/assets/{id}/tracks exists but is NOT called: its handler sends
+    // `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []` off the same
+    // document (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would
+    // cost a round-trip for bytes this renderer is holding.
+    //
+    // Mounted here, with the other read-only information blocks (status history,
+    // metadata, scenes) and ABOVE the action controls, because it is reporting
+    // only: #902 is explicitly read-only, so the panel creates no add/remove
+    // affordance for the POST/DELETE track routes that do exist.
+    mountAssetTracks({
+      asset: asset,
+      host: body,
+    });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
     // per execution; refreshed by the Run Pipeline control below.
