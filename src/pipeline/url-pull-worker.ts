@@ -9,6 +9,13 @@
 //   pending --start--> running --(stream ok)--> done   (asset -> processing)
 //                              \--(error)------> failed (asset -> failed)
 //
+// Because the worker owns the terminal transition, it also emits the job's
+// TERMINAL audit entry (`job.completed` / `job.failed`, issue #1000) — the
+// matching `job.submitted` is emitted by POST /ingest-url where the job record is
+// created. Same actor/action/target shape the transcode and packaging pipelines
+// use, so an ingest -> transcode -> package run reads as one contiguous trail
+// instead of starting mid-pipeline.
+//
 // Resilience: transient pull failures are retried up to MAX_ATTEMPTS with
 // exponential backoff. A SourceTooLargeError or SourceValidationError is
 // permanent and fails the job immediately without retry. Progress events
@@ -17,6 +24,12 @@
 
 import type { AssetRepository } from '../data/asset-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
+import {
+  emitAudit,
+  originActor,
+  type AuditEmitter,
+  type AuditErrorLog
+} from '../data/audit-emit.js';
 import { SourceTooLargeError, type WorkspaceStorage } from '../data/storage.js';
 import { QuotaExceededError, type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
@@ -88,6 +101,13 @@ export async function runPull(
     // a PERMANENT failure (QuotaExceededError), recorded on the job without
     // retry. Absent => no cap, behaviour unchanged (opt-in).
     quota?: StorageQuotaGuard;
+    // Best-effort audit emission (issue #1000), mirroring the transcode and
+    // packaging pipelines (src/pipeline/transcode.ts:281,332;
+    // src/pipeline/packaging.ts:589,616). Optional so existing callers / tests
+    // that do not assert audit are unaffected; when absent, emission is a no-op.
+    // A failed audit write is logged, never propagated (src/data/audit-emit.ts).
+    audit?: AuditEmitter;
+    auditLog?: AuditErrorLog;
   } & PullDeps
 ): Promise<void> {
   const { jobId, assetId, objectKey, sourceUrl } = params;
@@ -143,6 +163,27 @@ export async function runPull(
         progress: 100
       });
       await deps.assets.update(assetId, { status: 'processing' });
+      // Audit: ingest-url job reached terminal `done` (issue #1000). One entry,
+      // targetId = the job id — the same target the `job.submitted` entry used at
+      // creation time (src/routes/assets.ts POST /ingest-url), so the audit trail
+      // for an ingest job opens and closes on the same object. `system` origin +
+      // action/targetType/detail shape mirror the transcode completion entry
+      // (src/pipeline/transcode.ts:326-340). Emitted AFTER the durable job +
+      // asset writes, and only on the single attempt that actually succeeded (we
+      // return immediately), so a retried pull emits exactly one terminal entry.
+      emitAudit(
+        deps.audit,
+        {
+          actor: originActor('system'),
+          action: 'job.completed',
+          targetType: 'job',
+          targetId: jobId,
+          // No `sourceUrl`: a pull source may be a pre-signed URL carrying
+          // credentials in its query string, and the audit store is queryable.
+          detail: { jobType: 'ingest-url', assetId, bytesTransferred }
+        },
+        deps.auditLog
+      );
       return;
     } catch (err) {
       // Release any reservation taken this attempt so a failed/retried pull
@@ -162,4 +203,19 @@ export async function runPull(
   const message = lastError instanceof Error ? lastError.message : String(lastError);
   await deps.jobs.update(jobId, { status: 'failed', error: message });
   await deps.assets.update(assetId, { status: 'failed' });
+  // Audit: ingest-url job reached terminal `failed` (issue #1000). Reached only
+  // after the retry loop is exhausted or a permanent error short-circuits it, so
+  // a retried attempt does NOT emit — exactly one terminal entry per job, same
+  // shape as the transcode failure entry (src/pipeline/transcode.ts:275-288).
+  emitAudit(
+    deps.audit,
+    {
+      actor: originActor('system'),
+      action: 'job.failed',
+      targetType: 'job',
+      targetId: jobId,
+      detail: { jobType: 'ingest-url', assetId, error: message }
+    },
+    deps.auditLog
+  );
 }
