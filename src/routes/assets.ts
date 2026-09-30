@@ -151,7 +151,11 @@ import {
   RunnerFactoryUnresolvedError,
   type RunnerOption
 } from '../pipeline/runner-option.js';
-import { oscClipJobLog } from '../pipeline/osc-clip.js';
+// Shared accessor for the ffmpeg log an awaited OSC job failure carries as data
+// (issue #786 for clip, issue #944 for export / re-wrap). Used on the 502 paths
+// of POST /:id/clip and POST /:id/export to log the job's own output
+// SERVER-SIDE; it is never put in the response body.
+import { oscJobLog } from '../pipeline/osc-job-log.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
@@ -4877,7 +4881,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //   404 — unknown/foreign source asset (existence not leaked)
   //   409 — the source asset has no stored object to re-wrap
   //   501 — export / re-wrap is not configured on this deployment
-  //   502 — the OSC ffmpeg job failed
+  //   502 — the OSC ffmpeg job failed, ended on a status that is not
+  //         known-good, or produced no (or a zero-byte) output object
+  //
+  // OUTCOME CONTRACT (issue #944, the precondition #796 asked for before an
+  // export UI is built on this): a 201 is only ever returned for an export whose
+  // output object has been confirmed present and non-empty in storage. Three
+  // layers hold that up, and a client needs none of them to be true to read the
+  // status code correctly — 201 means "the object is there", every other code
+  // means "it is not":
+  //   1. the runner succeeds only on an ALLOW-list of job statuses
+  //      (osc-rewrap.ts:SUCCESS_STATUSES), so an unanticipated terminal value is
+  //      a failure rather than a success;
+  //   2. the orchestrator HEADs the written key and rejects a missing or 0-byte
+  //      object (rewrap.ts, via storage.ts:WorkspaceStorage.statObject), because
+  //      the OSC job status reports the container lifecycle and not the ffmpeg
+  //      outcome;
+  //   3. a failed export leaves the child asset `failed` with NO objectKey, so
+  //      it never serves a `/files` URL for an object that does not exist.
+  // Documented in docs/findings/export-truthful-status-944.md.
   app.post(
     '/:id/export',
     {
@@ -4939,6 +4961,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         );
         return reply.code(201).send(child);
       } catch (err) {
+        // Same split as the clip route (issue #786, applied to export in #944):
+        // the ffmpeg log is what makes an export failure diagnosable, but it is
+        // output from a service we do not control and can carry storage
+        // endpoints, bucket names and container paths. It is logged
+        // SERVER-SIDE ONLY (osc-rewrap.ts:OscRewrapJobError carries it as data,
+        // not in `message`), and the caller gets just the status-bearing
+        // sentence.
+        request.log.warn(
+          { err, assetId: asset.id, oscJobLog: oscJobLog(err) },
+          'export/re-wrap job failed'
+        );
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'rewrap_failed', message });
       }
@@ -5013,7 +5046,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // SERVER-SIDE ONLY (osc-clip.ts:OscClipJobError carries it as data, not
         // in `message`), and the caller gets just the status-bearing sentence.
         request.log.warn(
-          { err, assetId: asset.id, oscJobLog: oscClipJobLog(err) },
+          { err, assetId: asset.id, oscJobLog: oscJobLog(err) },
           'clip job failed'
         );
         const message = err instanceof Error ? err.message : String(err);
