@@ -1409,6 +1409,129 @@ function reportActionFailure(err, opts) {
   return errorToast(humanizeErrorReason(err) || (err && err.message), opts);
 }
 
+// ─── Permanently unrecoverable outcome (issue #933) ────────────────────────────
+//
+// CONTRACT GROUNDING (CLAUDE.md rule 7 — read in the live tree, not assumed)
+//
+//   POST /api/v1/assets/{id}/restore declares exactly three responses:
+//       response: { 200: assetSchema, 404: errorSchema, 410: errorSchema }
+//     src/routes/assets.ts:5755 — mirrored in openapi.json
+//     .paths["/api/v1/assets/{id}/restore"].post.responses (keys 200/404/410;
+//     one required path parameter `id`; no requestBody).
+//   errorSchema is
+//       z.object({ error: z.string(), message: z.string().optional() })
+//     src/routes/assets.ts:529 — so `error` is the ONLY guaranteed field and
+//     `message` may legitimately be absent.
+//   The route emits its 410 in exactly one place:
+//       return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
+//     src/routes/assets.ts:5767, reached when repo.getState(id) reports
+//     `kind === 'tombstone'` (assets.ts:5764-5768) — i.e. the retention sweep
+//     already purged the archived asset and replaced its document in place with a
+//     tombstone. The handler returns there: no state change, no audit entry
+//     (documented at assets.ts:5743-5744 and 5780-5781).
+//
+// WHY THIS IS NOT REPORTED LIKE EVERY OTHER FAILURE
+//
+// `.msg-error` and errorToast/reportActionFailure are this app's single signal
+// for "the action failed" — and in practice that means "try again": every refusal
+// this client humanizes ends with literally that instruction
+// (ACTION_FAILURE_REASON_COPY above). A 410 here is the opposite class of fact.
+// `archived` is terminal on the ordinary state machine (ALLOWED_TRANSITIONS.
+// archived = [], src/data/asset-repo.ts:39), `/:id/restore` is the only route
+// back out of it — and that is precisely the route that just refused, for a
+// document the API can no longer turn back into an asset. So a retry is not
+// merely unlikely to work; nothing in the API can ever make it work. Painting it
+// in the same red box as a 503 or a dropped connection invites exactly the retry
+// the issue exists to prevent, so it gets its own treatment: its own class, its
+// own label, and — the part styling alone cannot do — removal of the control that
+// led here.
+const PURGED_UNRECOVERABLE_LABEL = 'Permanently unrecoverable';
+
+// Curly-quote the first usable candidate for inline prose (same argument order as
+// nameOrFallback), or return '' when there is none — so a nameless record falls
+// back to the notice's own generic subject rather than reading as empty quotes.
+function quotedOrEmpty() {
+  const name = nameOrFallback.apply(null, arguments);
+  return name ? '“' + name + '”' : '';
+}
+
+// True for the apiFetch rejection raised by the tombstone 410 above.
+//
+// `err.status` is the primary discriminator (apiFetch sets it from the response,
+// app.js:292) and is sufficient on its own: the route declares one 410 and emits
+// it from one line. `err.body` (app.js:295) is used to CONFIRM the machine code
+// when a body was parsed, never required — per errorSchema a body may carry only
+// `error`, and a truncated/non-JSON response leaves `body` undefined.
+function isPurgedGone(err) {
+  if (!err || err.status !== 410) return false;
+  const body = err.body;
+  if (body && typeof body === 'object' && typeof body.error === 'string') {
+    return body.error === 'gone';
+  }
+  return true;
+}
+
+// Report a purged asset as permanently unrecoverable, and take away the retry
+// affordance that led here.
+//
+// `host`      — element to append the notice to (e.g. #action-msg).
+// `opts.retire` — elements to REMOVE from the DOM. Disabling a button is not
+//              enough: a greyed-out control still reads as "unavailable for now",
+//              and the whole point of a 410 is that there is no "for now". The
+//              explanatory note that described the action goes with it, so no
+//              stale promise (or dangling aria-describedby target) survives.
+// `opts.subject` — operator-facing name of the asset (untrusted text).
+// `opts.serverMessage` — the API's own `message`, shown verbatim as a secondary
+//              line when present; omitted entirely when it is not.
+// `opts.id`   — element id for the notice, so a caller can address its own.
+//
+// Built with innerHTML so every interpolated value passes through escHtml: both
+// `subject` and `serverMessage` carry data this client did not author.
+function renderPurgedUnrecoverable(host, opts) {
+  if (!host) return null;
+  const o = opts || {};
+
+  // Retire the control FIRST, so the notice is never announced next to a button
+  // that contradicts it.
+  const retire = o.retire || [];
+  for (let i = 0; i < retire.length; i++) {
+    const el = retire[i];
+    if (el && typeof el.remove === 'function') el.remove();
+  }
+
+  const notice = document.createElement('div');
+  notice.id = o.id || 'purged-unrecoverable-notice';
+  // Deliberately NOT .msg-error — see the note above. `.msg` alone keeps the
+  // shared box metrics; `.msg-unrecoverable` (style.css) supplies the distinct
+  // terminal styling.
+  notice.className = 'msg msg-unrecoverable';
+  // Appears without a page change, and is the outcome of an action the operator
+  // just took (WCAG 2.1 AA 4.1.3 Status Messages).
+  notice.setAttribute('role', 'alert');
+  // Machine-readable outcome class, so a test — or a future view — can tell a
+  // terminal outcome from a retryable one without matching on prose.
+  notice.setAttribute('data-outcome', 'unrecoverable');
+
+  const subject = nameOrFallback(o.subject, 'This asset');
+  const serverMessage = o.serverMessage == null ? '' : String(o.serverMessage).trim();
+
+  notice.innerHTML =
+    '<span class="unrecoverable-label">' + escHtml(PURGED_UNRECOVERABLE_LABEL) + '</span>' +
+    '<span class="unrecoverable-body">' +
+      escHtml(subject) + ' has been purged by the retention sweep. Its record is now a ' +
+      'tombstone, so the API answers 410 Gone and the asset can never be restored. ' +
+      'This is final — not a temporary failure, and not something a retry or a later ' +
+      'attempt can change. To work with this material again, ingest the source file as ' +
+      'a new asset.' +
+    '</span>' +
+    (serverMessage
+      ? '<span class="unrecoverable-detail">The API reported: ' + escHtml(serverMessage) + '</span>'
+      : '');
+
+  host.appendChild(notice);
+  return notice;
+}
+
 // ─── Storage-backend remove confirmation (issue #682) ──────────────────────────
 // Format the human-readable in-use error for a 409 body. The authoritative
 // contract (branch issue-679/storage-backend-api-endpoints,
@@ -2885,7 +3008,14 @@ async function renderAssetDetailBody(id, bodyEl) {
 
     var restoreBtn = body.querySelector('#btn-restore-asset');
     if (restoreBtn) {
+      // Latched once a 410 proves the asset is permanently unrecoverable (issue
+      // #933). The control is removed from the DOM at that point, so this only
+      // catches a dispatch from a reference that outlived it (a queued event, a
+      // stored handle) — but a second POST for a tombstone can only ever earn a
+      // second 410, so it must not be sent.
+      var restoreRetired = false;
       restoreBtn.addEventListener('click', async function () {
+        if (restoreRetired) return;
         actionMsg.innerHTML = '';
         var prevLabel = restoreBtn.textContent;
         restoreBtn.disabled = true;
@@ -2906,20 +3036,27 @@ async function renderAssetDetailBody(id, bodyEl) {
           );
           return;
         } catch (err) {
-          if (err && err.status === 410) {
-            // Terminal: the document is a tombstone, so no retry can ever work.
-            // Rendered as a PERSISTENT notice (showMsg auto-dismisses after 6s)
-            // and the control is retired rather than left inviting a retry.
-            restoreBtn.disabled = true;
-            restoreBtn.textContent = 'Restore unavailable';
-            var gone = document.createElement('div');
-            gone.id = 'restore-gone-notice';
-            gone.className = 'msg msg-error';
-            gone.setAttribute('role', 'alert');
-            gone.textContent =
-              'This asset has already been purged by the retention sweep (HTTP 410) — ' +
-              'its record is a tombstone and it can no longer be restored.';
-            actionMsg.appendChild(gone);
+          if (isPurgedGone(err)) {
+            // Terminal, and presented as such (issue #933): the document is a
+            // tombstone, so this is not a failure to retry but a permanent fact
+            // about the asset. Routed through the shared unrecoverable notice
+            // instead of the red `.msg-error` box every transient failure uses,
+            // and rendered PERSISTENTLY (showMsg auto-dismisses after 6s, which
+            // would quietly erase the one outcome that never changes).
+            //
+            // The Restore control and its explanatory note are REMOVED, not
+            // disabled: a greyed-out "Restore unavailable" button reads as "not
+            // right now", and the note still promised a revival that can no
+            // longer happen. With no control left there is no retry affordance
+            // to mistake for one. See isPurgedGone/renderPurgedUnrecoverable
+            // (app.js) for the 410 contract citations.
+            restoreRetired = true;
+            renderPurgedUnrecoverable(actionMsg, {
+              id: 'restore-gone-notice',
+              subject: quotedOrEmpty(asset.name, asset.slug, asset.id),
+              serverMessage: err.message,
+              retire: [restoreBtn, body.querySelector('#restore-note')],
+            });
             if (assetsTable) assetsTable.reload();
             return;
           }
@@ -7010,6 +7147,15 @@ export {
   reportActionFailure,
   humanizeErrorReason,
   ACTION_FAILURE_REASON_COPY,
+  // Permanently-unrecoverable outcome (issue #933). Exported so a DOM/unit test
+  // can assert that a 410 `gone` is told apart from a retryable failure, that the
+  // notice is visually distinct from `.msg-error`, that it survives (no
+  // auto-dismiss), and that the control which led there is removed rather than
+  // disabled. Shared, so any other caller of a route with a tombstone 410 reports
+  // it the same way.
+  isPurgedGone,
+  renderPurgedUnrecoverable,
+  PURGED_UNRECOVERABLE_LABEL,
   // Per-row test-connection action (issue #683). Exported so a DOM/unit test can
   // exercise the shared probe helper + the pure spinner/result row renderers
   // without a live probe.

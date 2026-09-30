@@ -692,6 +692,41 @@ button:disabled {
   border: 1px solid rgba(99, 102, 241, 0.3);
 }
 
+/* Permanently unrecoverable outcome (issue #933).
+   Deliberately NOT a variant of .msg-error: in this UI red means "that failed,
+   try again", and a 410 on restore means the record is a tombstone and no retry
+   can ever succeed. So it reads as a closed file rather than an alarm — muted
+   slate instead of danger red, a heavy left rule, and an uppercase label row, so
+   an operator can tell a terminal outcome from a transient one at a glance
+   without reading the sentence. */
+.msg-unrecoverable {
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--text-muted);
+}
+
+.msg-unrecoverable .unrecoverable-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.msg-unrecoverable .unrecoverable-body {
+  display: block;
+}
+
+.msg-unrecoverable .unrecoverable-detail {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* Empty state */
 .empty {
   text-align: center;
