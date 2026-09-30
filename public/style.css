@@ -2085,6 +2085,143 @@ body.detail-standalone .assets-side {
   display: none;
 }
 
+/* Column chooser (issue #959). A disclosure button in the shared
+   .ops-table-filters bar, opening a non-modal checkbox list. Non-modal on purpose:
+   choosing columns is an adjustment made WHILE reading the table, so the rows being
+   adjusted for must stay on screen. It sits last in the bar and is marked as a view
+   control, not a filter — it changes what you see, never what is requested. */
+.ops-columns-slot {
+  /* Push it to the end of the bar, away from the controls that DO change the
+     query, so the two kinds of control do not read as one group. */
+  margin-left: auto;
+  align-self: flex-end;
+}
+
+.ops-columns {
+  position: relative;
+}
+
+.ops-columns-btn {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  font-size: 13px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+/* "6 of 8" — so "am I hiding anything?" is answerable without opening the panel,
+   and is part of the button's accessible name. */
+.ops-columns-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ops-columns-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  /* Anchored to the right edge: the control sits at the right of the filter bar,
+     so a left-anchored panel would hang off the viewport on a narrow window. */
+  right: 0;
+  min-width: 220px;
+  padding: 10px 12px;
+  background: var(--surface, #1a1a1a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.ops-columns-panel[hidden] {
+  display: none;
+}
+
+.ops-columns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ops-columns-item {
+  /* Beats `.ops-table-filters label { flex-direction: column }` above — these are
+     checkbox rows, not stacked caption-over-input filter controls. */
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  color: var(--text, #eee);
+  cursor: pointer;
+}
+
+.ops-columns-item:hover {
+  background: var(--border);
+}
+
+/* Selector-qualified to outrank `.ops-table-filters input { padding: 5px 8px }`
+   above, which is written for text/date inputs and would otherwise inflate every
+   checkbox in this list. */
+.ops-table-filters .ops-columns-item input {
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* A column that has to stay visible. Muted and not-allowed rather than absent:
+   an entry that vanished would read as "this column does not exist". */
+.ops-columns-item.is-locked,
+.ops-columns-item.is-locked input {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+/* Outranks `.ops-table-filters label > span { font-weight: 500 }`: those are
+   filter captions, these are pickable column names and read as body text. */
+.ops-table-filters .ops-columns-item-label {
+  font-weight: 400;
+}
+
+/* A column can be hidden while the table is still sorted by it — sort is not
+   coupled to visibility. This flag is the only place that fact is visible, and
+   this list is where the column can be brought back. */
+.ops-columns-note {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 20px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent, #6366f1);
+  border: 1px solid var(--accent, #6366f1);
+}
+
+.ops-columns-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.ops-columns-hint[hidden] {
+  display: none;
+}
+
+.ops-columns-actions {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border, #333);
+}
+
+.ops-columns-showall {
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.ops-columns-showall:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Logs table — level badges (issue #371). `level` is an OPTIONAL log field; the
    cell shows a coloured pill per severity when present, else a dash. */
 .log-level {
