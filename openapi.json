@@ -19803,6 +19803,9 @@
                                 },
                                 "readyAt": {
                                   "type": "number"
+                                },
+                                "draining": {
+                                  "type": "boolean"
                                 }
                               },
                               "required": [
@@ -19826,6 +19829,9 @@
                     "maxInstances": {
                       "type": "number"
                     },
+                    "jobsPerInstance": {
+                      "type": "number"
+                    },
                     "idleTimeoutMs": {
                       "type": "number"
                     },
@@ -19836,6 +19842,7 @@
                   "required": [
                     "workspaces",
                     "maxInstances",
+                    "jobsPerInstance",
                     "idleTimeoutMs",
                     "scalerActive"
                   ],

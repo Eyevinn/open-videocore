@@ -361,7 +361,7 @@ a restart.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances` and `idleTimeoutMs`). Returns `scalerActive: false` until a stack is provisioned; the auto-scaler activates against the provisioned stack's Valkey immediately after `POST /api/v1/provision` completes, with no restart. |
+| `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances`, `jobsPerInstance` — concurrent jobs one instance can take — and `idleTimeoutMs`; each instance carries `draining: true` while it is being drained ahead of teardown). Returns `scalerActive: false` until a stack is provisioned; the auto-scaler activates against the provisioned stack's Valkey immediately after `POST /api/v1/provision` completes, with no restart. |
 | `GET` | `/api/v1/scaler/config` | Get auto-scaler configuration |
 | `PATCH` | `/api/v1/scaler/config` | Update auto-scaler configuration (`maxInstances`, `minInstances`, `idleTimeoutMs`) at runtime; `idleTimeoutMs` must be at least `10000` ms |
 

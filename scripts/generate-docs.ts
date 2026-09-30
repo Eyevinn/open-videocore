@@ -211,7 +211,7 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/admin/watch-folder/start': 'Start the watch-folder ingest poller.',
   'POST /api/v1/admin/watch-folder/stop': 'Stop the watch-folder ingest poller.',
   'GET /api/v1/scaler/status':
-    'Current transcoder instance pool status (effective `maxInstances`, `idleTimeoutMs`).',
+    'Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).',
   'PATCH /api/v1/scaler/config':
     'Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).',
   'GET /api/v1/scaler/config': 'Get auto-scaler configuration.',

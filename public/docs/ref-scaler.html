@@ -324,7 +324,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 
 <article class="endpoint" id="get-api-v1-scaler-status">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/scaler/status</code></h3>
-  <p class="endpoint-desc">Current transcoder instance pool status (effective `maxInstances`, `idleTimeoutMs`).</p>
+  <p class="endpoint-desc">Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).</p>
   
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -339,12 +339,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
           &quot;url&quot;: null,
           &quot;activeJobs&quot;: null,
           &quot;lastIdleAt&quot;: null,
-          &quot;readyAt&quot;: null
+          &quot;readyAt&quot;: null,
+          &quot;draining&quot;: null
         }
       ]
     }
   ],
   &quot;maxInstances&quot;: 0,
+  &quot;jobsPerInstance&quot;: 0,
   &quot;idleTimeoutMs&quot;: 0,
   &quot;scalerActive&quot;: true
 }</code></pre></div>

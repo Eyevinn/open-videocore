@@ -15,12 +15,16 @@
 //       { instanceId, url, activeJobs, lastIdleAt }
 //   - listInstances(redis, workspaceId): src/encore-scaler/instance-pool.ts:46
 //   - ioredis Redis.scan / .llen: ioredis type definitions.
+//   - JOBS_PER_INSTANCE: src/encore-scaler/types.ts — the per-instance job
+//     capacity the scaler loop itself treats as "busy"
+//     (scaler-loop.ts:245 `activeJobs >= JOBS_PER_INSTANCE`, :395 dispatch
+//     guard). Reported on the wire (#979) so a client never has to infer it.
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { Redis } from 'ioredis';
 import { z } from 'zod';
-import { keys } from '../encore-scaler/types.js';
+import { JOBS_PER_INSTANCE, keys } from '../encore-scaler/types.js';
 import { listInstances } from '../encore-scaler/instance-pool.js';
 
 type ScalerRouterOptions = {
@@ -59,12 +63,21 @@ const MIN_IDLE_TIMEOUT_MS = 10_000;
 //     resolveIdleSince()/isIdlePastTimeout() exist to tolerate — is REPORTED to
 //     the operator instead of failing response validation and hiding the whole
 //     workspace.
+//
+// #979:
+//   - `draining` is surfaced because scale-down marks an instance draining
+//     instead of killing it while it still has in-flight work (#513, drain-don't-
+//     kill). The record has carried the flag since then, but this schema stripped
+//     it, so "draining" was indistinguishable from "healthy and busy" to every
+//     client. Optional, matching EncoreInstanceRecord.draining: it is only
+//     present on a record that is actually draining.
 const instanceSchema = z.object({
   instanceId: z.string(),
   url: z.string(),
   activeJobs: z.number(),
   lastIdleAt: z.number().optional(),
-  readyAt: z.number().optional()
+  readyAt: z.number().optional(),
+  draining: z.boolean().optional()
 });
 
 const workspaceSchema = z.object({
@@ -77,6 +90,12 @@ const workspaceSchema = z.object({
 const scalerStatusSchema = z.object({
   workspaces: z.array(workspaceSchema),
   maxInstances: z.number(),
+  // How many concurrent jobs ONE instance can take before the scaler counts it
+  // as busy (#979). A server-owned config constant, reported alongside
+  // maxInstances/idleTimeoutMs so a client can render "activeJobs of capacity"
+  // from the payload instead of reverse-engineering capacity from the pool's
+  // observed load — an inference that is only right while the constant is 1.
+  jobsPerInstance: z.number(),
   idleTimeoutMs: z.number(),
   scalerActive: z.boolean()
 });
@@ -92,6 +111,7 @@ function toInstanceView(record: {
   activeJobs: number;
   lastIdleAt?: unknown;
   readyAt?: unknown;
+  draining?: unknown;
 }): z.infer<typeof instanceSchema> {
   const asNumber = (value: unknown): number | undefined =>
     typeof value === 'number' && Number.isFinite(value) ? value : undefined;
@@ -100,7 +120,10 @@ function toInstanceView(record: {
     url: record.url,
     activeJobs: record.activeJobs,
     lastIdleAt: asNumber(record.lastIdleAt),
-    readyAt: asNumber(record.readyAt)
+    readyAt: asNumber(record.readyAt),
+    // Only emitted when the record is actually draining (#979). An instance that
+    // is not draining carries no flag at all, exactly as the record does.
+    draining: record.draining === true ? true : undefined
   };
 }
 
@@ -151,6 +174,7 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         return {
           workspaces: [],
           maxInstances: liveMaxInstances,
+          jobsPerInstance: JOBS_PER_INSTANCE,
           idleTimeoutMs: liveIdleTimeoutMs,
           scalerActive: false
         };
@@ -173,7 +197,15 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         })
       );
 
-      return { workspaces, maxInstances: liveMaxInstances, idleTimeoutMs: liveIdleTimeoutMs, scalerActive: true };
+      return {
+        workspaces,
+        maxInstances: liveMaxInstances,
+        // Sourced from the scaler's own constant, not a router option, so the
+        // wire value and the loop's busy threshold cannot drift (#979).
+        jobsPerInstance: JOBS_PER_INSTANCE,
+        idleTimeoutMs: liveIdleTimeoutMs,
+        scalerActive: true
+      };
     }
   );
 
