@@ -69,6 +69,7 @@
 //     (src/encore-scaler/workspace-registry.ts:88, :206-209, :328-330).
 
 import { STACK_CONFIG_NAMESPACE } from './workspace-stack.js';
+import { OBJECT_STORE_SERVICE_ID } from './stack.js';
 import type { ParamStore, StackConfig } from './param-store.js';
 import type { EncoreS3Config } from '../encore-scaler/types.js';
 
@@ -90,9 +91,80 @@ export type ResolveEncoreS3ConfigDeps = {
   // True when a complete static ENCORE_S3_ENDPOINT + secret pair was configured
   // (local dev / ops override). That is an intentional, complete configuration,
   // so this resolver defers to it by returning undefined rather than throwing.
+  //
+  // NOTE (issue #991): this governs ONLY the "nothing resolved, so defer"
+  // decisions below. It deliberately does NOT gate `resolveEndpoint` — see
+  // mapEndpointForTranscoder for why. When a stack endpoint DOES resolve, that
+  // stack endpoint is what the transcoder gets, and the static value is not in
+  // play on this path at all.
   staticFallbackConfigured: boolean;
   log: EncoreS3ConfigLogger;
+  // Optional hook (issue #991) mapping the stack's PUBLIC object-store endpoint
+  // to the endpoint the SPAWNED TRANSCODER should use — in production the
+  // in-cluster Service address, so a long single-connection read of a large
+  // source never crosses the platform ingress (services/
+  // internal-minio-endpoint.ts). Contract: it must never throw and must return
+  // the input unchanged whenever no better endpoint is usable, so this resolver's
+  // behaviour without the hook and with an unusable in-cluster path are
+  // identical. Only the endpoint handed to the transcoder changes: the STORED
+  // stack config and every client-facing URL stay public (presigned uploads,
+  // playback/delivery, API responses), because those are built from
+  // StackConfig.minioEndpoint by the stack resolver, which this hook is not
+  // wired into.
+  //
+  // The second argument is the stack's object-store INSTANCE NAME, taken from
+  // `StackConfig.services` below. The resolver uses it to ask the platform for
+  // the in-cluster address via `getInternalEndpoint`
+  // (@osaas/client-core lib/core.d.ts:130-148) instead of inferring one; it is
+  // optional because an older stored config may not carry it.
+  resolveEndpoint?: (publicEndpoint: string, instanceName?: string) => Promise<string>;
 };
+
+// Apply the optional endpoint hook (issue #991) to the PUBLIC endpoint read from
+// the stack config, and fail soft in every other case.
+//
+// GATED ON PROVENANCE, NOT ON `staticFallbackConfigured`. This function is only
+// ever reached with an endpoint that came from `StackConfig.minioEndpoint` —
+// i.e. from the stack config — so the hook always applies here. A static
+// `ENCORE_S3_ENDPOINT` value cannot reach this function at all: when a complete
+// static pair is configured AND no stack endpoint resolves, this resolver
+// returns `undefined` and the registry uses its own `s3Config` built from the
+// env vars verbatim (workspace-registry.ts:206-209, main.ts `s3Config`). The
+// operator override is therefore honoured by a DIFFERENT code path that this
+// hook is not wired into.
+//
+// The earlier `|| staticFallbackConfigured` gate confused those two things. It
+// did not protect the static value (which never passes through here), and it
+// silently disabled the #991 fix for any operator who had left
+// `ENCORE_S3_ENDPOINT` set while actually being served from a provisioned
+// stack: they lost the ingress fix AND their static value went unused. Gating
+// on where the endpoint came from — which is unconditional at this call site —
+// is the correct rule.
+//
+// The hook is contracted never to throw, but if a caller ever wires one that
+// does, a spawn must not fail because of an optimisation: the throw is logged
+// and the PUBLIC endpoint is used, which is exactly the pre-#991 behaviour.
+async function mapEndpointForTranscoder(
+  publicEndpoint: string,
+  resolveEndpoint:
+    | ((publicEndpoint: string, instanceName?: string) => Promise<string>)
+    | undefined,
+  instanceName: string | undefined,
+  log: EncoreS3ConfigLogger
+): Promise<string> {
+  if (!resolveEndpoint) return publicEndpoint;
+  try {
+    const mapped = await resolveEndpoint(publicEndpoint, instanceName);
+    return mapped && mapped.length > 0 ? mapped : publicEndpoint;
+  } catch (err) {
+    log.error(
+      { err, publicEndpoint },
+      'encore-scaler: the in-cluster object-store endpoint resolver threw (it must not) — ' +
+        'falling back to the public endpoint for this spawn'
+    );
+    return publicEndpoint;
+  }
+}
 
 // `stackKey` is the EFFECTIVE stack identity the transcode request resolved to
 // (issue #615), so it IS the stack name: load its config by name directly. Only
@@ -105,7 +177,7 @@ export async function resolveEncoreS3Config(
   deps: ResolveEncoreS3ConfigDeps,
   stackKey: string
 ): Promise<EncoreS3Config | undefined> {
-  const { paramStore, secretAccessKey, staticFallbackConfigured, log } = deps;
+  const { paramStore, secretAccessKey, staticFallbackConfigured, log, resolveEndpoint } = deps;
 
   if (!secretAccessKey) {
     if (staticFallbackConfigured) return undefined;
@@ -144,8 +216,22 @@ export async function resolveEncoreS3Config(
   }
 
   if (config?.minioEndpoint) {
+    // The object-store instance name, for the platform's `getInternalEndpoint`
+    // lookup (issue #991). Read from the config already loaded above, so this
+    // costs no extra parameter-store round trip. Absent on a stack config old
+    // enough to carry no `services[]` entry for the object store, in which case
+    // the resolver falls back to deriving the address from the public endpoint.
+    const objectStoreInstanceName = config.services?.find(
+      (s) => s.serviceId === OBJECT_STORE_SERVICE_ID
+    )?.instanceName;
+
     return {
-      endpoint: config.minioEndpoint,
+      endpoint: await mapEndpointForTranscoder(
+        config.minioEndpoint,
+        resolveEndpoint,
+        objectStoreInstanceName,
+        log
+      ),
       accessKeyId: MINIO_ROOT_USER,
       secretAccessKey
     };
