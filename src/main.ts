@@ -62,6 +62,10 @@ import {
 } from './services/scaler-redis-url.js';
 import { resolveEncoreS3Config } from './services/encore-s3-config.js';
 import {
+  makeInternalEndpointResolver,
+  resolveInternalEndpointSettings
+} from './services/internal-minio-endpoint.js';
+import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
   PerWorkspaceSearchRepository,
@@ -722,6 +726,18 @@ const probe: ProbeRunner | undefined = storageAvailable
 // time. The tag is what lets the route tell a factory from a plain runner; a
 // factory reaching a stack with no s3Config is an explicit 501 rather than a
 // call that dispatches no job.
+//
+// ENDPOINT (issue #991): the three ephemeral ffmpeg-job runners below
+// (thumbnail, re-wrap, clip) keep the stack's PUBLIC object-store endpoint. It
+// arrives as `s3.endpoint` on request.connections.s3Config, which the stack
+// resolver populates from the stored public StackConfig.minioEndpoint
+// (services/workspace-stack.ts buildConnectionsFromStack). They are left public
+// DELIBERATELY: reachability of the job-runner namespace to the in-cluster
+// Service address was NOT verified, and unlike a full transcode these jobs are
+// short seeks / stream copies rather than one multi-minute single-connection read
+// of the whole source, so they are not the failure mode #991 fixes. Documented in
+// docs/investigations/991-internal-object-store-endpoint-paths.md; revisit once a
+// runner-side probe exists.
 const thumbnailExtractor = storageAvailable
   ? runnerFactory(
       (s3): FrameExtractor =>
@@ -994,6 +1010,23 @@ function activateScaler(redisUrl: string): void {
   const encoreS3AccessKey = process.env['ENCORE_S3_ACCESS_KEY'] ?? process.env['MINIO_ACCESS_KEY'] ?? 'admin';
   const encoreS3SecretKey = process.env['ENCORE_S3_SECRET_KEY'] ?? process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'];
 
+  // Hand each spawned transcoder the IN-CLUSTER object-store endpoint instead of
+  // the public ingress URL (issue #991), so one long single-connection read of a
+  // large source is not severed mid-stream by the ingress
+  // (docs/investigations/294-minio-ingress-longlived-connections.md). Env vars are
+  // read HERE ONLY and passed to the resolver as typed options; the resolver
+  // itself is opt-out, probe-gated, and falls back to the public endpoint with a
+  // logged warning (it never throws, and it cannot fail startup). Client-facing
+  // URLs are untouched — see the sibling-path audit in
+  // docs/investigations/991-internal-object-store-endpoint-paths.md.
+  const internalEndpointSettings = resolveInternalEndpointSettings(process.env);
+  const resolveTranscoderEndpoint = makeInternalEndpointResolver({
+    enabled: internalEndpointSettings.enabled,
+    port: internalEndpointSettings.port,
+    probeTimeoutMs: internalEndpointSettings.probeTimeoutMs,
+    log: app.log
+  });
+
   const redis = new IORedis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: null });
   sharedRedis = redis;
 
@@ -1116,7 +1149,15 @@ function activateScaler(redisUrl: string): void {
           // the static s3Config", workspace-registry.ts:206-209) instead of
           // throwing.
           staticFallbackConfigured: Boolean(encoreS3Endpoint && encoreS3SecretKey),
-          log: app.log
+          log: app.log,
+          // Issue #991: map the stack's PUBLIC endpoint to the in-cluster Service
+          // address for the TRANSCODER ONLY. Applied to BOTH scaler spawn paths,
+          // because both take this one resolver
+          // (workspace-registry.ts:206-209 getOrCreate and :346-351
+          // resumeExistingWorkspaces). Not applied when a static
+          // ENCORE_S3_ENDPOINT is configured — that operator override stays
+          // verbatim (see mapEndpointForTranscoder in encore-s3-config.ts).
+          resolveEndpoint: resolveTranscoderEndpoint
         },
         stackKey
       ),
@@ -1509,6 +1550,15 @@ function activateScaler(redisUrl: string): void {
         coords: {
           stackName: resolvedStackName,
           redisUrl,
+          // PUBLIC endpoint, deliberately (issue #991 sibling-path audit). The
+          // packager's `S3EndpointUrl` is fixed in its create body at provision
+          // time (services/packager-provisioning.ts buildPackagerCreateBody), so
+          // unlike the transcoder there is no per-spawn seam to flip: changing it
+          // for an existing packager means re-provisioning it. Whether that is
+          // safe, and whether the packager namespace can reach the in-cluster
+          // Service address at all, were both left UNVERIFIED by #991 — so this
+          // stays public rather than being changed on an assumption. See
+          // docs/investigations/991-internal-object-store-endpoint-paths.md.
           minioEndpoint,
           packagedBucket,
           publicBaseUrl

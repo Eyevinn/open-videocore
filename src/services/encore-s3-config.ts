@@ -92,7 +92,52 @@ export type ResolveEncoreS3ConfigDeps = {
   // so this resolver defers to it by returning undefined rather than throwing.
   staticFallbackConfigured: boolean;
   log: EncoreS3ConfigLogger;
+  // Optional hook (issue #991) mapping the stack's PUBLIC object-store endpoint
+  // to the endpoint the SPAWNED TRANSCODER should use — in production the
+  // in-cluster Service address, so a long single-connection read of a large
+  // source never crosses the platform ingress (services/
+  // internal-minio-endpoint.ts). Contract: it must never throw and must return
+  // the input unchanged whenever no better endpoint is usable, so this resolver's
+  // behaviour without the hook and with an unusable in-cluster path are
+  // identical. Only the endpoint handed to the transcoder changes: the STORED
+  // stack config and every client-facing URL stay public (presigned uploads,
+  // playback/delivery, API responses), because those are built from
+  // StackConfig.minioEndpoint by the stack resolver, which this hook is not
+  // wired into.
+  resolveEndpoint?: (publicEndpoint: string) => Promise<string>;
 };
+
+// Apply the optional endpoint hook (issue #991) to the PUBLIC endpoint read from
+// the stack config, and fail soft in every other case.
+//
+// Two deliberate rules:
+//   1. A complete STATIC configuration (ENCORE_S3_ENDPOINT + secret) is an
+//      explicit operator decision about which endpoint transcoders talk to, so
+//      the hook is NOT applied when one is configured — the operator's endpoint
+//      is honoured verbatim and this resolver never substitutes another.
+//   2. The hook is contracted never to throw, but if a caller ever wires one
+//      that does, a spawn must not fail because of an optimisation: the throw is
+//      logged and the PUBLIC endpoint is used, which is exactly the pre-#991
+//      behaviour.
+async function mapEndpointForTranscoder(
+  publicEndpoint: string,
+  resolveEndpoint: ((publicEndpoint: string) => Promise<string>) | undefined,
+  staticFallbackConfigured: boolean,
+  log: EncoreS3ConfigLogger
+): Promise<string> {
+  if (!resolveEndpoint || staticFallbackConfigured) return publicEndpoint;
+  try {
+    const mapped = await resolveEndpoint(publicEndpoint);
+    return mapped && mapped.length > 0 ? mapped : publicEndpoint;
+  } catch (err) {
+    log.error(
+      { err, publicEndpoint },
+      'encore-scaler: the in-cluster object-store endpoint resolver threw (it must not) — ' +
+        'falling back to the public endpoint for this spawn'
+    );
+    return publicEndpoint;
+  }
+}
 
 // `stackKey` is the EFFECTIVE stack identity the transcode request resolved to
 // (issue #615), so it IS the stack name: load its config by name directly. Only
@@ -105,7 +150,7 @@ export async function resolveEncoreS3Config(
   deps: ResolveEncoreS3ConfigDeps,
   stackKey: string
 ): Promise<EncoreS3Config | undefined> {
-  const { paramStore, secretAccessKey, staticFallbackConfigured, log } = deps;
+  const { paramStore, secretAccessKey, staticFallbackConfigured, log, resolveEndpoint } = deps;
 
   if (!secretAccessKey) {
     if (staticFallbackConfigured) return undefined;
@@ -145,7 +190,12 @@ export async function resolveEncoreS3Config(
 
   if (config?.minioEndpoint) {
     return {
-      endpoint: config.minioEndpoint,
+      endpoint: await mapEndpointForTranscoder(
+        config.minioEndpoint,
+        resolveEndpoint,
+        staticFallbackConfigured,
+        log
+      ),
       accessKeyId: MINIO_ROOT_USER,
       secretAccessKey
     };
