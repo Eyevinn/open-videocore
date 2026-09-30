@@ -24,6 +24,12 @@
 //     (:497), no body schema, responses 200 | 404 | 422 (:498). No batch
 //     membership route exists on that router, so several assets are added with
 //     one PUT each from a single user interaction.
+//   - Envelope `total` is the count of matching ASSETS across the whole matched
+//     set, not the returned page (src/routes/search.ts:130; the repository
+//     returns `assets: matched.slice(start, start + pageSize)` alongside
+//     `total: matched.length`, src/data/inmemory-search-repo.ts:53-57). Issue
+//     #949 leans on that: when `total` exceeds the hits on screen the picker
+//     says the list is cut short, so "not shown" cannot read as "not there".
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -36,7 +42,14 @@ import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import { InMemoryCollectionRepository } from '../src/data/inmemory-collection-repo.js';
 import { InMemorySearchRepository } from '../src/data/inmemory-search-repo.js';
 
-import { renderCollectionAssetPicker, addAssetsSummary, assetPickerHits } from '../public/app.js';
+import {
+  renderCollectionAssetPicker,
+  addAssetsSummary,
+  assetPickerHits,
+  assetPickerTotal,
+  assetPickerResultNote,
+  ASSET_PICKER_PAGE_SIZE,
+} from '../public/app.js';
 
 async function settle(ticks = 30): Promise<void> {
   for (let i = 0; i < ticks; i += 1) {
@@ -236,6 +249,41 @@ describe('collection asset picker (issue #915)', () => {
       page: 1,
     });
     expect(hits).toEqual([{ id: 'A1', name: 'clip', status: 'ready' }]);
+  });
+
+  // Issue #949: a common term can match more assets than one page holds. The
+  // picker must not present a cut-short list as the whole answer.
+  it('says so when the hit list is cut short by the page size', async () => {
+    const many = [];
+    for (let i = 0; i < ASSET_PICKER_PAGE_SIZE + 4; i += 1) {
+      many.push(await assets.create({ name: `News segment ${i}` }));
+    }
+    await search('news segment');
+
+    expect(hitBoxes()).toHaveLength(ASSET_PICKER_PAGE_SIZE);
+    const note = picker.querySelector('#add-asset-results-note') as HTMLElement;
+    expect(note).not.toBeNull();
+    expect(note.textContent).toContain(`Showing the first ${ASSET_PICKER_PAGE_SIZE} of ${many.length}`);
+    expect(note.textContent).toMatch(/narrow the search/i);
+  });
+
+  it('adds no truncation note when every match is on screen', async () => {
+    await search('bulletin');
+    expect(hitBoxes()).toHaveLength(2);
+    expect(picker.querySelector('#add-asset-results-note')).toBeNull();
+  });
+
+  it('derives the truncation note from the envelope total only', () => {
+    expect(assetPickerTotal({ assets: [], collections: [], total: 57, collectionTotal: 0, page: 1 })).toBe(
+      57
+    );
+    expect(assetPickerTotal({})).toBeNull();
+    expect(assetPickerResultNote(20, 57)).toBe(
+      'Showing the first 20 of 57 matching assets. Add a word from the name to narrow the search.'
+    );
+    expect(assetPickerResultNote(2, 2)).toBe('');
+    // A total the server did not report is never guessed at.
+    expect(assetPickerResultNote(20, null)).toBe('');
   });
 
   it('labels the search field and announces results accessibly', () => {
