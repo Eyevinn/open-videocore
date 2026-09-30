@@ -1873,6 +1873,100 @@ body.detail-standalone .assets-side {
   overflow: auto;
 }
 
+/* View-only toolbar strip (issue #959): controls that change how the table is
+ * PRESENTED, never what it queries. Sits below the filter bar so the query
+ * controls stay visually grouped and separate. */
+.ops-table-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Column chooser — a native <details> disclosure, so no popup library, no focus
+ * trap, and keyboard operation for free. */
+.ops-column-chooser {
+  position: relative;
+  font-size: 13px;
+}
+
+.ops-column-chooser-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  background: var(--surface, #1a1a1a);
+  color: var(--text, #eee);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.ops-column-chooser-summary::-webkit-details-marker {
+  display: none;
+}
+
+.ops-column-chooser-summary:focus-visible {
+  outline: 2px solid var(--accent, #6366f1);
+  outline-offset: 2px;
+}
+
+.ops-column-chooser-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ops-column-chooser-panel {
+  position: absolute;
+  right: 0;
+  z-index: 20;
+  min-width: 200px;
+  margin-top: 4px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  background: var(--surface, #1a1a1a);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.ops-column-chooser-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--text, #eee);
+}
+
+.ops-column-chooser-item:hover {
+  background: var(--surface-muted, #2a2a2a);
+}
+
+/* A locked column is the last thing keeping rows identifiable and actionable.
+ * It stays visible and readable — it is not an error, it is the floor. */
+.ops-column-chooser-item.is-locked {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+
+.ops-column-chooser-hint {
+  margin: 6px 0 0;
+  padding-top: 6px;
+  border-top: 1px solid var(--border, #333);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
 /* Sortable column header button — tri-state (none/asc/desc). */
 .ops-th-sort {
   display: inline-flex;

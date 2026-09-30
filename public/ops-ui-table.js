@@ -286,7 +286,8 @@ export function createOpsTableState(config) {
 
 // ─── Component factory ────────────────────────────────────────────────────────
 //
-// createOpsTable(config) -> { el, state, render, setStatus, setRows, destroy }
+// createOpsTable(config) -> { el, state, render, setStatus, setRows, setColumns,
+//                             destroy }
 //
 // config:
 //   columns:    [{ key, label, sortable?, sortKey?, align?, width?, render? }]
@@ -298,6 +299,12 @@ export function createOpsTableState(config) {
 //               Each table populates its own column-appropriate controls (status
 //               select, date-range, free-text). The primitive owns no filter
 //               semantics; it just mounts the control and forwards its value.
+//   toolbar:    optional () -> HTMLElement|null, mounted once into a dedicated
+//               `.ops-table-toolbar` strip between the filter bar and the table
+//               (issue #959). It is deliberately NOT a filter slot: a filter
+//               slot's value flows into state.setFilter(), which resets paging
+//               and travels to the backend. Toolbar controls are view-only
+//               (e.g. a column chooser) and must never touch the query.
 //   pagingMode: 'offset' | 'cursor'
 //   pageSize:   bounded, visible page size (default DEFAULT_PAGE_SIZE)
 //   rowKey:     (row) => string   — stable key for a row (defaults to row.id)
@@ -309,7 +316,10 @@ export function createOpsTableState(config) {
 // state.setPageInfo(). This keeps ALL table-specific logic out of the primitive.
 export function createOpsTable(config) {
   const cfg = config || {};
-  const columns = Array.isArray(cfg.columns) ? cfg.columns : [];
+  // Mutable so a consumer can change the VISIBLE column set at runtime via
+  // setColumns() (issue #959). Every render path reads this binding live, so
+  // header, body and the empty/loading/error colspan stay in step.
+  let columns = Array.isArray(cfg.columns) ? cfg.columns : [];
   const filters = Array.isArray(cfg.filters) ? cfg.filters : [];
   const rowKey = typeof cfg.rowKey === 'function' ? cfg.rowKey : function(r) { return r && r.id; };
   const emptyText = cfg.emptyText || 'No results.';
@@ -340,6 +350,14 @@ export function createOpsTable(config) {
   const filterBar = document.createElement('div');
   filterBar.className = 'ops-table-filters';
   el.appendChild(filterBar);
+
+  // View-only toolbar strip (issue #959) — column chooser and friends. Mounted
+  // once, like the filter bar, and hidden entirely when no toolbar is supplied
+  // so existing tables render byte-identically.
+  const toolbar = document.createElement('div');
+  toolbar.className = 'ops-table-toolbar';
+  toolbar.style.display = 'none';
+  el.appendChild(toolbar);
 
   const tableScroll = document.createElement('div');
   tableScroll.className = 'ops-table-scroll table-wrap';
@@ -430,6 +448,15 @@ export function createOpsTable(config) {
         filterBar.appendChild(slot);
       }
     });
+  }
+
+  // ── Toolbar (view-only controls; never touches filters/sort/paging) ──
+  function renderToolbar() {
+    if (typeof cfg.toolbar !== 'function') return;
+    const control = cfg.toolbar();
+    if (!(control instanceof Node)) return;
+    toolbar.appendChild(control);
+    toolbar.style.display = '';
   }
 
   // ── Body (shared loading / empty / error states) ──
@@ -546,6 +573,21 @@ export function createOpsTable(config) {
     renderPagination();
   }
 
+  // Swap the VISIBLE column set (issue #959). Purely presentational: it does not
+  // touch sort, filters, paging or the rows in hand — the same rows are simply
+  // re-projected through the new column list, so no refetch is implied and a
+  // sort on a now-hidden column stays exactly as the operator left it.
+  //
+  // The tbody is rebuilt, so a consumer that attaches row-level listeners after
+  // a render must re-attach them after calling this (the same contract as
+  // setRows()).
+  function setColumns(nextColumns) {
+    columns = Array.isArray(nextColumns) ? nextColumns : [];
+    renderHeader();
+    renderBody();
+    renderPagination();
+  }
+
   function setRows(nextRows) {
     rows = Array.isArray(nextRows) ? nextRows : [];
     status = rows.length ? 'ready' : 'empty';
@@ -557,8 +599,10 @@ export function createOpsTable(config) {
     if (el.parentNode) el.parentNode.removeChild(el);
   }
 
-  // Initial paint (filters mounted once; header/body/pagination reflect idle).
+  // Initial paint (filters + toolbar mounted once; header/body/pagination
+  // reflect idle).
   renderFilters();
+  renderToolbar();
   render();
 
   return {
@@ -567,6 +611,7 @@ export function createOpsTable(config) {
     render,
     setStatus,
     setRows,
+    setColumns,
     destroy,
     // Exposed for consumers/tests that want to read current view status.
     getStatus: function() { return status; },

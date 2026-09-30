@@ -414,3 +414,61 @@ describe('config surface', () => {
     expect(without.el.querySelector<HTMLElement>('.ops-table-caption')!.style.display).toBe('none');
   });
 });
+
+// ─── view-only toolbar + runtime column set (issue #959) ─────────────────────
+//
+// Both additions exist so a table can offer a column chooser without the choice
+// leaking into the query. The toolbar is deliberately NOT a filter slot (a
+// filter slot's value flows into state.setFilter(), which resets paging and
+// travels to the backend), and setColumns() deliberately touches nothing but the
+// projection of the rows already in hand.
+
+describe('toolbar slot', () => {
+  it('is absent by default, so existing tables render unchanged', () => {
+    const t = mount();
+    const toolbar = t.el.querySelector<HTMLElement>('.ops-table-toolbar')!;
+    expect(toolbar.children.length).toBe(0);
+    expect(toolbar.style.display).toBe('none');
+  });
+
+  it('mounts a supplied control once, above the table', () => {
+    const control = document.createElement('div');
+    control.className = 'my-control';
+    const factory = vi.fn(() => control);
+    const t = mount({ toolbar: factory });
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(t.el.querySelector('.ops-table-toolbar .my-control')).not.toBeNull();
+    expect(t.el.querySelector<HTMLElement>('.ops-table-toolbar')!.style.display).toBe('');
+    // The toolbar sits between the filter bar and the scroll region.
+    const kids = [...t.el.children].map((c) => c.className.split(' ')[0]);
+    expect(kids.indexOf('ops-table-toolbar')).toBeGreaterThan(kids.indexOf('ops-table-filters'));
+    expect(kids.indexOf('ops-table-toolbar')).toBeLessThan(kids.indexOf('ops-table-scroll'));
+  });
+});
+
+describe('setColumns — runtime column set', () => {
+  const ROWS = [{ id: 'r1', name: 'One', status: 'ready' }];
+
+  it('re-projects the rows in hand without touching sort, filters or paging', () => {
+    const t = mount();
+    t.state.toggleSort('id');
+    t.state.setFilter('status', 'ready');
+    t.state.setPageInfo({ total: 100 });
+    t.state.nextPage();
+    t.setRows(ROWS);
+    const before = t.state.getState();
+
+    t.setColumns(COLUMNS.filter((c) => c.key !== 'status'));
+
+    expect([...t.el.querySelectorAll('thead th')].length).toBe(2);
+    expect(t.el.querySelectorAll('tbody tr td').length).toBe(2);
+    expect(t.state.getState()).toEqual(before);
+  });
+
+  it('keeps the full-width message rows spanning the NEW column count', () => {
+    const t = mount();
+    t.setColumns(COLUMNS.slice(0, 2));
+    t.setStatus('error', 'nope');
+    expect(t.el.querySelector<HTMLTableCellElement>('tr.ops-table-error td')!.colSpan).toBe(2);
+  });
+});

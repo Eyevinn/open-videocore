@@ -34,6 +34,7 @@ import {
   normalizeTableState,
   applyTableState,
   readTableStateFromUrl,
+  hasTableParam,
 } from '../public/table-url-state.js';
 
 // ─── Schema constants ────────────────────────────────────────────────────────
@@ -49,6 +50,7 @@ describe('schema constants', () => {
       page: 'page',
       cursor: 'cursor',
       size: 'size',
+      cols: 'cols',
     });
   });
 
@@ -73,6 +75,9 @@ describe('decodeTableState — defaults & absent params', () => {
       page: 1,
       cursor: null,
       size: 20,
+      // Visible column set (issue #959). `null`, not `[]` — "the URL says
+      // nothing about columns" is a different fact from "show no columns".
+      cols: null,
     });
   });
 
@@ -249,6 +254,104 @@ describe('encodeTableState — writes only non-default keys', () => {
     );
     expect(qs).toContain('jobs.q=a+b%2Fc');
     expect(qs).toContain('jobs.status=queued%2Crunning');
+  });
+});
+
+// ─── cols: visible column set (issue #959) ───────────────────────────────────
+//
+// The column chooser stores its choice in the SAME namespaced contract as
+// sort/filter/paging, so a configured view is shareable by pasting one link.
+// Two properties make that work and are asserted here: (1) `null` means "the
+// URL says nothing", which is what lets a table fall back to an operator's
+// stored default; (2) the value is written only when it differs from the
+// table's declared default set, so a pristine view stays param-free.
+
+describe('cols — visible column set', () => {
+  it('parses a comma-separated column list, preserving order', () => {
+    expect(decodeTableState('assets.cols=id,title,actions', 'assets').cols).toEqual([
+      'id',
+      'title',
+      'actions',
+    ]);
+  });
+
+  it('de-dupes and trims, and ignores blank entries', () => {
+    expect(decodeTableState('assets.cols=id,%20title%20,id,,title', 'assets').cols).toEqual([
+      'id',
+      'title',
+    ]);
+  });
+
+  it('degrades a blank or all-empty list to the default rather than an empty set', () => {
+    // An empty column set is never a meaningful table, so it falls back — unlike
+    // `status`, where the empty array legitimately means "no status filter".
+    expect(decodeTableState('assets.cols=', 'assets').cols).toBeNull();
+    expect(decodeTableState('assets.cols=%20,%20', 'assets').cols).toBeNull();
+    expect(decodeTableState('assets.cols=,,', 'assets', { cols: ['id'] }).cols).toEqual(['id']);
+  });
+
+  it('accepts an array or a string as the per-table default', () => {
+    expect(decodeTableState('', 'assets', { cols: ['id', 'status'] }).cols).toEqual([
+      'id',
+      'status',
+    ]);
+    expect(decodeTableState('', 'assets', { cols: 'id,status' }).cols).toEqual(['id', 'status']);
+  });
+
+  it('writes cols only when it differs from the table default set', () => {
+    const defaults = { cols: ['thumb', 'id', 'title', 'actions'] };
+    expect(
+      encodeTableStateToQuery({ cols: ['thumb', 'id', 'title', 'actions'] }, 'assets', defaults),
+    ).toBe('');
+    expect(encodeTableStateToQuery({ cols: ['id', 'title'] }, 'assets', defaults)).toBe(
+      'assets.cols=id%2Ctitle',
+    );
+  });
+
+  it('keeps sibling tables independent', () => {
+    const qs = encodeTableState({ cols: ['id'] }, 'assets', undefined, new URLSearchParams('jobs.cols=name'));
+    expect(qs.get('assets.cols')).toBe('id');
+    expect(qs.get('jobs.cols')).toBe('name');
+  });
+
+  it('round-trips a reduced set through encode -> decode', () => {
+    const qs = encodeTableStateToQuery({ cols: ['id', 'status', 'actions'] }, 'assets');
+    expect(decodeTableState(qs, 'assets').cols).toEqual(['id', 'status', 'actions']);
+  });
+
+  it('normalizeTableState applies the same coercion in memory', () => {
+    expect(normalizeTableState({ cols: 'id, title ,id' }).cols).toEqual(['id', 'title']);
+    expect(normalizeTableState({ cols: 42 as unknown as string[] }).cols).toBeNull();
+  });
+});
+
+describe('hasTableParam — presence, not value', () => {
+  it('distinguishes an absent param from one whose value equals the default', () => {
+    expect(hasTableParam('', 'assets', PARAM_KEYS.cols)).toBe(false);
+    expect(hasTableParam('assets.cols=id,title', 'assets', PARAM_KEYS.cols)).toBe(true);
+    // This is the whole point: decode collapses these two into the same value,
+    // so a table with a localStorage fallback cannot use decode alone to decide
+    // which source wins.
+    const defaults = { cols: ['id', 'title'] };
+    expect(decodeTableState('', 'assets', defaults).cols).toEqual(
+      decodeTableState('assets.cols=id,title', 'assets', defaults).cols,
+    );
+  });
+
+  it('treats a blank value as absent', () => {
+    expect(hasTableParam('assets.cols=', 'assets', PARAM_KEYS.cols)).toBe(false);
+    expect(hasTableParam('assets.cols=%20', 'assets', PARAM_KEYS.cols)).toBe(false);
+  });
+
+  it('is namespaced like every other key', () => {
+    expect(hasTableParam('jobs.cols=id', 'assets', PARAM_KEYS.cols)).toBe(false);
+    expect(hasTableParam('jobs.cols=id', 'jobs', PARAM_KEYS.cols)).toBe(true);
+  });
+
+  it('accepts a URL, a query string, params, or nothing, without throwing', () => {
+    expect(hasTableParam('https://ops.example.com/t?assets.page=2', 'assets', PARAM_KEYS.page)).toBe(true);
+    expect(hasTableParam(new URLSearchParams('assets.page=2'), 'assets', PARAM_KEYS.page)).toBe(true);
+    expect(hasTableParam(null, 'assets', PARAM_KEYS.page)).toBe(false);
   });
 });
 

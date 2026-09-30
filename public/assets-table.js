@@ -106,8 +106,19 @@ import {
 import {
   decodeTableState,
   applyTableState,
+  hasTableParam,
+  PARAM_KEYS,
   SORT_DIR,
 } from './table-url-state.js';
+// Column visibility chooser (issue #959). The control, the anchor invariant and
+// the per-operator stored default all live in one table-agnostic module so a
+// second table can adopt them without a second implementation.
+import {
+  createColumnChooser,
+  resolveVisibleColumns,
+  readStoredColumns,
+  writeStoredColumns,
+} from './column-chooser.js';
 // Presigned thumbnail loading (issue #801). The thumbnail cell is rendered
 // src-less and filled in after each render — see hydrateThumbnails() below and
 // the contract grounding in public/thumbnail-url.js.
@@ -146,11 +157,48 @@ const SORT_KEY_CREATED = 'created';
 const SORT_KEY_STATUS = 'status';
 const SORT_KEY_TITLE = 'title';
 
+// ─── Column visibility (issue #959) ──────────────────────────────────────────
+//
+// Every column this table defines, in render order. This is the single source
+// of truth for the chooser, the URL `cols` value and the stored default; the
+// column definitions in buildColumns() are keyed to match and the two are
+// asserted equal in the tests so they cannot drift.
+//
+// NB the issue's scope line names a "size" column: this table has never had one
+// (no byte-size field is projected on either tier), so the chooser offers the
+// columns that actually exist — thumbnail, ID, slug, title, status, tags,
+// created and actions.
+export const ASSETS_COLUMN_KEYS = Object.freeze([
+  'thumb',
+  'id',
+  'slug',
+  'title',
+  'status',
+  'tags',
+  'created',
+  'actions',
+]);
+
+// The default view is every column — i.e. exactly the table that shipped before
+// this feature, so an operator who never opens the chooser sees no change.
+export const ASSETS_DEFAULT_COLUMN_KEYS = ASSETS_COLUMN_KEYS;
+
+// The invariant group: a row must stay identifiable (ID, slug or title) AND
+// actionable (actions). At least one of these four must remain visible, which
+// is precisely the acceptance criterion "actions + last identifying column
+// cannot both be hidden". Enforced in the chooser by locking the last one
+// standing (see public/column-chooser.js), so the invalid state is unreachable
+// rather than merely rejected.
+export const ASSETS_ANCHOR_COLUMN_KEYS = Object.freeze(['id', 'slug', 'title', 'actions']);
+
 // Per-table URL-state defaults. Natural order is created DESC (newest first) —
 // the most useful default for operators — expressed against the shared contract.
+// `cols` defaults to the full set so the pristine view stays param-free and a
+// link only carries `assets.cols` when there is a real choice to carry.
 const URL_DEFAULTS = Object.freeze({
   sort: { field: SORT_KEY_CREATED, dir: SORT_DIR.desc },
   size: ASSETS_PAGE_SIZE,
+  cols: ASSETS_DEFAULT_COLUMN_KEYS,
 });
 
 // ─── Small mappers between the URL contract and the primitive's state ─────────
@@ -381,6 +429,9 @@ function buildColumns(renderCtx) {
     {
       key: 'thumb',
       label: '',
+      // The header is deliberately blank, so the column chooser needs its own
+      // name for the checkbox (issue #959) — an unlabelled toggle is unusable.
+      chooserLabel: 'Thumbnail',
       width: '52px',
       // Rendered WITHOUT a src (issue #801): pointing an <img> at the API's
       // thumbnail byte route can never work, because the browser's <img> GET
@@ -566,10 +617,19 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //                                         guaranteed refusal pre-flight.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
 //   win (optional)                      — injectable window for URL sync (tests).
+//   storage (optional)                  — injectable Storage for the stored
+//                                         column default (tests); defaults to
+//                                         localStorage when available.
 //
 // The table reads its initial sort/filter/page from the URL (shared contract),
 // renders the shared primitive, fetches the correct tier on every state change,
 // and writes state back to the URL so the view is shareable/refreshable.
+//
+// Column visibility (issue #959) rides the SAME contract: `assets.cols` when the
+// URL carries it, otherwise the operator's stored default, otherwise every
+// column. It is presentation state only — it never enters a request, never
+// touches sort/filter/paging, and changing it re-projects the rows already in
+// hand instead of triggering a refetch.
 export function createAssetsTable(deps) {
   const d = deps || {};
   const win = 'win' in d ? d.win : typeof window !== 'undefined' ? window : undefined;
@@ -600,6 +660,31 @@ export function createAssetsTable(deps) {
     projection,
   });
 
+  // 2b) Resolve the visible column set (issue #959). Precedence is URL first,
+  //     then the operator's stored default, then every column — so a shared link
+  //     always reproduces the sender's view, while an operator who opens the app
+  //     cold gets their own last choice back. hasTableParam() is what separates
+  //     "the URL says nothing" from "the URL says the default set", which
+  //     decodeTableState alone collapses into the same value.
+  const urlCols = hasTableParam(search, ASSETS_NS, PARAM_KEYS.cols) ? urlState.cols : null;
+  let visibleKeys = resolveVisibleColumns({
+    urlCols,
+    storedCols: readStoredColumns(ASSETS_NS, d.storage),
+    allKeys: ASSETS_COLUMN_KEYS,
+    defaultKeys: ASSETS_DEFAULT_COLUMN_KEYS,
+    anchorKeys: ASSETS_ANCHOR_COLUMN_KEYS,
+  });
+
+  // Project the full column list down to the visible set, in table order. Sort
+  // keys travel with the definitions, so hiding a column never disturbs the sort
+  // the state hook is holding — including a sort on a column that is currently
+  // hidden, which stays active and stays in the URL, ready to reappear with the
+  // column (acceptance criterion: no coupling between visible columns and
+  // sort/query logic).
+  function visibleColumns() {
+    return columns.filter((c) => visibleKeys.includes(c.key));
+  }
+
   const filters = [
     { name: 'status', control: asSlot(statusFilterControl(initialFilters.status)) },
     { name: 'from', control: asSlot(dateFilterControl('from', 'Created from', initialFilters.from)) },
@@ -607,10 +692,26 @@ export function createAssetsTable(deps) {
     { name: 'q', control: asSlot(textFilterControl('q', 'Search', 'Full-text search…', initialFilters.q)) },
   ];
 
+  // The chooser lives in the primitive's view-only toolbar strip, NOT in the
+  // filter bar: a filter slot's value flows into state.setFilter(), which resets
+  // paging and travels to the backend, and column visibility must do neither.
+  const chooser = createColumnChooser({
+    columns,
+    visible: visibleKeys,
+    anchorKeys: ASSETS_ANCHOR_COLUMN_KEYS,
+    label: 'Columns',
+    lockedHint:
+      'Keep at least one of ID, Slug, Name / Title or Actions visible so every row stays identifiable and actionable.',
+    onChange: function (keys) {
+      setVisibleColumns(keys);
+    },
+  });
+
   const table = createOpsTable({
     caption: '',
-    columns,
+    columns: visibleColumns(),
     filters,
+    toolbar: () => chooser.el,
     pagingMode: PAGING_OFFSET,
     pageSize: urlState.size || ASSETS_PAGE_SIZE,
     initialSort: urlSortToInitialSort(urlState.sort),
@@ -627,14 +728,13 @@ export function createAssetsTable(deps) {
   // URL — but the flag keeps intent explicit and future-proofs re-entrancy).
   let loading = false;
 
-  async function reload() {
-    if (loading) return;
-    loading = true;
+  // 3) Mirror the current view state into the URL (shared contract) so a
+  //    refresh/share reproduces it. Replace (not push) — control changes already
+  //    re-render; we do not want a history entry per keystroke. Extracted from
+  //    reload() because a column change must update the URL WITHOUT refetching
+  //    (issue #959): the rows in hand are unaffected by which columns show.
+  function syncUrl() {
     const snap = table.state.getState();
-
-    // 3) Mirror the current interaction state into the URL (shared contract) so a
-    //    refresh/share reproduces the view. Replace (not push) — control changes
-    //    already re-render; we do not want a history entry per keystroke.
     const page = Math.floor((snap.offset || 0) / snap.pageSize) + 1;
     applyTableState(
       {
@@ -645,10 +745,40 @@ export function createAssetsTable(deps) {
         to: snap.filters.to || null,
         page,
         size: snap.pageSize,
+        cols: visibleKeys,
       },
       ASSETS_NS,
       { defaults: URL_DEFAULTS, replace: true, win }
     );
+  }
+
+  // Apply a new visible column set: persist it to BOTH sources (URL for sharing,
+  // localStorage for this operator's next cold start), then re-project the rows
+  // already in hand. No fetch, no paging reset, no sort change — the acceptance
+  // criterion that sort/filter/pagination keep working against a reduced column
+  // set holds because none of them can observe this call.
+  function setVisibleColumns(keys) {
+    visibleKeys = resolveVisibleColumns({
+      urlCols: keys,
+      allKeys: ASSETS_COLUMN_KEYS,
+      defaultKeys: ASSETS_DEFAULT_COLUMN_KEYS,
+      anchorKeys: ASSETS_ANCHOR_COLUMN_KEYS,
+    });
+    writeStoredColumns(ASSETS_NS, visibleKeys, d.storage);
+    syncUrl();
+    chooser.setVisible(visibleKeys);
+    table.setColumns(visibleColumns());
+    // setColumns() rebuilds the tbody, so the row-level listeners (and the
+    // thumbnail hydration) have to be re-attached — same contract as setRows().
+    wireRowHandlers();
+  }
+
+  async function reload() {
+    if (loading) return;
+    loading = true;
+    const snap = table.state.getState();
+
+    syncUrl();
 
     table.setStatus('loading');
     try {
@@ -744,6 +874,10 @@ export function createAssetsTable(deps) {
     el: table.el,
     reload,
     destroy: table.destroy,
+    // Column visibility (issue #959), exposed so a consumer can drive or read
+    // the chooser without reaching into the DOM.
+    getVisibleColumns: () => visibleKeys.slice(),
+    setVisibleColumns,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
     _table: table,

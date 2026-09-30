@@ -39,6 +39,15 @@
  *   cursor opaque cursor token (cursor-style paging). Mutually informative with
  *          `page`; a table uses whichever it declares in defaults.
  *   size   page size (rows per page).
+ *   cols   VISIBLE column set, as an ordered comma-separated list of column
+ *          keys. e.g. `assets.cols=id,title,status,actions` (issue #959).
+ *          `null` (the baseline default) means "not specified in the URL" —
+ *          which is NOT the same as the empty set. A table that offers a column
+ *          chooser reads this as: URL wins when present, otherwise fall back to
+ *          whatever per-operator default it stores locally. Keeping `cols` in
+ *          the SAME namespaced contract as sort/filter/paging is what makes a
+ *          configured view shareable by pasting one link; column visibility is
+ *          presentation state, so it never reaches a query.
  */
 
 // ─── Schema constants ────────────────────────────────────────────────────────
@@ -57,6 +66,7 @@ const PARAM_KEYS = Object.freeze({
   page: 'page',
   cursor: 'cursor',
   size: 'size',
+  cols: 'cols',
 });
 
 const SORT_DIR = Object.freeze({ asc: 'asc', desc: 'desc' });
@@ -75,6 +85,7 @@ const BASE_DEFAULTS = Object.freeze({
   page: 1, // 1-based
   cursor: null, // string | null
   size: 20, // rows per page
+  cols: null, // string[] | null — null = "no column set in the URL" (≠ empty set)
 });
 
 // Guardrails so a hostile/garbled URL can never blow up a table.
@@ -107,6 +118,7 @@ function resolveDefaults(defaults) {
     page: clampInt(d.page, BASE_DEFAULTS.page, PAGE_MIN, PAGE_MAX),
     cursor: typeof d.cursor === 'string' && d.cursor.length > 0 ? d.cursor : BASE_DEFAULTS.cursor,
     size: clampInt(d.size, BASE_DEFAULTS.size, SIZE_MIN, SIZE_MAX),
+    cols: normalizeColsValue('cols' in d ? d.cols : BASE_DEFAULTS.cols),
   };
 }
 
@@ -180,6 +192,36 @@ function normalizeStatusValue(v) {
     out.push(t);
   }
   return out;
+}
+
+/**
+ * Normalize a visible-column set into an ordered, de-duped string[], or null.
+ *
+ * Deliberately different from normalizeStatusValue: a status filter's "no
+ * filter" IS the empty array, whereas an EMPTY column set is never meaningful
+ * (a table with no columns) — so anything that normalizes to nothing degrades
+ * to null, i.e. "unspecified, use the table's own default". Order is preserved
+ * because it is the operator's column order.
+ */
+function normalizeColsValue(v) {
+  let parts;
+  if (Array.isArray(v)) {
+    parts = v;
+  } else if (typeof v === 'string') {
+    parts = v.split(',');
+  } else {
+    return null;
+  }
+  const out = [];
+  const seen = new Set();
+  for (const p of parts) {
+    if (typeof p !== 'string') continue;
+    const t = p.trim();
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out.length ? out : null;
 }
 
 /**
@@ -291,7 +333,29 @@ function decodeTableState(input, ns, defaults) {
   const sizeRaw = readParam(params, ns, PARAM_KEYS.size);
   const size = sizeRaw != null ? clampInt(sizeRaw, def.size, SIZE_MIN, SIZE_MAX) : def.size;
 
-  return { sort, status, q, from, to, page, cursor, size };
+  // visible column set (issue #959)
+  const colsRaw = readParam(params, ns, PARAM_KEYS.cols);
+  const cols = colsRaw != null ? (normalizeColsValue(colsRaw) ?? def.cols) : def.cols;
+
+  return { sort, status, q, from, to, page, cursor, size, cols };
+}
+
+/**
+ * Is a given namespaced key actually PRESENT (and non-blank) in the URL?
+ *
+ * decodeTableState deliberately collapses "absent" and "present but equal to
+ * the default" into the same decoded value, which is the right behaviour for
+ * every param that has a single source of truth. A column chooser has two
+ * (the URL, then a per-operator stored default), so it needs to tell the two
+ * apart before deciding which one wins. Pure; never throws.
+ *
+ * @param {string|URLSearchParams|null} input
+ * @param {string} ns
+ * @param {string} key  one of PARAM_KEYS
+ * @returns {boolean}
+ */
+function hasTableParam(input, ns, key) {
+  return readParam(toSearchParams(input), ns, key) != null;
 }
 
 // ─── Core: encode (state -> URL params) ──────────────────────────────────────
@@ -361,6 +425,12 @@ function encodeTableState(state, ns, defaults, into) {
   if (s.size !== def.size) {
     set(PARAM_KEYS.size, String(s.size));
   }
+  // Visible column set (issue #959). Written only when it differs from the
+  // table's declared default set, so the pristine view stays param-free and a
+  // shared link carries the column choice exactly when there is one to carry.
+  if (!shallowEqualStringArray(s.cols, def.cols) && s.cols && s.cols.length) {
+    set(PARAM_KEYS.cols, s.cols.join(','));
+  }
 
   return params;
 }
@@ -386,6 +456,7 @@ function normalizeState(state, def) {
           : null
         : def.cursor,
     size: 'size' in st ? clampInt(st.size, def.size, SIZE_MIN, SIZE_MAX) : def.size,
+    cols: 'cols' in st ? normalizeColsValue(st.cols) : def.cols,
   };
 }
 
@@ -482,4 +553,5 @@ export {
   normalizeTableState,
   applyTableState,
   readTableStateFromUrl,
+  hasTableParam,
 };
