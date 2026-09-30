@@ -40,6 +40,7 @@ import type { JobRepository } from '../data/job-repo.js';
 import type { PipelineRepository } from '../data/pipeline-repo.js';
 import type { StorageBackendConfig } from '../services/param-store.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
+import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
 import {
   completePackageJob,
   failPackageJob,
@@ -249,6 +250,12 @@ export type PackagingDeps = {
   // is logged, never propagated — packaging never becomes newly failable.
   audit?: AuditEmitter;
   auditLog?: AuditErrorLog;
+  // Best-effort operational log emission (issue #995). Optional exactly like
+  // `audit` above: when absent no log record is appended and behaviour is
+  // unchanged. Wired to the in-memory LogStore that backs GET /api/v1/logs
+  // (src/main.ts, `logStore`), so the `package` stage of a run is visible in the
+  // Logs tab.
+  pipelineLog?: PipelineLogSink;
 };
 
 // The base the packaging pipeline WRITES manifest URLs against. Stays
@@ -521,6 +528,19 @@ export class PackagingService implements PackagingTrigger {
         },
         this.deps.auditLog
       );
+      // Operational log: the `package` stage started (issue #995). Emitted at the
+      // SAME point as the audit entry — a successful enqueue — so the Logs tab
+      // shows the stage beginning, and the failure branch below reports the
+      // enqueue that never happened instead.
+      logPipelineEvent(
+        this.deps.pipelineLog,
+        {
+          stage: 'package',
+          level: 'info',
+          message: `enqueued job ${packageJobId ?? assetId} for asset ${assetId}`
+        },
+        this.deps.auditLog
+      );
     } catch (err) {
       this.deps.onError?.(err);
       const message = err instanceof Error ? err.message : String(err);
@@ -529,6 +549,19 @@ export class PackagingService implements PackagingTrigger {
       // job: fail it here with the same reason written onto the asset, so the
       // failure is readable from GET /api/v1/jobs (issue #976).
       await failPackageJob(this.packageJobDeps(), { jobId: packageJobId, assetId }, reason);
+      // Operational log: the enqueue failed, so no packager callback can ever
+      // settle this job (issue #995). There is no audit entry here (a failed
+      // submission is not a submission), but it is exactly the event an operator
+      // opens the Logs tab for.
+      logPipelineEvent(
+        this.deps.pipelineLog,
+        {
+          stage: 'package',
+          level: 'error',
+          message: `asset ${assetId}: ${reason}`
+        },
+        this.deps.auditLog
+      );
       try {
         await this.deps.assets.update(assetId, {
           packagingError: reason
@@ -595,6 +628,18 @@ export class PackagingService implements PackagingTrigger {
       },
       this.deps.auditLog
     );
+    // Operational log: the `package` stage reached terminal success (issue #995).
+    // Same guard as the audit entry — a callback for an unknown asset returned
+    // false above and records nothing.
+    logPipelineEvent(
+      this.deps.pipelineLog,
+      {
+        stage: 'package',
+        level: 'info',
+        message: `job ${packageJobId ?? assetId} for asset ${assetId} completed; HLS and DASH manifests published`
+      },
+      this.deps.auditLog
+    );
     return true;
   }
 
@@ -618,6 +663,16 @@ export class PackagingService implements PackagingTrigger {
         // Same target as the submission entry (see handleSuccess).
         targetId: packageJobId ?? assetId,
         detail: { jobType: 'package', assetId, error: message }
+      },
+      this.deps.auditLog
+    );
+    // Operational log: the `package` stage reached terminal failure (issue #995).
+    logPipelineEvent(
+      this.deps.pipelineLog,
+      {
+        stage: 'package',
+        level: 'error',
+        message: `job ${packageJobId ?? assetId} for asset ${assetId} failed: ${message}`
       },
       this.deps.auditLog
     );
