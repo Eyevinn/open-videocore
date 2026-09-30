@@ -473,6 +473,39 @@ tr.row-locked td:first-child {
   flex-wrap: wrap;
 }
 
+/* Read-only tracks panel (issue #902). Sub-group headings sit a step below
+   .section-title so "Editorial tracks" / "Source streams" read as parts of the
+   Audio section rather than as sections of their own. */
+.tracks-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 12px 0 6px;
+}
+
+.tracks-note,
+.tracks-none,
+.tracks-unavailable {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+/* An empty sub-group inside a section that has content elsewhere. Indented so it
+   reads as the body of the group heading above it. */
+.tracks-none {
+  padding-left: 2px;
+}
+
+.tracks-unavailable {
+  color: var(--text);
+}
+
+/* Inside the centred .empty box the detail line is secondary to the headline. */
+.empty .tracks-note {
+  margin-top: 4px;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
