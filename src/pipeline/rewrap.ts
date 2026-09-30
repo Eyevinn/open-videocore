@@ -99,12 +99,13 @@ export type RewrapDeps = {
 // Flow: create the child asset (parentId = source) -> advance to `processing`
 // -> mint a presigned source GET URL -> dispatch the ffmpeg `-c copy` job
 // (writing natively to s3://bucket/outputKey) -> VERIFY the output object
-// actually exists in storage -> only then advance the child to `ready` with its
-// objectKey set.
+// actually exists in storage and is non-empty -> only then advance the child to
+// `ready` with its objectKey set.
 //
 // On a runner failure — OR when the runner resolves but the output object is
-// absent (issue #316: ffmpeg-s3 reports a terminal "success" status even when it
-// could not write the output, e.g. a misconfigured destination) — the child
+// absent or zero-length (issue #316 / #944: ffmpeg-s3 reports a terminal
+// "success" status even when it could not write the output, e.g. a misconfigured
+// destination) — the child
 // asset is marked `failed` (so the broken export is observable and never exposes
 // a `/files` URL for a nonexistent object) and the error is re-thrown for the
 // route to map to a 502. The source asset is never mutated — an export is a pure
@@ -158,13 +159,26 @@ export async function rewrap(params: RewrapParams, deps: RewrapDeps): Promise<As
 
     // Defense in depth (issue #316). The runner can resolve "successfully" even
     // when ffmpeg wrote no output (ffmpeg-s3 reaches a terminal status the poller
-    // does not treat as a failure). Confirm the object actually exists before
-    // flipping the child to `ready`; otherwise we would expose a `/files` URL for
-    // an object that MinIO answers with NoSuchKey.
+    // does not treat as a failure). Confirm the object actually exists AND
+    // carries bytes before flipping the child to `ready`; otherwise we would
+    // expose a `/files` URL for an object that MinIO answers with NoSuchKey, or
+    // hand back a `ready` asset whose download is a zero-byte file.
+    //
+    // The 0-byte arm is issue #944: existence alone was checked here, while the
+    // equivalent check in clip.ts (added for #786) also rejects an empty object.
+    // ffmpeg creates its output target before it writes any packets, so a muxer
+    // that fails after opening the destination leaves exactly that — an object
+    // that exists and contains nothing. `statObject` returns the size, so the
+    // stronger check is free.
     const stat = await deps.storage.statObject(outputKey);
     if (!stat) {
       throw new Error(
         `rewrap output object "${outputKey}" not found in storage after the job reported success`
+      );
+    }
+    if (stat.size <= 0) {
+      throw new Error(
+        `rewrap output object "${outputKey}" is empty (0 bytes) after the job reported success`
       );
     }
   } catch (err) {

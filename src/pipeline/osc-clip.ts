@@ -37,7 +37,14 @@ import {
 } from '@osaas/client-core';
 import { FFPROBE_SERVICE_ID } from '../services/stack.js';
 import { pollOscJobUntilDone } from './osc-job-poll.js';
+import { captureJobLogs, OscJobError, oscJobLog, redactLogQueryStrings } from './osc-job-log.js';
 import type { ClipRunner } from './clip.js';
+
+// Re-exported so existing importers (and test/clip.test.ts) keep their clip-named
+// entry points. The implementations are shared with export / re-wrap — see
+// osc-job-log.ts (issue #944).
+export { redactLogQueryStrings };
+export { oscJobLog as oscClipJobLog };
 
 // Subset of the OSC SDK surface this runner needs. Declared structurally so the
 // real SDK functions satisfy it and tests can pass lightweight fakes (mirrors
@@ -75,48 +82,18 @@ export type OscJobApi = {
 // a future terminal value added to the poller cannot become a silent success.
 const SUCCESS_STATUSES = new Set(['SuccessCriteriaMet', 'Complete']);
 
-// Cap on how much ffmpeg log text is attached to a failure message, so a
-// runaway log cannot blow up an error string / response body.
-const MAX_LOG_CHARS = 4_000;
-
-// ffmpeg echoes its `-i` argument verbatim into stderr, and that argument is a
-// presigned MinIO GET URL whose query string carries a live SigV4 signature
-// (`X-Amz-Signature`, TTL per clip.ts:clipUrlTtlSeconds). The captured log ends
-// up in the server log, so every query string is stripped before the log leaves
-// this module — a live signature does not belong in a log file either. Path and
-// status text — the parts that explain the failure — are preserved. This is
-// defence in depth, not the primary control: the log is never returned to the
-// caller (see OscClipJobError).
-export function redactLogQueryStrings(text: string): string {
-  return text.replace(/\?[^"\s]+/g, '?<redacted>');
-}
-
 // Error thrown when the ffmpeg job does not end in a known-good state.
 //
 // The captured ffmpeg log is carried as a PROPERTY (and as `cause`), never
-// concatenated into `message` (issue #786 round-2 review). `message` is what
-// routes/assets.ts sends back in the 502 body, and the log is output from a
-// service we do not control: it can carry storage endpoint hostnames, bucket
-// names, container paths, and anything else that service chooses to print.
-// redactLogQueryStrings is a deny-list — it strips query strings and nothing
-// else — so it cannot be relied on to sanitise a form we have not anticipated.
-// Operators read the full text from the server log (routes/assets.ts logs
-// `oscJobLog` on the warn line); callers get only the status-bearing sentence.
-export class OscClipJobError extends Error {
-  readonly jobLog: string;
+// concatenated into `message` (issue #786 round-2 review) — see
+// osc-job-log.ts:OscJobError for why. `message` is what routes/assets.ts sends
+// back in the 502 body; operators read the full text from the server log
+// (routes/assets.ts logs `oscJobLog` on the warn line).
+export class OscClipJobError extends OscJobError {
   constructor(message: string, jobLog: string) {
-    super(message, jobLog ? { cause: jobLog } : undefined);
+    super(message, jobLog);
     this.name = 'OscClipJobError';
-    this.jobLog = jobLog;
   }
-}
-
-// Pull the captured ffmpeg log off an error for server-side logging, without
-// assuming the error is an OscClipJobError (the orchestrator rethrows whatever
-// the runner threw, and its own verification errors carry no log).
-export function oscClipJobLog(err: unknown): string | undefined {
-  const log = (err as { jobLog?: unknown } | null | undefined)?.jobLog;
-  return typeof log === 'string' && log.length > 0 ? log : undefined;
 }
 
 // Build the destination URI the ffmpeg job writes to. Mirrors the
@@ -145,25 +122,6 @@ function clipJobName(): string {
   const rand = Math.random().toString(36).slice(2, 8);
   const ts = Date.now().toString(36).slice(-6);
   return `clip${ts}${rand}`.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
-}
-
-// Best-effort capture of the job's ffmpeg output BEFORE the instance is removed
-// (issue #786: the runner held getLogsForInstance but never called it, so the
-// one artefact that explains an ffmpeg failure was discarded when the job was
-// reaped). Never throws — a failed log fetch must not mask the real failure.
-// getLogsForInstance returns `string | string[]`
-// (@osaas/client-core/lib/core.d.ts:85), so both shapes are normalised here.
-// Query strings are redacted before the text is returned — see
-// redactLogQueryStrings.
-async function captureJobLogs(api: OscJobApi, name: string, sat: string): Promise<string> {
-  try {
-    const log = await api.getLogsForInstance(api.context, FFPROBE_SERVICE_ID, name, sat);
-    const text = Array.isArray(log) ? log.join('\n') : String(log ?? '');
-    const trimmed = redactLogQueryStrings(text).trim();
-    return trimmed.length > MAX_LOG_CHARS ? trimmed.slice(-MAX_LOG_CHARS) : trimmed;
-  } catch {
-    return '';
-  }
 }
 
 // Construct the production ClipRunner. Each invocation creates one ephemeral
@@ -213,7 +171,7 @@ export function makeOscClipRunner(api: OscJobApi): ClipRunner {
       failure = `OSC clip job "${name}" did not complete: ${err instanceof Error ? err.message : String(err)}`;
     }
 
-    const logs = failure ? await captureJobLogs(api, name, sat) : '';
+    const logs = failure ? await captureJobLogs(api, FFPROBE_SERVICE_ID, name, sat) : '';
 
     try {
       await api.removeJob(api.context, FFPROBE_SERVICE_ID, name, sat);
