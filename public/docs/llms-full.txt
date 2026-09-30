@@ -2317,7 +2317,9 @@ Response 200 (application/json)
   "totalBytes": 0,
   "error": "string"
 }
-Field notes- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
+Field notes- packagingId — Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of `encoreJobId`.
+- outputPrefix — Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH objects under.
+- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
 - interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
 
   DELETE /api/v1/jobs/{id}
@@ -2344,7 +2346,9 @@ Response 200 (application/json)
   "totalBytes": 0,
   "error": "string"
 }
-Field notes- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
+Field notes- packagingId — Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of `encoreJobId`.
+- outputPrefix — Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH objects under.
+- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
 - interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
 
 ---

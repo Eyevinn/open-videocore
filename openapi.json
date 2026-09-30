@@ -15322,7 +15322,8 @@
                             "type": "string",
                             "enum": [
                               "ingest-url",
-                              "transcode"
+                              "transcode",
+                              "package"
                             ]
                           },
                           "status": {
@@ -15374,6 +15375,14 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "packagingId": {
+                            "type": "string",
+                            "description": "Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of `encoreJobId`."
+                          },
+                          "outputPrefix": {
+                            "type": "string",
+                            "description": "Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH objects under."
                           },
                           "encodeAttempts": {
                             "type": "number"
@@ -15484,7 +15493,8 @@
                       "type": "string",
                       "enum": [
                         "ingest-url",
-                        "transcode"
+                        "transcode",
+                        "package"
                       ]
                     },
                     "status": {
@@ -15536,6 +15546,14 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "packagingId": {
+                      "type": "string",
+                      "description": "Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of `encoreJobId`."
+                    },
+                    "outputPrefix": {
+                      "type": "string",
+                      "description": "Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH objects under."
                     },
                     "encodeAttempts": {
                       "type": "number"
@@ -15656,7 +15674,8 @@
                       "type": "string",
                       "enum": [
                         "ingest-url",
-                        "transcode"
+                        "transcode",
+                        "package"
                       ]
                     },
                     "status": {
@@ -15708,6 +15727,14 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "packagingId": {
+                      "type": "string",
+                      "description": "Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of `encoreJobId`."
+                    },
+                    "outputPrefix": {
+                      "type": "string",
+                      "description": "Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH objects under."
                     },
                     "encodeAttempts": {
                       "type": "number"
