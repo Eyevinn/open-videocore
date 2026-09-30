@@ -44,6 +44,10 @@ import { completeTranscode, type CallbackRendition } from '../pipeline/transcode
 // — the two paths that can apply a transcode completion — emit identical
 // payloads from one place.
 import { dispatchTranscodeCompletionEvents } from '../pipeline/transcode-completion-events.js';
+// Package-step Job records (issue #976). The packager's failure callback is the
+// live failure path — it carries no jobId, so it settles the job the same way it
+// settles the execution: by correlating on a running `package` step.
+import { failPackageJob } from '../pipeline/package-job.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
@@ -416,12 +420,16 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
               (s) => s.name === 'package' && s.status === 'running'
             );
             if (!hasRunningPackage) continue;
+            const reason = `packager failure: ${message}`;
+            const runningPackageStep = execution.steps.find(
+              (s) => s.name === 'package' && s.status === 'running'
+            );
             const steps = execution.steps.map((s) =>
               s.name === 'package' && s.status === 'running'
                 ? {
                     ...s,
                     status: 'failed' as const,
-                    error: `packager failure: ${message}`,
+                    error: reason,
                     completedAt: now
                   }
                 : s
@@ -430,6 +438,17 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
               steps,
               status: 'failed'
             });
+            // Settle this execution's `package` Job with the same reason (issue
+            // #976). The packager's failure callback carries no jobId of ours,
+            // so the job is resolved exactly the way the execution is: by the
+            // step's own jobId (stamped at enqueue), falling back to the
+            // asset's in-flight package job. Best-effort — never throws, so
+            // attribution stays as resilient as it was.
+            await failPackageJob(
+              { jobs: opts.jobRepository, pipeline: opts.pipelineRepository, logger: fastify.log },
+              { jobId: runningPackageStep?.jobId, assetId: execution.assetId },
+              reason
+            );
             if (opts.webhookDispatcher) {
               void opts.webhookDispatcher.dispatch({
                 type: 'package.failed',
@@ -562,7 +581,13 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
               if (encoreJobUrl) {
                 steps[nextIdx] = { ...steps[nextIdx], status: 'running', startedAt: now };
                 await opts.pipelineRepository.update(execution.id, { steps, status: 'running' });
-                void opts.packaging.triggerPackaging(found.job.assetId, encoreJobUrl);
+                // Awaited (was fire-and-forget) so the `package` Job record and
+                // its `steps[].jobId` stamp (issue #976) exist before the
+                // packager — which consumes the queue entry this call writes —
+                // can post its completion callback back at us. triggerPackaging
+                // still never throws: an enqueue failure records the reason on
+                // the asset and on the package job.
+                await opts.packaging.triggerPackaging(found.job.assetId, encoreJobUrl);
                 // #525 pt.2: packaging is genuinely in flight — leave the pin
                 // in place until the packager's success callback releases it.
                 packagingHandedOff = true;

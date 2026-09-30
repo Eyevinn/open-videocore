@@ -18,6 +18,13 @@
 //      completion. On success it writes `manifestUrls` (HLS + DASH) onto the
 //      asset; on failure it records `packagingError`. Packaging NEVER changes
 //      the asset's lifecycle status — it only annotates the record.
+//   3. Both of the above keep an observable `package` Job in step (issue #976):
+//      created at enqueue time and settled from the completion callbacks, so the
+//      step that produces the customer-facing output is listed by
+//      GET /api/v1/jobs like every other step. The lifecycle lives in
+//      src/pipeline/package-job.ts, shared with the OSC-native handoff in
+//      encore-callback-poller.ts, the packager failure callback, and #336's
+//      stalled-package sweep.
 //
 // DECOUPLING NOTE: the eyevinn-encore-packager already consumes the Valkey
 // queue populated by the callback-listener, so in a fully reference-wired stack
@@ -29,8 +36,16 @@
 // the OSC catalog — see docs/osc-feedback/incoming-issue9-packaging.md.
 
 import type { AssetRepository, ManifestUrls, PackagedOutput } from '../data/asset-repo.js';
+import type { JobRepository } from '../data/job-repo.js';
+import type { PipelineRepository } from '../data/pipeline-repo.js';
 import type { StorageBackendConfig } from '../services/param-store.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
+import {
+  completePackageJob,
+  failPackageJob,
+  startPackageJob,
+  type PackageJobDeps
+} from './package-job.js';
 
 // The bucket the packager writes streaming output into (mirrors PACKAGED_BUCKET
 // in routes/provision.ts and the packager's OutputFolder).
@@ -185,10 +200,15 @@ export interface PackageQueue {
 // features decoupled: #8 calls triggerPackaging when a transcode succeeds and
 // never needs to know how packaging is wired.
 export interface PackagingTrigger {
+  // Resolves to the id of the `package` Job recorded for this enqueue (issue
+  // #976), or undefined when no job repository is wired. Callers that own the
+  // execution record use it to populate `steps[].jobId`; callers that have
+  // already persisted a running `package` step can ignore it — the service
+  // stamps those itself (see `startPackageJob`).
   triggerPackaging(
     assetId: string,
     encoreJobUrl: string
-  ): Promise<void>;
+  ): Promise<string | undefined>;
 }
 
 // Success callback payload from the packager (POST .../packagerCallback/success).
@@ -211,6 +231,13 @@ export type PackagerFailurePayload = {
 export type PackagingDeps = {
   assets: AssetRepository;
   queue: PackageQueue;
+  // Job + execution records for the `package` step (issue #976). Optional so
+  // existing callers/tests that only assert enqueue behaviour are unaffected;
+  // when absent, no Job is created and behaviour is exactly as before. See
+  // src/pipeline/package-job.ts for the lifecycle (create at enqueue, settle
+  // from the completion callbacks).
+  jobs?: JobRepository;
+  pipeline?: PipelineRepository;
   // Public origin for the packaged bucket (MinIO/CDN). Used to build manifest
   // URLs. Config via env; defaults to a relative path so a missing origin still
   // yields a usable, resolvable manifest reference.
@@ -462,7 +489,15 @@ export class PackagingService implements PackagingTrigger {
   async triggerPackaging(
     assetId: string,
     encoreJobUrl: string
-  ): Promise<void> {
+  ): Promise<string | undefined> {
+    // Record the observable `package` Job BEFORE the enqueue (issue #976), so a
+    // packager that consumes the queue entry immediately still finds a job to
+    // settle, and so the enqueue-failure path below has a record to fail. This
+    // also stamps `steps[].jobId` on an already-running `package` step, which is
+    // why it precedes the enqueue rather than following it: stamping afterwards
+    // would race the packager's own completion callback. Best-effort — never
+    // throws (src/pipeline/package-job.ts).
+    const packageJobId = await startPackageJob(this.packageJobDeps(), assetId);
     try {
       const job: PackagingJob = {
         jobId: assetId,
@@ -471,15 +506,17 @@ export class PackagingService implements PackagingTrigger {
       await this.deps.queue.enqueue(job);
       // Audit: package job submitted (issue #564). One entry on a SUCCESSFUL
       // enqueue only — the catch path below is a failed submission that records
-      // `packagingError` instead. targetId is the packaging correlation id
-      // (= assetId; packaging carries no separate Job record).
+      // `packagingError` instead. targetId is the `package` Job id when one was
+      // recorded (issue #976 — matching how transcode audits its own job id,
+      // src/pipeline/transcode.ts), falling back to the packaging correlation id
+      // (= assetId) on a deployment with no job repository wired.
       emitAudit(
         this.deps.audit,
         {
           actor: originActor('system'),
           action: 'job.submitted',
           targetType: 'job',
-          targetId: assetId,
+          targetId: packageJobId ?? assetId,
           detail: { jobType: 'package', assetId }
         },
         this.deps.auditLog
@@ -487,14 +524,31 @@ export class PackagingService implements PackagingTrigger {
     } catch (err) {
       this.deps.onError?.(err);
       const message = err instanceof Error ? err.message : String(err);
+      const reason = `failed to enqueue packaging job: ${message}`;
+      // The enqueue never happened, so no packager callback can ever settle this
+      // job: fail it here with the same reason written onto the asset, so the
+      // failure is readable from GET /api/v1/jobs (issue #976).
+      await failPackageJob(this.packageJobDeps(), { jobId: packageJobId, assetId }, reason);
       try {
         await this.deps.assets.update(assetId, {
-          packagingError: `failed to enqueue packaging job: ${message}`
+          packagingError: reason
         });
       } catch {
         // Detached safety: nothing more we can do if the error write also fails.
       }
     }
+    return packageJobId;
+  }
+
+  // The package-job bookkeeping dependencies (issue #976). Absent repositories
+  // make every helper a no-op, so a PackagingService constructed without them
+  // behaves exactly as it did before package jobs existed.
+  private packageJobDeps(): PackageJobDeps {
+    return {
+      jobs: this.deps.jobs,
+      pipeline: this.deps.pipeline,
+      logger: this.deps.auditLog
+    };
   }
 
   // Invoked by POST /api/v1/internal/packagerCallback/success when the packager
@@ -522,6 +576,9 @@ export class PackagingService implements PackagingTrigger {
       manifestUrls,
       ...(packagedOutput ? { packagedOutput } : {})
     });
+    // Settle the observable `package` Job (issue #976). Idempotent: an
+    // at-least-once packager callback for an already-settled job is a no-op.
+    const packageJobId = await completePackageJob(this.packageJobDeps(), { assetId });
     // Audit: package job reached terminal success (issue #564). One entry;
     // emitted only when the asset resolved (a callback for an unknown asset
     // returns false above and records nothing).
@@ -531,7 +588,9 @@ export class PackagingService implements PackagingTrigger {
         actor: originActor('system'),
         action: 'job.completed',
         targetType: 'job',
-        targetId: assetId,
+        // Same target as the submission entry: the `package` Job id when one
+        // exists (issue #976), else the packaging correlation id (= assetId).
+        targetId: packageJobId ?? assetId,
         detail: { jobType: 'package', assetId }
       },
       this.deps.auditLog
@@ -544,6 +603,10 @@ export class PackagingService implements PackagingTrigger {
     const asset = await this.deps.assets.get(assetId);
     if (!asset) return false;
     await this.deps.assets.update(assetId, { packagingError: message });
+    // Settle the observable `package` Job as failed WITH the reason (issue
+    // #976), so the failure is readable from the Jobs tab without opening the
+    // asset record. Idempotent, and a no-op when no job repository is wired.
+    const packageJobId = await failPackageJob(this.packageJobDeps(), { assetId }, message);
     // Audit: package job reached terminal failure (issue #564). One entry;
     // emitted only when the asset resolved (unknown asset returns false above).
     emitAudit(
@@ -552,7 +615,8 @@ export class PackagingService implements PackagingTrigger {
         actor: originActor('system'),
         action: 'job.failed',
         targetType: 'job',
-        targetId: assetId,
+        // Same target as the submission entry (see handleSuccess).
+        targetId: packageJobId ?? assetId,
         detail: { jobType: 'package', assetId, error: message }
       },
       this.deps.auditLog

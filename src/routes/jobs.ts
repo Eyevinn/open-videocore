@@ -55,9 +55,10 @@ const jobSchema = z.object({
   progress: z.number(),
   bytesTransferred: z.number(),
   totalBytes: z.number().optional(),
-  // Number of ingest/URL-pull attempts (retry tracking for URL-pull ingest).
-  // This is the INGEST attempt count and is distinct from `encodeAttempts`
-  // below (which counts Encore dispatches of a transcode job).
+  // Number of ingest/URL-pull attempts (retry tracking for URL-pull ingest) or,
+  // for a `package` job (issue #976), the number of enqueues onto the packager
+  // queue — so a re-enqueue reads differently from a slow first run. Distinct
+  // from `encodeAttempts` below (Encore dispatches of a transcode job).
   attempts: z.number(),
   error: z.string().optional(),
   // Transcode-job fields (issue #8). Present only when type === 'transcode'.
@@ -66,6 +67,22 @@ const jobSchema = z.object({
   encoreInstanceId: z.string().optional(), // which pool instance is running this job
   profile: z.string().optional(),
   renditionAssetIds: z.array(z.string()).optional(),
+  // --- Package-job fields (issue #976). Present only when type === 'package'. ---
+  packagingId: z
+    .string()
+    .optional()
+    .describe(
+      'Correlation id carried through the packager queue message and echoed on ' +
+        'the packager completion callback. The package-job counterpart of ' +
+        '`encoreJobId`.'
+    ),
+  outputPrefix: z
+    .string()
+    .optional()
+    .describe(
+      'Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH ' +
+        'objects under.'
+    ),
   // --- Durable encode-attempt capture (ADR-012, #380/#381) ---
   // Count of Encore dispatches for this transcode job (1 on first dispatch,
   // incremented on each transport-class re-dispatch). DISTINCT from `attempts`

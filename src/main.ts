@@ -1187,6 +1187,9 @@ function activateScaler(redisUrl: string): void {
       // swallows per-execution errors and never throws into the tick.
       await reconcileStalledPackages({
         pipeline: pipelineRepository,
+        // #976: settle the stalled step's `package` job with the same
+        // diagnostic, so a swept run is explained in GET /api/v1/jobs too.
+        jobs: jobRepository,
         // Best-effort presence probe used ONLY to shape the diagnostic message.
         // It resolves the stack name (the packager instance shares it) and asks
         // OSC whether a packager instance exists. Any failure -> undefined, and
@@ -1408,6 +1411,12 @@ function activateScaler(redisUrl: string): void {
     assets: assetRepository,
     queue: makeOscPackagerQueue(redis, undefined, app.log),
     publicBaseUrl: packagingPublicBaseUrl(),
+    // Observable `package` Job records (issue #976): created at enqueue time,
+    // stamped onto the execution's `package` step as `steps[].jobId`, and
+    // settled from the packager's success/failure callbacks. Same repositories
+    // the routers and sweeps use.
+    jobs: jobRepository,
+    pipeline: pipelineRepository,
     // Best-effort package-job audit emission (issue #564): submit + terminal
     // (success/failure) callbacks each emit one entry, fire-and-forget.
     audit: auditEmitter,

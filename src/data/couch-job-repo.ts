@@ -46,6 +46,8 @@ export class CouchJobRepository implements JobRepository {
       attempts: 0,
       encoreJobId: input.encoreJobId,
       profile: input.profile,
+      packagingId: input.packagingId,
+      outputPrefix: input.outputPrefix,
       createdAt: now,
       updatedAt: now
     };
@@ -203,6 +205,8 @@ function toDoc(job: Job): Record<string, unknown> {
     encoreInternalJobId: job.encoreInternalJobId,
     profile: job.profile,
     renditionAssetIds: job.renditionAssetIds,
+    packagingId: job.packagingId,
+    outputPrefix: job.outputPrefix,
     encodeAttempts: job.encodeAttempts,
     encodeAttemptLog: job.encodeAttemptLog,
     interrupted: job.interrupted,
@@ -229,6 +233,8 @@ function fromDoc(doc: StoredDoc): Job {
     encoreInternalJobId: doc['encoreInternalJobId'] as string | undefined,
     profile: doc['profile'] as string | undefined,
     renditionAssetIds: doc['renditionAssetIds'] as string[] | undefined,
+    packagingId: doc['packagingId'] as string | undefined,
+    outputPrefix: doc['outputPrefix'] as string | undefined,
     encodeAttempts: doc['encodeAttempts'] as number | undefined,
     encodeAttemptLog: doc['encodeAttemptLog'] as EncodeAttempt[] | undefined,
     interrupted: doc['interrupted'] as boolean | undefined,
