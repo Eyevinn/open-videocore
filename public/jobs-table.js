@@ -180,6 +180,23 @@ export function pageJobs(jobs, offset, size) {
 // state.setFilter(name, value) records it. We keep the control DOM minimal and
 // accessible (labelled inputs). Initial values come from the decoded URL state.
 
+// An UNSET filter control must read as unset (issue #984). The search box gets
+// that for free — it has a native `placeholder`, styled muted by
+// `.ops-filter-search::placeholder` in public/style.css. The select and the two
+// date inputs have no placeholder: "All statuses" is a real <option> and
+// `yyyy-mm-dd` is the UA's own format hint, so both would otherwise paint at
+// full `var(--text)`. Pure CSS cannot cover the date case — an empty
+// `input[type="date"]` matches neither `:placeholder-shown` (date inputs have no
+// placeholder) nor `:not(:valid)` (an empty optional date IS valid) — so the
+// empty state is marked with one explicit class for all three, and
+// `.ops-filter-select.is-unset` / `.ops-filter-date.is-unset` paint it
+// `var(--text-muted)`. Called on every change AND on first render.
+const UNSET_CLASS = 'is-unset';
+
+function markUnset(control) {
+  control.classList.toggle(UNSET_CLASS, control.value === '');
+}
+
 function labelled(labelText, control, forId) {
   const frag = document.createDocumentFragment();
   const label = document.createElement('label');
@@ -221,7 +238,9 @@ function statusFilterControl(initialStatus) {
     if (Array.isArray(initialStatus) && initialStatus.length === 1) {
       sel.value = initialStatus[0];
     }
+    markUnset(sel);
     sel.addEventListener('change', () => {
+      markUnset(sel);
       // Empty string clears the filter (primitive treats '' as "unset").
       onChange(sel.value);
     });
@@ -239,7 +258,14 @@ function dateInput(id, labelText, initialValue, onValue) {
   input.id = id;
   input.className = 'ops-filter-date';
   if (initialValue) input.value = initialValue;
-  input.addEventListener('change', () => onValue(input.value));
+  markUnset(input);
+  input.addEventListener('change', () => {
+    markUnset(input);
+    onValue(input.value);
+  });
+  // A date input can also be cleared with the keyboard, which fires `input`
+  // without a `change` in some engines — keep the muted state in step either way.
+  input.addEventListener('input', () => markUnset(input));
   wrap.appendChild(labelled(labelText, input, id));
   return wrap;
 }

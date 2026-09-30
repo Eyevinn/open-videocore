@@ -1932,6 +1932,38 @@ body.detail-standalone .assets-side {
   min-width: 220px;
 }
 
+/* Unset filter controls read as unset (issue #984). All four controls in the bar
+   render their EMPTY state in var(--text-muted) and switch to var(--text) only
+   once a value is chosen, so "is anything filtered right now?" is answerable at a
+   glance. The search box is covered by its native placeholder; the select and the
+   date inputs carry no placeholder, so public/jobs-table.js markUnset() toggles
+   .is-unset on them (empty <select> option / empty date value). */
+.ops-filter-search::placeholder {
+  color: var(--text-muted);
+  opacity: 1; /* Firefox dims placeholders by default. */
+}
+
+.ops-filter-select.is-unset,
+.ops-filter-date.is-unset {
+  color: var(--text-muted);
+}
+
+/* The date field's yyyy-mm-dd format hint is drawn by the UA in its own shadow
+   subtree, which does not always inherit the host's color. */
+.ops-filter-date.is-unset::-webkit-datetime-edit {
+  color: var(--text-muted);
+}
+
+/* The open option list stays legible regardless of the closed control's state:
+   only the placeholder entry ("All statuses", value='') is muted there. */
+.ops-filter-select option {
+  color: var(--text);
+}
+
+.ops-filter-select option[value=''] {
+  color: var(--text-muted);
+}
+
 .ops-filter-select:focus-visible,
 .ops-filter-date:focus-visible,
 .ops-filter-search:focus-visible {
