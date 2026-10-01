@@ -2796,7 +2796,7 @@ async function renderAssetDetailBody(id, bodyEl) {
     //        (:5444), 404 = { error, message } for an unknown asset AND for an
     //        unknown track id (:5450, :5455), which are not distinguishable.
     //   GET /api/v1/assets/{id}/tracks — 200 { audioTracks, subtitleTracks },
-    //        both `required` (`tracksSchema` :836-839, handler :5264-5271). The
+    //        both `required` (`tracksSchema` :836-839, handler :5301-5320). The
     //        panel calls this ONLY after a write: neither write returns the
     //        resulting list, and this is the smallest authoritative read of it.
     //        The initial render still calls nothing — the arrays are already on

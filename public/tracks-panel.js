@@ -130,7 +130,7 @@
  *       `additionalProperties: false`:
  *         language  string, min 1, max 64   — REQUIRED
  *         format    "vtt" | "srt" | "ttml"  — REQUIRED
- *                   (`subtitleFormatSchema` :804 over
+ *                   (`subtitleFormatSchema` :808 over
  *                    `SUBTITLE_FORMATS` src/data/asset-repo.ts:449)
  *         label     string, min 1, max 128  — optional
  *         default   boolean                 — optional
@@ -138,7 +138,7 @@
  *       the id is server-generated (`randomUUID()`, :5408) and the object key is
  *       derived by the route (:5411). So this panel sends no id and no key.
  *     201 → `{ track, uploadUrl? }` (:5398). `track` is `subtitleTrackOutSchema`
- *       (:806-813) — the ONE new track, NOT the full list, which is why a
+ *       (:810-817) — the ONE new track, NOT the full list, which is why a
  *       successful add is followed by a re-read (below) rather than an
  *       append-in-place. `uploadUrl` is a presigned PUT, present only when
  *       object storage is configured (:5413-5416); it is NEVER rendered — it is
@@ -170,8 +170,9 @@
  *   REFRESH AFTER A WRITE — `GET /api/v1/assets/{id}/tracks`
  *     openapi.json .paths["/api/v1/assets/{id}/tracks"].get → 200
  *     `{ audioTracks, subtitleTracks }`, BOTH `required` (`tracksSchema`,
- *     src/routes/assets.ts:836-839; handler :5264-5271 sends
- *     `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []`).
+ *     src/routes/assets.ts:836-839; handler :5301-5320 sends
+ *     `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []`, read through
+ *     `repo.get(request.params.id)` at :5311).
  *     This is the read the panel refuses at RENDER time (it already holds those
  *     bytes) and needs after a WRITE, when it no longer does: neither write
  *     returns the resulting list. It is the smallest authoritative read of the
@@ -324,7 +325,7 @@ export const TRACKS_COPY = Object.freeze({
  * The subtitle `format` vocabulary, as an ordered list for the add form.
  *
  * Copied from the contract, not invented: `subtitleFormatSchema =
- * z.enum(SUBTITLE_FORMATS)` (src/routes/assets.ts:804) over
+ * z.enum(SUBTITLE_FORMATS)` (src/routes/assets.ts:808) over
  * `SUBTITLE_FORMATS = ['vtt','srt','ttml']` (src/data/asset-repo.ts:449), which
  * is also what `openapi.json` publishes as the `format` enum on both the request
  * and the response schema. A format outside this list is rejected by the route,
@@ -525,7 +526,7 @@ export function subtitleAddBody(values) {
  *
  * `apiFetch` throws an Error carrying `status` and the parsed body, and already
  * prefers the server's human `message` over its machine `error` code
- * (public/app.js:288-304), so the server's own words are used wherever it sent
+ * (public/app.js:289-321), so the server's own words are used wherever it sent
  * any. Only the two statuses the contract actually documents get bespoke copy:
  *   403 — `forbidden_insufficient_role` (src/auth/authorize.ts:99), the role
  *         mirror having been bypassed or the server disagreeing with it.
@@ -934,7 +935,7 @@ function appendSubtitleSection(block, subtitles, controls) {
         { text: attr(t.id), mono: true },
       ];
       if (removable) {
-        // House destructive styling (`button.btn-danger`, public/style.css:623),
+        // House destructive styling (`button.btn-danger`, public/style.css:688),
         // not a bespoke class — removing a track reads like every other
         // destructive control in this UI.
         const btn = el('button', 'btn-sm btn-danger', TRACKS_COPY.btnRemove);
