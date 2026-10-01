@@ -29,6 +29,7 @@ import {
 
 const createInstance = vi.fn();
 const getInstance = vi.fn();
+const listInstances = vi.fn();
 const removeInstance = vi.fn();
 const saveSecret = vi.fn();
 const waitForInstanceReady = vi.fn(async () => undefined);
@@ -37,6 +38,9 @@ const getPortsForInstance = vi.fn(async () => []);
 vi.mock('@osaas/client-core', () => ({
   createInstance: (...args: unknown[]) => createInstance(...(args as [])),
   getInstance: (...args: unknown[]) => getInstance(...(args as [])),
+  // Teardown confirms an empty getInstance probe against listInstances before
+  // reporting not_found (issue #1039).
+  listInstances: (...args: unknown[]) => listInstances(...(args as [])),
   removeInstance: (...args: unknown[]) => removeInstance(...(args as [])),
   getPortsForInstance: (...args: unknown[]) =>
     getPortsForInstance(...(args as [])),
@@ -177,6 +181,8 @@ function removedServiceIds(): string[] {
 beforeEach(() => {
   createInstance.mockReset();
   getInstance.mockReset();
+  listInstances.mockReset();
+  listInstances.mockResolvedValue([]);
   removeInstance.mockReset();
   saveSecret.mockReset();
   getServiceAccessToken.mockClear();
@@ -329,5 +335,108 @@ describe('POST /api/v1/provision rollback on failure (issue #736)', () => {
 
     // The exact remediation call the caller must make to finish cleanup.
     expect(result.removeLeftoversWith).toBe('DELETE /api/v1/provision/mystack');
+  });
+
+  // Issue #1039: when this run created NOTHING there is nothing to roll back,
+  // which is not the same as "nothing is left" — the instances it ADOPTED are
+  // still running. The old report said rollback status `not_found`, which reads
+  // as an empty stack, and named no still-running instance.
+  it('a failure with an empty created[] does not report the stack as empty', async () => {
+    const paramStore = makeStatefulParamStore();
+    // Storage already exists and is ADOPTED (provision() on "already taken");
+    // the very next service fails, so created[] is empty.
+    createInstance.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === 'minio-minio') {
+        throw new Error('Name is already taken');
+      }
+      throw new Error('couchdb provisioning boom');
+    });
+
+    const app = await buildApp(paramStore);
+    const op = await provisionAndWait(app);
+
+    expect(op.status).toBe('failed');
+
+    const result = op.result as {
+      rollback: { status: string; services: unknown[] };
+      stillRunning?: { serviceId: string; instanceName: string }[];
+      removeLeftoversWith?: string;
+    };
+
+    // Nothing was created, so nothing was torn down — and the status says so
+    // rather than claiming the instances were not found.
+    expect(result.rollback.status).toBe('not_attempted');
+    expect(result.rollback.status).not.toBe('not_found');
+    expect(result.rollback.services).toEqual([]);
+    expect(removedServiceIds()).toEqual([]);
+
+    // The adopted instance is still running and is named, with the call that
+    // removes it.
+    expect(result.stillRunning).toBeDefined();
+    expect(
+      result.stillRunning?.some((s) => s.serviceId === 'minio-minio')
+    ).toBe(true);
+    expect(result.removeLeftoversWith).toBe('DELETE /api/v1/provision/mystack');
+
+    // And the stored config still lists it so the DELETE can find it.
+    const partial = (await paramStore.loadStackConfig(
+      'default',
+      'mystack'
+    )) as StackConfig;
+    expect(partial.status).toBe('failed');
+    expect(partial.services.map((s) => s.serviceId)).toContain('minio-minio');
+  });
+
+  // Issue #1039: a created instance whose teardown could not be VERIFIED (the
+  // probe errored rather than proving absence) must be reported as still
+  // running, not written off.
+  it('lists a created instance whose teardown could not be verified as still running', async () => {
+    const paramStore = makeStatefulParamStore();
+    createInstance.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === 'valkey-io-valkey') {
+        throw new Error('valkey provisioning boom');
+      }
+      return instanceFor(serviceId);
+    });
+    // The teardown probe for the created storage instance cannot be verified:
+    // getInstance swallows its error into undefined and the confirming read
+    // fails too.
+    getInstance.mockImplementation(async (_c, serviceId: string) =>
+      serviceId === 'minio-minio' ? undefined : instanceFor(serviceId)
+    );
+    listInstances.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === 'minio-minio') throw new Error('fetch failed');
+      return [];
+    });
+
+    const app = await buildApp(paramStore);
+    const op = await provisionAndWait(app);
+
+    expect(op.status).toBe('failed');
+
+    const result = op.result as {
+      rollback: { status: string };
+      leftovers?: { serviceId: string; error?: string }[];
+      stillRunning?: { serviceId: string }[];
+      removeLeftoversWith?: string;
+    };
+    expect(result.rollback.status).toBe('failed');
+    // It was NOT deleted on the strength of an unverified probe...
+    expect(removedServiceIds()).not.toContain('minio-minio');
+    // ...and it is reported as a leftover that is still running.
+    expect(
+      result.leftovers?.some((l) => l.serviceId === 'minio-minio')
+    ).toBe(true);
+    expect(
+      result.stillRunning?.some((s) => s.serviceId === 'minio-minio')
+    ).toBe(true);
+    expect(result.removeLeftoversWith).toBe('DELETE /api/v1/provision/mystack');
+
+    // The stored config keeps it so the DELETE route can finish the job.
+    const partial = (await paramStore.loadStackConfig(
+      'default',
+      'mystack'
+    )) as StackConfig;
+    expect(partial.services.map((s) => s.serviceId)).toContain('minio-minio');
   });
 });
