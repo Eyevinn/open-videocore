@@ -18,6 +18,11 @@ import { createAssetsTable } from './assets-table.js';
 // (#368/#373) against the verified GET /api/v1/logs/ contract. See
 // public/logs-table.js.
 import { createLogsTable } from './logs-table.js';
+// Shared audit-table wiring (issue #987). Composes the merged shared table
+// primitive (#367/#372) in OFFSET paging mode and the URL-state contract
+// (#368/#373) against the verified GET /api/v1/audit contract (src/routes/
+// audit.ts:62-80). See public/audit-table.js.
+import { createAuditTable } from './audit-table.js';
 // Size-based upload routing (issue #747): stream small files through the proxy,
 // but push medium/large files straight to MinIO via the presigned single-part
 // and multipart routes so they never hit the proxy's request-body limit.
@@ -1921,7 +1926,7 @@ function openDetailWindow(type, id) {
 // here, so switchTab dropped every click on it (issue #823). The list is kept
 // explicit rather than derived from the DOM so a stray/injected button cannot
 // become routable; auditTabWiring() below is what keeps the three in step.
-const TABS = ['assets', 'jobs', 'logs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+const TABS = ['assets', 'jobs', 'logs', 'audit', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -7535,11 +7540,56 @@ async function renderLogsTab(container) {
   });
 }
 
+// ─── Audit tab ───────────────────────────────────────────────────────────────
+// A cross-cutting view over the audit log (issue #987). The per-asset trail on
+// the asset detail panel answers "what happened to THIS asset"; it is left
+// exactly as it was. This tab answers the questions that span resources — what
+// was archived, every failed job, a collection's deletion history, system vs
+// operator activity — by driving the same query endpoint with its real filters.
+//
+// All filtering and paging is server-side (GET /api/v1/audit accepts
+// targetType/targetId/origin/principalId/action/from/to + limit/offset —
+// src/routes/audit.ts:62-72), so the table lives entirely in the shared
+// primitive composed by public/audit-table.js. app.js owns only the chrome
+// (header + Refresh). No auto-poll: the log is append-only and offset-paged, so
+// a background poll would shift the page under the operator.
+
+let auditTableInstance = null;
+
+async function renderAuditTab(container) {
+  const layout = document.createElement('div');
+  layout.className = 'assets-layout';
+  container.appendChild(layout);
+
+  const main = document.createElement('div');
+  main.className = 'assets-main';
+  layout.appendChild(main);
+
+  const header = document.createElement('div');
+  header.className = 'assets-main-header';
+  header.innerHTML = [
+    '<span class="section-title">Audit</span>',
+    '<div class="flex-gap">',
+    '  <button id="audit-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
+    '</div>',
+  ].join('');
+  main.appendChild(header);
+
+  const auditTable = createAuditTable({ apiFetch, fmtDate });
+  auditTableInstance = auditTable;
+  main.appendChild(auditTable.el);
+
+  header.querySelector('#audit-refresh').addEventListener('click', function () {
+    auditTable.reload();
+  });
+}
+
 // ─── Tab renderer registry ───────────────────────────────────────────────────
 
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
 TAB_RENDERERS['logs'] = renderLogsTab;
+TAB_RENDERERS['audit'] = renderAuditTab;
 TAB_RENDERERS['transcoders'] = renderTranscodersTab;
 TAB_RENDERERS['pipelines'] = renderPipelinesTab;
 TAB_RENDERERS['profiles'] = renderProfilesTab;
