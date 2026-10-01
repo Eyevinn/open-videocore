@@ -2516,6 +2516,55 @@ async function renderAssetFiles(assetId, container) {
   }
 }
 
+// Remaining-retention-window text for an archived asset's restore action
+// (issue #891, scoped by the companion contract note for #888).
+//
+// Verified contract as of this writing: `assetSchema` — the schema both
+// `GET /api/v1/assets/{id}` and `POST /api/v1/assets/{id}/restore` 200 use
+// (src/routes/assets.ts:811-866ish, `additionalProperties: false`) — has NO
+// `retention`, `archivedAt`, `purgeAfter`, or `retentionMs` field. The full
+// property list was read directly off that schema (see the grep-verified
+// enumeration in docs/findings/asset-restore-contract-888.md §2/§4, itself
+// cross-checked against `openapi.json`). So nothing here is fabricated: this
+// helper is inert — returns null — against every asset the API serves today,
+// and only activates if a future, additive `asset.retention` object (the
+// shape docs/findings/asset-restore-contract-888.md §4 "Preferred" proposes:
+// `{ archivedAt, purgeAfter, retentionMs }`) actually appears on the wire.
+// Until that lands, the restore action shows no countdown — see restoreNote
+// below, which says so explicitly instead of guessing a deadline.
+function formatRetentionRemaining(retention) {
+  if (!retention || typeof retention !== 'object') return null;
+  var purgeAfter = retention.purgeAfter;
+  if (purgeAfter === null) {
+    // retentionMs === 0 convention ("never purge"), per the proposed field's
+    // own description (asset-restore-contract-888.md §4).
+    return 'No retention limit is configured for this deployment — this asset will not expire automatically.';
+  }
+  if (typeof purgeAfter !== 'string') return null;
+  var purgeMs = Date.parse(purgeAfter);
+  if (isNaN(purgeMs)) return null;
+  var diffMs = purgeMs - Date.now();
+  if (diffMs <= 0) {
+    return 'The retention window has elapsed. The next purge sweep may remove this asset.';
+  }
+  var min = Math.floor(diffMs / 60000);
+  var hr = Math.floor(min / 60);
+  var day = Math.floor(hr / 24);
+  var remaining;
+  if (day >= 1) {
+    remaining = day + ' day' + (day === 1 ? '' : 's');
+  } else if (hr >= 1) {
+    remaining = hr + ' hour' + (hr === 1 ? '' : 's');
+  } else {
+    remaining = Math.max(min, 1) + ' minute' + (min === 1 ? '' : 's');
+  }
+  // Approximate on purpose: the purge sweep runs on its own cadence
+  // (ARCHIVE_PURGE_INTERVAL_MS, default 1h — archived-asset-purge-loop.ts:31
+  // per the finding), so this is an earliest-possible deadline, not a
+  // guarantee of exactly-on-time purge.
+  return 'About ' + remaining + ' remain before the retention sweep may purge this asset.';
+}
+
 // Populate an asset detail view into `bodyEl` from a freshly-fetched asset.
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
@@ -2941,6 +2990,21 @@ async function renderAssetDetailBody(id, bodyEl) {
         'stored bytes are not moved between storage tiers. Once the retention ' +
         'sweep has purged the asset, restore is no longer possible.';
       body.appendChild(restoreNote);
+
+      // Remaining retention window (issue #891) — rendered ONLY when the
+      // server actually sends `asset.retention` (it does not today; see
+      // formatRetentionRemaining above). No countdown is fabricated when the
+      // field is absent, which is the honest state for every asset on the
+      // currently-verified contract.
+      const retentionText = formatRetentionRemaining(asset.retention);
+      if (retentionText) {
+        const retentionNote = document.createElement('div');
+        retentionNote.id = 'retention-window';
+        retentionNote.className = 'mt4 text-muted';
+        retentionNote.style.fontSize = '12px';
+        retentionNote.textContent = retentionText;
+        body.appendChild(retentionNote);
+      }
     }
 
     var runBtn = runDiv.querySelector('#btn-run-pipeline');
@@ -7593,6 +7657,12 @@ export {
   setupTabs,
   auditTabWiring,
   reportTabWiring,
+  // Remaining-retention-window text for the restore action (issue #891).
+  // Exported so a DOM/unit test can exercise the pure formatter directly,
+  // without needing a live `asset.retention` field (which the verified
+  // contract does not send today — see formatRetentionRemaining's own
+  // comment for the exact citation).
+  formatRetentionRemaining,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
