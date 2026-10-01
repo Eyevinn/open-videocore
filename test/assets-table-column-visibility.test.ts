@@ -18,6 +18,12 @@
 //   - the declared column keys and the legality group:
 //     ASSETS_COLUMN_KEYS / ASSETS_REQUIRED_COLUMN_GROUPS in public/assets-table.js.
 //   - the storage key: columnPrefKey(ns) in public/table-columns.js.
+//   - the chooser's mount point and the cascade it has to survive: renderFilters()
+//     in public/ops-ui-table.js appends `.ops-columns-slot` into the bar whose
+//     class is `ops-table-filters`, so `.ops-table-filters label` in
+//     public/style.css applies to every chooser row. The colour tokens asserted
+//     below are the :root definitions in public/style.css — `--text: #e2e8f0`,
+//     `--text-muted: #94a3b8`.
 //   - the request contracts the tests assert stay UNCHANGED under a reduced column
 //     set are the ones already grounded in test/assets-table.test.ts:
 //     tier 1 GET /api/v1/assets/ (limit/offset/status/from/to; envelope
@@ -27,6 +33,8 @@
 // The whole point of the feature is that the last of those is untouched: hiding a
 // column must not change a single query param, the page window, or the sort.
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createAssetsTable,
@@ -468,6 +476,90 @@ describe('actions + the last identifying column can never both be hidden', () =>
       await tick();
       expect(t.el.querySelectorAll('thead th').length).toBeGreaterThan(0);
       t.destroy();
+    }
+  });
+});
+
+// ─── Cascade: the chooser lives inside the filter bar ────────────────────────
+//
+// The chooser mounts into `.ops-table-filters` (public/ops-ui-table.js, the
+// `.ops-columns-slot` append in renderFilters), which means every chooser row —
+// a <label> — is ALSO matched by `.ops-table-filters label`. That rule is
+// (0,1,1) and paints a stacked, muted filter control; a bare `.ops-columns-item`
+// is (0,1,0) and silently loses. The first cut of this feature shipped exactly
+// that defect: rows rendered as checkbox-over-caption stacks and locked rows were
+// indistinguishable from unlocked ones, because BOTH resolved to --text-muted.
+//
+// Every assertion below is read off the real sheet in the real mount point, so a
+// future rule that outranks these selectors fails here instead of in review.
+describe('chooser rows resolve against the real stylesheet', () => {
+  const STYLESHEET = readFileSync(resolve(process.cwd(), 'public/style.css'), 'utf8');
+
+  function withStylesheet(): () => void {
+    const style = document.createElement('style');
+    style.textContent = STYLESHEET;
+    document.head.appendChild(style);
+    return () => style.remove();
+  }
+
+  it('renders rows as a row-direction flex line, not a stacked filter control', async () => {
+    const drop = withStylesheet();
+    try {
+      const { apiFetch } = fakeApi();
+      const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+      document.body.appendChild(t.el);
+      await tick();
+
+      // Sanity: the row really is inside the bar whose rule it has to outrank.
+      const row = t.el.querySelector('.ops-columns-item[data-column="tags"]') as HTMLElement;
+      expect(row.closest('.ops-table-filters')).not.toBeNull();
+      expect(row.tagName).toBe('LABEL');
+
+      const css = getComputedStyle(row);
+      expect(css.display).toBe('flex');
+      // The defect: `.ops-table-filters label { flex-direction: column }` won and
+      // put the caption under the checkbox.
+      expect(css.flexDirection).toBe('row');
+      expect(css.gap).toBe('8px');
+      // --text (#e2e8f0), not the filter bar's --text-muted (#94a3b8).
+      expect(css.color).toBe('#e2e8f0');
+
+      t.destroy();
+    } finally {
+      drop();
+    }
+  });
+
+  it('paints a locked row muted, visibly distinct from an unlocked one', async () => {
+    const drop = withStylesheet();
+    try {
+      const { apiFetch } = fakeApi();
+      const t = createAssetsTable({ ...deps(), apiFetch, win: stubWin() });
+      document.body.appendChild(t.el);
+      await tick();
+
+      // Drive the table into the state that locks a toggle, rather than faking
+      // the class: Actions becomes the last member of the required group.
+      setColumn(t.el, 'id', false);
+      setColumn(t.el, 'slug', false);
+      setColumn(t.el, 'title', false);
+
+      const locked = t.el.querySelector('.ops-columns-item[data-column="actions"]') as HTMLElement;
+      const plain = t.el.querySelector('.ops-columns-item[data-column="tags"]') as HTMLElement;
+      expect(locked.classList.contains('is-locked')).toBe(true);
+      expect(plain.classList.contains('is-locked')).toBe(false);
+
+      const lockedColor = getComputedStyle(locked).color;
+      const plainColor = getComputedStyle(plain).color;
+      // The defect: both resolved to --text-muted, so "you cannot hide this one"
+      // was carried by the disabled checkbox alone and the row read as ordinary.
+      expect(lockedColor).not.toBe(plainColor);
+      expect(lockedColor).toBe('#94a3b8');
+      expect(getComputedStyle(locked).cursor).toBe('not-allowed');
+
+      t.destroy();
+    } finally {
+      drop();
     }
   });
 });

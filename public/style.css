@@ -2142,9 +2142,15 @@ body.detail-standalone .assets-side {
   gap: 2px;
 }
 
-.ops-columns-item {
-  /* Beats `.ops-table-filters label { flex-direction: column }` above — these are
-     checkbox rows, not stacked caption-over-input filter controls. */
+/* Each row is a <label>, and the chooser mounts inside the filter bar
+   (public/ops-ui-table.js appends it to `.ops-table-filters`), so every row is
+   also matched by `.ops-table-filters label` above — a (0,1,1) rule that stacks a
+   caption over an input and mutes it. A bare `.ops-columns-item` is only (0,1,0),
+   so it loses and the rows collapse into checkbox-over-caption stacks. Qualify
+   with the ancestor to reach (0,2,0), the same way the checkbox and the row label
+   below already do. */
+.ops-table-filters .ops-columns-item {
+  display: flex;
   flex-direction: row;
   align-items: center;
   gap: 8px;
@@ -2154,7 +2160,7 @@ body.detail-standalone .assets-side {
   cursor: pointer;
 }
 
-.ops-columns-item:hover {
+.ops-table-filters .ops-columns-item:hover {
   background: var(--border);
 }
 
@@ -2168,9 +2174,12 @@ body.detail-standalone .assets-side {
 }
 
 /* A column that has to stay visible. Muted and not-allowed rather than absent:
-   an entry that vanished would read as "this column does not exist". */
-.ops-columns-item.is-locked,
-.ops-columns-item.is-locked input {
+   an entry that vanished would read as "this column does not exist". Qualified the
+   same way as the row rule above, so "muted" beats the row's `color: var(--text)`
+   on specificity (0,3,0 vs 0,2,0) rather than on source order — a locked row has
+   to stay visibly distinct from an unlocked one wherever this block ends up. */
+.ops-table-filters .ops-columns-item.is-locked,
+.ops-table-filters .ops-columns-item.is-locked input {
   color: var(--text-muted);
   cursor: not-allowed;
 }
