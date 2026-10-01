@@ -7103,20 +7103,106 @@ async function renderPipelinesTab(container) {
 
 // ─── TRANSCODERS TAB ───────────────────────────────────────────────────────────
 
-// Human-readable relative time for a lastIdleAt epoch-ms value ("X minutes ago").
-function relativeTime(epochMs) {
-  if (epochMs == null || isNaN(epochMs)) return '—';
-  const diffMs = Date.now() - Number(epochMs);
-  if (diffMs < 0) return 'just now';
-  const sec = Math.floor(diffMs / 1000);
-  if (sec < 5) return 'just now';
-  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's') + ' ago';
+// Coarse humanised duration for an elapsed span in ms ("47 seconds",
+// "9 minutes", "2 hours", "3 days"). Same unit ladder the card's old
+// relativeTime() helper used, minus the "ago" suffix: the row now names the
+// quantity itself ("Running 9 minutes"), and "ago" only makes sense for a point
+// in the past. A negative span (clock skew, or a timestamp written slightly
+// ahead of this browser's clock) clamps to zero rather than reading "-3 seconds".
+function humanDuration(ms) {
+  const sec = Math.max(0, Math.floor(Number(ms) / 1000));
+  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's');
   const min = Math.floor(sec / 60);
-  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's') + ' ago';
+  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's');
   const hr = Math.floor(min / 60);
-  if (hr < 24) return hr + ' hour' + (hr === 1 ? '' : 's') + ' ago';
+  if (hr < 24) return hr + ' hour' + (hr === 1 ? '' : 's');
   const day = Math.floor(hr / 24);
-  return day + ' day' + (day === 1 ? '' : 's') + ' ago';
+  return day + ' day' + (day === 1 ? '' : 's');
+}
+
+// The instance record's idle clock, mirroring the server's resolveIdleSince()
+// (src/encore-scaler/scaler-loop.ts:128): `lastIdleAt` when it is a usable
+// number, otherwise `readyAt`. Same order, same tolerance for a value that
+// round-tripped as a numeric string — so the age this card shows is the age the
+// reaping bound (isIdlePastTimeout, scaler-loop.ts:148) measures. Returns
+// undefined when neither timestamp is usable, which is the case the scale-down
+// path deliberately fails CLOSED on (unknown age => treated as aged).
+function resolveIdleSince(inst) {
+  const candidates = [inst && inst.lastIdleAt, inst && inst.readyAt];
+  for (const candidate of candidates) {
+    const epochMs = toEpochMs(candidate);
+    if (epochMs !== undefined) return epochMs;
+  }
+  return undefined;
+}
+
+// One timestamp candidate as epoch ms, or undefined when it is not usable.
+// Deliberately strict about the input type: a blanket Number() would turn `null`
+// into 0 — the epoch — and render a record with a missing timestamp as an
+// instance that has been busy since 1970 instead of as an unknown.
+function toEpochMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+// The one duration row on a transcoder card, state-aware (issue #982).
+//
+// The row used to read "Last idle <X> ago" unconditionally. `lastIdleAt` is
+// stamped when an instance's activeJobs last reached 0 (src/routes/internal.ts:202,
+// src/pipeline/encore-callback-poller.ts:371) and is frozen while it is busy, so
+// on a working instance that row counted upward away from an already-stale value
+// and reset to zero the moment work finished — i.e. it looked like a countdown to
+// reaping while running the opposite direction, sitting right next to an idle
+// timeout.
+//
+// Busy (activeJobs > 0): "Running <duration>" from `lastIdleAt`. No record field
+// is stamped at dispatch — the loop increments activeJobs without a timestamp
+// (src/encore-scaler/scaler-loop.ts:433) — so this is the closest the payload can
+// get, and it is an UPPER bound: it includes however long the instance sat idle
+// between becoming free and being handed its current job. On a queue-fed pool
+// that gap is at most a tick.
+//
+// Idle (activeJobs === 0): "Idle <duration>" from resolveIdleSince(), the exact
+// quantity the reaping bound compares against idleTimeoutMs. A freshly spawned
+// instance awaiting dispatch has lastIdleAt === readyAt (instance-pool.ts:471),
+// so it reads "Idle 12 seconds" — true, and the same clock that will reap it.
+//
+// Returns { label, value, title }; value is '—' when no timestamp is usable.
+function instanceActivity(inst, nowMs) {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  const active = Number(inst && inst.activeJobs) || 0;
+  if (active > 0) {
+    const since = toEpochMs(inst && inst.lastIdleAt);
+    if (since === undefined) {
+      return {
+        label: 'Running',
+        value: '—',
+        title: 'This instance is working, but its record carries no timestamp to measure from.',
+      };
+    }
+    return {
+      label: 'Running',
+      value: humanDuration(now - since),
+      title: 'Elapsed since this instance last became idle — its current work started within that window.',
+    };
+  }
+  const idleSince = resolveIdleSince(inst);
+  if (idleSince === undefined) {
+    return {
+      label: 'Idle',
+      value: '—',
+      title: 'No usable idle timestamp on this record; the scaler treats an unknown idle age as aged.',
+    };
+  }
+  return {
+    label: 'Idle',
+    value: humanDuration(now - idleSince),
+    title: 'Idle age — the value the scaler compares against the idle timeout before tearing this instance down.',
+  };
 }
 
 // Per-instance job capacity, read from the status payload (issue #979).
@@ -7185,19 +7271,25 @@ const IDLE_STUCK_FACTOR = 3;
 // Returns undefined when neither field is usable. Callers must NOT guess an age
 // from that: numeric strings are accepted (the record round-trips through JSON
 // and may have been repaired out of band), anything else is not a timestamp.
-function instanceIdleSince(inst) {
-  const candidates = [inst && inst.lastIdleAt, inst && inst.readyAt];
-  for (const candidate of candidates) {
-    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
-    if (typeof candidate === 'string' && candidate.trim() !== '') {
-      const parsed = Number(candidate);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-  }
-  return undefined;
-}
+//
+// #980 and #982 arrived at this same mirror independently — the health pill
+// needs the idle age to pick a colour, the duration row needs it to print a
+// number — so it is ONE implementation (resolveIdleSince, above) under two
+// names rather than two copies that can drift apart from each other and from
+// scaler-loop.ts:128. The name is kept because both surfaces' tests and
+// comments refer to it, and `instanceIdleSince` reads better at the health
+// call site than the server-side spelling does.
+const instanceIdleSince = resolveIdleSince;
 
 // Coarse duration wording for the pill's explanatory text ("6 minutes").
+//
+// Deliberately NOT humanDuration() (above), which the #982 duration row uses.
+// This one ROUNDS and tops out at hours, because the tooltip is prose comparing
+// an age against a bound ("Idle 6 minutes — past the 5 minute idle bound") where
+// the nearest unit reads better than a truncated one. humanDuration() FLOORS and
+// carries on into days, because the row reports an elapsed clock and must not
+// claim a minute that has not fully passed. Same ladder, different rounding on
+// purpose; neither is a copy of the other's job.
 function fmtDurationApprox(ms) {
   const sec = Math.max(0, Math.round(Number(ms) / 1000));
   if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's');
@@ -7364,6 +7456,11 @@ async function renderTranscodersTab(container) {
       const inst = f.inst;
       const active = Number(inst.activeJobs) || 0;
       const health = instanceHealth(inst, idleTimeoutMs, renderedAt);
+      // One state-aware duration row: running time while busy, idle age while
+      // idle (issue #982). See instanceActivity(). Reads the same `renderedAt`
+      // clock the health pill does, so the pill and the row on one card can
+      // never be measured a few milliseconds apart.
+      const activity = instanceActivity(inst, renderedAt);
       return [
         '<div class="tc-card">',
         '  <div class="tc-card-head">',
@@ -7386,8 +7483,8 @@ async function renderTranscodersTab(container) {
         '  <div class="tc-meta">',
         '    <span class="text-muted">Workspace</span> <span class="text-mono">' + escHtml(f.workspaceId) + '</span>',
         '  </div>',
-        '  <div class="tc-meta">',
-        '    <span class="text-muted">Last idle</span> ' + escHtml(relativeTime(inst.lastIdleAt)),
+        '  <div class="tc-meta tc-activity" title="' + escHtml(activity.title) + '">',
+        '    <span class="text-muted">' + escHtml(activity.label) + '</span> ' + escHtml(activity.value),
         '  </div>',
         '</div>',
       ].join('');
@@ -7582,6 +7679,14 @@ export {
   instanceIdleSince,
   IDLE_OVERDUE_GRACE_MS,
   IDLE_STUCK_FACTOR,
+  // The transcoder card's one duration row is state-aware (issue #982): running
+  // time while an instance is busy, idle age — the quantity the reaping bound
+  // uses — while it is not. Exported so a unit test can pin both branches, the
+  // shared duration formatting, and the idle-clock fallback that mirrors the
+  // server's resolveIdleSince().
+  humanDuration,
+  resolveIdleSince,
+  instanceActivity,
   renderTranscodersTab,
   // Exported so a DOM/unit test can prove every rendered tab button is
   // routable — i.e. present in the allowlist AND backed by a renderer — and
