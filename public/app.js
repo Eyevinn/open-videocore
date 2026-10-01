@@ -7221,25 +7221,160 @@ function resolveJobsPerInstance(status) {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 }
 
-// Green (idle) / amber (partial) / red (at capacity) load class for an instance.
-function loadClass(activeJobs, capacity) {
-  const a = Number(activeJobs) || 0;
-  if (a <= 0) return 'load-idle';
-  if (a >= capacity) return 'load-full';
-  return 'load-partial';
+// ─── Instance lifecycle health (issue #980) ──────────────────────────────────
+//
+// The pill used to colour UTILISATION — idle `--success`, busy `--danger`. On a
+// pool of on-demand instances that are billed while alive, that inverts the
+// meaning of the colours: transcoding is the state being paid for, idle is the
+// state costing money for nothing. "At capacity" was tautological on top of
+// that — at a capacity of 1 it just means activeJobs >= 1, so every working
+// instance was at capacity by construction and a normal encode rendered red for
+// its whole run.
+//
+// What the pill colours now is lifecycle health: whether the instance is where
+// the scaler's OWN rules say it should be.
+//
+//   transcoding  activeJobs > 0                          green  — paid work
+//   draining     activeJobs === 0 && draining            gray   — deliberate
+//   idle         idle age <= idleTimeoutMs + grace       gray   — warm hold
+//   overdue      idle age >  idleTimeoutMs + grace       amber  — not reaped
+//   stuck        idle age >  idleTimeoutMs * 3           red    — genuinely wrong
+//
+// Every threshold is derived from the `idleTimeoutMs` in the status payload —
+// the bound the scaler is live-enforcing, changeable at runtime via PATCH
+// /api/v1/scaler/config — so none of this goes stale when an operator retunes
+// ENCORE_IDLE_TIMEOUT_MS.
+//
+// Pool-level saturation (work queued, every instance busy, pool at maxInstances)
+// is the condition that IS actionable, but it is a property of the pool, not of
+// any one instance, and is tracked separately in #981.
+
+// Grace added to the idle bound before an idle instance counts as overdue. The
+// scaler loop ticks every 10s, so an instance can legitimately sit a tick or two
+// past its bound waiting to be picked up. 60s absorbs that jitter without
+// masking a real failure to reap.
+const IDLE_OVERDUE_GRACE_MS = 60_000;
+
+// Multiple of the idle bound past which an idle instance is stuck rather than
+// merely late: the bound itself plus two orphan-reap cycles.
+const IDLE_STUCK_FACTOR = 3;
+
+// Client-side mirror of the server's resolveIdleSince()
+// (src/encore-scaler/scaler-loop.ts:128): the epoch ms an idle instance has been
+// idle since. Prefers `lastIdleAt` (a real completion stamp) and falls back to
+// `readyAt` (the moment it entered the pool ready for work), because
+// `lastIdleAt` only advances when a job COMPLETES — a freshly spawned instance
+// that has never been dispatched has no completion to key off, and without the
+// `readyAt` fallback would read as infinitely old and render amber the instant
+// it appeared.
+//
+// Returns undefined when neither field is usable. Callers must NOT guess an age
+// from that: numeric strings are accepted (the record round-trips through JSON
+// and may have been repaired out of band), anything else is not a timestamp.
+//
+// #980 and #982 arrived at this same mirror independently — the health pill
+// needs the idle age to pick a colour, the duration row needs it to print a
+// number — so it is ONE implementation (resolveIdleSince, above) under two
+// names rather than two copies that can drift apart from each other and from
+// scaler-loop.ts:128. The name is kept because both surfaces' tests and
+// comments refer to it, and `instanceIdleSince` reads better at the health
+// call site than the server-side spelling does.
+const instanceIdleSince = resolveIdleSince;
+
+// Coarse duration wording for the pill's explanatory text ("6 minutes").
+//
+// Deliberately NOT humanDuration() (above), which the #982 duration row uses.
+// This one ROUNDS and tops out at hours, because the tooltip is prose comparing
+// an age against a bound ("Idle 6 minutes — past the 5 minute idle bound") where
+// the nearest unit reads better than a truncated one. humanDuration() FLOORS and
+// carries on into days, because the row reports an elapsed clock and must not
+// claim a minute that has not fully passed. Same ladder, different rounding on
+// purpose; neither is a copy of the other's job.
+function fmtDurationApprox(ms) {
+  const sec = Math.max(0, Math.round(Number(ms) / 1000));
+  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's');
+  const min = Math.round(sec / 60);
+  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's');
+  const hr = Math.round(min / 60);
+  return hr + ' hour' + (hr === 1 ? '' : 's');
 }
 
-// Operator-facing wording for each load class. Derived from the class rather
-// than re-deciding the same thresholds a second time, so the dot colour and the
-// tooltip can never disagree.
-const LOAD_CLASS_LABELS = {
-  'load-idle': 'idle',
-  'load-partial': 'partially loaded',
-  'load-full': 'at capacity',
-};
+// Lifecycle-health verdict for one instance: { cls, label, detail }.
+//
+// One function decides the colour AND the wording, so the dot and the text can
+// never disagree — the class is not re-derived from the thresholds a second time.
+//
+// Contract (GET /api/v1/scaler/status, `instanceSchema` + `scalerStatusSchema`
+// in src/routes/scaler.ts): instance = { instanceId, url, activeJobs,
+// lastIdleAt?, readyAt?, draining? }; bound = top-level `idleTimeoutMs`.
+function instanceHealth(inst, idleTimeoutMs, now) {
+  const active = Number(inst && inst.activeJobs) || 0;
+  const draining = !!(inst && inst.draining === true);
+  const at = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
 
-function loadLabel(cls) {
-  return LOAD_CLASS_LABELS[cls] || cls;
+  // Transcoding is green at ANY duration. This branch is also what makes the
+  // idle maths below sound: `lastIdleAt` holds the PREVIOUS idle moment and does
+  // not advance during a run, so on a busy instance it is stale by exactly the
+  // length of the encode. Idle age is only ever evaluated at activeJobs === 0.
+  if (active > 0) {
+    return {
+      cls: 'health-transcoding',
+      label: 'transcoding',
+      detail: draining
+        ? 'Transcoding. Draining: finishing its in-flight work and taking no new jobs.'
+        : 'Transcoding — doing the work this instance is billed for.',
+    };
+  }
+
+  // A draining instance (#513, drain-don't-kill) has been selected for teardown
+  // and deliberately held past its idle bound, so "past the bound" is not a
+  // fault for it and must never be flagged amber or red.
+  if (draining) {
+    return {
+      cls: 'health-draining',
+      label: 'draining',
+      detail: 'Selected for teardown and taking no new jobs. Not flagged for being past its idle bound.',
+    };
+  }
+
+  const bound = Number(idleTimeoutMs);
+  const idleSince = instanceIdleSince(inst);
+  if (!Number.isFinite(bound) || bound <= 0 || idleSince === undefined) {
+    // No usable bound, or no usable timestamp on the record: there is no
+    // evidence of a lifecycle fault, so do not invent one. The server's own
+    // scale-down path fails CLOSED on a missing stamp (isIdlePastTimeout,
+    // src/encore-scaler/scaler-loop.ts:148), so such an instance still gets
+    // reaped — its age simply is not diagnosable from this payload.
+    return {
+      cls: 'health-idle',
+      label: 'idle',
+      detail: 'Idle. Age not available from this payload.',
+    };
+  }
+
+  const idleAge = at - idleSince;
+  const boundText = fmtDurationApprox(bound);
+  if (idleAge > bound * IDLE_STUCK_FACTOR) {
+    return {
+      cls: 'health-stuck',
+      label: 'stuck',
+      detail: 'Idle ' + fmtDurationApprox(idleAge) + ' — more than ' + IDLE_STUCK_FACTOR +
+        '× the ' + boundText + ' idle bound. Teardown has failed; this is burning money.',
+    };
+  }
+  if (idleAge > bound + IDLE_OVERDUE_GRACE_MS) {
+    return {
+      cls: 'health-overdue',
+      label: 'overdue',
+      detail: 'Idle ' + fmtDurationApprox(idleAge) + ' — past the ' + boundText +
+        ' idle bound. Should already have been torn down.',
+    };
+  }
+  return {
+    cls: 'health-idle',
+    label: 'idle',
+    detail: 'Idle ' + fmtDurationApprox(idleAge) + ' — within the ' + boundText + ' idle bound.',
+  };
 }
 
 async function renderTranscodersTab(container) {
@@ -7304,23 +7439,42 @@ async function renderTranscodersTab(container) {
     }
 
     const capacity = resolveJobsPerInstance(status);
+    // The live idle bound every health threshold is measured against (#980),
+    // taken from the payload (`idleTimeoutMs`, scalerStatusSchema in
+    // src/routes/scaler.ts) rather than hardcoded here, so the colours follow
+    // ENCORE_IDLE_TIMEOUT_MS / PATCH /scaler/config instead of drifting from it.
+    const idleTimeoutMs = status && typeof status.idleTimeoutMs === 'number'
+      ? status.idleTimeoutMs
+      : undefined;
+    // One clock for the whole grid, so two cards rendered from the same payload
+    // cannot land on different sides of a threshold.
+    const renderedAt = Date.now();
 
     const grid = document.createElement('div');
     grid.className = 'tc-grid';
     grid.innerHTML = flatInstances.map(function(f) {
       const inst = f.inst;
       const active = Number(inst.activeJobs) || 0;
-      const cls = loadClass(active, capacity);
-      const label = loadLabel(cls);
+      const health = instanceHealth(inst, idleTimeoutMs, renderedAt);
       // One state-aware duration row: running time while busy, idle age while
-      // idle (issue #982). See instanceActivity().
-      const activity = instanceActivity(inst);
+      // idle (issue #982). See instanceActivity(). Reads the same `renderedAt`
+      // clock the health pill does, so the pill and the row on one card can
+      // never be measured a few milliseconds apart.
+      const activity = instanceActivity(inst, renderedAt);
       return [
         '<div class="tc-card">',
         '  <div class="tc-card-head">',
         '    <span class="tc-id text-mono">' + escHtml(inst.instanceId) + '</span>',
-        '    <span class="tc-load ' + cls + '" title="' + escHtml(label) + '">',
-        '      <span class="tc-dot"></span>' + escHtml(String(active)) + ' / ' + escHtml(String(capacity)),
+        '    <span class="tc-card-head-right">',
+        // Utilisation is still worth reporting — it is just not a health signal,
+        // so it renders as neutral text instead of a traffic light (#980).
+        '      <span class="tc-load text-mono" title="Active jobs of this instance’s job capacity.">' +
+        escHtml(String(active)) + ' / ' + escHtml(String(capacity)) + '</span>',
+        // The state name is VISIBLE text, not a tooltip: the meaning of the
+        // colour has to be readable without hovering (and without colour vision).
+        '      <span class="tc-health ' + health.cls + '" title="' + escHtml(health.detail) + '">',
+        '        <span class="tc-dot"></span>' + escHtml(health.label),
+        '      </span>',
         '    </span>',
         '  </div>',
         '  <div class="tc-row">',
@@ -7515,11 +7669,16 @@ export {
   SEARCH_FORMAT_PLACEHOLDER,
   // Per-instance capacity is read from the wire, not inferred (issue #979).
   // Exported so a DOM/unit test can assert the card reports the server's
-  // `jobsPerInstance` and that an instance below it renders as partially loaded —
-  // the state that was unreachable while capacity was derived from observed load.
+  // `jobsPerInstance`.
   resolveJobsPerInstance,
-  loadClass,
-  loadLabel,
+  // The instance pill colours LIFECYCLE HEALTH, not utilisation (issue #980).
+  // Exported so a DOM/unit test can pin the two traps that make the naive
+  // version wrong: `lastIdleAt` is stale while an instance is busy, and a
+  // draining instance is deliberately past its idle bound.
+  instanceHealth,
+  instanceIdleSince,
+  IDLE_OVERDUE_GRACE_MS,
+  IDLE_STUCK_FACTOR,
   // The transcoder card's one duration row is state-aware (issue #982): running
   // time while an instance is busy, idle age — the quantity the reaping bound
   // uses — while it is not. Exported so a unit test can pin both branches, the
