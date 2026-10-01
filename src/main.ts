@@ -1890,7 +1890,13 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // uses, so the membership view is consistent.
   collectionRepository,
   // Best-effort audit emission for asset mutations (issue #564).
-  audit: auditEmitter
+  audit: auditEmitter,
+  // Per-asset retention window on the read contract (issue #1034). Bound to the
+  // SAME live instance global the purge loop ticks on (`archiveRetentionMs`,
+  // hot-swapped by PATCH /api/v1/retention/config), read per request — so the
+  // window a read reports and the window the sweep enforces are one value, and a
+  // config change is reflected on the next read with no restart.
+  retentionMs: () => archiveRetentionMs
 };
 await app.register(assetsRouter, assetRouterOptions);
 
