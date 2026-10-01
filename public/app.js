@@ -54,6 +54,14 @@ import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete
 // full contract grounding is in that module's header.
 import { mountReviewState } from './review-state.js';
 
+// Editorial tags control (issue #899, broken out of #792): add/remove for the
+// asset's `descriptive.tags`, which had two write endpoints
+// (POST /assets/{id}/tags, DELETE /assets/{id}/tags/{tag}) and no control
+// anywhere in this UI. Add and remove only — the API exposes no rename and no
+// bulk operation. Full contract grounding, including the un-removable-tag gap,
+// is in that module's header.
+import { mountEditorialTags } from './editorial-tags.js';
+
 // Asset rename affordance (issue #956): a control for the `name` field that
 // PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
 // could trigger. UI only — no route or schema changes. Full contract grounding,
@@ -161,6 +169,33 @@ function canChangeDeleteLock() {
 function canChangeReviewState() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may ADD tags to an asset (issue #899).
+// `POST /assets/{id}/tags` is a `write`: `methodToAction`
+// (src/auth/authorize.ts:79-93) maps POST -> write and `MATRIX` (:54-58) gives
+// `write` to `editor` and `admin` only, applied by
+// `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1748 — router-scoped, so it covers the tag
+// sub-resources). Client-side mirror only; the 403
+// (`forbidden_insufficient_role`, :99) is still handled when it arrives.
+function canAddAssetTags() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may REMOVE a tag (issue #899). Deliberately a
+// SECOND check rather than a reuse of canAddAssetTags(): removal goes through
+// `DELETE /assets/{id}/tags/{tag}`, which `methodToAction`
+// (src/auth/authorize.ts:79-93) maps to the `delete` action, not `write`. Today
+// `MATRIX` (:54-58) grants both to the same two roles so the two checks agree,
+// but a future role holding `write` without `delete` could add tags it cannot
+// remove, and collapsing them into one gate would render a remove button that
+// is guaranteed to 403.
+function canRemoveAssetTags() {
+  const r = getClientRole();
+  const allowed = { viewer: false, editor: true, admin: true };
+  return allowed[r] === true;
 }
 
 // Whether the current client role may rename an asset (issue #956). Same matrix,
@@ -2573,7 +2608,12 @@ async function renderAssetDetailBody(id, bodyEl) {
       ['Title', escHtml(asset.title || asset.name || '—')],
       ['Status', statusCell],
       ['MIME type', escHtml(asset.mimeType || '—')],
-      ['Tags', renderTags(asset.tags)],
+      // No `Tags` row here (issue #899): tags are now an editable group lower
+      // down the pane (see the mountEditorialTags call). A read-only copy up
+      // here would be a second rendering of the same field that silently goes
+      // stale the moment a tag is added or removed. `renderTags` itself is
+      // untouched — the search-results table and the shared assets table both
+      // still use it.
       ['Created', escHtml(fmtDate(asset.createdAt))],
       ['Updated', escHtml(fmtDate(asset.updatedAt))]
     );
@@ -3077,6 +3117,49 @@ async function renderAssetDetailBody(id, bodyEl) {
       anchorEl: actionsDiv,
       host: body,
       canChange: canChangeReviewState(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
+
+    // ── Tags: add / remove (issue #899) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/editorial-tags.js:
+    //   READ — no request of its own. `asset.tags` from the asset read already
+    //        in hand; ABSENT (not []) when empty, so undefined and [] render
+    //        identically. (openapi.json
+    //        .paths["/api/v1/assets/{id}"].get.responses["200"]…properties.tags
+    //        = array of string, NOT in that schema's `required`;
+    //        src/routes/assets.ts:914, src/data/asset-document.ts:692)
+    //   POST /api/v1/assets/{id}/tags — body REQUIRED
+    //        { tags: string[] } (1..128 items, each 1..128 chars); 200 = the
+    //        FULL asset with the merged + deduplicated list, 404 { error }.
+    //        (…tags"].post; src/routes/assets.ts:5466-5487, merge at :5480 via
+    //        normalizeTags, src/data/asset-repo.ts:1297-1307)
+    //   DELETE /api/v1/assets/{id}/tags/{tag} — no body; 200 = the FULL asset,
+    //        404 { error }; removing an absent tag is a 200 no-op.
+    //        (…tags/{tag}"].delete; src/routes/assets.ts:5493-5514)
+    //
+    // Mounted immediately after the review block and before the action row, so
+    // the editorial surface reads Review -> Tags in the order
+    // docs/design/editorial-panel-layout.md §2 fixes, and no other block moves.
+    // Both writes answer with the full asset, so the group redraws from the
+    // response rather than patching its pill list — the only way the UI sees
+    // the server's dedupe and ordering. It never re-renders this pane, which
+    // would discard the operator's half-typed entry.
+    //
+    // Two capability flags, not one: POST is the `write` action and DELETE is
+    // the `delete` action (src/auth/authorize.ts:79-93).
+    //
+    // Sub-resource paths take the ULID (`asset.id`): neither tag route resolves
+    // a slug (both call repo.get(params.id) directly, :5476 and :5502).
+    mountEditorialTags({
+      assetId: asset.id,
+      tags: asset.tags,
+      anchorEl: actionsDiv,
+      host: body,
+      canAdd: canAddAssetTags(),
+      canRemove: canRemoveAssetTags(),
       apiFetch: apiFetch,
       showMsg: showMsg,
     });
@@ -7337,6 +7420,13 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirrors of the ADR-018 gates for the two tag writes
+  // (issue #899): POST /assets/{id}/tags is `write`, DELETE
+  // /assets/{id}/tags/{tag} is `delete`. Exported so a DOM/unit test can assert
+  // the add and remove affordances are offered to exactly the roles that hold
+  // each action — separately, as the matrix defines them.
+  canAddAssetTags,
+  canRemoveAssetTags,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
