@@ -71,6 +71,18 @@ import { mountAssetRename } from './asset-rename.js';
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
 
+// Version-chain navigation on asset detail (issue #907, broken out of #795):
+// the whole lineage an asset belongs to, as the tree the API can describe, with
+// the SERVER-COMPUTED current version badged, the asset being viewed marked
+// separately, every other member navigable, and an explicit state for an asset
+// with no other versions. One call — GET /assets/{id}/versions — which the
+// detail view's own GET /assets/{id} body cannot answer: that body carries the
+// asset's own `versionGroupId` but not the other members of the group. Full
+// contract grounding, and what the API does NOT expose (no promote/set-current
+// operation of any kind), is in that module's header; the interaction design it
+// implements is docs/design/asset-version-chain.md.
+import { mountVersionChain } from './version-chain.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -2374,7 +2386,13 @@ async function showAssetDetail(id, detailPanel) {
   });
 
   const body = detailPanel.querySelector('#detail-body');
-  await renderAssetDetailBody(id, body);
+  // Navigating the version chain (issue #907) rebuilds the whole pane, not just
+  // the body: the pop-out button above closes over `id`, so re-rendering the
+  // body alone would leave "open in new window" pointing at the version the
+  // operator just navigated away from.
+  await renderAssetDetailBody(id, body, {
+    onNavigate: function (nextId) { return showAssetDetail(nextId, detailPanel); },
+  });
 }
 
 // Fetch and render an asset's downloadable files + streaming file groups into
@@ -2520,7 +2538,18 @@ async function renderAssetFiles(assetId, container) {
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
 // the fetched asset (or throws if the fetch fails / 404s so callers can react).
-async function renderAssetDetailBody(id, bodyEl) {
+//
+// `opts.onNavigate(nextId)` (optional, issue #907) is how the version-chain
+// block hands the view to another member of the same chain. The default —
+// re-render this same body element for the new id — is correct for the embedded
+// side panel; callers whose surface owns more chrome than the body (the asset
+// pane's pop-out button, the detached window's self-poll) override it so their
+// chrome follows the navigation instead of going stale.
+async function renderAssetDetailBody(id, bodyEl, opts) {
+  const options = opts || {};
+  const navigateToVersion = typeof options.onNavigate === 'function'
+    ? options.onNavigate
+    : function (nextId) { return renderAssetDetailBody(nextId, bodyEl, options); };
   const body = bodyEl;
   body.innerHTML = '';
   const loader = loadingEl();
@@ -2766,6 +2795,51 @@ async function renderAssetDetailBody(id, bodyEl) {
     mountAssetTracks({
       asset: asset,
       host: body,
+    });
+
+    // ── Versions: the asset's whole version chain (issue #907) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/version-chain.js:
+    //   GET /api/v1/assets/{id}/versions — the ONLY operation on that path
+    //        (openapi.json .paths["/api/v1/assets/{id}/versions"]; handler
+    //        src/routes/assets.ts:3446-3484). 200 =
+    //        { assetId, versionGroupId?, currentVersionId, versions[] },
+    //        required ["assetId","currentVersionId","versions"] (:3452-3457);
+    //        items are the full assetSchema, of which this block reads `id`,
+    //        `name`, `status`, `createdAt` and the lineage edge
+    //        `versionOfAssetId` (:882). 404 = flat { error, message? } (:529).
+    //        No query parameters: the chain is not paginated, only capped at
+    //        MAX_LIMIT = 200 (src/data/asset-repo.ts:853).
+    //
+    // Three things this block does NOT do, because the contract does not
+    // support them:
+    //   - It never re-derives the current version. `currentVersionId` is
+    //     computed server-side by a preference ladder over `status`
+    //     (src/data/asset-repo.ts:1275-1294) and is explicitly NOT "the last
+    //     array element" (:1239-1243), so the field is read as sent.
+    //   - It offers no promote / set-current control: no endpoint accepts one,
+    //     and there is no stored marker it could write (ADR-024 D3). Current is
+    //     shown as observed state, never as an operator choice.
+    //   - It never reparents a member whose `versionOfAssetId` is outside the
+    //     returned page; those are grouped as orphans rather than attached to
+    //     the root, which would assert an edge the API did not report.
+    //
+    // The path takes the ULID (`asset.id`): unlike GET /assets/{id}, this route
+    // passes the raw param to repo.listVersions (:3463), which looks up by id
+    // alone — a slug would 404. The detail pane holds the ULID even when it was
+    // opened by slug.
+    //
+    // Mounted with the other read-only information blocks and ABOVE the action
+    // controls, next to Tracks: it reports lineage and originates no mutation.
+    await mountVersionChain({
+      assetId: asset.id,
+      host: body,
+      apiFetch: apiFetch,
+      // Inject the app's own status->class map so one `status` value never
+      // renders two different ways on a single page.
+      badgeClass: badgeClass,
+      onNavigate: navigateToVersion,
     });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
