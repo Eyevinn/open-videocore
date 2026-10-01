@@ -159,6 +159,8 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `MINIO_ROOT_PASSWORD` | **Yes** | Admin password used when provisioning MinIO instances. |
 | `COUCHDB_ADMIN_PASSWORD` | **Yes** | Admin password used when provisioning CouchDB instances. |
 | `PORT` | No | HTTP port (default `3000`). |
+| `PROVISION_READY_TIMEOUT_MS` | No | How long provisioning waits for each backing instance to report healthy, in milliseconds (default `300000`, i.e. 5 minutes). The wait polls instance health on its own loop and treats a dropped poll as "not ready yet", so a single network blip no longer aborts the stack; on timeout the error names the service and the last probe error, and the usual rollback tears down what that run created. |
+| `PROVISION_READY_POLL_INTERVAL_MS` | No | How often that readiness wait re-checks instance health, in milliseconds (default `1000`). |
 | `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). |
 | `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances the auto-scaler keeps warm per workspace even when idle (default `0` — scale to zero). Set to `1` or more to keep a warm floor for production / latency-sensitive shared pools. See [Auto-scaler warm floor](#auto-scaler-warm-floor-cost-vs-reliability) for the cost-vs-reliability trade-off. |
 | `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`, i.e. 5 minutes). Sets the boot-time default; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`idleTimeoutMs`, minimum `10000`). |
