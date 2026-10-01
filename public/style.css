@@ -829,7 +829,34 @@ button:disabled {
   color: var(--text);
 }
 
+.tc-card-head-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Utilisation readout: "activeJobs / capacity". Deliberately uncoloured —
+   utilisation is context, not a health signal, and colouring it is what made a
+   working instance render red (#980). The traffic light lives on .tc-health. */
 .tc-load {
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.tc-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* Lifecycle-health pill (#980). Carries the state name as visible text next to
+   the dot, so the meaning of the colour is readable without hovering and the
+   colour is never the only channel. */
+.tc-health {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -841,25 +868,28 @@ button:disabled {
   border: 1px solid var(--border);
 }
 
-.tc-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: currentColor;
-}
-
-.tc-load.load-idle {
+/* Doing the work the instance is billed for. */
+.tc-health.health-transcoding {
   color: var(--success);
   background: color-mix(in srgb, var(--success) 12%, transparent);
 }
 
-.tc-load.load-partial {
+/* Normal warm hold, and the deliberate drain state (#513): both are expected,
+   neither is actionable, so both read as muted rather than as an alert. */
+.tc-health.health-idle,
+.tc-health.health-draining {
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+}
+
+/* Past its idle bound plus grace — should have been reaped by now. */
+.tc-health.health-overdue {
   color: var(--warning);
   background: color-mix(in srgb, var(--warning) 14%, transparent);
 }
 
-.tc-load.load-full {
+/* Past three times its idle bound — teardown has genuinely failed. */
+.tc-health.health-stuck {
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 14%, transparent);
 }
