@@ -71,6 +71,13 @@ import { mountAssetRename } from './asset-rename.js';
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
 
+// Comments panel (issue #900): the free-text notes on an asset, plus one control
+// to add another. ADD + READ ONLY — the API exposes exactly `post` and `get` on
+// /api/v1/assets/{id}/comments and no `…/comments/{commentId}` path at all, so
+// an edit or delete control would have nothing to call. Full contract grounding,
+// including the author field the API does not have, is in that module's header.
+import { mountAssetComments } from './comments-panel.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -171,6 +178,19 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add a comment to an asset (issue #900).
+// Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only, and
+// `methodToAction` (:79-93) maps POST -> write, so POST /assets/{id}/comments is
+// refused to a `viewer` with 403 by `resourceAuthorizationPreHandler('asset')`
+// (:126, registered src/routes/assets.ts:1748). GET on the same sub-resource is
+// `read`, which a viewer DOES hold — so a viewer still sees every comment,
+// read-only. Client-side mirror only: the 403 is still handled if it arrives.
+function canAddComment() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -3079,6 +3099,55 @@ async function renderAssetDetailBody(id, bodyEl) {
       canChange: canChangeReviewState(),
       apiFetch: apiFetch,
       showMsg: showMsg,
+    });
+
+    // ── Comments: add + read (issue #900) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/comments-panel.js. Note the real path: the issue
+    // says `/comments`, but the comments collection is a SUB-RESOURCE of one
+    // asset and no top-level `/comments` path exists.
+    //   GET  /api/v1/assets/{id}/comments — 200 is a bare ARRAY of
+    //        { id, assetId, body, createdAt } (all four `required`,
+    //        additionalProperties false), 404 { error }. No query parameters at
+    //        all, so the list is unpaged and the server's order — oldest first
+    //        (listByAsset, src/data/comment-repo.ts:50-58) — is rendered as
+    //        given. (openapi.json .paths["/api/v1/assets/{id}/comments"].get;
+    //        src/routes/assets.ts:4798-4814)
+    //   POST /api/v1/assets/{id}/comments — body REQUIRED and carries EXACTLY
+    //        `body` (string, 1..4096 after trim); 201 = the created comment,
+    //        404 { error }, plus an undeclared-but-real 400 from the body
+    //        schema. (…].post; src/routes/assets.ts:4776-4793,
+    //        commentBodySchema :1174-1176)
+    //
+    // Mounted directly below "Editorial review" and above the action row, with
+    // the other editorial blocks: a comment is editorial commentary on the
+    // asset, not a lifecycle operation.
+    //
+    // ADD + READ ONLY, and not as a scope decision to revisit: the path carries
+    // only `post` and `get`, there is no `…/comments/{commentId}` path, and
+    // `CommentRepository` declares only `create` + `listByAsset`
+    // (src/data/comment-repo.ts:29-33). The panel also attributes no comment to
+    // anyone, because `Comment` has no author field (:17-22) and the API has no
+    // per-user identity to fill one with (src/auth/principal.ts:11-16).
+    //
+    // A successful add re-reads the sub-resource and rebuilds the block in
+    // place — one request, no full detail re-render — because `id` and
+    // `createdAt` are server-minted, so the returned list is the only truthful
+    // one. The panel keeps its own in-memory draft per asset id so the detached
+    // window's 5s self-poll cannot wipe a half-typed comment.
+    //
+    // Sub-resource paths take the ULID (`asset.id`): both handlers resolve the
+    // parent with a plain `repo.get(request.params.id)` and no slug fallback
+    // (src/routes/assets.ts:4786, :4807).
+    await mountAssetComments({
+      assetId: asset.id,
+      anchorEl: actionsDiv,
+      host: body,
+      canAdd: canAddComment(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+      fmtDate: fmtDate,
     });
 
     // ── Delete protection: lock / unlock (issue #895) ──
