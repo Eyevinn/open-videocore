@@ -501,6 +501,116 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* ── External identifiers (issue #908) ──────────────────────────────────────
+   Upstream { namespace, id } correlations. The namespace is a label from
+   somebody else's system, the identifier is an opaque key, and they are NOT
+   interchangeable — so they get separate columns with separate headers, and the
+   identifier reuses the monospace .cell-id treatment the UI already gives ids.
+   A left border matching .review-block marks this as a detail-panel block with
+   its own controls rather than part of the KV grid above. */
+.external-ids-block {
+  border-left: 3px solid var(--border);
+  padding-left: 10px;
+}
+
+/* The namespace is the smaller of the two values and reads as a label. */
+.external-id-namespace {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+/* An upstream id can be a long URN; let it wrap rather than widen the table. */
+.external-id-value {
+  word-break: break-all;
+}
+
+.external-id-actions {
+  white-space: nowrap;
+}
+
+.external-id-actions .btn-ghost + .btn-ghost {
+  margin-left: 6px;
+}
+
+/* Explanatory prose: the intro, the free-text namespace note, the "edit is two
+   requests" note, and the read-only role note. */
+.external-id-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+.external-id-role-note {
+  margin-top: 10px;
+}
+
+/* The add/edit form. A real fieldset/legend so the two fields are announced as
+   one group, and the legend doubles as the form's visible heading. */
+.external-id-form {
+  margin-top: 10px;
+}
+
+.external-id-fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 0;
+}
+
+.external-id-legend {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.external-id-field {
+  margin-top: 10px;
+}
+
+.external-id-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.external-id-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.external-id-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* Per-field and whole-form validation messages. Carried as TEXT next to the
+   field, never by colour alone (WCAG 1.4.1 / 3.3.1), and collapsed to nothing
+   when empty so no space is reserved for an error that is not there. */
+.external-id-error {
+  font-size: 12px;
+  color: var(--danger);
+  margin-top: 4px;
+}
+
+.external-id-error:empty {
+  display: none;
+}
+
+/* A field the client-side mirror of the API's bounds rejected. The ring is an
+   addition to the message above, not a replacement for it. */
+.external-id-input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.external-ids-msg:empty {
+  display: none;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
