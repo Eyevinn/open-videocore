@@ -70,6 +70,7 @@ import { mountAssetRename } from './asset-rename.js';
 // own. Full contract grounding, including what the API does NOT expose, is in
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
+import { AUDIO_EDIT_COPY } from './audio-track-edit.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -171,6 +172,22 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add or remove an asset's editorial audio
+// tracks (issue #903). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only and
+// `delete` to the same two, and `methodToAction` (:79-93) maps POST -> write and
+// DELETE -> delete. Both track routes sit under
+// `resourceAuthorizationPreHandler('asset')`, registered plugin-scoped on EVERY
+// asset route (src/routes/assets.ts:1748), so POST /assets/{id}/audio-tracks and
+// DELETE /assets/{id}/audio-tracks/{trackId} are both refused to a `viewer` with
+// 403 `forbidden_insufficient_role` (:99). A viewer still holds `read`, so the
+// tracks panel itself stays fully visible — only the write controls go.
+// Client-side mirror only: the 403 is still handled if it arrives.
+function canEditAudioTracks() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2754,18 +2771,49 @@ async function renderAssetDetailBody(id, bodyEl) {
     //        `technical.video = [{ codec, width, height, bitrateBps }]`
     //        (src/data/asset-document.ts:402-404).
     //
-    // GET /api/v1/assets/{id}/tracks exists but is NOT called: its handler sends
-    // `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []` off the same
-    // document (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would
-    // cost a round-trip for bytes this renderer is holding.
+    // GET /api/v1/assets/{id}/tracks exists but is NOT called on the render
+    // path: its handler sends `asset.audioTracks ?? []` /
+    // `asset.subtitleTracks ?? []` off the same document
+    // (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would cost a
+    // round-trip for bytes this renderer is holding. The audio editor DOES call
+    // it, but only after a 204 from a remove, which carries no body — see
+    // public/audio-track-edit.js.
     //
-    // Mounted here, with the other read-only information blocks (status history,
-    // metadata, scenes) and ABOVE the action controls, because it is reporting
-    // only: #902 is explicitly read-only, so the panel creates no add/remove
-    // affordance for the POST/DELETE track routes that do exist.
+    // Mounted here, with the other information blocks (status history, metadata,
+    // scenes) and ABOVE the action controls, because it is predominantly
+    // reporting: the only writes it offers are the two scoped to its own audio
+    // section.
+    //
+    // ── Audio track add/remove (issue #903, broken out of #794) ──
+    // Contract fetched before these calls were written and cited in full in
+    // public/audio-track-edit.js:
+    //   POST /api/v1/assets/{id}/audio-tracks — body
+    //        { language (required, 1-64), codec? (1-64), channels? (int 1-64),
+    //        label? (1-128), default? } `additionalProperties: false`
+    //        (addAudioTrackSchema, src/routes/assets.ts:821-827, wired :5325-5355);
+    //        201 returns the asset's FULL updated `{ audioTracks }` (:5333,
+    //        :5351-5353), so a successful add needs no follow-up read. 404 is the
+    //        only other declared response.
+    //   DELETE /api/v1/assets/{id}/audio-tracks/{trackId} — no body; 204 (empty,
+    //        no content-type on the wire) or 404 (src/routes/assets.ts:5360-5382).
+    //        The handler filters the list and patches ONE key (:5375, :5379), so
+    //        it deletes no media and touches nothing else.
+    // `asset.id` is the ULID even when this pane was opened by slug, which is
+    // what both routes need: each hands its raw path param to `repo.get` with no
+    // slug fallback (:5339, :5370).
     mountAssetTracks({
       asset: asset,
       host: body,
+      audioEdit: canEditAudioTracks()
+        ? {
+            assetId: asset.id,
+            apiFetch: apiFetch,
+            confirmModal: confirmModal,
+          }
+        : null,
+      // A viewer keeps the whole panel (they hold `read`) and is told once why
+      // the controls are not there, rather than being left to wonder.
+      audioEditDenied: canEditAudioTracks() ? null : AUDIO_EDIT_COPY.roleNote,
     });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
