@@ -2065,6 +2065,26 @@ body.detail-standalone .assets-side {
   min-width: 220px;
 }
 
+/* Assets table tag + metadata filter boxes (issue #914). Same box as the
+   free-text filter, minus the magnifier: a tag list is not a search term, and a
+   second magnifier in the same bar would say the three boxes do the same thing.
+   Only the left padding changes — the clear control still needs its 26px. */
+.ops-table-filters .ops-search-input-plain {
+  padding-left: 8px;
+  min-width: 180px;
+}
+
+/* The accepted shape (comma-separated tags, key=value pairs) stated under the
+   box rather than hidden in a placeholder the value overwrites. Bounded to the
+   control's width so a filter bar of three boxes does not reflow. */
+.ops-table-filters .ops-filter-hint {
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.3;
+  max-width: 220px;
+  color: var(--text-muted);
+}
+
 /* The native type="search" affordance is suppressed so there is never a second,
    unstyled, keyboard-invisible x next to ours. */
 .ops-search-input::-webkit-search-cancel-button,

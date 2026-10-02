@@ -55,6 +55,31 @@
  *     of matching ASSETS; `collectionTotal` counts collection hits separately and
  *     this table (assets only) ignores it.
  *
+ * TAG + METADATA FILTERS (issue #914). The filter bar also narrows by tag and by
+ * free-form operator metadata. Both are filters ONLY `GET /api/v1/search/` has —
+ * `GET /api/v1/assets/` declares neither (verified: openapi.json
+ * .paths["/api/v1/assets/"].get.parameters is limit/offset/status/parentId/from/to
+ * only, and `listQuerySchema`, src/routes/assets.ts:373) — so setting either one
+ * routes the request to the tier-2 search endpoint even with NO free-text term.
+ * That is sound, not a workaround: `q` is `.optional()` on `searchQuerySchema`
+ * (src/routes/search.ts:155-166), so a tags-only or metadata-only search is a
+ * first-class query, and every filter is applied to the whole matched set before
+ * the page slice, so the reported `total` stays exact (#834) on this tier too.
+ *   tags      — `?tags=` accepts a repeated param OR one comma-separated list and
+ *               normalises to a trimmed, non-empty array (`tagsSchema`,
+ *               src/routes/search.ts:139-150). The control therefore sends the
+ *               operator's comma-separated text as a single `tags` param, which is
+ *               the SAME shape the Search tab sends (app.js renderSearchTab:
+ *               `params.set('tags', tags)`).
+ *   metadata  — one `metadata.<key>=<value>` param per pair (issue #12;
+ *               `extractMetadataFilter`, src/routes/search.ts:221-240, which pulls
+ *               the dynamic keys out of the `.passthrough()` querystring at
+ *               src/routes/search.ts:218). Because the key names are dynamic they
+ *               appear in no OpenAPI `parameters` list — the route source IS the
+ *               contract for them.
+ * Container/MIME (`mimeType`) is deliberately NOT offered here (issue #822 owns
+ * that vocabulary; explicitly out of scope for #914), even though the param exists.
+ *
  * `status` / `from` / `to` ARE SERVER-SIDE ON BOTH TIERS (issue #833, merged).
  * Both endpoints share ONE definition of the created-at range grammar and match
  * semantics — `CreatedFromSchema`/`CreatedToSchema`/`resolveCreatedRange` in
@@ -279,6 +304,52 @@ function applyClientSort(rows, sort) {
   return out;
 }
 
+// ─── Structured filter parsing (issue #914) ───────────────────────────────────
+//
+// Both controls below hold their value as the raw text the operator typed, so the
+// box always shows exactly what they wrote. These two functions are the single
+// place that text becomes request shape — used by the fetch layer AND by the URL
+// sync, so a shared link and the request it reproduces can never disagree.
+
+// Comma-separated tag text -> trimmed, non-empty, de-duped tag list. Mirrors the
+// server's own normalisation (`tagsSchema`, src/routes/search.ts:139-150) so the
+// client never sends a blank tag the server would only drop.
+function parseTagsFilter(raw) {
+  if (typeof raw !== 'string') return [];
+  const out = [];
+  const seen = new Set();
+  raw.split(',').forEach(function (part) {
+    const t = part.trim();
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
+  });
+  return out;
+}
+
+// Comma-separated `key=value` text -> [{ key, value }]. Only the first `=` splits
+// a pair, so a value may contain `=`. A token with no `=` or a blank key is NOT a
+// filter the `metadata.<key>=<value>` grammar can carry, so it is dropped rather
+// than sent as something the server would ignore — the operator sees the full set
+// of rows their partially-typed filter still matches, and the control's hint says
+// what the shape is. A blank VALUE is kept: `metadata.genre=` is a real filter.
+// One pair per key, because the server keeps only the first value for a repeated
+// key (`extractMetadataFilter`, src/routes/search.ts:221-240).
+function parseMetadataFilter(raw) {
+  if (typeof raw !== 'string') return [];
+  const out = [];
+  const seen = new Set();
+  raw.split(',').forEach(function (part) {
+    const eq = part.indexOf('=');
+    if (eq < 0) return;
+    const key = part.slice(0, eq).trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ key, value: part.slice(eq + 1).trim() });
+  });
+  return out;
+}
+
 // ─── Data-source router: choose the FTS tier or the exact/range list tier ─────
 //
 // Given the primitive's current interaction state, build and run the correct
@@ -295,18 +366,31 @@ async function fetchAssetsPage(snap, deps) {
   const status = filters.status || '';
   const from = filters.from || '';
   const to = filters.to || '';
+  // Structured filters only the search tier can express (issue #914).
+  const tags = parseTagsFilter(filters.tags);
+  const metadata = parseMetadataFilter(filters.meta);
   const limit = snap.pageSize;
   const offset = snap.offset;
 
-  if (q) {
+  if (q || tags.length || metadata.length) {
     // ── Tier 2: free-text FTS via the canonical GET /api/v1/search/ path. ──
     // Paged by page/pageSize (page is 1-based). Envelope:
     // { assets, collections, total, collectionTotal, page }.
     const page = Math.floor(offset / limit) + 1;
     const params = new URLSearchParams();
-    params.set('q', q);
+    // `q` is optional on this endpoint, so a tags-only / metadata-only filter
+    // reaches the search tier WITHOUT an empty `q` (which would be a 400: the
+    // schema is `.min(1)`).
+    if (q) params.set('q', q);
     params.set('page', String(page));
     params.set('pageSize', String(limit));
+    // One comma-separated `tags` param — the shape `tagsSchema` normalises and
+    // the shape the Search tab already sends.
+    if (tags.length) params.set('tags', tags.join(','));
+    // One `metadata.<key>=<value>` param per pair (issue #12 query grammar).
+    metadata.forEach(function (pair) {
+      params.set('metadata.' + pair.key, pair.value);
+    });
     // status/from/to are real server params here (issue #833) — send them so the
     // filter narrows the whole matched set, not the page in hand.
     if (status) params.set('status', status);
@@ -457,8 +541,16 @@ function searchFilterControl(initial) {
     wrap.appendChild(span);
     wrap.appendChild(field);
 
-    // Wire the three rhythms onto the primitive's single onChange(value).
-    function wire(onChange) {
+    return { el: wrap, input, clear, wire: debouncedTextWiring(input, clear, initial) };
+  };
+}
+
+// The three typing rhythms a live text filter needs — debounce, flush, clear —
+// factored out of searchFilterControl so the tag and metadata boxes (issue #914)
+// behave identically to the free-text box instead of re-deriving the behaviour.
+// Returns the `wire(onChange)` function asSlot() expects.
+function debouncedTextWiring(input, clear, initial) {
+  return function wire(onChange) {
       let timer = null;
       // The value most recently handed to the table. Lets the flush paths (Enter,
       // blur) skip a second, identical request when the debounce already landed.
@@ -471,11 +563,11 @@ function searchFilterControl(initial) {
         }
       }
 
-      // Hand the box's current value to the table now. Trimmed, because the
+      // Hand the box's current value to the table now, trimmed: a whitespace-only
+      // value is not a filter. For the free-text box that matters because the
       // verified `q` param is a 1..512 string (openapi.json
-      // .paths["/api/v1/search/"].get.parameters) and a whitespace-only term is
-      // not a term — trimming it to '' is exactly what drops back to the tier-1
-      // list call.
+      // .paths["/api/v1/search/"].get.parameters), and trimming it to '' is
+      // exactly what drops back to the tier-1 list call.
       function dispatch() {
         cancel();
         dispatched = input.value.trim();
@@ -525,10 +617,88 @@ function searchFilterControl(initial) {
         // the search, not an exit from it.
         input.focus();
       });
-    }
-
-    return { el: wrap, input, clear, wire };
   };
+}
+
+// The tag and metadata filter boxes (issue #914). Both are plain text boxes with
+// the same debounce/flush/clear rhythms as the free-text box, because they are
+// the same KIND of control — a filter you narrow by typing — and the operator
+// should not have to learn two interaction models in one bar.
+//
+// Accessibility: each box carries a visible <label> (the wrapper IS a <label>, as
+// with the sibling controls) plus an `aria-describedby` hint naming the accepted
+// shape, so the grammar is announced rather than discovered by trial and error.
+// The clear button is a real focusable button with its own accessible name.
+function structuredTextFilterControl(opts) {
+  return function () {
+    const initial = opts.initial;
+    const wrap = document.createElement('label');
+    wrap.className = 'ops-filter-' + opts.name;
+    const span = document.createElement('span');
+    span.textContent = opts.label;
+
+    const field = document.createElement('div');
+    field.className = 'ops-search-field';
+
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.className = 'ops-search-input ops-search-input-plain';
+    input.placeholder = opts.placeholder;
+    input.setAttribute('aria-label', opts.label);
+    input.setAttribute('autocomplete', 'off');
+    const hintId = 'assets-filter-' + opts.name + '-hint';
+    input.setAttribute('aria-describedby', hintId);
+    if (initial) input.value = initial;
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'ops-search-clear';
+    clear.setAttribute('aria-label', opts.clearLabel);
+    clear.title = opts.clearLabel;
+    clear.textContent = '×'; // MULTIPLICATION SIGN — a glyph, not an icon font
+    clear.hidden = !(initial && initial.length);
+
+    field.appendChild(input);
+    field.appendChild(clear);
+
+    const hint = document.createElement('span');
+    hint.className = 'form-hint ops-filter-hint';
+    hint.id = hintId;
+    hint.textContent = opts.hint;
+
+    wrap.appendChild(span);
+    wrap.appendChild(field);
+    wrap.appendChild(hint);
+
+    return { el: wrap, input, clear, wire: debouncedTextWiring(input, clear, initial) };
+  };
+}
+
+function tagsFilterControl(initial) {
+  return structuredTextFilterControl({
+    name: 'tags',
+    label: 'Tags',
+    placeholder: 'news,sports',
+    // Says what the server actually does: `tags` is an AND across the listed
+    // tags in the repo matcher, and the comma is the separator the route's
+    // `tagsSchema` splits on.
+    hint: 'Comma-separated. An asset must carry every tag listed.',
+    clearLabel: 'Clear tag filter',
+    initial,
+  });
+}
+
+function metadataFilterControl(initial) {
+  return structuredTextFilterControl({
+    name: 'meta',
+    label: 'Metadata',
+    placeholder: 'genre=documentary',
+    // Exact-value match on the asset's free-form metadata bag, every listed pair
+    // required (src/data/search-repo.ts:392-400).
+    hint: 'key=value pairs, comma-separated. Exact match on every pair given.',
+    clearLabel: 'Clear metadata filter',
+    initial,
+  });
 }
 
 function dateFilterControl(name, labelText, initial) {
@@ -825,6 +995,11 @@ export function createAssetsTable(deps) {
   // 2) Initial filter values for the controls come from the decoded URL.
   const initialFilters = {};
   if (urlState.q) initialFilters.q = urlState.q;
+  // Structured filters (issue #914). The shared decoder hands these back as
+  // normalised arrays; the controls hold text, so they are re-joined with the
+  // same comma separator the decoder split on — a round trip, not a reformat.
+  if (urlState.tags && urlState.tags.length) initialFilters.tags = urlState.tags.join(',');
+  if (urlState.meta && urlState.meta.length) initialFilters.meta = urlState.meta.join(',');
   if (urlState.status && urlState.status.length) initialFilters.status = urlState.status[0];
   if (urlState.from) initialFilters.from = urlState.from;
   if (urlState.to) initialFilters.to = urlState.to;
@@ -834,7 +1009,11 @@ export function createAssetsTable(deps) {
   // Written by reload() from the fetch result immediately before setRows(), so
   // the Status renderer always reads the flag belonging to the rows it renders.
   // Starts true because the first load is tier 1 unless the URL seeds a `q`.
-  const projection = { carriesLock: !initialFilters.q };
+  // A tags/metadata-only filter also routes to tier 2 (#914), so it is just as
+  // lock-blind as a free-text term — the flag has to account for all three.
+  const projection = {
+    carriesLock: !(initialFilters.q || initialFilters.tags || initialFilters.meta),
+  };
 
   const columns = buildColumns({
     renderBadge: d.renderBadge,
@@ -856,6 +1035,10 @@ export function createAssetsTable(deps) {
     { name: 'from', control: asSlot(dateFilterControl('from', 'Created from', initialFilters.from)) },
     { name: 'to', control: asSlot(dateFilterControl('to', 'Created to', initialFilters.to)) },
     { name: 'q', control: asSlot(searchFilterControl(initialFilters.q)) },
+    // Structured filters (issue #914), after the free-text box: they REFINE a
+    // list, so they read left-to-right as "search, then narrow".
+    { name: 'tags', control: asSlot(tagsFilterControl(initialFilters.tags)) },
+    { name: 'meta', control: asSlot(metadataFilterControl(initialFilters.meta)) },
   ];
 
   const table = createOpsTable({
@@ -926,6 +1109,12 @@ export function createAssetsTable(deps) {
         sort: tableSortToUrlSort(snap.sort),
         status: snap.filters.status ? [snap.filters.status] : [],
         q: snap.filters.q || '',
+        // Normalised through the SAME parsers the request uses, so the URL can
+        // only ever describe filters that were actually sent (issue #914).
+        tags: parseTagsFilter(snap.filters.tags),
+        meta: parseMetadataFilter(snap.filters.meta).map(function (p) {
+          return p.key + '=' + p.value;
+        }),
         from: snap.filters.from || null,
         to: snap.filters.to || null,
         page,
