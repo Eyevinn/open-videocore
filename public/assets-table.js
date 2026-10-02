@@ -193,6 +193,16 @@ const URL_DEFAULTS = Object.freeze({
   size: ASSETS_PAGE_SIZE,
 });
 
+// ─── Bulk selection (issue #916) ─────────────────────────────────────────────
+//
+// The leading tick-box column that turns the Assets tab from a read-only list
+// into a place bulk actions can start from. It is opt-in (`selectable: true`)
+// so every other consumer of this module is unchanged, and it is declared
+// `hideable: false` so the column chooser cannot hide the control an active
+// selection depends on (normalizeVisibleColumns keeps a non-hideable column
+// visible whatever the URL/stored set asks for — public/table-columns.js:205-207).
+export const ASSETS_SELECT_COLUMN_KEY = 'select';
+
 // ─── Column visibility contract (issue #959) ─────────────────────────────────
 
 // The declared column keys, in render order. Exported so consumers and tests name
@@ -583,8 +593,36 @@ function buildColumns(renderCtx) {
   // the Status renderer below. It cannot go stale: the only writer is the fetch
   // that produced the very rows being rendered.
   const projection = renderCtx.projection;
+  // Bulk selection (issue #916). `selection` is the live Map the factory owns
+  // (id -> label); read at render time so a row that is already selected comes
+  // back ticked after a sort/page/filter repaint.
+  const selection = renderCtx.selection;
 
-  return [
+  const selectColumn = {
+    key: ASSETS_SELECT_COLUMN_KEY,
+    label: '',
+    // Named for the chooser list even though it never appears there, so a future
+    // change that makes it hideable does not ship an unlabelled entry.
+    chooserLabel: 'Select',
+    width: '32px',
+    hideable: false,
+    render: (a) => {
+      const label = a.name || a.slug || a.id;
+      return (
+        '<input type="checkbox" class="asset-select-box" value="' +
+        escHtml(a.id) +
+        '"' +
+        (selection && selection.has(a.id) ? ' checked' : '') +
+        ' data-asset-label="' +
+        escHtml(label) +
+        '" aria-label="Select ' +
+        escHtml(label) +
+        '" />'
+      );
+    },
+  };
+
+  const dataColumns = [
     {
       key: 'thumb',
       label: '',
@@ -725,6 +763,8 @@ function buildColumns(renderCtx) {
       },
     },
   ];
+
+  return renderCtx.selectable ? [selectColumn, ...dataColumns] : dataColumns;
 }
 
 // ─── Column visibility resolution (issue #959) ────────────────────────────────
@@ -809,6 +849,12 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //                                         derive, so the handler can explain a
 //                                         guaranteed refusal pre-flight.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
+//   selectable (optional, issue #916)   — when true, prepend a tick-box column
+//                                         and track a selection that survives
+//                                         sort/filter/page repaints.
+//   onSelectionChange(selection)        — fires on every selection change with
+//                                         `[{ id, label }]`; only meaningful
+//                                         alongside `selectable: true`.
 //   win (optional)                      — injectable window for URL sync (tests).
 //
 // The table reads its initial sort/filter/page from the URL (shared contract),
@@ -836,13 +882,39 @@ export function createAssetsTable(deps) {
   // Starts true because the first load is tier 1 unless the URL seeds a `q`.
   const projection = { carriesLock: !initialFilters.q };
 
+  // Bulk selection (issue #916). id -> human-readable label, so a bulk-action
+  // bar can name what it is about to act on without re-reading the rows. Lives
+  // outside the row data on purpose: it must SURVIVE a repaint (sort, filter,
+  // page) so an operator can gather assets from more than one page before
+  // acting. Only `clearSelection()` and an explicit untick remove entries.
+  const selection = new Map();
+  const selectable = d.selectable === true;
+
   const columns = buildColumns({
     renderBadge: d.renderBadge,
     renderTags: d.renderTags,
     fmtDate: d.fmtDate,
     isAssetWedged: d.isAssetWedged,
     projection,
+    selectable,
+    selection,
   });
+
+  function selectedIds() {
+    return [...selection.keys()];
+  }
+
+  // One place the consumer is told the selection moved, so the bulk bar never
+  // has to poll or re-derive it from the DOM.
+  function emitSelection() {
+    if (typeof d.onSelectionChange === 'function') {
+      d.onSelectionChange(
+        selectedIds().map(function (id) {
+          return { id: id, label: selection.get(id) || id };
+        })
+      );
+    }
+  }
 
   // Initial visible column set (issue #959): URL -> stored default -> all.
   const columnChoice = resolveInitialColumns(
@@ -987,6 +1059,24 @@ export function createAssetsTable(deps) {
     // not also open that row's detail panel.
     wireCopyIdButtons(tbody);
 
+    // Bulk-selection tick boxes (issue #916). `click` stops propagation so
+    // ticking a row does not ALSO open that row's detail panel — selecting and
+    // inspecting are different intents. `change` is what records the choice, so
+    // keyboard operation (focus the box, press Space) works identically.
+    tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+      box.addEventListener('click', function (e) {
+        e.stopPropagation();
+      });
+      box.addEventListener('change', function () {
+        if (box.checked) {
+          selection.set(box.value, box.dataset.assetLabel || box.value);
+        } else {
+          selection.delete(box.value);
+        }
+        emitSelection();
+      });
+    });
+
     tbody.querySelectorAll('tr[data-row-key]').forEach(function (tr) {
       const id = tr.getAttribute('data-row-key');
       // Row accent for a delete-locked row (issue #894, spec §3.1). Derived from
@@ -1047,10 +1137,48 @@ export function createAssetsTable(deps) {
   // Kick off the first load.
   reload();
 
+  // ── Bulk selection, for the consumer's action bar (issue #916) ──
+
+  // Tick every row currently on screen. Additive: rows selected on other pages
+  // stay selected.
+  function selectAllOnPage() {
+    const tbody = table.el.querySelector('tbody');
+    if (tbody) {
+      tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+        box.checked = true;
+        selection.set(box.value, box.dataset.assetLabel || box.value);
+      });
+    }
+    emitSelection();
+    return selectedIds();
+  }
+
+  function clearSelection() {
+    selection.clear();
+    const tbody = table.el.querySelector('tbody');
+    if (tbody) {
+      tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+        box.checked = false;
+      });
+    }
+    emitSelection();
+    return [];
+  }
+
   return {
     el: table.el,
     reload,
     destroy: table.destroy,
+    // Bulk selection (issue #916). `getSelection()` returns `{ id, label }`
+    // entries in tick order so a caller can both act on the ids and name them.
+    getSelection: function () {
+      return selectedIds().map(function (id) {
+        return { id: id, label: selection.get(id) || id };
+      });
+    },
+    getSelectedIds: selectedIds,
+    selectAllOnPage,
+    clearSelection,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
     // Column visibility (issue #959), for consumers/tests that want to read or
