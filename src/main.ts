@@ -1474,7 +1474,11 @@ function activateScaler(redisUrl: string): void {
     // Best-effort package-job audit emission (issue #564): submit + terminal
     // (success/failure) callbacks each emit one entry, fire-and-forget.
     audit: auditEmitter,
-    auditLog: app.log
+    auditLog: app.log,
+    // Operational log records for the `package` stage (issue #995): the enqueue
+    // and the packager's success/failure callbacks each append one entry to the
+    // SAME in-memory store GET /api/v1/logs reads (`logStore` above).
+    pipelineLog: logStore
   });
 
   // On-demand packager provisioning (epic #226, issue #244). The packager is no
@@ -1692,6 +1696,10 @@ function activateScaler(redisUrl: string): void {
     // (see the internalRouter registration below), so both terminal-state paths
     // deliver identical payloads to the same registrations.
     webhookDispatcher,
+    // Operational log records for the `transcode` stage (issue #995). The SAME
+    // in-memory store GET /api/v1/logs reads (`logStore` above), so a transcode
+    // that settles through this poller shows up in the Logs tab.
+    pipelineLog: logStore,
     logger: app.log
   });
 
@@ -1890,7 +1898,14 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // uses, so the membership view is consistent.
   collectionRepository,
   // Best-effort audit emission for asset mutations (issue #564).
-  audit: auditEmitter
+  audit: auditEmitter,
+  // Operational log records for the pipeline steps this router drives (issue
+  // #995): the `ingest` stage (URL-pull worker + the synchronous
+  // extract-metadata / thumbnail / subtitles / scene-detect steps) and the
+  // `transcode` submission. Appends to the SAME in-memory store
+  // GET /api/v1/logs reads (`logStore` above), which is what makes the Logs tab
+  // populate during a normal run.
+  pipelineLog: logStore
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -1963,7 +1978,10 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
     return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
   },
   // Best-effort audit emission for the transcode terminal-state callback (#564).
-  audit: auditEmitter
+  audit: auditEmitter,
+  // Operational log record for the transcode terminal-state callback (issue
+  // #995). Same store GET /api/v1/logs reads (`logStore` above).
+  pipelineLog: logStore
 };
 await app.register(internalRouter, internalRouterOptions);
 

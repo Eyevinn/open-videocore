@@ -111,6 +111,11 @@ import {
   stackResolvedMinioEndpoint
 } from '../services/workspace-stack.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import {
+  logPipelineEvent,
+  type PipelineLogSink,
+  type PipelineLogStage
+} from '../services/pipeline-log.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
 import {
@@ -1073,6 +1078,13 @@ type AssetsRouterOptions = {
   // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
+  // Best-effort operational log emission for pipeline steps (issue #995). Wired
+  // to the in-memory LogStore's `append()` write primitive — the same instance
+  // GET /api/v1/logs reads (src/main.ts, `logStore`; read path
+  // src/routes/logs.ts:94). When absent, pipeline execution proceeds without
+  // appending log records (no-op), so existing tests are unaffected. Emission
+  // never throws, so no route becomes newly failable.
+  pipelineLog?: PipelineLogSink;
 };
 
 // Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
@@ -1083,6 +1095,19 @@ type AssetsRouterOptions = {
 // asset (`subtitlesError` / `sceneDetectionError`) so the skip is explainable
 // after the fact.
 type OptionalStepOutcome = { started: true } | { started: false; reason: string };
+
+// Map a pipeline step to the coarse, operator-facing log stage (issue #995).
+// The Logs tab is a stage-level view, not a step-level one: `transcode` and
+// `package` are the two asynchronous steps that settle from an OSC callback and
+// get their own stage, and every other step (extract-metadata, thumbnail, and the
+// optional subtitles / scene-detect) is part of getting the asset in, so it
+// reports as `ingest`. CONTRACT: `PipelineStepName` — src/pipeline/pipelines.ts:22-23;
+// `PipelineLogStage` — src/services/pipeline-log.ts (PIPELINE_LOG_STAGES).
+function logStageForStep(name: PipelineStepName): PipelineLogStage {
+  if (name === 'transcode') return 'transcode';
+  if (name === 'package') return 'package';
+  return 'ingest';
+}
 
 // Skip reasons. They name the operator-facing knob that activates the step: the
 // per-stack instance name (StackConfig.autoSubtitlesInstanceName /
@@ -1760,6 +1785,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const storageFor = opts.storageFor;
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
+  // Best-effort operational log sink (issue #995). Undefined => pipeline steps
+  // run without appending to the log store GET /api/v1/logs reads.
+  const pipelineLog = opts.pipelineLog;
 
   // Resolve the scaler/Encore context key for a transcode request (issue #615).
   // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
@@ -2431,6 +2459,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     const resolvedSource = tryResolveSourceObject(asset);
     const sourceObjectKey = resolvedSource?.objectKey ?? '';
 
+    // Operational log (issue #995): one entry per SYNCHRONOUS step that settles
+    // inside the loop below. The two asynchronous steps are NOT logged here —
+    // `transcode` is logged by submitTranscode/completeTranscode and `package` by
+    // PackagingService, at the same points those modules emit their audit
+    // entries, so a run that settles from an OSC callback is covered even though
+    // this request has long since returned. Stage-mapped via logStageForStep, so
+    // the whole `ingest` pipeline reports under the `ingest` stage.
+    const logSettledStep = (
+      name: PipelineStepName,
+      outcome: 'done' | 'skipped',
+      reason?: string
+    ): void => {
+      logPipelineEvent(
+        pipelineLog,
+        {
+          stage: logStageForStep(name),
+          // A skip is not a failure (issue #789) but it IS the absence of work an
+          // operator would otherwise assume happened, so it is a `warn` rather
+          // than an `info`.
+          level: outcome === 'skipped' ? 'warn' : 'info',
+          message:
+            outcome === 'skipped'
+              ? `${name} step skipped for asset ${asset.id} (execution ${execution.id}): ${reason ?? 'no reason recorded'}`
+              : `${name} step completed for asset ${asset.id} (execution ${execution.id})`
+        },
+        request.log
+      );
+    };
+
     // Execute steps synchronously until we hit an asynchronous step (transcode/
     // package) which completes via an OSC callback, or run out of steps. The
     // fire-and-forget steps (extract-metadata, thumbnail) settle immediately.
@@ -2440,11 +2497,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         if (step.name === 'extract-metadata') {
           triggerExtraction(asset.id, sourceObjectKey);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          logSettledStep(step.name, 'done');
           continue;
         }
         if (step.name === 'thumbnail') {
           triggerThumbnail(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          logSettledStep(step.name, 'done');
           continue;
         }
         if (step.name === 'subtitles') {
@@ -2455,6 +2514,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           const outcome = triggerSubtitles(asset.id, sourceObjectKey, request);
           if (outcome.started) {
             stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+            logSettledStep(step.name, 'done');
           } else {
             // #789: nothing ran, so `done` would be a lie. Settle as `skipped`
             // (a terminal, non-failing state) and record WHY on the asset.
@@ -2466,6 +2526,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               startedAt: now(),
               completedAt: now()
             };
+            logSettledStep(step.name, 'skipped', outcome.reason);
           }
           continue;
         }
@@ -2477,6 +2538,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           const outcome = triggerSceneDetect(asset.id, sourceObjectKey, request);
           if (outcome.started) {
             stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+            logSettledStep(step.name, 'done');
           } else {
             // #789: see the subtitles branch above.
             await recordOptionalStepSkip('scene-detect', asset.id, outcome.reason, request);
@@ -2487,6 +2549,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               startedAt: now(),
               completedAt: now()
             };
+            logSettledStep(step.name, 'skipped', outcome.reason);
           }
           continue;
         }
@@ -2530,7 +2593,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               // execute behaviour unchanged.
               profileParams: encodeOpts?.profileParams
             },
-            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log }
+            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log, pipelineLog }
           );
           stepsCopy[i] = {
             ...step,
@@ -2653,8 +2716,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const message = err instanceof Error ? err.message : String(err);
       const idx = stepsCopy.findIndex((s) => s.status === 'pending');
       const failIdx = idx >= 0 ? idx : stepsCopy.length - 1;
-      stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      // `failIdx` is -1 only when the execution has no steps at all, in which
+      // case there is no step record to mark failed — the execution-level
+      // `status: 'failed'` below is the whole story. Guard the write so we never
+      // stamp a bogus index on the array.
+      if (failIdx >= 0) {
+        stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      }
+      // Step name for the log/stage, with a literal fallback for the no-steps
+      // case (which would otherwise read "undefined step failed"). `PipelineStepName`
+      // CONTRACT: src/pipeline/pipelines.ts:22-23; logStageForStep maps any
+      // non-transcode/package name to the `ingest` stage (src/routes/assets.ts:1106-1110),
+      // which is the correct coarse stage for an execution that never started a step.
+      const failedStep = failIdx >= 0 ? stepsCopy[failIdx] : undefined;
+      const failedStepLabel = failedStep ? failedStep.name : 'pipeline';
       await pipelineRepo.update(execution.id, { steps: stepsCopy, status: 'failed' });
+      // Operational log (issue #995): the step that failed the execution. This is
+      // the synchronous failure path — a step that threw before handing off to an
+      // OSC callback — so it is the only record of the failure the Logs tab would
+      // otherwise get (the callback-driven failures are logged by
+      // completeTranscode / PackagingService.handleFailure).
+      logPipelineEvent(
+        pipelineLog,
+        {
+          stage: failedStep ? logStageForStep(failedStep.name) : 'ingest',
+          level: 'error',
+          message: `${failedStepLabel} step failed for asset ${asset.id} (execution ${execution.id}): ${message}`
+        },
+        request.log
+      );
       reply.code(502).send({ error: 'pipeline_step_failed', message });
       return undefined;
     }
@@ -2898,7 +2988,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset actually advanced to `processing` (pull succeeded).
       void runner(
         { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
-        { jobs, assets: repo, storage: storageFor(), quota: opts.quota, ...opts.pullDeps }
+        {
+          jobs,
+          assets: repo,
+          storage: storageFor(),
+          quota: opts.quota,
+          ...opts.pullDeps,
+          // Operational log for the `ingest` stage (issue #995). Threaded after
+          // the `pullDeps` spread because `PullDeps` carries no log sink of its
+          // own — the worker's start/success/failure entries are the only record
+          // the Logs tab gets of a URL-pull ingest, which runs detached and
+          // therefore outlives this request.
+          pipelineLog,
+          pipelineLogErrors: request.log
+        }
       ).then(async () => {
         const settled = await repo.get(asset.id);
         if (settled?.status === 'processing') {
@@ -4448,7 +4551,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceBucket: request.connections?.sourceBucket ?? opts.sourceBucket,
             outputBucket: resolvedOutputBucket
           },
-          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log }
+          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log, pipelineLog }
         );
         return reply
           .code(202)

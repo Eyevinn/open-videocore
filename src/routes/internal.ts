@@ -39,6 +39,7 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
+import type { PipelineLogSink } from '../services/pipeline-log.js';
 // #829: the terminal-transcode webhook events are owned by the shared module so
 // this route and the completion poller (src/pipeline/encore-callback-poller.ts)
 // — the two paths that can apply a transcode completion — emit identical
@@ -139,6 +140,11 @@ type InternalRouterOptions = {
   // transcode job's terminal (done/failed) transition emits exactly one audit
   // entry, fire-and-forget. Absent => transcode completion runs un-audited.
   audit?: AuditEmitter;
+  // Best-effort operational log emission (issue #995). Passed to
+  // completeTranscode so the transcode job's terminal transition also appends one
+  // record to the in-memory LogStore GET /api/v1/logs reads (src/main.ts,
+  // `logStore`; read path src/routes/logs.ts:94). Absent => no log record.
+  pipelineLog?: PipelineLogSink;
 };
 
 // Are all steps of an execution settled? Used to close out an execution. A
@@ -507,7 +513,19 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           error: success ? undefined : (message ?? `encore status: ${status}`),
           renditions: success ? normaliseRenditions(output) : []
         },
-        { jobs: jobRepository, assets: repository, audit: opts.audit, auditLog: fastify.log }
+        {
+          jobs: jobRepository,
+          assets: repository,
+          audit: opts.audit,
+          auditLog: fastify.log,
+          // Operational log for the `transcode` stage's terminal state (issue
+          // #995), appended at the same point as the audit entry inside
+          // completeTranscode. This route is one of the paths that applies a
+          // transcode terminal state, so without it a completion that arrives
+          // here leaves the Logs tab showing a stage that started and never
+          // finished.
+          pipelineLog: opts.pipelineLog
+        }
       );
 
       // #525 pt.2: pin the instance that ran this job against premature
