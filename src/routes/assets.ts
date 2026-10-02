@@ -2716,7 +2716,20 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const message = err instanceof Error ? err.message : String(err);
       const idx = stepsCopy.findIndex((s) => s.status === 'pending');
       const failIdx = idx >= 0 ? idx : stepsCopy.length - 1;
-      stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      // `failIdx` is -1 only when the execution has no steps at all, in which
+      // case there is no step record to mark failed — the execution-level
+      // `status: 'failed'` below is the whole story. Guard the write so we never
+      // stamp a bogus index on the array.
+      if (failIdx >= 0) {
+        stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      }
+      // Step name for the log/stage, with a literal fallback for the no-steps
+      // case (which would otherwise read "undefined step failed"). `PipelineStepName`
+      // CONTRACT: src/pipeline/pipelines.ts:22-23; logStageForStep maps any
+      // non-transcode/package name to the `ingest` stage (src/routes/assets.ts:1106-1110),
+      // which is the correct coarse stage for an execution that never started a step.
+      const failedStep = failIdx >= 0 ? stepsCopy[failIdx] : undefined;
+      const failedStepLabel = failedStep ? failedStep.name : 'pipeline';
       await pipelineRepo.update(execution.id, { steps: stepsCopy, status: 'failed' });
       // Operational log (issue #995): the step that failed the execution. This is
       // the synchronous failure path — a step that threw before handing off to an
@@ -2726,9 +2739,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       logPipelineEvent(
         pipelineLog,
         {
-          stage: logStageForStep(stepsCopy[failIdx].name),
+          stage: failedStep ? logStageForStep(failedStep.name) : 'ingest',
           level: 'error',
-          message: `${stepsCopy[failIdx].name} step failed for asset ${asset.id} (execution ${execution.id}): ${message}`
+          message: `${failedStepLabel} step failed for asset ${asset.id} (execution ${execution.id}): ${message}`
         },
         request.log
       );

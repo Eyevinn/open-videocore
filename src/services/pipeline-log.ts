@@ -34,11 +34,12 @@
 //     reads `r.level` against the same enum (public/logs-table.js:241-248), the
 //     category column reads `r.category` (public/logs-table.js:250-253), and the
 //     `q` filter searches `message` ONLY, server-side
-//     (public/logs-table.js:145-147 -> src/services/log-store.ts:143). Every
-//     event below therefore carries an explicit `level` and a `message` that
-//     names its stage, so the stage is searchable via `q` even though the
-//     listing endpoint has no `category` param (known gap, already logged at
-//     docs/osc-feedback/incoming-logs-level-category-filter.md).
+//     (public/logs-table.js:145-147 -> src/services/log-store.ts). Every event
+//     below therefore carries an explicit `level` and a `message` that names its
+//     stage. That redundancy is deliberate: the listing querystring
+//     (src/routes/logs.ts, `listLogsQuerySchema`) has no `level` or `category`
+//     param, and `q` searches `message` only, so naming the stage in the message
+//     is the only way an operator can filter a stage server-side today.
 
 import type { AppendLogInput, LogLevel } from './log-store.js';
 

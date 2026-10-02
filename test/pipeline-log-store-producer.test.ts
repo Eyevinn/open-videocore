@@ -251,8 +251,12 @@ function packagerSuccess(app: FastifyInstance, assetId: string) {
   });
 }
 
+// The logs listing is behind the 401 presence gate (src/routes/logs.ts, the
+// `authGate(app)` preHandler added on the #995 review), so this harness — which
+// calls registerAuth above — must send a bearer token like every other gated
+// read in these tests.
 async function listLogs(app: FastifyInstance, query = 'limit=200&order=asc'): Promise<LogPage> {
-  const res = await app.inject({ method: 'GET', url: `/api/v1/logs?${query}` });
+  const res = await app.inject({ method: 'GET', url: `/api/v1/logs?${query}`, headers: A });
   expect(res.statusCode).toBe(200);
   return res.json() as LogPage;
 }

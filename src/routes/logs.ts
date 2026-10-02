@@ -8,14 +8,23 @@
 // endpoint is backed by the in-memory LogStore (src/services/log-store.ts),
 // modelled on the OperationStore that backs GET /api/v1/provision/operations.
 //
-// Not behind `authenticate`: like the provision operations listing and the
-// admin/scaler status endpoints, this reports aggregate operational state, not
-// workspace-scoped data.
+// Behind the 401 presence gate (issue #995 review). This endpoint is NOT the
+// aggregate-only surface it was when it shipped: the pipeline producer
+// (src/services/pipeline-log.ts) now writes per-asset detail into the records it
+// returns — asset ids, job ids, object keys, byte counts, profile names and raw
+// error strings (which can carry internal source host names). That is the same
+// class of data GET /api/v1/jobs returns, and that router gates anonymous
+// callers, so this one does too: anonymous reads must not be a side channel
+// around the gate on every other per-asset listing. See src/auth/middleware.ts
+// (authGate) for why the in-process gate exists even behind the platform wall.
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - Route module shape (FastifyPluginAsync + withTypeProvider<ZodTypeProvider>,
 //     zod `schema.querystring`/`schema.response`, `tags`): src/routes/retention.ts:58-92
 //     and src/routes/jobs.ts:83-104.
+//   - 401 presence gate wiring (`app.addHook('preHandler', authGate(app))` as the
+//     router's first hook, `authGate` imported from '../auth/middleware.js'):
+//     src/routes/jobs.ts:17 and :144; gate contract src/auth/middleware.ts:74-87.
 //   - Sibling listing envelope for reference (offset variant, deliberately NOT
 //     copied): src/routes/jobs.ts:91-99 (`{ items, total }`).
 //   - `{ items, nextCursor }` cursor envelope + `{ limit, cursor }` request the
@@ -27,6 +36,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { LOG_LEVELS, type LogStore } from '../services/log-store.js';
+import { authGate } from '../auth/middleware.js';
 
 // One log record as returned to callers. Mirrors LogRecord
 // (src/services/log-store.ts). `level`/`category` are optional — present only
@@ -70,6 +80,14 @@ type LogsRouterOptions = {
 export const logsRouter: FastifyPluginAsync<LogsRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const { logStore } = opts;
+
+  // 401 presence gate (issue #711 pattern, applied here on the #995 review):
+  // reject anonymous requests now that records carry per-asset identifiers.
+  // Plugin-scoped, so no public router is affected. The gate resolves
+  // `app.authenticate` lazily and no-ops when registerAuth was never called, so
+  // unit tests that build this router in isolation are unchanged
+  // (src/auth/middleware.ts:74-87).
+  app.addHook('preHandler', authGate(app));
 
   app.get(
     '/',
