@@ -552,6 +552,28 @@ describe('spawn-failure redaction is bounded by input size, not shape (#1071)', 
     expect(message).not.toContain(secret);
   });
 
+  it('bounds the HTML-tag pass too, and still strips ordinary tags', () => {
+    // `<[^>]*>` is the same quadratic shape as the rest when the input contains
+    // unmatched `<`: every one of them restarts a scan to the end of the string
+    // (9.8s on 160k before the bound, with only the clamp standing between that
+    // and the tick).
+    const unmatched = '<'.repeat(160_000);
+    expect(timeRedaction(new Error(unmatched))).toBeLessThan(BUDGET_MS);
+
+    // The bound is far above any real tag, so ordinary markup still goes.
+    expect(
+      redactSpawnFailureMessage(new Error('<p>plain <b>tags</b> stripped</p> ok'))
+    ).toBe('plain tags stripped ok');
+
+    // An absurdly long "tag" is left alone rather than scanned: it survives as
+    // literal angle brackets, which this record already tolerates (it is JSON,
+    // not markup) and which carry no secret the passes above did not see.
+    const overLong = redactSpawnFailureMessage(
+      new Error(`<${'a'.repeat(3_000)}> trailing`)
+    );
+    expect(overLong.startsWith('<aaa')).toBe(true);
+  });
+
   it('still redacts a known secret that STRADDLES the clamp boundary', () => {
     const secret = 'rootpass-do-not-leak-0003';
     // Place the secret so it begins just before the clamp and ends after it.
@@ -565,6 +587,119 @@ describe('spawn-failure redaction is bounded by input size, not shape (#1071)', 
     // secret in the kept prefix; the literal pass runs on the full string first,
     // so not even a fragment survives.
     expect(message).not.toContain(secret.slice(0, 10));
+  });
+});
+
+// The clamp above protects KNOWN literals, because the literal pass runs before
+// it. An UNKNOWN secret — one only the structural passes would have caught — is a
+// different problem: those passes recognise a secret by its SHAPE, and cutting
+// the input at a fixed offset destroys the shape. A JWT that no longer ends
+// where JWT_PATTERN expects, a hostname whose last label is gone, an access key
+// shortened below the spaced-credential pattern's 12-character minimum: each
+// stops being recognisable and the fragment is then published verbatim on the
+// unauthenticated GET /scaler/status.
+//
+// Measured on the fixed-offset clamp, sliding each payload across the boundary
+// behind a markup-only prefix (which the tag pass collapses, so the payload
+// lands inside the 400-character output): 7 leaking offsets for an access key
+// id, 10 for an internal hostname, 11 for a JWT. The clamp now cuts back to the
+// last delimiter instead, dropping the straddling token whole.
+describe('clamping never publishes a fragment of a structurally-detected secret (#1071)', () => {
+  // Markup-only filler: `<x>` collapses to nothing in the tag pass, so whatever
+  // follows the clamp boundary is near the FRONT of the final message — which is
+  // what makes this observable at all.
+  function padTo(offset: number, payload: string): string {
+    let text = '<html><head><title>504 Gateway Time-out</title></head><body>';
+    while (text.length < offset) text += '<x>';
+    return text.slice(0, offset) + payload;
+  }
+
+  // The part of each payload that must never appear, in whole or in part.
+  const cases: Array<{ name: string; payload: string; secret: string }> = [
+    {
+      name: 'an access key id behind a credential-ish header name',
+      payload: 'x-api-key AKIAIOSFODNN7EXAMPLE rejected',
+      secret: 'AKIAIOSFODNN7EXAMPLE'
+    },
+    {
+      name: 'an internal hostname',
+      payload: 'tenant-a7f3.svc.cluster.local refused',
+      secret: 'tenant-a7f3.svc.cluster.local'
+    },
+    {
+      name: 'a JWT',
+      payload:
+        'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk',
+      secret: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0'
+    },
+    {
+      name: 'a URL carrying credentials',
+      payload: 'connecting to https://admin:hunter2@store.example:9000/bucket failed',
+      secret: 'admin:hunter2@store.example'
+    }
+  ];
+
+  // Six characters is short enough to catch a leak worth having and long enough
+  // not to trip over ordinary words.
+  const MIN_LEAK = 6;
+
+  function longestSurvivingPrefix(output: string, secret: string): string | undefined {
+    for (let length = secret.length; length >= MIN_LEAK; length -= 1) {
+      const prefix = secret.slice(0, length);
+      if (output.includes(prefix)) return prefix;
+    }
+    return undefined;
+  }
+
+  for (const { name, payload, secret } of cases) {
+    it(`drops ${name} at every offset across the boundary`, () => {
+      const started = performance.now();
+      const leaks: string[] = [];
+      for (
+        let offset = REDACTION_INPUT_MAX_LENGTH - 40;
+        offset <= REDACTION_INPUT_MAX_LENGTH + 5;
+        offset += 1
+      ) {
+        const output = redactSpawnFailureMessage(new Error(padTo(offset, payload)));
+        const survived = longestSurvivingPrefix(output, secret);
+        if (survived !== undefined) leaks.push(`offset ${offset}: ${survived}`);
+      }
+      expect(leaks).toEqual([]);
+      // 46 offsets; the budget is per-call, so this is a generous ceiling on all
+      // of them together.
+      expect(performance.now() - started).toBeLessThan(200 * 46);
+    });
+  }
+
+  it('stays inside the per-call time budget while doing it', () => {
+    const worst = padTo(
+      REDACTION_INPUT_MAX_LENGTH - 10,
+      'x-api-key AKIAIOSFODNN7EXAMPLE rejected'
+    );
+    const started = performance.now();
+    redactSpawnFailureMessage(new Error(worst));
+    expect(performance.now() - started).toBeLessThan(200);
+  });
+
+  it('drops an unbroken run that extends past the clamp rather than publishing it', () => {
+    // No delimiter anywhere in the kept prefix: there is no safe place to cut,
+    // so nothing structural is published at all. A 4 KB token has no readable
+    // diagnostic in it either.
+    const message = redactSpawnFailureMessage(
+      new Error('A'.repeat(REDACTION_INPUT_MAX_LENGTH + 500))
+    );
+    expect(message).not.toContain('AAAAAA');
+  });
+
+  it('keeps the readable diagnostic either side of the dropped token', () => {
+    const output = redactSpawnFailureMessage(
+      new Error(padTo(REDACTION_INPUT_MAX_LENGTH - 20, 'x-api-key AKIAIOSFODNN7EXAMPLE'))
+    );
+    // The operator still learns what failed and which header was involved; only
+    // the value is gone.
+    expect(output).toContain('504 Gateway Time-out');
+    expect(output).toContain('x-api-key');
+    expect(output).not.toContain('AKIAIO');
   });
 });
 

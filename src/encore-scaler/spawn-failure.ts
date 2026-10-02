@@ -223,7 +223,55 @@ const JWT_PATTERN = /\beyJ[A-Za-z0-9._-]{10,}/g;
 // legitimate error text like `expected <n> profiles`. Escaping for a particular
 // rendering context belongs to whatever does that rendering, not to the stored
 // value.
-const HTML_TAG_PATTERN = /<[^>]*>/g;
+//
+// The length bound matters for cost, not for matching: `<[^>]*>` is the same
+// quadratic shape as the rest once the input contains unmatched `<` (measured:
+// 9.8s on '<'.repeat(160_000)), because every `<` restarts a scan to the end of
+// the string. 2048 characters is far longer than any tag in an error page —
+// over-long "tags" are not stripped and stay in the text as literal angle
+// brackets, which the record already tolerates (it is JSON, not markup).
+const HTML_TAG_PATTERN = /<[^>]{0,2048}>/g;
+
+// Characters that can END the kept prefix when the input is clamped.
+//
+// A SECRET IS ONLY SAFE FROM THE STRUCTURAL PASSES WHILE IT IS INTACT. Cutting
+// the input at a fixed offset can land in the middle of one, and the dangling
+// fragment then defeats every pass that would have caught it: a truncated JWT no
+// longer ends where JWT_PATTERN expects, a truncated host is no longer a dotted
+// name, and an access key shortened below the spaced-credential pattern's
+// 12-character threshold stops looking like a credential at all. The fragment is
+// then published, in the clear, on an unauthenticated endpoint. Measured on the
+// previous fixed-offset clamp, sliding a payload across the boundary behind a
+// markup-only prefix: 7 leaking offsets for an access key id, 10 for an internal
+// hostname, 11 for a JWT.
+//
+// So the cut is moved back to the last delimiter, and whatever followed it is
+// dropped whole. Whitespace is the obvious delimiter; the quote, bracket and
+// punctuation characters are here because an error body is often one long
+// unspaced run of markup or JSON, and each of them reliably ENDS a token — a
+// value can continue past `/`, `:`, `@`, `=` or `-`, which is exactly why those
+// are NOT in this set. `=` in particular is excluded deliberately: keeping
+// `key=` and dropping the value is the right outcome, and that is what happens,
+// because the cut moves back past `key=` to the delimiter before it.
+const CLAMP_DELIMITERS = new Set([
+  ' ', '\t', '\n', '\r', '\f', '\v',
+  '"', "'", '<', '>', '`',
+  ',', ';', '{', '}', '(', ')', '[', ']'
+]);
+
+// Cut `text` to at most `max` characters WITHOUT splitting a token.
+//
+// Linear: at most one backward scan over the kept prefix. A run with no
+// delimiter at all in the first `max` characters leaves nothing — deliberately.
+// Publishing the first 4 KB of one unbroken token is exactly the leak this
+// function exists to prevent, and an error body with no delimiter in 4 KB has no
+// readable diagnostic in it either.
+function clampToTokenBoundary(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = max;
+  while (end > 0 && !CLAMP_DELIMITERS.has(text[end - 1] as string)) end -= 1;
+  return text.slice(0, end);
+}
 
 // What the record says when the thrown value carried no text at all.
 const NO_MESSAGE = 'spawn failed with no error message';
@@ -262,9 +310,7 @@ export function redactSpawnFailureMessage(
   // passes are structural guesses at an unknown-shaped message, and running them
   // over an arbitrarily large upstream error page buys nothing the 400-character
   // output could keep, while costing the single-threaded process real time.
-  if (text.length > REDACTION_INPUT_MAX_LENGTH) {
-    text = text.slice(0, REDACTION_INPUT_MAX_LENGTH);
-  }
+  text = clampToTokenBoundary(text, REDACTION_INPUT_MAX_LENGTH);
 
   text = text.replace(URL_PATTERN, REDACTED);
   // After URLs (whose host is already gone with the whole URL) and before the
