@@ -262,14 +262,25 @@ function pendingRecords(pool: Record<string, string>): EncoreInstanceRecord[] {
 // the callback-trust probe). None of them should be reached for a pending
 // instance; answering them keeps a stray call from throwing instead of failing
 // the assertion that matters.
-function stubFetchForTick(): void {
+// `activeFor` reports how many jobs Encore says are really in progress on the
+// instance a findByStatus query addresses — the tick's reconcile step trusts
+// that over the tracked count, so a test that needs a busy instance to STAY busy
+// has to answer it honestly.
+function stubFetchForTick(activeFor: (url: string) => number = () => 0): void {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL) => {
       const url = String(input);
       if (url.includes('/encoreJobs/search/findByStatus')) {
+        const count = url.includes('status=QUEUED') ? 0 : activeFor(url);
+        const encoreJobs = Array.from({ length: count }, (_, i) => ({
+          externalId: `ext-${i}`
+        }));
         return new Response(
-          JSON.stringify({ _embedded: { encoreJobs: [] }, page: { totalElements: 0 } }),
+          JSON.stringify({
+            _embedded: { encoreJobs },
+            page: { totalElements: count }
+          }),
           { status: 200, headers: { 'content-type': 'application/json' } }
         );
       }
@@ -521,6 +532,29 @@ describe('a retry after a 504 adopts the instance the 504 created (#1071)', () =
     expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(0);
   });
 
+  // Same guard one service over: createOrAdoptCallbackListener's probe is shared
+  // with resolvePendingSpawns, so a throwing probe there would both mask the
+  // listener create's error and abort the completion of a pending spawn.
+  it('keeps the LISTENER create error when its adopt probe throws', async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    createInstanceMock.mockImplementation(async (...args: unknown[]) => {
+      const serviceId = args[1] as string;
+      if (serviceId === ENCORE_SERVICE_ID) return creationSucceeds(...args);
+      throw nameAlreadyTaken();
+    });
+    getInstanceMock.mockRejectedValue(
+      new Error('Service listener not found in your subscriptions')
+    );
+
+    const spawn = spawnInstance(makeConfig(redis)).catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = (await spawn) as Error;
+
+    expect(result.message).toMatch(/already taken/);
+    expect(result.message).not.toMatch(/not found in your subscriptions/);
+  });
+
   it('never destroys an ADOPTED instance when a later step fails', async () => {
     vi.useFakeTimers();
     const redis = new FakeRedis();
@@ -648,9 +682,100 @@ describe('a pending spawn is resumed, capped and ultimately reclaimed (#1071)', 
     ) as EncoreInstanceRecord;
     expect(record.pendingReadySince).toBeUndefined();
     expect(record.readyAt).toBeTypeOf('number');
+    // Promotion COMPLETED the spawn: the Encore readiness wait timed out before
+    // the paired callback listener was ever created, so the resolver created it
+    // and the promoted record carries its URL. Without that the instance would
+    // have joined the pool with no callback path at all.
+    expect(record.callbackListenerUrl).toBeDefined();
+    expect(
+      createInstanceMock.mock.calls.filter(
+        (call) => call[1] === ENCORE_CALLBACK_LISTENER_SERVICE_ID
+      )
+    ).toHaveLength(1);
     // Nothing was destroyed to get here: the instance that cost a node
     // provisioning is the one that ends up serving jobs.
     expect(removeInstanceMock).not.toHaveBeenCalled();
+  });
+
+  it('never promotes an instance whose callback listener does not exist yet', async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    const config = makeConfig(redis, { spawnReadyTimeoutMs: 5_000 });
+    const instanceId = await spawnIntoPending(redis, config);
+    // The pending record really has no listener: the Encore readiness wait
+    // (instance-pool.ts) runs BEFORE the listener is created, so a timeout there
+    // means the spawn never reached it.
+    expect(
+      pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)))[0]
+        ?.callbackListenerUrl
+    ).toBeUndefined();
+
+    // The Encore half is up, but the listener cannot be created — a permanent
+    // 4xx, so no amount of retrying will change it.
+    getInstanceHealthMock.mockImplementation(async (...args: unknown[]) =>
+      args[1] === ENCORE_SERVICE_ID ? 'running' : 'pending'
+    );
+    createInstanceMock.mockRejectedValue(
+      new FakeFetchError('callback listener config rejected', 422)
+    );
+    getInstanceMock.mockResolvedValue(undefined);
+
+    const first = await resolvePendingSpawns(config);
+
+    // NOT promoted. An Encore instance with no listener would be dispatched to
+    // with no progressCallbackUri, silently degrading every job to the
+    // terminal-job sweep with nothing visible on /scaler/status.
+    expect(first.promoted).toEqual([]);
+    const stillPending = pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)));
+    expect(stillPending).toHaveLength(1);
+    expect(stillPending[0]?.readyAt).toBeUndefined();
+
+    // It does not linger either: the deadline applies to an incomplete spawn
+    // exactly as it does to one that never came up, so a clean spawn replaces it.
+    await vi.advanceTimersByTimeAsync(6_000);
+    const second = await resolvePendingSpawns(config);
+    expect(second.destroyed).toEqual([instanceId]);
+    expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(0);
+  });
+
+  it('never promotes an ADOPTED instance whose listener create failed permanently', async () => {
+    // The adoption variant of the same hole: a 504'd create is adopted, its
+    // listener is then refused outright, and the instance lands in the pending
+    // record with no callback path.
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    const config = makeConfig(redis, { spawnReadyTimeoutMs: 5_000 });
+    createInstanceMock.mockImplementation(async (...args: unknown[]) => {
+      const serviceId = args[1] as string;
+      if (serviceId === ENCORE_SERVICE_ID) {
+        if (createInstanceMock.mock.calls.length === 1) throw gatewayTimeout();
+        throw nameAlreadyTaken();
+      }
+      throw new FakeFetchError('callback listener config rejected', 422);
+    });
+    getInstanceMock.mockImplementation(async (...args: unknown[]) => {
+      const serviceId = args[1] as string;
+      const name = args[2] as string;
+      if (serviceId !== ENCORE_SERVICE_ID) return undefined;
+      return { name, url: `https://${name}.osc.example` };
+    });
+    getInstanceHealthMock.mockResolvedValue('running');
+
+    const spawn = spawnInstance(config).catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await spawn;
+
+    const [pendingRecord] = pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)));
+    expect(pendingRecord).toBeDefined();
+    expect(pendingRecord?.callbackListenerUrl).toBeUndefined();
+
+    // OSC reports the adopted instance running, but its listener still cannot be
+    // created, so it is NOT promoted however healthy the Encore half looks.
+    const { promoted } = await resolvePendingSpawns(config);
+    expect(promoted).toEqual([]);
+    expect(
+      pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)))[0]?.readyAt
+    ).toBeUndefined();
   });
 
   it('destroys an instance that never becomes reachable, once its budget is spent', async () => {
@@ -756,6 +881,73 @@ describe('a pending spawn is resumed, capped and ultimately reclaimed (#1071)', 
     // Nor is the pending instance dispatched to: it has never reported healthy,
     // so the job stays queued for whichever instance is ready first.
     expect(await redis.llen(keys.queue(WORKSPACE))).toBe(1);
+  });
+
+  it('holds one slot, not the whole pool: scale-up still fires with headroom', async () => {
+    const redis = new FakeRedis();
+    // Two instances already at the busy threshold, one pending, a cap of five
+    // and a deep queue. The pool is out of USABLE capacity and has headroom, so
+    // the gate must fire. Before this fix the pending record's permanent
+    // activeJobs: 0 made `allBusy` false, and scale-up froze for the whole
+    // workspace for as long as anything was coming up.
+    const now = Date.now();
+    for (const [i, id] of ['busy01', 'busy02'].entries()) {
+      const instanceId = `${scalerInstancePrefix(WORKSPACE)}${id}`;
+      await redis.hset(
+        keys.pool(WORKSPACE),
+        instanceId,
+        JSON.stringify({
+          instanceId,
+          url: `https://${instanceId}.osc.example`,
+          callbackListenerUrl: `https://${instanceId}-cb.osc.example`,
+          callbackTrustReady: true,
+          activeJobs: 1,
+          lastIdleAt: now - i,
+          readyAt: now
+        } satisfies EncoreInstanceRecord)
+      );
+    }
+    const pendingId = `${scalerInstancePrefix(WORKSPACE)}pend02`;
+    await redis.hset(
+      keys.pool(WORKSPACE),
+      pendingId,
+      JSON.stringify({
+        instanceId: pendingId,
+        url: `https://${pendingId}.osc.example`,
+        activeJobs: 0,
+        lastIdleAt: now,
+        pendingReadySince: now
+      } satisfies EncoreInstanceRecord)
+    );
+    for (let i = 0; i < 20; i += 1) {
+      await redis.rpush(
+        keys.queue(WORKSPACE),
+        JSON.stringify({ jobId: `job-${i}`, payload: {}, enqueuedAt: now })
+      );
+    }
+
+    createInstanceMock.mockImplementation(creationSucceeds);
+    getInstanceHealthMock.mockImplementation(async (...args: unknown[]) =>
+      // The pending instance is still coming up, so it stays pending for the
+      // whole test and the scale-up has to happen beside it.
+      args[2] === pendingId ? 'pending' : 'running'
+    );
+    // Both existing instances really are mid-job, so the tick's reconcile step
+    // leaves them busy rather than correcting them down to idle.
+    stubFetchForTick((url) => (url.includes('busy') ? 1 : 0));
+
+    const loop = new EncoreScalerLoop(
+      makeConfig(redis, { maxInstances: 5, spawnReadyTimeoutMs: 10 * 60_000 })
+    );
+    await loop.tick();
+
+    const encoreCreates = createInstanceMock.mock.calls.filter(
+      (call) => call[1] === ENCORE_SERVICE_ID
+    );
+    expect(encoreCreates).toHaveLength(1);
+    // The pending entry is untouched by the scale-up; it is extra capacity on
+    // its way, not a reason to stop asking for more.
+    expect(pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(1);
   });
 });
 

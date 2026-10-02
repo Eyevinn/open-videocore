@@ -510,6 +510,80 @@ export async function spawnInstance(
   }
 }
 
+// The dedicated Valkey queue each spawned callback listener publishes completion
+// messages on. Deliberately NOT the eyevinn-encore-packager default: an external
+// packager subscribed to the default queue would win the BZPOPMIN race against
+// our own poller and swallow our completion messages (issue #93). MUST match
+// DEFAULT_QUEUE_KEY in src/pipeline/encore-callback-poller.ts.
+const CALLBACK_LISTENER_QUEUE_KEY = 'ovc:transcode-done';
+
+// Create the callback listener paired with `instanceId`, or adopt the existing
+// one if that name is already taken (#1071).
+//
+// Single source of truth for the listener's creation body, because TWO paths now
+// create it: a normal spawn, and resolvePendingSpawns completing a spawn whose
+// Encore readiness wait timed out BEFORE it ever got here. If they disagreed
+// about `RedisQueue` or `EncoreUrl`, the second path would produce an instance
+// whose completions go somewhere nothing reads.
+//
+// Contracts (verified, @osaas/client-core@0.24.0):
+//   - createInstance(context, serviceId, token, body) — lib/core.js:76-89.
+//   - getInstance(context, serviceId, name, token) — lib/core.js:128-150;
+//     rethrows ONLY 401, returns undefined for every other failure, so undefined
+//     means "could not confirm" and is NOT treated as an adoption.
+// Throws whatever createInstance threw when adoption is not possible, so the
+// caller owns retry/back-off classification.
+async function createOrAdoptCallbackListener(
+  config: EncoreScalerConfig,
+  instanceId: string,
+  encoreUrl: string,
+  callbackSat: string
+): Promise<{ instance: OscInstance; adopted: boolean }> {
+  try {
+    const created = (await createInstance(
+      config.oscContext,
+      ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+      callbackSat,
+      {
+        name: instanceId,
+        RedisUrl: config.redisUrl,
+        EncoreUrl: encoreUrl.replace(/\/+$/, ''),
+        RedisQueue: CALLBACK_LISTENER_QUEUE_KEY
+      }
+    )) as OscInstance;
+    return { instance: created, adopted: false };
+  } catch (err) {
+    // Adopt-on-"already taken": the listener is named after its Encore
+    // instance, so a create that landed behind a 504 makes the retry collide
+    // with itself.
+    if (isNameAlreadyTakenError(err)) {
+      // tryGetInstance, not getInstance: the probe runs inside the create's
+      // failure path, where OSC is by definition unhealthy, and getInstance can
+      // throw (its getService lookup is outside its own try — lib/core.js:128).
+      // A throwing probe used to replace the create's error, abandon the
+      // caller's retry loop and — on the resolvePendingSpawns path — abort the
+      // completion of a pending spawn (#1071 review finding 4). An unconfirmed
+      // probe is "could not confirm", so the original error is re-thrown below
+      // and the caller's transient classification decides what happens next.
+      const existing = await tryGetInstance(
+        config,
+        ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+        instanceId,
+        callbackSat
+      );
+      if (existing) {
+        console.warn(
+          '[encore-scaler] adopted pre-existing callback listener %s (workspace=%s) (#1071)',
+          instanceId,
+          config.workspaceId
+        );
+        return { instance: existing, adopted: true };
+      }
+    }
+    throw err;
+  }
+}
+
 async function spawnPooledInstance(
   config: EncoreScalerConfig,
   maxAttempts: number,
@@ -655,47 +729,19 @@ async function spawnPooledInstance(
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       progress.attempts += 1;
       try {
-        callback = (await createInstance(
-          config.oscContext,
-          ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-          callbackSat,
-          {
-            name: instanceId,
-            RedisUrl: config.redisUrl,
-            EncoreUrl: encoreUrl.replace(/\/+$/, ''),
-            RedisQueue: 'ovc:transcode-done'
-          }
-        )) as OscInstance;
+        const result = await createOrAdoptCallbackListener(
+          config,
+          instanceId,
+          encoreUrl,
+          callbackSat
+        );
+        callback = result.instance;
+        listenerAdopted = result.adopted;
         break;
       } catch (err) {
         lastCallbackErr = err;
-        // Same adopt-on-"already taken" as the Encore create above (#1071): the
-        // listener is named after its Encore instance, so a 504'd create that
-        // landed behind the gateway makes the retry collide with itself.
-        if (isNameAlreadyTakenError(err)) {
-          const existing = await tryGetInstance(
-            config,
-            ENCORE_CALLBACK_LISTENER_SERVICE_ID,
-            instanceId,
-            callbackSat
-          );
-          // As above, `undefined` here means "could not confirm" rather than
-          // "absent" (lib/core.js:140-149) — and a probe that threw is folded
-          // into the same answer by tryGetInstance — so it falls through to the
-          // normal transient classification instead of being treated as proof.
-          if (existing) {
-            callback = existing;
-            listenerAdopted = true;
-            console.warn(
-              '[encore-scaler] spawn: adopted pre-existing callback listener %s ' +
-                '(workspace=%s attempt=%d) (#1071)',
-              instanceId,
-              config.workspaceId,
-              attempt
-            );
-            break;
-          }
-        }
+        // The adopt-on-"already taken" step lives in
+        // createOrAdoptCallbackListener above, shared with resolvePendingSpawns.
         const isTransient = isTransientOscError(err);
         if (!isTransient || attempt === maxAttempts) throw err;
         await new Promise((r) => setTimeout(r, attempt * 5_000));
@@ -841,8 +887,35 @@ async function recordPendingSpawn(
   });
 }
 
-// Resolve every PENDING pool entry for this workspace (#1071): promote the ones
-// OSC now reports `running`, destroy the ones that have run out of time.
+// getInstanceHealth, reduced to "what OSC says, or nothing". Used by the pending
+// resolver, where an unavailable answer is a normal state to wait through rather
+// than an error to propagate.
+async function instanceHealthOrUndefined(
+  config: EncoreScalerConfig,
+  serviceId: string,
+  instanceId: string,
+  token: string
+): Promise<string | undefined> {
+  try {
+    return await getInstanceHealth(config.oscContext, serviceId, instanceId, token);
+  } catch {
+    return undefined;
+  }
+}
+
+async function serviceTokenOrUndefined(
+  config: EncoreScalerConfig,
+  serviceId: string
+): Promise<string | undefined> {
+  try {
+    return await config.oscContext.getServiceAccessToken(serviceId);
+  } catch {
+    return undefined;
+  }
+}
+
+// Resolve every PENDING pool entry for this workspace (#1071): FINISH the spawns
+// that can be finished, destroy the ones that have run out of time.
 //
 // This is what keeps a readiness timeout from becoming either a leak or a
 // stampede. Called once per tick, before the scale-up gate, so that:
@@ -852,6 +925,20 @@ async function recordPendingSpawn(
 //     own, instead of surviving indefinitely because the orphan sweep (rightly)
 //     refuses to act on an instance whose in-flight state it cannot confirm.
 //
+// PROMOTION IS NOT JUST "THE INSTANCE IS UP". A spawn whose Encore readiness wait
+// timed out never reached the code that creates the paired callback listener, so
+// its pending record has no callbackListenerUrl — and an Encore instance with no
+// listener completes jobs into nowhere: dispatch omits progressCallbackUri and
+// every job silently falls back to the terminal-job sweep, with nothing visible
+// on GET /scaler/status. (The trust gate cannot catch it either: ensureCallbackTrust
+// fails OPEN on a missing listener URL, which is only sound for reconcile-from-OSC
+// adoptions, where the listener genuinely exists.) So this function COMPLETES the
+// spawn instead: it creates (or adopts) the missing listener, and only promotes
+// the instance once the listener exists AND OSC reports both halves `running`.
+// Each step is one tick's worth of work — no blocking waits inside the tick — and
+// an instance that cannot be completed stays pending until its deadline, where a
+// clean spawn replaces it.
+//
 // The destroy decision is AUTHORITATIVE, not inferred: getInstanceHealth is
 // OSC's own view of the instance (@osaas/client-core lib/core.d.ts:86, the same
 // call the SDK's waitForInstanceReady gates on). An instance OSC does not report
@@ -859,6 +946,12 @@ async function recordPendingSpawn(
 // cannot interrupt work. A health probe that throws is treated the same way
 // after the deadline — the instance has then been unreachable AND not-running
 // for a whole extra readiness budget.
+//
+// A promoted instance is deliberately one tick behind for dispatch: it is written
+// back here, and step 5 of the SAME tick already holds the instance list it read
+// at step 2. The next tick dispatches to it (and runs its callback-trust probe).
+// That is at most one tick of latency on an instance that has already been minutes
+// in the making, in exchange for never dispatching against a half-written record.
 //
 // Returns the ids promoted and destroyed (for logging/tests). Never throws: a
 // failure here must not take out the tick.
@@ -888,70 +981,138 @@ export async function resolvePendingSpawns(
   }
 
   for (const inst of pending) {
-    let health: string | undefined;
-    try {
-      health = await getInstanceHealth(
-        config.oscContext,
-        ENCORE_SERVICE_ID,
-        inst.instanceId,
-        sat
-      );
-    } catch {
-      health = undefined;
-    }
+    let record = inst;
+    const health = await instanceHealthOrUndefined(
+      config,
+      ENCORE_SERVICE_ID,
+      inst.instanceId,
+      sat
+    );
+    let blockedBy: string | undefined;
 
     if (health === 'running') {
-      const now = Date.now();
-      const { pendingReadySince, ...rest } = inst;
-      try {
-        await updateInstance(config.redis, config.workspaceId, {
-          ...rest,
-          lastIdleAt: now,
-          readyAt: now
-        });
-        promoted.push(inst.instanceId);
-        console.warn(
-          '[encore-scaler] pending spawn %s (workspace=%s) reported running after ' +
-            '%dms and joined the pool — the node it was waiting for finished ' +
-            'provisioning (#1071)',
-          inst.instanceId,
-          config.workspaceId,
-          now - (pendingReadySince ?? now)
-        );
-      } catch (err) {
-        console.error(
-          '[encore-scaler] could not promote pending spawn %s (workspace=%s):',
-          inst.instanceId,
-          config.workspaceId,
-          err
-        );
+      // Step 1: the Encore half is up. Make sure it has a callback listener —
+      // the readiness timeout may well have struck before the spawn ever created
+      // one. Best effort per tick; a failure leaves the record pending and is
+      // retried on the next tick until the deadline.
+      if (!record.callbackListenerUrl) {
+        try {
+          const callbackSat = await config.oscContext.getServiceAccessToken(
+            ENCORE_CALLBACK_LISTENER_SERVICE_ID
+          );
+          const { instance: listener } = await createOrAdoptCallbackListener(
+            config,
+            record.instanceId,
+            record.url,
+            callbackSat
+          );
+          record = { ...record, callbackListenerUrl: instanceUrl(listener) };
+          await updateInstance(config.redis, config.workspaceId, record);
+          console.warn(
+            '[encore-scaler] pending spawn %s (workspace=%s): created the paired ' +
+              'callback listener its timed-out spawn never got to (#1071)',
+            record.instanceId,
+            config.workspaceId
+          );
+        } catch (err) {
+          blockedBy = 'callback listener could not be created';
+          console.error(
+            '[encore-scaler] pending spawn %s (workspace=%s): could not create its ' +
+              'paired callback listener — NOT promoted, because an instance with no ' +
+              'listener completes jobs into nowhere (#1071):',
+            record.instanceId,
+            config.workspaceId,
+            err
+          );
+        }
       }
-      continue;
+
+      // Step 2: both halves must be up before this instance may take work.
+      if (record.callbackListenerUrl) {
+        const callbackSat = await serviceTokenOrUndefined(
+          config,
+          ENCORE_CALLBACK_LISTENER_SERVICE_ID
+        );
+        const listenerHealth = callbackSat
+          ? await instanceHealthOrUndefined(
+              config,
+              ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+              record.instanceId,
+              callbackSat
+            )
+          : undefined;
+        if (listenerHealth === 'running') {
+          const now = Date.now();
+          const { pendingReadySince, ...rest } = record;
+          try {
+            await updateInstance(config.redis, config.workspaceId, {
+              ...rest,
+              lastIdleAt: now,
+              readyAt: now
+            });
+            promoted.push(record.instanceId);
+            console.warn(
+              '[encore-scaler] pending spawn %s (workspace=%s) is fully up after ' +
+                '%dms (instance and callback listener) and joined the pool — the node ' +
+                'it was waiting for finished provisioning (#1071)',
+              record.instanceId,
+              config.workspaceId,
+              now - (pendingReadySince ?? now)
+            );
+            continue;
+          } catch (err) {
+            console.error(
+              '[encore-scaler] could not promote pending spawn %s (workspace=%s):',
+              record.instanceId,
+              config.workspaceId,
+              err
+            );
+          }
+        } else {
+          blockedBy = `callback listener health=${String(listenerHealth ?? 'unavailable')}`;
+        }
+      }
+    } else {
+      blockedBy = `instance health=${String(health ?? 'unavailable')}`;
     }
 
-    const waitedMs = Date.now() - (inst.pendingReadySince ?? 0);
+    const waitedMs = Date.now() - (record.pendingReadySince ?? 0);
     if (waitedMs < graceMs) continue; // still inside its extra budget
 
     try {
+      // Claim the record BEFORE tearing anything down, so two overlapping
+      // resolvers (a slow tick overlapping the next) cannot both issue the OSC
+      // teardown: hdel returns 1 for exactly one of them. destroyInstance's own
+      // pool-record delete then becomes a no-op.
+      const claimed = await config.redis.hdel(
+        keys.pool(config.workspaceId),
+        record.instanceId
+      );
+      if (claimed === 0) continue; // another resolver already owns this teardown
       // destroyInstance tears down the Encore instance AND its paired callback
-      // listener, and drops the pool record.
-      await destroyInstance(inst.instanceId, config);
-      destroyed.push(inst.instanceId);
+      // listener.
+      await destroyInstance(record.instanceId, config);
+      destroyed.push(record.instanceId);
       console.warn(
-        '[encore-scaler] pending spawn %s (workspace=%s) never reported running ' +
-          '(OSC health=%s) after %dms — destroyed rather than left billing (#1071)',
-        inst.instanceId,
+        '[encore-scaler] pending spawn %s (workspace=%s) could not be completed ' +
+          'after %dms (%s) — destroyed rather than left billing; the next scale-up ' +
+          'starts a clean spawn (#1071)',
+        record.instanceId,
         config.workspaceId,
-        String(health ?? 'unavailable'),
-        waitedMs
+        waitedMs,
+        blockedBy ?? 'reason unknown'
       );
     } catch (err) {
-      // Keep the record so the next tick retries the teardown.
+      // Put the record back so the next tick retries the teardown rather than
+      // losing track of a live instance.
       console.error(
         '[encore-scaler] could not destroy stuck pending spawn %s (workspace=%s):',
-        inst.instanceId,
+        record.instanceId,
         config.workspaceId,
         err
+      );
+      await updateInstance(config.redis, config.workspaceId, record).catch(
+        () => undefined
       );
     }
   }
