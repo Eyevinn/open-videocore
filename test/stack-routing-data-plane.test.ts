@@ -103,6 +103,13 @@ type Harness = {
   stacks: Record<string, Stack>;
   submitted: EncoreSubmitInput[];
   submittedInputs: Array<{ inputUri?: string }>;
+  // Simulates the resolver cache entry ageing past CACHE_TTL_MS
+  // (services/workspace-stack.ts) WITHOUT touching resolve(): only the cached
+  // read goes cold, which is exactly the real expiry behaviour and the condition
+  // the post-pull continuation can hit on a long transfer (issue #1058 review).
+  expireResolverCache: () => void;
+  // Storage handles the extractor was actually invoked with, in order.
+  extractedWith: Array<{ assetId: string; storage: unknown }>;
 };
 
 // Resolver stub keyed exactly like WorkspaceStackResolver: a name with a stored
@@ -117,12 +124,19 @@ async function buildApp(
   const pick = (requested?: string): Stack =>
     (requested && stacks[requested]) || stacks[names[0]!]!;
 
+  let cacheCold = false;
   const resolver = {
     resolve: async (stackName?: string) => pick(stackName).connections,
-    resolveCached: (stackName?: string) => pick(stackName).connections,
+    resolveCached: (stackName?: string) =>
+      cacheCold ? undefined : pick(stackName).connections,
     resolveStackName: async (requested?: string) =>
       requested && stacks[requested] ? requested : names[0]
   } as unknown as WorkspaceStackResolver;
+
+  // Records which WorkspaceStorage each extraction ran against, so a test can
+  // assert the handle came from the right stack rather than only that an
+  // extraction happened.
+  const extractedWith: Array<{ assetId: string; storage: unknown }> = [];
 
   const submitted: EncoreSubmitInput[] = [];
   const encore: EncoreClient = {
@@ -156,12 +170,28 @@ async function buildApp(
     sourceBucket: SOURCE_BUCKET,
     outputBucket: 'openvideocore-packaged',
     pullDeps: { sleep: async () => {}, baseBackoffMs: 0 },
+    // Probe + extractor stubs so the fire-and-forget extraction actually runs
+    // (triggerExtraction no-ops without `probe`). The extractor records the
+    // storage handle it was handed instead of doing any work.
+    probe: async () => ({ streams: [], format: {} }) as never,
+    extract: (async (params: { assetId: string }, deps: { storage: unknown }) => {
+      extractedWith.push({ assetId: params.assetId, storage: deps.storage });
+    }) as never,
     resolveStackContext:
       opts.resolveStackContext ??
       (async (requested?: string) => (requested && stacks[requested] ? requested : names[0]))
   });
   await app.ready();
-  return { app, stacks, submitted, submittedInputs: submitted as Array<{ inputUri?: string }> };
+  return {
+    app,
+    stacks,
+    submitted,
+    submittedInputs: submitted as Array<{ inputUri?: string }>,
+    expireResolverCache: () => {
+      cacheCold = true;
+    },
+    extractedWith
+  };
 }
 
 const AUTH = { authorization: 'Bearer test-token' };
@@ -206,6 +236,71 @@ describe('data plane resolves the stack the request names (issue #1058)', () => 
       expect(h.stacks['b']!.storage.stored).toEqual([`ingest/${assetId}`]);
       expect(h.stacks['a']!.storage.stored).toEqual([]);
     } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // Issue #1058 review, finding 3. The post-pull metadata extraction used to call
+  // the request-scoped storage factory a SECOND time, from inside the detached
+  // `.then()` that runs after the pull settles. That factory is a cache read, so
+  // on a transfer longer than the resolver TTL it returned undefined and THREW —
+  // inside a promise with no `.catch` — losing the extraction silently and
+  // raising an unhandled rejection. The handle is now captured once, before the
+  // pull, and reused.
+  it('still extracts metadata on the NAMED stack when the resolver cache expires mid-pull', async () => {
+    const payload = Buffer.from('hello-video-bytes');
+    // Gate the response body so the pull is provably still in flight when the
+    // cache goes cold — no sleep-based race.
+    const body = new Readable({ read() {} });
+    const fetch = vi.fn(
+      async () =>
+        new Response(Readable.toWeb(body) as ReadableStream<Uint8Array>, {
+          headers: { 'content-length': String(payload.length) }
+        })
+    ) as unknown as typeof globalThis.fetch;
+
+    const h = await buildApp(['a', 'b']);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetch;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown): void => {
+      unhandled.push(err);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const res = await h.app.inject({
+        method: 'POST',
+        url: '/api/v1/assets/ingest-url',
+        headers: { ...AUTH, 'x-stack-name': 'b' },
+        payload: { sourceUrl: 'https://example.com/clip.mp4', name: 'clip' }
+      });
+      expect(res.statusCode).toBe(202);
+      const { assetId } = res.json();
+
+      // The request has returned and the pull is open: age the cache entry out,
+      // then let the bytes through.
+      h.expireResolverCache();
+      body.push(payload);
+      body.push(null);
+
+      // The bytes still land on the named stack (the pull holds its own handle).
+      await waitFor(() => h.stacks['b']!.storage.stored.length > 0);
+      expect(h.stacks['b']!.storage.stored).toEqual([`ingest/${assetId}`]);
+
+      // ...and the extraction STILL runs, against stack b's storage, even though
+      // a fresh `resolveCached('b')` would now return undefined. Pre-fix this
+      // array stayed empty and an unhandled rejection was raised instead.
+      await waitFor(() => h.extractedWith.length > 0);
+      expect(h.extractedWith).toHaveLength(1);
+      expect(h.extractedWith[0]!.assetId).toBe(assetId);
+      expect(h.extractedWith[0]!.storage).toBe(h.stacks['b']!.storage);
+      expect(h.extractedWith[0]!.storage).not.toBe(h.stacks['a']!.storage);
+
+      // Give any stray rejection a turn of the loop to surface before asserting.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
       globalThis.fetch = originalFetch;
     }
   });

@@ -2505,6 +2505,18 @@ watchFolder?.start();
 // started when a cap is configured AND object storage is reachable; otherwise
 // there is nothing to enforce or sweep. Runs one immediate sweep on boot then on
 // STORAGE_QUOTA_RECONCILE_INTERVAL_MS (default 6h).
+//
+// KNOWN GAP on a multi-stack install (#1090, found reviewing #1058). This resolves
+// `resolveCached()` with NO stack name at boot, so it sums only the FIRST listed
+// stack's two buckets — but since #1058 the data plane writes bytes to whichever
+// stack the request named. Because the sweep OVERWRITES the committed total
+// rather than adding to it, usage on stacks 2..N is erased from the counter on
+// every sweep, so the cap silently UNDER-counts and admits more than the operator
+// configured. Fixing it needs the architect call #1090 is waiting on (is a quota
+// per deployment or per stack?): ADR-020 Decision 1 says one deployment is one
+// tenant, which argues for summing every provisioned stack via listStackNames()
+// here, but that is a behaviour change to a billing-adjacent number, not a bug
+// fix. Single-stack deployments — every one on OSC today — are unaffected.
 if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
   const conns = stackResolver.resolveCached();
   if (conns?.storageClient) {

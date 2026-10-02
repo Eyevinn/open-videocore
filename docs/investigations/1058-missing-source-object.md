@@ -301,6 +301,17 @@ move together, which is the invariant #1058 broke.
   the URL-pull worker (`void runner(...)`) and the metadata extraction that
   follows it resolve the same stack the ingest request named, without threading a
   parameter through every call site.
+  - One exception has to be threaded explicitly. The storage factory is a *cache*
+    read (`resolveCached`), and a large pull can outlive the resolver's
+    `CACHE_TTL_MS`; calling it again from the post-pull continuation would then
+    THROW inside a detached promise — losing the extraction silently and raising
+    an unhandled rejection — rather than return the wrong stack. So
+    `POST /assets/ingest-url` resolves the handle ONCE while the request is in
+    flight (`pullStorage`) and hands the same handle to both the pull and
+    `triggerExtraction(..., pullStorage)`, the same shape
+    `onObjectStored(assetId, objectKey, storage?)` already uses for the upload
+    path. The continuation also carries a `.catch` now, so a failure to start the
+    extraction is logged instead of being an unhandled rejection.
 - Outside a request the store is empty and resolution falls back to the first
   listed stack — which is correct for a single-stack install but is NOT enough
   for the paths that settle work, so those re-enter the right stack explicitly:
@@ -413,6 +424,32 @@ data-plane cases and three of the six callback cases.
   are covered by their own identity sources; the remaining sweeps and the
   watch-folder are not. Tracked as **#1090**, which needs an architect call on
   whether a sweep is per-deployment or per-stack.
+- **Making the storage-quota reconciler stack-aware.** The 6 h sweep (ADR-020
+  Decision 2, `src/main.ts`) resolves `resolveCached()` with no name at boot and
+  sums only the first-listed stack's buckets — then *overwrites* the committed
+  total. Now that bytes can land on any named stack, usage on stacks 2..N is
+  erased from the counter on every sweep, so the cap silently UNDER-counts. Called
+  out separately from the other sweeps on **#1090** because the consequence is
+  distinct: the others fail to act on assets, this one mis-states a
+  billing-adjacent number. Deliberately not fixed here — "sum every provisioned
+  stack" is the architect call #1090 is waiting on, not a bug fix, and the code
+  comment at the wiring site now says so.
+- **A large-file (>= 400 MB) regression test.** #1058's acceptance criteria asked
+  for one if the fix shipped alongside the diagnosis. It is **waived
+  deliberately**, because Point 3 establishes that payload size is a confounded
+  variable rather than a cause: both minio upload branches commit the object
+  before the pull resolves, so the single-part and multipart paths are
+  indistinguishable from the worker's point of view, and the bug is a *routing*
+  defect — the write and the read address different stacks regardless of how many
+  bytes moved. A 400 MB fixture would assert nothing the 17-byte payload in
+  `test/stack-routing-data-plane.test.ts` does not already assert, while adding
+  minutes to every CI run. What size *did* affect is the reporter's experience,
+  not the mechanism: a large upload is simply the case an operator notices,
+  because a short one fails fast enough to look like a transient error. The
+  routing claim is pinned instead by asserting WHICH stack each half resolves —
+  the six data-plane cases and six callback cases above — which is the actual
+  invariant. If a size-dependent failure is ever observed *after* this fix, it is
+  a different bug and should get its own issue rather than retro-fitting this one.
 
 ## Remediation for assets already misrouted
 

@@ -1878,10 +1878,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
   // configured. Returns true when an extraction was actually kicked off.
+  //
+  // `storage` lets a caller hand in a WorkspaceStorage it already resolved
+  // instead of resolving a fresh one here. Callers that run INSIDE the request
+  // can omit it — `storageFor()` reads the resolver cache entry the onRequest
+  // hook just warmed for this request's stack (issue #1058). A caller that
+  // reaches this AFTER the request's work has settled must pass the handle,
+  // because `makeRequestScopedStorageFactory` is a cache read and the entry can
+  // age past the resolver TTL (`CACHE_TTL_MS`, services/workspace-stack.ts)
+  // during a long transfer — after which the factory THROWS rather than
+  // returning the wrong stack. Same reason, and the same shape, as
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts:83).
   function triggerExtraction(
     assetId: string,
     objectKey: string,
-    externalSource?: ExternalProbeSource
+    externalSource?: ExternalProbeSource,
+    storage?: WorkspaceStorage
   ): boolean {
     if (!opts.probe || !storageFor) {
       return false;
@@ -1890,7 +1902,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       { assetId, objectKey, ...(externalSource ? { externalSource } : {}) },
       {
         assets: repo,
-        storage: storageFor(),
+        storage: storage ?? storageFor(),
         probe: opts.probe,
         ...opts.extractDeps
       }
@@ -3085,6 +3097,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         sourceUrl
       });
 
+      // Resolved ONCE, here, while the request is still in flight — and reused
+      // for both the pull and the extraction that follows it (issue #1058
+      // review). `storageFor()` is a cache read keyed on this request's stack
+      // name, and a large pull can outlive the resolver TTL; resolving again
+      // from the `.then()` below would throw inside a detached promise (silent
+      // loss of the extraction plus an unhandled rejection) rather than return
+      // the right stack. The handle itself is a plain client wrapper with no
+      // TTL of its own, so holding it across the pull is safe.
+      const pullStorage = storageFor();
+
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
@@ -3095,7 +3117,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         {
           jobs,
           assets: repo,
-          storage: storageFor(),
+          storage: pullStorage,
           quota: opts.quota,
           ...opts.pullDeps,
           // Operational log for the `ingest` stage (issue #995). Threaded after
@@ -3106,12 +3128,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           pipelineLog,
           pipelineLogErrors: request.log
         }
-      ).then(async () => {
-        const settled = await repo.get(asset.id);
-        if (settled?.status === 'processing') {
-          triggerExtraction(asset.id, objectKey);
-        }
-      });
+      )
+        .then(async () => {
+          const settled = await repo.get(asset.id);
+          if (settled?.status === 'processing') {
+            triggerExtraction(asset.id, objectKey, undefined, pullStorage);
+          }
+        })
+        // This continuation outlives the request, so nothing is left to surface
+        // a rejection: `repo.get` resolves the stack through the ambient context
+        // and can fail on its own (a dead CouchDB, a stack de-provisioned mid
+        // pull). Logged rather than swallowed, and never rethrown, so an ingest
+        // whose extraction could not be kicked off is visible in the operational
+        // log instead of arriving as an unhandled rejection (issue #1058 review).
+        .catch((err: unknown) => {
+          request.log.error(
+            { err, assetId: asset.id, jobId: job.id },
+            'post-pull metadata extraction could not be started'
+          );
+        });
 
       return reply.code(202).send({ assetId: asset.id, jobId: job.id });
     }
@@ -4375,7 +4410,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // caller polls GET /api/v1/jobs/:id and the Encore callback finishes the work.
   //   202 — accepted, transcode submitted
   //   404 — unknown/foreign source asset (existence not leaked)
-  //   409 — the source asset has no stored object to transcode
+  //   409 — `no_object` — the source asset has no stored object to transcode
+  //         (pipeline/source-object.ts NO_SOURCE_OBJECT_ERROR);
+  //         `burn_in_source_not_ready` / `burn_in_source_not_available` — a
+  //         burn-in was asked for but its caption source has no key yet, or the
+  //         key's bytes have not landed (issues #388 / #389);
+  //         `stack_routing_mismatch` — the source bytes and the transcoder would
+  //         resolve DIFFERENT stacks, so the transcode would fail with an
+  //         indistinguishable 404 (issue #1058). Refused up front rather than
+  //         submitted; retry naming one stack consistently via `X-Stack-Name`.
   //   501 — transcoding is not configured on this deployment
   //   502 — Encore rejected the submission
   app.post(
@@ -4727,7 +4770,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //
   //   202 — packaging enqueued (or pipeline started)
   //   404 — unknown/foreign asset (existence not leaked)
-  //   409 — pipeline already running / job not found / instance unavailable
+  //   409 — pipeline already running / job not found / instance unavailable /
+  //         `stack_routing_mismatch` (issue #1058, pipeline mode only — it shares
+  //         `startPipelineExecution` with POST /:id/execute, whose abr-vod
+  //         pipeline contains a transcode step)
   //   501 — required service not configured on this deployment
   //   502 — Encore submission failed
   app.post(
@@ -4842,7 +4888,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         (package-only, issue #739) `no_renditions` — nothing to package,
   //         `no_transcode_job` — no recorded completed transcode to package from,
   //         `instance_not_found` — the transcode's Encore instance is no longer
-  //         pooled, so the job URL the packager needs cannot be resolved
+  //         pooled, so the job URL the packager needs cannot be resolved /
+  //         `stack_routing_mismatch` (issue #1058) — for any pipeline CONTAINING
+  //         a transcode step, the source bytes and the transcoder would resolve
+  //         different stacks; refused before the execution record is created
   //   501 — pipeline execution or the required OSC service is not configured
   //   502 — the first step's submission failed
   app.post(
