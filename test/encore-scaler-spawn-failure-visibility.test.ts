@@ -518,12 +518,20 @@ describe('a failed scale-up is visible and does not abort the tick (issue #1071)
   it('records the real attempt count when every transient retry is exhausted', async () => {
     const redis = new FakeRedis();
     const workspaceId = 'ws-retries';
-    createInstanceMock.mockRejectedValue(new Error('503 Service Unavailable'));
+    // A transient OSC failure as @osaas/client-core actually reports one: a
+    // FetchError carrying `httpCode` (lib/fetch.js defaultErrorFactory). #1071
+    // moved the transient classifier onto that structural status, so a plain
+    // Error whose TEXT happens to contain "503" is — correctly — no longer
+    // retried; only a response that really was a 5xx is.
+    const transient = Object.assign(new Error('Service Unavailable'), {
+      httpCode: 503
+    });
+    createInstanceMock.mockRejectedValue(transient);
 
     vi.useFakeTimers();
     try {
       const pending = spawnInstance(makeConfig(redis, workspaceId), 3);
-      const settled = expect(pending).rejects.toThrow(/503/);
+      const settled = expect(pending).rejects.toThrow(/Service Unavailable/);
       // Let both back-offs (5s, 10s) elapse.
       await vi.advanceTimersByTimeAsync(60_000);
       await settled;

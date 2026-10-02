@@ -50,8 +50,14 @@ export type DroppedJob = {
 // WORKSPACE, not per instance: the thing that failed is the workspace's
 // scale-up, and there is no instance to hang it off.
 //   - at:                  epoch ms the failure was recorded.
-//   - attempts:            create attempts this spawn made before giving up
-//                          (spawnInstance's maxAttempts retry loop).
+//   - attempts:            TOTAL createInstance calls the failed spawn made,
+//                          summed over BOTH services it creates — the Encore
+//                          instance and its paired callback listener, each with
+//                          its own maxAttempts loop. It is NOT the attempt number
+//                          of a single loop and may exceed maxAttempts (an Encore
+//                          create that succeeded on try 2 followed by three failed
+//                          listener creates reports 5). Read it as "how much work
+//                          this spawn burned before giving up".
 //   - consecutiveFailures: how many spawns in a row have failed, carried
 //                          forward across records and reset by a success, so a
 //                          transient blip is distinguishable from a scaler that
@@ -116,6 +122,15 @@ export type EncoreScalerConfig = {
   // reaper's grace window is supposed to be able to outlast. On timeout the spawn
   // fails and its cleanup path destroys the Encore instance and any paired
   // listener. Unset uses DEFAULT_SPAWN_READY_TIMEOUT_MS.
+  //
+  // #1071: this budget must cover NODE provisioning, not just pod start. OSC may
+  // have to bring up a whole new worker node to place the instance (which is also
+  // why createInstance can answer 504 while the work continues behind the
+  // gateway), and that takes minutes. The default was raised to 15 minutes
+  // accordingly; a deployment on a cluster with spare capacity can lower it with
+  // ENCORE_SPAWN_READY_TIMEOUT_MS. On timeout the instance is now left ALIVE for
+  // the orphan sweep rather than destroyed, because a not-yet-`running` instance
+  // is usually still coming up rather than broken.
   spawnReadyTimeoutMs?: number;
   // #778 (review round 2): how often (ms) that bounded wait re-checks
   // getInstanceHealth. The scaler owns the poll loop instead of racing a timer

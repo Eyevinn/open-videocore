@@ -8,6 +8,11 @@
 // Contract sources (verified against @osaas/client-core lib/core.d.ts):
 //   createInstance(context, serviceId, token, body): Promise<any>
 //   removeInstance(context, serviceId, name, token): Promise<void>
+//   getInstance(context, serviceId, name, token): Promise<any>           (:56)
+//     — resolves UNDEFINED when the instance does not exist: lib/core.js:140-150
+//       swallows a FetchError with httpCode 404 and returns undefined (it
+//       rethrows only 401 as UnauthorizedError). Every adopt path below must
+//       therefore treat `undefined` as "not there after all", not as success.
 //   getInstanceHealth(context, serviceId, name, token): Promise<string>  (:86)
 // The Encore serviceId is 'encore' (src/services/stack.ts:25). The returned
 // instance object carries `name` (instance id) and `url` — same fields the
@@ -17,6 +22,7 @@ import { createHash } from 'node:crypto';
 import type { Redis } from 'ioredis';
 import {
   createInstance,
+  getInstance,
   getInstanceHealth,
   listInstances as oscListInstances,
   removeInstance
@@ -24,6 +30,11 @@ import {
 import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './types.js';
 import { fetchEncoreActiveState } from './encore-active-state.js';
 import { hasPendingPackaging } from './packaging-pin.js';
+import {
+  isNameAlreadyTakenError,
+  isTransientOscError,
+  oscHttpCode
+} from './osc-error.js';
 import {
   clearSpawnFailure,
   recordSpawnFailure,
@@ -268,7 +279,34 @@ export async function reconcilePoolFromOsc(
 // destroys the Encore instance AND its paired listener) instead of leaking.
 // Logged as OSC friction (CLAUDE.md rule 6):
 // docs/osc-feedback/incoming-waitforinstanceready-unbounded.md.
-export const DEFAULT_SPAWN_READY_TIMEOUT_MS = 5 * 60_000;
+//
+// #1071: raised from 5 minutes to 15. Five minutes was sized for a POD starting
+// on a node that already exists. The platform's own answer to the 504s in #1071
+// is that a create may have to wait for a whole new worker NODE to be
+// provisioned, and the request keeps running behind the gateway timeout while
+// that happens — minutes, not seconds. A budget sized for pod start turned that
+// into a loop: the create finally succeeds, the readiness wait expires while the
+// node is still coming up, the cleanup path destroys the half-born instance, and
+// the next tick starts the whole node provisioning over again.
+// Override per deployment with ENCORE_SPAWN_READY_TIMEOUT_MS (main.ts) /
+// EncoreScalerConfig.spawnReadyTimeoutMs.
+export const DEFAULT_SPAWN_READY_TIMEOUT_MS = 15 * 60_000;
+
+// Raised when the bounded readiness wait expires. Carries the service and
+// instance so the spawn's cleanup path can tell this apart from every other
+// failure: a readiness timeout means the instance EXISTS and is very likely
+// still coming up (#1071 — node provisioning), so destroying it is wrong. Every
+// other failure in that block means the spawn cannot proceed and must clean up.
+export class SpawnReadyTimeoutError extends Error {
+  readonly serviceId: string;
+  readonly instanceId: string;
+  constructor(serviceId: string, instanceId: string, message: string) {
+    super(message);
+    this.name = 'SpawnReadyTimeoutError';
+    this.serviceId = serviceId;
+    this.instanceId = instanceId;
+  }
+}
 
 // How often (ms) the bounded readiness wait re-checks instance health. Matches
 // the 1s cadence @osaas/client-core's own waitForInstanceReady uses
@@ -343,7 +381,9 @@ async function waitForInstanceReadyBounded(
     : lastStatus
       ? `; last reported health: ${lastStatus}`
       : '';
-  throw new Error(
+  throw new SpawnReadyTimeoutError(
+    serviceId,
+    instanceId,
     `timed out after ${timeoutMs}ms waiting for OSC instance ${instanceId} ` +
       `(service ${serviceId}) to report running${detail}`
   );
@@ -351,9 +391,20 @@ async function waitForInstanceReadyBounded(
 
 // Mutable bookkeeping threaded through a single spawn so its failure path can
 // report HOW MUCH was attempted and WHICH short-lived credentials were in play
-// (#1071). `attempts` counts every createInstance call this spawn made across
-// both services; `secrets` collects the service access tokens it minted, so the
-// recorded error text can be scrubbed of them before it is served over HTTP.
+// (#1071).
+//
+// `attempts` is the TOTAL number of createInstance calls this spawn made, summed
+// over BOTH services it creates: the Encore instance (up to `maxAttempts`) and
+// its paired callback listener (up to `maxAttempts` again). It is therefore NOT
+// the attempt number of any one retry loop and can exceed `maxAttempts` — a
+// spawn that created the Encore instance on its second try and then exhausted
+// three listener attempts reports attempts: 5. It is a "how much work did this
+// spawn burn before giving up" counter, which is what distinguishes one unlucky
+// call from a workspace hammering OSC every tick. Incremented once per attempt,
+// before the call, so an attempt that throws still counts.
+//
+// `secrets` collects the service access tokens the spawn minted, so the recorded
+// error text can be scrubbed of them before it is served over HTTP.
 type SpawnProgress = { attempts: number; secrets: string[] };
 
 // Spawn a fresh Encore OSC instance and register it in the pool. The instance
@@ -391,10 +442,12 @@ export async function spawnInstance(
         secrets: spawnFailureSecrets(config, progress.secrets)
       });
       console.error(
-        '[encore-scaler] spawn failed (workspace=%s attempts=%d consecutive=%d): %s',
+        '[encore-scaler] spawn failed (workspace=%s createCalls=%d consecutive=%d ' +
+          'httpCode=%s): %s',
         config.workspaceId,
         recorded.attempts,
         recorded.consecutiveFailures,
+        String(oscHttpCode(err) ?? 'none'),
         recorded.message
       );
     } catch (recordErr) {
@@ -425,6 +478,13 @@ async function spawnPooledInstance(
   // Whether the paired callback listener was created, so the cleanup path knows
   // it has a listener to remove as well (#778 review finding 3).
   let listenerCreated = false;
+  // #1071: whether the Encore instance / its listener was ADOPTED — found
+  // already existing on OSC and fetched with getInstance — rather than created
+  // by this spawn's own successful createInstance call. The cleanup path below
+  // never destroys an adopted instance, following the adopted-vs-created
+  // distinction src/routes/provision.ts already makes for rollback (#417/#736).
+  let instanceAdopted = false;
+  let listenerAdopted = false;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     progress.attempts += 1;
     try {
@@ -450,12 +510,44 @@ async function spawnPooledInstance(
       break;
     } catch (err) {
       lastErr = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      // Only retry on transient 5xx / network errors, not on 4xx (bad request).
-      const isTransient =
-        msg.includes('500') || msg.includes('502') || msg.includes('503') ||
-        msg.includes('ORCHESTRATOR_UNAVAILABLE') || msg.includes('ORCHESTRATOR_AUTH_TRANSIENT') ||
-        msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
+      // #1071 ADOPT-ON-"ALREADY TAKEN". `name` is computed ONCE, outside this
+      // loop, so every attempt sends the same name. That is deliberate: when a
+      // previous attempt timed out at the gateway (504) but completed behind it,
+      // OSC answers the retry with "Name is already taken" — which is proof the
+      // instance we wanted exists. Fetch and adopt it instead of failing or
+      // creating a duplicate, the same idempotency src/routes/provision.ts:822-843
+      // implements for the provisioning path (#417).
+      if (isNameAlreadyTakenError(err)) {
+        const existing = (await getInstance(
+          config.oscContext,
+          ENCORE_SERVICE_ID,
+          name,
+          sat
+        )) as OscInstance | undefined;
+        if (existing) {
+          instance = existing;
+          instanceAdopted = true;
+          console.warn(
+            '[encore-scaler] spawn: adopted pre-existing Encore instance %s ' +
+              '(workspace=%s attempt=%d) — a previous create landed despite ' +
+              'reporting a failure (#1071)',
+            name,
+            config.workspaceId,
+            attempt
+          );
+          break;
+        }
+        // getInstance resolves undefined on 404 (lib/core.js:140-150): the name
+        // is taken but not by anything we can see (a teardown racing us). Fall
+        // through and let the retry/back-off decide, rather than adopting
+        // `undefined` as if it were an instance.
+      }
+      // Retry only what can succeed on a later attempt. Classified on the
+      // error's structural httpCode, NOT on substring-matching its message
+      // (#1071): the 504 that caused the incident arrives as an HTML error page
+      // whose text was never matched, while any message merely containing '503'
+      // was retried as though it were one.
+      const isTransient = isTransientOscError(err);
       if (!isTransient || attempt === maxAttempts) throw err;
       // Exponential back-off: 5s, 10s.
       await new Promise((r) => setTimeout(r, attempt * 5_000));
@@ -511,11 +603,30 @@ async function spawnPooledInstance(
         break;
       } catch (err) {
         lastCallbackErr = err;
-        const msg = err instanceof Error ? err.message : String(err);
-        const isTransient =
-          msg.includes('500') || msg.includes('502') || msg.includes('503') ||
-          msg.includes('ORCHESTRATOR_UNAVAILABLE') || msg.includes('ORCHESTRATOR_AUTH_TRANSIENT') ||
-          msg.includes('ECONNRESET') || msg.includes('context deadline exceeded');
+        // Same adopt-on-"already taken" as the Encore create above (#1071): the
+        // listener is named after its Encore instance, so a 504'd create that
+        // landed behind the gateway makes the retry collide with itself.
+        if (isNameAlreadyTakenError(err)) {
+          const existing = (await getInstance(
+            config.oscContext,
+            ENCORE_CALLBACK_LISTENER_SERVICE_ID,
+            instanceId,
+            callbackSat
+          )) as OscInstance | undefined;
+          if (existing) {
+            callback = existing;
+            listenerAdopted = true;
+            console.warn(
+              '[encore-scaler] spawn: adopted pre-existing callback listener %s ' +
+                '(workspace=%s attempt=%d) (#1071)',
+              instanceId,
+              config.workspaceId,
+              attempt
+            );
+            break;
+          }
+        }
+        const isTransient = isTransientOscError(err);
         if (!isTransient || attempt === maxAttempts) throw err;
         await new Promise((r) => setTimeout(r, attempt * 5_000));
       }
@@ -545,20 +656,52 @@ async function spawnPooledInstance(
     await updateInstance(config.redis, config.workspaceId, record);
     return record;
   } catch (err) {
-    // Clean up the already-created Encore instance so it doesn't become an
-    // untracked orphan. Best-effort: swallow cleanup errors so the original
-    // error is what propagates to the caller.
-    try {
-      await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
-    } catch {
-      // Ignore — we're already in an error path.
+    // #1071: TWO cases must NOT be torn down here.
+    //
+    //  a) ADOPTED. The instance was already on OSC when this spawn found it, so
+    //     this spawn did not create it and must not destroy it — the same
+    //     adopted-vs-created rule src/routes/provision.ts applies to rollback
+    //     (#417/#736).
+    //  b) STILL COMING UP. A readiness timeout (SpawnReadyTimeoutError) is not
+    //     evidence of a broken instance: when OSC had to provision a new worker
+    //     node the instance is simply not `running` yet. Destroying it threw
+    //     away minutes of node provisioning and sent the next tick around the
+    //     same loop. It is left alive; the orphan reaper (reapOrphanedInstances)
+    //     owns it from here and will only destroy it after the grace window AND
+    //     a positive no-work confirmation, or adopt it back into the pool if it
+    //     turns out to be working.
+    //
+    // Everything else is cleaned up as before so it doesn't become an untracked
+    // orphan. Best-effort: swallow cleanup errors so the original error is what
+    // propagates to the caller.
+    const stillComingUp = err instanceof SpawnReadyTimeoutError;
+    const keepEncoreInstance = instanceAdopted || stillComingUp;
+    if (keepEncoreInstance) {
+      console.warn(
+        '[encore-scaler] spawn failed but the Encore instance %s (workspace=%s) is ' +
+          'NOT being destroyed (adopted=%s stillComingUp=%s) — the orphan sweep owns ' +
+          'it from here (#1071)',
+        instanceId,
+        config.workspaceId,
+        String(instanceAdopted),
+        String(stillComingUp)
+      );
+    } else {
+      try {
+        await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
+      } catch {
+        // Ignore — we're already in an error path.
+      }
     }
     // #778 review finding 3: the paired callback listener leaks in exactly the
     // same way. If it was created before the failure (listener readiness wait or
     // the pool write threw), the same-named listener keeps running and billing,
     // and nothing else would ever remove it. Removed unconditionally when we know
-    // it was created; a 404 is harmless either way.
-    if (listenerCreated) {
+    // it was created; a 404 is harmless either way. An ADOPTED listener, or one
+    // whose Encore instance is being kept because it is still coming up, is left
+    // alone for the same reasons as the instance above (#1071) — a listener with
+    // no Encore instance is itself swept by the orphan reaper.
+    if (listenerCreated && !listenerAdopted && !keepEncoreInstance) {
       try {
         const callbackSat = await config.oscContext.getServiceAccessToken(
           ENCORE_CALLBACK_LISTENER_SERVICE_ID
@@ -623,11 +766,17 @@ export async function destroyInstance(
 //
 // That worst case is now BOUNDED (#778 review finding 4): two readiness waits of
 // at most DEFAULT_SPAWN_READY_TIMEOUT_MS (Encore instance + paired callback
-// listener) plus up to two 5s/10s transient createInstance retries on each, i.e.
-// ~10.5 minutes with the defaults. 20 minutes leaves real headroom on top of
-// that, and the reaper additionally needs TWO sweeps (first sighting only starts
-// the clock) before it acts.
-export const DEFAULT_ORPHAN_GRACE_MS = 20 * 60_000;
+// listener) plus up to two 5s/10s transient createInstance retries on each.
+//
+// #1071 raised DEFAULT_SPAWN_READY_TIMEOUT_MS to 15 minutes to accommodate OSC
+// provisioning a new worker node, which moves that worst case to ~30.5 minutes —
+// past the old 20-minute window. Left at 20 the reaper would have started
+// destroying instances WHILE THEIR OWN SPAWN WAS STILL WAITING ON THEM, which is
+// precisely the failure it was built to avoid, so the window moves with it. 45
+// minutes keeps the same kind of headroom over the new worst case, and the
+// reaper additionally needs TWO sweeps (the first sighting only starts the
+// clock) and a positive no-work confirmation before it acts.
+export const DEFAULT_ORPHAN_GRACE_MS = 45 * 60_000;
 
 // Collect every instanceId tracked in ANY pool hash on this Valkey, not just
 // this workspace's. Several stacks can share one Valkey, and a workspaceId that

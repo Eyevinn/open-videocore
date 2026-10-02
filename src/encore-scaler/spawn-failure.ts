@@ -21,7 +21,9 @@
 // bearer token, or instance/ingress URLs. redactSpawnFailureMessage() strips
 // known literal secrets, every URL, every auth-scheme header value, every
 // `name: value` pair whose NAME reads like a credential, and JWT-shaped blobs,
-// then truncates. Over-redaction is the intended failure mode: an operator
+// then strips HTML markup (#1071: an OSC gateway timeout is answered with a
+// whole HTML error page, which the SDK hands us as the error message) and
+// truncates. Over-redaction is the intended failure mode: an operator
 // needs the SHAPE of the failure ("403 from the orchestrator", "timed out
 // waiting for ... to report running"), not the secret inside it.
 //
@@ -79,6 +81,27 @@ const SENSITIVE_FIELD_PATTERN =
 // A JWT-shaped blob, for a bare token that appears with no label at all.
 const JWT_PATTERN = /\beyJ[A-Za-z0-9._-]{10,}/g;
 
+// An HTML/XML-ish tag. OSC's gateway answers a timed-out createInstance with a
+// whole HTML error page, not JSON, and @osaas/client-core puts that page's text
+// in the error message verbatim (lib/fetch.js defaultErrorFactory, non-JSON
+// branch) — so the recorded message was literally
+// "<html> <head><title>504 Gateway Time-out</title></head> ...". Tags are
+// stripped rather than entity-escaped: the markup carries no diagnostic value
+// (the readable text "504 Gateway Time-out nginx" survives), it makes the 400
+// character budget go much further, and nothing that reaches an operator's
+// browser, terminal or log viewer can then be interpreted as markup.
+const HTML_TAG_PATTERN = /<[^>]*>/g;
+
+// Any stray angle bracket left after tag-stripping (an unclosed "<", a bare
+// ">"). Replaced with their HTML entities so the stored message is inert
+// wherever it is rendered, while still showing the operator a character was
+// there. The spawn-failure record is served by GET /scaler/status and goes
+// straight into dashboards.
+const STRAY_ANGLE_BRACKETS: Array<[RegExp, string]> = [
+  [/</g, '&lt;'],
+  [/>/g, '&gt;']
+];
+
 // What the record says when the thrown value carried no text at all.
 const NO_MESSAGE = 'spawn failed with no error message';
 
@@ -117,6 +140,14 @@ export function redactSpawnFailureMessage(
     (_match, name: string, separator: string) => `${name}${separator}${REDACTED}`
   );
   text = text.replace(JWT_PATTERN, REDACTED);
+
+  // Markup last, so every secret-bearing pattern above still sees the original
+  // text (an href or a form value inside a tag is redacted before the tag that
+  // held it is removed).
+  text = text.replace(HTML_TAG_PATTERN, ' ');
+  for (const [pattern, entity] of STRAY_ANGLE_BRACKETS) {
+    text = text.replace(pattern, entity);
+  }
 
   text = text.replace(/\s+/g, ' ').trim();
   if (text.length > SPAWN_FAILURE_MESSAGE_MAX_LENGTH) {

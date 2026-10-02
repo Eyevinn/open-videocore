@@ -218,25 +218,30 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
   // Review finding 3: a spawn that dies AFTER the callback listener was created
   // used to leak the listener — the identical billing leak as #778, one service
   // over, and nothing swept it either.
-  it('removes the paired callback listener too when the spawn fails after creating it', async () => {
+  //
+  // #1071 NARROWED this: a spawn that fails because something is NOT READY YET
+  // no longer destroys anything, because "not ready yet" is the normal state
+  // while OSC provisions a new worker node, and tearing the instance down threw
+  // away minutes of provisioning every tick. Immediate teardown is now reserved
+  // for failures that are not a readiness timeout (below); a readiness timeout
+  // leaves both instances to the orphan sweep, which has the grace window and
+  // the positive no-work check to decide safely.
+  it('removes the paired callback listener too when the spawn fails for a non-readiness reason', async () => {
     const redis = new FakeRedis();
     const workspaceId = 'ws-listener-leak';
     createInstance.mockImplementation(async (_ctx, _svc, _tok, body) => ({
       name: (body as { name: string }).name,
       url: `https://${(body as { name: string }).name}.example`
     }));
-    // Encore becomes ready; the LISTENER never does. getInstanceHealth's
-    // 2nd positional arg is the serviceId (lib/core.d.ts:86).
-    getInstanceHealth.mockImplementation(async (..._args: unknown[]) => {
-      if (_args[1] === ENCORE_CALLBACK_LISTENER_SERVICE_ID) {
-        throw new Error('listener never became ready');
-      }
-      return 'running';
-    });
+    // Both instances come up fine; the POOL WRITE is what fails — a Valkey
+    // error, not a readiness problem. The spawn cannot proceed and neither
+    // instance is tracked anywhere, so both must be torn down here and now.
+    getInstanceHealth.mockResolvedValue('running');
+    vi.spyOn(redis, 'hset').mockRejectedValue(new Error('valkey write failed'));
 
     await expect(
       spawnInstance(makeConfig(redis, workspaceId, { spawnReadyTimeoutMs: 20 }))
-    ).rejects.toThrow(/listener never became ready/);
+    ).rejects.toThrow(/valkey write failed/);
 
     const removedServices = removeInstance.mock.calls.map((call) => call[1]);
     expect(removedServices).toContain(ENCORE_SERVICE_ID);
@@ -249,7 +254,17 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
   // getInstanceHealth in a `while` loop with NO timeout (lib/core.js:343-353), so
   // an instance that never reports `running` used to hang the spawn forever while
   // holding a live, billing OSC instance with no pool record.
-  it('bounds the readiness wait and cleans up when the instance never becomes ready', async () => {
+  //
+  // #1071 changed what "cleans up" means on this path. The wait is still
+  // bounded — that is what gives the orphan reaper's grace window a worst case
+  // to outlast — but the instance is no longer DESTROYED when the deadline
+  // passes. OSC may be provisioning a whole new worker node behind the create
+  // (the same latency that makes createInstance answer 504), so "not running
+  // yet" is routinely a half-born instance rather than a broken one, and
+  // destroying it threw the provisioning away and started it again next tick.
+  // The instance is left alive and handed to the orphan sweep, which only acts
+  // after the grace window AND a positive confirmation that it has no work.
+  it('bounds the readiness wait and leaves a still-starting instance to the orphan sweep', async () => {
     const redis = new FakeRedis();
     const workspaceId = 'ws-hang';
     createInstance.mockImplementation(async (_ctx, _svc, _tok, body) => ({
@@ -264,8 +279,12 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
       spawnInstance(makeConfig(redis, workspaceId, { spawnReadyTimeoutMs: 50 }))
     ).rejects.toThrow(/timed out after 50ms waiting for OSC instance/);
 
-    // The live Encore instance is destroyed rather than left to bill.
-    expect(removeInstance.mock.calls.map((call) => call[1])).toContain(ENCORE_SERVICE_ID);
+    // NOT destroyed: it may well be seconds away from `running` on a node OSC
+    // is still provisioning (#1071).
+    expect(removeInstance).not.toHaveBeenCalled();
+    // It is still not in the pool — nothing may be dispatched to an instance
+    // that has never reported healthy — so the orphan sweep sees it and owns
+    // its fate from here.
     expect(await redis.hgetall(keys.pool(workspaceId))).toEqual({});
   });
 
