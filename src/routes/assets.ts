@@ -2894,8 +2894,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
-      // extraction against the now-stored object (issue #6); we only extract if
-      // the asset actually advanced to `processing` (pull succeeded).
+      // extraction AND poster-frame extraction against the now-stored object
+      // (issues #6, #1050); we only run either if the asset actually advanced to
+      // `processing` (pull succeeded).
+      //
+      // issue #1050: this branch previously ran extraction only, so a
+      // URL-ingested asset never got a `thumbnails` entry while an uploaded one
+      // did (main.ts onObjectStored runs both). The pull lands the bytes in
+      // OSC-managed storage under our own `ingest/<id>` key, so the thumbnail
+      // runner's presignedGet of that key resolves exactly as it does for an
+      // upload — the two paths are now at parity.
+      //
+      // Deliberately NOT applied to the external-backend branch above: there
+      // objectKey is `s3://<foreign-bucket>/<key>`, and the thumbnail runner
+      // resolves its source via deps.storage.presignedGet (thumbnail.ts:119),
+      // which cannot presign a bucket this deployment's storage does not own.
+      // triggerExtraction takes an externalSource for that case; triggerThumbnail
+      // has no equivalent, so calling it there would fail silently. Giving the
+      // thumbnail path the same external-source treatment is a separate change.
       void runner(
         { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
         { jobs, assets: repo, storage: storageFor(), quota: opts.quota, ...opts.pullDeps }
@@ -2903,6 +2919,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const settled = await repo.get(asset.id);
         if (settled?.status === 'processing') {
           triggerExtraction(asset.id, objectKey);
+          triggerThumbnail(asset.id, objectKey, request);
         }
       });
 
