@@ -11,6 +11,9 @@
 //       queue:    encore:queue:{workspaceId}    (Redis list — LLEN for depth)
 //       inflight: encore:inflight:{workspaceId} (Redis list — LLEN for depth)
 //       pool:     encore:pool:{workspaceId}     (Redis hash of EncoreInstanceRecord)
+//       spawnFailure: encore:spawn-failure:{workspaceId}
+//                 (Redis string — JSON SpawnFailureRecord, read back via
+//                  readSpawnFailure() in src/encore-scaler/spawn-failure.ts)
 //   - EncoreInstanceRecord shape: src/encore-scaler/types.ts:37-42
 //       { instanceId, url, activeJobs, lastIdleAt }
 //   - listInstances(redis, workspaceId): src/encore-scaler/instance-pool.ts:46
@@ -26,6 +29,7 @@ import type { Redis } from 'ioredis';
 import { z } from 'zod';
 import { JOBS_PER_INSTANCE, keys } from '../encore-scaler/types.js';
 import { listInstances } from '../encore-scaler/instance-pool.js';
+import { readSpawnFailure } from '../encore-scaler/spawn-failure.js';
 
 type ScalerRouterOptions = {
   // The Valkey connection used by the scaler. Undefined when the scaler is off
@@ -80,11 +84,38 @@ const instanceSchema = z.object({
   draining: z.boolean().optional()
 });
 
+// The workspace's most recent FAILED scale-up (#1071).
+//
+// Without this, a pool that stops growing with jobs still queued looks the same
+// whether the scaler is at `maxInstances` or whether every spawn is being
+// refused: `instances: 1, queueDepth: 1` either way. maxInstances + the
+// instances array already answer "am I at cap"; this answers "did the last
+// attempt to grow fail, when, after how many tries, and with what error" — so
+// the two are finally distinguishable without reading pod logs.
+//
+// `message` is pre-redacted at WRITE time (spawn-failure.ts
+// redactSpawnFailureMessage): credentials, URLs and tokens never reach this
+// field, because OSC error text can echo the request body the spawn sent.
+// Absent entirely when the last spawn succeeded or none has failed in
+// SPAWN_FAILURE_TTL_MS.
+const spawnFailureSchema = z.object({
+  // Epoch ms the failure was recorded.
+  at: z.number(),
+  // Create attempts the failed spawn made before giving up.
+  attempts: z.number(),
+  // Spawns that have failed in a row; reset by a success. 1 = a fresh blip,
+  // a climbing number = the scaler has been unable to grow for a while.
+  consecutiveFailures: z.number(),
+  // Redacted error text.
+  message: z.string()
+});
+
 const workspaceSchema = z.object({
   workspaceId: z.string(),
   queueDepth: z.number(),
   inflightDepth: z.number(),
-  instances: z.array(instanceSchema)
+  instances: z.array(instanceSchema),
+  spawnFailure: spawnFailureSchema.optional()
 });
 
 const scalerStatusSchema = z.object({
@@ -127,22 +158,42 @@ function toInstanceView(record: {
   };
 }
 
-// Scan for every pool hash key and extract the workspaceId. Uses SCAN (cursor
-// paging) rather than KEYS so it does not block Valkey on large keyspaces.
-const POOL_PREFIX = keys.pool('');
-async function scanWorkspaceIds(redis: Redis): Promise<string[]> {
-  const pattern = `${POOL_PREFIX}*`;
-  const found = new Set<string>();
+// Scan for every key with `prefix` and return the workspaceId suffixes. Uses
+// SCAN (cursor paging) rather than KEYS so it does not block Valkey on large
+// keyspaces.
+async function scanWorkspaceIdsWithPrefix(
+  redis: Redis,
+  prefix: string,
+  into: Set<string>
+): Promise<void> {
+  const pattern = `${prefix}*`;
   let cursor = '0';
   do {
     const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
     cursor = next;
     for (const key of batch) {
-      if (key.startsWith(POOL_PREFIX)) {
-        found.add(key.slice(POOL_PREFIX.length));
+      if (key.startsWith(prefix)) {
+        into.add(key.slice(prefix.length));
       }
     }
   } while (cursor !== '0');
+}
+
+// Every workspace the status response should report on.
+//
+// The pool hash is the primary source, but it is NOT sufficient (#1071): a
+// workspace whose spawns all fail has no pool hash at all, so keying the
+// listing on pool keys alone hid exactly the case the spawn-failure record
+// exists to surface — nothing provisioned, jobs queueing, and no row in
+// `workspaces` to hang the explanation off. The spawn-failure keyspace is
+// therefore scanned too, and a workspace present in only that one is reported
+// with an empty `instances` array alongside its queue depths.
+const POOL_PREFIX = keys.pool('');
+const SPAWN_FAILURE_PREFIX = keys.spawnFailure('');
+async function scanWorkspaceIds(redis: Redis): Promise<string[]> {
+  const found = new Set<string>();
+  await scanWorkspaceIdsWithPrefix(redis, POOL_PREFIX, found);
+  await scanWorkspaceIdsWithPrefix(redis, SPAWN_FAILURE_PREFIX, found);
   return [...found];
 }
 
@@ -183,16 +234,21 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
       const workspaceIds = await scanWorkspaceIds(redis);
       const workspaces = await Promise.all(
         workspaceIds.map(async (workspaceId) => {
-          const [queueDepth, inflightDepth, instances] = await Promise.all([
+          const [queueDepth, inflightDepth, instances, spawnFailure] = await Promise.all([
             redis.llen(keys.queue(workspaceId)),
             redis.llen(keys.inflight(workspaceId)),
-            listInstances(redis, workspaceId)
+            listInstances(redis, workspaceId),
+            // #1071. readSpawnFailure is total (never throws, drops a junk
+            // record) so one unreadable key cannot take the whole status
+            // response down.
+            readSpawnFailure(redis, workspaceId)
           ]);
           return {
             workspaceId,
             queueDepth,
             inflightDepth,
-            instances: instances.map(toInstanceView)
+            instances: instances.map(toInstanceView),
+            spawnFailure
           };
         })
       );

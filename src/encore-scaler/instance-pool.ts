@@ -24,6 +24,11 @@ import {
 import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './types.js';
 import { fetchEncoreActiveState } from './encore-active-state.js';
 import { hasPendingPackaging } from './packaging-pin.js';
+import {
+  clearSpawnFailure,
+  recordSpawnFailure,
+  spawnFailureSecrets
+} from './spawn-failure.js';
 
 // Encore's OSC service identifier. Not hardcoded at the call sites — sourced
 // from the provisioning contract (STACK_SERVICES / provision route) via this
@@ -344,15 +349,73 @@ async function waitForInstanceReadyBounded(
   );
 }
 
+// Mutable bookkeeping threaded through a single spawn so its failure path can
+// report HOW MUCH was attempted and WHICH short-lived credentials were in play
+// (#1071). `attempts` counts every createInstance call this spawn made across
+// both services; `secrets` collects the service access tokens it minted, so the
+// recorded error text can be scrubbed of them before it is served over HTTP.
+type SpawnProgress = { attempts: number; secrets: string[] };
+
 // Spawn a fresh Encore OSC instance and register it in the pool. The instance
 // name is unique per spawn so concurrent scale-ups never collide.
 // Retries up to 3 times on transient 5xx OSC infrastructure errors (e.g.
 // ingress-nginx admission webhook timeouts that appear under cluster load).
+//
+// #1071: whichever way this ends, it leaves a trace in the pool's own Valkey
+// state. A failure is recorded under keys.spawnFailure(workspaceId) — timestamp,
+// attempts made, consecutive failures, redacted message — and surfaced by GET
+// /scaler/status, because the throw alone was invisible to anyone without pod
+// logs: the caller (scaler-loop.ts tick step 3) could only log it and wait for
+// the next tick, leaving "at cap" and "cannot spawn" indistinguishable on the
+// wire. A success clears the record. Both are best-effort: the bookkeeping must
+// never mask the real error, nor fail a spawn that actually worked.
 export async function spawnInstance(
   config: EncoreScalerConfig,
   maxAttempts = 3
 ): Promise<EncoreInstanceRecord> {
+  const progress: SpawnProgress = { attempts: 0, secrets: [] };
+  try {
+    const record = await spawnPooledInstance(config, maxAttempts, progress);
+    try {
+      await clearSpawnFailure(config.redis, config.workspaceId);
+    } catch {
+      // The record carries a TTL and the next failure overwrites it, so a
+      // failed clear self-heals. Never fail a spawn that succeeded.
+    }
+    return record;
+  } catch (err) {
+    try {
+      const recorded = await recordSpawnFailure(config.redis, config.workspaceId, {
+        attempts: progress.attempts,
+        error: err,
+        secrets: spawnFailureSecrets(config, progress.secrets)
+      });
+      console.error(
+        '[encore-scaler] spawn failed (workspace=%s attempts=%d consecutive=%d): %s',
+        config.workspaceId,
+        recorded.attempts,
+        recorded.consecutiveFailures,
+        recorded.message
+      );
+    } catch (recordErr) {
+      // Valkey trouble must not swallow the spawn error the caller needs.
+      console.error(
+        '[encore-scaler] could not record spawn failure (workspace=%s):',
+        config.workspaceId,
+        recordErr
+      );
+    }
+    throw err;
+  }
+}
+
+async function spawnPooledInstance(
+  config: EncoreScalerConfig,
+  maxAttempts: number,
+  progress: SpawnProgress
+): Promise<EncoreInstanceRecord> {
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+  progress.secrets.push(sat);
   // Lowercase-alphanumeric, matching OSC's instance-name rules
   // (isValidInstanceName) and the provision route's own naming constraints.
   const name = `${scalerInstancePrefix(config.workspaceId)}${Date.now().toString(36)}`;
@@ -363,6 +426,7 @@ export async function spawnInstance(
   // it has a listener to remove as well (#778 review finding 3).
   let listenerCreated = false;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    progress.attempts += 1;
     try {
       const instanceBody: Record<string, string> = { name };
       if (config.s3Config) {
@@ -424,12 +488,14 @@ export async function spawnInstance(
     const callbackSat = await config.oscContext.getServiceAccessToken(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID
     );
+    progress.secrets.push(callbackSat);
     // Retry callback listener creation with the same transient-error logic as
     // the Encore instance above. The OSC ingress webhook sometimes returns
     // ORCHESTRATOR_UNAVAILABLE under load; a short back-off is enough.
     let callback: OscInstance | undefined;
     let lastCallbackErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      progress.attempts += 1;
       try {
         callback = (await createInstance(
           config.oscContext,

@@ -19854,6 +19854,30 @@
                               ],
                               "additionalProperties": false
                             }
+                          },
+                          "spawnFailure": {
+                            "type": "object",
+                            "properties": {
+                              "at": {
+                                "type": "number"
+                              },
+                              "attempts": {
+                                "type": "number"
+                              },
+                              "consecutiveFailures": {
+                                "type": "number"
+                              },
+                              "message": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "at",
+                              "attempts",
+                              "consecutiveFailures",
+                              "message"
+                            ],
+                            "additionalProperties": false
                           }
                         },
                         "required": [

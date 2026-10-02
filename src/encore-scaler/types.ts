@@ -41,6 +41,32 @@ export type DroppedJob = {
   reason?: string;
 };
 
+// #1071: the last scale-up for a workspace that could not create an instance.
+//
+// spawnInstance() retries transient OSC errors and then throws; before this the
+// throw was only ever logged, so GET /scaler/status could not tell "the pool is
+// at maxInstances" apart from "OSC is refusing to create the instance" — both
+// present as a pool that stops growing with jobs still queued. One record per
+// WORKSPACE, not per instance: the thing that failed is the workspace's
+// scale-up, and there is no instance to hang it off.
+//   - at:                  epoch ms the failure was recorded.
+//   - attempts:            create attempts this spawn made before giving up
+//                          (spawnInstance's maxAttempts retry loop).
+//   - consecutiveFailures: how many spawns in a row have failed, carried
+//                          forward across records and reset by a success, so a
+//                          transient blip is distinguishable from a scaler that
+//                          has been unable to grow for an hour.
+//   - message:             the error text, REDACTED (src/encore-scaler/
+//                          spawn-failure.ts redactSpawnFailureMessage) — it is
+//                          served over HTTP, and OSC error text can echo the
+//                          credentials/URLs/token the spawn request carried.
+export type SpawnFailureRecord = {
+  at: number;
+  attempts: number;
+  consecutiveFailures: number;
+  message: string;
+};
+
 export type EncoreScalerConfig = {
   workspaceId: string;
   maxInstances: number;
@@ -337,5 +363,12 @@ export const keys = {
   // record not yet written — instance-pool.ts spawnInstance) is never reaped
   // out from under the spawn that is still in progress. Entries are deleted as
   // soon as the instance is adopted into the pool, reaped, or disappears.
-  orphanSeen: (workspaceId: string) => `encore:orphan-seen:${workspaceId}`
+  orphanSeen: (workspaceId: string) => `encore:orphan-seen:${workspaceId}`,
+  // #1071: JSON SpawnFailureRecord for the workspace's most recent failed
+  // scale-up, written by spawnInstance's failure path (instance-pool.ts) and
+  // read by GET /scaler/status (routes/scaler.ts) so a scaler that cannot grow
+  // is distinguishable from one that is simply at its cap. Cleared on the next
+  // successful spawn; given a PX TTL (SPAWN_FAILURE_TTL_MS) so a record nothing
+  // ever clears self-expires instead of reporting ancient history forever.
+  spawnFailure: (workspaceId: string) => `encore:spawn-failure:${workspaceId}`
 };

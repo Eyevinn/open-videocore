@@ -248,8 +248,32 @@ export class EncoreScalerLoop {
       instances.length < maxInstances &&
       (belowMin || (pending > 0 && allBusy))
     ) {
-      const spawned = await spawnInstance(this.config);
-      instances = [...instances, spawned];
+      // #1071: a spawn that cannot create an instance must NOT abort the tick.
+      // spawnInstance retries transient OSC errors and then throws; letting that
+      // throw escape took out everything after this gate — scale-down (step 4),
+      // the orphan sweep (4b) and dispatch (5) — for as long as spawning kept
+      // failing. That is worst exactly where it hurts most: on the belowMin
+      // pre-warm path the gate fires on EVERY tick regardless of pending work,
+      // so a workspace that cannot spawn stopped reaping and stopped dispatching
+      // to the capacity it already had. The failure itself is recorded on the
+      // pool's own state by spawnInstance (keys.spawnFailure) and reported per
+      // workspace by GET /scaler/status, so swallowing it here loses no signal:
+      // it is precisely what makes "at cap" distinguishable from "cannot spawn"
+      // without pod logs.
+      try {
+        const spawned = await spawnInstance(this.config);
+        instances = [...instances, spawned];
+      } catch (err) {
+        console.error(
+          '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
+            'continuing the tick with the existing pool:',
+          workspaceId,
+          pending,
+          instances.length,
+          maxInstances,
+          err
+        );
+      }
     }
 
     // 4. Scale down idle instances, but never below minInstances — and NEVER an
