@@ -301,15 +301,39 @@ move together, which is the invariant #1058 broke.
   the URL-pull worker (`void runner(...)`) and the metadata extraction that
   follows it resolve the same stack the ingest request named, without threading a
   parameter through every call site.
-- Outside a request the store is empty, resolution falls back to the first listed
-  stack, and behaviour is unchanged. That is also the limitation: see #1090.
+- Outside a request the store is empty and resolution falls back to the first
+  listed stack — which is correct for a single-stack install but is NOT enough
+  for the paths that settle work, so those re-enter the right stack explicitly:
+  - **the OSC callbacks** (`src/routes/internal.ts`) carry no `X-Stack-Name`.
+    The Encore completion callback decodes its stack from the `externalId` we
+    issued (`encodeEncoreJobId(contextId, jobLocalId)`) and runs the whole
+    handler in it. The packager callbacks carry no identity of ours at all — only
+    our assetId on success, nothing on failure — so the success handler finds the
+    stack that actually holds the asset (default first, then the other
+    provisioned stacks) and the failure handler attributes once per provisioned
+    stack. Without this a job on a non-first stack 404s on every callback and
+    stays `running` with its asset `processing` forever.
+  - **the scaler-tick reconcilers** (`reconcileFailedTranscodes` +
+    `reconcileStalledPackages`, `src/main.ts`) are repository-driven with no
+    request behind them, so they only ever enumerated the first-listed stack.
+    They now run once inside each provisioned stack's context, via the new
+    `WorkspaceStackResolver.listStackNames()`. This matters more than it looks:
+    the reproduction in #1058 was settled by exactly this reconciler, so without
+    it a non-default-stack transcode has no terminal-state path at all.
+  - the remaining sweeps, the watch-folder, and durable persistence of the stack
+    identity on the job/asset document are tracked in #1090.
 
-**A fail-loud guard backs it up.** `POST /:id/transcode` compares the data
+**A fail-loud guard backs it up.** `POST /:id/transcode` and `POST /:id/execute`
+compare the data
 plane's resolved stack identity (`request.connections.stackName`, new on
 `WorkspaceConnections` and set from the name the config was loaded under) against
 the control plane's (`resolveStackContext`, issue #615). A disagreement returns
 `409 stack_routing_mismatch` naming both stacks, instead of submitting a job that
-can only fail with an indistinguishable 404. The comparison is on stack
+can only fail with an indistinguishable 404. On `execute` the check runs for any
+pipeline that CONTAINS a transcode step (not merely one that starts with it —
+the live reproduction used `abr-vod`, where transcode is reached after the
+execution record would have been created) and before that record is created, so
+a split never leaves a dangling execution. The comparison is on stack
 **identity**, never on endpoint hostname: the transcoder correctly uses the
 in-cluster address while the API uses the public ingress for the same instance
 (#991), so hostnames legitimately differ.
@@ -318,12 +342,18 @@ The submit-time reachability preflight now probes the resolved stack's own sourc
 bucket (`request.connections?.sourceBucket`) rather than the deployment-wide boot
 default.
 
-Regression coverage: `test/stack-routing-data-plane.test.ts` reproduces the
+Regression coverage: `test/stack-routing-callbacks.test.ts` covers the
+request-less paths — a header-less Encore callback settling a stack-`b` job, the
+unchanged default-stack case, an unknown job still 404ing, and both packager
+callbacks reaching a non-default stack.
+
+`test/stack-routing-data-plane.test.ts` reproduces the
 two-stack divergence — stacks `['a','b']`, requests carrying `X-Stack-Name: b` —
 for the ingest-url write, the `/files` presigned URL and the transcode source
-read, plus the mismatch guard and the unchanged no-header default. Reverting the
-ambient lookup to `undefined` (i.e. the pre-fix "always the first listed stack"
-behaviour) fails five of the six.
+read, the mismatch guard on both `transcode` and `execute`, and the unchanged
+no-header default. Reverting the ambient lookup to `undefined` (i.e. the pre-fix
+"always the first listed stack" behaviour) fails five of the six original
+data-plane cases and three of the six callback cases.
 
 ### What was deliberately NOT done
 
@@ -334,10 +364,11 @@ behaviour) fails five of the six.
   `src/services/transcode-namespace-acceptance.test.ts`. Removing a tested
   routing guarantee is an architecture decision, not a bug fix.
 - **Persisting the stack identity on the job/asset document.** The ambient
-  identity lives for the life of the request, so background work with no request
-  behind it (sweeps, the watch-folder, anything re-resolving after a restart)
-  still uses the default stack. Tracked as **#1090**, which needs an architect
-  call on whether a sweep is per-deployment or per-stack.
+  identity lives for the life of the request, so work that must re-resolve after
+  a process restart has nothing durable to re-enter with. The settle paths above
+  are covered by their own identity sources; the remaining sweeps and the
+  watch-folder are not. Tracked as **#1090**, which needs an architect call on
+  whether a sweep is per-deployment or per-stack.
 
 ## Remediation for assets already misrouted
 

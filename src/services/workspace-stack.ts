@@ -1089,6 +1089,35 @@ export class WorkspaceStackResolver {
     return this.loadStackConfigWithMigration(ps, names[0]!);
   }
 
+  // The provisioned stack names, in parameter-store listing order (issue #1058).
+  //
+  // Exposes the SAME listing the resolution paths use — including the bounded
+  // one-shot migration fallback for a pre-#804 stack — so a caller that must run
+  // once per stack (the scaler-tick reconcilers, the stack-less packager
+  // callbacks) enumerates exactly the stacks `resolve()` can address. Empty when
+  // no parameter store is configured (env-override / bare local run), in which
+  // case callers fall back to the single default resolution.
+  //
+  // A read failure is logged and reported as "no stacks" rather than thrown: the
+  // callers are best-effort sweeps and unauthenticated callbacks, and a
+  // parameter-store blip must not break a tick or fail a callback.
+  async listStackNames(): Promise<string[]> {
+    const ps = this.paramStore;
+    if (!ps) return [];
+    try {
+      return await this.listStackNamesWithMigration(ps);
+    } catch (err) {
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE
+        },
+        'stack resolver: failed to list stack names'
+      );
+      return [];
+    }
+  }
+
   // Synchronous read of already-resolved connections from cache. Returns
   // undefined when nothing is cached (or the entry expired). The global
   // preHandler hook warms the cache with `resolve()` before any handler runs,

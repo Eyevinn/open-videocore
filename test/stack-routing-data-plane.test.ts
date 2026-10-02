@@ -26,8 +26,10 @@ import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import { InMemoryJobRepository } from '../src/data/job-repo.js';
 import {
   PerWorkspaceAssetRepository,
-  PerWorkspaceJobRepository
+  PerWorkspaceJobRepository,
+  PerWorkspacePipelineRepository
 } from '../src/data/per-workspace-repos.js';
+import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
 import {
   makeRequestScopedStorageFactory,
   requestStackNameFromHeaders,
@@ -72,6 +74,7 @@ type Stack = {
   name: string;
   assets: InMemoryAssetRepository;
   jobs: InMemoryJobRepository;
+  pipelines: InMemoryPipelineRepository;
   storage: FakeStackStorage;
   connections: WorkspaceConnections;
 };
@@ -79,10 +82,12 @@ type Stack = {
 function makeStack(name: string): Stack {
   const assets = new InMemoryAssetRepository();
   const jobs = new InMemoryJobRepository();
+  const pipelines = new InMemoryPipelineRepository();
   const storage = new FakeStackStorage(name);
   const connections = {
     assets,
     jobs,
+    pipelines,
     storageFor: () => storage,
     storageClient: undefined,
     sourceBucket: SOURCE_BUCKET,
@@ -90,7 +95,7 @@ function makeStack(name: string): Stack {
     s3Config: { endpoint: `https://${name}.minio-minio.example`, accessKey: 'admin', secretKey: 'x' },
     stackName: name
   } as unknown as WorkspaceConnections;
-  return { name, assets, jobs, storage, connections };
+  return { name, assets, jobs, pipelines, storage, connections };
 }
 
 type Harness = {
@@ -146,6 +151,7 @@ async function buildApp(
     repository: new PerWorkspaceAssetRepository(resolver),
     jobRepository: new PerWorkspaceJobRepository(resolver),
     storageFor: makeRequestScopedStorageFactory(resolver),
+    pipelineRepository: new PerWorkspacePipelineRepository(resolver),
     encore,
     sourceBucket: SOURCE_BUCKET,
     outputBucket: 'openvideocore-packaged',
@@ -284,6 +290,53 @@ describe('transcode refuses a data-plane / control-plane stack split (issue #105
     });
     expect(res.statusCode).toBe(202);
     expect(h.submitted).toHaveLength(1);
+  });
+});
+
+describe('pipeline execute refuses a stack split too (issue #1058)', () => {
+  // POST /:id/execute is the path the live reproduction used
+  // (`{"pipeline":"abr-vod"}`), and its transcode step is reached AFTER the
+  // execution record is created — so the guard must run before that.
+  async function readyAsset(h: Harness): Promise<string> {
+    const asset = await h.stacks['b']!.assets.create({ name: 'clip' });
+    await h.stacks['b']!.assets.update(asset.id, { objectKey: `ingest/${asset.id}` });
+    await h.stacks['b']!.assets.update(asset.id, { status: 'processing' });
+    await h.stacks['b']!.assets.update(asset.id, { status: 'ready' });
+    return asset.id;
+  }
+
+  it('409s abr-vod before creating the execution when the planes disagree', async () => {
+    const h = await buildApp(['a', 'b'], { resolveStackContext: async () => 'a' });
+    const id = await readyAsset(h);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/execute`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: { pipeline: 'abr-vod' }
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe('stack_routing_mismatch');
+    expect(h.submitted).toHaveLength(0);
+    // No dangling execution record was left behind.
+    expect(await h.stacks['b']!.pipelines.listByAsset(id)).toHaveLength(0);
+  });
+
+  it('runs abr-vod normally when both planes resolve the same stack', async () => {
+    const h = await buildApp(['a', 'b']);
+    const id = await readyAsset(h);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/execute`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: { pipeline: 'abr-vod' }
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(h.submitted).toHaveLength(1);
+    expect(h.submitted[0]!.externalId.split('__')[0]).toBe('b');
   });
 });
 

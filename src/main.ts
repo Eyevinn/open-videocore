@@ -1228,51 +1228,67 @@ function activateScaler(redisUrl: string): void {
     // whose getJobStatus() polls Encore. Best-effort: errors are swallowed inside
     // the sweep so a reconcile failure never breaks the tick.
     reconcileFailedTranscodes: async () => {
-      await reconcileFailedTranscodes({
-        jobs: jobRepository,
-        assets: assetRepository,
-        pipeline: pipelineRepository,
-        // scalerRegistry implements EncoreClient; getJobStatus() decodes the
-        // workspace from the encore job id and polls the right instance. It is
-        // assigned below (encore = scalerRegistry) before any tick fires.
-        encore: scalerRegistry!,
-        stallTimeoutMs: encoreStallTimeoutMs,
-        // #829: this sweep is one of the three paths that apply a transcode
-        // terminal state, and the only one that can see a job whose Encore
-        // record was garbage-collected (404 past the stall timeout) — the
-        // completion poller's sweep cannot, since it only reconciles jobs Encore
-        // still reports. Same dispatcher instance the internal router and the
-        // poller get, so the failure events are identical whichever path noticed.
-        webhookDispatcher,
-        logger: {
-          info: (...a: unknown[]) => app.log.info(a),
-          warn: (...a: unknown[]) => app.log.warn(a)
-        }
-      });
-      // Bound the `package` pipeline step (issue #336) on the same tick: a
-      // `package` step still `running` past packageStallTimeoutMs is failed with
-      // a diagnostic distinguishing "no packager instance" from "no completion
-      // signal". The packager step is advanced ONLY by the packager completion
-      // callback, so without this bound a missing packager / lost callback /
-      // stalled packager job leaves it running forever. Best-effort: the sweep
-      // swallows per-execution errors and never throws into the tick.
-      await reconcileStalledPackages({
-        pipeline: pipelineRepository,
-        // #976: settle the stalled step's `package` job with the same
-        // diagnostic, so a swept run is explained in GET /api/v1/jobs too.
-        jobs: jobRepository,
-        // Best-effort presence probe used ONLY to shape the diagnostic message.
-        // It resolves the stack name (the packager instance shares it) and asks
-        // OSC whether a packager instance exists. Any failure -> undefined, and
-        // the message degrades to present=unknown rather than mis-attributing a
-        // cause. Never gates the timeout.
-        packagerPresent: probePackagerPresent,
-        stallTimeoutMs: packageStallTimeoutMs,
-        logger: {
-          info: (...a: unknown[]) => app.log.info(a),
-          warn: (...a: unknown[]) => app.log.warn(a)
-        }
-      });
+      // Both sweeps below are repository-driven, and the repositories resolve the
+      // AMBIENT request stack (issue #1058) — of which a scaler tick has none, so
+      // they previously only ever enumerated the first-listed stack. A transcode
+      // on any other stack then had no terminal-state path at all: the
+      // reproduction in #1058 was settled by exactly this reconciler. Run the
+      // sweeps once inside EACH provisioned stack's context instead. With no
+      // parameter store (env override / bare local run) the list is empty and the
+      // single default resolution runs, byte-identical to before.
+      const runSweepsForCurrentStack = async (): Promise<void> => {
+        await reconcileFailedTranscodes({
+          jobs: jobRepository,
+          assets: assetRepository,
+          pipeline: pipelineRepository,
+          // scalerRegistry implements EncoreClient; getJobStatus() decodes the
+          // workspace from the encore job id and polls the right instance. It is
+          // assigned below (encore = scalerRegistry) before any tick fires.
+          encore: scalerRegistry!,
+          stallTimeoutMs: encoreStallTimeoutMs,
+          // #829: this sweep is one of the three paths that apply a transcode
+          // terminal state, and the only one that can see a job whose Encore
+          // record was garbage-collected (404 past the stall timeout) — the
+          // completion poller's sweep cannot, since it only reconciles jobs Encore
+          // still reports. Same dispatcher instance the internal router and the
+          // poller get, so the failure events are identical whichever path noticed.
+          webhookDispatcher,
+          logger: {
+            info: (...a: unknown[]) => app.log.info(a),
+            warn: (...a: unknown[]) => app.log.warn(a)
+          }
+        });
+        // Bound the `package` pipeline step (issue #336) on the same tick: a
+        // `package` step still `running` past packageStallTimeoutMs is failed with
+        // a diagnostic distinguishing "no packager instance" from "no completion
+        // signal". The packager step is advanced ONLY by the packager completion
+        // callback, so without this bound a missing packager / lost callback /
+        // stalled packager job leaves it running forever. Best-effort: the sweep
+        // swallows per-execution errors and never throws into the tick.
+        await reconcileStalledPackages({
+          pipeline: pipelineRepository,
+          // #976: settle the stalled step's `package` job with the same
+          // diagnostic, so a swept run is explained in GET /api/v1/jobs too.
+          jobs: jobRepository,
+          // Best-effort presence probe used ONLY to shape the diagnostic message.
+          // It resolves the stack name (the packager instance shares it) and asks
+          // OSC whether a packager instance exists. Any failure -> undefined, and
+          // the message degrades to present=unknown rather than mis-attributing a
+          // cause. Never gates the timeout.
+          packagerPresent: probePackagerPresent,
+          stallTimeoutMs: packageStallTimeoutMs,
+          logger: {
+            info: (...a: unknown[]) => app.log.info(a),
+            warn: (...a: unknown[]) => app.log.warn(a)
+          }
+        });
+      };
+      const stackNames = await stackResolver.listStackNames();
+      const stackContexts: Array<string | undefined> =
+        stackNames.length > 0 ? stackNames : [undefined];
+      for (const stackContext of stackContexts) {
+        await runWithRequestStack(stackContext, runSweepsForCurrentStack);
+      }
     },
     // When the scaler's reconcile() detects that tracked jobs have silently
     // vanished from an Encore instance's live QUEUED/IN_PROGRESS set with no
@@ -1976,7 +1992,12 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
     return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
   },
   // Best-effort audit emission for the transcode terminal-state callback (#564).
-  audit: auditEmitter
+  audit: auditEmitter,
+  // The packager's callbacks carry no stack identity of ours (issue #1058), so
+  // they search the provisioned stacks for the asset/execution the callback
+  // belongs to. The Encore callback needs no list — its stack is encoded in the
+  // externalId we issued.
+  listStackNames: () => stackResolver.listStackNames()
 };
 await app.register(internalRouter, internalRouterOptions);
 
@@ -1999,6 +2020,12 @@ const onObjectStored =
           // Read s3Config from the already-warm resolver cache, for the stack
           // this request named (issue #1058). The upload preHandler called
           // resolve() with the same name, so resolveCached() is valid here.
+          // CAVEAT (#1090): this is a CACHE read, so it returns undefined if the
+          // entry has aged past the resolver TTL between the preHandler and this
+          // fire-and-forget continuation, in which case the thumbnail runner
+          // falls back to the boot-default bucket. Fine for the request path
+          // (the entry was just written); recorded on #1090 with the rest of the
+          // non-request resolution gaps.
           const conns = stackResolver.resolveCached(currentRequestStackName());
           const bucket = conns?.sourceBucket ?? sourceBucket;
           // Same resolution helper the asset routes use (issue #838). This path

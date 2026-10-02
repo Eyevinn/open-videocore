@@ -2260,6 +2260,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
     const firstStep = steps[0];
 
+    // Data-plane / control-plane stack agreement (issue #1058), for ANY pipeline
+    // that contains a transcode step — not just one that starts with it, since
+    // `abr-vod` and `full` reach transcode later and the live reproduction used
+    // `abr-vod`. Resolved BEFORE the execution record is created, so a split
+    // never leaves a dangling execution with a step marked running against a
+    // source the transcoder cannot read. Reused verbatim as the scaler context
+    // in the step loop below, so the identity we verified is the identity we
+    // submit with.
+    const controlPlane = await transcodeStackIdentity(request);
+    if (steps.includes('transcode')) {
+      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
+      if (mismatch) {
+        request.log.error(
+          {
+            assetId: asset.id,
+            pipeline: pipelineName,
+            dataPlaneStack: mismatch.dataPlaneStack,
+            controlPlaneStack: mismatch.controlPlaneStack
+          },
+          'refusing to start pipeline: the source bytes and the transcoder resolve different stacks (issue #1058)'
+        );
+        reply.code(409).send({
+          error: 'stack_routing_mismatch',
+          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+        });
+        return undefined;
+      }
+    }
+
     // Pre-flight the first step's requirements before creating the execution so
     // an un-runnable pipeline never leaves a dangling running execution.
     if (firstStep === 'transcode' || firstStep === 'package') {
@@ -2538,7 +2567,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               // this request routes to (issue #615), not the fixed deployment
               // context, so a pipeline execution against a healthy named stack
               // is not pinned to whichever stack was provisioned first.
-              workspaceId: await transcodeContext(request),
+              workspaceId: controlPlane.contextId,
               sourceAssetId: asset.id,
               sourceObjectKey,
               // Read the transcode INPUT from the resolved stack's per-stack
