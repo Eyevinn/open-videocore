@@ -262,7 +262,19 @@ export class EncoreScalerLoop {
     // 3. Scale up (one instance per tick). Pre-warm to minInstances regardless
     //    of pending work; otherwise scale up only when every instance is busy
     //    and there is pending work.
-    const allBusy = instances.every((i) => i.activeJobs >= JOBS_PER_INSTANCE);
+    //
+    //    #1071: `allBusy` asks "is all the capacity I HAVE already working?", so
+    //    it must only consider instances that can take work. A PENDING entry
+    //    cannot: it has never reported healthy and dispatch skips it, so its
+    //    activeJobs is permanently 0. Counting it made `allBusy` false for as
+    //    long as any instance was coming up, which froze scale-up for the WHOLE
+    //    workspace — 2 busy instances, 20 queued jobs and a cap of 5 would spawn
+    //    nothing. Pending entries are still counted in `instances.length` below:
+    //    they hold ONE slot each against maxInstances, because each is a real
+    //    instance OSC is really provisioning, but they never speak for the
+    //    busyness of the pool.
+    const usable = instances.filter((i) => i.pendingReadySince === undefined);
+    const allBusy = usable.every((i) => i.activeJobs >= JOBS_PER_INSTANCE);
     const belowMin = instances.length < minInstances;
     if (
       instances.length < maxInstances &&
