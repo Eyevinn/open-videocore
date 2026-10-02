@@ -43,6 +43,11 @@ import type { EncoreClient, EncoreSubmitInput } from '../src/pipeline/encore-cli
 // (src/routes/provision.ts), which is what makes the divergence silent.
 const SOURCE_BUCKET = 'openvideocore-source';
 
+// Marker inside every fake object-store secret, so "no secret in the logs"
+// (issue #1093) is a substring assertion over the captured log stream rather
+// than an eyeball check.
+const OBJECT_STORE_SECRET_MARKER = 'objectstore-secret-must-never-be-logged';
+
 // Fake object store for one stack. Records the keys written and mints presigned
 // URLs against that stack's own endpoint host, so a URL alone identifies the
 // instance it points at.
@@ -84,7 +89,11 @@ type Stack = {
   connections: WorkspaceConnections;
 };
 
-function makeStack(name: string): Stack {
+// `credentialStack` is the stack the object-store credential/endpoint was
+// resolved from (WorkspaceConnections.s3Config.stackName, issue #1093). It
+// defaults to this stack — the correct case — and is overridden only to
+// construct the deliberately mis-routed credential the #1093 suite needs.
+function makeStack(name: string, credentialStack: string = name): Stack {
   const assets = new InMemoryAssetRepository();
   const jobs = new InMemoryJobRepository();
   const pipelines = new InMemoryPipelineRepository();
@@ -97,7 +106,14 @@ function makeStack(name: string): Stack {
     storageClient: undefined,
     sourceBucket: SOURCE_BUCKET,
     packagedBucket: 'openvideocore-packaged',
-    s3Config: { endpoint: `https://${name}.minio-minio.example`, accessKey: 'admin', secretKey: 'x' },
+    s3Config: {
+      endpoint: `https://${credentialStack}.minio-minio.example`,
+      accessKey: 'admin',
+      // Distinctive so a test can assert the refusal log (and any other log
+      // line) never carries the object-store secret (issue #1093).
+      secretKey: `${OBJECT_STORE_SECRET_MARKER}-${credentialStack}`,
+      stackName: credentialStack
+    },
     stackName: name
   } as unknown as WorkspaceConnections;
   return { name, assets, jobs, pipelines, storage, connections };
@@ -115,6 +131,10 @@ type Harness = {
   expireResolverCache: () => void;
   // Storage handles the extractor was actually invoked with, in order.
   extractedWith: Array<{ assetId: string; storage: unknown }>;
+  // Every line the app's own logger emitted, raw (issue #1093): the no-secret
+  // assertion reads the serialised output, not a structured stub, so a secret
+  // smuggled through a nested object or an `err` field would still show up.
+  logLines: string[];
 };
 
 // Resolver stub keyed exactly like WorkspaceStackResolver: a name with a stored
@@ -122,10 +142,15 @@ type Harness = {
 // FIRST listed stack. `names[0]` is the default stack.
 async function buildApp(
   names: string[],
-  opts: { resolveStackContext?: (requested?: string) => Promise<string | undefined> } = {}
+  opts: {
+    resolveStackContext?: (requested?: string) => Promise<string | undefined>;
+    // Stack name -> the stack its object-store credential actually belongs to
+    // (issue #1093). Absent entries keep the correct same-stack credential.
+    credentialStack?: Record<string, string>;
+  } = {}
 ): Promise<Harness> {
   const stacks: Record<string, Stack> = {};
-  for (const n of names) stacks[n] = makeStack(n);
+  for (const n of names) stacks[n] = makeStack(n, opts.credentialStack?.[n] ?? n);
   const pick = (requested?: string): Stack =>
     (requested && stacks[requested]) || stacks[names[0]!]!;
 
@@ -151,7 +176,19 @@ async function buildApp(
     }
   };
 
-  const app = Fastify();
+  // Capture the app's real log output so the no-secret assertion runs against
+  // what a deployment would actually write to stdout (issue #1093).
+  const logLines: string[] = [];
+  const app = Fastify({
+    logger: {
+      level: 'info',
+      stream: {
+        write(line: string) {
+          logLines.push(line);
+        }
+      }
+    }
+  });
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
 
@@ -195,7 +232,8 @@ async function buildApp(
     expireResolverCache: () => {
       cacheCold = true;
     },
-    extractedWith
+    extractedWith,
+    logLines
   };
 }
 
@@ -437,6 +475,102 @@ describe('pipeline execute refuses a stack split too (issue #1058)', () => {
     expect(res.statusCode).toBe(202);
     expect(h.submitted).toHaveLength(1);
     expect(h.submitted[0]!.externalId.split('__')[0]).toBe('b');
+  });
+});
+
+describe('submit asserts the object-store credential belongs to the routed stack (issue #1093)', () => {
+  // The split #1058's guard cannot see. Documents and control plane BOTH
+  // resolve 'b', so stackRoutingMismatch is satisfied — but the object-store
+  // credential and endpoint carried on those connections were resolved for
+  // stack 'a'. Every stack's source bucket has the identical literal name, so
+  // pre-#1093 this submitted happily and the transcoder failed later with a
+  // missing-object error (NoSuchKey) that named neither stack.
+  async function misRoutedCredentialHarness(): Promise<Harness> {
+    return buildApp(['a', 'b'], { credentialStack: { b: 'a' } });
+  }
+
+  async function readyAssetOnB(h: Harness): Promise<string> {
+    const asset = await h.stacks['b']!.assets.create({ name: 'clip' });
+    await h.stacks['b']!.assets.update(asset.id, { objectKey: `ingest/${asset.id}` });
+    await h.stacks['b']!.assets.update(asset.id, { status: 'processing' });
+    await h.stacks['b']!.assets.update(asset.id, { status: 'ready' });
+    return asset.id;
+  }
+
+  it('fails fast naming the expected and actual stack ids instead of a missing-object error', async () => {
+    const h = await misRoutedCredentialHarness();
+    const id = await readyAssetOnB(h);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/transcode`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: {}
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe('stack_routing_mismatch');
+    // EXPECTED (routed) and ACTUAL (credential) stack ids are both named.
+    expect(res.json().message).toContain('belong to stack "a"');
+    expect(res.json().message).toContain('routes to stack "b"');
+    // Nothing was handed to the transcoder, so there is no NoSuchKey to wait for.
+    expect(h.submitted).toHaveLength(0);
+  });
+
+  it('refuses a pipeline whose transcode step would read with the wrong credential', async () => {
+    const h = await misRoutedCredentialHarness();
+    const id = await readyAssetOnB(h);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/execute`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: { pipeline: 'abr-vod' }
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe('stack_routing_mismatch');
+    expect(h.submitted).toHaveLength(0);
+    // ...and no dangling execution record, same invariant as #1058.
+    expect(await h.stacks['b']!.pipelines.listByAsset(id)).toHaveLength(0);
+  });
+
+  it('never writes the object-store secret to the log, only the stack id and endpoint host', async () => {
+    const h = await misRoutedCredentialHarness();
+    const id = await readyAssetOnB(h);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/transcode`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: {}
+    });
+    expect(res.statusCode).toBe(409);
+
+    const log = h.logLines.join('\n');
+    // The refusal WAS logged, with both identities and the endpoint host.
+    expect(log).toContain('"reason":"object-store-credential"');
+    expect(log).toContain('"expectedStack":"b"');
+    expect(log).toContain('"actualStack":"a"');
+    expect(log).toContain('"actualEndpointHost":"a.minio-minio.example"');
+    // ...and the secret appears nowhere in the output.
+    expect(log).not.toContain(OBJECT_STORE_SECRET_MARKER);
+  });
+
+  it('submits normally when the credential belongs to the routed stack', async () => {
+    const h = await buildApp(['a', 'b']);
+    const id = await readyAssetOnB(h);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/transcode`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: {}
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(h.submitted).toHaveLength(1);
+    expect(h.logLines.join('\n')).not.toContain(OBJECT_STORE_SECRET_MARKER);
   });
 });
 

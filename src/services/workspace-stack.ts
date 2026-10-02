@@ -51,6 +51,7 @@ import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
 import type { SceneDetector } from '../pipeline/scene-detector.js';
 import type { Context } from '@osaas/client-core';
 import type { ResolverHealthSignal } from './resolver-health.js';
+import { logObjectStoreClient } from './object-store-stack-identity.js';
 
 // Builders that turn a stored optional-service instance name (from the stack
 // record) into the corresponding pipeline-step generator (issue #217). main.ts
@@ -116,7 +117,17 @@ export type WorkspaceConnections = {
   encore: EncoreClient | undefined;
   sourceBucket: string;
   packagedBucket: string;
-  s3Config: { endpoint: string; accessKey: string; secretKey: string } | undefined;
+  // Object-store credential + endpoint for the resolved stack, TAGGED with the
+  // stack identity it was built for (issue #1093). The tag travels with the
+  // credential — not alongside it — so the submit path can assert that the
+  // bytes will be read with the credential of the stack the request routes to
+  // (objectStoreStackMismatch, services/object-store-stack-identity.ts) instead
+  // of discovering the split as an indistinguishable missing-object error from
+  // the transcoder. `stackName` is undefined on the paths that are not stack
+  // records (env override), exactly like WorkspaceConnections.stackName below.
+  s3Config:
+    | { endpoint: string; accessKey: string; secretKey: string; stackName: string | undefined }
+    | undefined;
   // Per-role storage backend metadata for the resolved stack (issue #211/#213).
   // Carried through so the delivery route can emit backend-appropriate URLs
   // (proxied for 'minio', public/derived object URLs for 'external') without a
@@ -186,7 +197,10 @@ function buildConnectionsFromStack(
   optionalSteps: OptionalStepBuilders,
   // The parameter-store name this config was loaded under (issue #1058).
   // Carried onto the connections as their stack identity.
-  stackName: string | undefined
+  stackName: string | undefined,
+  // Observability logger. The object-store client construction below is logged
+  // through it (issue #1093) — stack id + endpoint host only, never the secret.
+  log: StackResolverLogger = noopLogger
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -207,6 +221,16 @@ function buildConnectionsFromStack(
     useSSL,
     accessKey: 'admin',
     secretKey: minioPassword
+  });
+  // Record WHICH stack this object-store client was pointed at (issue #1093).
+  // Every stack's buckets carry the same literal names, so without this line a
+  // client aimed at the wrong instance is invisible in the logs until a read
+  // fails with a missing-object error that names nothing. Stack id + endpoint
+  // HOST only — `minioPassword` is never logged.
+  logObjectStoreClient(log, {
+    source: 'stack-resolver',
+    stackName,
+    endpoint: config.minioEndpoint
   });
 
   const assets = new CouchAssetRepository(wc);
@@ -259,7 +283,14 @@ function buildConnectionsFromStack(
     encore,
     sourceBucket: config.sourceBucket,
     packagedBucket: config.packagedBucket,
-    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword },
+    // Tagged with the stack identity the credential was resolved from (issue
+    // #1093) so the submit path can assert credential/route agreement.
+    s3Config: {
+      endpoint: config.minioEndpoint,
+      accessKey: 'admin',
+      secretKey: minioPassword,
+      stackName
+    },
     // Carry the per-role storage backend metadata (issue #211) so the delivery
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
@@ -309,7 +340,12 @@ export function stackResolvedMinioEndpoint(
 // bypassing the parameter store. The env values are used verbatim — COUCHDB_URL
 // is expected to already carry any credentials it needs, and MinIO uses the
 // MINIO_ACCESS_KEY/MINIO_SECRET_KEY pair.
-function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefined {
+function buildEnvConnections(
+  oscContext: Context,
+  // Observability logger, so the env-override object-store client construction
+  // is logged on the same seam as the per-stack one (issue #1093).
+  log: StackResolverLogger = noopLogger
+): WorkspaceConnections | undefined {
   const couchUrl = process.env['COUCHDB_URL'];
   const minioUrl = process.env['MINIO_URL'];
   if (!couchUrl && !minioUrl) return undefined;
@@ -373,6 +409,15 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     });
     const client = storageClient;
     storageFor = () => new WorkspaceStorage(client, sourceBucket);
+    // Same construction log as the per-stack path (issue #1093). `stackName` is
+    // undefined here because the env override is not a stack record, which is
+    // itself the useful signal: a deployment logging this line is not routing
+    // per stack at all. Endpoint HOST only; MINIO_SECRET_KEY is never logged.
+    logObjectStoreClient(log, {
+      source: 'env-override',
+      stackName: undefined,
+      endpoint: minioUrl
+    });
   }
 
   const encoreUrl = process.env['ENCORE_URL'];
@@ -387,7 +432,18 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
-    s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
+    s3Config: minioUrl
+      ? {
+          endpoint: minioUrl,
+          accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin',
+          secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '',
+          // Not a stack record, so there is no stack identity to tag the
+          // credential with (issue #1093) — and therefore nothing for the
+          // submit-time assertion to compare, which leaves the env-override
+          // path's behaviour unchanged.
+          stackName: undefined
+        }
+      : undefined,
     // The env-override path has no parameter-store record, so no per-role
     // backend metadata: delivery keeps its default (proxied) behaviour.
     storage: undefined,
@@ -829,7 +885,7 @@ export class WorkspaceStackResolver {
     // Explicit env-var override (local dev / ops). When COUCHDB_URL or MINIO_URL
     // is set we build connections from the environment for ALL workspaces,
     // bypassing the parameter store entirely.
-    const envConnections = buildEnvConnections(this.oscContext);
+    const envConnections = buildEnvConnections(this.oscContext, this.log);
     if (envConnections) {
       // Explicit env override is an intended, healthy configuration — not a
       // degraded fallback. Clear any prior degraded gauge (issue #422).
@@ -968,7 +1024,17 @@ export class WorkspaceStackResolver {
     // to no-op in-memory connections so /health and infra routes stay up.
     const built =
       config && isReadyStack(config)
-        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, resolvedName)
+        ? buildConnectionsFromStack(
+            config,
+            this.minioPassword,
+            this.couchPassword,
+            this.oscContext,
+            this.optionalSteps,
+            resolvedName,
+            // Log the stack identity of the client we are about to construct
+            // (issue #1093).
+            this.log
+          )
         : null;
 
     // Emit the aggregate degraded-resolution signal (issue #422): a null build
