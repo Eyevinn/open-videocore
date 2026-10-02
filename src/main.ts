@@ -504,6 +504,27 @@ await app.register(provisionRouter, {
   paramStore,
   operationStore,
   publicBaseUrl: resolvePublicBaseUrl(),
+  // Bound (ms) on each backing instance's readiness wait during provisioning
+  // (issue #1038). Unset leaves the route on its own 5-minute default
+  // (DEFAULT_INSTANCE_READY_TIMEOUT_MS); a timeout routes into the existing
+  // rollback with an error naming the service and the last probe error, instead
+  // of the unbounded SDK wait that a single dropped poll could abort.
+  ...(process.env['PROVISION_READY_TIMEOUT_MS']
+    ? {
+        readyTimeoutMs: parseInt(
+          process.env['PROVISION_READY_TIMEOUT_MS'],
+          10
+        )
+      }
+    : {}),
+  ...(process.env['PROVISION_READY_POLL_INTERVAL_MS']
+    ? {
+        readyPollIntervalMs: parseInt(
+          process.env['PROVISION_READY_POLL_INTERVAL_MS'],
+          10
+        )
+      }
+    : {}),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
