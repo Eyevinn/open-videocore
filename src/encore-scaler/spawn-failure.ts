@@ -88,19 +88,16 @@ const JWT_PATTERN = /\beyJ[A-Za-z0-9._-]{10,}/g;
 // "<html> <head><title>504 Gateway Time-out</title></head> ...". Tags are
 // stripped rather than entity-escaped: the markup carries no diagnostic value
 // (the readable text "504 Gateway Time-out nginx" survives), it makes the 400
-// character budget go much further, and nothing that reaches an operator's
-// browser, terminal or log viewer can then be interpreted as markup.
+// character budget go much further, and the operator-facing text is readable
+// again ("504 Gateway Time-out ... nginx").
+//
+// A stray `<` or `>` left over from a non-markup message is deliberately kept
+// AS-IS: this record is served as JSON (GET /scaler/status), where an angle
+// bracket is an ordinary character and entity-encoding it would only corrupt
+// legitimate error text like `expected <n> profiles`. Escaping for a particular
+// rendering context belongs to whatever does that rendering, not to the stored
+// value.
 const HTML_TAG_PATTERN = /<[^>]*>/g;
-
-// Any stray angle bracket left after tag-stripping (an unclosed "<", a bare
-// ">"). Replaced with their HTML entities so the stored message is inert
-// wherever it is rendered, while still showing the operator a character was
-// there. The spawn-failure record is served by GET /scaler/status and goes
-// straight into dashboards.
-const STRAY_ANGLE_BRACKETS: Array<[RegExp, string]> = [
-  [/</g, '&lt;'],
-  [/>/g, '&gt;']
-];
 
 // What the record says when the thrown value carried no text at all.
 const NO_MESSAGE = 'spawn failed with no error message';
@@ -145,9 +142,6 @@ export function redactSpawnFailureMessage(
   // text (an href or a form value inside a tag is redacted before the tag that
   // held it is removed).
   text = text.replace(HTML_TAG_PATTERN, ' ');
-  for (const [pattern, entity] of STRAY_ANGLE_BRACKETS) {
-    text = text.replace(pattern, entity);
-  }
 
   text = text.replace(/\s+/g, ' ').trim();
   if (text.length > SPAWN_FAILURE_MESSAGE_MAX_LENGTH) {

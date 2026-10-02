@@ -29,6 +29,7 @@ import {
   destroyInstance,
   listInstances,
   reapOrphanedInstances,
+  resolvePendingSpawns,
   spawnInstance,
   updateInstance
 } from './instance-pool.js';
@@ -236,6 +237,25 @@ export class EncoreScalerLoop {
     // 1. Pending work.
     const pending = await redis.llen(keys.queue(workspaceId));
 
+    // 1b. Resolve any PENDING spawn (#1071): an instance a previous tick's spawn
+    //     left running because it had not reported `running` within the readiness
+    //     budget — normal while OSC provisions a new worker node. Promote it into
+    //     the pool proper the moment OSC reports it healthy, or destroy it once it
+    //     has had a second full budget and OSC still does not. This runs BEFORE
+    //     the pool is read so the scale-up gate below sees the result: a promoted
+    //     instance is capacity we already have (no sibling spawned for the node
+    //     already being provisioned), and a destroyed one frees its slot under
+    //     maxInstances. Never fatal to the tick.
+    try {
+      await resolvePendingSpawns(this.config);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] pending-spawn resolve error (workspace=%s):',
+        workspaceId,
+        err
+      );
+    }
+
     // 2. Current pool.
     let instances = await listInstances(redis, workspaceId);
 
@@ -300,6 +320,14 @@ export class EncoreScalerLoop {
       // A record with neither usable timestamp fails closed (eligible), never
       // "hold forever"; the real-work + packaging-pin checks below still decide
       // whether it is destroyed or drained.
+      // #1071: a PENDING spawn is owned end to end by resolvePendingSpawns
+      // (step 1b) — it has never reported healthy, so neither the idle clock nor
+      // the real-work query says anything useful about it, and it has its own
+      // deadline. Never a scale-down candidate.
+      if (inst.pendingReadySince !== undefined) {
+        survivors.push(inst);
+        continue;
+      }
       const idlePastTimeout = isIdlePastTimeout(inst, now, idleTimeoutMs);
       if (inst.activeJobs === 0 && resolveIdleSince(inst) === undefined) {
         this.warnMissingIdleStampThrottled(inst, now);
@@ -404,6 +432,14 @@ export class EncoreScalerLoop {
       // new job dispatches. Skip it so its real active-job count can reach zero
       // and a later tick can safely remove it.
       if (inst.draining === true) {
+        continue;
+      }
+      // #1071: a PENDING spawn is in the pool so it counts against maxInstances
+      // and cannot be lost, but OSC has never reported it `running`. Dispatching
+      // to it would post a job to an instance that is still being placed on a
+      // node. It becomes eligible the tick after resolvePendingSpawns promotes
+      // it, which is also when its callback-trust probe starts.
+      if (inst.pendingReadySince !== undefined) {
         continue;
       }
       // Gate first-job dispatch on confirmed outbound TLS trust to the paired

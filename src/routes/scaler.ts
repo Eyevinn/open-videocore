@@ -98,17 +98,39 @@ const instanceSchema = z.object({
 // field, because OSC error text can echo the request body the spawn sent.
 // Absent entirely when the last spawn succeeded or none has failed in
 // SPAWN_FAILURE_TTL_MS.
-const spawnFailureSchema = z.object({
-  // Epoch ms the failure was recorded.
-  at: z.number(),
-  // Create attempts the failed spawn made before giving up.
-  attempts: z.number(),
-  // Spawns that have failed in a row; reset by a success. 1 = a fresh blip,
-  // a climbing number = the scaler has been unable to grow for a while.
-  consecutiveFailures: z.number(),
-  // Redacted error text.
-  message: z.string()
-});
+const spawnFailureSchema = z
+  .object({
+    at: z
+      .number()
+      .describe('Epoch milliseconds at which the failed scale-up was recorded.'),
+    attempts: z
+      .number()
+      .describe(
+        'Total instance-create calls the failed spawn made, across both the ' +
+          'transcoder instance and its paired callback listener. Not the attempt ' +
+          'number of a single retry loop: it can exceed the per-loop retry limit.'
+      ),
+    consecutiveFailures: z
+      .number()
+      .describe(
+        'How many scale-ups have failed in a row for this workspace. Reset to 0 ' +
+          'by a successful spawn, so 1 is a fresh blip while a climbing number ' +
+          'means the scaler has been unable to grow for a while.'
+      ),
+    message: z
+      .string()
+      .describe(
+        'Error text from the failed spawn, redacted at write time: credentials, ' +
+          'URLs and tokens are stripped, as is any HTML markup, because upstream ' +
+          'error text can echo the request the spawn sent.'
+      )
+  })
+  .describe(
+    'The last scale-up for this workspace that could not create an instance. ' +
+      'Absent when the most recent spawn succeeded, or when none has failed ' +
+      'recently. This is what distinguishes "the pool is at maxInstances" from ' +
+      '"the pool cannot grow", which are otherwise identical on the wire.'
+  );
 
 const workspaceSchema = z.object({
   workspaceId: z.string(),

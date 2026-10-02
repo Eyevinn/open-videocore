@@ -69,17 +69,25 @@ vi.mock('@osaas/client-core', async () => {
 
 import {
   DEFAULT_SPAWN_READY_TIMEOUT_MS,
+  ENCORE_CALLBACK_LISTENER_SERVICE_ID,
   ENCORE_SERVICE_ID,
   reapOrphanedInstances,
+  resolvePendingSpawns,
+  scalerInstancePrefix,
   spawnInstance
 } from '../src/encore-scaler/instance-pool.js';
+import { EncoreScalerLoop } from '../src/encore-scaler/scaler-loop.js';
 import {
   isNameAlreadyTakenError,
   isTransientOscError,
   oscHttpCode
 } from '../src/encore-scaler/osc-error.js';
 import { readSpawnFailure } from '../src/encore-scaler/spawn-failure.js';
-import { keys, type EncoreScalerConfig } from '../src/encore-scaler/types.js';
+import {
+  keys,
+  type EncoreInstanceRecord,
+  type EncoreScalerConfig
+} from '../src/encore-scaler/types.js';
 
 // The exact body OSC's gateway returned in the #1071 incident log.
 const GATEWAY_TIMEOUT_HTML =
@@ -110,6 +118,8 @@ const nameAlreadyTaken = (): FakeFetchError =>
 class FakeRedis {
   hashes = new Map<string, Map<string, string>>();
   strings = new Map<string, string>();
+  lists = new Map<string, string[]>();
+  sets = new Map<string, Set<string>>();
 
   private hash(key: string): Map<string, string> {
     let h = this.hashes.get(key);
@@ -118,6 +128,58 @@ class FakeRedis {
       this.hashes.set(key, h);
     }
     return h;
+  }
+  private list(key: string): string[] {
+    let l = this.lists.get(key);
+    if (!l) {
+      l = [];
+      this.lists.set(key, l);
+    }
+    return l;
+  }
+  private set_(key: string): Set<string> {
+    let s = this.sets.get(key);
+    if (!s) {
+      s = new Set();
+      this.sets.set(key, s);
+    }
+    return s;
+  }
+  async llen(key: string): Promise<number> {
+    return this.lists.get(key)?.length ?? 0;
+  }
+  async rpush(key: string, value: string): Promise<number> {
+    const l = this.list(key);
+    l.push(value);
+    return l.length;
+  }
+  async rpoplpush(src: string, dst: string): Promise<string | null> {
+    const v = this.list(src).pop();
+    if (v === undefined) return null;
+    this.list(dst).unshift(v);
+    return v;
+  }
+  async lrem(key: string, _count: number, value: string): Promise<number> {
+    const l = this.list(key);
+    const idx = l.indexOf(value);
+    if (idx === -1) return 0;
+    l.splice(idx, 1);
+    return 1;
+  }
+  async sadd(key: string, member: string): Promise<number> {
+    const s = this.set_(key);
+    const isNew = !s.has(member);
+    s.add(member);
+    return isNew ? 1 : 0;
+  }
+  async srem(key: string, member: string): Promise<number> {
+    return this.set_(key).delete(member) ? 1 : 0;
+  }
+  async scard(key: string): Promise<number> {
+    return this.sets.get(key)?.size ?? 0;
+  }
+  async pexpire(): Promise<number> {
+    return 1;
   }
   async hgetall(key: string): Promise<Record<string, string>> {
     return Object.fromEntries(this.hashes.get(key) ?? new Map());
@@ -154,7 +216,12 @@ class FakeRedis {
     _n: number
   ): Promise<[string, string[]]> {
     const prefix = pattern.replace(/\*$/, '');
-    const all = [...this.hashes.keys(), ...this.strings.keys()];
+    const all = [
+      ...this.hashes.keys(),
+      ...this.strings.keys(),
+      ...this.lists.keys(),
+      ...this.sets.keys()
+    ];
     return ['0', [...new Set(all)].filter((k) => k.startsWith(prefix))];
   }
 }
@@ -182,6 +249,33 @@ function makeConfig(
     spawnReadyPollIntervalMs: 1,
     ...overrides
   };
+}
+
+// Every PENDING record (#1071) currently in a pool hash dump.
+function pendingRecords(pool: Record<string, string>): EncoreInstanceRecord[] {
+  return Object.values(pool)
+    .map((raw) => JSON.parse(raw) as EncoreInstanceRecord)
+    .filter((record) => record.pendingReadySince !== undefined);
+}
+
+// The tick makes HTTP calls of its own (the per-instance active-state query and
+// the callback-trust probe). None of them should be reached for a pending
+// instance; answering them keeps a stray call from throwing instead of failing
+// the assertion that matters.
+function stubFetchForTick(): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes('/encoreJobs/search/findByStatus')) {
+        return new Response(
+          JSON.stringify({ _embedded: { encoreJobs: [] }, page: { totalElements: 0 } }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+      return new Response('', { status: 404 });
+    })
+  );
 }
 
 // createInstance succeeds: echo the requested name back with a URL, as OSC does.
@@ -358,23 +452,27 @@ describe('a retry after a 504 adopts the instance the 504 created (#1071)', () =
     expect(removeInstanceMock).not.toHaveBeenCalled();
   });
 
-  it('keeps retrying when the taken name resolves to nothing (getInstance 404)', async () => {
+  it('retries, never adopting a phantom, when getInstance cannot confirm the name', async () => {
     vi.useFakeTimers();
     const redis = new FakeRedis();
     createInstanceMock.mockRejectedValue(nameAlreadyTaken());
-    // getInstance returns undefined on a 404 (lib/core.js:140-150). Adopting
-    // `undefined` as if it were an instance is the bug this guards.
+    // getInstance resolves undefined for EVERY failure except 401
+    // (lib/core.js:140-150) — a 404, but equally a 500 or a dropped socket — so
+    // undefined means "could not confirm", not "absent". Adopting it as if it
+    // were an instance is the bug this guards; giving up on it immediately,
+    // when the taken name says the instance probably does exist, is the other.
     getInstanceMock.mockResolvedValue(undefined);
 
     const spawn = spawnInstance(makeConfig(redis)).catch((err: unknown) => err);
-    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(60_000);
     const result = (await spawn) as Error;
 
     expect(result).toBeInstanceOf(Error);
     expect(result.message).toMatch(/already taken/);
-    // A 400 is not transient, so it fails on the first attempt rather than
-    // adopting a phantom.
-    expect(createInstanceMock).toHaveBeenCalledTimes(1);
+    // Retried with back-off (the name is fixed, so a retry cannot duplicate),
+    // giving adoption another chance each time, then threw the original error.
+    expect(createInstanceMock).toHaveBeenCalledTimes(3);
+    expect(getInstanceMock).toHaveBeenCalledTimes(3);
     expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(0);
   });
 
@@ -457,7 +555,213 @@ describe('the readiness budget covers node provisioning (#1071)', () => {
     expect(result.name).toBe('SpawnReadyTimeoutError');
     // The instance exists and is very likely still coming up: destroying it
     // threw away the node provisioning that had already happened and sent the
-    // next tick around the same loop. The orphan sweep owns it from here.
+    // next tick around the same loop.
+    expect(removeInstanceMock).not.toHaveBeenCalled();
+    // It is not leaked either — it is tracked as a PENDING pool entry.
+    const record = pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)))[0];
+    expect(record?.pendingReadySince).toBeTypeOf('number');
+    expect(record?.readyAt).toBeUndefined();
+    expect(record?.activeJobs).toBe(0);
+  });
+});
+
+// Everything above leaves the instance ALIVE. These are the tests that say what
+// then happens to it — the reason that is not simply the #778 billing leak with
+// a new name.
+describe('a pending spawn is resumed, capped and ultimately reclaimed (#1071)', () => {
+  // Spawn once against a never-ready instance and return its pending record.
+  async function spawnIntoPending(
+    redis: FakeRedis,
+    config: EncoreScalerConfig
+  ): Promise<string> {
+    createInstanceMock.mockImplementation(creationSucceeds);
+    getInstanceHealthMock.mockResolvedValue('pending');
+    const spawn = spawnInstance(config).catch(() => undefined);
+    // Just past the readiness budget, so the pending record is stamped roughly
+    // now and its own (equal) budget has barely started.
+    await vi.advanceTimersByTimeAsync(6_000);
+    await spawn;
+    const [record] = pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)));
+    if (!record) throw new Error('expected a pending record');
+    return record.instanceId;
+  }
+
+  it('promotes the instance as soon as OSC reports it running', async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    const config = makeConfig(redis, { spawnReadyTimeoutMs: 5_000 });
+    const instanceId = await spawnIntoPending(redis, config);
+
+    // The node finished provisioning between ticks.
+    getInstanceHealthMock.mockResolvedValue('running');
+    const { promoted, destroyed } = await resolvePendingSpawns(config);
+
+    expect(promoted).toEqual([instanceId]);
+    expect(destroyed).toEqual([]);
+    const record = JSON.parse(
+      (await redis.hgetall(keys.pool(WORKSPACE)))[instanceId]!
+    ) as EncoreInstanceRecord;
+    expect(record.pendingReadySince).toBeUndefined();
+    expect(record.readyAt).toBeTypeOf('number');
+    // Nothing was destroyed to get here: the instance that cost a node
+    // provisioning is the one that ends up serving jobs.
+    expect(removeInstanceMock).not.toHaveBeenCalled();
+  });
+
+  it('destroys an instance that never becomes reachable, once its budget is spent', async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    const config = makeConfig(redis, { spawnReadyTimeoutMs: 5_000 });
+    const instanceId = await spawnIntoPending(redis, config);
+
+    // Nothing about this instance ever answers: OSC health throws (so the
+    // orphan sweep's in-flight check could never confirm it either) and it is
+    // never `running`. Before #1071's review this state survived every sweep
+    // forever, billing.
+    getInstanceHealthMock.mockRejectedValue(new Error('instance unreachable'));
+
+    // Inside its extra budget: still waiting, not destroyed.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await resolvePendingSpawns(config)).toMatchObject({ destroyed: [] });
+    expect(removeInstanceMock).not.toHaveBeenCalled();
+
+    // Past it: reclaimed. An instance OSC does not report running cannot be
+    // mid-transcode, so this cannot interrupt work.
+    await vi.advanceTimersByTimeAsync(6_000);
+    const { destroyed } = await resolvePendingSpawns(config);
+
+    expect(destroyed).toEqual([instanceId]);
+    const removedServices = removeInstanceMock.mock.calls.map((call) => call[1]);
+    expect(removedServices).toContain(ENCORE_SERVICE_ID);
+    // The pool record goes with it, so nothing is left behind in Valkey either.
+    expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(0);
+  });
+
+  it('reaps the paired callback listener too when the listener is what never came up', async () => {
+    // The original #778 scenario, which #1071 changed the TIMING of rather than
+    // the outcome: the Encore instance is healthy, its listener never is, and
+    // both must end up destroyed rather than billing.
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    const config = makeConfig(redis, { spawnReadyTimeoutMs: 5_000 });
+    createInstanceMock.mockImplementation(creationSucceeds);
+    getInstanceHealthMock.mockImplementation(async (...args: unknown[]) =>
+      args[1] === ENCORE_SERVICE_ID ? 'running' : 'pending'
+    );
+
+    const spawn = spawnInstance(config).catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = (await spawn) as Error;
+    expect(result.name).toBe('SpawnReadyTimeoutError');
+    // Neither was destroyed on the spot...
+    expect(removeInstanceMock).not.toHaveBeenCalled();
+    const [pending] = pendingRecords(await redis.hgetall(keys.pool(WORKSPACE)));
+    expect(pending?.callbackListenerUrl).toBeDefined();
+
+    // ...but the Encore instance reports running, so the pending spawn is
+    // promoted and its (never-ready) listener comes with it. Make the whole
+    // instance unreachable instead and let its budget run out: both services
+    // are then torn down.
+    getInstanceHealthMock.mockResolvedValue('pending');
+    await vi.advanceTimersByTimeAsync(10_000);
+    const { destroyed } = await resolvePendingSpawns(config);
+
+    expect(destroyed).toEqual([pending!.instanceId]);
+    const removedServices = removeInstanceMock.mock.calls.map((call) => call[1]);
+    expect(removedServices).toContain(ENCORE_SERVICE_ID);
+    expect(removedServices).toContain(ENCORE_CALLBACK_LISTENER_SERVICE_ID);
+  });
+
+  it('counts pending instances against maxInstances, so repeated timeouts cannot pile up', async () => {
+    const redis = new FakeRedis();
+    // The state a timed-out spawn leaves behind: one instance in the pool,
+    // pending, never dispatched to, still inside its readiness budget.
+    const instanceId = `${scalerInstancePrefix(WORKSPACE)}pend01`;
+    await redis.hset(
+      keys.pool(WORKSPACE),
+      instanceId,
+      JSON.stringify({
+        instanceId,
+        url: `https://${instanceId}.osc.example`,
+        activeJobs: 0,
+        lastIdleAt: Date.now(),
+        pendingReadySince: Date.now()
+      } satisfies EncoreInstanceRecord)
+    );
+    // One job queued and a cap of ONE instance, so the scale-up gate is tested
+    // every tick: pending or not, there is work and no usable capacity.
+    await redis.rpush(
+      keys.queue(WORKSPACE),
+      JSON.stringify({ jobId: 'job-1', payload: {}, enqueuedAt: Date.now() })
+    );
+    createInstanceMock.mockImplementation(creationSucceeds);
+    getInstanceHealthMock.mockResolvedValue('pending');
+    stubFetchForTick();
+
+    const loop = new EncoreScalerLoop(
+      makeConfig(redis, { maxInstances: 1, spawnReadyTimeoutMs: 10 * 60_000 })
+    );
+    for (let i = 0; i < 4; i += 1) await loop.tick();
+
+    // NOTHING was created. Before the pending record existed the pool stayed
+    // empty, so maxInstances — counted from the pool hash — was never reached
+    // and every tick provisioned another node beside the one already coming up.
+    expect(createInstanceMock).not.toHaveBeenCalled();
+    expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toEqual([instanceId]);
+    // Nor is the pending instance dispatched to: it has never reported healthy,
+    // so the job stays queued for whichever instance is ready first.
+    expect(await redis.llen(keys.queue(WORKSPACE))).toBe(1);
+  });
+});
+
+describe('the orphan sweep can reclaim an unreachable instance (#1071 review)', () => {
+  it('reaps an orphan OSC does not report running, even when it answers nothing', async () => {
+    const redis = new FakeRedis();
+    const config = makeConfig(redis, { orphanGraceMs: 1_000 });
+    const instanceId = `${scalerInstancePrefix(WORKSPACE)}abc123`;
+    oscListInstancesMock.mockResolvedValue([
+      { name: instanceId, url: `https://${instanceId}.osc.example` }
+    ]);
+    // The instance answers no HTTP at all, so the in-flight check cannot
+    // confirm anything...
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('connect ECONNREFUSED');
+      })
+    );
+    // ...but OSC says it is not running, which is authoritative and means it
+    // cannot be mid-transcode.
+    getInstanceHealthMock.mockResolvedValue('failed');
+
+    // First sweep only starts the grace clock.
+    expect(await reapOrphanedInstances(config)).toEqual([]);
+    await new Promise((r) => setTimeout(r, 1_100));
+    const reaped = await reapOrphanedInstances(config);
+
+    expect(reaped).toEqual([instanceId]);
+  });
+
+  it('still refuses to reap an unreachable orphan OSC reports as running', async () => {
+    const redis = new FakeRedis();
+    const config = makeConfig(redis, { orphanGraceMs: 1_000 });
+    const instanceId = `${scalerInstancePrefix(WORKSPACE)}def456`;
+    oscListInstancesMock.mockResolvedValue([
+      { name: instanceId, url: `https://${instanceId}.osc.example` }
+    ]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('connect ETIMEDOUT');
+      })
+    );
+    // Running but unreachable: it really could be mid-transcode behind a
+    // network problem, so it is left alone exactly as #778 intended.
+    getInstanceHealthMock.mockResolvedValue('running');
+
+    expect(await reapOrphanedInstances(config)).toEqual([]);
+    await new Promise((r) => setTimeout(r, 1_100));
+    expect(await reapOrphanedInstances(config)).toEqual([]);
     expect(removeInstanceMock).not.toHaveBeenCalled();
   });
 });

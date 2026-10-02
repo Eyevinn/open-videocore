@@ -223,9 +223,11 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
   // no longer destroys anything, because "not ready yet" is the normal state
   // while OSC provisions a new worker node, and tearing the instance down threw
   // away minutes of provisioning every tick. Immediate teardown is now reserved
-  // for failures that are not a readiness timeout (below); a readiness timeout
-  // leaves both instances to the orphan sweep, which has the grace window and
-  // the positive no-work check to decide safely.
+  // for failures that are not a readiness timeout (this test); a readiness
+  // timeout instead records a PENDING pool entry that the next tick resolves —
+  // promoting it or destroying it on its own deadline, listener included. The
+  // listener-never-ready case is covered end to end in
+  // test/encore-scaler-spawn-504-node-provisioning.test.ts.
   it('removes the paired callback listener too when the spawn fails for a non-readiness reason', async () => {
     const redis = new FakeRedis();
     const workspaceId = 'ws-listener-leak';
@@ -282,10 +284,16 @@ describe('spawnInstance stamps readyAt on the pool record (issue #778)', () => {
     // NOT destroyed: it may well be seconds away from `running` on a node OSC
     // is still provisioning (#1071).
     expect(removeInstance).not.toHaveBeenCalled();
-    // It is still not in the pool — nothing may be dispatched to an instance
-    // that has never reported healthy — so the orphan sweep sees it and owns
-    // its fate from here.
-    expect(await redis.hgetall(keys.pool(workspaceId))).toEqual({});
+    // Nor is it leaked. It is recorded as a PENDING pool entry, so it counts
+    // against maxInstances, is never dispatched to, and resolvePendingSpawns
+    // either promotes or destroys it on the next tick.
+    const pool = await redis.hgetall(keys.pool(workspaceId));
+    const records = Object.values(pool).map(
+      (raw) => JSON.parse(raw) as EncoreInstanceRecord
+    );
+    expect(records).toHaveLength(1);
+    expect(records[0]!.pendingReadySince).toBeTypeOf('number');
+    expect(records[0]!.readyAt).toBeUndefined();
   });
 
   // Review round 2 (non-blocking, instance-pool.ts:285): the first fix raced a

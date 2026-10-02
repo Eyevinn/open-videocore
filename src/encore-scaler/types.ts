@@ -119,18 +119,18 @@ export type EncoreScalerConfig = {
   // (lib/core.js:343-353, v0.24.0), so without this a spawn can hang forever
   // while holding a live,
   // billing OSC instance that has no pool record — the very state the orphan
-  // reaper's grace window is supposed to be able to outlast. On timeout the spawn
-  // fails and its cleanup path destroys the Encore instance and any paired
-  // listener. Unset uses DEFAULT_SPAWN_READY_TIMEOUT_MS.
+  // reaper's grace window is supposed to be able to outlast. Unset uses
+  // DEFAULT_SPAWN_READY_TIMEOUT_MS.
   //
   // #1071: this budget must cover NODE provisioning, not just pod start. OSC may
   // have to bring up a whole new worker node to place the instance (which is also
   // why createInstance can answer 504 while the work continues behind the
   // gateway), and that takes minutes. The default was raised to 15 minutes
   // accordingly; a deployment on a cluster with spare capacity can lower it with
-  // ENCORE_SPAWN_READY_TIMEOUT_MS. On timeout the instance is now left ALIVE for
-  // the orphan sweep rather than destroyed, because a not-yet-`running` instance
-  // is usually still coming up rather than broken.
+  // ENCORE_SPAWN_READY_TIMEOUT_MS. On timeout the spawn no longer destroys the
+  // instance: it records it as a PENDING pool entry (EncoreInstanceRecord
+  // .pendingReadySince) that the next tick waits on, which counts against
+  // maxInstances and carries its own destroy deadline — this same budget again.
   spawnReadyTimeoutMs?: number;
   // #778 (review round 2): how often (ms) that bounded wait re-checks
   // getInstanceHealth. The scaler owns the poll loop instead of racing a timer
@@ -276,6 +276,24 @@ export type EncoreInstanceRecord = {
   // ever killing an instance with a genuine in-flight transcode when the tracked
   // activeJobs count has diverged from the instance's real IN_PROGRESS state.
   draining?: boolean;
+  // #1071: epoch ms at which a spawn gave up waiting for this instance to report
+  // `running` and left it ALIVE rather than destroying it. The instance exists on
+  // OSC and is probably still coming up (node provisioning), so it is tracked
+  // here as a PENDING pool entry instead of being thrown away or leaked:
+  //   - it counts towards maxInstances, so repeated readiness timeouts cannot
+  //     pile up uncapped behind a cap computed from this hash;
+  //   - the next tick waits on it (resolvePendingSpawns) rather than spawning a
+  //     sibling for the node that is already being provisioned;
+  //   - it is NEVER dispatched to while this is set — it has never reported
+  //     healthy;
+  //   - and it has a deadline: resolvePendingSpawns promotes it the moment OSC
+  //     reports `running`, and destroys it once this timestamp is older than the
+  //     readiness budget with OSC still not reporting `running` (an instance OSC
+  //     says is not running cannot be mid-transcode), so the billing leak is
+  //     bounded rather than left to the orphan sweep's conservative refusal to
+  //     act on an unconfirmable instance.
+  // Absent on every normal record.
+  pendingReadySince?: number;
 };
 
 export type QueuedJob = {

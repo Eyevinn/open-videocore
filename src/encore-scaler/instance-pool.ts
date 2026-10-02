@@ -9,10 +9,12 @@
 //   createInstance(context, serviceId, token, body): Promise<any>
 //   removeInstance(context, serviceId, name, token): Promise<void>
 //   getInstance(context, serviceId, name, token): Promise<any>           (:56)
-//     — resolves UNDEFINED when the instance does not exist: lib/core.js:140-150
-//       swallows a FetchError with httpCode 404 and returns undefined (it
-//       rethrows only 401 as UnauthorizedError). Every adopt path below must
-//       therefore treat `undefined` as "not there after all", not as success.
+//     — resolves UNDEFINED on ANY failure except 401. lib/core.js:140-150
+//       rethrows only a FetchError with httpCode 401 (as UnauthorizedError);
+//       every other error — a 404, but equally a 500, a 504 or a dropped socket —
+//       falls out of the catch and the function returns undefined. So `undefined`
+//       means "could not confirm", NOT "does not exist", and no adopt path below
+//       may read it as success OR as proof of absence.
 //   getInstanceHealth(context, serviceId, name, token): Promise<string>  (:86)
 // The Encore serviceId is 'encore' (src/services/stack.ts:25). The returned
 // instance object carries `name` (instance id) and `url` — same fields the
@@ -275,8 +277,10 @@ export async function reconcilePoolFromOsc(
 // never becomes healthy hangs forever while holding a live, billing OSC instance
 // with no pool record — the exact state the orphan reaper acts on. Bounding the
 // wait gives that state a real worst case that DEFAULT_ORPHAN_GRACE_MS can
-// exceed, and routes the failure into spawnInstance's cleanup path (which now
-// destroys the Encore instance AND its paired listener) instead of leaking.
+// exceed, and routes the failure into spawnInstance's cleanup path instead of
+// leaking. (What that cleanup path DOES on a readiness timeout changed in
+// #1071: the instance is no longer destroyed, it is recorded as a PENDING pool
+// entry — see recordPendingSpawn / resolvePendingSpawns below.)
 // Logged as OSC friction (CLAUDE.md rule 6):
 // docs/osc-feedback/incoming-waitforinstanceready-unbounded.md.
 //
@@ -478,6 +482,10 @@ async function spawnPooledInstance(
   // Whether the paired callback listener was created, so the cleanup path knows
   // it has a listener to remove as well (#778 review finding 3).
   let listenerCreated = false;
+  // URL of that listener once it exists, so a pending-spawn record written by
+  // the failure path below can carry it (#1071). Without it a resumed instance
+  // would have to be dispatched to with no callback path.
+  let listenerUrl: string | undefined;
   // #1071: whether the Encore instance / its listener was ADOPTED — found
   // already existing on OSC and fetched with getInstance — rather than created
   // by this spawn's own successful createInstance call. The cleanup path below
@@ -537,10 +545,26 @@ async function spawnPooledInstance(
           );
           break;
         }
-        // getInstance resolves undefined on 404 (lib/core.js:140-150): the name
-        // is taken but not by anything we can see (a teardown racing us). Fall
-        // through and let the retry/back-off decide, rather than adopting
-        // `undefined` as if it were an instance.
+        // getInstance returned undefined, which means "could not confirm" and
+        // not "does not exist" — lib/core.js:140-150 swallows EVERY error but
+        // 401, so a 404, a 500 and a dropped socket are indistinguishable here.
+        // The name being taken is itself strong evidence the instance exists, so
+        // this is retry-worthy: back off and try the create again, which will
+        // collide again and give adoption a second chance. Safe because the name
+        // is fixed, so a retry can never create a duplicate. On the last attempt
+        // the original "already taken" error is thrown, exactly as before.
+        if (attempt < maxAttempts) {
+          console.warn(
+            '[encore-scaler] spawn: instance name %s is taken but getInstance could ' +
+              'not confirm the instance (workspace=%s attempt=%d) — retrying (#1071)',
+            name,
+            config.workspaceId,
+            attempt
+          );
+          await new Promise((r) => setTimeout(r, attempt * 5_000));
+          continue;
+        }
+        throw err;
       }
       // Retry only what can succeed on a later attempt. Classified on the
       // error's structural httpCode, NOT on substring-matching its message
@@ -613,6 +637,9 @@ async function spawnPooledInstance(
             instanceId,
             callbackSat
           )) as OscInstance | undefined;
+          // As above, `undefined` here means "could not confirm" rather than
+          // "absent" (lib/core.js:140-150), so it falls through to the normal
+          // transient classification instead of being treated as proof.
           if (existing) {
             callback = existing;
             listenerAdopted = true;
@@ -633,6 +660,7 @@ async function spawnPooledInstance(
     }
     if (!callback) throw lastCallbackErr;
     listenerCreated = true;
+    listenerUrl = instanceUrl(callback);
     await waitForInstanceReadyBounded(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID,
       instanceId,
@@ -643,7 +671,7 @@ async function spawnPooledInstance(
     const record: EncoreInstanceRecord = {
       instanceId,
       url: encoreUrl,
-      callbackListenerUrl: instanceUrl(callback),
+      callbackListenerUrl: listenerUrl,
       activeJobs: 0,
       lastIdleAt: readyAt,
       // #778: the instance is idle from right now. `lastIdleAt` only advances on
@@ -666,10 +694,16 @@ async function spawnPooledInstance(
     //     evidence of a broken instance: when OSC had to provision a new worker
     //     node the instance is simply not `running` yet. Destroying it threw
     //     away minutes of node provisioning and sent the next tick around the
-    //     same loop. It is left alive; the orphan reaper (reapOrphanedInstances)
-    //     owns it from here and will only destroy it after the grace window AND
-    //     a positive no-work confirmation, or adopt it back into the pool if it
-    //     turns out to be working.
+    //     same loop.
+    //
+    // Neither is simply LEFT RUNNING either, which would be #778's billing leak
+    // again: the orphan sweep deliberately refuses to destroy an instance whose
+    // in-flight state it cannot confirm, so an instance that never becomes
+    // reachable would survive every sweep forever, outside maxInstances, while
+    // the next tick spawned a sibling beside it. Both cases are instead recorded
+    // as a PENDING pool entry (recordPendingSpawn): tracked, counted against the
+    // cap, never dispatched to, resumed by the next tick, and destroyed on its
+    // own deadline if OSC still does not report it `running`.
     //
     // Everything else is cleaned up as before so it doesn't become an untracked
     // orphan. Best-effort: swallow cleanup errors so the original error is what
@@ -679,13 +713,31 @@ async function spawnPooledInstance(
     if (keepEncoreInstance) {
       console.warn(
         '[encore-scaler] spawn failed but the Encore instance %s (workspace=%s) is ' +
-          'NOT being destroyed (adopted=%s stillComingUp=%s) — the orphan sweep owns ' +
-          'it from here (#1071)',
+          'NOT being destroyed (adopted=%s stillComingUp=%s) — recorded as a pending ' +
+          'spawn for the next tick to resume (#1071)',
         instanceId,
         config.workspaceId,
         String(instanceAdopted),
         String(stillComingUp)
       );
+      try {
+        await recordPendingSpawn(config, {
+          instanceId,
+          url: encoreUrl,
+          callbackListenerUrl: listenerCreated ? listenerUrl : undefined
+        });
+      } catch (recordErr) {
+        // If the pending record cannot be written the instance is untracked, so
+        // say so loudly: the orphan sweep is then the only thing that can clean
+        // it up, and only once it can confirm the instance has no work.
+        console.error(
+          '[encore-scaler] could not record pending spawn for instance %s ' +
+            '(workspace=%s) — it is live on OSC with no pool record (#1071):',
+          instanceId,
+          config.workspaceId,
+          recordErr
+        );
+      }
     } else {
       try {
         await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
@@ -718,6 +770,150 @@ async function spawnPooledInstance(
     }
     throw err;
   }
+}
+
+// Record an instance a failed spawn deliberately left running as a PENDING pool
+// entry (#1071).
+//
+// The record is a normal EncoreInstanceRecord with `pendingReadySince` set and
+// NO `readyAt`, which is what makes every existing path do the right thing with
+// it: the scale-up gate counts it against maxInstances, dispatch skips it
+// (scaler-loop step 5 checks pendingReadySince), the orphan sweep sees it as
+// tracked and leaves it alone, and resolvePendingSpawns below either promotes or
+// destroys it on the next tick.
+async function recordPendingSpawn(
+  config: EncoreScalerConfig,
+  instance: { instanceId: string; url: string; callbackListenerUrl?: string }
+): Promise<void> {
+  const now = Date.now();
+  await updateInstance(config.redis, config.workspaceId, {
+    instanceId: instance.instanceId,
+    url: instance.url,
+    callbackListenerUrl: instance.callbackListenerUrl,
+    activeJobs: 0,
+    // No readyAt: this instance has never reported healthy. lastIdleAt is
+    // stamped so the record still has a usable clock for anything that reads one.
+    lastIdleAt: now,
+    pendingReadySince: now
+  });
+}
+
+// Resolve every PENDING pool entry for this workspace (#1071): promote the ones
+// OSC now reports `running`, destroy the ones that have run out of time.
+//
+// This is what keeps a readiness timeout from becoming either a leak or a
+// stampede. Called once per tick, before the scale-up gate, so that:
+//   - an instance whose node finished provisioning is picked up and used, rather
+//     than a second one being spawned beside it;
+//   - an instance that is never going to come up is destroyed on a deadline we
+//     own, instead of surviving indefinitely because the orphan sweep (rightly)
+//     refuses to act on an instance whose in-flight state it cannot confirm.
+//
+// The destroy decision is AUTHORITATIVE, not inferred: getInstanceHealth is
+// OSC's own view of the instance (@osaas/client-core lib/core.d.ts:86, the same
+// call the SDK's waitForInstanceReady gates on). An instance OSC does not report
+// as `running` cannot be mid-transcode, so destroying it past the deadline
+// cannot interrupt work. A health probe that throws is treated the same way
+// after the deadline — the instance has then been unreachable AND not-running
+// for a whole extra readiness budget.
+//
+// Returns the ids promoted and destroyed (for logging/tests). Never throws: a
+// failure here must not take out the tick.
+export async function resolvePendingSpawns(
+  config: EncoreScalerConfig
+): Promise<{ promoted: string[]; destroyed: string[] }> {
+  const promoted: string[] = [];
+  const destroyed: string[] = [];
+
+  let instances: EncoreInstanceRecord[];
+  try {
+    instances = await listInstances(config.redis, config.workspaceId);
+  } catch {
+    return { promoted, destroyed };
+  }
+  const pending = instances.filter(
+    (inst) => typeof inst.pendingReadySince === 'number'
+  );
+  if (pending.length === 0) return { promoted, destroyed };
+
+  const graceMs = config.spawnReadyTimeoutMs ?? DEFAULT_SPAWN_READY_TIMEOUT_MS;
+  let sat: string;
+  try {
+    sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+  } catch {
+    return { promoted, destroyed };
+  }
+
+  for (const inst of pending) {
+    let health: string | undefined;
+    try {
+      health = await getInstanceHealth(
+        config.oscContext,
+        ENCORE_SERVICE_ID,
+        inst.instanceId,
+        sat
+      );
+    } catch {
+      health = undefined;
+    }
+
+    if (health === 'running') {
+      const now = Date.now();
+      const { pendingReadySince, ...rest } = inst;
+      try {
+        await updateInstance(config.redis, config.workspaceId, {
+          ...rest,
+          lastIdleAt: now,
+          readyAt: now
+        });
+        promoted.push(inst.instanceId);
+        console.warn(
+          '[encore-scaler] pending spawn %s (workspace=%s) reported running after ' +
+            '%dms and joined the pool — the node it was waiting for finished ' +
+            'provisioning (#1071)',
+          inst.instanceId,
+          config.workspaceId,
+          now - (pendingReadySince ?? now)
+        );
+      } catch (err) {
+        console.error(
+          '[encore-scaler] could not promote pending spawn %s (workspace=%s):',
+          inst.instanceId,
+          config.workspaceId,
+          err
+        );
+      }
+      continue;
+    }
+
+    const waitedMs = Date.now() - (inst.pendingReadySince ?? 0);
+    if (waitedMs < graceMs) continue; // still inside its extra budget
+
+    try {
+      // destroyInstance tears down the Encore instance AND its paired callback
+      // listener, and drops the pool record.
+      await destroyInstance(inst.instanceId, config);
+      destroyed.push(inst.instanceId);
+      console.warn(
+        '[encore-scaler] pending spawn %s (workspace=%s) never reported running ' +
+          '(OSC health=%s) after %dms — destroyed rather than left billing (#1071)',
+        inst.instanceId,
+        config.workspaceId,
+        String(health ?? 'unavailable'),
+        waitedMs
+      );
+    } catch (err) {
+      // Keep the record so the next tick retries the teardown.
+      console.error(
+        '[encore-scaler] could not destroy stuck pending spawn %s (workspace=%s):',
+        inst.instanceId,
+        config.workspaceId,
+        err
+      );
+    }
+  }
+
+  return { promoted, destroyed };
 }
 
 // Tear down an Encore OSC instance and drop it from the pool hash. Idempotent:
@@ -999,61 +1195,96 @@ export async function reapOrphanedInstances(
 
       if (active === undefined) {
         // Unreachable / unparseable — could be mid-transcode, or not yet
-        // `running` after a slow spawn. Never destroy on an unconfirmed count;
-        // the next sweep retries (the sighting is deliberately kept).
-        console.warn(
-          '[encore-scaler] orphan sweep: could not confirm real in-flight state for ' +
-            'orphaned instance %s (workspace=%s) — NOT reaped this sweep (#778)',
-          instanceId,
-          config.workspaceId
-        );
-        continue;
-      }
-
-      let pendingPackaging = false;
-      try {
-        pendingPackaging = await hasPendingPackaging(config.redis, instanceId);
-      } catch {
-        // Unknown pin state is treated as "pinned": never destroy on an
-        // unverifiable answer.
-        pendingPackaging = true;
-      }
-
-      if (active.count > 0 || pendingPackaging) {
-        // The orphan has genuine in-flight work (or a packaging handoff pinned
-        // against it). Do NOT destroy it: ADOPT it into the pool so the existing
-        // drain-don't-kill logic (#513) and the packaging pin (#525 pt.2) own its
-        // teardown, exactly as they do for every other instance.
+        // `running` after a slow spawn. Never destroy on an unconfirmed count
+        // from the instance itself... but do not stop there either: an instance
+        // that never becomes reachable used to survive EVERY sweep forever,
+        // which is the billing leak this reaper exists to close (#1071 review).
+        //
+        // So fall back to OSC's own view of the instance. getInstanceHealth
+        // (@osaas/client-core lib/core.d.ts:86) is authoritative and does not
+        // depend on the instance answering our HTTP calls: an instance OSC does
+        // not report as `running`, a whole grace window after it was first seen
+        // orphaned, cannot be running a transcode, so destroying it cannot
+        // interrupt work. Only a `running`-but-unreachable instance is still
+        // left alone, because that one really could be mid-job behind a network
+        // problem.
+        let health: string | undefined;
         try {
-          await updateInstance(config.redis, config.workspaceId, {
+          const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+          health = await getInstanceHealth(
+            config.oscContext,
+            ENCORE_SERVICE_ID,
             instanceId,
-            url: candidate.encoreUrl,
-            // Not recoverable from OSC; dispatch's trust gate fails open on an
-            // absent listener URL (scaler-loop.ts ensureCallbackTrust), same as
-            // reconcilePoolFromOsc's adoptions.
-            activeJobs: active.count,
-            lastIdleAt: now,
-            readyAt: now
-          });
-          await config.redis.hdel(seenKey, instanceId).catch(() => undefined);
-          console.warn(
-            '[encore-scaler] orphan sweep: orphaned instance %s (workspace=%s) has ' +
-              'real in-flight work (count=%d pendingPackaging=%s) — adopted into the ' +
-              'pool to be drained rather than destroyed (#778)',
-            instanceId,
-            config.workspaceId,
-            active.count,
-            String(pendingPackaging)
+            sat
           );
-        } catch (err) {
-          console.error(
-            '[encore-scaler] orphan sweep: failed to adopt busy orphan %s (workspace=%s):',
-            instanceId,
-            config.workspaceId,
-            err
-          );
+        } catch {
+          health = undefined;
         }
-        continue;
+        if (health === 'running') {
+          console.warn(
+            '[encore-scaler] orphan sweep: could not confirm real in-flight state for ' +
+              'orphaned instance %s (workspace=%s), and OSC reports it running — ' +
+              'NOT reaped this sweep (#778)',
+            instanceId,
+            config.workspaceId
+          );
+          continue;
+        }
+        console.warn(
+          '[encore-scaler] orphan sweep: orphaned instance %s (workspace=%s) is ' +
+            'unreachable and OSC does not report it running (health=%s) — it cannot ' +
+            'be mid-transcode, so it is being reaped rather than left billing (#1071)',
+          instanceId,
+          config.workspaceId,
+          String(health ?? 'unavailable')
+        );
+        // Falls through to the teardown below.
+      } else {
+        let pendingPackaging = false;
+        try {
+          pendingPackaging = await hasPendingPackaging(config.redis, instanceId);
+        } catch {
+          // Unknown pin state is treated as "pinned": never destroy on an
+          // unverifiable answer.
+          pendingPackaging = true;
+        }
+
+        if (active.count > 0 || pendingPackaging) {
+          // The orphan has genuine in-flight work (or a packaging handoff pinned
+          // against it). Do NOT destroy it: ADOPT it into the pool so the
+          // existing drain-don't-kill logic (#513) and the packaging pin (#525
+          // pt.2) own its teardown, exactly as they do for every other instance.
+          try {
+            await updateInstance(config.redis, config.workspaceId, {
+              instanceId,
+              url: candidate.encoreUrl,
+              // Not recoverable from OSC; dispatch's trust gate fails open on an
+              // absent listener URL (scaler-loop.ts ensureCallbackTrust), same as
+              // reconcilePoolFromOsc's adoptions.
+              activeJobs: active.count,
+              lastIdleAt: now,
+              readyAt: now
+            });
+            await config.redis.hdel(seenKey, instanceId).catch(() => undefined);
+            console.warn(
+              '[encore-scaler] orphan sweep: orphaned instance %s (workspace=%s) has ' +
+                'real in-flight work (count=%d pendingPackaging=%s) — adopted into the ' +
+                'pool to be drained rather than destroyed (#778)',
+              instanceId,
+              config.workspaceId,
+              active.count,
+              String(pendingPackaging)
+            );
+          } catch (err) {
+            console.error(
+              '[encore-scaler] orphan sweep: failed to adopt busy orphan %s (workspace=%s):',
+              instanceId,
+              config.workspaceId,
+              err
+            );
+          }
+          continue;
+        }
       }
     }
 

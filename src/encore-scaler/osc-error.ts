@@ -11,10 +11,10 @@
 //   - Any message that merely CONTAINED '503' anywhere (an id, a byte count, a
 //     timestamp) was retried as if it were a 503.
 //
-// The platform side of this (a synchronous createInstance that answers 504 while
+// The platform side of this — a synchronous createInstance that answers 504 while
 // a new worker node is provisioned, with no idempotency key to make the retry
-// unambiguous) is logged as OSC friction per CLAUDE.md rule 6:
-// docs/osc-feedback/incoming-osc-createinstance-504-node-provisioning.md.
+// unambiguous — is logged as OSC friction in the engagement repo and summarised
+// on issue #1071; nothing in this repository can prevent the 504 itself.
 //
 // The error carries the status structurally and always has: @osaas/client-core's
 // defaultErrorFactory builds `new FetchError({ message, httpCode: response.status })`
