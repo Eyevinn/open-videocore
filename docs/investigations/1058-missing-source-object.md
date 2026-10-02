@@ -2,8 +2,13 @@
 
 **Date:** 2026-10-02
 **Author:** surface-backend-api agent
-**Type:** root-cause analysis (diagnosis task — no behavioural fix in this commit, see "Why no fix is committed")
+**Type:** root-cause analysis + the fix that closes it (see "The fix")
+**Code pinned to:** `d5a8200` — every `file:line` reference below is read against that
+commit (the base this investigation branched from). The fix commit on this branch
+moves some of those lines; the references are deliberately NOT re-pointed, so the
+evidence stays verifiable against the code as it was when the bug was reported.
 **Related:** #615 (per-request stack keying of the transcode path), #639 (per-stack source bucket), #804 (fail-loud endpoint resolution), #991 (in-cluster object-store endpoint), #616 (submit-time reachability preflight)
+**Spun out of this analysis:** #1088 (resumed-multipart part-number off-by-one), #1089 (shared object-store root credential — security), #1090 (background work still resolves the default stack)
 
 ## Summary
 
@@ -30,6 +35,19 @@ This is size-independent. The 449 MB file is a **confounded** variable: the
 reported working case is a *different stack* that also happens to use small
 clips. See point 3 for the positive evidence that multipart handling is not
 involved.
+
+**Reproduced end to end** on a two-stack install (#1058 comment, 2026-10-02
+12:26–12:39 UTC): stacks `['mcdev7','mcdev7b']`, every request carrying
+`X-Stack-Name: mcdev7b`. The ingest wrote to `mcdev7`, the transcoder read
+`mcdev7b`, and the failure text was byte-for-byte the customer's.
+
+**The impact is wider than transcode.** The same divergence is visible on
+`GET /api/v1/assets/{id}/files` — a *delivery* surface. In the reproduction the
+presigned source URL named `mcdev7` under **either** header value, because the
+URL is minted from `storageFor()` (the default stack) while the asset was
+ingested under a header naming the other stack. Any download or playback URL
+handed out for a non-first-stack asset therefore pointed at the wrong object
+store, with no transcoder involved. Same root cause, separate blast radius.
 
 ## Point 1 — which endpoint and bucket each of the three paths uses
 
@@ -155,7 +173,9 @@ Three separate guards all pass:
    (`src/services/workspace-stack.ts:192-198`,
    `WorkspaceStackResolver` constructor `:724-756`). So if both instances share
    that root password, a cross-instance read **authenticates successfully** and
-   returns `NoSuchKey` rather than a 403 that would have named the problem.
+   returns `NoSuchKey` rather than a 403 that would have named the problem. The
+   blast radius of one shared root credential across every stack is a security
+   concern in its own right, filed as **#1089**.
 
 ## Point 2 — lifecycle / expiry / cleanup / move-after-extract
 
@@ -235,7 +255,7 @@ object absent:
    resume comparison is keyed one off the server's numbering. That is a
    correctness risk for *resumed* large uploads (wrong-offset or duplicated part
    content), **not** a disappearance mechanism — and large files are the only ones
-   that reach it. Worth a separate issue; it does not explain #1058.
+   that reach it. Filed separately as **#1088**; it does not explain #1058.
 
 ## Conclusion
 
@@ -263,59 +283,109 @@ than the first-listed one, the two halves address different object stores. Befor
 the same first-listed stack as the data plane — which is why this is a
 regression that only appears on an installation with more than one stack.
 
-## Why no fix is committed
+## The fix
 
-Both ways to close the gap are larger than a contained bug fix and change
-documented behaviour, so neither is guessed at here:
+**The data plane now resolves the stack the request names.** Bytes and documents
+move together, which is the invariant #1058 broke.
 
-- **(a) Point the control plane at the data plane's stack** — make
-  `transcodeContext` resolve with no name. Two lines, but it deliberately
+- `src/services/request-stack-context.ts` (new) holds the request's stack name in
+  an `AsyncLocalStorage` store, plus the request-scoped `StorageFactory` built
+  from it.
+- `src/main.ts` establishes that store in a single `onRequest` hook — ahead of
+  the existing `preHandler`, which now resolves `request.connections` from the
+  same ambient name — and `storageFor` is `makeRequestScopedStorageFactory(stackResolver)`.
+- `src/data/per-workspace-repos.ts` resolves with `currentRequestStackName()` on
+  every call, so asset, job, pipeline, search, profile, collection, webhook and
+  audit documents land on the stack the request named.
+- Work detached from a handler inherits the store along the async resource chain:
+  the URL-pull worker (`void runner(...)`) and the metadata extraction that
+  follows it resolve the same stack the ingest request named, without threading a
+  parameter through every call site.
+- Outside a request the store is empty, resolution falls back to the first listed
+  stack, and behaviour is unchanged. That is also the limitation: see #1090.
+
+**A fail-loud guard backs it up.** `POST /:id/transcode` compares the data
+plane's resolved stack identity (`request.connections.stackName`, new on
+`WorkspaceConnections` and set from the name the config was loaded under) against
+the control plane's (`resolveStackContext`, issue #615). A disagreement returns
+`409 stack_routing_mismatch` naming both stacks, instead of submitting a job that
+can only fail with an indistinguishable 404. The comparison is on stack
+**identity**, never on endpoint hostname: the transcoder correctly uses the
+in-cluster address while the API uses the public ingress for the same instance
+(#991), so hostnames legitimately differ.
+
+The submit-time reachability preflight now probes the resolved stack's own source
+bucket (`request.connections?.sourceBucket`) rather than the deployment-wide boot
+default.
+
+Regression coverage: `test/stack-routing-data-plane.test.ts` reproduces the
+two-stack divergence — stacks `['a','b']`, requests carrying `X-Stack-Name: b` —
+for the ingest-url write, the `/files` presigned URL and the transcode source
+read, plus the mismatch guard and the unchanged no-header default. Reverting the
+ambient lookup to `undefined` (i.e. the pre-fix "always the first listed stack"
+behaviour) fails five of the six.
+
+### What was deliberately NOT done
+
+- **Pointing the control plane at the data plane's stack** (making
+  `transcodeContext` resolve with no name) would have been two lines, but it
   disables #615, whose behaviour is pinned by
-  `test/transcode-stack-routing.test.ts` ("keys the scaler context by the named
-  stack") and `src/services/transcode-namespace-acceptance.test.ts`. Removing a
-  tested, ADR-adjacent routing guarantee is an architecture decision, not an
-  implementation detail.
-- **(b) Thread the stack through the data plane** (the real fix) — `storageFor`
-  is a **synchronous, request-less** `StorageFactory` (`src/main.ts:658`) and the
-  `PerWorkspace*` repositories take no stack argument at all
-  (`src/data/per-workspace-repos.ts`). Honouring the header there touches every
-  ingest, probe, thumbnail, clip, package, export, delivery and sweep call site,
-  and it also has to decide where the *asset document* lives. Cross-cutting.
+  `test/transcode-stack-routing.test.ts` and
+  `src/services/transcode-namespace-acceptance.test.ts`. Removing a tested
+  routing guarantee is an architecture decision, not a bug fix.
+- **Persisting the stack identity on the job/asset document.** The ambient
+  identity lives for the life of the request, so background work with no request
+  behind it (sweeps, the watch-folder, anything re-resolving after a restart)
+  still uses the default stack. Tracked as **#1090**, which needs an architect
+  call on whether a sweep is per-deployment or per-stack.
 
-Recommended sequencing:
+## Remediation for assets already misrouted
 
-1. **Immediate operational mitigation (no deploy):** have clients stop sending an
-   `X-Stack-Name` that names anything other than the first-listed stack for this
-   installation, or run the affected workload on the first-listed stack. That
-   makes the control plane and data plane agree again.
-2. **Small, contained hardening (tracked separately as #1059):** widen the
-   submit-time preflight from `bucketExists` to a `statObject` of
-   `source.objectKey` against the storage the transcoder will actually read
-   (`src/services/stack-reachability.ts:100-104, 216`; call site
-   `src/routes/assets.ts:4408-4425`; `WorkspaceStorage.statObject`,
-   `src/data/storage.ts:136-146`). This converts the silent downstream
-   `NoSuchKey` into an immediate, named submit error on every deployment. It does
-   **not** fix the mismatch — it stops it being invisible — which is why it is a
-   separate issue with its own regression test rather than part of this
-   diagnosis.
+The fix changes where *new* work resolves; it does not move bytes or documents
+that are already split. On an installation that ran the broken combination
+(more than one provisioned stack, requests naming a non-first stack), an affected
+asset has its document **and** its object on the first-listed stack, while the
+client believes it belongs to the named stack. After this fix those assets are no
+longer visible to a request that names the other stack.
 
-   One caveat for whoever implements it: the existing object-presence precedent
-   on this route, the #389 burn-in check, resolves its storage through
-   `storageFor()` — the **data-plane/default** stack
-   (`src/routes/assets.ts:4374`). Copying that would re-check the instance the
-   bytes are already in and stay green on exactly the #1058 case. The check has
-   to run against the storage the transcoder is given, i.e. the connections the
-   `s3Endpoint` was derived from.
-3. **The real fix (architect / ADR):** decide whether one deployment addresses
-   one stack (then (a), and `X-Stack-Name` must stop influencing transcode
-   routing) or genuinely many (then (b), and the data plane must be threaded).
-   ADR-018/ADR-020's "one deployment == one tenant" framing points at (a);
-   #615's premise points at (b).
+Identify them first — they are exactly the assets that exist on the first-listed
+stack but were created by requests naming a different one:
 
-## Runtime data a human must obtain to confirm this
+1. `GET /api/v1/provision/` lists the provisioned stack names; element 0 is the
+   stack everything previously resolved to.
+2. List assets with **no** `X-Stack-Name` (the first-listed stack). Any asset a
+   client expects to find under another stack name is affected.
+3. The resolver's own logs discriminate without guessing: a request logs
+   `{ source: 'x-stack-name', stackName }` for the header resolution and
+   `{ source: 'default', listed: [...] }` for the unnamed one. An ingest whose
+   `stackName` differs from `listed[0]` produced a misrouted asset.
 
-Everything above is from the code. One runtime fact closes it, and two more
-settle the alternatives:
+Then choose per asset:
+
+- **Leave it on the first-listed stack** (cheapest). Address it with no
+  `X-Stack-Name`, or with the first-listed stack's name. Everything — documents,
+  bytes, `/files` URLs, transcode — is self-consistent there.
+- **Move it to the stack it was meant for.** Copy the object between the two
+  object stores at the same key (`ingest/<assetId>`; both stacks use the same
+  bucket name, so only the endpoint differs), then re-create the asset document
+  on the target stack with the same `objectKey` and re-run extraction. There is
+  no supported server-side cross-stack copy today.
+- **Re-ingest.** For assets whose source URL is still available, re-running
+  `POST /api/v1/assets/ingest-url` with the intended `X-Stack-Name` now produces a
+  correctly routed asset, and the old one can be archived.
+
+Do **not** attempt to repair this by editing only the asset document: a document
+on one stack pointing at an object on another is the exact state this issue is
+about, and nothing detects it.
+
+## Runtime data that confirmed this
+
+The analysis above is from the code; it was subsequently **confirmed by
+experiment** on a two-stack install (#1058 comment, 2026-10-02 12:26–12:39 UTC):
+the write landed on the first-listed stack, the `/files` URL named it under
+either header, and the transcoder read the header-named stack and 404'd. The
+checks below are retained because they are how an operator identifies affected
+assets on their own installation (see "Remediation" above):
 
 1. **Did the failing requests carry an `X-Stack-Name` naming a non-first stack?**
    The resolver already logs both halves: `{ source: 'x-stack-name', namespace,

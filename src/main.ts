@@ -54,6 +54,12 @@ import {
 import { StorageQuotaReconciler } from './data/storage-quota-reconcile.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
+import {
+  makeRequestScopedStorageFactory,
+  requestStackNameFromHeaders,
+  runWithRequestStack,
+  currentRequestStackName
+} from './services/request-stack-context.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
   resolveStackRedisUrl,
@@ -455,12 +461,23 @@ const stackResolver = new WorkspaceStackResolver({
 // app.authenticate at registration time.
 registerAuth(app);
 
+// Establish the request-scoped stack identity BEFORE anything resolves a stack
+// (issue #1058). Everything the data plane resolves while serving this request —
+// the PerWorkspace* repositories and the object-storage factory — reads this
+// ambient name, so asset/job documents and object bytes land on the SAME stack
+// the transcode control plane routes to (issue #615). Running `done()` inside
+// the AsyncLocalStorage scope keeps the store attached for every later hook, the
+// handler, and any work the handler detaches (the URL-pull worker and its
+// follow-on metadata extraction).
+app.addHook('onRequest', (request, _reply, done) => {
+  runWithRequestStack(requestStackNameFromHeaders(request.headers), done);
+});
+
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
 // the app trusts every request that reaches it.
 app.decorateRequest('connections', null);
 app.addHook('preHandler', async (request) => {
-  const stackHeader = request.headers['x-stack-name'];
-  const stackName = typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
+  const stackName = currentRequestStackName();
   try {
     request.connections = await stackResolver.resolve(stackName);
   } catch (err) {
@@ -655,13 +672,13 @@ const auditEmitter = new PerWorkspaceAuditEmitter(stackResolver);
 // the resolved stack has no object storage (in-memory fallback) it throws — the
 // routes only call this when the asset has an objectKey, and upload routes are
 // gated by `storageAvailable` below.
-const storageFor: StorageFactory = (): WorkspaceStorage => {
-  const conns = stackResolver.resolveCached();
-  if (!conns?.storageFor) {
-    throw new Error('object storage is not configured for this stack');
-  }
-  return conns.storageFor();
-};
+//
+// Keyed by the REQUEST's stack (issue #1058): the factory reads the ambient
+// request stack name, so the bytes it writes/presigns live on the same stack as
+// the documents the repositories write and the stack the transcoder is pointed
+// at. Outside a request the name is undefined and the workspace default
+// resolves, unchanged.
+const storageFor: StorageFactory = makeRequestScopedStorageFactory(stackResolver);
 
 // Whether any object storage is reachable at all (explicit env override OR a
 // provisioned stack). Upload/URL-pull routes and the watch-folder are only
@@ -1979,9 +1996,10 @@ const onObjectStored =
           );
         }
         if (thumbnailExtractor) {
-          // Read s3Config from the already-warm resolver cache. The upload
-          // preHandler called resolve() so resolveCached() is valid here.
-          const conns = stackResolver.resolveCached();
+          // Read s3Config from the already-warm resolver cache, for the stack
+          // this request named (issue #1058). The upload preHandler called
+          // resolve() with the same name, so resolveCached() is valid here.
+          const conns = stackResolver.resolveCached(currentRequestStackName());
           const bucket = conns?.sourceBucket ?? sourceBucket;
           // Same resolution helper the asset routes use (issue #838). This path
           // is fire-and-forget on upload, so an unresolvable factory is logged

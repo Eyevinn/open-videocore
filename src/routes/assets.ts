@@ -1773,11 +1773,42 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // env-override) or when it resolves undefined (no provisioned stack), leaving
   // single-stack behaviour byte-identical.
   async function transcodeContext(request: import('fastify').FastifyRequest): Promise<string> {
-    if (!opts.resolveStackContext) return DEPLOYMENT_CONTEXT;
+    return (await transcodeStackIdentity(request)).contextId;
+  }
+
+  // The control plane's stack identity for this request (issue #1058).
+  // `contextId` is what keys the scaler (unchanged); `resolved` is the stack
+  // NAME the resolver reported, or undefined when no resolver is wired or no
+  // stack is provisioned — the two cases where there is no identity to compare.
+  async function transcodeStackIdentity(
+    request: import('fastify').FastifyRequest
+  ): Promise<{ contextId: string; resolved: string | undefined }> {
+    if (!opts.resolveStackContext) return { contextId: DEPLOYMENT_CONTEXT, resolved: undefined };
     const header = request.headers['x-stack-name'];
     const requested = typeof header === 'string' && header.length > 0 ? header : undefined;
     const resolved = await opts.resolveStackContext(requested);
-    return resolved ?? DEPLOYMENT_CONTEXT;
+    return { contextId: resolved ?? DEPLOYMENT_CONTEXT, resolved };
+  }
+
+  // Fail loud when the data plane and the transcode control plane resolved
+  // DIFFERENT stacks (issue #1058). The source bytes live wherever the data
+  // plane wrote them (`request.connections`, keyed by the request's stack since
+  // this issue's fix); the transcoder is created with the S3 endpoint of the
+  // stack the control plane resolved. If those two identities disagree, the
+  // transcoder reads a bucket of the same literal name on the wrong instance and
+  // reports an indistinguishable 404 — so we refuse to submit instead.
+  //
+  // Compares stack IDENTITY, never endpoint hostnames: the transcoder correctly
+  // uses the in-cluster address while the API uses the public ingress for the
+  // same instance (issue #991), so hostnames legitimately differ.
+  function stackRoutingMismatch(
+    request: import('fastify').FastifyRequest,
+    controlPlaneStack: string | undefined
+  ): { dataPlaneStack: string; controlPlaneStack: string } | undefined {
+    const dataPlaneStack = request.connections?.stackName;
+    if (!dataPlaneStack || !controlPlaneStack) return undefined;
+    if (dataPlaneStack === controlPlaneStack) return undefined;
+    return { dataPlaneStack, controlPlaneStack };
   }
 
   // Resolve whether a named transcode profile can execute on this platform tier
@@ -4388,6 +4419,27 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // per-stack value exists. Output PATH template is unchanged.
       const resolvedOutputBucket =
         request.connections?.packagedBucket ?? opts.outputBucket;
+
+      // Data-plane / control-plane stack agreement (issue #1058). Resolved once
+      // here and reused as the scaler context below, so the identity we verified
+      // is the identity we submit with.
+      const controlPlane = await transcodeStackIdentity(request);
+      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
+      if (mismatch) {
+        request.log.error(
+          {
+            assetId: asset.id,
+            objectKey: source.objectKey,
+            dataPlaneStack: mismatch.dataPlaneStack,
+            controlPlaneStack: mismatch.controlPlaneStack
+          },
+          'refusing to submit transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+        );
+        return reply.code(409).send({
+          error: 'stack_routing_mismatch',
+          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+        });
+      }
       try {
         // FAST reachability preflight (issue #617): before enqueuing work, probe
         // the stack's dependencies (queue/Valkey via the shared IORedis ping,
@@ -4412,7 +4464,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             ...(request.connections?.s3Config
               ? { minioEndpoint: request.connections.s3Config.endpoint }
               : {}),
-            bucket: opts.sourceBucket
+            // Probe the bucket the transcode will actually read — the resolved
+            // stack's source bucket (issue #639/#1058) — not the deployment-wide
+            // boot default.
+            bucket: request.connections?.sourceBucket ?? opts.sourceBucket
           },
           {
             ...(opts.packagingRedis ? { queueClient: opts.packagingRedis } : {}),
@@ -4430,7 +4485,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             // request routes to (issue #615), resolved from X-Stack-Name, not
             // the fixed deployment context — so a transcode against a healthy
             // named stack reaches that stack regardless of provisioning order.
-            workspaceId: await transcodeContext(request),
+            workspaceId: controlPlane.contextId,
             sourceAssetId: asset.id,
             sourceObjectKey: source.objectKey,
             preset: request.body.profile,
