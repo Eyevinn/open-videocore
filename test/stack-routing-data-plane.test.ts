@@ -62,6 +62,11 @@ class FakeStackStorage {
     this.stored.push(key);
     return { etag: `etag-${this.stack}`, bytesTransferred: transferred };
   }
+  // The pull worker clears any orphaned multipart upload for the key before it
+  // writes (issue #1088). Nothing is ever left in progress here.
+  async abortIncompleteMultipartUploads(): Promise<number> {
+    return 0;
+  }
   async presignedGet(key: string): Promise<string> {
     return `https://${this.stack}.minio-minio.example/${SOURCE_BUCKET}/${key}?signed=1`;
   }

@@ -105,6 +105,16 @@ export type CompletedPart = {
   etag: string;
 };
 
+// How many orphaned multipart uploads for one key `abortIncompleteMultipartUploads`
+// will clear in a single call (issue #1088). The lookup primitive only ever
+// returns the most recently initiated upload for a key, so clearing several
+// means calling it repeatedly; the bound stops a backend that keeps answering
+// with an upload we cannot actually abort from spinning forever. More than one
+// orphan for the same key means several earlier writes died mid-stream, which
+// is already an outlier — a bound of 10 is far above anything a retry loop can
+// produce (MAX_ATTEMPTS is 3, src/pipeline/url-pull-worker.ts:47).
+const MAX_INCOMPLETE_UPLOAD_ABORTS = 10;
+
 export class WorkspaceStorage {
   constructor(
     private readonly client: MinioClient,
@@ -219,6 +229,46 @@ export class WorkspaceStorage {
   // Abort an in-progress multipart upload, reclaiming any staged part data.
   async abortMultipartUpload(localKey: string, uploadId: string): Promise<void> {
     await this.client.abortMultipartUpload(this.bucket, this.scopedKey(localKey), uploadId);
+  }
+
+  // Discard every multipart upload still open for a key, returning how many
+  // were aborted (0 when the key has none). Issue #1088.
+  //
+  // Why a writer needs this: `putStream` below is a single putObject call, but
+  // for a body larger than the client's part size that call is a multipart
+  // upload, and a transfer that dies part-way leaves the upload open with its
+  // staged parts intact. The client does NOT start clean on the next write to
+  // the same key — it looks for an existing upload first and RESUMES it,
+  // comparing the staged part etags against the chunks it is about to send
+  // (node_modules/minio/dist/esm/internal/client.mjs:1445-1479). On that resume
+  // path it advances its part counter before using it in the part request
+  // (client.mjs:1480 vs :1486), so its numbering sits one off the numbering the
+  // server staged the parts under: a chunk that repeats the previous chunk's
+  // bytes matches the wrong staged part and gets "resumed" rather than
+  // uploaded, and the object is assembled from a duplicated or wrong-offset
+  // part. Clearing the upload before the next write removes the resume
+  // altogether, which is the fix that does not depend on an upstream release.
+  //
+  // Also reclaims the staged bytes, which would otherwise sit in the bucket
+  // until a lifecycle rule expired them.
+  //
+  // Lookup primitive: `findUploadId(bucket, key): Promise<string | undefined>`
+  // returns the uploadId of the most recently initiated upload for an exact key
+  // match, or undefined when there is none
+  // (node_modules/minio/dist/esm/internal/client.d.mts:259, implementation
+  // client.mjs:1143-1171) — hence the bounded loop rather than a single call.
+  async abortIncompleteMultipartUploads(localKey: string): Promise<number> {
+    const key = this.scopedKey(localKey);
+    let aborted = 0;
+    for (let i = 0; i < MAX_INCOMPLETE_UPLOAD_ABORTS; i++) {
+      const uploadId = await this.client.findUploadId(this.bucket, key);
+      if (!uploadId) {
+        break;
+      }
+      await this.abortMultipartUpload(key, uploadId);
+      aborted++;
+    }
+    return aborted;
   }
 
   // Stream a source into MinIO without buffering the whole payload in memory

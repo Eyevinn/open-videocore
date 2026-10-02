@@ -457,7 +457,10 @@ describe('LogStore producer: URL-pull ingest (issue #995)', () => {
         jobs,
         assets,
         storage: {
-          putStream: async () => ({ bytesTransferred: 1234 })
+          putStream: async () => ({ bytesTransferred: 1234 }),
+          // Orphaned-multipart cleanup the worker runs around each write
+          // (issue #1088) — nothing in progress, so no log entry of its own.
+          abortIncompleteMultipartUploads: async () => 0
         } as unknown as import('../src/data/storage.js').WorkspaceStorage,
         openS3: openS3(),
         pipelineLog: logStore
@@ -485,7 +488,8 @@ describe('LogStore producer: URL-pull ingest (issue #995)', () => {
         storage: {
           putStream: async () => {
             throw new Error('storage offline');
-          }
+          },
+          abortIncompleteMultipartUploads: async () => 0
         } as unknown as import('../src/data/storage.js').WorkspaceStorage,
         openS3: openS3(),
         sleep: async () => undefined,
