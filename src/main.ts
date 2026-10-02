@@ -144,6 +144,7 @@ import {
   settleFailedTranscode
 } from './pipeline/failed-transcode-reconciler.js';
 import { reconcileStalledPackages } from './pipeline/stalled-package-reconciler.js';
+import { reconcileInterruptedIngests } from './pipeline/interrupted-ingest-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
@@ -2333,6 +2334,26 @@ const abandonedUploadSweepLoop = new AbandonedUploadSweepLoop({
   }
 });
 abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
+
+// Interrupted-ingest reconciliation (issue #1084). A ONE-SHOT boot-time scan, not
+// a loop: an ingest-url job's lifecycle is owned in-process by runPull
+// (src/pipeline/url-pull-worker.ts), so a job left `running` by a process that
+// died mid-pull has nobody left to settle it and no existing sweep covers it
+// (reconcileFailedTranscodes above handles transcode jobs only). The boundary is
+// this process's start time: a `running` ingest-url job stamped before it cannot
+// belong to a live worker here, while anything stamped at or after it may be a
+// pull streaming bytes right now and is left strictly alone. Settles the JOB
+// record only — moving the asset out of `uploading` is #1085 and partial-byte
+// cleanup is #1086 — and does NOT re-queue the pull. Idempotent, so a crash
+// between boots cannot double-settle. Detached + swallowed: a reconcile failure
+// must never block the API from serving.
+void reconcileInterruptedIngests({
+  jobs: jobRepository,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a)
+  }
+}).catch((err) => app.log.warn({ err }, 'interrupted-ingest reconciliation on boot failed'));
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
