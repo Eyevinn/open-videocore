@@ -83,6 +83,7 @@ import {
   recordSpawnFailure,
   redactSpawnFailureMessage,
   spawnFailureSecrets,
+  REDACTION_INPUT_MAX_LENGTH,
   SPAWN_FAILURE_MESSAGE_MAX_LENGTH
 } from '../src/encore-scaler/spawn-failure.js';
 import {
@@ -458,6 +459,112 @@ describe('spawn-failure message redaction (issue #1071)', () => {
 
     expect(redactSpawnFailureMessage(new Error(''))).not.toBe('');
     expect(redactSpawnFailureMessage(undefined)).not.toBe('');
+  });
+});
+
+// The input to this function is whatever the upstream sent, verbatim: a whole
+// HTML error page for the 504 that #1071 is about, and in principle anything at
+// all. It runs on the scaler's single thread, in the tick and in the HTTP path,
+// so its cost has to be bounded by the SIZE of the input, not by its SHAPE.
+//
+// It was not. Several patterns had the same defect — an unbounded greedy run
+// followed by a required character (`[a-z0-9+.-]*:`, `[A-Za-z0-9-]*[A-Za-z0-9]`,
+// `[A-Za-z0-9_.-]*(?:secret|...)`) — which under /g is retried at every offset
+// and is therefore quadratic. Measured before the fix on 'connect to ' +
+// 'a-'.repeat(n): 20k chars 693ms, 40k 2.8s, 80k 11.2s, with the URL and
+// credential-field patterns each contributing as much as the network-location
+// one. A single large error body would have stalled the whole process.
+//
+// Two independent guards, either of which is sufficient:
+//   1. every such run is now bounded at the real limit of the thing it
+//      describes (a DNS label is 63 octets, a URL scheme is short, a field name
+//      is short), making each attempt constant work;
+//   2. the input is clamped to REDACTION_INPUT_MAX_LENGTH before the pattern
+//      passes — but only AFTER the literal-secret pass, which must always see
+//      the whole string.
+describe('spawn-failure redaction is bounded by input size, not shape (#1071)', () => {
+  // Generous: the fixed version is ~2ms for all of these, and the pre-fix code
+  // was 700ms-11s. Anything in between is still a defect, and this threshold is
+  // slack enough not to flake on a loaded CI runner.
+  const BUDGET_MS = 200;
+
+  function timeRedaction(error: unknown, secrets: string[] = []): number {
+    const started = performance.now();
+    redactSpawnFailureMessage(error, secrets);
+    return performance.now() - started;
+  }
+
+  it('redacts a 100 KB hyphenated token quickly', () => {
+    // 'a-' repeated is the pathological input: every offset is a valid start for
+    // a DNS label, a URL scheme and a credential field name all at once.
+    const hostile = `connect to ${'a-'.repeat(50_000)}!`;
+    expect(hostile.length).toBeGreaterThan(100_000);
+    expect(timeRedaction(new Error(hostile))).toBeLessThan(BUDGET_MS);
+  });
+
+  it('redacts a large upstream HTML error page quickly', () => {
+    const page =
+      '<html><head><title>504 Gateway Time-out</title></head><body>' +
+      '<center><h1>504 Gateway Time-out</h1></center>'.repeat(2_000) +
+      '<hr><center>nginx</center></body></html>';
+    expect(page.length).toBeGreaterThan(90_000);
+
+    const started = performance.now();
+    const message = redactSpawnFailureMessage(new Error(page));
+    expect(performance.now() - started).toBeLessThan(BUDGET_MS);
+    // Still useful: the operator gets the actual failure, not markup.
+    expect(message).toContain('504 Gateway Time-out');
+    expect(message).not.toContain('<html');
+    expect(message.length).toBeLessThanOrEqual(SPAWN_FAILURE_MESSAGE_MAX_LENGTH);
+  });
+
+  it('scales linearly, so a bigger body cannot become a stall', () => {
+    const small = timeRedaction(new Error(`connect to ${'a-'.repeat(10_000)}!`));
+    const large = timeRedaction(new Error(`connect to ${'a-'.repeat(80_000)}!`));
+    // 8x the input. Quadratic would be ~64x; this allows a very generous 12x to
+    // absorb timer noise on a tiny measurement while still failing outright on
+    // a reintroduced quadratic pattern.
+    expect(large).toBeLessThan(Math.max(small * 12, BUDGET_MS));
+  });
+
+  it('still redacts a known secret that sits inside the kept prefix', () => {
+    const secret = 'rootpass-do-not-leak-0001';
+    const message = redactSpawnFailureMessage(
+      new Error(`auth failed for ${secret} while starting ${'x'.repeat(100_000)}`),
+      [secret]
+    );
+    expect(message).not.toContain(secret);
+    expect(message).toContain('auth failed for');
+  });
+
+  it('still redacts a known secret that lies BEYOND the clamp boundary', () => {
+    // The whole point of clamping only AFTER the literal pass: a credential the
+    // caller told us about is removed wherever it sits, even 80 KB in, so the
+    // clamp can never turn a cost problem into a leak. Asserted on the function
+    // that does the removing rather than on the truncated output, which would
+    // hide the difference.
+    const secret = 'rootpass-do-not-leak-0002';
+    const filler = 'x'.repeat(80_000);
+    const message = redactSpawnFailureMessage(
+      new Error(`starting ${filler} auth failed for ${secret}`),
+      [secret]
+    );
+    expect(message).not.toContain(secret);
+  });
+
+  it('still redacts a known secret that STRADDLES the clamp boundary', () => {
+    const secret = 'rootpass-do-not-leak-0003';
+    // Place the secret so it begins just before the clamp and ends after it.
+    const head = 'x'.repeat(REDACTION_INPUT_MAX_LENGTH - 10);
+    const message = redactSpawnFailureMessage(
+      new Error(`${head}${secret} and then some more text`),
+      [secret]
+    );
+    expect(message).not.toContain(secret);
+    // A naive clamp-then-redact would have left the leading characters of the
+    // secret in the kept prefix; the literal pass runs on the full string first,
+    // so not even a fragment survives.
+    expect(message).not.toContain(secret.slice(0, 10));
   });
 });
 

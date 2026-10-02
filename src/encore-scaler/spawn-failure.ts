@@ -76,19 +76,49 @@ export const REDACTED = '[redacted]';
 // shorter than this is not a credential worth leaking anyway.
 const MIN_LITERAL_SECRET_LENGTH = 4;
 
+// How much of the message the PATTERN passes are allowed to see.
+//
+// Every pass below is a scan over the whole string, and the thrown value here is
+// routinely a whole upstream HTML error page (@osaas/client-core puts
+// `response.text()` straight into the message). The output is capped at
+// SPAWN_FAILURE_MESSAGE_MAX_LENGTH regardless, so there is nothing to gain from
+// pattern-matching megabytes — and something to lose: this process is
+// single-threaded, so a pathological input holds up the scaler loop and every
+// HTTP request with it (#1071 review finding: 'a-'.repeat(20000) took 2.8s).
+//
+// The clamp is applied AFTER the literal-secret pass, never before. The literal
+// pass must see the FULL string, or a known credential that straddles the clamp
+// boundary — or sits beyond it — would survive into a later record, and the
+// clamp would have turned a bounded cost into a leak.
+export const REDACTION_INPUT_MAX_LENGTH = 4_096;
+
+// NOTE ON THESE PATTERNS. Every quantifier that can run over a long stretch of
+// input is BOUNDED. An unbounded greedy run followed by a required character
+// (`[a-z0-9+.-]*:`) is re-tried at every offset under /g, which is quadratic:
+// the review measured 20k chars at 178ms, 80k at 2.9s on exactly that shape.
+// The bounds below are all comfortably larger than the real thing they describe
+// (a URL scheme, a DNS label, a field name), so they cost nothing in matching
+// power — but they turn each attempt into constant work.
+
 // Any absolute URL, whatever the scheme. Dropped wholesale rather than reduced
 // to a host: instance and ingress URLs are themselves capability-ish (they are
 // the endpoints an operator's token addresses) and a URL can carry userinfo or
-// a pre-signed query string.
-const URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>\\]+/gi;
+// a pre-signed query string. The scheme is bounded: the longest registered IANA
+// scheme is well under 30 characters.
+const URL_PATTERN = /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s"'<>\\]+/gi;
 
 // A bare NETWORK LOCATION: an IPv4 literal, a bracketed IPv6 literal, or a
 // dotted DNS name — each with an optional `:port` (#1071 review finding 2).
 // Candidates are matched broadly here and then filtered in
 // isNetworkLocation() below, because the shape overlaps with things an operator
 // genuinely needs to keep reading (a version string, a file reference).
+//
+// Each DNS label is bounded at its REAL limit (RFC 1035: 63 octets, so 61
+// between the required first and last characters). Unbounded, the inner run was
+// the quadratic shape described above — a long hyphenated token made every
+// offset re-scan to the end of the string.
 const NETWORK_LOCATION_PATTERN =
-  /(?:\[[0-9A-Fa-f:]{3,}\]|\b[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)(?::\d{1,5})?/g;
+  /(?:\[[0-9A-Fa-f:]{3,}\]|\b[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)(?::\d{1,5})?/g;
 
 const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
 
@@ -157,7 +187,7 @@ const AUTH_SCHEME_PATTERN = /\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 // (s3SecretAccessKey, s3AccessKeyId, RedisUrl, ...) without us having to know
 // every field name in advance.
 const SENSITIVE_FIELD_PATTERN =
-  /("?[A-Za-z0-9_.-]*(?:secret|token|password|passwd|credential|authorization|accesskey|apikey|key)[A-Za-z0-9_.-]*"?)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}\]&]+)/gi;
+  /("?[A-Za-z0-9_.-]{0,64}(?:secret|token|password|passwd|credential|authorization|accesskey|apikey|key)[A-Za-z0-9_.-]{0,64}"?)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}\]&]+)/gi;
 
 // The same credential-ish NAME followed only by WHITESPACE (#1071 review
 // suggestion 5): `x-api-key abc123DEFghi456 rejected`, or a header/env name
@@ -172,7 +202,7 @@ const SENSITIVE_FIELD_PATTERN =
 // Anything shorter or wordlike survives, and only the single whitespace-adjacent
 // token is consumed, so trailing diagnostic text ("rejected") is kept.
 const SENSITIVE_FIELD_SPACED_PATTERN =
-  /("?[A-Za-z0-9_.-]*(?:secret|token|password|passwd|credential|authorization|accesskey|apikey|key)[A-Za-z0-9_.-]*"?)(\s+)((?=[A-Za-z0-9._~+/=-]*[A-Za-z])(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{12,}|[A-Za-z0-9+/=_-]{20,})(?![A-Za-z0-9._~+/=-])/gi;
+  /("?[A-Za-z0-9_.-]{0,64}(?:secret|token|password|passwd|credential|authorization|accesskey|apikey|key)[A-Za-z0-9_.-]{0,64}"?)(\s+)((?=[A-Za-z0-9._~+/=-]*[A-Za-z])(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{12,}|[A-Za-z0-9+/=_-]{20,})(?![A-Za-z0-9._~+/=-])/gi;
 
 // A JWT-shaped blob, for a bare token that appears with no label at all.
 const JWT_PATTERN = /\beyJ[A-Za-z0-9._-]{10,}/g;
@@ -224,6 +254,16 @@ export function redactSpawnFailureMessage(
     // split/join rather than a RegExp so the secret is never treated as a
     // pattern (a credential can legitimately contain regex metacharacters).
     text = text.split(literal).join(REDACTED);
+  }
+
+  // Only now is the input clamped. The literal pass above has already seen the
+  // WHOLE string, so a known credential is gone wherever it sat — including one
+  // that straddles this boundary or lies entirely beyond it. From here on the
+  // passes are structural guesses at an unknown-shaped message, and running them
+  // over an arbitrarily large upstream error page buys nothing the 400-character
+  // output could keep, while costing the single-threaded process real time.
+  if (text.length > REDACTION_INPUT_MAX_LENGTH) {
+    text = text.slice(0, REDACTION_INPUT_MAX_LENGTH);
   }
 
   text = text.replace(URL_PATTERN, REDACTED);
