@@ -26,6 +26,11 @@ import {
   SourceValidationError,
   type SourceDeps
 } from './source.js';
+import {
+  logPipelineEvent,
+  type PipelineLogErrorLog,
+  type PipelineLogSink
+} from '../services/pipeline-log.js';
 
 // Default 50 GB cap; configurable via INGEST_MAX_SOURCE_BYTES.
 export const DEFAULT_MAX_SOURCE_BYTES = 50 * 1024 * 1024 * 1024;
@@ -88,6 +93,13 @@ export async function runPull(
     // a PERMANENT failure (QuotaExceededError), recorded on the job without
     // retry. Absent => no cap, behaviour unchanged (opt-in).
     quota?: StorageQuotaGuard;
+    // Best-effort operational log emission for the `ingest` stage (issue #995).
+    // Optional: when absent no log record is appended and behaviour is unchanged.
+    // Wired to the in-memory LogStore that backs GET /api/v1/logs (src/main.ts,
+    // `logStore`). `logPipelineEvent` never throws, so this cannot make the
+    // never-throws contract of runPull (see the doc comment above) any weaker.
+    pipelineLog?: PipelineLogSink;
+    pipelineLogErrors?: PipelineLogErrorLog;
   } & PullDeps
 ): Promise<void> {
   const { jobId, assetId, objectKey, sourceUrl } = params;
@@ -97,8 +109,26 @@ export async function runPull(
 
   await deps.jobs.update(jobId, { status: 'running' });
 
+  // Operational log: the `ingest` stage started (issue #995). Emitted once the
+  // job is `running` — the point from which this worker owns the job's lifecycle
+  // — and NOT per retry attempt, so a run appends a bounded number of entries.
+  logPipelineEvent(
+    deps.pipelineLog,
+    {
+      stage: 'ingest',
+      level: 'info',
+      message: `pulling source for asset ${assetId} (job ${jobId})`
+    },
+    deps.pipelineLogErrors
+  );
+
   let lastError: unknown;
+  // Attempts actually consumed, so the terminal-failure log entry reports the
+  // real count (a permanent error breaks out at attempt 1 and never reaches
+  // MAX_ATTEMPTS).
+  let attemptsUsed = 0;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    attemptsUsed = attempt;
     await deps.jobs.update(jobId, { attempts: attempt });
     let reservation;
     try {
@@ -143,6 +173,16 @@ export async function runPull(
         progress: 100
       });
       await deps.assets.update(assetId, { status: 'processing' });
+      // Operational log: the `ingest` stage reached terminal success (issue #995).
+      logPipelineEvent(
+        deps.pipelineLog,
+        {
+          stage: 'ingest',
+          level: 'info',
+          message: `asset ${assetId} (job ${jobId}) stored ${bytesTransferred} byte(s) to ${objectKey}`
+        },
+        deps.pipelineLogErrors
+      );
       return;
     } catch (err) {
       // Release any reservation taken this attempt so a failed/retried pull
@@ -162,4 +202,16 @@ export async function runPull(
   const message = lastError instanceof Error ? lastError.message : String(lastError);
   await deps.jobs.update(jobId, { status: 'failed', error: message });
   await deps.assets.update(assetId, { status: 'failed' });
+  // Operational log: the `ingest` stage reached terminal failure (issue #995).
+  // One entry for the run's terminal outcome — the per-attempt errors stay on
+  // `onAttemptError` so the log is not flooded by the retry loop.
+  logPipelineEvent(
+    deps.pipelineLog,
+    {
+      stage: 'ingest',
+      level: 'error',
+      message: `asset ${assetId} (job ${jobId}) failed after ${attemptsUsed} attempt(s): ${message}`
+    },
+    deps.pipelineLogErrors
+  );
 }

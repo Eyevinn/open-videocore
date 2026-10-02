@@ -3,9 +3,10 @@
 // Hosts unauthenticated callbacks that OSC services post back to open-videocore
 // to signal asynchronous completion. These endpoints are NOT behind the
 // `authenticate` preHandler because the caller is an OSC service, not a
-// workspace-scoped client; instead they rely on the unguessable, workspace-
-// namespaced `packagingId` carried in the payload to map the callback to an
-// asset (the packagingId is the only authority a caller can demonstrate).
+// workspace-scoped client. What a caller must demonstrate to reach anything
+// DIFFERS per endpoint — the success callback is bound to an unguessable id it
+// has to know, the failure callback requires no identifier at all — so read the
+// SECURITY NOTE below before assuming any of them is id-gated.
 //
 // SECURITY NOTE — the two packager callbacks have DIFFERENT blast radii, and the
 // failure one is wide:
@@ -25,9 +26,14 @@
 //     So one unauthenticated, bodyless-but-for-a-message POST can fail every
 //     in-flight packaging job in the deployment. This is a widened version of a
 //     fan-out that already existed within one stack (issue #209 attribution), and
-//     it is bounded by ADR-018/ADR-020's one-deployment-is-one-tenant model —
+//     it is bounded by the isolation model in
+//     docs/architecture/ADR-020-quota-deployment-model-and-metering-source.md
+//     ("One deployed open-videocore instance is one tenant", Decision 1):
 //     stacks 2..N belong to the SAME tenant, so nothing crosses a tenant
-//     boundary — but it is strictly more than the success path can do.
+//     boundary — but it is strictly more than the success path can do. Note the
+//     ADR numbers are ambiguous here (two files share each of 018 and 020), so
+//     this cites the filename deliberately; ADR-018's "stack" wording is a
+//     different document and is NOT the authority for this claim.
 //
 // Hardening both with a shared callback secret is tracked in the issue #9
 // friction log; getting a correlation id onto the failure callback is tracked in
@@ -57,6 +63,7 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
+import type { PipelineLogSink } from '../services/pipeline-log.js';
 // #829: the terminal-transcode webhook events are owned by the shared module so
 // this route and the completion poller (src/pipeline/encore-callback-poller.ts)
 // — the two paths that can apply a transcode completion — emit identical
@@ -164,6 +171,11 @@ type InternalRouterOptions = {
   // belongs to. Wired from WorkspaceStackResolver.listStackNames(). Absent (or
   // empty) => the single default resolution is used, unchanged.
   listStackNames?: () => Promise<string[]>;
+  // Best-effort operational log emission (issue #995). Passed to
+  // completeTranscode so the transcode job's terminal transition also appends one
+  // record to the in-memory LogStore GET /api/v1/logs reads (src/main.ts,
+  // `logStore`; read path src/routes/logs.ts:94). Absent => no log record.
+  pipelineLog?: PipelineLogSink;
 };
 
 // The provisioned stack names, never throwing (issue #1058). These callbacks are
@@ -605,7 +617,20 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
             error: success ? undefined : (message ?? `encore status: ${status}`),
             renditions: success ? normaliseRenditions(output) : []
           },
-          { jobs: jobRepository, assets: repository, audit: opts.audit, auditLog: fastify.log }
+          {
+            jobs: jobRepository,
+            assets: repository,
+            audit: opts.audit,
+            auditLog: fastify.log,
+            // Operational log for the `transcode` stage's terminal state (issue
+            // #995), appended at the same point as the audit entry inside
+            // completeTranscode. This route is one of the paths that applies a
+            // transcode terminal state, so without it a completion that arrives
+            // here leaves the Logs tab showing a stage that started and never
+            // finished. Emitted INSIDE the issue #1058 stack re-entry above, so
+            // the record is written for the stack the job actually belongs to.
+            pipelineLog: opts.pipelineLog
+          }
         );
 
         // #525 pt.2: pin the instance that ran this job against premature

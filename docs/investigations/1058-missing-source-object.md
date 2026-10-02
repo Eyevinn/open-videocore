@@ -344,9 +344,13 @@ content is a free-text message can fail every in-flight packaging job in the
 deployment, where before it could fail every in-flight packaging job on one
 stack. A strict superset of an already-accepted behaviour.
 
-**Why that is bounded.** ADR-018/ADR-020 fix the unit of isolation at **one
-deployment == one tenant**. Stacks 2..N of a deployment are additional stacks of
-the *same* tenant, not other customers — so the widened sweep reaches more of one
+**Why that is bounded.** The unit of isolation is fixed by
+`docs/architecture/ADR-020-quota-deployment-model-and-metering-source.md`,
+Decision 1: *"One deployed open-videocore instance is one tenant."* (Cited by
+filename on purpose — two ADR files share the number 020 and two share 018, and
+ADR-018's "stack" wording is a different document that does not establish this.)
+Stacks 2..N of a deployment are additional stacks of the *same* tenant, not other
+customers — so the widened sweep reaches more of one
 tenant's own work and crosses no tenant boundary. The pre-existing within-stack
 fan-out was accepted on exactly that reasoning; this is the same reasoning applied
 to the same tenant's other stacks. If the isolation model ever changes so that a
