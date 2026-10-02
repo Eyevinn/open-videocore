@@ -2590,7 +2590,13 @@ Response 200 (application/json)
           "readyAt": null,
           "draining": null
         }
-      ]
+      ],
+      "spawnFailure": {
+        "at": 0,
+        "attempts": 0,
+        "consecutiveFailures": 0,
+        "message": "string"
+      }
     }
   ],
   "maxInstances": 0,

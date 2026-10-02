@@ -871,6 +871,24 @@ const encoreCallbackTrustTimeoutMs = parseInt(process.env['ENCORE_CALLBACK_TRUST
 // than re-raising it as silently dropped. Defaults to 10s; override via
 // ENCORE_RECONCILE_GRACE_MS.
 const encoreReconcileGraceMs = parseInt(process.env['ENCORE_RECONCILE_GRACE_MS'] || String(10 * 1000), 10);
+// Bounded wait (issue #1071) for a freshly created Encore instance (and its
+// paired callback listener) to report `running` before the spawn gives up. This
+// has to cover OSC provisioning a NEW WORKER NODE to place the instance on, not
+// just a pod starting on a node that already exists — the same latency that makes
+// createInstance answer 504 while the create continues behind the gateway. A
+// budget sized for pod start made every node-provisioning spawn fail and destroy
+// the instance it had just waited minutes for. Defaults to 15 minutes
+// (DEFAULT_SPAWN_READY_TIMEOUT_MS); lower it with ENCORE_SPAWN_READY_TIMEOUT_MS
+// on a cluster that always has spare capacity. Invalid/absent => the built-in
+// default.
+const encoreSpawnReadyTimeoutMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_READY_TIMEOUT_MS'] || '',
+  10
+);
+const encoreSpawnReadyTimeoutMs =
+  Number.isFinite(encoreSpawnReadyTimeoutMsRaw) && encoreSpawnReadyTimeoutMsRaw > 0
+    ? encoreSpawnReadyTimeoutMsRaw
+    : undefined;
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -1136,6 +1154,9 @@ function activateScaler(redisUrl: string): void {
     // callback poller recorded completing (keys.jobCompletionSeen) within this
     // window rather than re-raising them as silently dropped.
     reconcileGraceMs: encoreReconcileGraceMs,
+    // Readiness budget for a freshly created instance (issue #1071): sized for
+    // OSC provisioning a new worker node, not just a pod start.
+    spawnReadyTimeoutMs: encoreSpawnReadyTimeoutMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
