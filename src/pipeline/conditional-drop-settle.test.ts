@@ -359,6 +359,11 @@ describe('#709 (c) poller resumes a drop-failed pipeline on a corrective SUCCESS
     // failure text — the drop's error string does not survive the correction.
     expect(done?.progress).toBe(100);
     expect(done?.error).toBeUndefined();
+    // ...and the correction is still traceable on the record. The poller applies
+    // completions with no audit emitter, so this record-level annotation is the
+    // ONLY trace of the drop on this production path.
+    expect(done?.droppedThenRecovered).toBe(true);
+    expect(done?.correctedDropError).toBe('dropped by Encore: gone from active set with no completion');
 
     // Source asset recovered to ready with the produced rendition.
     const recoveredAsset = await assets.get(asset.id);

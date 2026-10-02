@@ -332,13 +332,26 @@ export async function completeTranscode(
     // terminal success that reads as a failure to every consumer of `error`, and
     // it poisons "find jobs with an error" triage with drops that recovered.
     // Applies to the whole success path, not just the correction: a job that ends
-    // `done` carries no error message, whatever happened on the way there. The
-    // drop itself stays diagnosable via the audit trail (the settle's
-    // `job.failed` entry, plus `correctedConditionalDrop` on the `job.completed`
-    // entry below) and the correction log line in the callback poller — so a
-    // too-short reconcile grace period is still detectable without leaving a
-    // success looking like a failure.
-    clearError: true
+    // `done` carries no error message, whatever happened on the way there.
+    clearError: true,
+    // #1023: ...but the spurious drop must not vanish with the text. Record the
+    // correction ON THE JOB RECORD, in this same write, so it is present on
+    // EVERY correction path and in BOTH repository backends. The audit entry
+    // below is NOT sufficient on its own: `deps.audit` is optional and the
+    // callback poller (src/pipeline/encore-callback-poller.ts) applies
+    // completions with only `{ jobs, assets }`, so emitAudit no-ops there and an
+    // audit-only trace would exist for corrections observed by the internal
+    // callback route and for nothing else. With these two fields a corrected
+    // drop stays diagnosable — and so does a too-short reconcile grace period —
+    // from the job record alone, however the correction arrived. Written only
+    // when this completion actually corrected a conditional drop; a normal
+    // completion leaves both fields absent.
+    ...(isConditionalDropFailed
+      ? {
+          droppedThenRecovered: true,
+          ...(clearedDropError ? { correctedDropError: clearedDropError } : {})
+        }
+      : {})
   });
 
   // Audit: transcode job reached terminal `done` (issue #564). One entry per
@@ -355,11 +368,14 @@ export async function completeTranscode(
         assetId: params.sourceAssetId,
         renditionCount: renditions.length,
         // #1023: when this completion CORRECTED a conditional drop-detection
-        // failure (#709), record that on the audit entry — including the failure
-        // text just cleared off the job. A spurious drop is worth knowing about
-        // (it can mean the reconcile grace period is too short), so the
-        // diagnostic moves here rather than being lost with the cleared `error`.
-        // The audit detail bag is deliberately free-form (src/data/audit-repo.ts
+        // failure (#709), note that on the audit entry too — including the
+        // failure text just cleared off the job — so the correction shows up in
+        // the actor/timeline view an operator reads the audit trail for. This is
+        // a SECOND copy of a diagnostic that already lives durably on the job
+        // record (`droppedThenRecovered` / `correctedDropError` in the write
+        // above), not the only copy: this entry is emitted only when a caller
+        // wired `deps.audit`, which the callback poller does not. The audit
+        // detail bag is deliberately free-form (src/data/audit-repo.ts
         // AuditDetailSchema), so these keys need no schema change. Omitted
         // entirely on a normal completion.
         ...(isConditionalDropFailed

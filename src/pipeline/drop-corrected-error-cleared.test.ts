@@ -11,8 +11,11 @@
 // Cases (the #1023 acceptance criteria):
 //   (1) a job that hit drop-detection and then completed successfully ends
 //       `status: 'done'`, `progress: 100`, and NO error string at all.
-//   (2) the drop stays diagnosable: the corrective completion's audit entry
-//       records `correctedConditionalDrop` plus the failure text just cleared.
+//   (2) the drop stays diagnosable on EVERY correction path: the job record
+//       itself carries `droppedThenRecovered` + `correctedDropError`, written
+//       with only the deps the callback poller passes (`{ jobs, assets }`) — no
+//       audit emitter. (2b) the internal-callback path, which does wire an
+//       emitter, additionally gets `correctedConditionalDrop` on the audit entry.
 //   (3) a genuinely failed job is unaffected — `status: 'failed'` with its reason.
 //   (4) filtering jobs by "has an error" returns only the jobs that really failed.
 //
@@ -22,8 +25,19 @@
 //     src/pipeline/transcode.ts:230-345; CompleteTranscodeParams.conditionalDrop —
 //     src/pipeline/transcode.ts:185-198.
 //   - Job.error ("Terminal error message when status === 'failed'"), Job.progress,
-//     Job.droppedByScaler and UpdateJobInput.clearError (#1023) + applyJobPatch's
-//     `delete next.error` — src/data/job-repo.ts:113, 106-110, 178, 236-249, 384.
+//     Job.droppedByScaler, Job.droppedThenRecovered / Job.correctedDropError
+//     (#1023) and UpdateJobInput.clearError (#1023) + applyJobPatch's
+//     `delete next.error` — src/data/job-repo.ts (type Job, type UpdateJobInput,
+//     applyJobPatch).
+//   - Both repository backends carry the two new fields: applyJobPatch
+//     (src/data/job-repo.ts) for InMemoryJobRepository, and toDoc/fromDoc
+//     (src/data/couch-job-repo.ts) for CouchJobRepository.
+//   - The poller's completeTranscode deps are `{ jobs: deps.jobRepository,
+//     assets: deps.assetRepository }` — no `audit` — src/pipeline/
+//     encore-callback-poller.ts (handleMessage's completeTranscode call); the
+//     internal callback route passes an emitter — src/routes/internal.ts.
+//   - emitAudit(emitter | undefined, ...) no-ops without an emitter —
+//     src/data/audit-emit.ts.
 //   - settleFailedTranscode(deps, job, error, reason?) with SettleReason
 //     'gone-from-active-set' | 'encore-error' —
 //     src/pipeline/failed-transcode-reconciler.ts:186, 203-208.
@@ -130,7 +144,37 @@ describe('#1023 a job corrected from drop-detection carries no error', () => {
     expect(done?.droppedByScaler).toBe(false);
   });
 
-  it('(2) keeps the spurious drop diagnosable on the corrective completion audit entry', async () => {
+  it('(2) keeps the spurious drop diagnosable ON THE RECORD with no audit emitter wired', async () => {
+    const { jobs, assets, jobId, assetId } = await runningTranscode();
+
+    await settleFailedTranscode(
+      { jobs, assets },
+      (await jobs.get(jobId))!,
+      DROP_ERROR,
+      'gone-from-active-set'
+    );
+    // The deps the PRODUCTION correction paths actually pass: the callback
+    // poller calls completeTranscode with `{ jobs, assets }` and NO audit
+    // emitter, so emitAudit no-ops and an audit-only trace would not exist
+    // here. Asserting with an emitter wired would be false confidence — the
+    // diagnostic has to be path-independent, which means on the record.
+    await completeTranscode(
+      { jobId, sourceAssetId: assetId, success: true, renditions: [rendition] },
+      { jobs, assets }
+    );
+
+    const done = await jobs.get(jobId);
+    // The job is a clean terminal success...
+    expect(done?.status).toBe('done');
+    expect(done?.error).toBeUndefined();
+    expect(done?.droppedByScaler).toBe(false);
+    // ...and yet the drop that was corrected is still visible, with the reason
+    // the drop claimed, so a too-short reconcile grace period stays detectable.
+    expect(done?.droppedThenRecovered).toBe(true);
+    expect(done?.correctedDropError).toBe(DROP_ERROR);
+  });
+
+  it('(2b) also annotates the audit trail on the internal-callback path, which wires an emitter', async () => {
     const { jobs, assets, jobId, assetId } = await runningTranscode();
     const audit = recordingAudit();
 
@@ -150,12 +194,15 @@ describe('#1023 a job corrected from drop-detection carries no error', () => {
     const completed = audit.entries.find((e) => e.action === 'job.completed');
     expect(completed).toBeDefined();
     expect(completed?.detail?.['correctedConditionalDrop']).toBe(true);
-    // The text cleared off the job is preserved here, so a too-short reconcile
-    // grace period is still detectable after the fix.
     expect(completed?.detail?.['clearedDropError']).toBe(DROP_ERROR);
+    // The record-level trace is written on this path too — the audit entry is an
+    // additional copy for the timeline view, never the only one.
+    const done = await jobs.get(jobId);
+    expect(done?.droppedThenRecovered).toBe(true);
+    expect(done?.correctedDropError).toBe(DROP_ERROR);
   });
 
-  it('(2b) a normal completion records no drop-correction annotation', async () => {
+  it('(2c) a normal completion records no drop-correction annotation', async () => {
     const { jobs, assets, jobId, assetId } = await runningTranscode();
     const audit = recordingAudit();
 
@@ -168,7 +215,14 @@ describe('#1023 a job corrected from drop-detection carries no error', () => {
     const completed = audit.entries.find((e) => e.action === 'job.completed');
     expect(completed?.detail?.['correctedConditionalDrop']).toBeUndefined();
     expect(completed?.detail?.['clearedDropError']).toBeUndefined();
-    expect((await jobs.get(jobId))?.error).toBeUndefined();
+    const done = await jobs.get(jobId);
+    expect(done?.error).toBeUndefined();
+    // A job that was never dropped gains no drop annotation at all — the fields
+    // are ABSENT (not false/empty), so "was this job ever dropped?" has exactly
+    // one reading.
+    expect(done?.droppedThenRecovered).toBeUndefined();
+    expect(done?.correctedDropError).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(done!, 'droppedThenRecovered')).toBe(false);
   });
 
   it('(3) leaves a genuinely failed job failed, with its reason intact', async () => {
@@ -213,5 +267,9 @@ describe('#1023 a job corrected from drop-detection carries no error', () => {
     const withError = items.filter((j) => typeof j.error === 'string' && j.error.length > 0);
     expect(withError.map((j) => j.id)).toEqual([b.jobId]);
     expect(items.find((j) => j.id === a.jobId)?.status).toBe('done');
+    // The recovered job drops out of error triage without becoming invisible:
+    // "which jobs were dropped and came back?" is its own, separate reading.
+    const recovered = items.filter((j) => j.droppedThenRecovered === true);
+    expect(recovered.map((j) => j.id)).toEqual([a.jobId]);
   });
 });
