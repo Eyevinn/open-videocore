@@ -323,6 +323,46 @@ move together, which is the invariant #1058 broke.
   - the remaining sweeps, the watch-folder, and durable persistence of the stack
     identity on the job/asset document are tracked in #1090.
 
+### The packager failure callback's blast radius is now wider — deliberately
+
+This is the one place where the fix makes an existing exposure bigger, so it is
+stated plainly rather than buried in the diff.
+
+`POST /api/v1/internal/packagerCallback/failure` is **unauthenticated and carries
+no identifier of ours** — the packager has none to send, so the body is only
+`{ message }`. The handler therefore correlates by *execution state*: it fails
+every execution currently stalled on a running `package` step, settles each one's
+package `Job`, and dispatches a `package.failed` webhook for each. That fan-out
+is not new (issue #209 chose state-correlation precisely because there is no id),
+but it previously stopped at the first-listed stack. It now runs on **every
+provisioned stack**, because the payload carries no stack identity either and the
+alternative is that a packaging failure on any other stack is never attributed
+and that execution stalls forever — the very class of bug this issue is about.
+
+So the honest statement of the change: one unauthenticated POST whose only
+content is a free-text message can fail every in-flight packaging job in the
+deployment, where before it could fail every in-flight packaging job on one
+stack. A strict superset of an already-accepted behaviour.
+
+**Why that is bounded.** ADR-018/ADR-020 fix the unit of isolation at **one
+deployment == one tenant**. Stacks 2..N of a deployment are additional stacks of
+the *same* tenant, not other customers — so the widened sweep reaches more of one
+tenant's own work and crosses no tenant boundary. The pre-existing within-stack
+fan-out was accepted on exactly that reasoning; this is the same reasoning applied
+to the same tenant's other stacks. If the isolation model ever changes so that a
+deployment hosts more than one tenant, this endpoint must be revisited **before**
+that lands.
+
+**What would actually close it** is an identifier on the failure callback — a
+packager-side correlation id, so attribution is a lookup instead of a sweep.
+That is upstream work, logged in the `encore-packager` contract friction log; a
+shared callback secret (issue #9's friction log) would separately stop a forged
+call reaching the handler at all. Both are better answers than narrowing the
+sweep, which would just restore the stalled-forever bug for non-default stacks.
+The current state is recorded in the SECURITY NOTE at the top of
+`src/routes/internal.ts` and pinned by a test that asserts the fan-out on both
+the default and a named stack.
+
 **A fail-loud guard backs it up.** `POST /:id/transcode` and `POST /:id/execute`
 compare the data
 plane's resolved stack identity (`request.connections.stackName`, new on

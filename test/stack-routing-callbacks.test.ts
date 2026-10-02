@@ -190,7 +190,58 @@ describe('packager callbacks reach non-default stacks (issue #1058)', () => {
     expect(h.handledSuccessIn).toEqual([undefined]);
   });
 
-  it('attributes a failure callback to a running package step on a non-default stack', async () => {
+  // The failure callback carries NO identifier of ours — not an assetId, not a
+  // stack — so it can only correlate by execution state, and since #1058 it does
+  // that on every provisioned stack. This test pins BOTH halves of the resulting
+  // behaviour deliberately: the non-default stack is now reached (the fix), and
+  // the default stack is still swept (the pre-existing within-stack fan-out of
+  // issue #209, unchanged). Stacks 2..N belong to the same tenant under
+  // ADR-018/ADR-020, so the widened sweep stays inside one tenant — see the
+  // SECURITY NOTE at the top of src/routes/internal.ts.
+  it('fails running package steps on EVERY provisioned stack (accepted fan-out)', async () => {
+    const h = await buildApp(['a', 'b']);
+
+    const seedRunningPackage = async (stack: Stack): Promise<string> => {
+      const asset = await stack.assets.create({ name: 'clip' });
+      const execution = await stack.pipelines.create({
+        assetId: asset.id,
+        pipelineName: 'abr-vod',
+        steps: ['transcode', 'package']
+      });
+      await stack.pipelines.update(execution.id, {
+        steps: [
+          { name: 'transcode', status: 'done' },
+          { name: 'package', status: 'running' }
+        ]
+      });
+      return execution.id;
+    };
+
+    const onDefault = await seedRunningPackage(h.stacks['a']!);
+    const onNamed = await seedRunningPackage(h.stacks['b']!);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: '/api/v1/internal/packagerCallback/failure',
+      payload: { message: 'packager blew up' }
+    });
+
+    expect(res.statusCode).toBe(200);
+
+    // The non-default stack — pre-fix this execution was never attributed and
+    // stalled on `running` forever.
+    const named = await h.stacks['b']!.pipelines.get(onNamed);
+    expect(named?.status).toBe('failed');
+    expect(named?.steps.find((s) => s.name === 'package')?.error).toContain('packager blew up');
+
+    // The default stack — explicitly asserted, not assumed: the sweep is a
+    // superset of the old behaviour, so this execution is failed too.
+    const defaulted = await h.stacks['a']!.pipelines.get(onDefault);
+    expect(defaulted?.status).toBe('failed');
+    expect(defaulted?.steps.find((s) => s.name === 'package')?.error).toContain('packager blew up');
+  });
+
+  it('leaves executions with no running package step untouched on every stack', async () => {
     const h = await buildApp(['a', 'b']);
     const asset = await h.stacks['b']!.assets.create({ name: 'clip' });
     const execution = await h.stacks['b']!.pipelines.create({
@@ -198,10 +249,12 @@ describe('packager callbacks reach non-default stacks (issue #1058)', () => {
       pipelineName: 'abr-vod',
       steps: ['transcode', 'package']
     });
+    // transcode still running, package not yet started: nothing for the packager
+    // failure to attribute, on any stack.
     await h.stacks['b']!.pipelines.update(execution.id, {
       steps: [
-        { name: 'transcode', status: 'done' },
-        { name: 'package', status: 'running' }
+        { name: 'transcode', status: 'running' },
+        { name: 'package', status: 'pending' }
       ]
     });
 
@@ -213,7 +266,7 @@ describe('packager callbacks reach non-default stacks (issue #1058)', () => {
 
     expect(res.statusCode).toBe(200);
     const after = await h.stacks['b']!.pipelines.get(execution.id);
-    expect(after?.status).toBe('failed');
-    expect(after?.steps.find((s) => s.name === 'package')?.error).toContain('packager blew up');
+    expect(after?.status).toBe('running');
+    expect(after?.steps.find((s) => s.name === 'transcode')?.status).toBe('running');
   });
 });

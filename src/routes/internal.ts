@@ -7,13 +7,31 @@
 // namespaced `packagingId` carried in the payload to map the callback to an
 // asset (the packagingId is the only authority a caller can demonstrate).
 //
-// SECURITY NOTE: a forged packager-callback can at most set manifestUrls /
-// packagingError on an asset whose packagingId the caller already knows; it can
-// never change the asset's lifecycle status, cross workspaces (the workspaceId
-// is derived from the packagingId and re-validated by the repo's ownership
-// guard), or read data back. A malformed/unknown packagingId resolves to 404.
-// Hardening this with a shared callback secret is tracked in the issue #9
-// friction log.
+// SECURITY NOTE — the two packager callbacks have DIFFERENT blast radii, and the
+// failure one is wide:
+//
+//   * SUCCESS (`/packagerCallback/success`) is identifier-bound. A forged call
+//     can at most set manifestUrls on an asset whose id the caller already
+//     knows; it can never change the asset's lifecycle status or read data
+//     back, and an unknown id resolves to 404.
+//
+//   * FAILURE (`/packagerCallback/failure`) requires NO identifier at all. The
+//     packager sends only `{ message }` — it has no id of ours to send — so the
+//     handler correlates by EXECUTION STATE instead: it fails every execution
+//     currently stalled on a running `package` step, settles each one's package
+//     Job (failPackageJob) and dispatches a `package.failed` webhook for each.
+//     Since issue #1058 that sweep runs on EVERY PROVISIONED STACK, not just the
+//     first-listed one, because the payload carries no stack identity either.
+//     So one unauthenticated, bodyless-but-for-a-message POST can fail every
+//     in-flight packaging job in the deployment. This is a widened version of a
+//     fan-out that already existed within one stack (issue #209 attribution), and
+//     it is bounded by ADR-018/ADR-020's one-deployment-is-one-tenant model —
+//     stacks 2..N belong to the SAME tenant, so nothing crosses a tenant
+//     boundary — but it is strictly more than the success path can do.
+//
+// Hardening both with a shared callback secret is tracked in the issue #9
+// friction log; getting a correlation id onto the failure callback is tracked in
+// the encore-packager contract friction log.
 //
 // Issue #8 adds POST /api/v1/internal/encore-callback (transcode completion) to
 // this same router. The Encore callback resolves its workspace + job from the
@@ -291,6 +309,13 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       }
     },
     async (request, reply) => {
+      // Not-configured first: a deployment without packaging must answer 501
+      // without doing any lookup work at all.
+      if (!opts.packaging) {
+        return reply
+          .code(501)
+          .send({ error: 'not_configured', message: 'packaging is not configured' });
+      }
       // The packager callback carries only `jobId` (= the assetId we enqueued)
       // and no stack identity (issue #1058). Find the stack whose asset store
       // actually holds that asset and run the whole handler — manifest write,
@@ -298,12 +323,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
       // non-default stack is applied there instead of 404ing.
       const owningStack = await stackOwningAsset(request.body.jobId);
       return runWithRequestStack(owningStack, async () => {
-        if (!opts.packaging) {
-          return reply
-            .code(501)
-            .send({ error: 'not_configured', message: 'packaging is not configured' });
-        }
-        const applied = await opts.packaging.handleSuccess(request.body);
+        const applied = await opts.packaging!.handleSuccess(request.body);
         if (!applied) return reply.code(404).send({ error: 'not_found' });
         // Advance the matching PipelineExecution when packaging completes.
         if (opts.pipelineRepository) {
