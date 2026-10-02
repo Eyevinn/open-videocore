@@ -133,14 +133,26 @@ instance that came up moments later. `lib/core.js:343-353` does not wrap the
 probe in a `try`, so the helper has no tolerance for a transient poll failure and
 the rejection carries no service attribution.
 
-#1038 lifted the scaler's bounded loop into a shared helper
+#1038 generalised the scaler's bounded loop into a shared helper
 (`src/services/instance-readiness.ts`, `waitForInstanceReadyBounded`) and moved
 the five provisioning readiness waits onto it. #1055 then moved the two call
 sites outside `src/routes/provision.ts` that #1038's scope had missed — the
 on-demand packager (`src/services/packager-provisioning.ts`) and the config
 service's dedicated Valkey in the startup bootstrap (`src/main.ts` into
-`src/services/param-store.ts`). With both landed, `waitForInstanceReady` is
-unused on every path this repo controls that waits for an instance it created.
+`src/services/param-store.ts`). With both landed, the SDK's
+`waitForInstanceReady` is unused on every path this repo controls that waits for
+an instance it created.
+
+Two things that sentence does *not* claim. The scaler
+(`src/encore-scaler/instance-pool.ts`) still carries its own near-identical copy
+of the loop rather than calling the shared helper — the copy is bounded, so this
+is duplication rather than a live defect, and collapsing it onto the shared
+helper is tracked separately. And the bound is only real if the configured
+budget is a number: an invalid `PROVISION_READY_TIMEOUT_MS` used to reach the
+loop as `NaN`, which defeats a deadline comparison silently, so the env read is
+now validated (`resolveReadinessDurationMs`) before it can get there. Neither is
+OSC friction — both are ours — but they are the kind of thing an SDK-supplied
+`timeoutMs` would have made impossible to get wrong, which is the ask below.
 The full write-up of that second facet (and the specific SDK changes that would
 retire the workaround) is in the engagement repo:
 `eng-open-videocore-agents/docs/osc-feedback/incoming-waitforinstanceready-single-dropped-poll.md`.

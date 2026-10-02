@@ -100,9 +100,12 @@ const coords = {
   minioEndpoint: 'https://minio.example',
   packagedBucket: 'openvideocore-packaged'
 };
+// Fixture values only — never real credentials. Prefixed so a secret scanner
+// (and a reader) can tell at a glance that these are dummies (#1055 review,
+// non-blocking finding 4).
 const secrets = {
-  minioRootPassword: 'rootpw',
-  oscPersonalAccessToken: 'pat'
+  minioRootPassword: 'dummy-root-password',
+  oscPersonalAccessToken: 'test-access-token'
 };
 
 // Stand-in for the caller's `package` step: it awaits the packager ensure the

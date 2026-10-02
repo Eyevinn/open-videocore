@@ -12,7 +12,12 @@ import { Context, createInstance, getInstance, getPortsForInstance } from '@osaa
 // waitForInstanceReady (issue #1055, follow-up to #1038): the SDK helper has no
 // deadline, so a config Valkey that never reports `running` hung this
 // deployment's startup bootstrap with no error.
-import { waitForInstanceReadyBounded } from './services/instance-readiness.js';
+import {
+  waitForInstanceReadyBounded,
+  resolveReadinessDurationMs,
+  DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+  DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS
+} from './services/instance-readiness.js';
 import {
   jsonSchemaTransform,
   serializerCompiler,
@@ -539,19 +544,25 @@ await app.register(provisionRouter, {
   // (DEFAULT_INSTANCE_READY_TIMEOUT_MS); a timeout routes into the existing
   // rollback with an error naming the service and the last probe error, instead
   // of the unbounded SDK wait that a single dropped poll could abort.
-  ...(process.env['PROVISION_READY_TIMEOUT_MS']
-    ? {
-        readyTimeoutMs: parseInt(process.env['PROVISION_READY_TIMEOUT_MS'], 10)
-      }
-    : {}),
-  ...(process.env['PROVISION_READY_POLL_INTERVAL_MS']
-    ? {
-        readyPollIntervalMs: parseInt(
-          process.env['PROVISION_READY_POLL_INTERVAL_MS'],
-          10
-        )
-      }
-    : {}),
+  //
+  // Both reads are validated rather than handed straight to parseInt (#1055
+  // review finding 2): `parseInt('abc', 10)` is NaN, NaN is not nullish, so a
+  // typo used to survive the `??` defaults downstream and reach timeoutMs —
+  // where NaN defeats every deadline check in waitForInstanceReadyBounded and
+  // turns the bounded wait into an unbounded hot loop. resolveReadinessDurationMs
+  // accepts only a finite positive value and warn-logs anything else.
+  readyTimeoutMs: resolveReadinessDurationMs(
+    process.env['PROVISION_READY_TIMEOUT_MS'],
+    DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+    'PROVISION_READY_TIMEOUT_MS',
+    app.log
+  ),
+  readyPollIntervalMs: resolveReadinessDurationMs(
+    process.env['PROVISION_READY_POLL_INTERVAL_MS'],
+    DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS,
+    'PROVISION_READY_POLL_INTERVAL_MS',
+    app.log
+  ),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly

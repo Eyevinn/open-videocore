@@ -57,6 +57,55 @@ export const DEFAULT_INSTANCE_READY_TIMEOUT_MS = 5 * 60_000;
 // ends on time.
 export const DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS = 1_000;
 
+// The logger subset resolveReadinessDurationMs warns through. Deliberately the
+// same shape BootstrapLogger uses (src/services/profile-bootstrap.ts:39-42), so
+// Fastify's `app.log` satisfies it directly with no adapter.
+export type InstanceReadinessLogger = {
+  warn: (obj: unknown, msg?: string) => void;
+};
+
+// Resolve a readiness duration (ms) from a raw environment string, rejecting
+// anything that would not actually bound the wait.
+//
+// WHY THIS EXISTS (#1055 review, blocking finding 2). Callers used to read the
+// env directly — `parseInt(process.env['PROVISION_READY_TIMEOUT_MS'], 10)` —
+// and leave the default to the `??` fallbacks downstream
+// (src/routes/provision.ts readinessOptions, and `options.timeoutMs ??
+// DEFAULT_INSTANCE_READY_TIMEOUT_MS` in waitForInstanceReadyBounded below).
+// That does not hold, because `parseInt('abc', 10)` is `NaN` and NaN is NOT
+// nullish: it survives every `??` and lands in `timeoutMs`, where it kills all
+// three loop guards at once —
+//   * `remaining <= 0` is false for NaN, so the loop never breaks there;
+//   * `Math.min(pollIntervalMs, NaN)` is NaN, so setTimeout fires immediately
+//     instead of waiting out the poll interval; and
+//   * `Date.now() >= deadline` is never true for a NaN deadline.
+// The result is the opposite of this module's purpose: an unbounded hot loop
+// issuing hundreds of getInstanceHealth calls a second for the life of the
+// process. `'0'` was a milder variant of the same hole — truthy, so it was
+// forwarded, putting the deadline in the past and timing the wait out before
+// its first probe.
+//
+// So only a finite, strictly positive duration is accepted. Anything else
+// (unparseable, zero, negative) falls back to `defaultMs`, and a value the
+// operator actually set is warn-logged naming the rejected input so a typo is
+// visible at boot rather than silently changing the deadline.
+export function resolveReadinessDurationMs(
+  raw: string | undefined,
+  defaultMs: number,
+  envName: string,
+  log?: InstanceReadinessLogger
+): number {
+  if (raw === undefined || raw.trim() === '') return defaultMs;
+  const parsed = parseInt(raw, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  log?.warn(
+    { env: envName, value: raw, fallbackMs: defaultMs },
+    `${envName} must be a positive number of milliseconds; ignoring ` +
+      `"${raw}" and using the default of ${defaultMs}ms`
+  );
+  return defaultMs;
+}
+
 export type InstanceReadinessOptions = {
   // Hard deadline for the whole wait. Unset =>
   // DEFAULT_INSTANCE_READY_TIMEOUT_MS.
