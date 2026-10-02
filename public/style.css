@@ -1363,6 +1363,28 @@ pre.code-block {
   background: rgba(99, 102, 241, 0.14);
 }
 
+/* Clickable collection row (issue #917). The whole row opens the detail panel,
+   so it must LOOK activatable and must show where keyboard focus is. The focus
+   ring uses :focus-visible, so it appears for keyboard users without drawing an
+   outline on every mouse click; `outline-offset: -2px` keeps the ring inside the
+   row so it is not clipped by the surrounding .table-wrap scroll container. */
+tbody tr.coll-row {
+  cursor: pointer;
+}
+
+tbody tr.coll-row:hover {
+  background: rgba(99, 102, 241, 0.08);
+}
+
+tbody tr.coll-row:focus-visible {
+  outline: 2px solid var(--accent, #6366f1);
+  outline-offset: -2px;
+}
+
+tbody tr.coll-row.row-selected {
+  background: rgba(99, 102, 241, 0.14);
+}
+
 /* Pagination bar */
 .pagination {
   display: flex;
