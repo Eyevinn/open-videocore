@@ -28,6 +28,11 @@ import { PackagingService, type PackageQueue, type PackagingJob } from '../src/p
 import type { EncoreClient } from '../src/pipeline/encore-client.js';
 import type { AuditEmitter } from '../src/data/audit-emit.js';
 import type { RecordAuditInput } from '../src/data/audit-repo.js';
+import type { StorageFactory } from '../src/routes/assets.js';
+import type {
+  SourceBackendJobCredentials,
+  StorageBackendRegistry
+} from '../src/services/storage-backend-registry.js';
 
 // Records every emitted entry so a test can assert count + shape. A `failNext`
 // toggle makes the NEXT record() reject, to prove the primary op survives.
@@ -165,6 +170,154 @@ describe('asset mutation audit instrumentation (issue #564)', () => {
     expect(audit.entries).toHaveLength(0);
     // The asset really was persisted.
     expect(await repo.get((res.json() as { id: string }).id)).toBeDefined();
+  });
+});
+
+// Ingest-by-URL creates an asset down TWO branches (issue #999): the default
+// OSC-managed pull and the registered-external-backend source (#548, ADR-017
+// D4). Both call AssetRepository.create, so both owe the trail the same single
+// `asset.created` entry POST / records — previously neither emitted one, so an
+// asset that appeared via ingest-url had no accountable creation record.
+//
+// Contract grounding (verified before writing):
+//   - the emission shape copied from POST / — src/routes/assets.ts:2762-2772
+//     (actor originActor('user') / action 'asset.created' / targetType 'asset' /
+//     targetId / detail).
+//   - `detail` is a free-form `z.record(z.string(), z.unknown())` bag, so the
+//     added `sourceUrl` key needs no schema change — src/data/audit-repo.ts:65.
+//   - `sourceUrl` is the ingest job's own field name — src/data/job-repo.ts:100.
+//   - `resolveSourceCredentials(workspaceId, ref) => SourceBackendJobCredentials`
+//     — src/services/storage-backend-registry.ts:901-904, type at :398-405.
+//   - assetsRouter `storageBackendRegistry` / `storageFor` / `runPull` options —
+//     src/routes/assets.ts:930-963.
+describe('ingest-url asset.created audit instrumentation (issue #999)', () => {
+  // URL-pull ingest 501s without a storage factory; the stubbed pull worker
+  // never touches it, so an empty object satisfies the check.
+  const storageFor: StorageFactory = () => ({}) as never;
+
+  // A registry stub that resolves one registered source backend. Typed against
+  // the real SourceBackendJobCredentials contract so the shape cannot drift;
+  // the route only ever calls resolveSourceCredentials on this path.
+  const registryStub = {
+    resolveSourceCredentials: async (): Promise<SourceBackendJobCredentials> => ({
+      bucket: 'ext-bkt',
+      awsAccessKeyId: 'AKIA',
+      // The route never inlines this; it is a `{{secrets.<name>}}` reference in
+      // production and must not reach the audit entry either.
+      awsSecretAccessKey: '{{secrets.storagebackend.b1.source.awssecretaccesskey}}',
+      s3EndpointUrl: 'https://s3.example.com'
+    })
+  } as unknown as StorageBackendRegistry;
+
+  async function buildIngestApp(
+    repo: InMemoryAssetRepository,
+    audit: AuditEmitter,
+    withRegistry: boolean
+  ): Promise<FastifyInstance> {
+    const app = Fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    await app.register(assetsRouter, {
+      prefix: '/api/v1/assets',
+      repository: repo,
+      audit,
+      storageFor,
+      // Stubbed in-process pull worker: the accepted request returns 202 without
+      // any network / S3 work.
+      runPull: (async () => undefined) as never,
+      ...(withRegistry ? { storageBackendRegistry: registryStub } : {})
+    });
+    await app.ready();
+    return app;
+  }
+
+  let repo: InMemoryAssetRepository;
+  let audit: RecordingEmitter;
+
+  beforeEach(() => {
+    repo = new InMemoryAssetRepository();
+    audit = new RecordingEmitter();
+  });
+
+  it('the default (OSC-managed pull) branch emits exactly one asset.created entry', async () => {
+    const app = await buildIngestApp(repo, audit, false);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/assets/ingest-url',
+      // s3:// avoids the SSRF DNS lookup (only http/https hosts are resolved).
+      payload: { sourceUrl: 's3://ingest-bucket/clip.mp4', title: 'Pulled Clip' }
+    });
+    expect(res.statusCode).toBe(202);
+    const { assetId } = res.json() as { assetId: string };
+    await settle();
+
+    const created = audit.entries.filter((e) => e.action === 'asset.created');
+    expect(created).toHaveLength(1);
+    expect(created[0].targetType).toBe('asset');
+    expect(created[0].targetId).toBe(assetId);
+    expect(created[0].actor).toEqual({ principalId: null, origin: 'user' });
+    expect(created[0].detail).toMatchObject({
+      name: 'Pulled Clip',
+      sourceUrl: 's3://ingest-bucket/clip.mp4'
+    });
+    // Same `status` key POST / records, read off the asset as created.
+    expect(typeof created[0].detail?.['status']).toBe('string');
+  });
+
+  it('the registered-external-backend branch emits exactly one asset.created entry', async () => {
+    const app = await buildIngestApp(repo, audit, true);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/assets/ingest-url',
+      payload: {
+        sourceUrl: 's3://ext-bkt/path/to/clip.mp4',
+        title: 'External Clip',
+        sourceBackend: 'my-bucket'
+      }
+    });
+    expect(res.statusCode).toBe(202);
+    const { assetId } = res.json() as { assetId: string };
+    await settle();
+
+    const created = audit.entries.filter((e) => e.action === 'asset.created');
+    expect(created).toHaveLength(1);
+    expect(created[0].targetType).toBe('asset');
+    expect(created[0].targetId).toBe(assetId);
+    expect(created[0].actor).toEqual({ principalId: null, origin: 'user' });
+    // The credential-free `s3://bucket/key` locator — the same value stored on
+    // the ingest job — and never the resolved credential reference.
+    expect(created[0].detail).toMatchObject({
+      name: 'External Clip',
+      sourceUrl: 's3://ext-bkt/path/to/clip.mp4'
+    });
+    expect(JSON.stringify(created[0])).not.toContain('secrets.');
+    expect(JSON.stringify(created[0])).not.toContain('AKIA');
+  });
+
+  it('a failing audit write does not fail either ingest-url branch', async () => {
+    audit.failAlways = true;
+
+    const defaultApp = await buildIngestApp(repo, audit, false);
+    const defaultRes = await defaultApp.inject({
+      method: 'POST',
+      url: '/api/v1/assets/ingest-url',
+      payload: { sourceUrl: 's3://ingest-bucket/clip.mp4' }
+    });
+    expect(defaultRes.statusCode).toBe(202);
+
+    const externalApp = await buildIngestApp(repo, audit, true);
+    const externalRes = await externalApp.inject({
+      method: 'POST',
+      url: '/api/v1/assets/ingest-url',
+      payload: { sourceUrl: 's3://ext-bkt/path/to/clip.mp4', sourceBackend: 'my-bucket' }
+    });
+    expect(externalRes.statusCode).toBe(202);
+
+    await settle();
+    expect(audit.entries).toHaveLength(0);
+    // Both assets really were persisted despite every audit write rejecting.
+    expect(await repo.get((defaultRes.json() as { assetId: string }).assetId)).toBeDefined();
+    expect(await repo.get((externalRes.json() as { assetId: string }).assetId)).toBeDefined();
   });
 });
 

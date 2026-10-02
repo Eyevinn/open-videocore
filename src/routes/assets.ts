@@ -2934,10 +2934,36 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           description,
           tags
         });
+        // Audit: asset created (issue #999, instrumentation convention of #564).
+        // Same shape as POST / (assets.ts:2762-2772) — one entry, targetId = the
+        // new asset id, `detail.name`/`detail.status` read off the asset as
+        // created — plus `sourceUrl`, so an ingest-by-URL creation is
+        // distinguishable from a plain POST / in the queryable trail
+        // (GET /api/v1/audit). Emitted here, directly after repo.create and
+        // BEFORE the objectKey/status update below, for the same reason the
+        // default branch does: the asset exists from this point on, so a failure
+        // in any later step must not swallow the creation record. `detail.status`
+        // is therefore the status at creation, not the post-update one.
+        //
+        // `sourceUrl` here is the credential-free `s3://bucket/key` locator built
+        // below — the exact value the ingest job records (`sourceUrl`, CONTRACT:
+        // src/data/job-repo.ts:100) — never the registered external credential,
+        // which this path never holds as a literal anyway (#548).
+        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
+        emitAudit(
+          audit,
+          {
+            actor: originActor('user'),
+            action: 'asset.created',
+            targetType: 'asset',
+            targetId: extAsset.id,
+            detail: { name: extAsset.name, status: extAsset.status, sourceUrl: extObjectKey }
+          },
+          request.log
+        );
         // The recorded source is the credential-free `s3://bucket/key` locator;
         // the object already lives in the external bucket, so no byte-pull runs
         // and the asset advances straight to `processing`.
-        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
         await repo.update(extAsset.id, { objectKey: extObjectKey, status: 'processing' });
         const extJob = await jobs.create({
           type: 'ingest-url',
@@ -2972,6 +2998,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         description,
         tags
       });
+      // Audit: asset created (issue #999). Identical shape + placement to the
+      // external-backend branch above and to POST / (assets.ts:2762-2772), so an
+      // ingest-by-URL creation produces one `asset.created` entry no matter which
+      // branch served the request. The recorded `sourceUrl` is the request's own
+      // pull URL — the same value already persisted on the ingest job below
+      // (`sourceUrl`, CONTRACT: src/data/job-repo.ts:100), so this adds no value
+      // the API did not already store.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.created',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: { name: asset.name, status: asset.status, sourceUrl }
+        },
+        request.log
+      );
       const objectKey = `ingest/${asset.id}`;
       await repo.update(asset.id, { objectKey });
 
