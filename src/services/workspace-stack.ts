@@ -133,6 +133,15 @@ export type WorkspaceConnections = {
   // `scene-detect` step skips gracefully — fire-and-forget, never throws.
   subtitleGenerator: SubtitleGenerator | undefined;
   sceneDetector: SceneDetector | undefined;
+  // The stack identity these connections were built from (issue #1058): the
+  // parameter-store stack name, i.e. the same identity `resolveStackName()`
+  // returns for the transcode control plane. Undefined on the env-override and
+  // in-memory fallback paths, which are not stack records. Callers compare this
+  // against the control plane's resolved stack to detect a data-plane /
+  // control-plane split; they MUST NOT compare endpoint hostnames, which
+  // legitimately differ for the same stack (in-cluster vs public ingress,
+  // issue #991).
+  stackName: string | undefined;
 };
 
 // A cached resolution. `fromReadyStack` records whether `connections` were
@@ -174,7 +183,10 @@ function buildConnectionsFromStack(
   minioPassword: string,
   couchPassword: string,
   oscContext: Context,
-  optionalSteps: OptionalStepBuilders
+  optionalSteps: OptionalStepBuilders,
+  // The parameter-store name this config was loaded under (issue #1058).
+  // Carried onto the connections as their stack identity.
+  stackName: string | undefined
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -252,7 +264,8 @@ function buildConnectionsFromStack(
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
     subtitleGenerator,
-    sceneDetector
+    sceneDetector,
+    stackName
   };
 }
 
@@ -383,7 +396,10 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     // OPTIONAL subtitles/scene-detect steps stay disabled here and skip
     // gracefully, exactly as when the name is absent from a record.
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    // Not a stack record: the env override is one global set of coordinates, so
+    // there is no stack identity to compare against (issue #1058).
+    stackName: undefined
   };
 }
 
@@ -406,7 +422,9 @@ function buildInMemoryConnections(): WorkspaceConnections {
     s3Config: undefined,
     storage: undefined,
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    // No stack record behind the no-storage fallback (issue #1058).
+    stackName: undefined
   };
 }
 
@@ -846,6 +864,10 @@ export class WorkspaceStackResolver {
     // directly; otherwise use the first provisioned stack as the workspace
     // default.
     let config: StackConfig | undefined;
+    // The name the config was actually loaded under (issue #1058). Carried onto
+    // the built connections so the data plane's stack identity is observable
+    // and comparable with the control plane's (resolveStackName).
+    let resolvedName: string | undefined;
     try {
       if (stackName) {
         // READ-PATH diagnostic (issue #415): the resolver reads by the
@@ -857,6 +879,7 @@ export class WorkspaceStackResolver {
           'resolver reading stack config by requested name'
         );
         config = await this.loadStackConfigWithMigration(ps, stackName);
+        if (config) resolvedName = stackName;
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
         // connections. This prevents stale UI stack selections from breaking
@@ -869,6 +892,7 @@ export class WorkspaceStackResolver {
           );
           if (names.length > 0) {
             config = await this.loadStackConfigWithMigration(ps, names[0]!);
+            if (config) resolvedName = names[0]!;
           }
         }
       } else {
@@ -883,6 +907,7 @@ export class WorkspaceStackResolver {
         );
         if (names.length > 0) {
           config = await this.loadStackConfigWithMigration(ps, names[0]!);
+          if (config) resolvedName = names[0]!;
         }
       }
     } catch (err) {
@@ -943,7 +968,7 @@ export class WorkspaceStackResolver {
     // to no-op in-memory connections so /health and infra routes stay up.
     const built =
       config && isReadyStack(config)
-        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, resolvedName)
         : null;
 
     // Emit the aggregate degraded-resolution signal (issue #422): a null build
@@ -1062,6 +1087,35 @@ export class WorkspaceStackResolver {
     const names = await this.listStackNamesWithMigration(ps);
     if (names.length === 0) return undefined;
     return this.loadStackConfigWithMigration(ps, names[0]!);
+  }
+
+  // The provisioned stack names, in parameter-store listing order (issue #1058).
+  //
+  // Exposes the SAME listing the resolution paths use — including the bounded
+  // one-shot migration fallback for a pre-#804 stack — so a caller that must run
+  // once per stack (the scaler-tick reconcilers, the stack-less packager
+  // callbacks) enumerates exactly the stacks `resolve()` can address. Empty when
+  // no parameter store is configured (env-override / bare local run), in which
+  // case callers fall back to the single default resolution.
+  //
+  // A read failure is logged and reported as "no stacks" rather than thrown: the
+  // callers are best-effort sweeps and unauthenticated callbacks, and a
+  // parameter-store blip must not break a tick or fail a callback.
+  async listStackNames(): Promise<string[]> {
+    const ps = this.paramStore;
+    if (!ps) return [];
+    try {
+      return await this.listStackNamesWithMigration(ps);
+    } catch (err) {
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE
+        },
+        'stack resolver: failed to list stack names'
+      );
+      return [];
+    }
   }
 
   // Synchronous read of already-resolved connections from cache. Returns

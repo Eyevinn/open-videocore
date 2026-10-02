@@ -9,7 +9,17 @@
 // still receive a single repository object — while the actual backing service is
 // selected lazily at call time rather than wired as a global singleton at
 // startup. OSC provides structural tenant isolation (ADR-003), so there is no
-// workspace parameter to thread; the resolver returns the deployment's stack.
+// workspace parameter to thread.
+//
+// There IS a stack to thread (issue #1058). Each call resolves the stack the
+// in-flight request named via `X-Stack-Name`, read from the ambient
+// request-scoped context (services/request-stack-context.ts) rather than passed
+// through every router option. Previously every call here resolved with NO name
+// — the first listed stack — while the transcode control plane resolved from the
+// header (issue #615), so on a multi-stack installation asset documents and the
+// object bytes they describe could be written to two different stacks. Outside a
+// request (sweeps, boot wiring) the context is empty and resolution falls back
+// to the workspace default, unchanged.
 
 import type {
   AssetReadState,
@@ -68,13 +78,14 @@ import type {
 } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from './job-repo.js';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
+import { currentRequestStackName } from '../services/request-stack-context.js';
 import type { AuditEmitter } from './audit-emit.js';
 import type { RecordAuditInput } from './audit-repo.js';
 
 export class PerWorkspaceAssetRepository implements AssetRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<AssetRepository> {
-    return (await this.resolver.resolve()).assets;
+    return (await this.resolver.resolve(currentRequestStackName())).assets;
   }
   async create(input: CreateAssetInput): Promise<Asset> {
     return (await this.repo()).create(input);
@@ -145,7 +156,7 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
 export class PerWorkspaceJobRepository implements JobRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<JobRepository> {
-    return (await this.resolver.resolve()).jobs;
+    return (await this.resolver.resolve(currentRequestStackName())).jobs;
   }
   async create(input: CreateJobInput): Promise<Job> {
     return (await this.repo()).create(input);
@@ -185,7 +196,7 @@ export class PerWorkspaceJobRepository implements JobRepository {
 export class PerWorkspacePipelineRepository implements PipelineRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<PipelineRepository> {
-    return (await this.resolver.resolve()).pipelines;
+    return (await this.resolver.resolve(currentRequestStackName())).pipelines;
   }
   async create(input: {
     assetId: string;
@@ -232,19 +243,19 @@ export class PerWorkspaceEncoreClient implements EncoreClient {
     if (!decodeEncoreJobId(input.externalId)) {
       throw new Error('cannot decode encore externalId');
     }
-    const conns = await this.resolver.resolve();
+    const conns = await this.resolver.resolve(currentRequestStackName());
     if (!conns.encore) {
       throw new Error('transcoding (Encore) is not configured for this stack');
     }
     return conns.encore.submit(input);
   }
   async getJobStatus(encoreJobId: string): Promise<string | undefined> {
-    const conns = await this.resolver.resolve();
+    const conns = await this.resolver.resolve(currentRequestStackName());
     if (!conns.encore) return undefined;
     return conns.encore.getJobStatus(encoreJobId);
   }
   async cancel(encoreJobId: string): Promise<void> {
-    const conns = await this.resolver.resolve();
+    const conns = await this.resolver.resolve(currentRequestStackName());
     // No Encore configured: nothing to cancel — idempotent no-op, matching
     // getJobStatus above.
     if (!conns.encore) return;
@@ -255,14 +266,14 @@ export class PerWorkspaceEncoreClient implements EncoreClient {
 export class PerWorkspaceSearchRepository implements SearchRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   async search(query: SearchQuery): Promise<SearchResult> {
-    return (await this.resolver.resolve()).search.search(query);
+    return (await this.resolver.resolve(currentRequestStackName())).search.search(query);
   }
 }
 
 export class PerWorkspaceWebhookRepository implements WebhookRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<WebhookRepository> {
-    return (await this.resolver.resolve()).webhooks;
+    return (await this.resolver.resolve(currentRequestStackName())).webhooks;
   }
   async create(input: CreateWebhookInput): Promise<WebhookRegistration> {
     return (await this.repo()).create(input);
@@ -278,7 +289,7 @@ export class PerWorkspaceWebhookRepository implements WebhookRepository {
 export class PerWorkspaceProfileRepository implements ProfileRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<ProfileRepository> {
-    return (await this.resolver.resolve()).profiles;
+    return (await this.resolver.resolve(currentRequestStackName())).profiles;
   }
   async create(input: CreateProfileInput): Promise<Profile> {
     return (await this.repo()).create(input);
@@ -303,7 +314,7 @@ export class PerWorkspaceProfileRepository implements ProfileRepository {
 export class PerWorkspaceCollectionRepository implements CollectionRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<CollectionRepository> {
-    return (await this.resolver.resolve()).collections;
+    return (await this.resolver.resolve(currentRequestStackName())).collections;
   }
   async create(input: CreateCollectionInput): Promise<Collection> {
     return (await this.repo()).create(input);
@@ -339,7 +350,7 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
 export class PerWorkspaceAuditRepository implements AuditRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<AuditRepository> {
-    return (await this.resolver.resolve()).audit;
+    return (await this.resolver.resolve(currentRequestStackName())).audit;
   }
   async query(query: AuditQuery): Promise<AuditQueryResult> {
     return (await this.repo()).query(query);
@@ -358,7 +369,7 @@ export class PerWorkspaceAuditRepository implements AuditRepository {
 export class PerWorkspaceAuditEmitter implements AuditEmitter {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   async record(input: RecordAuditInput): Promise<unknown> {
-    const audit = (await this.resolver.resolve()).audit;
+    const audit = (await this.resolver.resolve(currentRequestStackName())).audit;
     if (!audit) {
       // No durable audit store on this stack (in-memory fallback): silently
       // skip. The entry is intentionally not persisted rather than erroring.
