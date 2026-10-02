@@ -40,6 +40,17 @@ import {
   type PackagedOutput,
   type SubtitleTrack
 } from '../data/asset-repo.js';
+// Per-asset retention window on the read contract (issue #1034). The projection
+// lives in ONE module shared with nothing else to re-derive: it reuses
+// archivedAtOf() (the purge sweep's own eligibility source) and the live
+// instance-global retention window, so the route adds no second source of truth.
+import {
+  assetRetentionWindow,
+  type AssetRetentionWindow
+} from '../data/asset-retention.js';
+// Boot/fallback resolution of the archived-asset retention window from the
+// environment (12-factor), used when the router is wired without a live getter.
+import { archiveRetentionMsFromEnv } from './retention.js';
 // Created-at range filtering (issue #833). The wire grammar, the inclusive
 // bound semantics and the normalisation to canonical UTC instants live in ONE
 // module shared with GET /api/v1/search/, so the two endpoints cannot answer a
@@ -838,6 +849,64 @@ const tracksSchema = z.object({
   subtitleTracks: z.array(subtitleTrackOutSchema)
 });
 
+// Per-asset retention window (issue #1034). Read-only PROJECTION of the
+// instance-global retention policy (`retentionMs`, GET/PATCH
+// /api/v1/retention/config) onto one archived asset — it introduces no new
+// policy and no second source of truth: `archivedAt` is `archivedAtOf(asset)`,
+// the same function the purge sweep tests eligibility with, and `retentionMs` is
+// the live window read at request time (so a PATCH to the config can never leave
+// a client holding a stale deadline).
+//
+// Present ONLY while `status === "archived"` (the only state the purge sweep
+// scans); omitted entirely on every other asset, including the body of a
+// successful restore — which has just left `archived`.
+//
+// Attached by the ONE helper `withRetentionWindow` (below) at every response
+// that serializes an EXISTING asset — the single-asset reads (`GET /:id`,
+// `GET /by-external-id/...`), the `GET /` listing (so `?status=archived` rows
+// carry it), the `GET /:id/versions` chain (which includes archived members by
+// design), and the mutation bodies that echo the stored asset — so the rule is
+// uniform rather than per-route. Creation responses (`201`) are the only
+// exception, and only because a newly created asset is never `archived`. The
+// TAMS-address lookup resolves `ready` assets only, so it never carries one.
+const retentionWindowSchema = z
+  .object({
+    archivedAt: z
+      .string()
+      .describe(
+        'When the asset entered `archived` (ISO 8601): the `at` of the most ' +
+          'recent `-> archived` transition in `statusHistory`, falling back to ' +
+          '`updatedAt` when no such transition is recorded. Identical to the ' +
+          'value the retention purge sweep measures the window from.'
+      ),
+    purgeAfter: z
+      .string()
+      .nullable()
+      .describe(
+        'EARLIEST POSSIBLE purge time (ISO 8601) — `archivedAt + retentionMs` ' +
+          '— NOT a guaranteed deadline: the purge sweep is timer-driven ' +
+          '(default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset ' +
+          'that still has live child assets, so the asset commonly stays ' +
+          'restorable past this instant. Reaching it does NOT mean the next ' +
+          'restore returns 410. `null` means the asset will never be purged: ' +
+          'either retention is disabled (`retentionMs` 0) or `archivedAt` ' +
+          'cannot be parsed, which the sweep also refuses to purge on.'
+      ),
+    retentionMs: z
+      .number()
+      .int()
+      .min(0)
+      .describe(
+        'The effective instance-global archived-asset retention window in ' +
+          'milliseconds at read time (the same value GET /api/v1/retention/' +
+          'config reports). 0 means retention is disabled — never purge.'
+      )
+  })
+  .describe(
+    'Retention window for an archived asset (issue #1034). Present only while ' +
+      '`status` is `archived`; absent on every other asset.'
+  );
+
 const assetSchema = z.object({
   id: z.string(),
   // Canonical editorial title of the asset (issue #347). This is the ONE
@@ -912,6 +981,10 @@ const assetSchema = z.object({
   subtitleTracks: z.array(subtitleTrackOutSchema).optional(),
   // First-class tags (issue #11). Absent until the first tag is set.
   tags: z.array(z.string()).optional(),
+  // Per-asset retention window (issue #1034). Derived, read-only, and present
+  // ONLY while `status === "archived"` — see retentionWindowSchema above. It is
+  // not persisted on the asset document and is never accepted from a client.
+  retention: retentionWindowSchema.optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -1073,6 +1146,19 @@ type AssetsRouterOptions = {
   // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
+  // The EFFECTIVE instance-global archived-asset retention window, in ms, read
+  // per request (issue #1034). A getter rather than a number so the read path
+  // sees the live value PATCH /api/v1/retention/config hot-swaps — main.ts binds
+  // it to the same `archiveRetentionMs` instance global the purge loop ticks on
+  // (`retentionMs: () => archiveRetentionMs`), so the window a read reports and
+  // the window the sweep enforces cannot drift.
+  //
+  // When absent (tests and any wiring that does not pass it) it falls back to
+  // `archiveRetentionMsFromEnv()`, evaluated per call — the SAME env var
+  // (ARCHIVE_RETENTION_MS) main.ts resolves the boot value from, so an unwired
+  // router reports the deployment's configured window rather than inventing one.
+  // Used only to derive the read-only `retention` member of an archived asset.
+  retentionMs?: () => number;
 };
 
 // Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
@@ -1760,6 +1846,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const storageFor = opts.storageFor;
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
+  // Live read of the effective archived-asset retention window (issue #1034).
+  // Called per request so the derived `retention` member reflects a hot-swapped
+  // PATCH /api/v1/retention/config; falls back to the env var main.ts boots from.
+  const retentionMsNow = opts.retentionMs ?? archiveRetentionMsFromEnv;
+
+  // Attach the derived, read-only `retention` window to an asset about to be
+  // serialized through `assetSchema` (issue #1034). A no-op for any asset that
+  // is not `archived`: assetRetentionWindow returns undefined and the response
+  // simply carries no `retention` member (the field is optional, so this stays
+  // additive and non-breaking for every existing client). Nothing is persisted —
+  // the window is projected from the asset's own statusHistory plus the live
+  // instance-global policy at read time.
+  function withRetentionWindow(asset: Asset): Asset & { retention?: AssetRetentionWindow } {
+    const retention = assetRetentionWindow(asset, retentionMsNow());
+    return retention ? { ...asset, retention } : asset;
+  }
 
   // Resolve the scaler/Encore context key for a transcode request (issue #615).
   // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
@@ -2925,7 +3027,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!created.ok) {
         return reply.code(400).send({ error: 'invalid_created_range', message: created.message });
       }
-      return repo.list({ ...rest, ...created.range });
+      const page = await repo.list({ ...rest, ...created.range });
+      // Same derived `retention` member as GET /:id (issue #1034), so a client
+      // listing `?status=archived` reads the window from the same contract
+      // instead of re-deriving it per row. Non-archived items are untouched.
+      return { ...page, items: page.items.map(withRetentionWindow) };
     }
   );
 
@@ -3145,7 +3251,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(asset);
+      return reply.code(200).send(withRetentionWindow(asset));
     }
   );
 
@@ -3204,7 +3310,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -3400,7 +3506,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
         }
         if (state.kind === 'asset') {
-          return reply.code(200).send(state.asset);
+          // `retention` (issue #1034) is attached here, not persisted: an
+          // archived asset reports its earliest-possible purge time derived from
+          // the live retention policy; any other asset is unchanged.
+          return reply.code(200).send(withRetentionWindow(state.asset));
         }
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -3408,7 +3517,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(asset);
+      return reply.code(200).send(withRetentionWindow(asset));
     }
   );
 
@@ -3478,7 +3587,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         assetId: request.params.id,
         versionGroupId: target?.versionGroupId,
         currentVersionId: current,
-        versions
+        // The chain deliberately includes `archived` members (lineage history),
+        // so each one carries the same derived `retention` window GET /:id
+        // reports (issue #1034); live members carry none.
+        versions: versions.map(withRetentionWindow)
       });
     }
   );
@@ -5273,7 +5385,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         },
         request.log
       );
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5482,7 +5594,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5510,7 +5622,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5572,7 +5684,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5619,7 +5731,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           request.log
         );
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5749,7 +5861,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5771,7 +5883,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!updated) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(updated);
+      return reply.code(200).send(withRetentionWindow(updated));
     }
   );
 
@@ -5794,6 +5906,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // this API does not relocate bytes), so a restored asset whose bytes were
   // relocated to the `archive` tier reports `ready` while those bytes are still
   // cold — the response never claims otherwise.
+  // The 200 body likewise carries NO `retention` member (issue #1034): the
+  // window is attached by the same uniform rule as everywhere else, and the
+  // restored asset has just left `archived`, so there is no purge window left to
+  // report. The pre-restore window is readable from `GET /:id` while the asset
+  // is still archived.
   app.post(
     '/:id/restore',
     {
@@ -5837,7 +5954,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         },
         request.log
       );
-      return reply.code(200).send(restored);
+      return reply.code(200).send(withRetentionWindow(restored));
     }
   );
 };

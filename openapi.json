@@ -2392,6 +2392,32 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -2937,6 +2963,32 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                           },
                           "createdAt": {
                             "type": "string"
@@ -3627,6 +3679,32 @@
                               "type": "string"
                             }
                           },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -4138,6 +4216,32 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                           },
                           "createdAt": {
                             "type": "string"
@@ -4726,6 +4830,32 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -5288,6 +5418,32 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                     },
                     "createdAt": {
                       "type": "string"
@@ -6028,6 +6184,32 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -6607,6 +6789,32 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                     },
                     "createdAt": {
                       "type": "string"
@@ -7286,6 +7494,32 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                           },
                           "createdAt": {
                             "type": "string"
@@ -10081,6 +10315,32 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -10712,6 +10972,32 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                     },
                     "createdAt": {
                       "type": "string"
@@ -11477,6 +11763,32 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                     },
                     "createdAt": {
                       "type": "string"
@@ -12508,6 +12820,32 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -13026,6 +13364,32 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                     },
                     "createdAt": {
                       "type": "string"
@@ -13638,6 +14002,32 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -14192,6 +14582,32 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -14699,6 +15115,32 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                     },
                     "createdAt": {
                       "type": "string"
@@ -15209,6 +15651,32 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded. Identical to the value the retention purge sweep measures the window from."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "EARLIEST POSSIBLE purge time (ISO 8601) \u2014 `archivedAt + retentionMs` \u2014 NOT a guaranteed deadline: the purge sweep is timer-driven (default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset that still has live child assets, so the asset commonly stays restorable past this instant. Reaching it does NOT mean the next restore returns 410. `null` means the asset will never be purged: either retention is disabled (`retentionMs` 0) or `archivedAt` cannot be parsed, which the sweep also refuses to purge on."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The effective instance-global archived-asset retention window in milliseconds at read time (the same value GET /api/v1/retention/config reports). 0 means retention is disabled \u2014 never purge."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Retention window for an archived asset (issue #1034). Present only while `status` is `archived`; absent on every other asset."
                     },
                     "createdAt": {
                       "type": "string"
