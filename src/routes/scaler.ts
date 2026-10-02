@@ -94,8 +94,13 @@ const instanceSchema = z.object({
 // the two are finally distinguishable without reading pod logs.
 //
 // `message` is pre-redacted at WRITE time (spawn-failure.ts
-// redactSpawnFailureMessage): credentials, URLs and tokens never reach this
-// field, because OSC error text can echo the request body the spawn sent.
+// redactSpawnFailureMessage): credentials, URLs, bare network locations and
+// tokens never reach this field, because OSC error text can echo the request
+// body the spawn sent — and because this router is deliberately unauthenticated
+// (see the header), so whatever lands in the field is public. The redaction is
+// structural rather than a literal-secret list for exactly that reason (#1071
+// review finding 2): a failed spawn is often a transport failure, and those
+// quote internal hostnames and IP:port pairs with no scheme to recognise them by.
 // Absent entirely when the last spawn succeeded or none has failed in
 // SPAWN_FAILURE_TTL_MS.
 const spawnFailureSchema = z
@@ -121,8 +126,10 @@ const spawnFailureSchema = z
       .string()
       .describe(
         'Error text from the failed spawn, redacted at write time: credentials, ' +
-          'URLs and tokens are stripped, as is any HTML markup, because upstream ' +
-          'error text can echo the request the spawn sent.'
+          'tokens, URLs and bare network locations (host, host:port, IP:port) are ' +
+          'stripped, as is any HTML markup, because upstream error text can echo ' +
+          'the request the spawn sent. This endpoint is unauthenticated, so the ' +
+          'field carries the SHAPE of the failure, not its details.'
       )
   })
   .describe(

@@ -19,13 +19,27 @@
 // it is scrubbed before it is ever written: OSC error text can quote the request
 // body we sent (which carries the workspace's object-storage credentials), the
 // bearer token, or instance/ingress URLs. redactSpawnFailureMessage() strips
-// known literal secrets, every URL, every auth-scheme header value, every
-// `name: value` pair whose NAME reads like a credential, and JWT-shaped blobs,
-// then strips HTML markup (#1071: an OSC gateway timeout is answered with a
-// whole HTML error page, which the SDK hands us as the error message) and
-// truncates. Over-redaction is the intended failure mode: an operator
-// needs the SHAPE of the failure ("403 from the orchestrator", "timed out
-// waiting for ... to report running"), not the secret inside it.
+// known literal secrets, every URL, every NETWORK LOCATION (IP or DNS name,
+// with or without a port), every auth-scheme header value, every `name: value`
+// pair whose NAME reads like a credential, every credential-named field whose
+// value is merely SPACE-separated, and JWT-shaped blobs, then strips HTML markup
+// (#1071: an OSC gateway timeout is answered with a whole HTML error page, which
+// the SDK hands us as the error message) and truncates. Over-redaction is the
+// intended failure mode: an operator needs the SHAPE of the failure ("403 from
+// the orchestrator", "timed out waiting for ... to report running"), not the
+// secret inside it.
+//
+// The network-location pass matters because GET /scaler/status is deliberately
+// UNAUTHENTICATED (src/routes/scaler.ts) and this record is served there, so the
+// message is public (#1071 review finding 2). A spawn failure is frequently a
+// transport failure, and those name internal topology directly rather than as a
+// URL the URL pass would catch:
+//   "getaddrinfo ENOTFOUND cache-7f3a.internal.example.net"
+//   "connect ECONNREFUSED 10.42.3.17:6379"
+//   "endpoint store-a1b2.svc.cluster.local:9000 unreachable"
+// None of those carry a scheme, and a literal-secret match on the configured
+// `redis://10.42.3.17:6379` does not cover the bare `10.42.3.17:6379` inside an
+// ECONNREFUSED either, so both are handled structurally here.
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - keys.spawnFailure(workspaceId) / SpawnFailureRecord — defined in
@@ -68,6 +82,73 @@ const MIN_LITERAL_SECRET_LENGTH = 4;
 // a pre-signed query string.
 const URL_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>\\]+/gi;
 
+// A bare NETWORK LOCATION: an IPv4 literal, a bracketed IPv6 literal, or a
+// dotted DNS name — each with an optional `:port` (#1071 review finding 2).
+// Candidates are matched broadly here and then filtered in
+// isNetworkLocation() below, because the shape overlaps with things an operator
+// genuinely needs to keep reading (a version string, a file reference).
+const NETWORK_LOCATION_PATTERN =
+  /(?:\[[0-9A-Fa-f:]{3,}\]|\b[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)(?::\d{1,5})?/g;
+
+const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+// Extensions of things this system actually names in error text. Only consulted
+// for a candidate with NO port, so `store.example:9000` is still a host even if
+// something is one day called `example`.
+const FILE_SUFFIXES = new Set([
+  'conf',
+  'csv',
+  'html',
+  'js',
+  'json',
+  'log',
+  'm3u8',
+  'md',
+  'mp4',
+  'mpd',
+  'sh',
+  'ts',
+  'txt',
+  'xml',
+  'yaml',
+  'yml'
+]);
+
+// Does a NETWORK_LOCATION_PATTERN candidate really name a host?
+//
+// Kept deliberately narrow in one direction only: a candidate that is NOT a
+// host must survive, because this pass runs over the only diagnostic text the
+// operator gets. Three shapes are therefore excluded:
+//   - a dotted number (`1.18.0`, `0.24.0`) — an upstream version, and nginx's
+//     own 504 page ends with one;
+//   - a name whose last label is not at least two letters (`e.g`, `v1.2`), which
+//     cannot be a TLD or a Kubernetes-style suffix;
+//   - a port-less FILE NAME (`profiles.yaml`, `manifest.m3u8`). A file name is
+//     not topology, and "failed to load [redacted]" is a materially worse
+//     answer to "why can this workspace not grow" than the file name is a leak.
+// An IPv4 literal is always a host. Everything else that looks like
+// `label.label[.label]` is treated as one, including single-label-plus-TLD and
+// `.internal` / `.svc.cluster.local` forms.
+//
+// NOT matched: a single-label `host:port` such as `cache:6379`. That shape is
+// indistinguishable from `status:504` / `httpCode:502` by inspection, and
+// redacting the status out of a spawn failure would defeat the point of the
+// record. It is instead covered by the literal pass: spawnFailureSecrets()
+// derives the host and host:port of every URL-shaped secret the spawn held
+// (see below), which is where a single-label internal name comes from in
+// practice.
+function isNetworkLocation(candidate: string): boolean {
+  const hasPort = /:\d{1,5}$/.test(candidate);
+  const host = candidate.replace(/:\d{1,5}$/, '');
+  if (host.startsWith('[')) return true; // bracketed IPv6
+  if (IPV4.test(host)) return true;
+  if (/^[\d.]+$/.test(host)) return false; // dotted version number
+  const labels = host.split('.');
+  const last = (labels[labels.length - 1] ?? '').toLowerCase();
+  if (!hasPort && FILE_SUFFIXES.has(last)) return false;
+  return /^[A-Za-z]{2,}$/.test(last);
+}
+
 // `Authorization: Bearer <token>` and friends, in whatever casing.
 const AUTH_SCHEME_PATTERN = /\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 
@@ -77,6 +158,21 @@ const AUTH_SCHEME_PATTERN = /\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 // every field name in advance.
 const SENSITIVE_FIELD_PATTERN =
   /("?[A-Za-z0-9_.-]*(?:secret|token|password|passwd|credential|authorization|accesskey|apikey|key)[A-Za-z0-9_.-]*"?)(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}\]&]+)/gi;
+
+// The same credential-ish NAME followed only by WHITESPACE (#1071 review
+// suggestion 5): `x-api-key abc123DEFghi456 rejected`, or a header/env name
+// echoed with its value in a log line. The separator-less form needs a stricter
+// test on the VALUE, or "secret not found" would redact the word "not" and the
+// message would stop being readable. A space-separated value therefore only
+// counts as a credential when it could not be ordinary prose:
+//   - >= 12 characters of credential alphabet containing BOTH a letter and a
+//     digit (an access key id, a hex/base62 token), or
+//   - >= 20 characters of pure base64/base64url alphabet (a secret access key,
+//     which can be all letters).
+// Anything shorter or wordlike survives, and only the single whitespace-adjacent
+// token is consumed, so trailing diagnostic text ("rejected") is kept.
+const SENSITIVE_FIELD_SPACED_PATTERN =
+  /("?[A-Za-z0-9_.-]*(?:secret|token|password|passwd|credential|authorization|accesskey|apikey|key)[A-Za-z0-9_.-]*"?)(\s+)((?=[A-Za-z0-9._~+/=-]*[A-Za-z])(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{12,}|[A-Za-z0-9+/=_-]{20,})(?![A-Za-z0-9._~+/=-])/gi;
 
 // A JWT-shaped blob, for a bare token that appears with no label at all.
 const JWT_PATTERN = /\beyJ[A-Za-z0-9._-]{10,}/g;
@@ -131,9 +227,19 @@ export function redactSpawnFailureMessage(
   }
 
   text = text.replace(URL_PATTERN, REDACTED);
+  // After URLs (whose host is already gone with the whole URL) and before the
+  // field passes, so a bare host that appears as a field VALUE is caught by
+  // whichever pass reaches it first.
+  text = text.replace(NETWORK_LOCATION_PATTERN, (match) =>
+    isNetworkLocation(match) ? REDACTED : match
+  );
   text = text.replace(AUTH_SCHEME_PATTERN, (_match, scheme: string) => `${scheme} ${REDACTED}`);
   text = text.replace(
     SENSITIVE_FIELD_PATTERN,
+    (_match, name: string, separator: string) => `${name}${separator}${REDACTED}`
+  );
+  text = text.replace(
+    SENSITIVE_FIELD_SPACED_PATTERN,
     (_match, name: string, separator: string) => `${name}${separator}${REDACTED}`
   );
   text = text.replace(JWT_PATTERN, REDACTED);
@@ -163,7 +269,35 @@ export function spawnFailureSecrets(
     config.s3Config?.secretAccessKey,
     ...extra
   ];
-  return secrets.filter((s): s is string => typeof s === 'string' && s.trim() !== '');
+  const literals = secrets.filter(
+    (s): s is string => typeof s === 'string' && s.trim() !== ''
+  );
+  return [...literals, ...literals.flatMap(derivedUrlLiterals)];
+}
+
+// The pieces of a URL-shaped secret that can appear in an error WITHOUT the
+// scheme that made it a URL (#1071 review finding 2).
+//
+// A transport failure quotes the authority on its own: a configured
+// `redis://10.42.3.17:6379` comes back as `connect ECONNREFUSED 10.42.3.17:6379`,
+// which the literal pass misses because the literal still has its scheme. The
+// host, the host:port and any userinfo are therefore added as literals in their
+// own right. This is what covers the single-label internal name
+// (`cache:6379`) that the structural network-location pass deliberately leaves
+// alone. Not a URL => no derived literals.
+function derivedUrlLiterals(secret: string): string[] {
+  let url: URL;
+  try {
+    url = new URL(secret);
+  } catch {
+    return [];
+  }
+  const derived = [url.host, url.hostname];
+  // Userinfo is a credential in its own right, and `URL` is the only thing that
+  // can reliably separate it from the host.
+  if (url.password) derived.push(decodeURIComponent(url.password));
+  if (url.username) derived.push(decodeURIComponent(url.username));
+  return derived.filter((value) => value !== '');
 }
 
 // Read the workspace's last recorded spawn failure.

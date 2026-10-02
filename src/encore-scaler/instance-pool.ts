@@ -9,12 +9,17 @@
 //   createInstance(context, serviceId, token, body): Promise<any>
 //   removeInstance(context, serviceId, name, token): Promise<void>
 //   getInstance(context, serviceId, name, token): Promise<any>           (:56)
-//     — resolves UNDEFINED on ANY failure except 401. lib/core.js:140-150
-//       rethrows only a FetchError with httpCode 401 (as UnauthorizedError);
-//       every other error — a 404, but equally a 500, a 504 or a dropped socket —
-//       falls out of the catch and the function returns undefined. So `undefined`
-//       means "could not confirm", NOT "does not exist", and no adopt path below
-//       may read it as success OR as proof of absence.
+//     — resolves UNDEFINED on ANY response failure except 401. lib/core.js:140-148
+//       rethrows only a FetchError with httpCode 401 (as UnauthorizedError, :142-143)
+//       and maps 404 to undefined (:145-146); every other error — a 500, a 504 or a
+//       dropped socket — falls out of the catch to `return undefined` (:149). So
+//       `undefined` means "could not confirm", NOT "does not exist", and no adopt
+//       path below may read it as success OR as proof of absence.
+//     — but it CAN still throw, which is why every call below goes through
+//       tryGetInstance(): the `getService(context, serviceId)` subscription lookup
+//       at lib/core.js:128 is OUTSIDE that try block, so a failing service catalog
+//       ("Service X not found in your subscriptions", or any FetchError from
+//       /mysubscriptions) propagates, as does UnauthorizedError on a 401.
 //   getInstanceHealth(context, serviceId, name, token): Promise<string>  (:86)
 // The Encore serviceId is 'encore' (src/services/stack.ts:25). The returned
 // instance object carries `name` (instance id) and `url` — same fields the
@@ -68,6 +73,45 @@ function instanceName(instance: OscInstance): string {
     return instance.name;
   }
   throw new Error('encore instance did not return a usable name');
+}
+
+// getInstance as a TOTAL "could you confirm this instance?" probe (#1071 review
+// finding 4).
+//
+// Every adopt path below runs INSIDE a `catch` for a failed createInstance, and
+// it is there precisely because OSC is unhealthy. getInstance is not total —
+// `getService` sits outside its internal try (lib/core.js:128) and a 401 is
+// rethrown as UnauthorizedError (:142-143) — so calling it bare let the PROBE's
+// error escape the retry loop: it discarded `lastErr`, skipped the remaining
+// attempts and their back-off, and became the error recorded against the spawn,
+// so the operator saw "Service encore not found in your subscriptions" instead of
+// the create's real failure.
+//
+// A probe failure is therefore folded back into "could not confirm" (undefined),
+// which the callers already handle by backing off and retrying the create. The
+// probe error is logged, never propagated.
+async function tryGetInstance(
+  config: EncoreScalerConfig,
+  serviceId: string,
+  name: string,
+  token: string
+): Promise<OscInstance | undefined> {
+  try {
+    return (await getInstance(config.oscContext, serviceId, name, token)) as
+      | OscInstance
+      | undefined;
+  } catch (err) {
+    console.warn(
+      '[encore-scaler] spawn: could not probe %s instance %s while adopting ' +
+        '(workspace=%s) — treating as unconfirmed and keeping the original create ' +
+        'error (#1071):',
+      serviceId,
+      name,
+      config.workspaceId,
+      err
+    );
+    return undefined;
+  }
 }
 
 // Read every instance record from the pool hash.
@@ -526,12 +570,10 @@ async function spawnPooledInstance(
       // creating a duplicate, the same idempotency src/routes/provision.ts:822-843
       // implements for the provisioning path (#417).
       if (isNameAlreadyTakenError(err)) {
-        const existing = (await getInstance(
-          config.oscContext,
-          ENCORE_SERVICE_ID,
-          name,
-          sat
-        )) as OscInstance | undefined;
+        // tryGetInstance, not getInstance: a probe that itself fails must not
+        // replace the create's error or abandon the retry loop (#1071 review
+        // finding 4).
+        const existing = await tryGetInstance(config, ENCORE_SERVICE_ID, name, sat);
         if (existing) {
           instance = existing;
           instanceAdopted = true;
@@ -631,15 +673,16 @@ async function spawnPooledInstance(
         // listener is named after its Encore instance, so a 504'd create that
         // landed behind the gateway makes the retry collide with itself.
         if (isNameAlreadyTakenError(err)) {
-          const existing = (await getInstance(
-            config.oscContext,
+          const existing = await tryGetInstance(
+            config,
             ENCORE_CALLBACK_LISTENER_SERVICE_ID,
             instanceId,
             callbackSat
-          )) as OscInstance | undefined;
+          );
           // As above, `undefined` here means "could not confirm" rather than
-          // "absent" (lib/core.js:140-150), so it falls through to the normal
-          // transient classification instead of being treated as proof.
+          // "absent" (lib/core.js:140-149) — and a probe that threw is folded
+          // into the same answer by tryGetInstance — so it falls through to the
+          // normal transient classification instead of being treated as proof.
           if (existing) {
             callback = existing;
             listenerAdopted = true;

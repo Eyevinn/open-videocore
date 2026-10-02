@@ -13,8 +13,9 @@
 //
 // The platform side of this — a synchronous createInstance that answers 504 while
 // a new worker node is provisioned, with no idempotency key to make the retry
-// unambiguous — is logged as OSC friction in the engagement repo and summarised
-// on issue #1071; nothing in this repository can prevent the 504 itself.
+// unambiguous — is logged as OSC friction per CLAUDE.md rule 6 in
+// docs/osc-feedback/incoming-osc-createinstance-504-node-provisioning.md and
+// summarised on issue #1071; nothing in this repository can prevent the 504 itself.
 //
 // The error carries the status structurally and always has: @osaas/client-core's
 // defaultErrorFactory builds `new FetchError({ message, httpCode: response.status })`
@@ -65,6 +66,23 @@ const TRANSIENT_MESSAGE_MARKERS = [
   'context deadline exceeded'
 ];
 
+// The two 4xx statuses that are retryable BY DEFINITION, so they are classified
+// with the 5xx rather than with the rejections (#1071 review suggestion 5):
+//
+//   408 Request Timeout — the server gave up waiting for the request, i.e. it
+//     never processed it. RFC 9110 §15.5.9 says the client MAY repeat it.
+//   429 Too Many Requests — rate limiting. The only correct response is to wait
+//     and repeat; treating it as permanent means a scale-up that collides with
+//     another tenant's burst fails outright and the pool does not grow.
+//
+// Retry-After is NOT honoured, and cannot be from here: @osaas/client-core
+// discards the response once it has built the error, so the thrown FetchError
+// carries only `{ message, httpCode }` (lib/fetch.js defaultErrorFactory, class
+// FetchError) with no headers. Callers therefore apply their own fixed back-off,
+// which is why this is logged with the rest of the createInstance friction in
+// docs/osc-feedback/incoming-osc-createinstance-504-node-provisioning.md.
+const RETRYABLE_CLIENT_STATUSES = new Set([408, 429]);
+
 // Should a failed OSC call be retried?
 //
 //   - 5xx (500, 502, 503 and — the #1071 regression — 504) => transient.
@@ -72,13 +90,18 @@ const TRANSIENT_MESSAGE_MARKERS = [
 //     gateway: OSC answers it while a new worker node is being provisioned, and
 //     the instance usually does get created. Callers must therefore pair the
 //     retry with adopt-on-"already taken" (isNameAlreadyTakenError below).
+//   - 408 and 429 => transient (see above).
 //   - Any other status, 4xx above all => permanent. A rejected request body, a
 //     bad token or an exhausted quota will fail identically on every attempt;
 //     retrying burns the back-off budget and delays the real error.
 //   - No status at all => fall back to the transport/orchestrator markers.
 export function isTransientOscError(err: unknown): boolean {
   const httpCode = oscHttpCode(err);
-  if (httpCode !== undefined) return httpCode >= 500 && httpCode <= 599;
+  if (httpCode !== undefined) {
+    return (
+      (httpCode >= 500 && httpCode <= 599) || RETRYABLE_CLIENT_STATUSES.has(httpCode)
+    );
+  }
   const message = err instanceof Error ? err.message : String(err ?? '');
   return TRANSIENT_MESSAGE_MARKERS.some((marker) => message.includes(marker));
 }

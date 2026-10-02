@@ -313,10 +313,18 @@ describe('OSC error classification is structural, not textual (#1071)', () => {
     }
   });
 
-  it('never retries a 4xx', () => {
+  it('never retries a 4xx the server actually rejected', () => {
     for (const code of [400, 401, 403, 404, 409, 422]) {
       expect(isTransientOscError(new FakeFetchError('rejected', code))).toBe(false);
     }
+  });
+
+  // #1071 review suggestion 5: the two 4xx that are retryable by definition.
+  // Classified permanent, a 429 made a scale-up that merely collided with
+  // another tenant's burst fail outright, and the pool did not grow.
+  it('retries the two 4xx that mean "not processed yet"', () => {
+    expect(isTransientOscError(new FakeFetchError('Too Many Requests', 429))).toBe(true);
+    expect(isTransientOscError(new FakeFetchError('Request Timeout', 408))).toBe(true);
   });
 
   it('does not retry a 4xx whose message merely contains "503"', () => {
@@ -473,6 +481,43 @@ describe('a retry after a 504 adopts the instance the 504 created (#1071)', () =
     // giving adoption another chance each time, then threw the original error.
     expect(createInstanceMock).toHaveBeenCalledTimes(3);
     expect(getInstanceMock).toHaveBeenCalledTimes(3);
+    expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(0);
+  });
+
+  // #1071 review finding 4. getInstance is NOT total: `getService` sits outside
+  // its internal try (lib/core.js:128) and a 401 is rethrown as
+  // UnauthorizedError (:142-143). Called bare inside the create's `catch`, a
+  // failing probe — likely, since we are there because OSC is unhealthy —
+  // escaped the retry loop, discarded the create's error, and skipped the
+  // remaining attempts and their back-off. The operator then saw the probe's
+  // error recorded against the spawn instead of the create's.
+  it('keeps the create error and finishes the retry loop when the adopt probe itself throws', async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedis();
+    createInstanceMock.mockRejectedValue(nameAlreadyTaken());
+    getInstanceMock.mockRejectedValue(
+      new Error('Service encore not found in your subscriptions')
+    );
+
+    const spawn = spawnInstance(makeConfig(redis)).catch((err: unknown) => err);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = (await spawn) as Error;
+
+    // The CREATE's error is what propagates and what is recorded, not the probe's.
+    expect(result.message).toMatch(/already taken/);
+    expect(result.message).not.toMatch(/not found in your subscriptions/);
+    const failure = await readSpawnFailure(
+      redis as unknown as Parameters<typeof readSpawnFailure>[0],
+      WORKSPACE
+    );
+    expect(failure?.message).toMatch(/already taken/);
+    expect(failure?.message).not.toMatch(/subscriptions/);
+    // The back-off and the remaining attempts still happened: a probe that
+    // cannot answer is "could not confirm", which is retry-worthy because the
+    // name is fixed and a retry therefore cannot duplicate.
+    expect(createInstanceMock).toHaveBeenCalledTimes(3);
+    expect(getInstanceMock).toHaveBeenCalledTimes(3);
+    expect(failure?.attempts).toBe(3);
     expect(Object.keys(await redis.hgetall(keys.pool(WORKSPACE)))).toHaveLength(0);
   });
 

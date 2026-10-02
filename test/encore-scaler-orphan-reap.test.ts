@@ -424,10 +424,18 @@ describe('orphan reaper — instances on OSC with no pool record (issue #778)', 
     expect(await redis.hgetall(keys.orphanSeen(workspaceId))).toEqual({});
   });
 
-  it('NEVER destroys an orphan whose real state cannot be confirmed', async () => {
+  // The protection is now scoped to an orphan OSC still reports as RUNNING: that
+  // one really could be mid-transcode behind a network problem. An unreachable
+  // orphan OSC does NOT report running is reaped instead of surviving every sweep
+  // forever (#1071 review finding 1) — asserted in
+  // test/encore-scaler-spawn-504-node-provisioning.test.ts, 'the orphan sweep can
+  // reclaim an unreachable instance'. getInstanceHealth defaults to 'running' in
+  // beforeEach, which is the case under test here.
+  it('NEVER destroys a RUNNING orphan whose real in-flight state cannot be confirmed', async () => {
     const redis = new FakeRedis();
     listOnlyEncore([{ name: orphanId, url: `https://${orphanId}.example` }]);
     await seenLongAgo(redis, orphanId);
+    getInstanceHealth.mockResolvedValue('running');
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => {

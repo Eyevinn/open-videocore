@@ -82,6 +82,7 @@ import {
   readSpawnFailure,
   recordSpawnFailure,
   redactSpawnFailureMessage,
+  spawnFailureSecrets,
   SPAWN_FAILURE_MESSAGE_MAX_LENGTH
 } from '../src/encore-scaler/spawn-failure.js';
 import {
@@ -360,6 +361,95 @@ describe('spawn-failure message redaction (issue #1071)', () => {
     expect(message).not.toContain('unknown-value-9999');
     expect(message).not.toContain('hunter2hunter2');
     expect(message).toContain('rejected');
+  });
+
+  // #1071 review finding 2. GET /scaler/status is deliberately unauthenticated,
+  // so this message is public. A failed spawn is very often a TRANSPORT failure,
+  // and those name internal topology without a scheme — which is exactly what
+  // the URL pass could not see.
+  it('redacts a bare internal hostname, an IP:port and a cluster-local host:port', () => {
+    const cases = [
+      'getaddrinfo ENOTFOUND cache-7f3a.internal.example.net',
+      'connect ECONNREFUSED 10.42.3.17:6379',
+      'object store endpoint store-a1b2.svc.cluster.local:9000 unreachable',
+      'proxy [fd00:ec2::23]:8080 refused the connection'
+    ];
+    for (const text of cases) {
+      const message = redactSpawnFailureMessage(new Error(text));
+      expect(message).not.toContain('cache-7f3a');
+      expect(message).not.toContain('internal.example.net');
+      expect(message).not.toContain('10.42.3.17');
+      expect(message).not.toContain('svc.cluster.local');
+      expect(message).not.toContain('fd00:ec2::23');
+      expect(message).toContain('[redacted]');
+    }
+    // The failure SHAPE still survives all of it — that is the whole point of
+    // the record.
+    expect(redactSpawnFailureMessage(new Error(cases[1]!))).toContain('ECONNREFUSED');
+    expect(redactSpawnFailureMessage(new Error(cases[0]!))).toContain('ENOTFOUND');
+  });
+
+  it('keeps the diagnostics that merely LOOK like a host', () => {
+    // A dotted version number (nginx's 504 page ends with one), a status code
+    // written with a colon, and a short abbreviation must all survive: an
+    // operator reading "the pool cannot grow" has nothing else to go on.
+    const message = redactSpawnFailureMessage(
+      new Error('upstream nginx/1.18.0 returned status:504 (e.g. node provisioning)')
+    );
+    expect(message).toContain('1.18.0');
+    expect(message).toContain('status:504');
+    expect(message).toContain('e.g.');
+
+    // A file name is not topology, and it is often the whole answer to "why can
+    // this workspace not grow".
+    const fileNames = redactSpawnFailureMessage(
+      new Error('could not load profiles.yaml referenced by manifest.m3u8')
+    );
+    expect(fileNames).toContain('profiles.yaml');
+    expect(fileNames).toContain('manifest.m3u8');
+  });
+
+  it('redacts the bare host:port of a URL-shaped secret the spawn held', () => {
+    // The literal pass alone could not do this: the configured literal still has
+    // its scheme (`redis://cache:6379`), while the error quotes only the
+    // authority. spawnFailureSecrets() therefore derives host and host:port.
+    const secrets = spawnFailureSecrets({
+      redisUrl: 'redis://admin:s3cr3t-pass@cache:6379',
+      s3Config: undefined
+    });
+    const message = redactSpawnFailureMessage(
+      new Error('connect ECONNREFUSED cache:6379'),
+      secrets
+    );
+    expect(message).not.toContain('cache:6379');
+    expect(message).toContain('ECONNREFUSED');
+    // Userinfo is a credential in its own right.
+    expect(
+      redactSpawnFailureMessage(new Error('auth failed for s3cr3t-pass'), secrets)
+    ).not.toContain('s3cr3t-pass');
+  });
+
+  // #1071 review suggestion 5.
+  it('redacts a credential whose value is only SPACE-separated from its name', () => {
+    const spacedKey = redactSpawnFailureMessage(
+      new Error('x-api-key abc123DEFghi456 rejected')
+    );
+    expect(spacedKey).not.toContain('abc123DEFghi456');
+    expect(spacedKey).toContain('rejected');
+
+    // An all-letters secret, which is why the >= 20 base64-alphabet branch
+    // exists: there is no digit to key off.
+    const spacedSecret = redactSpawnFailureMessage(
+      new Error('STORE_SECRET_ACCESS_KEY ZqvNhKpLsTwRyUbCdFgJmXaEkHtPrSdQ')
+    );
+    expect(spacedSecret).not.toContain('ZqvNhKpLsTwRyUbCdFgJmXaEkHtPrSdQ');
+  });
+
+  it('does not eat ordinary prose that follows a credential-ish word', () => {
+    const message = redactSpawnFailureMessage(
+      new Error('secret not found for key profiles and token missing')
+    );
+    expect(message).toBe('secret not found for key profiles and token missing');
   });
 
   it('truncates a wall of upstream text and never yields an empty message', () => {

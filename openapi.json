@@ -19872,7 +19872,7 @@
                               },
                               "message": {
                                 "type": "string",
-                                "description": "Error text from the failed spawn, redacted at write time: credentials, URLs and tokens are stripped, as is any HTML markup, because upstream error text can echo the request the spawn sent."
+                                "description": "Error text from the failed spawn, redacted at write time: credentials, tokens, URLs and bare network locations (host, host:port, IP:port) are stripped, as is any HTML markup, because upstream error text can echo the request the spawn sent. This endpoint is unauthenticated, so the field carries the SHAPE of the failure, not its details."
                               }
                             },
                             "required": [
