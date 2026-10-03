@@ -529,6 +529,48 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* Subtitle add/remove controls in the tracks panel (issue #940).
+
+   The add form is set off from the list above it by a rule rather than a filled
+   panel: it is a continuation of the Subtitles section, not a separate card, and
+   a box would read as a fourth track kind. */
+.subtitle-add-form {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+/* The per-row Remove cell. Narrow and never the growing column — the content
+   columns get the width. */
+.cell-action {
+  width: 1%;
+  white-space: nowrap;
+}
+
+/* The inline outcome area for both subtitle controls. It is a live region that
+   exists even while empty (so an insertion is announced), which means it must
+   collapse to nothing when there is no message — no margin, no min-height, or
+   an empty region would push the form away from the table it belongs to. */
+.subtitle-track-msg:empty {
+  display: none;
+}
+
+/* The field a refusal is about. Colour is the SECOND signal, never the only one:
+   the message in .subtitle-track-msg names the field in words and focus is moved
+   into it, so this is reinforcement for a sighted reader (WCAG 1.4.1) and
+   aria-invalid carries it to assistive technology. */
+.subtitle-add-form [aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+/* Checkbox + its text on one line, so the hit target covers the label (the
+   <label> wraps the input) and the two never wrap apart. */
+.subtitle-add-default-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
