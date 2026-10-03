@@ -2065,12 +2065,25 @@ async function renderAssetsTab(container) {
   // "Needs attention" checkbox: operators isolate `processing` via the status
   // filter; the per-row "Needs attention" badge + inline Re-drive action are
   // preserved by the table's Status/Actions column renderers.
+  // ── Bulk-action bar (issue #916) ──
+  // Mounted above the table and declared before it so the table's
+  // `onSelectionChange` can hand it every change. It starts with an empty
+  // selection, which is the state its controls render as disabled.
+  let bulkBar = null;
+
   assetsTable = createAssetsTable({
     apiFetch,
     renderBadge,
     renderTags,
     fmtDate,
     isAssetWedged,
+    // Opt in to the leading tick-box column (issue #916). Without this the
+    // table renders exactly as before, which is what every other consumer of
+    // createAssetsTable still gets.
+    selectable: true,
+    onSelectionChange: function (selection) {
+      if (bulkBar) bulkBar.setSelection(selection);
+    },
     onRowClick: function (id) {
       showAssetDetail(id, detailPanel);
     },
@@ -2214,6 +2227,20 @@ async function renderAssetsTab(container) {
       }
     },
   });
+
+  // Bulk bar between the header and the table: the controls sit next to the
+  // rows they act on, and the DOM order matches the reading order (tick rows ->
+  // choose a target -> add), not the other way round.
+  bulkBar = renderAssetsBulkBar({
+    apiFetch,
+    getSelection: function () { return assetsTable.getSelection(); },
+    clearSelection: function () { assetsTable.clearSelection(); },
+    onAdded: function () {
+      // Membership lives on the collection, not on the asset row, so the asset
+      // list itself has nothing new to show — deliberately no reload() here.
+    },
+  });
+  main.appendChild(bulkBar.el);
   main.appendChild(assetsTable.el);
 
   // ── Upload modal ──
@@ -4195,6 +4222,196 @@ function addAssetsSummary(result) {
   }
   const detail = result.failed.map(function(f) { return f.id + ' (' + f.message + ')'; }).join('; ');
   return 'Added ' + result.added.length + ' of ' + total + ' assets. Failed: ' + detail;
+}
+
+// ─── Assets-tab bulk "add to collection" (issue #916) ────────────────────────
+//
+// CONTRACT GROUNDING. This view issues NO new call of its own. The only write it
+// performs is `addAssetsToCollection()` above (app.js — the one PUT-per-asset
+// loop over `/collections/:id/assets/:assetId`), which is the exact function the
+// collection-detail picker's "Add selected" button calls
+// (`renderCollectionAssetPicker` -> `addAssetsToCollection`, app.js:4203+).
+// Reusing that function — rather than re-issuing the PUT here — is what keeps the
+// two entry points on one add-membership path, so the 404/422 handling and the
+// partial-failure summary (`addAssetsSummary`) cannot drift between them.
+//
+// The verified backend contract behind that shared function:
+//   - PUT /api/v1/collections/{id}/assets/{assetId} — src/routes/collections.ts:586-620
+//     (`app.put('/:id/assets/:assetId', ...)`, declared at :587). Schema:
+//     `params: z.object({ id: z.string(), assetId: z.string() })`, NO body schema,
+//     `response: { 200: collectionSchema, 404: errorSchema, 422: errorSchema }`
+//     (:589-592). Route header comment src/routes/collections.ts:18. Mirrored in
+//     openapi.json at `.paths["/api/v1/collections/{id}/assets/{assetId}"].put`
+//     (no operationId is emitted by the generator — the path+method IS the
+//     identifier in this spec). 422 is `asset_not_found` for an asset that does
+//     not resolve (:598-603); 404 is an unknown collection (:609-611).
+//   - There is still NO batch/multi-member route on that router: its only other
+//     membership route is DELETE `/:id/assets/:assetId`
+//     (src/routes/collections.ts:625). So "add N assets" is N PUTs issued from
+//     one user interaction, exactly as the detail picker does it.
+//   - Collection list for the target picker: GET /api/v1/collections/ returns
+//     `{ collections: [...] }` with each item requiring `id`, `name`, `assetIds`,
+//     `createdAt`, `updatedAt` (openapi.json
+//     `.paths["/api/v1/collections/"].get.responses["200"]`). Only `id` and `name`
+//     are read here.
+
+// Normalise whatever the collections list endpoint returned into `{ id, name }`
+// options. Tolerant of the three envelope shapes the Collections tab already
+// accepts (app.js:3901-3902) so the two readers cannot disagree about the wire.
+function bulkCollectionOptions(res) {
+  const list = Array.isArray(res)
+    ? res
+    : res && Array.isArray(res.collections)
+      ? res.collections
+      : res && Array.isArray(res.items)
+        ? res.items
+        : [];
+  return list
+    .map(function(c) {
+      return { id: c && c.id != null ? String(c.id) : '', name: (c && c.name) || '' };
+    })
+    .filter(function(c) { return c.id !== ''; });
+}
+
+// The label on the bulk bar's primary button, and the bar's own live-region text.
+// Kept pure so the wording is testable without a DOM round-trip.
+function bulkAddButtonLabel(count) {
+  if (count === 0) return 'Add to collection';
+  return 'Add ' + count + ' asset' + (count === 1 ? '' : 's') + ' to collection';
+}
+
+function bulkSelectionSummary(selection) {
+  const n = selection.length;
+  if (n === 0) return 'No assets selected.';
+  if (n === 1) return '1 asset selected: ' + selection[0].label + '.';
+  return n + ' assets selected.';
+}
+
+// The bulk-action bar for the Assets tab. Returns
+// `{ el, setSelection }` — a detached element plus the one function the table's
+// `onSelectionChange` calls. `opts.getSelection()` supplies the ids at submit
+// time (never a stale copy), `opts.onAdded()` fires after a run that added at
+// least one membership, and `opts.clearSelection()` drops the selection the run
+// consumed.
+function renderAssetsBulkBar(opts) {
+  opts = opts || {};
+  const fetchFn = opts.apiFetch || apiFetch;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'assets-bulk-bar';
+  wrap.id = 'assets-bulk-bar';
+  // The bar is a named region rather than a floating strip of controls, so a
+  // screen-reader user can reach it directly and knows what it governs
+  // (WCAG 2.1 AA — 1.3.1, 4.1.2).
+  wrap.setAttribute('role', 'group');
+  wrap.setAttribute('aria-label', 'Bulk actions for selected assets');
+  wrap.innerHTML = [
+    '<div class="form-row">',
+    '  <div class="grow" id="assets-bulk-count" aria-live="polite">No assets selected.</div>',
+    '  <div class="form-field">',
+    '    <label for="assets-bulk-collection">Target collection</label>',
+    '    <select id="assets-bulk-collection" aria-describedby="assets-bulk-hint"></select>',
+    '  </div>',
+    '  <button id="assets-bulk-add-btn" disabled>Add to collection</button>',
+    '  <button id="assets-bulk-clear-btn" class="btn-ghost" disabled>Clear selection</button>',
+    '</div>',
+    '<div class="form-hint" id="assets-bulk-hint">Tick assets in the table, pick an existing collection, then add them. Selection survives paging and filtering, so assets from more than one page can be added together.</div>',
+    '<div id="assets-bulk-msg" aria-live="polite"></div>',
+  ].join('');
+
+  const countEl = wrap.querySelector('#assets-bulk-count');
+  const selectEl = wrap.querySelector('#assets-bulk-collection');
+  const addBtn = wrap.querySelector('#assets-bulk-add-btn');
+  const clearBtn = wrap.querySelector('#assets-bulk-clear-btn');
+  const msgEl = wrap.querySelector('#assets-bulk-msg');
+
+  let selection = [];
+  // Null until the list has been read; distinguishes "no collections exist" from
+  // "not asked yet", which decide different disabled states.
+  let collections = null;
+
+  function refreshControls() {
+    countEl.textContent = bulkSelectionSummary(selection);
+    addBtn.textContent = bulkAddButtonLabel(selection.length);
+    clearBtn.disabled = selection.length === 0;
+    addBtn.disabled = selection.length === 0 || !selectEl.value;
+  }
+
+  function setSelection(next) {
+    selection = Array.isArray(next) ? next : [];
+    refreshControls();
+  }
+
+  // Populate the target picker. A failure is reported in the bar rather than
+  // thrown: the table behind it is still usable, only this action is not.
+  async function loadCollections() {
+    try {
+      collections = bulkCollectionOptions(await fetchFn('/collections'));
+    } catch (err) {
+      collections = [];
+      showMsg(msgEl, 'Failed to load collections: ' + err.message, 'error');
+    }
+    selectEl.innerHTML =
+      collections.length === 0
+        ? '<option value="">No collections — create one in the Collections tab</option>'
+        : '<option value="">Choose a collection…</option>' +
+          collections
+            .map(function(c) {
+              return '<option value="' + escHtml(c.id) + '">' + escHtml(c.name || c.id) + '</option>';
+            })
+            .join('');
+    refreshControls();
+  }
+
+  selectEl.addEventListener('change', refreshControls);
+
+  clearBtn.addEventListener('click', function() {
+    msgEl.innerHTML = '';
+    if (typeof opts.clearSelection === 'function') opts.clearSelection();
+    setSelection([]);
+  });
+
+  addBtn.addEventListener('click', async function() {
+    const collectionId = selectEl.value;
+    if (!collectionId) return;
+    const ids = (typeof opts.getSelection === 'function' ? opts.getSelection() : selection).map(
+      function(s) { return typeof s === 'string' ? s : s.id; }
+    );
+    if (ids.length === 0) return;
+
+    const prev = addBtn.textContent;
+    addBtn.disabled = true;
+    addBtn.textContent = 'Adding…';
+    msgEl.innerHTML = '';
+    try {
+      // THE shared add-membership path — identical call to the one the
+      // collection-detail picker makes. No second implementation exists.
+      const result = await addAssetsToCollection(collectionId, ids);
+      const summary = addAssetsSummary(result);
+      showMsg(msgEl, summary, result.failed.length === 0 ? 'success' : 'error');
+      if (result.added.length > 0) {
+        // Only the ids that landed leave the selection: a failed add stays
+        // ticked so the operator can retry it without re-finding the row.
+        const landed = new Set(result.added);
+        const remaining = selection.filter(function(s) { return !landed.has(s.id); });
+        if (remaining.length === 0 && typeof opts.clearSelection === 'function') {
+          opts.clearSelection();
+        }
+        setSelection(remaining);
+        if (typeof opts.onAdded === 'function') opts.onAdded(collectionId, result);
+      }
+    } catch (err) {
+      showMsg(msgEl, 'Failed to add to collection: ' + err.message, 'error');
+    } finally {
+      addBtn.textContent = selection.length === 0 ? bulkAddButtonLabel(0) : prev;
+      refreshControls();
+    }
+  });
+
+  refreshControls();
+  void loadCollections();
+
+  return { el: wrap, setSelection: setSelection, reloadCollections: loadCollections };
 }
 
 // The add-to-collection control: name search + multi-select, with the raw-id
@@ -7708,6 +7925,15 @@ export {
   addAssetsToCollection,
   addAssetsSummary,
   ASSET_PICKER_DEBOUNCE_MS,
+  // Assets-tab bulk add-to-collection (issue #916). Exported so a DOM test can
+  // drive the real bar and assert it goes through the SAME addAssetsToCollection
+  // path as the collection-detail picker — one PUT per selected asset against
+  // PUT /api/v1/collections/{id}/assets/{assetId} — plus the pure label/summary
+  // wording and the collection-envelope normaliser.
+  renderAssetsBulkBar,
+  bulkCollectionOptions,
+  bulkAddButtonLabel,
+  bulkSelectionSummary,
   // Truncation disclosure on the hit list (issue #949). Exported so a unit test
   // can pin the "showing N of M" wording and the no-note case without going
   // through a search round trip.
