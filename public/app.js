@@ -76,6 +76,14 @@ import { mountAssetRename } from './asset-rename.js';
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
 
+// Version-chain view on the asset detail pane (issue #942, broken out of #795),
+// implementing docs/design/asset-version-chain.md. One extra read —
+// GET /assets/{id}/versions — renders the whole lineage as a tree, badges the
+// member the server names in `currentVersionId`, marks the asset being viewed,
+// and shows an explicit "no other versions" state for a single-member chain.
+// Full contract grounding is in that module's header.
+import { mountVersionChain } from './version-chain.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -2374,12 +2382,28 @@ async function showAssetDetail(id, detailPanel) {
     if (table) table.querySelectorAll('tbody tr').forEach(function(r) { r.classList.remove('row-selected'); });
   });
 
+  // Which asset the pane is CURRENTLY showing. It moves when the operator steps
+  // through the version chain (issue #942), so "pop out" must follow it rather
+  // than reopening the asset the pane happened to be opened with.
+  var shownId = id;
+
   detailPanel.querySelector('#popout-detail').addEventListener('click', function() {
-    openDetailWindow('asset', id);
+    openDetailWindow('asset', shownId);
   });
 
   const body = detailPanel.querySelector('#detail-body');
-  await renderAssetDetailBody(id, body);
+
+  // Re-render the pane in place for `nextId`, remembering it, so the chain can
+  // be walked without leaving the panel.
+  function navigateTo(nextId) {
+    shownId = nextId;
+    return renderAssetDetailBody(nextId, body, {
+      onNavigate: navigateTo,
+      fromVersionChain: true,
+    });
+  }
+
+  await renderAssetDetailBody(id, body, { onNavigate: navigateTo });
 }
 
 // Fetch and render an asset's downloadable files + streaming file groups into
@@ -2525,7 +2549,20 @@ async function renderAssetFiles(assetId, container) {
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
 // the fetched asset (or throws if the fetch fails / 404s so callers can react).
-async function renderAssetDetailBody(id, bodyEl) {
+//
+// `opts.onNavigate(nextId)` — how this surface moves to ANOTHER asset, used by
+// the version-chain block (issue #942). The default re-renders this same
+// element in place, which is right for the side panel; the detached window
+// overrides it so its own polling loop and document title follow the move
+// instead of yanking the reader back to the asset the window was opened with.
+async function renderAssetDetailBody(id, bodyEl, opts) {
+  opts = opts || {};
+  // Set for exactly ONE render: the one that follows a click inside the version
+  // chain. Cleared from the options threaded onward so a later re-render (a
+  // lock action, a restore, the detached window's poll) does not keep stealing
+  // focus back to the chain.
+  const focusVersionRow = opts.fromVersionChain === true;
+  if (focusVersionRow) opts = Object.assign({}, opts, { fromVersionChain: false });
   const body = bodyEl;
   body.innerHTML = '';
   const loader = loadingEl();
@@ -2771,6 +2808,57 @@ async function renderAssetDetailBody(id, bodyEl) {
     mountAssetTracks({
       asset: asset,
       host: body,
+    });
+
+    // ── Versions: the asset's version chain (issue #942) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/version-chain.js:
+    //   GET /api/v1/assets/{id}/versions — openapi.json
+    //   .paths["/api/v1/assets/{id}/versions"] (the only key is `get`; the only
+    //   parameter is path `id`); 200
+    //   { assetId, versionGroupId?, currentVersionId, versions[] } with
+    //   `required: ["assetId","currentVersionId","versions"]`, 404 { error,
+    //   message? }. Source: src/routes/assets.ts:3689-3727 (schema :3694-3699).
+    //
+    // This is the ONE place the detail pane pays a second round-trip for
+    // lineage, and it has to: `versions` is group-scoped and is not carried on
+    // the asset body — the asset only knows its own `versionGroupId` /
+    // `versionOfAssetId` edges, not its siblings.
+    //
+    // `currentVersionId` is read, never re-derived: the server's ladder skips
+    // archived, failed and in-flight members, so "the last element of
+    // `versions`" is explicitly the wrong rule (src/data/asset-repo.ts:1239-1246).
+    //
+    // Mounted with the other read-only information blocks and ABOVE the action
+    // controls. No promote / set-current affordance is offered because no such
+    // endpoint exists (ADR-024 D3) — the badge reports observed state.
+    //
+    // The path param must be the ULID: the handler passes the raw param to
+    // repo.listVersions, so a slug would 404. `asset.id` is the ULID even when
+    // this pane was opened by slug.
+    await mountVersionChain({
+      assetId: asset.id,
+      host: body,
+      apiFetch: apiFetch,
+      // Moving to another version re-renders the pane for THAT id, which
+      // re-fetches its versions: the envelope is target-relative (`assetId`
+      // moves, so "you are here" moves), so the previous response is never
+      // carried over.
+      onNavigate:
+        typeof opts.onNavigate === 'function'
+          ? opts.onNavigate
+          : function (nextId) {
+              return renderAssetDetailBody(
+                nextId,
+                bodyEl,
+                Object.assign({}, opts, { fromVersionChain: true })
+              );
+            },
+      // Keep the reader's place in the chain: after an in-chain navigation the
+      // new "you are here" row takes focus rather than the pane resetting to
+      // the top.
+      focusHere: focusVersionRow,
     });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
@@ -3044,7 +3132,7 @@ async function renderAssetDetailBody(id, bodyEl) {
     // must re-read rather than patch the view optimistically.
     var rerenderThenMsg = async function (text, kind) {
       try {
-        await renderAssetDetailBody(id, bodyEl);
+        await renderAssetDetailBody(id, bodyEl, opts);
       } catch (_) {
         // The re-read itself failed (e.g. the asset is now a tombstone). The
         // renderer has already written its own error into bodyEl; don't mask it.
@@ -3286,7 +3374,7 @@ async function renderAssetDetailBody(id, bodyEl) {
         }
         actionMsg.appendChild(pre);
         if (wedgedDetail) {
-          await renderAssetDetailBody(id, bodyEl);
+          await renderAssetDetailBody(id, bodyEl, opts);
           return;
         }
       } catch (err) {
