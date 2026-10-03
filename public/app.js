@@ -76,6 +76,17 @@ import { mountAssetRename } from './asset-rename.js';
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
 
+// External identifiers panel (issue #943, broken out of #796): the
+// `{ namespace, id }` correlations linking this asset to systems outside
+// open-videocore, listed and correctable in place. The asset read model carries
+// nothing to list from — `assetSchema` declares no `externalIdentifiers`
+// property, so the serializer strips the field from every asset body
+// (src/routes/assets.ts:3536-3539) — so the panel reads the dedicated
+// sub-resource GET /assets/{id}/external-ids. Full contract grounding, including
+// why an edit is attach-then-detach rather than an update, is in that module's
+// header.
+import { mountAssetExternalIds } from './external-ids.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -176,6 +187,22 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may correct an asset's external identifiers
+// (issue #943). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` AND `delete` to `editor` and
+// `admin` and neither to `viewer`; `methodToAction` (:79-93) maps POST -> write
+// and DELETE -> delete, and `resourceAuthorizationPreHandler('asset')` (:126,
+// registered src/routes/assets.ts:1773) applies it to both halves of an edit.
+// An edit needs BOTH (the API has no update call — see public/external-ids.js),
+// so the gate is the intersection, which is the same pair of roles. GET on the
+// sub-resource is `read`, which a viewer DOES hold — hence a viewer still sees
+// the identifiers, read-only. Client-side mirror only: the 403 is still handled
+// if it arrives.
+function canEditExternalIds() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2771,6 +2798,50 @@ async function renderAssetDetailBody(id, bodyEl) {
     mountAssetTracks({
       asset: asset,
       host: body,
+    });
+
+    // ── External identifiers: view + inline edit (issue #943) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/external-ids.js:
+    //   GET    /api/v1/assets/{id}/external-ids — 200 is an ARRAY of
+    //          { namespace, id } (both `required`, additionalProperties false),
+    //          404 { error }. The pairs are returned exactly as stored, in
+    //          persisted order. (openapi.json
+    //          .paths["/api/v1/assets/{id}/external-ids"].get;
+    //          src/routes/assets.ts:3555-3602)
+    //   POST   /api/v1/assets/{id}/external-ids — body REQUIRED
+    //          { namespace (1..256), id (1..1024) }; 200 = the full asset,
+    //          400 / 404 { error }, 409 { error, reason, namespace, externalId,
+    //          conflictingAssetId } in enforced-uniqueness mode only.
+    //          (…].post; src/routes/assets.ts:3416-3451, body schema :500-523,
+    //          409 envelope :529-536)
+    //   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId} — 204
+    //          whether or not the pair was carried (idempotent), 404 only when
+    //          the ASSET is unknown. (…].delete; src/routes/assets.ts:3487-3532)
+    //
+    // The field names are `namespace` and `id` — there is no `value` field in
+    // the contract (ExternalIdentifierSchema, src/data/asset-document.ts:173-186;
+    // ExternalIdentifier, src/data/asset-repo.ts:281-286).
+    //
+    // A separate read is unavoidable: `assetSchema` declares no
+    // `externalIdentifiers` property, so the serializer strips the set out of
+    // the `asset` body already fetched above (src/routes/assets.ts:3536-3539).
+    // And an edit is attach-then-detach, not an update: `attachExternalId`
+    // APPENDS and never replaces an entry sharing a namespace
+    // (src/data/asset-repo.ts:1524-1557), and no PATCH/PUT exists on the
+    // sub-resource.
+    //
+    // Mounted with the other informational blocks, above the action controls.
+    // The sub-resource paths take the ULID (`asset.id`), which this pane holds
+    // even when it was opened by slug — all three routes resolve the param with
+    // a plain repo.get, with no slug fallback.
+    await mountAssetExternalIds({
+      assetId: asset.id,
+      host: body,
+      canEdit: canEditExternalIds(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
     });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
