@@ -70,6 +70,7 @@
 
 import { STACK_CONFIG_NAMESPACE } from './workspace-stack.js';
 import { OBJECT_STORE_SERVICE_ID } from './stack.js';
+import { logObjectStoreClient } from './object-store-stack-identity.js';
 import type { ParamStore, StackConfig } from './param-store.js';
 import type { EncoreS3Config } from '../encore-scaler/types.js';
 
@@ -81,6 +82,11 @@ const MINIO_ROOT_USER = 'admin';
 
 export type EncoreS3ConfigLogger = {
   error: (obj: unknown, msg?: string) => void;
+  // Construction log for the object-store config handed to a spawned
+  // transcoder (issue #1093): stack id + endpoint host only, never the secret.
+  // OPTIONAL so every existing caller/test that wired an error-only logger
+  // keeps type-checking; `logObjectStoreClient` no-ops when it is absent.
+  info?: (obj: unknown, msg?: string) => void;
 };
 
 export type ResolveEncoreS3ConfigDeps = {
@@ -194,12 +200,21 @@ export async function resolveEncoreS3Config(
   }
 
   let config: StackConfig | undefined;
+  // The stack name the config was ACTUALLY loaded under (issue #1093). Equal to
+  // `stackKey` on the direct hit; the first-provisioned name on the documented
+  // fallback below. Logged on construction so "which stack is this transcoder
+  // reading with" is answerable from logs alone — the fallback is legitimate for
+  // a single-stack deployment keyed by DEPLOYMENT_CONTEXT, and indistinguishable
+  // from a mis-route without it.
+  let resolvedStackName: string | undefined;
   try {
     config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
+    if (config) resolvedStackName = stackKey;
     if (!config) {
       const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
       if (names.length > 0) {
         config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+        if (config) resolvedStackName = names[0]!;
       }
     }
   } catch (err) {
@@ -225,13 +240,27 @@ export async function resolveEncoreS3Config(
       (s) => s.serviceId === OBJECT_STORE_SERVICE_ID
     )?.instanceName;
 
+    const endpoint = await mapEndpointForTranscoder(
+      config.minioEndpoint,
+      resolveEndpoint,
+      objectStoreInstanceName,
+      log
+    );
+
+    // Construction log for the transcoder's object-store client (issue #1093).
+    // `endpointHost` is the host of the endpoint the TRANSCODER will use, which
+    // is the in-cluster address when the #991 hook mapped it — so this line is
+    // also how an operator tells the mapped and public paths apart. Stack id +
+    // host only: `secretAccessKey` is never logged.
+    logObjectStoreClient(log, {
+      source: 'transcoder-config',
+      stackName: resolvedStackName,
+      endpoint,
+      requestedStackName: stackKey
+    });
+
     return {
-      endpoint: await mapEndpointForTranscoder(
-        config.minioEndpoint,
-        resolveEndpoint,
-        objectStoreInstanceName,
-        log
-      ),
+      endpoint,
       accessKeyId: MINIO_ROOT_USER,
       secretAccessKey
     };
