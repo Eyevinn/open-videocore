@@ -59,12 +59,16 @@ import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete
 // full contract grounding is in that module's header.
 import { mountReviewState } from './review-state.js';
 
-// Asset rename affordance (issue #956): a control for the `name` field that
-// PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
+// Asset rename affordance (issues #956, #927): a control for the `name` field
+// that PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
 // could trigger. UI only — no route or schema changes. Full contract grounding,
 // including why a rename cannot move the asset's id, slug or stored object keys,
 // is in that module's header.
-import { mountAssetRename } from './asset-rename.js';
+//   mountAssetRename  — the detail view's action-row control (#956).
+//   openRenameDialog  — the dialog behind it, called directly by the assets
+//                       table's per-row Rename control (#927) so both surfaces
+//                       share one interaction and one request shape.
+import { mountAssetRename, openRenameDialog } from './asset-rename.js';
 
 // Read-only tracks panel (issue #902, broken out of #794): one section per track
 // kind — video, audio, subtitle — each listing only the attributes the API
@@ -2074,6 +2078,44 @@ async function renderAssetsTab(container) {
     onRowClick: function (id) {
       showAssetDetail(id, detailPanel);
     },
+    // ── Rename from the row (issue #927) ──
+    //
+    // The detail view got this action first (#956); this is the same action
+    // reached one click earlier. It is deliberately the SAME dialog
+    // (openRenameDialog) and therefore the same single PATCH /api/v1/assets/{id}
+    // body — `{ name }` and nothing else — rather than a second rename path that
+    // could drift from it. The contract is cited in full in
+    // public/asset-rename.js; nothing about the API changes for this control.
+    //
+    // Passed as the function, not its result: the table calls it while rendering
+    // each page, so changing role in the UI takes effect on the next repaint.
+    canRename: canRenameAsset,
+    onRename: async function (id, name) {
+      const outcome = await openRenameDialog({
+        // `name` is the row's current title, so the field is prefilled without a
+        // second GET. The row carries the ULID in `data-id`, which is what
+        // PATCH /:id requires — that route has no slug fallback.
+        asset: { id: id, name: name },
+        apiFetch: apiFetch,
+        openModal: openModal,
+      });
+      if (outcome.renamed) {
+        // Reload (the table's default) so the new title appears in the Name /
+        // Title column. If the detail pane happens to be showing this asset, it
+        // is re-read too: it renders the same `name` and would otherwise keep
+        // displaying the old one.
+        if (detailPanel.style.display !== 'none' && detailPanel.dataset.assetId === id) {
+          showAssetDetail(id, detailPanel);
+        }
+        return true;
+      }
+      // Not renamed — cancelled, or refused. Every refusal (403, 404, a rejected
+      // name, a transport failure) has already been stated IN the dialog, where
+      // the operator still has what they typed, so nothing is reported a second
+      // time out here. A 404 is the one case that still earns a reload: the row on
+      // screen is stale, and the reload is what removes it.
+      return outcome.gone === true;
+    },
     onDelete: async function (id, name, rowState) {
       const label = nameOrFallback(name, 'this asset');
       // Route the operator from a blocked archive to the place the block can be
@@ -2354,6 +2396,10 @@ async function renderAssetsTab(container) {
 
 async function showAssetDetail(id, detailPanel) {
   detailPanel.style.display = 'flex';
+  // Which asset this pane is currently showing, so a list-row action that changes
+  // the asset (the row Rename, issue #927) can tell whether the open pane is now
+  // displaying a stale value and needs re-reading.
+  detailPanel.dataset.assetId = id;
   // Static structural HTML only. A "pop out" affordance sits next to the close
   // button so the user can detach this asset detail into its own window.
   detailPanel.innerHTML = [

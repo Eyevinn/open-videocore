@@ -112,6 +112,21 @@
  * Resolution order on load is URL -> stored per-operator default -> all columns;
  * see resolveInitialColumns() below.
  *
+ * ROW RENAME (issue #927). The Actions column carries a Rename control, so an
+ * operator renames an asset from the list without opening the detail pane. The
+ * only write it can make is the one the detail view already made:
+ *   PATCH /api/v1/assets/{id} — path param `id` only; request body properties
+ *   `name` (string, minLength 1, maxLength 256), `description`, `objectKey`,
+ *   `status`, `metadata`, `tags`, all optional, `additionalProperties: false`;
+ *   responses 200 (the full asset) / 404 / 422. Verified in openapi.json
+ *   .paths["/api/v1/assets/{id}"].patch and in `updateSchema`
+ *   (src/routes/assets.ts:418, `name` at :420) wired at `app.patch('/:id', …)`
+ *   (src/routes/assets.ts:5682). NO schema change was needed for this control.
+ * The dialog, the validation and the body construction are NOT reimplemented
+ * here: the row hands off to openRenameDialog (public/asset-rename.js), the same
+ * entry point the detail view uses, which sends exactly `{ name }`. This module
+ * contributes the button and the reload; see the Actions column renderer.
+ *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
  */
@@ -583,6 +598,12 @@ function buildColumns(renderCtx) {
   // the Status renderer below. It cannot go stale: the only writer is the fetch
   // that produced the very rows being rendered.
   const projection = renderCtx.projection;
+  // Client-side mirror of the ADR-018 write gate for PATCH /api/v1/assets/{id}
+  // (issue #927). Read as a FUNCTION at render time, not captured as a boolean at
+  // construction time, so a role changed in the UI after the table was built is
+  // honoured by the next repaint instead of showing a control that is certain to
+  // earn a 403.
+  const canRename = typeof renderCtx.canRename === 'function' ? renderCtx.canRename : null;
 
   return [
     {
@@ -697,6 +718,36 @@ function buildColumns(renderCtx) {
               escHtml(a.id) +
               '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
             : '') +
+          // Rename, straight from the row (issue #927 — the "inline-in-list"
+          // affordance for the detail view's existing control). It opens the SAME
+          // dialog the detail view opens (openRenameDialog, public/asset-rename.js),
+          // so there is one rename interaction in this UI, not two: the row saves
+          // the operator a detail-pane round trip, it does not get its own rules.
+          //
+          // `data-name` carries the row's current title so the dialog can prefill
+          // without a second GET. `name` is REQUIRED on both tiers (it is in the
+          // `required` list of the tier-1 list item and non-optional on the tier-2
+          // `assetSchema`), so the `|| a.slug || ''` tail is defence against a
+          // malformed payload, not an expected case: it keeps the attribute
+          // well-formed, and the dialog's own `min(1)` rule then makes the operator
+          // supply a name rather than sending an empty one.
+          //
+          // Offered on BOTH tiers. Unlike the delete lock, nothing here depends on
+          // a field the free-text search projection omits: `id` and `name` are
+          // both present on the tier-2 asset schema (src/routes/search.ts:77-90),
+          // so a search-tier row can be renamed as safely as a list-tier one.
+          //
+          // A viewer gets NO button rather than a disabled one: the role cannot
+          // hold `write`, so the control could only ever produce a 403. The server
+          // remains the authority — the dialog still handles the 403 if the
+          // client-side mirror is wrong.
+          (canRename && canRename()
+            ? '<button class="btn-ghost asset-rename-btn" data-id="' +
+              escHtml(a.id) +
+              '" data-name="' +
+              escHtml(a.name || a.slug || '') +
+              '" title="Rename this asset" style="font-size:12px;padding:3px 8px;">Rename</button> '
+            : '') +
           // `data-name` carries the SAME human-readable label the "Name / Title"
           // column renders (a.name || a.slug) so the archive confirmation can
           // name its subject without a second lookup (issue #919). Empty when the
@@ -809,6 +860,14 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //                                         derive, so the handler can explain a
 //                                         guaranteed refusal pre-flight.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
+//   canRename() -> boolean (optional)   — client-side mirror of the ADR-018 write
+//                                         gate (issue #927). Called at render
+//                                         time; when it is absent or answers
+//                                         false, no row carries a Rename control.
+//   onRename(id, name) -> Promise       — rename action; `name` is the row's
+//                                         current title, for the dialog's
+//                                         prefill. The table reloads unless the
+//                                         handler resolves `false`.
 //   win (optional)                      — injectable window for URL sync (tests).
 //
 // The table reads its initial sort/filter/page from the URL (shared contract),
@@ -842,6 +901,7 @@ export function createAssetsTable(deps) {
     fmtDate: d.fmtDate,
     isAssetWedged: d.isAssetWedged,
     projection,
+    canRename: d.canRename,
   });
 
   // Initial visible column set (issue #959): URL -> stored default -> all.
@@ -1016,6 +1076,25 @@ export function createAssetsTable(deps) {
         const ok = await d.onDelete(btn.dataset.id, btn.dataset.name || '', {
           locked: btn.dataset.locked === 'true',
         });
+        if (ok !== false) reload();
+      });
+    });
+
+    // Rename from the row (issue #927). The handler owns the dialog and the
+    // request; this only keeps the row click from also opening the detail pane,
+    // and reloads so the renamed row shows its new title in whichever tier is on
+    // screen — both the list and the free-text search projection read `name` from
+    // the live asset document, so one reload is enough and no reindex step
+    // exists to wait for.
+    //
+    // `false` means "nothing changed" (cancelled, or a refusal the handler has
+    // already explained), and skips the reload for the same reason the archive
+    // handler does: a request that changed nothing has nothing to repaint.
+    tbody.querySelectorAll('.asset-rename-btn').forEach(function (btn) {
+      btn.addEventListener('click', async function (e) {
+        e.stopPropagation();
+        if (typeof d.onRename !== 'function') return;
+        const ok = await d.onRename(btn.dataset.id, btn.dataset.name || '');
         if (ok !== false) reload();
       });
     });
