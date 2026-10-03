@@ -29,10 +29,16 @@ import {
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import {
   AUTO_SUBTITLES_SERVICE_ID,
+  OBJECT_STORE_SERVICE_ID,
   PACKAGER_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES
 } from '../services/stack.js';
+import {
+  LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+  planObjectStoreCredential,
+  type ObjectStoreCredentialPlan
+} from '../services/object-store-credentials.js';
 import {
   packagerOscApiFromContext,
   teardownOnDemandPackager
@@ -580,6 +586,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // the same serviceId. (The PACKAGED-role secrets are minted by the on-demand
   // packager ensure step now, not here — epic #226 / issue #243.)
   const EXT_SOURCE = 'extsource';
+  // Role-qualified secret purpose for the stack's OWN per-stack object-store
+  // credential (issue #1094), kept distinct from EXT_SOURCE so an operator who
+  // ALSO supplied an external source bucket gets two separate secrets under the
+  // same consuming serviceId instead of one overwriting the other. The
+  // credential-mapping layer appends the field-specific suffix (e.g.
+  // `.s3secretaccesskey`), exactly as it does for the #212 external credentials.
+  const OBJECT_STORE = 'objectstore';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -706,6 +719,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         }
         inFlightProvisions.add(name);
 
+        // The object-store credential THIS stack's instance is created with
+        // (issue #1094). Decided ONCE here, before anything is created or
+        // written, and then used by every write below — the 'provisioning'
+        // marker, the create body, our own S3 client, the OSC secrets, the final
+        // 'ready' config and the partial 'failed' config — so a retry of this
+        // stack can never flip between the per-stack and the legacy credential
+        // and leave the API authenticating with a key the live instance does not
+        // have. Defaults to the legacy process-global credential and is upgraded
+        // to the per-stack one by planObjectStoreCredential below; the secret
+        // lives only in this closure and in saveSecret.
+        let objectStorePlan: ObjectStoreCredentialPlan = {
+          credential: {
+            accessKeyId: LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+            secretAccessKey: minioRootPassword
+          },
+          perStack: false
+        };
+
         try {
           if (paramStore) {
             try {
@@ -727,6 +758,42 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 });
                 return;
               }
+              // Decide this stack's object-store credential (issue #1094)
+              // BEFORE the marker is written, so the marker already carries the
+              // per-stack access key id and a later retry reads it back instead
+              // of concluding "no id recorded" and falling back.
+              //
+              // The existence probe is the safety input: provisioning ADOPTS an
+              // object store that already exists (#417) and adoption does NOT
+              // rewrite its root user, so an already-live instance with no
+              // recorded per-stack id must keep the legacy credential (#1096
+              // migrates it). A probe that cannot answer is reported as
+              // "exists", which is the non-breaking answer.
+              let objectStoreInstanceExists = true;
+              try {
+                const sat = await osc.getServiceAccessToken(
+                  OBJECT_STORE_SERVICE_ID
+                );
+                objectStoreInstanceExists = Boolean(
+                  await getInstance(osc, OBJECT_STORE_SERVICE_ID, name, sat)
+                );
+              } catch (probeErr) {
+                app.log.warn(
+                  { err: probeErr, name, serviceId: OBJECT_STORE_SERVICE_ID },
+                  'object-store existence probe failed; keeping the legacy ' +
+                    'object-store credential for this stack'
+                );
+              }
+              objectStorePlan = planObjectStoreCredential({
+                stackName: name,
+                seed: minioRootPassword,
+                legacySecretAccessKey: minioRootPassword,
+                storedAccessKeyId: existing?.objectStoreAccessKeyId,
+                storedConfigExists: Boolean(existing),
+                objectStoreInstanceExists,
+                paramStoreAvailable: true
+              });
+
               // No completed config yet: record a 'provisioning' marker BEFORE
               // creating any companion so a repeated call (this process or a
               // fresh one after a restart) sees an attempt is in flight and
@@ -740,6 +807,14 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 redisUrl: '',
                 sourceBucket: SOURCE_BUCKET,
                 packagedBucket: PACKAGED_BUCKET,
+                // Non-secret per-stack access key id (issue #1094). Recorded on
+                // the marker too, so the mode survives a retry.
+                ...(objectStorePlan.perStack
+                  ? {
+                      objectStoreAccessKeyId:
+                        objectStorePlan.credential.accessKeyId
+                    }
+                  : {}),
                 storage: storageMetadata,
                 services: []
               });
@@ -859,17 +934,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       let currentService = '';
       try {
         // 1. MinIO — S3-compatible object storage.
-        currentService = 'minio-minio';
+        currentService = OBJECT_STORE_SERVICE_ID;
+        // Per-stack object-store credential (issue #1094). The SECRET only ever
+        // reaches saveSecret (via secretRef) and the S3 client below — the
+        // create body carries the {{secrets.*}} reference, never the literal,
+        // and nothing here is logged. The access key id is non-secret.
+        const objectStoreCredential = objectStorePlan.credential;
         const minioRootPasswordRef = await secretRef(
-          'minio-minio',
+          OBJECT_STORE_SERVICE_ID,
           ROOTPASSWORD,
-          minioRootPassword
+          objectStoreCredential.secretAccessKey
         );
-        const minio = await provision('minio-minio', {
-          RootUser: 'admin',
+        const minio = await provision(OBJECT_STORE_SERVICE_ID, {
+          RootUser: objectStoreCredential.accessKeyId,
           RootPassword: minioRootPasswordRef
         });
-        await waitForInstanceReady('minio-minio', name, osc);
+        await waitForInstanceReady(OBJECT_STORE_SERVICE_ID, name, osc);
         const minioEndpoint = instanceUrl(minio);
 
         // 1b. Create the source and packaged buckets on the live MinIO instance.
@@ -885,11 +965,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               ? 443
               : 80,
           useSSL: minioUrl.protocol === 'https:',
-          accessKey: 'admin',
-          // The admin S3 client connects with the real credential — OSC resolves
+          accessKey: objectStoreCredential.accessKeyId,
+          // The root S3 client connects with the real credential — OSC resolves
           // the {{secrets.*}} reference on its side, but our client speaks S3
-          // directly to the live instance and needs the literal password.
-          secretKey: minioRootPassword
+          // directly to the live instance and needs the literal secret. This is
+          // THIS STACK's credential (issue #1094), not a deployment-wide one.
+          secretKey: objectStoreCredential.secretAccessKey
         });
         const delay = (ms: number) =>
           new Promise((resolve) => setTimeout(resolve, ms));
@@ -1127,6 +1208,40 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           );
         }
 
+        // The stack's OWN per-stack object-store credential, persisted as OSC
+        // secrets for the same two source-reading services (issue #1094),
+        // through the SAME mapping layer the #212 external credentials use
+        // above. The per-stack object store is an S3-compatible store like any
+        // other, so it is mapped by exactly the same code rather than a parallel
+        // one: `encoreCredentialMapping`/`ffmpegS3CredentialMapping` place the
+        // non-secret accessKeyId/endpoint in config fields and hand the secret
+        // to saveSecret, scoped per serviceId, under the `objectstore.*`
+        // purposes. As with the block above the returned references are not used
+        // here — these services are created in a different lifecycle (scaler
+        // spawn / per-job) — the point is that the secret exists under each
+        // consuming serviceId and the literal never leaves saveSecret.
+        //
+        // Only for a stack that actually HAS a per-stack credential: a stack
+        // still on the legacy deployment-wide password keeps its pre-#1094
+        // behaviour (no object-store secret is minted for it) until #1096
+        // migrates it.
+        if (objectStorePlan.perStack) {
+          const objectStoreCreds: ExternalStorageCredentials = {
+            bucket: SOURCE_BUCKET,
+            accessKeyId: objectStorePlan.credential.accessKeyId,
+            secretAccessKey: objectStorePlan.credential.secretAccessKey,
+            endpointUrl: minioEndpoint
+          };
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.encore,
+            encoreCredentialMapping(objectStoreCreds, OBJECT_STORE)
+          );
+          await applyCredentialMapping(
+            EXTERNAL_STORAGE_SERVICE_IDS.ffmpegS3,
+            ffmpegS3CredentialMapping(objectStoreCreds, OBJECT_STORE)
+          );
+        }
+
         // Persist the stack's non-secret connection coordinates to the OSC
         // parameter store (issue #31, ADR-002) so the API — and deprovision
         // (#29) — can rediscover this stack at runtime without the caller
@@ -1157,6 +1272,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               ? { autoSubtitlesInstanceName }
               : {}),
             ...(sceneDetectInstanceName ? { sceneDetectInstanceName } : {}),
+            // The object store's per-stack access key id (issue #1094).
+            // NON-SECRET — an identifier. Its matching secret is NOT stored
+            // (here or anywhere at rest): readers re-derive it from this id plus
+            // the deployment seed (services/object-store-credentials.ts). Absent
+            // for a stack still on the legacy deployment-wide credential, which
+            // is exactly how the fallback is detected until #1096.
+            ...(objectStorePlan.perStack
+              ? { objectStoreAccessKeyId: objectStorePlan.credential.accessKeyId }
+              : {}),
             // Non-secret storage backend metadata (issue #211). Secrets are
             // never included — only bucket/endpointUrl/region + backend type.
             storage: storageMetadata,
@@ -1310,6 +1434,17 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 redisUrl: '',
                 sourceBucket: SOURCE_BUCKET,
                 packagedBucket: PACKAGED_BUCKET,
+                // Preserve the per-stack access key id on the partial write
+                // (issue #1094). The instances that survived this failure were
+                // created with it, so dropping it here would make a retry (or
+                // the resolver) fall back to the legacy credential against an
+                // object store that only accepts the per-stack one.
+                ...(objectStorePlan.perStack
+                  ? {
+                      objectStoreAccessKeyId:
+                        objectStorePlan.credential.accessKeyId
+                    }
+                  : {}),
                 // Preserve the requested storage backend metadata on the partial
                 // write so deprovision/downstream can still resolve it (#211).
                 storage: storageMetadata,
@@ -1732,6 +1867,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // re-finds a stale entry still converges. A delete failure is logged
           // but does not fail the call: the OSC instances are already removed
           // and a stale config entry is a recoverable inconsistency.
+          //
+          // OBJECT-STORE CREDENTIAL LIFECYCLE (issue #1094). This delete is
+          // also the credential's teardown step: `objectStoreAccessKeyId` is
+          // the ONLY persisted part of the per-stack credential, and the secret
+          // is derived from it (services/object-store-credentials.ts), so
+          // removing the entry makes the credential unresolvable by every read
+          // path — and the object store that honoured it has just been removed
+          // above. What CANNOT be torn down from here is the OSC secret ENTRY
+          // itself: @osaas/client-core exposes `saveSecret` only — there is no
+          // delete (nor read-back) for `/mysecrets/<serviceId>` in the SDK
+          // (lib/index.d.ts, lib/core.js:355-369), so the write-once secret
+          // names outlive the stack with nothing referencing them. Logged as
+          // OSC friction in
+          // docs/osc-feedback/incoming-no-osc-secret-deletion-for-stack-teardown.md.
           try {
             await paramStore.deleteStackConfig(workspaceId, name);
           } catch (err) {
