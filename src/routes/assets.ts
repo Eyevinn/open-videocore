@@ -38,7 +38,8 @@ import {
   type AssetAudioTrack,
   type AssetRepository,
   type PackagedOutput,
-  type SubtitleTrack
+  type SubtitleTrack,
+  type TechnicalMetadata
 } from '../data/asset-repo.js';
 // Created-at range filtering (issue #833). The wire grammar, the inclusive
 // bound semantics and the normalisation to canonical UTC instants live in ONE
@@ -766,7 +767,25 @@ const technicalMetadataSchema = z.object({
   bitrateBps: z.number(),
   containerFormat: z.string(),
   audioTracks: z.array(audioTrackSchema),
-  extractedAt: z.string()
+  extractedAt: z.string(),
+  // Frames per second of the primary video stream (issue #1066). Clients doing
+  // frame-by-frame stepping need it to convert between frames and seconds.
+  // OPTIONAL: omitted for a source with no video stream, and for assets probed
+  // before the extractor read the rate.
+  frameRate: z
+    .number()
+    .optional()
+    .describe(
+      'Frames per second of the primary video stream, as reported by the probe. ' +
+        'Omitted when the source carries no video stream or was probed before ' +
+        'the frame rate was extracted.'
+    ),
+  // Start timecode of the source, e.g. "01:00:00:00" (issue #1066). OPTIONAL:
+  // most sources carry none.
+  startTimecode: z
+    .string()
+    .optional()
+    .describe('Start timecode of the source (e.g. "01:00:00:00"), when it carries one.')
 });
 
 const manifestUrlsSchema = z.object({
@@ -838,10 +857,61 @@ const addSubtitleTrackSchema = z.object({
   default: z.boolean().optional()
 });
 
+// One probed video track on GET /:id/tracks (issue #1066). The field names and
+// optionality mirror the stored video-track contract (VideoTrackSchema,
+// data/asset-document.ts) so the same track reads the same on the wire as it is
+// persisted. Machine-extracted, unlike the editorial audio/subtitle tracks
+// alongside it: there is no `id` and no `language`, and the API can report at
+// most one entry (the probe flattens the primary video stream).
+const videoTrackOutSchema = z.object({
+  codec: z.string(),
+  width: z.number(),
+  height: z.number(),
+  bitrateBps: z.number().optional(),
+  frameRate: z
+    .number()
+    .optional()
+    .describe(
+      'Frames per second of this video track, as reported by the probe. Omitted ' +
+        'when the asset was probed before the frame rate was extracted.'
+    ),
+  startTimecode: z
+    .string()
+    .optional()
+    .describe('Start timecode of the source (e.g. "01:00:00:00"), when it carries one.')
+});
+
 const tracksSchema = z.object({
+  // Probed video tracks (issue #1066). Empty when technical metadata has not been
+  // extracted yet, when the last extraction failed, or when the source carries no
+  // video stream. Listed first because it is the track kind frame-accurate
+  // clients read the frame rate from.
+  videoTracks: z.array(videoTrackOutSchema),
   audioTracks: z.array(audioTrackOutSchema),
   subtitleTracks: z.array(subtitleTrackOutSchema)
 });
+
+// Lift the probe's flattened video attributes into the track list GET /:id/tracks
+// reports (issue #1066). At most one track, none at all when technical metadata is
+// absent (never extracted / last extraction failed) or when the probe found no
+// video stream — an audio-only source records `codec: 'unknown'` with zero
+// dimensions (pipeline/metadata-extractor.ts parseFfprobe), which is not a track.
+export function videoTracksFromTechnicalMetadata(
+  tm: TechnicalMetadata | null | undefined
+): z.infer<typeof videoTrackOutSchema>[] {
+  if (!tm) return [];
+  if (tm.codec === 'unknown' && !tm.width && !tm.height) return [];
+  return [
+    {
+      codec: tm.codec,
+      width: tm.width,
+      height: tm.height,
+      bitrateBps: tm.bitrateBps,
+      ...(tm.frameRate !== undefined ? { frameRate: tm.frameRate } : {}),
+      ...(tm.startTimecode !== undefined ? { startTimecode: tm.startTimecode } : {})
+    }
+  ];
+}
 
 const assetSchema = z.object({
   id: z.string(),
@@ -5575,8 +5645,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // omitted from the response.
   // -------------------------------------------------------------------------
 
-  // List an asset's audio + subtitle tracks.
-  //   200 — { audioTracks, subtitleTracks } (each possibly empty)
+  // List an asset's tracks: the probed video track(s) plus the editorial audio and
+  // subtitle tracks.
+  //
+  // `videoTracks` is machine-extracted (issue #1066), not editorial: it is derived
+  // from the asset's `technicalMetadata`, which flattens the primary video stream,
+  // so it carries at most one entry and is empty when extraction has not run, the
+  // last extraction failed, or the source has no video stream. It is the endpoint
+  // a frame-accurate client reads `frameRate` from.
+  //   200 — { videoTracks, audioTracks, subtitleTracks } (each possibly empty)
   //   404 — unknown/foreign asset
   app.get(
     '/:id/tracks',
@@ -5593,6 +5670,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send({
+        videoTracks: videoTracksFromTechnicalMetadata(asset.technicalMetadata),
         audioTracks: asset.audioTracks ?? [],
         subtitleTracks: asset.subtitleTracks ?? []
       });

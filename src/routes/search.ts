@@ -57,7 +57,12 @@ const technicalMetadataSchema = z.object({
   bitrateBps: z.number(),
   containerFormat: z.string(),
   audioTracks: z.array(audioTrackSchema),
-  extractedAt: z.string()
+  extractedAt: z.string(),
+  // Same two optional probe fields the asset read exposes (issue #1066): declared
+  // here as well so a hit reports the same technical metadata as GET /assets/{id}
+  // instead of silently dropping them from the projection.
+  frameRate: z.number().optional(),
+  startTimecode: z.string().optional()
 });
 
 const manifestUrlsSchema = z.object({

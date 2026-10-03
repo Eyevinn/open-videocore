@@ -45,12 +45,26 @@ export type FfprobeStream = {
   sample_rate?: string | number;
   bit_rate?: string | number;
   duration?: string | number;
+  // Frame rate, as a RATIONAL string ("30000/1001", "25/1") — ffprobe never
+  // reports it as a number (issue #1066). `r_frame_rate` is the stream's base
+  // rate and is preferred; `avg_frame_rate` is the average over the decoded
+  // frames and is the fallback, because a stream with a variable rate can report
+  // `r_frame_rate: "0/0"`.
+  r_frame_rate?: string | number;
+  avg_frame_rate?: string | number;
+  // Stream-level metadata tags. The only one we consume is `timecode` — the
+  // source's start timecode, carried on the video stream or on a companion
+  // timecode track depending on the container.
+  tags?: Record<string, string | number | undefined>;
 };
 
 export type FfprobeFormat = {
   format_name?: string;
   duration?: string | number;
   bit_rate?: string | number;
+  // Container-level metadata tags. Some containers carry the start timecode here
+  // instead of on a stream.
+  tags?: Record<string, string | number | undefined>;
 };
 
 export type FfprobeResult = {
@@ -95,6 +109,55 @@ function toNumber(value: string | number | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Parse one ffprobe frame-rate field (issue #1066).
+//
+// ffprobe reports frame rate as a rational STRING — "25/1", "30000/1001" — so a
+// plain Number() on it yields NaN for every non-integer rate. We divide and round
+// to three decimals so 30000/1001 reads as 29.97 rather than 29.970029970029972,
+// which is the precision a frame-stepping client needs and no more.
+//
+// Returns undefined (field stays absent) rather than 0 for anything unusable:
+// a missing field, "N/A", a zero/absent denominator, or ffprobe's "0/0" for a
+// stream with no meaningful rate. Reporting 0 fps would be a wrong answer a
+// client cannot distinguish from a real one.
+export function parseFrameRate(value: string | number | undefined): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0 ? roundRate(value) : undefined;
+  }
+  const [numerator, denominator = '1'] = value.trim().split('/');
+  const n = Number.parseFloat(numerator ?? '');
+  const d = Number.parseFloat(denominator);
+  if (!Number.isFinite(n) || !Number.isFinite(d) || d === 0 || n <= 0) return undefined;
+  return roundRate(n / d);
+}
+
+function roundRate(rate: number): number {
+  return Math.round(rate * 1000) / 1000;
+}
+
+// The source's start timecode (issue #1066), e.g. "01:00:00:00". Where it lives
+// depends on the container: on the video stream's tags, on the container's format
+// tags, or on a companion timecode track with no video of its own. We take the
+// first of those that carries a non-empty `timecode` tag and leave the field
+// absent when none does — a source without a start timecode is normal.
+export function parseStartTimecode(
+  streams: FfprobeStream[],
+  format: FfprobeFormat,
+  video: FfprobeStream | undefined
+): string | undefined {
+  const candidates = [video?.tags?.['timecode'], format.tags?.['timecode']];
+  for (const s of streams) {
+    candidates.push(s.tags?.['timecode']);
+  }
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null) continue;
+    const timecode = String(candidate).trim();
+    if (timecode) return timecode;
+  }
+  return undefined;
+}
+
 // Map raw ffprobe output onto our TechnicalMetadata shape. Picks the first
 // video stream for the primary codec/resolution; collects every audio stream
 // into `audioTracks`. Falls back to format-level duration/bitrate when the
@@ -116,6 +179,13 @@ export function parseFfprobe(result: FfprobeResult, now: string): TechnicalMetad
   const durationSeconds = toNumber(video?.duration ?? format.duration);
   const bitrateBps = toNumber(format.bit_rate ?? video?.bit_rate);
 
+  // Frame rate + start timecode (issue #1066), both OPTIONAL and both omitted
+  // when the source does not carry them — an audio-only source has no video
+  // stream to read a rate off, and most sources carry no start timecode.
+  const frameRate =
+    parseFrameRate(video?.r_frame_rate) ?? parseFrameRate(video?.avg_frame_rate);
+  const startTimecode = parseStartTimecode(streams, format, video);
+
   return {
     codec: video?.codec_name ?? 'unknown',
     width: toNumber(video?.width),
@@ -124,7 +194,9 @@ export function parseFfprobe(result: FfprobeResult, now: string): TechnicalMetad
     bitrateBps,
     containerFormat: format.format_name ?? 'unknown',
     audioTracks,
-    extractedAt: now
+    extractedAt: now,
+    ...(frameRate !== undefined ? { frameRate } : {}),
+    ...(startTimecode !== undefined ? { startTimecode } : {})
   };
 }
 
