@@ -529,6 +529,52 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* ── External identifiers (issue #943) ──────────────────────────────────────
+   Secondary explanatory lines, matching .tracks-note so the two detail-panel
+   blocks read as siblings. */
+.external-ids-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+.empty .external-ids-note {
+  margin-top: 4px;
+}
+
+/* The actions column is only as wide as its buttons; the two identifier columns
+   share the rest. Both hold opaque upstream strings of unpredictable length, so
+   they wrap rather than overflow — a truncated correlation key is worse than a
+   tall row. */
+.external-ids-table td.external-id-namespace,
+.external-ids-table td.external-id-value {
+  word-break: break-all;
+}
+
+.external-ids-table td.external-id-actions {
+  white-space: nowrap;
+  width: 1%;
+}
+
+/* In the editing state each cell holds a full-width field, so the inputs line up
+   under their column headers. */
+.external-ids-table .external-id-namespace-input,
+.external-ids-table .external-id-value-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* A refusal is shown next to the fields it is about, not only in the block's
+   live region. Hidden until there is something to say. */
+.external-id-row-error {
+  margin-top: 6px;
+  white-space: normal;
+}
+
+.external-id-row--editing {
+  vertical-align: top;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
