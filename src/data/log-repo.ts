@@ -34,6 +34,54 @@
 // history"): every append mints a brand-new ULID document and never carries a
 // `_rev` forward, so a written entry cannot be overwritten by application code.
 // There is no update and no delete path here.
+//
+// ---------------------------------------------------------------------------
+// TWO KNOWN GAPS (review findings on #996), both deliberately left as follow-ups
+// because neither is contained to this module. Recorded here with the exact
+// symbols a follow-up would reuse, so nobody has to rediscover them.
+//
+// 1. NO MANGO INDEX BACKS THESE READS. Every `couch.find` below (the `seq`
+//    window in `list`, and `existsAboveSeq` on the probe + freshness paths) is a
+//    selector with no matching index, so CouchDB falls back to the all-docs
+//    index and scans the whole database per call, warning "no matching index
+//    found". The right index is a composite on `['resourceType', 'seq']`
+//    (resourceType first — it is the equality term; `seq` second — it carries
+//    the range), which makes both the window read and the `limit: 1` existence
+//    probe index-only.
+//    Why not here: `StackCouch` (src/data/couchdb.ts:22) exposes put/get/list/
+//    find/count/remove and NO index-creation primitive, and nothing in this repo
+//    creates a Mango index or a `_design` document today — the pre-existing audit
+//    partition reads the same unindexed way (`find({ resourceType })`,
+//    src/data/audit-repo.ts:295). So adding one means a new shared StackCouch
+//    primitive plus deciding WHERE ddocs get provisioned for a per-stack
+//    database, which is an architecture + stack-provisioning call, not a
+//    log-store call. It should be fixed once, for every partition, not smuggled
+//    in here for one.
+//    Bounded in the meantime: `list` reads at most LOG_SCAN_WINDOW documents and
+//    `existsAboveSeq` at most 1, so the RESULT size is bounded even though the
+//    scan is not.
+//
+// 2. NO RETENTION / PURGE PATH FOR THIS PARTITION. The partition grows for the
+//    lifetime of the deployment. The in-memory sibling is capped
+//    (LOG_STORE_MAX_RECORDS, src/services/log-store.ts), but that cap is about
+//    process memory and deliberately does not apply to a durable store, so there
+//    is currently nothing that ages a persisted log entry out.
+//    The precedent to copy is audit-log retention, which solved exactly this for
+//    the sibling append-only partition: ADR-021
+//    (docs/architecture/ADR-021-audit-log-retention.md), boot config via env
+//    (`AUDIT_RETENTION_MS`, unset/0/negative = never purge),
+//    `AuditRetentionRepository` (src/data/audit-repo.ts:180),
+//    `purgeExpiredAuditEntries` (src/pipeline/audit-retention-purge-sweep.ts)
+//    and its loop (src/pipeline/audit-retention-purge-loop.ts).
+//    Why not here: that is a new config surface (a `LOG_RETENTION_MS` env var),
+//    a new sweep + loop, and a retention-window policy decision — an ADR-level
+//    choice, and ADR-021 shows the repo treats it as one.
+//    NOTE for whoever picks it up: purging breaks this store's gap-free `seq`
+//    premise at the OLD end of the stream. `list`'s window arithmetic already
+//    tolerates missing seqs inside a window, but `probeMaxSeq` must keep being
+//    the authority for the HEAD of the stream (it already is), and `size()`
+//    below would stop being the record count once entries are removed.
+// ---------------------------------------------------------------------------
 
 import { z } from 'zod';
 import { ulid } from 'ulid';
@@ -99,10 +147,39 @@ const MAX_PROBE_DOUBLINGS = 45;
 // than restarting at 1 (which would make old cursors point into the middle of
 // the new stream). On the first append/list after boot the store recovers the
 // high-water mark straight from the partition (`probeMaxSeq`) and counts on from
-// there in memory. One API process writes the stream, so that in-memory counter
-// is the single writer; each entry is still a distinct ULID document, so even a
-// concurrent writer could not overwrite an entry — the worst case is two entries
-// sharing a `seq`.
+// there in memory.
+//
+// SINGLE-WRITER ASSUMPTION (review finding, #996). The in-memory counter is
+// authoritative only because a deployment runs ONE API process: ADR-020
+// (docs/architecture/ADR-020-quota-deployment-model-and-metering-source.md,
+// "Consequence / boundary condition") fixes the deployment model as one instance
+// per tenant and builds the storage quota as a "single instance-wide" total on
+// exactly the same premise; src/pipeline/watch-folder.ts:25 relies on it too.
+// Within one process the allocation is race-free: `recoverHighWater` is the only
+// `await` before the read-and-increment, so two concurrent `append()` calls
+// cannot take the same number.
+//
+// What a SECOND writer process would break, precisely: two instances both
+// recover the same high-water mark and both issue seq N. Entries are distinct
+// ULID documents so neither is overwritten, but the cursor is a bare `seq`
+// boundary (`encodeLogCursor`, src/services/log-store.ts) and `applyLogQuery`
+// resumes STRICTLY past it — so if the duplicated N lands on a page boundary,
+// the second entry with seq N is skipped and is unreachable by paging. That is a
+// silent read loss, not just a cosmetic tie.
+//
+// DELIBERATELY NOT FIXED HERE, because the fix is a design change that should
+// land with the multi-writer mode that would need it, not speculatively ahead of
+// it (and the cheap version costs two extra round trips on every append, on a
+// path that is fire-and-forget by design). When that mode is designed, the two
+// viable options, both already expressible with primitives in this repo:
+//   1. Allocate `seq` from a single CAS'd counter document instead of memory,
+//      using `updateWithRetry` + `isUpdateConflict` (src/data/couchdb.ts:171,118)
+//      — the same read-modify-write-with-409-retry primitive #278 added. Keeps
+//      `seq` globally unique across writers; costs a get+put per append.
+//   2. Make the cursor a composite (`seq`, document ULID) boundary so an
+//      ambiguous `seq` is still orderable. The cursor is opaque to callers
+//      (src/routes/logs.ts), so this does NOT change the public contract, but it
+//      does change `applyLogQuery` and so must be done for BOTH stores at once.
 export class CouchLogStore implements LogStore {
   // Highest `seq` known to exist in the partition. `undefined` until recovered.
   private highWater: number | undefined;
@@ -128,8 +205,17 @@ export class CouchLogStore implements LogStore {
   }
 
   // Number of records in the partition. Observability/tests only (the listing
-  // endpoint returns no total). Equal to the high-water mark because the stream
-  // is append-only and gap-free: nothing in this module removes an entry.
+  // endpoint returns no total). Reported as the high-water mark, which is the
+  // record count because the stream is append-only — nothing in this module
+  // removes an entry — and `seq` starts at 1.
+  //
+  // Caveat, since this is the one place it leaks: a `seq` is claimed BEFORE the
+  // document write, so an append whose `couch.put` fails leaves its number
+  // consumed and the mark one ahead of the documents that exist. Harmless for
+  // the read path (`list`'s window simply finds no document at that `seq`, and
+  // `applyLogQuery` pages over the hole) and for a fire-and-forget producer,
+  // but it means this is an upper bound, not an exact count, after a failed
+  // write.
   async size(): Promise<number> {
     return this.currentMaxSeq(this.couchFor());
   }
