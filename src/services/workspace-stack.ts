@@ -45,6 +45,8 @@ import {
   type AuditRetentionRepository
 } from '../data/audit-repo.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
+import { CouchLogStore } from '../data/log-repo.js';
+import { InMemoryLogStore, type LogStore } from './log-store.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
@@ -109,6 +111,12 @@ export type WorkspaceConnections = {
   // purge sweep drives per tick. Typed as the intersection so the single field
   // serves all three consumers; both concrete repos satisfy it.
   audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
+  // Operational log store backing GET /api/v1/logs (issues #473, #996). Backed
+  // by CouchLogStore on every Couch-backed stack — so appended entries survive a
+  // restart — and by InMemoryLogStore on the env-no-couch / in-memory fallback
+  // paths, exactly like `audit` above. Always present, so the router receives one
+  // store regardless of backend.
+  logs: LogStore;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   storageFor: StorageFactory | undefined;
@@ -221,6 +229,10 @@ function buildConnectionsFromStack(
   const pipelines = new CouchPipelineRepository(wc);
   // Audit store over the same per-stack CouchDB connection (issue #564).
   const audit = new CouchAuditRepository(wc);
+  // Durable operational log store over the same connection (issue #996): the
+  // log stream is persisted rather than held in a process-local array, so it
+  // survives a restart.
+  const logs = new CouchLogStore(wc);
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -252,6 +264,7 @@ function buildConnectionsFromStack(
     webhooks,
     collections,
     audit,
+    logs,
     profiles,
     pipelines,
     storageFor,
@@ -328,6 +341,9 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   // (listOldestPage/purgeEntry) — so the retention sweep runs on the in-memory
   // env path too, not just Couch.
   let audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
+  // Operational log store (issue #996): durable CouchLogStore on the couch env
+  // path, InMemoryLogStore otherwise — always present, like `audit` above.
+  let logs: LogStore;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
 
@@ -344,6 +360,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
     audit = new CouchAuditRepository(wc);
+    logs = new CouchLogStore(wc);
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -351,6 +368,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
     audit = new InMemoryAuditRepository();
+    logs = new InMemoryLogStore();
     // Search projects assets + collections (issue #561).
     search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
@@ -384,7 +402,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -409,12 +427,15 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
   const audit = new InMemoryAuditRepository();
+  // No Couch on this path, so the log stream cannot be durable here (issue
+  // #996): it falls back to the process-local store, like `audit` above.
+  const logs = new InMemoryLogStore();
   // Search projects assets + collections (issue #561).
   const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',

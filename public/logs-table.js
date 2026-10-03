@@ -317,7 +317,15 @@ export function createLogsTable(deps) {
     initialSort: urlSortToInitialSort(urlState.sort),
     initialFilters,
     rowKey: (r) => r && r.seq,
-    emptyText: 'No log entries match the current filters.',
+    // "No match" is only honest when the backend has finished looking. The logs
+    // endpoint scans the persisted stream in bounded windows, so an empty page
+    // WITH a nextCursor means "no match in the part scanned so far" — the
+    // operator has more stream to walk (issue #996 review). Saying "no entries
+    // match" there hid entries that did match, further down the stream.
+    emptyText: (ctx) =>
+      ctx && ctx.hasNext
+        ? 'No matching log entries in this part of the stream — choose Next to keep searching.'
+        : 'No log entries match the current filters.',
   });
 
   // Seed the initial cursor from the URL so a shared deep-linked page restores.

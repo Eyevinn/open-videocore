@@ -66,7 +66,7 @@ import { logsRouter } from '../src/routes/logs.js';
 import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import { InMemoryJobRepository } from '../src/data/job-repo.js';
 import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
-import { LOG_LEVELS, LogStore } from '../src/services/log-store.js';
+import { LOG_LEVELS, InMemoryLogStore } from '../src/services/log-store.js';
 import { logPipelineEvent } from '../src/services/pipeline-log.js';
 import { runPull } from '../src/pipeline/url-pull-worker.js';
 import { PackagingService, type PackageQueue, type PackagingJob } from '../src/pipeline/packaging.js';
@@ -126,7 +126,7 @@ type Harness = {
   assets: InMemoryAssetRepository;
   jobs: InMemoryJobRepository;
   pipelines: InMemoryPipelineRepository;
-  logStore: LogStore;
+  logStore: InMemoryLogStore;
   enqueued: PackagingJob[];
 };
 
@@ -142,7 +142,7 @@ async function buildApp(opts: { queueFails?: boolean } = {}): Promise<Harness> {
   // ONE store instance shared by every producer and by the listing router —
   // exactly how src/main.ts wires the single `logStore` const into the assets
   // router, the internal router, the packaging service and the callback poller.
-  const logStore = new LogStore();
+  const logStore = new InMemoryLogStore();
   const { queue, enqueued } = fakeQueue({ fail: opts.queueFails });
   const redis = makeRedis();
 
@@ -300,7 +300,7 @@ describe('LogStore producer: append() during a pipeline run (issue #995)', () =>
     // The core regression this issue exists for: the write path is reached by a
     // normal run, not only by the store's own tests.
     expect(appendSpy).toHaveBeenCalled();
-    expect(h.logStore.size()).toBeGreaterThan(0);
+    expect(await h.logStore.size()).toBeGreaterThan(0);
     await h.app.close();
   });
 
@@ -447,7 +447,7 @@ describe('LogStore producer: URL-pull ingest (issue #995)', () => {
   it('appends ingest entries on a successful pull', async () => {
     const assets = new InMemoryAssetRepository();
     const jobs = new InMemoryJobRepository();
-    const logStore = new LogStore();
+    const logStore = new InMemoryLogStore();
     const asset = await assets.create({ name: 'pulled' });
     const job = await jobs.create({ type: 'ingest-url', assetId: asset.id });
 
@@ -467,7 +467,7 @@ describe('LogStore producer: URL-pull ingest (issue #995)', () => {
       }
     );
 
-    const items = logStore.list({ limit: 200, order: 'asc' }).items;
+    const items = (await logStore.list({ limit: 200, order: 'asc' })).items;
     expect(items.length).toBeGreaterThanOrEqual(2);
     expect(items.every((r) => r.category === 'ingest')).toBe(true);
     expect(items.some((r) => r.level === 'info' && r.message.includes('1234'))).toBe(true);
@@ -476,7 +476,7 @@ describe('LogStore producer: URL-pull ingest (issue #995)', () => {
   it('appends an error-level ingest entry on a terminal pull failure', async () => {
     const assets = new InMemoryAssetRepository();
     const jobs = new InMemoryJobRepository();
-    const logStore = new LogStore();
+    const logStore = new InMemoryLogStore();
     const asset = await assets.create({ name: 'pulled' });
     const job = await jobs.create({ type: 'ingest-url', assetId: asset.id });
 
@@ -497,7 +497,7 @@ describe('LogStore producer: URL-pull ingest (issue #995)', () => {
       }
     );
 
-    const items = logStore.list({ limit: 200, order: 'asc' }).items;
+    const items = (await logStore.list({ limit: 200, order: 'asc' })).items;
     const errors = items.filter((r) => r.level === 'error');
     expect(errors).toHaveLength(1);
     expect(errors[0].category).toBe('ingest');
