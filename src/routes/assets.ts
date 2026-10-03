@@ -1079,7 +1079,7 @@ type AssetsRouterOptions = {
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
   // Best-effort operational log emission for pipeline steps (issue #995). Wired
-  // to the in-memory LogStore's `append()` write primitive — the same instance
+  // to the log store's `append()` write primitive — the same instance
   // GET /api/v1/logs reads (src/main.ts, `logStore`; read path
   // src/routes/logs.ts:94). When absent, pipeline execution proceeds without
   // appending log records (no-op), so existing tests are unaffected. Emission

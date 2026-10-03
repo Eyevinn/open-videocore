@@ -67,6 +67,14 @@ import type {
   Profile
 } from './profile-repo.js';
 import type {
+  AppendLogInput,
+  ListLogsOptions,
+  ListLogsResult,
+  LogReader,
+  LogRecord,
+  LogSink
+} from '../services/log-store.js';
+import type {
   PipelineRepository,
   PipelineExecution
 } from './pipeline-repo.js';
@@ -376,5 +384,32 @@ export class PerWorkspaceAuditEmitter implements AuditEmitter {
       return undefined;
     }
     return audit.record(input);
+  }
+}
+
+// Stack-delegating operational log store (issue #996). Holds no connection of
+// its own: on every call it resolves the active stack and delegates to that
+// stack's log store — CouchLogStore on a Couch-backed stack (durable, survives a
+// restart), the process-local LogStore on the no-Couch dev/test paths. Mirrors
+// PerWorkspaceAuditRepository / PerWorkspaceAuditEmitter above, so the logs
+// router and the pipeline producer each receive ONE object regardless of
+// backend.
+//
+// Satisfies both halves of the store contract (src/services/log-store.ts):
+//   - `LogReader.list(opts) -> ListLogsResult` for GET /api/v1/logs
+//     (src/routes/logs.ts:110-113) — the response contract is unchanged, this
+//     wrapper only moves WHERE the records come from.
+//   - `LogSink.append(input) -> LogRecord` for the pipeline producer
+//     (src/services/pipeline-log.ts), which calls it fire-and-forget.
+export class PerWorkspaceLogStore implements LogReader, LogSink {
+  constructor(private readonly resolver: WorkspaceStackResolver) {}
+  private async store(): Promise<LogSink & LogReader> {
+    return (await this.resolver.resolve(currentRequestStackName())).logs;
+  }
+  async append(input: AppendLogInput): Promise<LogRecord> {
+    return (await this.store()).append(input);
+  }
+  async list(opts: ListLogsOptions = {}): Promise<ListLogsResult> {
+    return (await this.store()).list(opts);
   }
 }

@@ -1,13 +1,20 @@
-// In-memory operational log store (issue #473).
+// Operational log store: record model, query semantics, and the in-memory
+// implementation (issue #473; persisted to CouchDB by issue #996).
 //
 // Backs GET /api/v1/logs — a cursor/sequence-paged, append-only, time-ordered
-// log stream. There is no persistent log store in the repo today; the closest
-// analogues are the per-job `encodeAttemptLog` field (a nested array on one job)
-// and the provision OperationStore (an unbounded in-memory array with no
-// message/level/category fields and no paging). This store is the minimal,
-// well-scoped source needed to satisfy #473: a single append-only sequence with
-// message/level/category records and monotonic sequence numbers so paging is
-// stable against concurrent appends (no offset drift).
+// log stream: a single append-only sequence with message/level/category records
+// and monotonic sequence numbers so paging is stable against concurrent appends
+// (no offset drift).
+//
+// The DURABLE implementation is CouchLogStore (src/data/couch-log-repo.ts,
+// issue #996), which persists each record as its own immutable document the way
+// CouchAuditRepository persists audit entries (src/data/audit-repo.ts:199-215).
+// The class below is the in-memory implementation retained for the
+// no-Couch/dev/test paths (buildEnvConnections / buildInMemoryConnections,
+// src/services/workspace-stack.ts), exactly as InMemoryAuditRepository is
+// retained alongside CouchAuditRepository. Both share ONE filter/sort/paginate
+// function (`applyLogQuery` below) so the two cannot drift — the same device
+// `applyAuditQuery` (src/data/audit-repo.ts:141) uses for the audit stores.
 //
 // The retained window is CAPPED (LOG_STORE_MAX_RECORDS, issue #995 review):
 // records are evicted oldest-first once the cap is reached, so a long-running
@@ -15,16 +22,14 @@
 // Sequence numbers are never reset or reused, so eviction does not weaken the
 // paging contract.
 //
-// Modelled on OperationStore (src/services/operation-store.ts): a plain in-memory
-// class holding records in a Map/array, injected into its router the same way
-// the OperationStore is injected into provisionRouter (src/main.ts:301-307).
-//
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - OperationStore in-memory store + sort-newest-first list() shape:
 //     src/services/operation-store.ts:17-38.
 //   - `{ items, nextCursor }` cursor envelope expected by the frontend table
 //     primitive: public/ops-ui-table.js:210-213 (`state.nextCursor = i.nextCursor`)
 //     and pageParams() sending `{ limit, cursor }`: public/ops-ui-table.js:262-268.
+//   - Shared-pure-query device for a Couch + in-memory store pair:
+//     `applyAuditQuery(all, query)` at src/data/audit-repo.ts:141-162.
 
 // Optional severity carried by a log record. Absent when the underlying source
 // does not classify the entry.
@@ -126,6 +131,79 @@ function clampLimit(limit: number | undefined): number {
   return Math.min(MAX_LIMIT, Math.max(1, Math.trunc(limit)));
 }
 
+// Pure filter + sort + cursor-paginate over already-materialised records.
+// Shared by the in-memory LogStore and the durable CouchLogStore
+// (src/data/couch-log-repo.ts) so the two implementations of the
+// `{ items, nextCursor }` contract cannot drift — the same device
+// `applyAuditQuery` (src/data/audit-repo.ts:141) provides for the audit stores.
+// Never mutates its input: the array it sorts is its own copy.
+//
+// This is the ONLY place the listing semantics live: the time-range/`q` filters,
+// the `seq`-ordered sort, the "resume strictly after the cursor boundary" rule,
+// and the `nextCursor` mint. Moving it out of the class changed none of them.
+export function applyLogQuery(
+  records: readonly LogRecord[],
+  opts: ListLogsOptions = {}
+): ListLogsResult {
+  const limit = clampLimit(opts.limit);
+  const order = opts.order === 'asc' ? 'asc' : 'desc';
+  const cursorSeq = decodeCursor(opts.cursor);
+  const q = opts.q?.toLowerCase();
+
+  // Apply the server-side filters first. Filtering never changes the underlying
+  // `seq` values, so cursors stay valid across filter changes.
+  const filtered = records.filter((r) => {
+    if (opts.from !== undefined && r.timestamp < opts.from) return false;
+    if (opts.to !== undefined && r.timestamp > opts.to) return false;
+    if (q !== undefined && !r.message.toLowerCase().includes(q)) return false;
+    return true;
+  });
+
+  // Newest-first by default. Sequence order is the tie-break-free ordering
+  // authority (timestamps can collide; `seq` cannot), so we order by `seq`.
+  // `filtered` is already a fresh array owned by this call, so it is sorted in
+  // place — the caller's array is never reordered.
+  const ordered = filtered.sort((a, b) => (order === 'desc' ? b.seq - a.seq : a.seq - b.seq));
+
+  // Resume strictly AFTER the cursor's seq boundary, respecting direction.
+  const afterCursor =
+    cursorSeq === undefined
+      ? ordered
+      : ordered.filter((r) => (order === 'desc' ? r.seq < cursorSeq : r.seq > cursorSeq));
+
+  const page = afterCursor.slice(0, limit);
+  // There is a next page iff the filtered/ordered stream had more entries than
+  // this page returned. The cursor is the last returned record's seq.
+  const hasMore = afterCursor.length > page.length;
+  const last = page[page.length - 1];
+  const nextCursor = hasMore && last ? encodeCursor(last.seq) : null;
+
+  return { items: page.map((r) => ({ ...r })), nextCursor };
+}
+
+// The read capability GET /api/v1/logs needs (src/routes/logs.ts). Returns the
+// `{ items, nextCursor }` contract either synchronously (in-memory LogStore) or
+// as a promise (CouchLogStore / PerWorkspaceLogStore), so the route is written
+// against the interface and works over both without a contract change.
+export interface LogReader {
+  list(opts?: ListLogsOptions): ListLogsResult | Promise<ListLogsResult>;
+}
+
+// The write capability the pipeline producer needs. Satisfied synchronously by
+// the in-memory LogStore and asynchronously by the durable CouchLogStore
+// (src/data/couch-log-repo.ts). `PipelineLogSink`
+// (src/services/pipeline-log.ts:51-53) is the even narrower, return-type-
+// agnostic view the pipeline call sites depend on; this one keeps the record
+// type for callers that use the written record.
+export interface LogSink {
+  append(input: AppendLogInput): LogRecord | Promise<LogRecord>;
+}
+
+// In-memory operational log store, retained for the no-Couch paths (dev/test,
+// buildEnvConnections without COUCHDB_URL, buildInMemoryConnections) exactly as
+// InMemoryAuditRepository is retained alongside CouchAuditRepository
+// (src/data/audit-repo.ts:312). Process-local: records do NOT survive a restart
+// — that is what CouchLogStore (src/data/couch-log-repo.ts, issue #996) is for.
 export class LogStore {
   // Append order == sequence order, so the array is intrinsically ordered by
   // `seq` ascending. We never reorder entries, and the only removal is
@@ -176,41 +254,11 @@ export class LogStore {
     return this.records.length;
   }
 
+  // Filter/sort/paginate the held window. Delegates to the shared pure
+  // `applyLogQuery` so this store and the durable CouchLogStore answer the
+  // listing contract identically (`records` is passed as a readonly view and is
+  // never reordered or mutated by the query).
   list(opts: ListLogsOptions = {}): ListLogsResult {
-    const limit = clampLimit(opts.limit);
-    const order = opts.order === 'asc' ? 'asc' : 'desc';
-    const cursorSeq = decodeCursor(opts.cursor);
-    const q = opts.q?.toLowerCase();
-
-    // Apply the server-side filters first. This is done over the full array;
-    // filtering never changes the underlying `seq` values, so cursors stay valid
-    // across filter changes.
-    const filtered = this.records.filter((r) => {
-      if (opts.from !== undefined && r.timestamp < opts.from) return false;
-      if (opts.to !== undefined && r.timestamp > opts.to) return false;
-      if (q !== undefined && !r.message.toLowerCase().includes(q)) return false;
-      return true;
-    });
-
-    // Newest-first by default. Sequence order is the tie-break-free ordering
-    // authority (timestamps can collide; `seq` cannot), so we order by `seq`.
-    // `filtered` is already a fresh array owned by this call, so it is sorted in
-    // place — the held `records` array is never reordered.
-    const ordered = filtered.sort((a, b) => (order === 'desc' ? b.seq - a.seq : a.seq - b.seq));
-
-    // Resume strictly AFTER the cursor's seq boundary, respecting direction.
-    const afterCursor =
-      cursorSeq === undefined
-        ? ordered
-        : ordered.filter((r) => (order === 'desc' ? r.seq < cursorSeq : r.seq > cursorSeq));
-
-    const page = afterCursor.slice(0, limit);
-    // There is a next page iff the filtered/ordered stream had more entries than
-    // this page returned. The cursor is the last returned record's seq.
-    const hasMore = afterCursor.length > page.length;
-    const last = page[page.length - 1];
-    const nextCursor = hasMore && last ? encodeCursor(last.seq) : null;
-
-    return { items: page.map((r) => ({ ...r })), nextCursor };
+    return applyLogQuery(this.records, opts);
   }
 }
