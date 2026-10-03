@@ -2382,3 +2382,92 @@ body.detail-standalone .assets-side {
   color: var(--text-muted);
   word-break: break-word;
 }
+
+/* ─── Detail-panel raw disclosure (issue #963) ─────────────────────────────── */
+/* The full server record is kept on every detail panel but demoted behind a
+   native <details>, collapsed by default (public/detail-sections.js), so the
+   curated fields lead and the JSON is there when a field this UI does not
+   render yet matters. Native disclosure => keyboard operable and state-exposed
+   with no ARIA of our own (WCAG 2.1 SC 2.1.1, 4.1.2). */
+.raw-disclosure > summary {
+  cursor: pointer;
+  display: list-item;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 4px 2px;
+  width: fit-content;
+}
+
+.raw-disclosure > summary:hover {
+  color: var(--text);
+}
+
+/* A visible, non-colour focus indicator: the summary is a focus stop and the
+   UA default outline is easy to lose against this surface (SC 2.4.7). */
+.raw-disclosure > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Keep the raw JSON scrollable rather than letting it stretch the panel. */
+.raw-disclosure-body {
+  max-height: 420px;
+  overflow: auto;
+}
+
+/* ─── Encode-attempt history (issue #963) ─────────────────────────────────── */
+/* One line answering "was this retried, and did it recover?", above a row-per
+   -attempt table. Shown only for a job with more than one Encore dispatch, so
+   a first-time success gains no empty section. */
+.attempt-summary {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+/* Attempt rows are not clickable — undo the global clickable-row cursor so the
+   timeline does not advertise an interaction it does not have. */
+.attempt-timeline tbody tr:hover {
+  cursor: default;
+}
+
+.attempt-timeline tbody th.attempt-index {
+  padding: 8px 10px;
+  text-align: left;
+  font-family: 'Courier New', monospace;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* The outcome is carried by the WORD ("Failed" / "Succeeded" / "In flight");
+   the colour only reinforces it, so the state survives being read in
+   monochrome (SC 1.4.1). */
+.attempt-outcome {
+  font-weight: 600;
+}
+
+.attempt-outcome-failed {
+  /* The lighter red the job Error row already uses, for contrast above 4.5:1
+     against this surface rather than the saturated --danger. */
+  color: #f87171;
+}
+
+.attempt-outcome-succeeded {
+  color: var(--success);
+}
+
+.attempt-outcome-open {
+  color: var(--warning);
+}
+
+.attempt-outcome-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  word-break: break-word;
+}

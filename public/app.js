@@ -36,6 +36,22 @@ import { applyThumbnail } from './thumbnail-url.js';
 // button; slugs are shown under their own "Slug" header. Contract grounding for
 // which value each endpoint accepts lives in public/copy-id.js.
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Shared detail-panel primitives (issue #963): the collapsed "Raw" disclosure
+// that holds the full server record, and the copyable field value built on the
+// copy-id.js control. Factored out because the pipeline-execution detail view
+// (issue #964) needs the same two affordances; contract grounding for the
+// values passed in stays with each caller.
+import {
+  createRawDisclosure,
+  rawDisclosureOpen,
+  copyableFieldHtml,
+  wireCopyableFields,
+} from './detail-sections.js';
+// Encode-attempt history (issue #963): the derivation + rendering of
+// `encodeAttemptLog` / `encodeAttempts`, so a job rescued by a classified retry
+// reads differently from a plain slow success. Full contract grounding for
+// every field it touches is in that module's header.
+import { renderAttemptHistory } from './job-attempts.js';
 // Delete-lock detail surface (issue #895): the "Delete protection" block and the
 // lock / unlock / edit-note actions on the asset detail view, implementing
 // docs/ux/asset-lock-state-spec.md §4. State derivation and copy live in
@@ -3577,9 +3593,25 @@ async function showJobDetail(id, detailPanel) {
 // `opts.afterCancel()` runs after a successful in-panel cancel (embedded only).
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
 // the fetched job (or throws if the fetch fails / 404s).
+//
+// CONTRACT: GET /api/v1/jobs/{id} — `jobSchema`, src/routes/jobs.ts:50-145
+// (openapi.json:15658, path key "/api/v1/jobs/{id}", method `get`; the spec
+// assigns this operation no operationId). Per-field grounding is inline at each
+// row below; the encode-attempt fields (`encodeAttempts`, `encodeAttemptLog`)
+// are grounded in public/job-attempts.js's header.
+//
+// Issue #963 shape: the panel LEADS with curated fields, then the encode-attempt
+// history (only when the job was actually retried), and ends with the full
+// record behind a collapsed "Raw" disclosure — it no longer dumps
+// JSON.stringify(job) as the primary surface.
 async function renderJobDetailBody(id, bodyEl, opts) {
   opts = opts || {};
   const body = bodyEl;
+  // Read the raw-disclosure state BEFORE the container is cleared. The detached
+  // window re-renders this body every DETAIL_POLL_INTERVAL_MS (public/detail.js
+  // tick()), so without carrying the operator's own expansion across the
+  // re-render the raw record would slam shut under them every 5 seconds.
+  const rawWasOpen = rawDisclosureOpen(body);
   body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
@@ -3613,10 +3645,39 @@ async function renderJobDetailBody(id, bodyEl, opts) {
     }
     if (job.profile) kvRows.push(['Profile', escHtml(job.profile)]);
     if (job.progress != null) kvRows.push(['Progress', escHtml(job.progress + '%')]);
+    // Bytes pulled, for a URL-pull ingest job (issue #963). `bytesTransferred`
+    // is a REQUIRED number on the job (src/routes/jobs.ts:72; present in the
+    // GET 200 `required` list, openapi.json:15802-15813) and `totalBytes` is
+    // OPTIONAL (src/routes/jobs.ts:73) — absent when the source served no
+    // content-length, which is why the "of N" half is conditional. Shown only
+    // for the job type that transfers bytes: `type` is
+    // 'ingest-url' | 'transcode' | 'package' (src/routes/jobs.ts:52 ->
+    // JOB_TYPES, src/data/job-repo.ts:84).
+    if (job.type === 'ingest-url' && job.bytesTransferred != null) {
+      kvRows.push(['Transferred',
+        escHtml(fmtBytes(job.bytesTransferred)) +
+          (job.totalBytes != null
+            ? ' <span class="text-muted">of ' + escHtml(fmtBytes(job.totalBytes)) + '</span>'
+            : '')]);
+    }
     kvRows.push(['Created', escHtml(fmtDate(job.createdAt))]);
     kvRows.push(['Updated', escHtml(fmtDate(job.updatedAt))]);
     if (job.error) {
       kvRows.push(['Error', '<span style="color:var(--error,#f87171)">' + escHtml(job.error) + '</span>']);
+    }
+    // Encore job id (issue #963). This is the handle the transcode job's
+    // completion signal is correlated by — it is what an operator greps for in
+    // the Encore instance's own logs — so it must be on screen and copyable,
+    // not buried in the raw record. OPTIONAL on the wire and present only for
+    // transcode jobs (src/routes/jobs.ts:80-81; openapi.json:15725, absent from
+    // the GET 200 `required` list at openapi.json:15802-15813), so the row is
+    // conditional. Rendered through the shared click-to-copy control
+    // (public/copy-id.js via copyableFieldHtml) rather than a hover tooltip:
+    // the value IS the visible text, and the button carries the aria-live
+    // feedback.
+    if (job.encoreJobId) {
+      kvRows.push(['Encore Job ID',
+        copyableFieldHtml(job.encoreJobId, 'Copy Encore job id')]);
     }
     if (job.encoreInstanceId) {
       // Placeholder value; resolved to a link (or plain text) after render once
@@ -3631,6 +3692,17 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
     }).join('');
     body.appendChild(kvDiv);
+    // Bind the click-to-copy control(s) in the field list (currently the Encore
+    // job id). Idempotent, so a re-render on the poll tick re-binds safely.
+    wireCopyableFields(kvDiv);
+
+    // Encode-attempt history (issue #963). Renders NOTHING when the job was
+    // dispatched once: a single-attempt job has no history to compare and must
+    // not get an empty section. When it was retried, the timeline is how a
+    // rescued run (classified failure + backoff + a later success) is told apart
+    // from a plain slow success without reading JSON.
+    const attemptHistory = renderAttemptHistory(job, { fmtDate: fmtDate });
+    if (attemptHistory) body.appendChild(attemptHistory);
 
     // Resolve the Encore instance to a clickable link via the scaler status.
     if (job.encoreInstanceId) {
@@ -3730,10 +3802,17 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       body.appendChild(actions);
     }
 
-    const pre = document.createElement('pre');
-    pre.className = 'code-block mt12';
-    pre.textContent = JSON.stringify(job, null, 2);
-    body.appendChild(pre);
+    // The full server record, kept but demoted (issue #963). It is the only
+    // view guaranteed complete when the API grows a field this panel does not
+    // render yet, so it stays — behind a disclosure, COLLAPSED by default, so
+    // the curated fields above are what the panel leads with. `rawWasOpen`
+    // carries an operator's own expansion across the detached window's poll
+    // re-render.
+    body.appendChild(createRawDisclosure(job, {
+      label: 'Raw job JSON',
+      open: rawWasOpen,
+      className: 'mt12',
+    }));
     return job;
   } catch (err) {
     body.innerHTML = '';
