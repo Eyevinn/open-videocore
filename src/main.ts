@@ -80,7 +80,8 @@ import {
   PerWorkspaceCollectionRepository,
   PerWorkspaceAuditRepository,
   PerWorkspaceProfileRepository,
-  PerWorkspaceAuditEmitter
+  PerWorkspaceAuditEmitter,
+  PerWorkspaceLogStore
 } from './data/per-workspace-repos.js';
 import type { AssetRepository } from './data/asset-repo.js';
 import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
@@ -121,7 +122,7 @@ import {
   auditRetentionMsFromEnv
 } from './routes/retention.js';
 import { logsRouter } from './routes/logs.js';
-import { LogStore } from './services/log-store.js';
+import type { LogReader, LogSink } from './services/log-store.js';
 import {
   ArchivedAssetPurgeLoop,
   archivePurgeIntervalMsFromEnv
@@ -508,12 +509,15 @@ registerPrincipal(app, {
 
 const operationStore = new OperationStore();
 
-// In-memory operational log store backing GET /api/v1/logs (issue #473). There
-// is no persistent log store today; this is the minimal append-only, sequence-
-// keyed source that satisfies cursor paging + the log record shape, modelled on
-// operationStore above. Registered by reference so future producers can append
-// to the same instance the router reads.
-const logStore = new LogStore();
+// Operational log store backing GET /api/v1/logs (issue #473), PERSISTED to the
+// resolved stack's CouchDB since issue #996: it was a process-local array, so
+// every restart emptied the Logs tab. This wrapper holds no connection — each
+// append/list resolves the active stack and delegates to its CouchLogStore
+// (src/data/couch-log-repo.ts, the CouchAuditRepository document pattern), or to
+// the process-local LogStore on the no-Couch dev paths. Registered by reference,
+// exactly as before, so every producer below appends to the same store the
+// router reads; the GET /api/v1/logs request/response contract is unchanged.
+const logStore: LogSink & LogReader = new PerWorkspaceLogStore(stackResolver);
 
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
@@ -1531,7 +1535,8 @@ function activateScaler(redisUrl: string): void {
     auditLog: app.log,
     // Operational log records for the `package` stage (issue #995): the enqueue
     // and the packager's success/failure callbacks each append one entry to the
-    // SAME in-memory store GET /api/v1/logs reads (`logStore` above).
+    // SAME store GET /api/v1/logs reads (`logStore` above) — durable since
+    // issue #996.
     pipelineLog: logStore
   });
 
@@ -1751,7 +1756,7 @@ function activateScaler(redisUrl: string): void {
     // deliver identical payloads to the same registrations.
     webhookDispatcher,
     // Operational log records for the `transcode` stage (issue #995). The SAME
-    // in-memory store GET /api/v1/logs reads (`logStore` above), so a transcode
+    // store GET /api/v1/logs reads (`logStore` above, durable since #996), so a transcode
     // that settles through this poller shows up in the Logs tab.
     pipelineLog: logStore,
     logger: app.log
@@ -1956,7 +1961,7 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // Operational log records for the pipeline steps this router drives (issue
   // #995): the `ingest` stage (URL-pull worker + the synchronous
   // extract-metadata / thumbnail / subtitles / scene-detect steps) and the
-  // `transcode` submission. Appends to the SAME in-memory store
+  // `transcode` submission. Appends to the SAME store
   // GET /api/v1/logs reads (`logStore` above), which is what makes the Logs tab
   // populate during a normal run.
   pipelineLog: logStore
@@ -2284,7 +2289,8 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
 await app.register(retentionRouter, retentionRouterOptions);
 
 // Operational logs listing (issue #473). Cursor/sequence-paged, newest-first,
-// append-only log stream over the in-memory logStore. Offset paging is
+// append-only log stream over the durable `logStore` above (CouchDB-backed per
+// issue #996). Offset paging is
 // deliberately excluded (#371): only a bounded `limit` + opaque `cursor`, so
 // appended entries never shift an in-flight page.
 await app.register(logsRouter, { prefix: '/api/v1/logs', logStore });

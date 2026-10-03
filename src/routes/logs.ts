@@ -4,9 +4,15 @@
 // log stream. #371 rules out offset paging for this surface (offset counts drift
 // as entries are appended to a high-volume append-only stream), so this endpoint
 // is cursor-only: a bounded `limit` plus an opaque `cursor`, returning
-// `{ items, nextCursor }`. There is no persistent log store in the repo, so the
-// endpoint is backed by the in-memory LogStore (src/services/log-store.ts),
-// modelled on the OperationStore that backs GET /api/v1/provision/operations.
+// `{ items, nextCursor }`.
+//
+// The store behind it is DURABLE as of issue #996: records are persisted to the
+// stack's CouchDB by CouchLogStore (src/data/couch-log-repo.ts) the way
+// CouchAuditRepository persists audit entries, so the Logs tab still shows what
+// happened before a restart. This router depends only on the `LogReader`
+// interface (`list(opts) -> { items, nextCursor }` sync OR promised,
+// src/services/log-store.ts), which both the durable store and the retained
+// in-memory LogStore satisfy — the request/response contract below is unchanged.
 //
 // Behind the 401 presence gate (issue #995 review). This endpoint is NOT the
 // aggregate-only surface it was when it shipped: the pipeline producer
@@ -29,13 +35,18 @@
 //     copied): src/routes/jobs.ts:91-99 (`{ items, total }`).
 //   - `{ items, nextCursor }` cursor envelope + `{ limit, cursor }` request the
 //     frontend table primitive sends: public/ops-ui-table.js:210-213, 262-268.
-//   - Injected in-memory store pattern (OperationStore into provisionRouter):
+//   - Injected store pattern (OperationStore into provisionRouter):
 //     src/main.ts:301-307; store contract: src/services/log-store.ts.
+//   - Durable store + its read method: `CouchLogStore.list(opts):
+//     Promise<ListLogsResult>` (src/data/couch-log-repo.ts), and the stack-
+//     delegating `PerWorkspaceLogStore` main.ts injects
+//     (src/data/per-workspace-repos.ts) — both narrowed here to `LogReader`
+//     (src/services/log-store.ts).
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
-import { LOG_LEVELS, type LogStore } from '../services/log-store.js';
+import { LOG_LEVELS, type LogReader } from '../services/log-store.js';
 import { authGate } from '../auth/middleware.js';
 
 // One log record as returned to callers. Mirrors LogRecord
@@ -74,7 +85,11 @@ const listLogsResponseSchema = z.object({
 });
 
 type LogsRouterOptions = {
-  logStore: LogStore;
+  // Read surface only. `LogReader` is satisfied by the durable CouchLogStore
+  // (promised `list`), the stack-delegating PerWorkspaceLogStore, and the
+  // in-memory LogStore (synchronous `list`) — so unit tests that build this
+  // router over a plain `new LogStore()` are unchanged.
+  logStore: LogReader;
 };
 
 export const logsRouter: FastifyPluginAsync<LogsRouterOptions> = async (fastify, opts) => {
@@ -109,7 +124,9 @@ export const logsRouter: FastifyPluginAsync<LogsRouterOptions> = async (fastify,
     },
     async (request) => {
       const { limit, cursor, from, to, q, order } = request.query;
-      return logStore.list({ limit, cursor, from, to, q, order });
+      // Awaited so a promised read (the durable CouchDB store) and a
+      // synchronous one (in-memory) both serialise to the same body.
+      return await logStore.list({ limit, cursor, from, to, q, order });
     }
   );
 };
