@@ -1,43 +1,93 @@
 // Default SceneDetector backed by the OSC eyevinn-function-scenes media function
-// (issue #115).
+// (issue #115; wire shape corrected in #798, contract recording added in #799).
 //
 // eyevinn-function-scenes ("Scene Detect Media Function") is a serverless media
 // FUNCTION. Like eyevinn-auto-subtitles (and unlike the eyevinn-ffmpeg-s3
 // ephemeral job runner used for ffprobe/thumbnails/clip), we treat it as a
 // resolvable instance we call over HTTP at its instance URL. This runner resolves
-// that instance URL (getInstance().url) and its service access token, then starts
-// a detection job on the function's job API.
+// that instance URL (getInstance().url) and its service access token, then drives
+// the function's ASYNCHRONOUS JOB API.
 //
-// CALL SHAPE (issue #799): the request is no longer written out at the call site.
+// CALL SHAPE (#799): the create-job request is NOT written out at the call site.
 // It is built from the recorded service contract in function-scenes-contract.ts
-// and pinned by test/scene-detect-contract.test.ts, because this call has drifted
-// from the service once before: it used to POST `{ url }` to the function root,
-// and `/` is the HEALTHCHECK (`server.get("/")`, index.js:33) with no POST route
-// — which is the whole reason #783 saw `405 Allow: GET` in production. The
-// confirmed detection endpoint is `POST /api/v1` with a `{ medialocator }` body.
-// There is NO source-URL query parameter anywhere in the service: no handler ever
-// reads `req.query` (#797 was opened to find that parameter's name; the confirmed
-// answer is that it does not exist).
+// and pinned by test/scene-detect-contract.test.ts, because this call drifted from
+// the service once already: it used to POST `{ url }` to the function root, and
+// `/` is the HEALTHCHECK (`server.get("/")`, index.js:33) with no POST route,
+// which is exactly why #783 saw `405 Allow: GET` in production. There is NO
+// source-URL query parameter anywhere in the service (no handler reads
+// `req.query`), so the "switch to GET + query parameter" premise #798 was filed
+// with does not match the service; the 405 is fixed by moving the POST to the real
+// detection route instead.
 //
-// STILL OPEN (issue #798): detection is an ASYNCHRONOUS JOB API. `POST /api/v1`
-// returns `{ thumbnails, status }` — two relative endpoints to poll — and the
-// service exposes only extracted KEYFRAME IMAGE URIs, never the scene-boundary
-// timecodes `SceneDetectorResult` models. So a job can be started correctly (that
-// is what this file now does) but cannot yet be turned into `sceneMetadata`:
-// polling plus a re-scope of what `sceneMetadata` means is #798's job, and the
-// re-scope is an architect/ux decision, not an implementation detail. Until then
-// this runner reports an explicit error rather than an empty result — see the
-// comment at the end of makeOscSceneDetector for why the empty result would be
-// actively harmful.
+// Interaction model (confirmed, see "Contract sources"):
+//   1. `POST /api/v1` with `{"medialocator": "<presigned GET url>"}` starts a job
+//      and returns `{ thumbnails, status }` — both RELATIVE paths built from the
+//      function's own BASE_PATH, so they are resolved against the instance URL
+//      rather than reconstructed from a job id we guessed.
+//   2. `GET <status>` is polled until `state` is terminal: `completed` (success)
+//      or `failed` / `cancelled` (genuine detection failure).
+// Polling is required rather than optional: `SceneDetectJob.execute()` resolves on
+// the FIRST ffmpeg stderr chunk (scene_detect_job.js:41-42), so `createJob` — and
+// therefore the POST — returns while the decode is still running and the job state
+// only reaches `completed`/`failed` on the ffmpeg `exit` handler
+// (scene_detect_job.js:44-52). A create-only call cannot know whether detection
+// succeeded.
 //
-// Contract sources (verified 2026-09-26): see function-scenes-contract.ts, which
-// records `Eyevinn/function-scenes` @ 492a18f23e253194c27800563ea0c96bef187aef
-// (`api.json` `#/model/request.medialocator`, `#/model/createJobResponse`, and
-// the `index.js` route table), plus
-// docs/investigations/797-function-scenes-runtime-contract.md and
-// services/stack.ts SCENE_DETECT_SERVICE_ID. `get-service-schema
-// eyevinn-function-scenes` exposes provisioning config (`name`) only — no runtime
-// wire shape — which is why the service source is the contract of record.
+// KNOWN GAP — scene-boundary timecodes are NOT retrievable from this service.
+// The job's ffmpeg invocation writes cut timecodes to `time.txt` INSIDE the job
+// workdir (`select='gt(scene,0.4)',metadata=print:file=${workdir}/time.txt`,
+// lib/scene_detect_job.js `execute()`), and no documented endpoint exposes that
+// file — `GET /api/v1/:id/thumbnails` returns only extracted keyframe image URIs.
+// Our `SceneMetadata` (asset-repo.ts, and `sceneMetadata` in openapi.json, which
+// pins `boundaries[].startSeconds/endSeconds/keyframeSeconds` with
+// `additionalProperties: false`) models timecodes only, so a successful run
+// currently yields ZERO boundaries. Re-scoping `sceneMetadata` to carry keyframe
+// URIs is an API-contract change, and reading `time.txt` through the undocumented
+// `/images/*` static mount is not a contract — both are decisions for the
+// architect/ux, tracked in #883 and in
+// docs/investigations/797-function-scenes-runtime-contract.md ("Impact on
+// sceneMetadata").
+// Until that decision lands this runner reports the gap EXPLICITLY, as
+// `boundariesUnavailable`, rather than as an empty result: an empty result would be
+// normalized into `sceneMetadata` with `sceneCount: 0`, which claims "this video has
+// no scene cuts" and is indistinguishable to an API consumer from a genuine
+// single-shot video — a silent wrong answer for every input. It is NOT reported as a
+// detection failure either: the job genuinely succeeded, so `sceneDetectionError`
+// stays reserved for genuine detection failures — transport errors, non-2xx
+// responses, malformed payloads, a `failed`/`cancelled` job, or a job that never
+// reaches a terminal state inside the poll budget.
+//
+// Contract sources (verified from the service's own source; recording 2026-09-26,
+// re-fetched at the same pinned ref 2026-09-27 while merging #799 into this branch):
+//   - Upstream service source `Eyevinn/function-scenes`
+//     @ 492a18f23e253194c27800563ea0c96bef187aef (`master`):
+//       * `api.json` — the OpenAPI 3.0.0 document the function serves at
+//         `/api/docs/` (index.js:29-30): `paths./api/v1.post` with request body
+//         `#/model/request` (`required: ["medialocator"]`, "URL to video file or
+//         video stream") and response `#/model/createJobResponse`
+//         (`thumbnails`, `status`); `paths./api/v1/{id}/status.get` → `#/model/job`
+//         (`state` enum `created|running|completed|failed|cancelled`). Vendored
+//         byte-identically at docs/contracts/eyevinn-function-scenes-api.json and
+//         diffed by test/scene-detect-contract.test.ts.
+//       * `index.js` route table — `server.get("/")` healthcheck (:33),
+//         `server.post("/api/v1")` reading `req.body.medialocator` (:45), calling
+//         `sceneDetect.createJob` (:46) and responding
+//         `{ thumbnails: `${BASE_PATH}/api/v1/${id}/thumbnails`,
+//            status: `${BASE_PATH}/api/v1/${id}/status` }` (:47-50),
+//         `server.get("/api/v1/:id/status")` (:78),
+//         `server.get("/api/v1/:id/thumbnails")` (:63).
+//       * `lib/scene_detect.js` — `createJob()` awaits `job.execute()` (:24).
+//       * `lib/scene_detect_job.js` — `execute()` (the ffmpeg command, the
+//         resolve-on-first-stderr behaviour, the `exit` handler that sets
+//         `completed`/`failed`, and the `time.txt` gap above), `getStatus()`
+//         (`{ id, state, session }`).
+//   - Recorded, machine-checkable form: src/pipeline/function-scenes-contract.ts
+//     (`FUNCTION_SCENES_CONTRACT`, `buildCreateJobRequest`,
+//     `parseCreateJobResponse`).
+//   - Full write-up: docs/investigations/797-function-scenes-runtime-contract.md
+//   - get-service-schema `eyevinn-function-scenes` (provisioning config: `name`
+//     only — it exposes NO runtime wire shape, which is why the source was needed).
+//   - services/stack.ts SCENE_DETECT_SERVICE_ID.
 
 import { getInstance, type Context } from '@osaas/client-core';
 import { SCENE_DETECT_SERVICE_ID } from '../services/stack.js';
@@ -47,6 +97,42 @@ import {
   parseCreateJobResponse
 } from './function-scenes-contract.js';
 import type { SceneDetector, SceneDetectorResult } from './scene-detector.js';
+
+// Detection route on the function, taken from the recorded contract
+// (api.json `paths./api/v1.post`). NOT '/', which is the healthcheck — see the
+// file header.
+export const DEFAULT_SCENE_DETECT_PATH = FUNCTION_SCENES_CONTRACT.createJob.path;
+
+// Default per-request timeout for every call to the function. Generous: the
+// create-job handler awaits `job.execute()` (lib/scene_detect.js:24), which only
+// settles once ffmpeg has opened the input and written its first stderr chunk, so
+// a slow source URL delays the response. Bounded all the same, so a wedged
+// instance cannot pin a socket for the life of the process.
+export const DEFAULT_SCENE_REQUEST_TIMEOUT_MS = 10 * 60_000; // 10 minutes
+// Status polling budget. Detection runs for roughly the decode time of the
+// source, so the ceiling is generous; the step is fire-and-forget, nobody is
+// waiting on it.
+const DEFAULT_POLL_INTERVAL_MS = 3_000;
+const DEFAULT_POLL_TIMEOUT_MS = 15 * 60_000;
+
+// Why a completed job still yields no scene boundaries. Surfaced on the detector
+// result so the outcome is distinguishable from a genuine no-cut video (see the
+// KNOWN GAP in the file header, and the `boundariesUnavailable` handling in
+// scene-detector.ts).
+export const BOUNDARIES_UNAVAILABLE_REASON =
+  'eyevinn-function-scenes reports extracted keyframe images only; it exposes no ' +
+  'scene-boundary timecodes (cut times are written to a job-local time.txt that no ' +
+  'endpoint serves), so no cut timecodes can be read from this service';
+
+// Job states, read off the recorded contract (`#/model/job.state` enum; the
+// STATE_* constants in lib/scene_detect_job.js).
+const STATE_COMPLETED = 'completed';
+const FAILURE_STATES = new Set(['failed', 'cancelled']);
+const ACTIVE_STATES: Set<string> = new Set(
+  FUNCTION_SCENES_CONTRACT.jobStates.filter(
+    (state) => state !== STATE_COMPLETED && !FAILURE_STATES.has(state)
+  )
+);
 
 // Subset of the OSC SDK surface this runner needs, declared structurally so the
 // real SDK functions satisfy it and callers can pass lightweight fakes (mirrors
@@ -59,25 +145,32 @@ export type OscSceneApi = {
   // so the deployment supplies the name it created; there is no per-request
   // instance.
   instanceName: string;
-  // Runtime endpoint path on the function, appended to the instance URL.
-  // Defaults to the contract path (`POST /api/v1`); the override exists only so
-  // a deployment can follow a future service change without a release, and is
-  // carried verbatim. Setting it to anything else takes the call off-contract,
-  // which is exactly what the pinned default protects against.
+  // Runtime detection path on the function, appended to the instance URL.
+  // Defaults to the contract path (DEFAULT_SCENE_DETECT_PATH, '/api/v1'); the
+  // override exists only so a deployment can follow the function if it is ever
+  // mounted under a BASE_PATH, and is carried verbatim. Setting it to anything
+  // else takes the call off-contract, which is what the pinned default protects
+  // against.
   path?: string;
-  // Per-request timeout in milliseconds. Needed because `POST /api/v1` is NOT a
-  // quick acknowledgement: the handler awaits the whole ffmpeg decode before it
-  // answers (lib/scene_detect.js `createJob`), so an un-timed call can hold a
-  // socket open for the length of the video. Injectable so tests need not wait.
-  requestTimeoutMs?: number;
   // Injectable fetch for tests; defaults to the global fetch.
   fetchImpl?: typeof fetch;
+  // Bounded-wait knobs, injectable so tests need not sleep.
+  requestTimeoutMs?: number;
+  pollIntervalMs?: number;
+  pollTimeoutMs?: number;
 };
 
-// Default cap on one create-job call. Generous because the service decodes the
-// whole source before responding, but bounded so a wedged instance cannot pin a
-// socket indefinitely.
-export const DEFAULT_SCENE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+// Build the JSON request body for the detection endpoint. Delegates to the
+// recorded contract so the source-URL field name lives in exactly one place: it is
+// `medialocator` — api.json `#/model/request` marks it the single REQUIRED
+// property ("URL to video file or video stream") and the handler reads
+// `req.body.medialocator` (index.js:45). A short-lived presigned GET URL satisfies
+// it: the value is handed straight to `ffmpeg -i`
+// (lib/scene_detect_job.js `execute()`), the same convention as the ffmpeg-s3
+// `-i` / auto-subtitles paths.
+export function sceneRequestBody(presignedUrl: string): Record<string, unknown> {
+  return buildCreateJobRequest(presignedUrl).body;
+}
 
 // Resolve the base URL of the eyevinn-function-scenes instance. Throws when the
 // instance cannot be resolved so the orchestrator records a clear error.
@@ -97,47 +190,188 @@ async function resolveInstanceUrl(api: OscSceneApi, token: string): Promise<stri
   return url.replace(/\/+$/, '');
 }
 
+// Resolve one of the RELATIVE endpoints the create-job response hands back
+// (`${BASE_PATH}/api/v1/${jobId}/status`) against the instance URL. Using the
+// returned value verbatim — rather than rebuilding `/api/v1/{id}/status` — is what
+// keeps us correct when the function runs under a BASE_PATH (index.js:21).
+//
+// The resolved URL is PINNED to the instance origin. `new URL(reference, base)`
+// ignores the base entirely when `reference` is absolute, and the follow-up poll
+// carries our OSC service access token as a `Bearer` header. Upstream only ever
+// builds relative paths today (index.js:48-49), but a server-controlled value must
+// not be able to redirect a credentialed request to an arbitrary host, so an
+// off-origin reference is rejected rather than followed (defence in depth).
+export function resolveAgainstInstance(baseUrl: string, reference: string): string {
+  let base: URL;
+  let resolved: URL;
+  try {
+    base = new URL(`${baseUrl}/`);
+    resolved = new URL(reference, base);
+  } catch {
+    throw new Error(
+      `scene-detect function returned an unusable endpoint reference: ${reference}`
+    );
+  }
+  if (resolved.origin !== base.origin) {
+    throw new Error(
+      `scene-detect function returned an off-origin endpoint reference ` +
+        `(${resolved.origin} is not ${base.origin}); refusing to send the service ` +
+        `access token off the instance origin`
+    );
+  }
+  return resolved.toString();
+}
+
+// Every call to the function is bounded: a detached pipeline step has no caller to
+// time it out.
+async function fetchWithTimeout(
+  doFetch: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  try {
+    return await doFetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`scene-detect call to ${url} failed: ${message}`);
+  }
+}
+
+// Errors are restify-errors instances serialised as `{ code, message }`
+// (index.js:55,:59 — InternalServerError / InvalidContentError). Surface whichever
+// of those we can read so a recorded `sceneDetectionError` says why.
+async function describeErrorResponse(res: Response): Promise<string> {
+  let detail = '';
+  try {
+    const body = (await res.json()) as { code?: unknown; message?: unknown };
+    const parts = [body.code, body.message].filter(
+      (part): part is string => typeof part === 'string' && part.length > 0
+    );
+    if (parts.length > 0) detail = ` (${parts.join(': ')})`;
+  } catch {
+    // Body absent or not JSON — the status code alone has to do.
+  }
+  return `HTTP ${res.status}${detail}`;
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// Poll the job's own status endpoint until it reports a terminal state. Returns
+// on `completed`; throws on `failed`/`cancelled`, on a malformed status payload,
+// and on exhausting the poll budget — all genuine detection failures.
+async function waitForJob(
+  doFetch: typeof fetch,
+  statusUrl: string,
+  token: string,
+  requestTimeoutMs: number,
+  pollIntervalMs: number,
+  pollTimeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + pollTimeoutMs;
+  let lastState = 'unknown';
+  while (Date.now() < deadline) {
+    const res = await fetchWithTimeout(
+      doFetch,
+      statusUrl,
+      { method: FUNCTION_SCENES_CONTRACT.jobStatus.method, headers: { authorization: `Bearer ${token}` } },
+      requestTimeoutMs
+    );
+    if (!res.ok) {
+      throw new Error(`scene-detect status poll failed: ${await describeErrorResponse(res)}`);
+    }
+    const status = (await res.json()) as { state?: unknown } | null;
+    const state = typeof status?.state === 'string' ? status.state : undefined;
+    if (state === undefined) {
+      throw new Error('scene-detect status response carried no job state');
+    }
+    lastState = state;
+    if (state === STATE_COMPLETED) return;
+    if (FAILURE_STATES.has(state)) {
+      throw new Error(`scene-detect job ended in state "${state}"`);
+    }
+    // `created`/`running` — and anything the service grows later — keep polling
+    // until the budget runs out; the timeout below is the backstop.
+    if (!ACTIVE_STATES.has(state)) lastState = `${state} (unrecognised)`;
+    await sleep(pollIntervalMs);
+  }
+  throw new Error(
+    `scene-detect job did not reach a terminal state within ${pollTimeoutMs / 1000}s ` +
+      `(last state: ${lastState})`
+  );
+}
+
 // Construct the production SceneDetector. Each invocation resolves the service
-// token + instance URL and starts one detection job on the function.
+// token + instance URL, starts a detection job, waits for it to finish, and
+// returns the raw result envelope for scene-detector.ts to normalize.
 export function makeOscSceneDetector(api: OscSceneApi): SceneDetector {
   const doFetch = api.fetchImpl ?? fetch;
-  const path = api.path && api.path.length > 0 ? api.path : FUNCTION_SCENES_CONTRACT.createJob.path;
+  const path = api.path && api.path.length > 0 ? api.path : DEFAULT_SCENE_DETECT_PATH;
+  const requestTimeoutMs = api.requestTimeoutMs ?? DEFAULT_SCENE_REQUEST_TIMEOUT_MS;
+  const pollIntervalMs = api.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const pollTimeoutMs = api.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+
   return async (presignedUrl: string): Promise<SceneDetectorResult> => {
     const token = await api.context.getServiceAccessToken(SCENE_DETECT_SERVICE_ID);
     const baseUrl = await resolveInstanceUrl(api, token);
     // Join baseUrl (no trailing slash) + path (leading slash preserved).
     const endpoint = path.startsWith('/') ? `${baseUrl}${path}` : `${baseUrl}/${path}`;
+    // Method, content type and body all come from the recorded contract (#799).
     const request = buildCreateJobRequest(presignedUrl);
 
-    const res = await doFetch(endpoint, {
-      method: request.method,
-      headers: {
-        ...request.headers,
-        // OSC terminates service auth at the edge using the SAT bearer.
-        authorization: `Bearer ${token}`
+    const res = await fetchWithTimeout(
+      doFetch,
+      endpoint,
+      {
+        method: request.method,
+        headers: {
+          ...request.headers,
+          // OSC terminates service auth at the edge using the SAT bearer.
+          authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(request.body)
       },
-      body: JSON.stringify(request.body),
-      signal: AbortSignal.timeout(api.requestTimeoutMs ?? DEFAULT_SCENE_REQUEST_TIMEOUT_MS)
-    });
+      requestTimeoutMs
+    );
     if (!res.ok) {
-      throw new Error(`scene-detect function failed: HTTP ${res.status}`);
+      throw new Error(`scene-detect function failed: ${await describeErrorResponse(res)}`);
     }
 
-    // Validate the create-job envelope against the contract, so an incompatible
-    // service update is reported as a contract failure rather than swallowed.
-    const created = parseCreateJobResponse(await res.json());
-
-    // The job exists and is running; we just cannot report it yet (#798). The
-    // alternative — returning `{}` — would be normalised by parseSceneResult
-    // into `{ boundaries: [], sceneCount: 0 }` and stored as a SUCCESSFUL
-    // detection of zero scenes, which is indistinguishable from a genuinely
-    // cut-free video and would be wrong for every single input. An explicit
-    // failure is recorded as `sceneDetectionError` by the orchestrator and is
-    // honest about the gap.
-    throw new Error(
-      `scene-detect job started (status endpoint "${created.status}") but scene boundaries ` +
-        `cannot be read from ${SCENE_DETECT_SERVICE_ID}: it returns keyframe image URIs only, ` +
-        `and create-then-poll plus the sceneMetadata re-scope are pending (issue #798)`
+    // `#/model/createJobResponse`: `{ thumbnails, status }`, both relative. Validated
+    // against the recorded contract so an incompatible service update surfaces as a
+    // contract failure instead of being swallowed. The `status` endpoint is the one
+    // field this runner cannot proceed without, so the failure is reported in those
+    // terms.
+    let created: { thumbnails: string; status: string };
+    try {
+      created = parseCreateJobResponse(await res.json());
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`scene-detect function returned no job status endpoint: ${detail}`);
+    }
+    await waitForJob(
+      doFetch,
+      resolveAgainstInstance(baseUrl, created.status),
+      token,
+      requestTimeoutMs,
+      pollIntervalMs,
+      pollTimeoutMs
     );
+
+    // The job completed. The function exposes keyframe image URIs only and no cut
+    // timecodes at all (see the KNOWN GAP in the file header), so there is nothing
+    // to map onto `scenes`/`cuts`.
+    //
+    // Reporting that as `{}` would be a SILENT WRONG ANSWER: scene-detector.ts
+    // would normalize it to `sceneMetadata: { boundaries: [], sceneCount: 0 }`,
+    // which asserts "this video has no scene cuts" — indistinguishable, to an API
+    // consumer, from a genuine single-shot video, and wrong for every input. So the
+    // structural gap is reported EXPLICITLY instead; `detectScenes` then declines to
+    // write a fabricated zero-boundary record. It is not an error either: the job
+    // really did succeed, so `sceneDetectionError` stays clear for genuine failures.
+    // Re-scoping `sceneMetadata` so a completed run can carry keyframe URIs is
+    // tracked in #883.
+    return { boundariesUnavailable: { reason: BOUNDARIES_UNAVAILABLE_REASON } };
   };
 }
