@@ -2048,6 +2048,11 @@ async function renderAssetsTab(container) {
     '<div class="flex-gap">',
     '  <button id="btn-open-upload" class="header-btn">Upload File</button>',
     '  <button id="btn-open-ingest" class="header-btn">Ingest URL</button>',
+    // Add-to-collection without starting from a row (issue #950): the same
+    // dialog the row action opens, just with nothing pre-ticked. Kept next to
+    // the other tab-level actions because it is one — it acts on assets the
+    // operator picks inside the dialog, not on the current table page.
+    '  <button id="btn-add-to-collection" class="header-btn">Add to Collection</button>',
     '  <button id="assets-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
     '</div>',
   ].join('');
@@ -2191,6 +2196,13 @@ async function renderAssetsTab(container) {
         });
         return false;
       }
+    },
+    // Add-to-collection, started from the row (issue #950). Opens the shared
+    // multi-select picker with this asset already ticked, so the operator can
+    // add just it or add it together with others they find in the dialog. No
+    // table reload is needed: membership is not one of this table's columns.
+    onAddToCollection: function (id, name) {
+      openAddToCollectionDialog({ assets: [{ id: id, name: name }] });
     },
     onRedrive: async function (id) {
       // Re-run the extractor synchronously via the recovery path of
@@ -2345,6 +2357,11 @@ async function renderAssetsTab(container) {
         }
       });
     });
+  });
+
+  // ── Add-to-collection (issue #950) ──
+  header.querySelector('#btn-add-to-collection').addEventListener('click', function() {
+    openAddToCollectionDialog({ assets: [] });
   });
 
   header.querySelector('#assets-refresh').addEventListener('click', function() {
@@ -4200,12 +4217,38 @@ function addAssetsSummary(result) {
 // The add-to-collection control: name search + multi-select, with the raw-id
 // field kept behind a disclosure as a fallback. Returns a detached element;
 // `onAdded()` (optional) fires after at least one membership add succeeds.
-function renderCollectionAssetPicker(collectionId, opts) {
+//
+// `target` is the collection the picked assets are added to. It is EITHER a
+// collection id (the collection-side caller, which already knows it) OR a
+// zero-argument function returning the id (issue #950: the Assets-tab caller
+// chooses the target inside the same dialog, so the id is not known when the
+// picker is built and must be read at add time instead of captured). Resolving
+// late rather than rebuilding the picker per target is what lets the operator
+// change their mind about the destination without losing the selection they
+// already made.
+//
+// opts:
+//   onAdded()            — fires after at least one membership add succeeds.
+//   initialSelection     — [{ id, name }] pre-ticked on mount (issue #950: the
+//                          Assets-tab row action seeds the row it started from,
+//                          so "add this one plus two more I will now find" is
+//                          one interaction). Ids with no name fall back to the
+//                          id for the chip label, exactly as a search hit does.
+//   title                — heading text (default 'Add assets to collection').
+//   noTargetMessage      — shown instead of issuing any request when the
+//                          resolver yields no collection id.
+function renderCollectionAssetPicker(target, opts) {
   opts = opts || {};
+  // Read the destination at ADD time, never at build time. A string target is
+  // its own answer; a function target is asked again on every add.
+  function resolveTargetId() {
+    const raw = typeof target === 'function' ? target() : target;
+    return raw == null ? '' : String(raw).trim();
+  }
   const wrap = document.createElement('div');
   wrap.className = 'mt12';
   wrap.innerHTML = [
-    '<div class="section-title">Add assets to collection</div>',
+    '<div class="section-title">' + escHtml(opts.title || 'Add assets to collection') + '</div>',
     '<div class="form-row mt8">',
     '  <div class="form-field grow">',
     '    <label for="add-asset-search">Find assets by name</label>',
@@ -4247,6 +4290,17 @@ function renderCollectionAssetPicker(collectionId, opts) {
   // Selection survives re-searching: an asset ticked under one query stays
   // ticked when the result list is replaced by the next one.
   const selected = new Map();
+
+  // Seeded selection (issue #950). The Assets-tab entry point starts from an
+  // asset the operator already found, so that asset arrives ticked rather than
+  // having to be searched for a second time. Same Map the hit list writes, so
+  // chips, the button count and the add fan-out treat seeded and searched-for
+  // assets identically.
+  (Array.isArray(opts.initialSelection) ? opts.initialSelection : []).forEach(function(a) {
+    const id = a && a.id != null ? String(a.id) : '';
+    if (!id) return;
+    selected.set(id, (a && a.name) || id);
+  });
 
   function renderSelected() {
     const ids = [...selected.keys()];
@@ -4351,8 +4405,16 @@ function renderCollectionAssetPicker(collectionId, opts) {
     const ids = [...selected.keys()];
     msgEl.innerHTML = '';
     if (ids.length === 0) { showMsg(msgEl, 'Select at least one asset.', 'error'); return; }
+    const targetId = resolveTargetId();
+    if (!targetId) {
+      // No destination yet (issue #950). Say so instead of issuing a PUT to
+      // `/collections//assets/…`, which would 404 and read as "the add failed"
+      // rather than "you have not said where".
+      showMsg(msgEl, opts.noTargetMessage || 'Choose a collection first.', 'error');
+      return;
+    }
     selectedBtn.disabled = true;
-    const result = await addAssetsToCollection(collectionId, ids);
+    const result = await addAssetsToCollection(targetId, ids);
     result.added.forEach(function(id) { selected.delete(id); });
     renderSelected();
     showMsg(msgEl, addAssetsSummary(result), result.failed.length === 0 ? 'success' : 'error');
@@ -4364,9 +4426,14 @@ function renderCollectionAssetPicker(collectionId, opts) {
     const assetId = wrap.querySelector('#add-asset-id').value.trim();
     msgEl.innerHTML = '';
     if (!assetId) { showMsg(msgEl, 'Asset ID required.', 'error'); return; }
+    const targetId = resolveTargetId();
+    if (!targetId) {
+      showMsg(msgEl, opts.noTargetMessage || 'Choose a collection first.', 'error');
+      return;
+    }
     try {
       await apiFetch(
-        '/collections/' + encodeURIComponent(collectionId) + '/assets/' + encodeURIComponent(assetId),
+        '/collections/' + encodeURIComponent(targetId) + '/assets/' + encodeURIComponent(assetId),
         { method: 'PUT', body: JSON.stringify({}) }
       );
       showMsg(msgEl, 'Asset added.', 'success');
@@ -4378,6 +4445,188 @@ function renderCollectionAssetPicker(collectionId, opts) {
 
   renderSelected();
   return wrap;
+}
+
+// ─── Add-to-collection, started from the Assets tab (issue #950) ─────────────
+//
+// Collection membership used to be editable from the collection detail view
+// only, which forced a collection-first workflow even when the operator had
+// already found the asset they cared about in the Assets table. This dialog is
+// the other direction: start from the asset, choose the destination.
+//
+// It adds NO second picker and NO second add path. The multi-select hit list,
+// the chips, the "Add N selected assets" confirm button, the per-asset PUT
+// fan-out (addAssetsToCollection) and the partial-failure summary
+// (addAssetsSummary) are the SAME component the collection-side flow mounts —
+// renderCollectionAssetPicker above (app.js:4203) — re-mounted here with its
+// target resolved from this dialog's collection select and its selection seeded
+// with whatever asset the operator started from. The only thing this function
+// owns is "which collection?".
+//
+// Verified contract (CLAUDE.md rule 7):
+//   - Target list: GET /api/v1/collections/ — openapi.json path key
+//     "/api/v1/collections/" (`get`), whose 200 schema is
+//     `{ collections: Collection[] }` with `collections` REQUIRED and
+//     `additionalProperties: false`; the route is src/routes/collections.ts:341
+//     (`app.get('/')`, response `z.object({ collections: z.array(
+//     collectionSchema) })`). It declares NO query parameters at all
+//     (openapi.json ….get.parameters is absent; the handler takes no query
+//     schema and calls `repo.list()` at :346) — so there is no server-side
+//     name filter to lean on and the select is populated from the full list.
+//     Per-collection fields read here: `id`, `name` and `assetIds` (all three
+//     are in `collectionSchema`'s `required` list), the last only to show how
+//     many assets the destination already holds.
+//   - Membership add: PUT /api/v1/collections/{id}/assets/{assetId} —
+//     openapi.json path key "/api/v1/collections/{id}/assets/{assetId}"
+//     (`put`): two REQUIRED path params (`id`, `assetId`), NO requestBody, and
+//     responses 200 | 404 | 422. Route: src/routes/collections.ts:586-623.
+//     Adding an asset that is already a member is a no-op, not an error —
+//     `addAssetId()` dedupes while preserving order
+//     (src/data/collection-repo.ts:236-238) — so a re-add of an existing member
+//     answers 200 and the dialog does not have to pre-filter the selection.
+//     There is still no batch membership route on that router, which is why the
+//     shared fan-out issues one PUT per asset.
+//
+// opts:
+//   assets        — [{ id, name }] the selection to seed (may be empty: the
+//                   header entry point opens the dialog with nothing picked).
+//   collectionId  — optional pre-chosen destination.
+//   onAdded()     — optional; fires after at least one add succeeds.
+
+// "News (3 assets)" — the destination's own name plus how full it already is,
+// so the operator can tell two similarly named collections apart. The count is
+// omitted when the payload carries no `assetIds` rather than printed as 0,
+// which would be a claim the response did not make.
+function collectionOptionLabel(c) {
+  const name = (c && c.name) || '(untitled)';
+  if (!c || !Array.isArray(c.assetIds)) return name;
+  const n = c.assetIds.length;
+  return name + ' (' + n + ' asset' + (n === 1 ? '' : 's') + ')';
+}
+
+function openAddToCollectionDialog(opts) {
+  opts = opts || {};
+  const seed = Array.isArray(opts.assets) ? opts.assets : [];
+
+  return openModal('Add assets to collection', function(body) {
+    body.innerHTML = [
+      '<div class="form-row">',
+      '  <div class="form-field grow">',
+      '    <label for="atc-collection">Target collection</label>',
+      '    <select id="atc-collection" aria-describedby="atc-collection-hint">',
+      '      <option value="">Loading collections…</option>',
+      '    </select>',
+      '    <div class="form-hint" id="atc-collection-hint" aria-live="polite">The collection the selected assets are added to.</div>',
+      '  </div>',
+      '</div>',
+      '<div id="atc-picker-host"></div>',
+      '<div id="atc-msg" aria-live="polite"></div>',
+    ].join('');
+
+    const select = body.querySelector('#atc-collection');
+    const hint = body.querySelector('#atc-collection-hint');
+    const pickerHost = body.querySelector('#atc-picker-host');
+    const msgEl = body.querySelector('#atc-msg');
+
+    // Build the option list, keeping whatever destination is already chosen.
+    function renderOptions(collections) {
+      const keep = select.value;
+      select.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = 'Choose a collection…';
+      select.appendChild(placeholder);
+      collections.forEach(function(c) {
+        if (!c || c.id == null) return;
+        const opt = document.createElement('option');
+        opt.value = String(c.id);
+        // textContent, not innerHTML: a collection name is operator-supplied.
+        opt.textContent = collectionOptionLabel(c);
+        select.appendChild(opt);
+      });
+      const want = keep || (opts.collectionId != null ? String(opts.collectionId) : '');
+      if (want && collections.some(function(c) { return c && String(c.id) === want; })) {
+        select.value = want;
+      }
+      syncHint(collections);
+    }
+
+    function syncHint(collections) {
+      if (!select.value) {
+        hint.textContent = 'The collection the selected assets are added to.';
+        return;
+      }
+      const chosen = collections.filter(function(c) { return c && String(c.id) === select.value; })[0];
+      if (!chosen || !Array.isArray(chosen.assetIds)) {
+        hint.textContent = 'Adding an asset that is already a member changes nothing.';
+        return;
+      }
+      const n = chosen.assetIds.length;
+      hint.textContent = 'This collection holds ' + n + ' asset' + (n === 1 ? '' : 's') +
+        '. Adding an asset that is already a member changes nothing.';
+    }
+
+    // One GET per open, plus one after a successful add so the counts above stay
+    // true without the operator reopening the dialog.
+    let known = [];
+    async function loadTargets() {
+      try {
+        const res = await apiFetch('/collections');
+        // The verified envelope is `{ collections: [...] }`; the two fallbacks
+        // mirror loadCollections() above so both readers tolerate the same
+        // shapes rather than disagreeing about them.
+        known = (res && (res.collections || res.items)) || (Array.isArray(res) ? res : []);
+      } catch (err) {
+        select.innerHTML = '';
+        select.disabled = true;
+        showMsg(msgEl, 'Could not load collections: ' + err.message, 'error');
+        return false;
+      }
+      if (known.length === 0) {
+        // The action adds to an EXISTING collection; there is no create-inline
+        // path here, so say where one is made instead of offering an empty
+        // select and a confirm button that cannot work.
+        select.innerHTML = '';
+        select.disabled = true;
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No collections yet. Create one in the Collections tab first.';
+        pickerHost.innerHTML = '';
+        pickerHost.appendChild(empty);
+        return false;
+      }
+      renderOptions(known);
+      return true;
+    }
+
+    select.addEventListener('change', function() { syncHint(known); });
+
+    const loader = loadingEl();
+    pickerHost.appendChild(loader);
+    void loadTargets().then(function(ready) {
+      loader.remove();
+      if (!ready) return;
+      // Focus the destination select once the dialog is attached (openModal
+      // builds the body BEFORE appending the backdrop, so focusing earlier
+      // would be a no-op on a detached element — same reason confirmModal
+      // defers its own focus). It is the first thing the operator has to
+      // decide, and it is the one field the row action cannot pre-fill.
+      try { select.focus(); } catch (_) { /* non-focusable in a stub DOM */ }
+      // THE shared picker — same component, same confirm flow, same fan-out.
+      // Its target is read from the select at add time (see resolveTargetId in
+      // renderCollectionAssetPicker), so changing the destination mid-dialog
+      // does not discard the assets already ticked.
+      pickerHost.appendChild(renderCollectionAssetPicker(function() { return select.value; }, {
+        title: 'Assets to add',
+        initialSelection: seed,
+        noTargetMessage: 'Choose a target collection first.',
+        onAdded: function() {
+          void loadTargets();
+          if (typeof opts.onAdded === 'function') opts.onAdded();
+        },
+      }));
+    });
+  });
 }
 
 async function showCollectionDetail(id, detailPanel, onRefresh) {
@@ -7714,6 +7963,12 @@ export {
   assetPickerTotal,
   assetPickerResultNote,
   ASSET_PICKER_PAGE_SIZE,
+  // Add-to-collection started from the Assets tab (issue #950). Exported so a
+  // DOM test can drive the real dialog against the real collections + search
+  // routers and assert that it re-mounts the SHARED picker above rather than a
+  // second copy of it — same hit list, same confirm button, same PUT fan-out.
+  openAddToCollectionDialog,
+  collectionOptionLabel,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).

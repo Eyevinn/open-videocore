@@ -583,6 +583,10 @@ function buildColumns(renderCtx) {
   // the Status renderer below. It cannot go stale: the only writer is the fetch
   // that produced the very rows being rendered.
   const projection = renderCtx.projection;
+  // Add-to-collection row action (issue #950). Strictly OPT-IN: the control is
+  // rendered only when the consumer supplied an `onAddToCollection` handler, so
+  // a table mounted without one has exactly the actions cell it had before.
+  const canAddToCollection = renderCtx.canAddToCollection === true;
 
   return [
     {
@@ -697,6 +701,26 @@ function buildColumns(renderCtx) {
               escHtml(a.id) +
               '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
             : '') +
+          // Add-to-collection (issue #950). Membership used to be reachable
+          // only from a collection's own detail view, which made the operator
+          // work collection-first even when they had already found the asset.
+          // This starts the SAME add flow from the row they are looking at: the
+          // handler opens the shared multi-select picker with this asset
+          // pre-ticked, so one asset or several land in one confirmation.
+          //
+          // `data-name` carries the same human-readable label the Name / Title
+          // column renders, so the dialog can show a chip the operator
+          // recognises instead of a 26-character ULID. The ULID in `data-id` is
+          // what the membership route actually takes (see the note on the
+          // member table in public/app.js: PUT /collections/:id/assets/:assetId
+          // resolves the asset with a plain `assets.get()`, so a slug 422s).
+          (canAddToCollection
+            ? '<button class="btn-ghost asset-add-collection-btn" data-id="' +
+              escHtml(a.id) +
+              '" data-name="' +
+              escHtml(a.name || a.slug || '') +
+              '" title="Add this asset to a collection" style="font-size:12px;padding:3px 8px;">Add to collection</button> '
+            : '') +
           // `data-name` carries the SAME human-readable label the "Name / Title"
           // column renders (a.name || a.slug) so the archive confirmation can
           // name its subject without a second lookup (issue #919). Empty when the
@@ -809,6 +833,14 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //                                         derive, so the handler can explain a
 //                                         guaranteed refusal pre-flight.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
+//   onAddToCollection(id, name)         — OPTIONAL (issue #950). Present = each
+//                                         row offers an "Add to collection"
+//                                         action; absent = it does not, and the
+//                                         actions cell is unchanged. `name` is
+//                                         the row's human-readable label so the
+//                                         caller's dialog can name its subject
+//                                         without a second lookup. No reload
+//                                         follows: membership is not a column.
 //   win (optional)                      — injectable window for URL sync (tests).
 //
 // The table reads its initial sort/filter/page from the URL (shared contract),
@@ -842,6 +874,7 @@ export function createAssetsTable(deps) {
     fmtDate: d.fmtDate,
     isAssetWedged: d.isAssetWedged,
     projection,
+    canAddToCollection: typeof d.onAddToCollection === 'function',
   });
 
   // Initial visible column set (issue #959): URL -> stored default -> all.
@@ -1017,6 +1050,23 @@ export function createAssetsTable(deps) {
           locked: btn.dataset.locked === 'true',
         });
         if (ok !== false) reload();
+      });
+    });
+
+    // Add-to-collection row action (issue #950). `stopPropagation` because the
+    // whole row is a click target that opens the detail panel, and "add this to
+    // a collection" is not "show me this asset".
+    //
+    // The table deliberately does NOT reload afterwards: collection membership
+    // is not a field of any column it renders (neither the list projection nor
+    // the search projection carries it), so a refetch would cost a round-trip
+    // and a loading flash to redraw identical rows. The dialog reports the
+    // outcome itself.
+    tbody.querySelectorAll('.asset-add-collection-btn').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        if (typeof d.onAddToCollection !== 'function') return;
+        d.onAddToCollection(btn.dataset.id, btn.dataset.name || '');
       });
     });
 
