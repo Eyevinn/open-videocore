@@ -529,6 +529,177 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* ── Version chain on the asset detail view (issue #942) ───────────────────
+   One vertical list, indented by tree depth, oldest at top — the order the API
+   returns. The chain can branch (two versions cut from one source), so the
+   indent is load-bearing, not decoration. */
+.version-chain-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.version-group {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 12px;
+  font-size: 11px;
+}
+
+.version-group-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.version-group-id {
+  color: var(--text);
+}
+
+.version-chain-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.version-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.version-row:last-child {
+  border-bottom: none;
+}
+
+/* Depth is capped at four levels so a long chain cannot run off the panel; the
+   row's aria-level still carries the true depth. */
+.version-depth-1 { padding-left: 20px; }
+.version-depth-2 { padding-left: 40px; }
+.version-depth-3 { padding-left: 60px; }
+.version-depth-4 { padding-left: 80px; }
+
+.version-connector {
+  color: var(--text-muted);
+  font-family: 'Courier New', monospace;
+}
+
+/* Fixed-width slot so rows stay aligned whether or not the Current badge is in
+   it. */
+.version-current-slot {
+  display: inline-block;
+  min-width: 72px;
+}
+
+.version-name {
+  color: var(--text);
+  font-weight: 500;
+}
+
+a.version-name {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a.version-name:hover,
+a.version-name:focus-visible {
+  text-decoration: underline;
+}
+
+.version-created {
+  color: var(--text-muted);
+}
+
+/* Holds the shared id cell + its copy button (issue #851's affordance). */
+.version-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* The asset the pane is showing. Marked separately from Current: the two are
+   different facts and frequently land on different rows. Carried by a word and
+   a left accent, never by colour alone (WCAG 1.4.1). */
+.version-row-here {
+  background: rgba(99, 102, 241, 0.08);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.version-row-here:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.version-here {
+  font-size: 11px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Archived members stay in the chain — this is lineage history, not a live
+   listing — at reduced emphasis and still navigable. */
+.version-row-archived .version-name {
+  opacity: 0.75;
+}
+
+/* `currentVersionId` is server-computed and orthogonal to `status`, so Current
+   is its own badge variant alongside the status badge rather than a status
+   colour. Follows the .badge-locked precedent: a deliberate state, not a fault.
+   Teal keeps it distinct from the indigo lock flag. */
+.badge-current {
+  background: rgba(20, 184, 166, 0.18);
+  color: #2dd4bf;
+  border: 1px solid rgba(20, 184, 166, 0.45);
+}
+
+.version-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.empty .version-note {
+  margin: 4px 0 0;
+}
+
+/* Truncation and "nothing ready yet" are statements the operator must not miss
+   while reading the list, so they sit above it with a left accent. */
+.version-truncation,
+.version-not-ready {
+  border-left: 3px solid var(--warning);
+  padding-left: 10px;
+}
+
+/* An orphan group: members whose source version fell outside the returned
+   page. Never reparented to the root, so the heading says why they are apart. */
+.version-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 12px 0 6px;
+}
+
+.version-chain-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.version-nav-position {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;

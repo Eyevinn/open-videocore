@@ -100,8 +100,20 @@ function buildChrome(headingText) {
   return body;
 }
 
+// Stepping through the version chain (issue #942) in THIS window must move the
+// window, not just the body: `id` above is fixed for the lifetime of the page
+// and drives both the self-poll and the document title, so an in-place swap
+// would be undone by the very next tick. Reloading the same page with the new
+// id keeps polling, the title and the browser's own back button consistent.
+function navigateToAsset(nextId) {
+  const params = new URLSearchParams(window.location.search);
+  params.set('type', 'asset');
+  params.set('id', String(nextId));
+  window.location.search = params.toString();
+}
+
 async function runAsset(bodyEl) {
-  const asset = await renderAssetDetailBody(id, bodyEl);
+  const asset = await renderAssetDetailBody(id, bodyEl, { onNavigate: navigateToAsset });
   // Prefer the human-friendly title/name once fetched; fall back to the id.
   const label = (asset && (asset.title || asset.name)) || id;
   document.title = 'Asset ' + label + ' — open-videocore ops';
