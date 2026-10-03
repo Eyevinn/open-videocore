@@ -16,6 +16,8 @@ import nano from 'nano';
 import {
   deprovisionStack,
   deprovisionStackFromConfig,
+  foldTeardownResults,
+  type ServiceTeardownResult,
   type StackTeardownResult
 } from '../services/deprovision.js';
 import {
@@ -35,7 +37,9 @@ import {
 } from '../services/stack.js';
 import {
   packagerOscApiFromContext,
-  teardownOnDemandPackager
+  packagerTeardownAsServiceResults,
+  teardownOnDemandPackager,
+  type PackagerTeardownResult
 } from '../services/packager-provisioning.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
@@ -1246,13 +1250,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // call the tenant was never told to make. Tear them down best-effort
           // here, in dependency-safe order, reusing the SAME idempotent
           // teardown the DELETE route uses (deprovisionStackFromConfig ->
-          // teardownService: probes getInstance first, tolerates already-gone).
+          // teardownService: probes getInstance, CONFIRMS an empty probe against
+          // the instance list, and tolerates a confirmed already-gone instance).
           //
           // CRITICAL (issue #736 trap): only `created` is rolled back. provision()
           // is idempotent (#417) and ADOPTS a pre-existing instance on "already
           // taken"; those live in `provisioned` but NOT `created`, so a rollback
           // never deletes an instance the tenant already had.
           let rollback: StackTeardownResult | undefined;
+          let rollbackThrew: string | undefined;
           if (created.length > 0) {
             try {
               rollback = await deprovisionStackFromConfig(
@@ -1270,6 +1276,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             } catch (rollbackErr) {
+              rollbackThrew =
+                rollbackErr instanceof Error
+                  ? rollbackErr.message
+                  : String(rollbackErr);
               app.log.error(
                 { rollbackErr, name, created },
                 'rollback of created instances threw; some may still be running'
@@ -1277,10 +1287,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             }
           }
 
+          // A rollback that threw tore down NOTHING we can account for, so every
+          // created instance is unaccounted-for rather than gone (issue #1039:
+          // an unverifiable teardown must never read as "nothing left"). Report
+          // each one as a failed teardown so it lands in `leftovers`, in
+          // `stillRunning`, and in the persisted services[] a retry reads.
+          const rollbackServices: ServiceTeardownResult[] =
+            rollback?.services ??
+            created.map((c) => ({
+              serviceId: c.serviceId,
+              role: 'unknown',
+              status: 'failed' as const,
+              error: rollbackThrew ?? 'rollback did not run'
+            }));
+
           // Created instances that could NOT be torn down are still running and
           // still billing — surfaced in the operation result with the exact
           // deprovision call so the tenant can finish removing them.
-          const leftovers = (rollback?.services ?? []).filter(
+          const leftovers = rollbackServices.filter(
             (s) => s.status === 'failed'
           );
 
@@ -1330,20 +1354,43 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // Report the rollback outcome so the caller knows the created
             // instances were torn down (or, if teardown itself failed, exactly
             // which leftovers remain and how to remove them) — issue #736.
+            //
+            // When this operation created nothing there was nothing to roll
+            // back, which is NOT the same as "nothing is left": any instance the
+            // run ADOPTED is still running. That case reports `not_attempted`
+            // rather than the old `not_found`, which read as an empty stack
+            // (issue #1039). `stillRunning` lists everything that survives —
+            // adopted instances included — with the call that removes them.
             result: {
               name,
               failedService: currentService,
-              rollback: rollback
-                ? { status: rollback.status, services: rollback.services }
-                : { status: 'not_found', services: [] },
+              rollback:
+                created.length === 0
+                  ? {
+                      status: 'not_attempted',
+                      services: [],
+                      reason: 'this operation created no instances'
+                    }
+                  : {
+                      status: rollback?.status ?? 'failed',
+                      services: rollbackServices
+                    },
+              ...(stillRunning.length > 0
+                ? {
+                    stillRunning: stillRunning.map((p) => ({
+                      serviceId: p.serviceId,
+                      instanceName: p.name
+                    })),
+                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                  }
+                : {}),
               ...(leftovers.length > 0
                 ? {
                     leftovers: leftovers.map((s) => ({
                       serviceId: s.serviceId,
                       instanceName: name,
                       error: s.error
-                    })),
-                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                    }))
                   }
                 : {})
             }
@@ -1617,7 +1664,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 'on-demand packager teardown failed; continuing static teardown'
               );
             }
-            const result = await deprovisionStack(osc, name);
+            // Fold the packager outcome into the reported result (issue #1056).
+            // There is no stored config to keep on this path, but the result
+            // must not read as clean while the packager is still running. The
+            // static TEARDOWN_ORDER also covers PACKAGER_SERVICE_ID, so the
+            // fold MERGES onto that entry instead of reporting two packagers.
+            const result = foldTeardownResults(
+              await deprovisionStack(osc, name),
+              packagerTeardownAsServiceResults(packagerTeardown)
+            );
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
@@ -1674,7 +1729,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // (consumer-before-producer, mirroring TEARDOWN_ORDER). Safe whether
           // or not packaging ever ran: not_found when no packager exists. A
           // failure is logged but must not abort the static-service teardown
-          // that follows (same policy as the scaler teardown above).
+          // that follows (same policy as the scaler teardown above) — though,
+          // unlike before issue #1056, the outcome is now folded into the
+          // reported result below rather than only logged, so a packager that
+          // survives teardown keeps the stored config and is named.
           //
           // SKIP this reconciliation when the packager IS already recorded in
           // config.services[] (e.g. a stack persisted by an older eager path):
@@ -1685,8 +1743,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const packagerInStoredServices = config.services.some(
             (s) => s.serviceId === PACKAGER_SERVICE_ID
           );
+          // Left undefined when the packager IS in the stored services[]: the
+          // stored-config teardown below reports it, so folding it again would
+          // double-count it (see packagerTeardownAsServiceResults).
+          let packagerTeardown: PackagerTeardownResult | undefined;
           if (!packagerInStoredServices) {
-            const packagerTeardown = await teardownOnDemandPackager(
+            packagerTeardown = await teardownOnDemandPackager(
               packagerOscApiFromContext(osc),
               name
             );
@@ -1704,18 +1766,31 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // torn down too: their instance names are passed alongside services[]
           // and deprovisionStackFromConfig merges (and dedupes) them so a stack
           // that activated auto-subtitles or scene-detect is fully removed.
-          const result = await deprovisionStackFromConfig(
-            osc,
-            name,
-            config.services,
-            {
-              ...(config.autoSubtitlesInstanceName
-                ? { autoSubtitlesInstanceName: config.autoSubtitlesInstanceName }
-                : {}),
-              ...(config.sceneDetectInstanceName
-                ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
-                : {})
-            }
+          //
+          // The on-demand packager torn down above is NOT in that stored list,
+          // so its outcome is folded in here (issue #1056) and the stack status
+          // is re-aggregated over the combined list. That gives the packager the
+          // same retry semantics as any stored service: a `failed` packager
+          // makes the whole result `failed`, which keeps the parameter-store
+          // entry below and names the still-running instance in result.services.
+          const result = foldTeardownResults(
+            await deprovisionStackFromConfig(
+              osc,
+              name,
+              config.services,
+              {
+                ...(config.autoSubtitlesInstanceName
+                  ? {
+                      autoSubtitlesInstanceName:
+                        config.autoSubtitlesInstanceName
+                    }
+                  : {}),
+                ...(config.sceneDetectInstanceName
+                  ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
+                  : {})
+              }
+            ),
+            packagerTeardownAsServiceResults(packagerTeardown)
           );
 
           if (result.status === 'failed') {
