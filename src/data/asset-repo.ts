@@ -14,6 +14,7 @@
 // ADR-003/#59: workspace guard removed (structural OSC isolation).
 import { ulid } from 'ulid';
 import { withinCreatedRange } from './created-range.js';
+import { currentRequestStackName } from '../services/request-stack-context.js';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -606,6 +607,23 @@ export type Asset = {
   //     (validated string, e.g. `[0:0_10:0)`), per ADR-008.
   tamsFlowIds?: string[];
   tamsTimerange?: string;
+  // The provisioned stack this asset was created against (issue #1097),
+  // captured from the ambient request stack context at create time
+  // (`currentRequestStackName()`, src/services/request-stack-context.ts) and
+  // persisted in the ADR-005 `administrative` namespace (system-owned
+  // provenance, NOT editorial — see asset-document.ts).
+  //
+  // It matters most for an asset created OUTSIDE a job (direct upload,
+  // watch-folder): there is no Job record to carry the identity, so without
+  // this the fire-and-forget work that follows the upload (metadata
+  // extraction, thumbnails) has nothing durable to re-enter when the ambient
+  // context is gone — e.g. after a process restart.
+  //
+  // Optional and immutable: absent on every asset created before #1097 and on
+  // assets created outside a request, where an absent value keeps TODAY's
+  // behaviour (the first-listed stack). Not exposed on UpdateAssetInput — an
+  // asset's stack never changes.
+  stackName?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -633,6 +651,10 @@ export type CreateAssetInput = {
   // How the asset is entering the system (ADR-005). Defaults to 'upload'.
   sourceMethod?: AssetSourceMethod;
   originUri?: string;
+  // Explicit stack identity override (issue #1097). Normally omitted — the
+  // repository stamps `currentRequestStackName()` — and supplied only by a
+  // caller that knows the stack while not running inside its context (tests).
+  stackName?: string;
 };
 
 // Mutable fields accepted by PATCH. `status` is validated against the state
@@ -1438,6 +1460,9 @@ export class InMemoryAssetRepository implements AssetRepository {
       sourceMethod: method,
       originUri: input.originUri,
       provenance: initialProvenance(now, method),
+      // Durable stack identity (issue #1097). Undefined outside a request,
+      // which preserves the previous default-stack behaviour.
+      stackName: input.stackName ?? currentRequestStackName(),
       createdAt: now,
       updatedAt: now
     };

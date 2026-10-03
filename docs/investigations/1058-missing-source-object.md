@@ -521,3 +521,34 @@ assets on their own installation (see "Remediation" above):
 A cheap positive control that needs no logs: ingest and transcode the same
 449 MB file with **no** `X-Stack-Name` header at all. If it succeeds, the file
 size is exonerated and the stack asymmetry is the cause.
+
+## Follow-up — durable stack identity for background work (#1097)
+
+The #1058 fix carries the request's stack in AsyncLocalStorage
+(`src/services/request-stack-context.ts`). That store dies with the process, so
+work that outlives the request — a detached URL pull, fire-and-forget metadata
+extraction, a transcode completion message returned to the queue on startup by
+`recoverProcessingQueue` (`src/pipeline/encore-callback-poller.ts`) — had no way
+back to its stack and resolved the first-listed one again.
+
+#1097 persists the identity on the documents themselves: `Job.stackName`
+(`src/data/job-repo.ts`) and `Asset.stackName` (`src/data/asset-repo.ts`,
+persisted at `administrative.stackName` per ADR-005). Both are stamped at create
+time from `currentRequestStackName()`, and each background worker re-enters that
+stack with `runWithPersistedStack` before touching a repository or storage.
+
+**The documented fallback.** Both fields are optional and absent on:
+
+- every document written before #1097;
+- documents created outside a request (boot wiring, sweeps, watch-folder), where
+  there is no ambient stack to record.
+
+For those documents behaviour is **unchanged**: resolution falls back to the
+caller's own ambient context if there is one, and otherwise to the first-listed
+stack (`workspace-stack.ts resolve()`, no-stackName branch) — the pre-#1097
+behaviour. `runWithPersistedStack` deliberately does **not** re-enter
+`undefined`, because that would discard an ambient stack the caller had
+legitimately established. Each worker reports taking the fallback at **debug**
+level (`PERSISTED_STACK_FALLBACK_MESSAGE`), so an operator can grep for legacy
+documents without adding noise to a normal run. No backfill is performed and no
+`schemaVersion` bump is required.
