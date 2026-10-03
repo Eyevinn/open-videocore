@@ -556,6 +556,75 @@ tr.row-locked td:first-child {
   margin: 1px 2px;
 }
 
+/* ── Tags panel on the asset detail view (issue #934) ───────────────────────
+   Reuses the .tag pill above, so a tag reads the same here as it does in the
+   assets table and in search results; the panel only adds the chip layout, the
+   remove affordance and the add row. The chips are a real <ul>/<li> list (the
+   list semantics are what give the group a length and a label in the
+   accessibility tree), so the list markers and padding are cleared. */
+.tags-block .tags-intro,
+.tags-block .tags-field-help {
+  font-size: 12px;
+}
+
+.tag-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* A tag is up to 128 characters of arbitrary text, so a chip wraps rather than
+   stretching the panel; the remove control stays on the same line as its tag. */
+.tag-chip .tag-chip-label {
+  margin: 0;
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+
+button.tag-remove {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 20px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  /* 20px of hit area in a 11px-text row: a destructive control should not be a
+     pixel-hunt (WCAG 2.5.8). */
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0 4px;
+}
+
+button.tag-remove:hover,
+button.tag-remove:focus-visible {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: var(--danger);
+}
+
+.tags-add-row {
+  align-items: flex-end;
+}
+
+.tags-add-field {
+  flex: 1 1 220px;
+  max-width: 420px;
+}
+
+.tags-block .tags-add-error {
+  margin-top: 6px;
+}
+
 /* Forms */
 .form-row {
   display: flex;
