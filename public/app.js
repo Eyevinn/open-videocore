@@ -3934,7 +3934,17 @@ async function renderCollectionsTab(container) {
       // :90) and is
       // returned by GET /collections (:315-324), so the list already knows.
       const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
-      return '<tr data-id="' + escHtml(c.id) + '">' +
+      // The whole row opens the detail view (issue #951), so it has to be
+      // reachable without a mouse: `tabindex="0"` puts it in the tab order and
+      // the keydown handler below activates it with Enter/Space, mirroring the
+      // keyboard contract of the failed-step chip (app.js renderStepChip,
+      // `role="button" tabindex="0"` + Enter/Space, and its wiring further
+      // down). Deliberately NO `role="button"` here: on a <tr> that replaces
+      // the row/cell semantics, so the ID, Name, Asset-count and Created cells
+      // would stop being announced as a row. The labelled control for assistive
+      // tech stays the View button inside the row; the focusable row is the
+      // keyboard equivalent of the mouse shortcut, not a replacement for it.
+      return '<tr class="coll-row" data-id="' + escHtml(c.id) + '" tabindex="0">' +
         '<td class="cell-id">' + escHtml(c.id) + '</td>' +
         '<td>' + escHtml(c.name || '—') + '</td>' +
         '<td>' + escHtml(String(assetCount)) + '</td>' +
@@ -3954,11 +3964,44 @@ async function renderCollectionsTab(container) {
       '</table>';
     wrap.appendChild(tableWrap);
 
+    // Row-level activation (issue #951). The row delegates to the SAME call the
+    // View button already makes — showCollectionDetail(id, detailPanel,
+    // loadCollections) — rather than re-deriving how a collection is opened, so
+    // the two routes cannot drift. Row click + inner-button stopPropagation is
+    // the pattern the Assets table uses (public/assets-table.js:1000-1009) and
+    // the Jobs table copies (public/jobs-table.js:633-645); the Enter/Space
+    // handling is the one from the failed-step chip (app.js, renderStepChip's
+    // wiring in renderExecutionRow).
+    tableWrap.querySelectorAll('tbody tr.coll-row').forEach(function(tr) {
+      const openDetail = function() {
+        showCollectionDetail(tr.dataset.id, detailPanel, loadCollections);
+      };
+      tr.addEventListener('click', openDetail);
+      tr.addEventListener('keydown', function(ev) {
+        if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+        // Only the row itself. A button inside the row handles its own
+        // Enter/Space and then fires a click, which the button handlers stop
+        // from bubbling — without this guard the keydown would still reach the
+        // row and open the detail alongside (or instead of) the button action.
+        if (ev.target !== tr) return;
+        ev.preventDefault();
+        openDetail();
+      });
+    });
+
     tableWrap.querySelectorAll('.coll-view-btn').forEach(function(btn) {
-      btn.addEventListener('click', function() { showCollectionDetail(btn.dataset.id, detailPanel, loadCollections); });
+      btn.addEventListener('click', function(ev) {
+        // The row above opens the same detail; stop here so one click is one
+        // open, not two (same guard as public/assets-table.js:1009).
+        ev.stopPropagation();
+        showCollectionDetail(btn.dataset.id, detailPanel, loadCollections);
+      });
     });
     tableWrap.querySelectorAll('.coll-delete-btn').forEach(function(btn) {
-      btn.addEventListener('click', async function() {
+      btn.addEventListener('click', async function(ev) {
+        // Destructive action: it must never also open the row's detail panel
+        // behind the confirmation dialog (public/assets-table.js:1008-1009).
+        ev.stopPropagation();
         // Collection delete confirmation (issue #919). Impact wording verified
         // against DELETE /api/v1/collections/{id}
         // (src/routes/collections.ts:383-436), NOT assumed:

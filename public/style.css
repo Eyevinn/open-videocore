@@ -238,6 +238,18 @@ tbody tr:hover {
   cursor: pointer;
 }
 
+/* Keyboard-focusable collection row (issue #951). The row carries tabindex="0"
+   and activates on Enter/Space, so the focused row has to be as visible as the
+   hovered one — the same outline treatment the other focusable ops-UI controls
+   use (.ops-th-sort:focus-visible, .step-failed[role='button']:focus-visible).
+   An outline rather than a background change: it survives the :hover tint and
+   does not rely on colour alone (WCAG 1.4.1). */
+tbody tr.coll-row:focus-visible {
+  outline: 2px solid var(--accent, #6366f1);
+  outline-offset: -2px;
+  background: rgba(99, 102, 241, 0.06);
+}
+
 tbody td {
   padding: 8px 10px;
   vertical-align: middle;
