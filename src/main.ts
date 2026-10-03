@@ -111,7 +111,8 @@ import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
 import { checkProfilesIndexReachable } from './services/profiles-reachability.js';
 import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
-import { InMemoryCommentRepository } from './data/comment-repo.js';
+import { InMemoryCommentRepository, type CommentRepository } from './data/comment-repo.js';
+import { CouchCommentRepository } from './data/couch-comment-repo.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { usageRouter } from './routes/usage.js';
@@ -1008,10 +1009,20 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 // callback poller (started on scaler activation) can advance executions.
 const pipelineRepository = new PerWorkspacePipelineRepository(stackResolver);
 
-// Asset comments (issue #135). In-memory: comments are a simple free-text
-// sub-resource for this iteration (mirrors the ephemeral pipeline repo above).
+// Asset comments (issue #135), persisted since issue #1046. Review comments are
+// durable editorial content, so they are stored in the stack's CouchDB and
+// survive a restart. Selected on the SAME env condition as every other Couch
+// repository — COUCHDB_URL present means the Couch-backed implementation, absent
+// means the in-memory fallback (see buildEnvConnections,
+// src/services/workspace-stack.ts:300,321-345), using the env-read + direct
+// StackCouch construction convention the quota store above follows.
 // Shared with the assets router, which owns POST/GET /:id/comments.
-const commentRepository = new InMemoryCommentRepository();
+const commentCouchUrl = process.env['COUCHDB_URL'];
+const commentCouchServer = commentCouchUrl ? couchServer(commentCouchUrl) : undefined;
+const commentCouchDb = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
+const commentRepository: CommentRepository = commentCouchServer
+  ? new CouchCommentRepository(() => new StackCouch(commentCouchServer, commentCouchDb))
+  : new InMemoryCommentRepository();
 
 // Read the first provisioned stack's Valkey URL from the parameter store, or a
 // classified reason why none could be resolved. Self-discovered: there is no
