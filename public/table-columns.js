@@ -1,8 +1,11 @@
 /**
  * open-videocore ops dashboard — table-columns.js
  *
- * Column visibility for ops-UI tables (issue #959, broken out of #856): the
- * model, the per-operator persistence, and the chooser control.
+ * Column visibility for ops-UI tables (issues #959/#960, broken out of #856): the
+ * model, the per-operator persistence, the load-time precedence rule, and the
+ * chooser control. Table-agnostic from the start, and shared by the assets, jobs
+ * and logs tables since #960 — every table-specific decision (the column set, the
+ * "cannot hide" rules, the namespace) is an input, never a constant in here.
  *
  * WHAT THIS IS
  *   One table-agnostic answer to "which of this table's declared columns are
@@ -131,6 +134,68 @@ export function clearStoredColumns(ns, win) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Decide a table's INITIAL visible set, and whether that set is an EXPLICIT
+ * operator choice. This is the persistence precedence rule stated once, for every
+ * table (issue #960): it was written per-table for the assets table in #959, and
+ * jobs/logs must not each re-derive it or they will drift.
+ *
+ * Precedence, highest first:
+ *   1. the `cols` param already decoded from the URL — a shared link must
+ *      reproduce the sender's view, the same rule sort/filter/page follow. It
+ *      beats storage so that opening a colleague's link does not silently apply
+ *      your own preference.
+ *   2. this browser's stored default for `ns` — an operator who shaped the table
+ *      once should not have to reshape it on every bare visit.
+ *   3. every declared column.
+ *
+ * `explicit` is what decides whether the set is mirrored back into the URL: cases
+ * 1 and 2 are real choices worth encoding, case 3 is the absence of one and stays
+ * out of the query string so a default view still has a clean URL.
+ *
+ * Every candidate goes through normalizeVisibleColumns(), so a hand-edited param,
+ * a set stored before a column was renamed, or one that would empty a required
+ * group is REPAIRED rather than honoured or rejected.
+ *
+ * @param {object} options
+ * @param {string[]|null} [options.urlCols]  decoded `<ns>.cols` (null = absent).
+ * @param {string} options.ns                storage/URL namespace for this table.
+ * @param {Array} options.columns            the table's declared columns.
+ * @param {string[][]} [options.requireAtLeastOne]
+ * @param {Window} [options.win]             injectable window (tests).
+ * @param {string[]|null} [options.stored]   pre-read stored set; when `undefined`
+ *        it is read from storage for `ns`. Lets a caller/test supply one directly,
+ *        or pass `null` to opt out of storage entirely.
+ * @returns {{keys:string[], explicit:boolean, source:'url'|'stored'|'default'}}
+ */
+export function resolveInitialColumns(options) {
+  const o = options || {};
+  const columns = Array.isArray(o.columns) ? o.columns : [];
+  const opts = { requireAtLeastOne: o.requireAtLeastOne };
+
+  const urlCols = cleanKeyList(o.urlCols);
+  if (urlCols) {
+    return { keys: normalizeVisibleColumns(urlCols, columns, opts), explicit: true, source: 'url' };
+  }
+
+  // `undefined` (including the key simply being absent) means "read storage";
+  // anything else — a list, or an explicit null — is taken at face value.
+  const stored = o.stored !== undefined ? cleanKeyList(o.stored) : readStoredColumns(o.ns, o.win);
+  if (stored && stored.length) {
+    return {
+      keys: normalizeVisibleColumns(stored, columns, opts),
+      explicit: true,
+      source: 'stored',
+    };
+  }
+
+  return {
+    keys: normalizeVisibleColumns(null, columns, opts),
+    explicit: false,
+    source: 'default',
+  };
 }
 
 // De-dupe / trim an arbitrary key list. Returns null for "nothing usable" so the
