@@ -166,6 +166,7 @@ import { Redis as IORedis } from 'ioredis';
 import { Client as MinioClient } from 'minio';
 import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
+import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
@@ -1139,6 +1140,16 @@ function activateScaler(redisUrl: string): void {
     // construction as the process-global connection in activateScaler above so
     // lifecycle semantics (lazyConnect, unbounded per-request retries) match.
     makeRedis: (url: string) => new IORedis(url, { lazyConnect: true, maxRetriesPerRequest: null }),
+    // Enumerate the provisioned stacks so a read-only observer can cover a stack
+    // whose loop has not been created in this process yet (issue #1074). Same
+    // namespace and same read path as resolveRedisUrl above, so the two cannot
+    // disagree about which stacks exist. Returns [] when the parameter store is
+    // unconfigured; the registry then reports only the stacks it already holds a
+    // connection for.
+    listStackKeys: async (): Promise<string[]> => {
+      if (!paramStore) return [];
+      return paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+    },
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
@@ -1768,6 +1779,11 @@ function activateScaler(redisUrl: string): void {
   internalRouterOptions.packaging = packaging;
   internalRouterOptions.redis = redis;
   scalerRouterOptions.redis = redis;
+  // Label the process-global connection with the same non-secret identifier the
+  // registry derives for a per-stack connection (issue #1074), so a stack that
+  // falls back to this Valkey reports the SAME connectionId instead of looking
+  // like a second store. The URL itself never reaches the wire.
+  scalerRouterOptions.redisConnectionId = valkeyConnectionId(redisUrl);
   usageRouterOptions.redis = redis;
 
   // Start loops for any workspaces that had pool entries from a previous run.
@@ -1821,6 +1837,7 @@ async function deactivateScaler(): Promise<void> {
   internalRouterOptions.packaging = undefined;
   internalRouterOptions.redis = undefined;
   scalerRouterOptions.redis = undefined;
+  scalerRouterOptions.redisConnectionId = undefined;
   usageRouterOptions.redis = undefined;
 
   try {
@@ -2232,6 +2249,13 @@ await app.register(adminRouter, {
 const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/scaler',
   redis: sharedRedis,
+  // Fan the status read out over the SAME per-stack Valkeys the scaler loops use
+  // (issue #1074). `scalerRegistry` is a module-level binding assigned by
+  // activateScaler, so the closure picks up the live registry (or its absence)
+  // per request, exactly like onConfigChange below. Returns [] while the scaler
+  // is off, which leaves the response reporting the process-global connection
+  // only — and `connections` states that explicitly.
+  listStackConnections: async () => (scalerRegistry ? scalerRegistry.listStackConnections() : []),
   maxInstances: encoreMaxInstances,
   minInstances: 0,
   idleTimeoutMs: encoreIdleTimeoutMs,
