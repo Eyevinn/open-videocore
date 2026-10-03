@@ -16,6 +16,7 @@ import nano from 'nano';
 import {
   deprovisionStack,
   deprovisionStackFromConfig,
+  foldTeardownResults,
   type ServiceTeardownResult,
   type StackTeardownResult
 } from '../services/deprovision.js';
@@ -36,7 +37,9 @@ import {
 } from '../services/stack.js';
 import {
   packagerOscApiFromContext,
-  teardownOnDemandPackager
+  packagerTeardownAsServiceResults,
+  teardownOnDemandPackager,
+  type PackagerTeardownResult
 } from '../services/packager-provisioning.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
@@ -1661,7 +1664,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 'on-demand packager teardown failed; continuing static teardown'
               );
             }
-            const result = await deprovisionStack(osc, name);
+            // Fold the packager outcome into the reported result (issue #1056).
+            // There is no stored config to keep on this path, but the result
+            // must not read as clean while the packager is still running. The
+            // static TEARDOWN_ORDER also covers PACKAGER_SERVICE_ID, so the
+            // fold MERGES onto that entry instead of reporting two packagers.
+            const result = foldTeardownResults(
+              await deprovisionStack(osc, name),
+              packagerTeardownAsServiceResults(packagerTeardown)
+            );
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
@@ -1718,7 +1729,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // (consumer-before-producer, mirroring TEARDOWN_ORDER). Safe whether
           // or not packaging ever ran: not_found when no packager exists. A
           // failure is logged but must not abort the static-service teardown
-          // that follows (same policy as the scaler teardown above).
+          // that follows (same policy as the scaler teardown above) — though,
+          // unlike before issue #1056, the outcome is now folded into the
+          // reported result below rather than only logged, so a packager that
+          // survives teardown keeps the stored config and is named.
           //
           // SKIP this reconciliation when the packager IS already recorded in
           // config.services[] (e.g. a stack persisted by an older eager path):
@@ -1729,8 +1743,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const packagerInStoredServices = config.services.some(
             (s) => s.serviceId === PACKAGER_SERVICE_ID
           );
+          // Left undefined when the packager IS in the stored services[]: the
+          // stored-config teardown below reports it, so folding it again would
+          // double-count it (see packagerTeardownAsServiceResults).
+          let packagerTeardown: PackagerTeardownResult | undefined;
           if (!packagerInStoredServices) {
-            const packagerTeardown = await teardownOnDemandPackager(
+            packagerTeardown = await teardownOnDemandPackager(
               packagerOscApiFromContext(osc),
               name
             );
@@ -1748,18 +1766,31 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // torn down too: their instance names are passed alongside services[]
           // and deprovisionStackFromConfig merges (and dedupes) them so a stack
           // that activated auto-subtitles or scene-detect is fully removed.
-          const result = await deprovisionStackFromConfig(
-            osc,
-            name,
-            config.services,
-            {
-              ...(config.autoSubtitlesInstanceName
-                ? { autoSubtitlesInstanceName: config.autoSubtitlesInstanceName }
-                : {}),
-              ...(config.sceneDetectInstanceName
-                ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
-                : {})
-            }
+          //
+          // The on-demand packager torn down above is NOT in that stored list,
+          // so its outcome is folded in here (issue #1056) and the stack status
+          // is re-aggregated over the combined list. That gives the packager the
+          // same retry semantics as any stored service: a `failed` packager
+          // makes the whole result `failed`, which keeps the parameter-store
+          // entry below and names the still-running instance in result.services.
+          const result = foldTeardownResults(
+            await deprovisionStackFromConfig(
+              osc,
+              name,
+              config.services,
+              {
+                ...(config.autoSubtitlesInstanceName
+                  ? {
+                      autoSubtitlesInstanceName:
+                        config.autoSubtitlesInstanceName
+                    }
+                  : {}),
+                ...(config.sceneDetectInstanceName
+                  ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
+                  : {})
+              }
+            ),
+            packagerTeardownAsServiceResults(packagerTeardown)
           );
 
           if (result.status === 'failed') {
