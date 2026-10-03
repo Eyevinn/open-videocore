@@ -177,6 +177,38 @@ describe('createLogsTable composition', () => {
     expect(nextBtn.disabled).toBe(true);
   });
 
+  // Issue #996 review. The logs endpoint scans the persisted stream in bounded
+  // windows, so an empty page handed back WITH a nextCursor means "no match in
+  // the part scanned so far", not "no match". Claiming "No log entries match the
+  // current filters." there told the operator the search was over while the
+  // match sat one window further down the stream.
+  it('does NOT claim "no match" while the backend is still handing back a cursor', async () => {
+    const apiFetch = vi.fn().mockResolvedValue({ items: [], nextCursor: 'edge-1' });
+    const table = createLogsTable({ apiFetch, win: null });
+    document.body.appendChild(table.el);
+    await table.reload();
+
+    const empty = table.el.querySelector('tbody tr.ops-table-empty');
+    expect(empty).not.toBeNull();
+    expect(empty?.textContent).not.toContain('No log entries match the current filters.');
+    expect(empty?.textContent).toContain('Next');
+    // ...and Next is actually reachable, so the operator can keep paging.
+    const nextBtn = table.el.querySelector('.ops-table-next') as HTMLButtonElement;
+    expect(nextBtn.disabled).toBe(false);
+    const pagination = table.el.querySelector('.ops-table-pagination') as HTMLElement;
+    expect(pagination.style.display).not.toBe('none');
+  });
+
+  it('does say "no match" on an empty page that is genuinely terminal', async () => {
+    const apiFetch = vi.fn().mockResolvedValue({ items: [], nextCursor: null });
+    const table = createLogsTable({ apiFetch, win: null });
+    document.body.appendChild(table.el);
+    await table.reload();
+
+    const empty = table.el.querySelector('tbody tr.ops-table-empty');
+    expect(empty?.textContent).toBe('No log entries match the current filters.');
+  });
+
   it('reconstructs order + message + range state from the URL via the shared contract', async () => {
     const win = {
       location: { search: '?logs.sort=timestamp&logs.q=disk&logs.from=2026-01-02', pathname: '/', hash: '' },

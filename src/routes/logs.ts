@@ -48,8 +48,9 @@ import { authGate } from '../auth/middleware.js';
 // (src/services/log-store.ts). `level`/`category` are optional — present only
 // when the underlying source classifies the entry.
 const logRecordSchema = z.object({
-  // Monotonic, gap-free sequence number. The stable pagination key: cursors
-  // encode a `seq` boundary, so appends never shift an in-flight page.
+  // Monotonic, gap-free sequence number. The pagination axis: a cursor is
+  // anchored on `seq` (plus an internal tie-break the token carries, #996
+  // review), never on an array offset, so appends never shift an in-flight page.
   seq: z.number().int(),
   timestamp: z.string(),
   message: z.string(),

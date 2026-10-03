@@ -319,7 +319,13 @@ export function createOpsTableState(config) {
 //   pagingMode: 'offset' | 'cursor'
 //   pageSize:   bounded, visible page size (default DEFAULT_PAGE_SIZE)
 //   rowKey:     (row) => string   — stable key for a row (defaults to row.id)
-//   emptyText:  shown when a successful load returns zero rows
+//   emptyText:  shown when a successful load returns zero rows. Either a string
+//               or a function `({ hasNext }) => string`, so a cursor-paged table
+//               can tell "nothing matches anywhere" apart from "nothing matches
+//               in THIS page, and the backend is still handing back a cursor"
+//               (issue #996 review: a bounded backend scan can legitimately
+//               return an empty page plus a cursor, and reporting that as "no
+//               match" tells the operator the search is over when it is not).
 //   caption:    optional table title text rendered above the filter bar
 //
 // The component does NOT fetch. The consumer subscribes to `state` (or passes
@@ -332,7 +338,7 @@ export function createOpsTable(config) {
   const columns = Array.isArray(cfg.columns) ? cfg.columns : [];
   const filters = Array.isArray(cfg.filters) ? cfg.filters : [];
   const rowKey = typeof cfg.rowKey === 'function' ? cfg.rowKey : function(r) { return r && r.id; };
-  const emptyText = cfg.emptyText || 'No results.';
+  const emptyTextCfg = cfg.emptyText;
 
   const state = createOpsTableState({
     pagingMode: cfg.pagingMode,
@@ -345,6 +351,20 @@ export function createOpsTable(config) {
   let status = 'idle';
   let rows = [];
   let errorMessage = '';
+
+  // Resolve the empty-state text at PAINT time, so a function form sees the
+  // paging facts the consumer recorded with setPageInfo() just before setRows().
+  function resolveEmptyText() {
+    if (typeof emptyTextCfg === 'function') {
+      try {
+        const snap = state.getState();
+        return emptyTextCfg({ hasNext: !!snap.hasNext, cursor: snap.cursor }) || 'No results.';
+      } catch (_err) {
+        return 'No results.';
+      }
+    }
+    return emptyTextCfg || 'No results.';
+  }
 
   // ── Column visibility (issue #959) ──
   // Held outside the interaction store on purpose: it is view state. A change
@@ -551,7 +571,7 @@ export function createOpsTable(config) {
       tbody.appendChild(fullWidthRow(colspan, 'ops-table-empty',
         function(td) {
           td.classList.add('empty');
-          td.textContent = emptyText;
+          td.textContent = resolveEmptyText();
         }));
       return;
     }
@@ -599,9 +619,14 @@ export function createOpsTable(config) {
     const canNext = state.canNext();
     prevBtn.disabled = !canPrev;
     nextBtn.disabled = !canNext;
-    // Hide entirely when there is genuinely nothing to page through.
+    // Hide entirely when there is genuinely nothing to page through. An EMPTY
+    // page still shows the controls when there is somewhere to go (issue #996
+    // review): a cursor-paged backend can return no rows for this page and still
+    // hand back a cursor, and the operator has to be able to press Next to keep
+    // searching rather than be told the search is over.
     const hasAnyNav = canPrev || canNext;
-    pagination.style.display = (status === 'ready' && (rows.length > 0 || hasAnyNav)) ? '' : 'none';
+    const loaded = status === 'ready' || status === 'empty';
+    pagination.style.display = (loaded && (rows.length > 0 || hasAnyNav)) ? '' : 'none';
 
     // Page indicator. Offset mode can show a range against a known total;
     // cursor mode has no total, so it shows the 1-based page number.

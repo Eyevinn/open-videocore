@@ -57,7 +57,13 @@
 //    database, which is an architecture + stack-provisioning call, not a
 //    log-store call. It should be fixed once, for every partition, not smuggled
 //    in here for one.
-//    Bounded in the meantime: `list` reads at most LOG_SCAN_WINDOW documents and
+//    Logged as OSC-adjacent friction per CLAUDE.md rule 6 (there is no index /
+//    `_design` provisioning primitive for an OSC-provisioned CouchDB instance,
+//    and no decided home for design documents on a per-stack database):
+//    docs/osc-feedback/incoming-couchdb-mango-index-provisioning.md in the agent
+//    repo.
+//    Bounded in the meantime: `list` reads at most
+//    LOG_MAX_SCAN_WINDOWS * LOG_SCAN_WINDOW documents per call and
 //    `existsAboveSeq` at most 1, so the RESULT size is bounded even though the
 //    scan is not.
 //
@@ -90,13 +96,15 @@ import {
   LOG_LEVELS,
   applyLogQuery,
   buildLogRecord,
+  clampLogLimit,
   decodeLogCursor,
   encodeLogCursor,
   type AppendLogInput,
   type ListLogsOptions,
   type ListLogsResult,
   type LogRecord,
-  type LogStore
+  type LogStore,
+  type SequencedLogRecord
 } from '../services/log-store.js';
 
 // resourceType discriminator for the log partition — mirrors the
@@ -127,14 +135,30 @@ const LogEntryDocumentSchema = z.object({
 
 export type CouchFactory = () => StackCouch;
 
-// How many records one `list()` call materialises from the store before the
-// shared in-process filter/sort/paginate runs. A whole `seq` window is read in a
-// single `find`, so this is both the Mango `limit` and the window width. Chosen
-// well above LOG_MAX_LIMIT (200, src/services/log-store.ts) so sparse filters
-// still fill a page from one round trip, while keeping any single read bounded
-// (the audit partition takes the same "bounded fetch, then filter in the
-// application layer" approach, src/data/audit-repo.ts:301-305).
+// How many records ONE window of a `list()` call materialises before the shared
+// in-process filter/sort/paginate runs. A whole `seq` window is read in a single
+// `find`, so this is both the Mango `limit` and the window width. Chosen well
+// above LOG_MAX_LIMIT (200, src/services/log-store.ts) so sparse filters still
+// fill a page from one round trip, while keeping any single read bounded (the
+// audit partition takes the same "bounded fetch, then filter in the application
+// layer" approach, src/data/audit-repo.ts:301-305).
+//
+// The `seq` range is gap-free and exactly LOG_SCAN_WINDOW wide, so at most
+// LOG_SCAN_WINDOW documents can match it: the Mango `limit` can never truncate a
+// window and hide an entry.
 const LOG_SCAN_WINDOW = 1000;
+
+// How many windows ONE `list()` call may walk before it gives up and hands back
+// a window-edge cursor (review finding on #996). `list` used to scan exactly one
+// window and then filter in process, so a filtered page whose only match sat
+// beyond that window returned `{ items: [], nextCursor: <edge> }` — and the UI
+// rendered "no entries match" while a match existed one window further down.
+// Advancing internally fixes that for any realistic filter; the cap keeps a
+// single request bounded (at most LOG_MAX_SCAN_WINDOWS * LOG_SCAN_WINDOW
+// documents read) instead of walking an arbitrarily long partition inside one
+// HTTP request. Hitting the cap is not a dead end: the edge cursor resumes the
+// walk exactly where it stopped, and the page is still marked "keep paging".
+const LOG_MAX_SCAN_WINDOWS = 10;
 
 // Upper bound on the exponential/binary probe below, so a corrupt `seq` cannot
 // spin the doubling loop forever. 2^45 entries is unreachable in practice.
@@ -149,37 +173,44 @@ const MAX_PROBE_DOUBLINGS = 45;
 // high-water mark straight from the partition (`probeMaxSeq`) and counts on from
 // there in memory.
 //
-// SINGLE-WRITER ASSUMPTION (review finding, #996). The in-memory counter is
-// authoritative only because a deployment runs ONE API process: ADR-020
-// (docs/architecture/ADR-020-quota-deployment-model-and-metering-source.md,
-// "Consequence / boundary condition") fixes the deployment model as one instance
-// per tenant and builds the storage quota as a "single instance-wide" total on
-// exactly the same premise; src/pipeline/watch-folder.ts:25 relies on it too.
-// Within one process the allocation is race-free: `recoverHighWater` is the only
-// `await` before the read-and-increment, so two concurrent `append()` calls
-// cannot take the same number.
+// `seq` IS NOT GLOBALLY UNIQUE, and the read path does not assume it is (review
+// finding, #996 — the earlier "race-free within one process" claim here was
+// wrong and has been removed).
 //
-// What a SECOND writer process would break, precisely: two instances both
-// recover the same high-water mark and both issue seq N. Entries are distinct
-// ULID documents so neither is overwritten, but the cursor is a bare `seq`
-// boundary (`encodeLogCursor`, src/services/log-store.ts) and `applyLogQuery`
-// resumes STRICTLY past it — so if the duplicated N lands on a page boundary,
-// the second entry with seq N is skipped and is unreachable by paging. That is a
-// silent read loss, not just a cosmetic tie.
+// Why it was wrong: a store instance is not process-wide. WorkspaceConnections
+// is cached for only CACHE_TTL_MS (5 min, src/services/workspace-stack.ts:70)
+// and every rebuild mints a fresh `new CouchLogStore(wc)`
+// (src/services/workspace-stack.ts:235) whose `highWater` starts `undefined`.
+// So within ONE process, across a cache expiry, two live instances over the same
+// partition both recover the same mark and both issue seq N — no second API
+// process required (and ADR-020's one-instance-per-tenant deployment model does
+// nothing to prevent it). A replayed backup or a genuinely second writer
+// produces the same duplicate.
 //
-// DELIBERATELY NOT FIXED HERE, because the fix is a design change that should
-// land with the multi-writer mode that would need it, not speculatively ahead of
-// it (and the cheap version costs two extra round trips on every append, on a
-// path that is fire-and-forget by design). When that mode is designed, the two
-// viable options, both already expressible with primitives in this repo:
-//   1. Allocate `seq` from a single CAS'd counter document instead of memory,
-//      using `updateWithRetry` + `isUpdateConflict` (src/data/couchdb.ts:171,118)
-//      — the same read-modify-write-with-409-retry primitive #278 added. Keeps
-//      `seq` globally unique across writers; costs a get+put per append.
-//   2. Make the cursor a composite (`seq`, document ULID) boundary so an
-//      ambiguous `seq` is still orderable. The cursor is opaque to callers
-//      (src/routes/logs.ts), so this does NOT change the public contract, but it
-//      does change `applyLogQuery` and so must be done for BOTH stores at once.
+// What that used to break: entries are distinct ULID documents, so neither is
+// overwritten, but the cursor WAS a bare `seq` boundary and `applyLogQuery`
+// resumes strictly past the boundary — so a duplicated N landing on a page
+// boundary made the second entry with seq N unreachable by paging. A silent read
+// loss, not a cosmetic tie.
+//
+// FIXED by making the cursor a composite `(seq, document ULID)` boundary
+// (`encodeLogCursor`/`decodeLogCursor`/`applyLogQuery`,
+// src/services/log-store.ts): ULIDs are unique and lexicographically sortable,
+// so `(seq, id)` is a total order even when `seq` repeats, and paging resumes
+// strictly past that composite rather than past the whole `seq`. Both backends
+// run the same engine, so neither can drift. The cursor is opaque to callers
+// (src/routes/logs.ts), so this is NOT a public contract change, and a legacy
+// bare-`seq` token still decodes and still behaves as it did.
+//
+// STILL OPEN, deliberately: `seq` remains per-instance, so a duplicate is
+// possible and the numbers are therefore not a global ordinal — only a
+// pagination axis, which is all the public contract uses them for. If a future
+// mode needs globally unique numbers, allocate `seq` from a single CAS'd counter
+// document using `updateWithRetry` + `isUpdateConflict`
+// (src/data/couchdb.ts:171,118) — the read-modify-write-with-409-retry primitive
+// #278 added. Not done here: it costs a get+put on every append, on a path that
+// is fire-and-forget by design, and the composite cursor already removes the
+// read loss that made duplicates dangerous.
 export class CouchLogStore implements LogStore {
   // Highest `seq` known to exist in the partition. `undefined` until recovered.
   private highWater: number | undefined;
@@ -224,17 +255,26 @@ export class CouchLogStore implements LogStore {
   // both run the identical `applyLogQuery` engine, so filtering, ordering and
   // cursor handling cannot drift (src/services/log-store.ts).
   //
-  // Only a bounded `seq` window is materialised per call, walking the stream in
-  // the paging direction from the cursor boundary. CouchDB Mango exposes no
-  // `sort` through StackCouch.find (src/data/couchdb.ts:66), so the window is
-  // selected by `seq` range — cheap and exact, because `seq` is gap-free — and
-  // ordered in process.
+  // The stream is walked in bounded `seq` windows, in the paging direction, from
+  // the cursor boundary. CouchDB Mango exposes no `sort` through StackCouch.find
+  // (src/data/couchdb.ts:66), so a window is selected by `seq` range — cheap and
+  // exact, because `seq` is gap-free — and ordered in process.
   //
-  // When the window is exhausted without filling the page but unscanned `seq`
-  // space remains in the paging direction, the returned `nextCursor` is anchored
-  // at the window edge instead of null. That keeps the documented contract
-  // ("null `nextCursor` marks the last page", src/routes/logs.ts:79-87) honest:
-  // a short page with a cursor means "keep paging", never "the stream ended".
+  // KEEPS ADVANCING until the page is full (review finding on #996). One window
+  // is not enough when a filter is sparse: `from`/`to`/`q` are applied after the
+  // window is materialised, so a single-window read returned an EMPTY page for a
+  // match sitting one window further along, and the UI then said "no entries
+  // match" about a stream that contained one. This loop keeps opening the next
+  // window until the page is filled, the stream is exhausted in this direction,
+  // or LOG_MAX_SCAN_WINDOWS windows have been read in this one call.
+  //
+  // When the walk stops with unscanned `seq` space still ahead of it, the
+  // returned `nextCursor` is anchored at the window edge instead of null. That
+  // keeps the documented contract ("null `nextCursor` marks the last page",
+  // src/routes/logs.ts:79-87) honest: a short page with a cursor means "keep
+  // paging", never "the stream ended". The frontend reads it that way too — an
+  // empty page WITH a cursor is rendered as "keep paging", not as "no match"
+  // (public/logs-table.js, public/ops-ui-table.js).
   async list(opts: ListLogsOptions = {}): Promise<ListLogsResult> {
     const couch = this.couchFor();
     const maxSeq = await this.currentMaxSeq(couch);
@@ -243,45 +283,67 @@ export class CouchLogStore implements LogStore {
     }
 
     const order = opts.order === 'asc' ? 'asc' : 'desc';
-    const cursorSeq = decodeLogCursor(opts.cursor);
+    const limit = clampLogLimit(opts.limit);
+    const boundary = decodeLogCursor(opts.cursor);
+    // Pre-filter pushed into the Mango selector. Never NARROWER than the
+    // in-process filter (see logMangoFilter), so it can only reduce transfer.
+    const mangoFilter = logMangoFilter(opts);
 
-    // Window bounds, inclusive, in `seq` space.
-    let lo: number;
-    let hi: number;
-    if (order === 'desc') {
-      // Newest-first: start just below the cursor boundary and walk down.
-      hi = cursorSeq === undefined ? maxSeq : Math.min(maxSeq, cursorSeq - 1);
-      lo = Math.max(1, hi - LOG_SCAN_WINDOW + 1);
-    } else {
-      // Oldest-first: start just above the cursor boundary and walk up.
-      lo = cursorSeq === undefined ? 1 : Math.max(1, cursorSeq + 1);
-      hi = Math.min(maxSeq, lo + LOG_SCAN_WINDOW - 1);
+    // Outer edge, inclusive, of the next window to read. The cursor's own `seq`
+    // is INCLUDED rather than stepped past: a `seq` can repeat (see
+    // SequencedLogRecord, src/services/log-store.ts), and it is `applyLogQuery`
+    // that excludes the exact boundary RECORD by its composite `(seq, id)` key.
+    // Stepping past the whole `seq` here is what used to lose a tied entry.
+    let frontier =
+      order === 'desc'
+        ? boundary === undefined
+          ? maxSeq
+          : Math.min(maxSeq, boundary.seq)
+        : boundary === undefined
+          ? 1
+          : Math.max(1, boundary.seq);
+    const streamRemains = (): boolean => (order === 'desc' ? frontier >= 1 : frontier <= maxSeq);
+
+    const scanned: SequencedLogRecord[] = [];
+    let page: ListLogsResult = { items: [], nextCursor: null };
+
+    for (let window = 0; window < LOG_MAX_SCAN_WINDOWS && streamRemains(); window += 1) {
+      const lo = order === 'desc' ? Math.max(1, frontier - LOG_SCAN_WINDOW + 1) : frontier;
+      const hi = order === 'desc' ? frontier : Math.min(maxSeq, frontier + LOG_SCAN_WINDOW - 1);
+
+      const docs = await couch.find(
+        { resourceType: LOG_RESOURCE_TYPE, seq: { $gte: lo, $lte: hi }, ...mangoFilter },
+        { limit: LOG_SCAN_WINDOW }
+      );
+      for (const doc of docs) {
+        if (doc.resourceType === LOG_RESOURCE_TYPE) scanned.push(fromDoc(doc));
+      }
+      // This window is now fully accounted for; the next one starts past it.
+      frontier = order === 'desc' ? lo - 1 : hi + 1;
+
+      // Re-run the shared engine over everything scanned so far. Windows are
+      // disjoint and walked in order, so the union is exactly the prefix of the
+      // stream this call has seen.
+      page = applyLogQuery(scanned, opts);
+      if (page.items.length >= limit) break;
     }
-    if (hi < lo) {
-      return { items: [], nextCursor: null };
-    }
 
-    const docs = await couch.find(
-      { resourceType: LOG_RESOURCE_TYPE, seq: { $gte: lo, $lte: hi } },
-      { limit: LOG_SCAN_WINDOW }
-    );
-    const candidates = docs
-      .filter((d) => d.resourceType === LOG_RESOURCE_TYPE)
-      .map(fromDoc);
-
-    const page = applyLogQuery(candidates, opts);
     if (page.nextCursor !== null) {
-      // More matches inside the scanned window: the standard cursor already
-      // points at the right boundary.
+      // More matches inside what we scanned: the composite cursor the engine
+      // produced already points at the right boundary record.
       return page;
     }
-    // Window exhausted. If there is more stream beyond it in this direction,
-    // hand back the window edge so the caller resumes strictly past it.
-    const edge = order === 'desc' ? (lo > 1 ? lo : undefined) : hi < maxSeq ? hi : undefined;
-    if (edge !== undefined) {
-      return { items: page.items, nextCursor: encodeLogCursor(edge) };
+    if (!streamRemains()) {
+      // Walked to the end of the stream in this direction: a null cursor here is
+      // the truth, not a window artefact.
+      return page;
     }
-    return page;
+    // Stopped with stream left (page full, or the window budget ran out). Anchor
+    // on the edge of the last window read — an id-less `seq` boundary, so the
+    // next call resumes strictly past the whole of that `seq`, which is sound
+    // precisely because every entry at that `seq` was in a window we scanned.
+    const edgeSeq = order === 'desc' ? frontier + 1 : frontier - 1;
+    return { items: page.items, nextCursor: encodeLogCursor(edgeSeq) };
   }
 
   // The highest `seq` the partition holds right now, for the read path.
@@ -312,6 +374,44 @@ export class CouchLogStore implements LogStore {
   }
 }
 
+// Pre-filter for the window read, pushed into the Mango selector so CouchDB
+// drops non-matching documents before they cross the wire (review finding on
+// #996: a sparse filter used to pull a whole window back and discard it in
+// process).
+//
+// HARD INVARIANT: this selector must never be NARROWER than the in-process
+// filter in `applyLogQuery` (src/services/log-store.ts). A narrower pushdown
+// hides a matching entry, which is the exact silent-drop failure this fix is
+// about, so each term here is only pushed down when it provably agrees with the
+// in-process comparison:
+//   - `q` -> `message: { $regex }`. The in-process test is
+//     `message.toLowerCase().includes(q.toLowerCase())`, so the pattern is the
+//     query escaped to a literal with the case-insensitive inline flag. Pushed
+//     down ONLY for printable-ASCII queries, where `(?i)` and `toLowerCase()`
+//     agree by construction; anything else (non-ASCII case folding differs
+//     between the two engines) is left to the in-process filter alone.
+//   - `from`/`to` are deliberately NOT pushed down. The in-process test is a
+//     plain lexicographic string comparison, while Mango compares strings with
+//     CouchDB's own collation; the two agree for identically formatted ISO
+//     instants but are not guaranteed to for mixed-offset timestamps, and a
+//     disagreement at the boundary would drop a matching entry. The `seq`
+//     window already bounds the read, so the pushdown would buy little.
+function logMangoFilter(opts: ListLogsOptions): Record<string, unknown> {
+  const q = opts.q;
+  if (q === undefined || q === '' || !isPrintableAscii(q)) return {};
+  return { message: { $regex: `(?i)${escapeRegExpLiteral(q)}` } };
+}
+
+function isPrintableAscii(value: string): boolean {
+  return /^[ -~]*$/.test(value);
+}
+
+// Escape every regex metacharacter so the query is matched as a literal
+// substring, exactly as `String.includes` does in process.
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Highest persisted `seq` in the log partition, or 0 when the partition is
 // empty.
 //
@@ -319,8 +419,13 @@ export class CouchLogStore implements LogStore {
 // entry" cannot simply be read off a descending scan. Instead this asks a
 // yes/no question — "does any entry exist above N?" — with a `limit: 1` Mango
 // probe, and brackets the answer by doubling and then bisecting. That is
-// O(log n) tiny round trips once per store instance, versus paging the whole
-// partition to its tail.
+// O(log n) tiny round trips, versus paging the whole partition to its tail.
+//
+// How often it runs: once per store instance to recover the mark after boot
+// (`recoverHighWater`), and again on a read whose cheap `existsAboveSeq` check
+// says the cached mark is behind — i.e. whenever someone else has appended. NOT
+// once per process: a new store instance is minted whenever the
+// WorkspaceConnections cache is rebuilt (src/services/workspace-stack.ts:235).
 async function probeMaxSeq(couch: StackCouch): Promise<number> {
   // `seq` starts at 1, so "something above 0" means "the partition is non-empty".
   if (!(await existsAboveSeq(couch, 0))) return 0;
@@ -379,7 +484,11 @@ function toDoc(id: string, record: LogRecord): Record<string, unknown> {
 // body, so a document written before the field existed still deserializes.
 // `localId` falls back to the document `_id` the same way audit's fromDoc does
 // (src/data/audit-repo.ts:376).
-function fromDoc(doc: StoredDoc): LogRecord {
+// The document ULID is carried through as the record's internal `id`, which is
+// the tie-break half of the composite cursor (`SequencedLogRecord`,
+// src/services/log-store.ts). It is stripped again by `applyLogQuery` and never
+// reaches the wire.
+function fromDoc(doc: StoredDoc): SequencedLogRecord {
   const parsed = LogEntryDocumentSchema.parse({
     ...doc,
     resourceType: LOG_RESOURCE_TYPE,
@@ -387,6 +496,7 @@ function fromDoc(doc: StoredDoc): LogRecord {
     localId: String(doc['localId'] ?? doc._id)
   });
   return {
+    id: parsed.localId,
     seq: parsed.seq,
     timestamp: parsed.timestamp,
     message: parsed.message,

@@ -373,7 +373,13 @@ export class PerWorkspaceAuditRepository implements AuditRepository {
 export class PerWorkspaceLogStore implements LogStore {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async store(): Promise<LogStore> {
-    return (await this.resolver.resolve()).logs;
+    // Resolve the stack the REQUEST names, exactly like every sibling wrapper in
+    // this file (issue #1058). Calling `resolve()` with no argument keys the
+    // resolver cache on '' and takes its no-stackName branch — the first-listed
+    // stack (src/services/workspace-stack.ts:845-846) — so on a multi-stack
+    // install the log stream was read from, and appended to, the wrong stack's
+    // partition while every other surface honoured X-Stack-Name.
+    return (await this.resolver.resolve(currentRequestStackName())).logs;
   }
   async append(input: AppendLogInput): Promise<LogRecord> {
     return (await this.store()).append(input);

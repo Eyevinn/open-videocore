@@ -22,11 +22,14 @@ import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod
 import { Readable } from 'node:stream';
 
 import { assetsRouter } from '../src/routes/assets.js';
+import { logsRouter } from '../src/routes/logs.js';
 import { InMemoryAssetRepository } from '../src/data/asset-repo.js';
 import { InMemoryJobRepository } from '../src/data/job-repo.js';
+import { InMemoryLogStore } from '../src/services/log-store.js';
 import {
   PerWorkspaceAssetRepository,
   PerWorkspaceJobRepository,
+  PerWorkspaceLogStore,
   PerWorkspacePipelineRepository
 } from '../src/data/per-workspace-repos.js';
 import { InMemoryPipelineRepository } from '../src/data/pipeline-repo.js';
@@ -80,6 +83,7 @@ type Stack = {
   assets: InMemoryAssetRepository;
   jobs: InMemoryJobRepository;
   pipelines: InMemoryPipelineRepository;
+  logs: InMemoryLogStore;
   storage: FakeStackStorage;
   connections: WorkspaceConnections;
 };
@@ -88,11 +92,15 @@ function makeStack(name: string): Stack {
   const assets = new InMemoryAssetRepository();
   const jobs = new InMemoryJobRepository();
   const pipelines = new InMemoryPipelineRepository();
+  // Each stack owns its own operational log store, exactly as
+  // WorkspaceConnections.logs does (src/services/workspace-stack.ts:119,235).
+  const logs = new InMemoryLogStore();
   const storage = new FakeStackStorage(name);
   const connections = {
     assets,
     jobs,
     pipelines,
+    logs,
     storageFor: () => storage,
     storageClient: undefined,
     sourceBucket: SOURCE_BUCKET,
@@ -100,7 +108,7 @@ function makeStack(name: string): Stack {
     s3Config: { endpoint: `https://${name}.minio-minio.example`, accessKey: 'admin', secretKey: 'x' },
     stackName: name
   } as unknown as WorkspaceConnections;
-  return { name, assets, jobs, pipelines, storage, connections };
+  return { name, assets, jobs, pipelines, logs, storage, connections };
 }
 
 type Harness = {
@@ -115,6 +123,9 @@ type Harness = {
   expireResolverCache: () => void;
   // Storage handles the extractor was actually invoked with, in order.
   extractedWith: Array<{ assetId: string; storage: unknown }>;
+  // Stack names `resolve()` was actually called with, in order. A wrapper that
+  // forgets `currentRequestStackName()` shows up here as `undefined`.
+  resolvedWith: Array<string | undefined>;
 };
 
 // Resolver stub keyed exactly like WorkspaceStackResolver: a name with a stored
@@ -130,8 +141,12 @@ async function buildApp(
     (requested && stacks[requested]) || stacks[names[0]!]!;
 
   let cacheCold = false;
+  const resolvedWith: Array<string | undefined> = [];
   const resolver = {
-    resolve: async (stackName?: string) => pick(stackName).connections,
+    resolve: async (stackName?: string) => {
+      resolvedWith.push(stackName);
+      return pick(stackName).connections;
+    },
     resolveCached: (stackName?: string) =>
       cacheCold ? undefined : pick(stackName).connections,
     resolveStackName: async (requested?: string) =>
@@ -186,6 +201,13 @@ async function buildApp(
       opts.resolveStackContext ??
       (async (requested?: string) => (requested && stacks[requested] ? requested : names[0]))
   });
+
+  // The operational log stream is part of the same data plane: it is read AND
+  // written per request through PerWorkspaceLogStore (src/data/per-workspace-repos.ts).
+  await app.register(logsRouter, {
+    prefix: '/api/v1/logs',
+    logStore: new PerWorkspaceLogStore(resolver)
+  });
   await app.ready();
   return {
     app,
@@ -195,7 +217,8 @@ async function buildApp(
     expireResolverCache: () => {
       cacheCold = true;
     },
-    extractedWith
+    extractedWith,
+    resolvedWith
   };
 }
 
@@ -437,6 +460,78 @@ describe('pipeline execute refuses a stack split too (issue #1058)', () => {
     expect(res.statusCode).toBe(202);
     expect(h.submitted).toHaveLength(1);
     expect(h.submitted[0]!.externalId.split('__')[0]).toBe('b');
+  });
+});
+
+// The operational log store was the one data-plane wrapper left behind by #1058:
+// PerWorkspaceLogStore.store() called `resolver.resolve()` with NO argument, so
+// it keyed the resolver cache on '' and took the no-stackName branch — the
+// first-listed stack (src/services/workspace-stack.ts:845-846) — regardless of
+// the request's X-Stack-Name. On a two-stack install that meant the logs tab
+// served stack 'a''s stream while every other surface served 'b''s.
+describe('the log store resolves the stack the request names (issue #1058)', () => {
+  it('reads the NAMED stack stream, and resolves it by name', async () => {
+    const h = await buildApp(['a', 'b']);
+    await h.stacks['a']!.logs.append({ message: 'entry on the first-listed stack' });
+    await h.stacks['b']!.logs.append({ message: 'entry on the named stack' });
+
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/api/v1/logs',
+      headers: { ...AUTH, 'x-stack-name': 'b' }
+    });
+    expect(res.statusCode).toBe(200);
+    const messages = (res.json() as { items: Array<{ message: string }> }).items.map(
+      (r) => r.message
+    );
+    // Pre-fix this returned the first-listed stack's entry under EITHER header.
+    expect(messages).toEqual(['entry on the named stack']);
+
+    // ...and the resolution went through the request's stack name, not ''.
+    expect(h.resolvedWith).toContain('b');
+    expect(h.resolvedWith).not.toContain(undefined);
+  });
+
+  it('appends to the NAMED stack partition', async () => {
+    const h = await buildApp(['a', 'b']);
+    const logStore = new PerWorkspaceLogStore({
+      resolve: async (stackName?: string) => {
+        h.resolvedWith.push(stackName);
+        return (stackName && h.stacks[stackName]
+          ? h.stacks[stackName]!
+          : h.stacks['a']!
+        ).connections;
+      }
+    } as unknown as WorkspaceStackResolver);
+
+    // Append inside the request-scoped ambient stack the `onRequest` hook
+    // establishes in production (src/services/request-stack-context.ts).
+    await new Promise<void>((resolve, reject) => {
+      runWithRequestStack('b', () => {
+        logStore
+          .append({ message: 'written while the request named stack b' })
+          .then(() => resolve())
+          .catch(reject);
+      });
+    });
+
+    expect((await h.stacks['b']!.logs.list()).items.map((r) => r.message)).toEqual([
+      'written while the request named stack b'
+    ]);
+    expect((await h.stacks['a']!.logs.list()).items).toEqual([]);
+    expect(h.resolvedWith).toContain('b');
+  });
+
+  it('still falls back to the first-listed stack when the request names none', async () => {
+    const h = await buildApp(['a', 'b']);
+    await h.stacks['a']!.logs.append({ message: 'default stack entry' });
+    await h.stacks['b']!.logs.append({ message: 'named stack entry' });
+
+    const res = await h.app.inject({ method: 'GET', url: '/api/v1/logs', headers: AUTH });
+    expect(res.statusCode).toBe(200);
+    expect(
+      (res.json() as { items: Array<{ message: string }> }).items.map((r) => r.message)
+    ).toEqual(['default stack entry']);
   });
 });
 
