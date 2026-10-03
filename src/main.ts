@@ -58,7 +58,9 @@ import {
   makeRequestScopedStorageFactory,
   requestStackNameFromHeaders,
   runWithRequestStack,
-  currentRequestStackName
+  runWithPersistedStack,
+  currentRequestStackName,
+  PERSISTED_STACK_FALLBACK_MESSAGE
 } from './services/request-stack-context.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
@@ -2049,55 +2051,89 @@ await app.register(internalRouter, internalRouterOptions);
 // the upload route and the watch-folder service. The upload route resolves the
 // caller's workspace before invoking this, so the resolver cache is warm and
 // the sync storageFor() and resolveCached() can be read synchronously.
+// `stackName` is the asset's persisted stack identity (`Asset.stackName`, issue
+// #1097). An upload/watch-folder asset is created OUTSIDE any job, so this is
+// the only durable record of where it lives; the whole detached continuation
+// below runs inside it so the extraction + thumbnail writes and the s3Config
+// read resolve that stack rather than the first-listed one. Absent (pre-#1097
+// asset, or watch-folder, which creates assets with no ambient stack) keeps
+// today's behaviour and is reported at debug level.
 const onObjectStored =
   storageAvailable
-    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) => {
-        const effectiveStorage = storage ?? storageFor();
-        if (probe) {
-          void extractTechnicalMetadata(
-            { assetId, objectKey },
-            { assets: assetRepository, storage: effectiveStorage, probe }
-          );
-        }
-        if (thumbnailExtractor) {
-          // Read s3Config from the already-warm resolver cache, for the stack
-          // this request named (issue #1058). The upload preHandler called
-          // resolve() with the same name, so resolveCached() is valid here.
-          // CAVEAT (#1090): this is a CACHE read, so it returns undefined if the
-          // entry has aged past the resolver TTL between the preHandler and this
-          // fire-and-forget continuation, in which case the thumbnail runner
-          // falls back to the boot-default bucket. Fine for the request path
-          // (the entry was just written); recorded on #1090 with the rest of the
-          // non-request resolution gaps.
-          const conns = stackResolver.resolveCached(currentRequestStackName());
-          const bucket = conns?.sourceBucket ?? sourceBucket;
-          // Same resolution helper the asset routes use (issue #838). This path
-          // is fire-and-forget on upload, so an unresolvable factory is logged
-          // at error level and skipped rather than thrown at the uploader — but
-          // it is logged, not silently treated as "no thumbnails configured".
-          try {
-            const extractor = resolveRunnerOption(
-              thumbnailExtractor,
-              runnerS3Config(conns?.s3Config, bucket),
-              'thumbnailExtractor'
-            );
-            void extractThumbnails(
-              { assetId, objectKey, timecodes: [1] },
-              { assets: assetRepository, storage: effectiveStorage, extractor }
-            ).catch(() => { /* failures recorded on asset */ });
-          } catch (err) {
-            if (err instanceof RunnerFactoryUnresolvedError) {
-              app.log.error(
-                { err, assetId },
-                'skipping post-upload thumbnail extraction: runner factory could not be resolved'
-              );
-            } else {
-              throw err;
-            }
-          }
-        }
-      }
+    ? (
+        assetId: string,
+        objectKey: string,
+        storage?: WorkspaceStorage,
+        stackName?: string
+      ) =>
+        runWithPersistedStack(
+          stackName,
+          () => onObjectStoredInStack(assetId, objectKey, storage),
+          () =>
+            app.log.debug(
+              { assetId, objectKey },
+              `post-object-stored pipeline: ${PERSISTED_STACK_FALLBACK_MESSAGE}`
+            )
+        )
     : undefined;
+
+function onObjectStoredInStack(
+  assetId: string,
+  objectKey: string,
+  storage?: WorkspaceStorage
+): void {
+  const effectiveStorage = storage ?? storageFor();
+  // The stack this work is running in: the request's (issue #1058) or the
+  // asset's persisted one, re-entered by the wrapper above (issue #1097).
+  const stackName = currentRequestStackName();
+  if (probe) {
+    void extractTechnicalMetadata(
+      // Passed explicitly as well, so the extractor re-enters the stack on its
+      // own and stays correct however it is invoked.
+      { assetId, objectKey, ...(stackName ? { stackName } : {}) },
+      { assets: assetRepository, storage: effectiveStorage, probe, stackLog: app.log }
+    );
+  }
+  if (thumbnailExtractor) {
+    // Read s3Config from the already-warm resolver cache, for the stack this
+    // work belongs to — the request's stack (issue #1058) or, when the caller
+    // is detached from the request, the asset's PERSISTED stack re-entered by
+    // the wrapper above (issue #1097). The upload preHandler called resolve()
+    // with the same name, so resolveCached() is valid here.
+    // CAVEAT (#1090): this is a CACHE read, so it returns undefined if the
+    // entry has aged past the resolver TTL between the preHandler and this
+    // fire-and-forget continuation, in which case the thumbnail runner falls
+    // back to the boot-default bucket. Fine for the request path (the entry was
+    // just written); recorded on #1090 with the rest of the non-request
+    // resolution gaps.
+    const conns = stackResolver.resolveCached(stackName);
+    const bucket = conns?.sourceBucket ?? sourceBucket;
+    // Same resolution helper the asset routes use (issue #838). This path is
+    // fire-and-forget on upload, so an unresolvable factory is logged at error
+    // level and skipped rather than thrown at the uploader — but it is logged,
+    // not silently treated as "no thumbnails configured".
+    try {
+      const extractor = resolveRunnerOption(
+        thumbnailExtractor,
+        runnerS3Config(conns?.s3Config, bucket),
+        'thumbnailExtractor'
+      );
+      void extractThumbnails(
+        { assetId, objectKey, timecodes: [1] },
+        { assets: assetRepository, storage: effectiveStorage, extractor }
+      ).catch(() => { /* failures recorded on asset */ });
+    } catch (err) {
+      if (err instanceof RunnerFactoryUnresolvedError) {
+        app.log.error(
+          { err, assetId },
+          'skipping post-upload thumbnail extraction: runner factory could not be resolved'
+        );
+      } else {
+        throw err;
+      }
+    }
+  }
+}
 
 // Registered UNCONDITIONALLY (mirroring assetsRouter above, main.ts:1184) so
 // the upload/multipart routes always enter the route tree and therefore the

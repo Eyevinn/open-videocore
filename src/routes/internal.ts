@@ -285,17 +285,26 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
   // decode. Probe the default resolution FIRST — on a single-stack install (and
   // for every asset on the first-listed stack) that is one lookup and the
   // behaviour is exactly as before — and only then try the other provisioned
-  // stacks. Returns undefined when the default stack owns the asset, when no
-  // stack does (the handler then 404s as before), or when there is no asset repo
-  // wired at all.
+  // stacks. Returns undefined when no stack owns the asset (the handler then
+  // 404s as before), when there is no asset repo wired at all, or when the asset
+  // found on the default resolution carries no persisted stack name.
+  //
+  // Issue #1097: the asset itself now records the stack it was created against
+  // (`Asset.stackName`, src/data/asset-repo.ts), so when a probe finds the asset
+  // we prefer that persisted value over the name we probed under. That pins the
+  // handler to an EXPLICIT stack instead of leaving the default resolution to
+  // re-derive "first listed" on every call inside the handler. An asset written
+  // before #1097 has no such value, which falls back to exactly the previous
+  // behaviour (undefined for the default stack, the probed name otherwise).
   async function stackOwningAsset(assetId: string): Promise<string | undefined> {
     const assets = opts.repository;
     if (!assets) return undefined;
     try {
-      if (await assets.get(assetId)) return undefined;
+      const onDefaultStack = await assets.get(assetId);
+      if (onDefaultStack) return onDefaultStack.stackName;
       for (const name of await listStackNamesSafely(opts)) {
         const found = await runWithRequestStack(name, async () => assets.get(assetId));
-        if (found) return name;
+        if (found) return found.stackName ?? name;
       }
     } catch (err) {
       // Best-effort: a lookup failure degrades to the default resolution rather

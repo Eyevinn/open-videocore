@@ -8,6 +8,7 @@
 // status, progress, and any terminal error.
 
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
+import { currentRequestStackName } from '../services/request-stack-context.js';
 
 // ---------------------------------------------------------------------------
 // Job model + lifecycle
@@ -175,6 +176,24 @@ export type Job = {
   // unconditional and must never be overridden. Cleared once a job settles to a
   // real terminal outcome (done, or a re-affirmed failure).
   droppedByScaler?: boolean;
+  // --- Durable stack identity (#1097) ---
+  // The provisioned stack this job was created against, captured from the
+  // request's ambient stack context at create time
+  // (`currentRequestStackName()`, src/services/request-stack-context.ts). It is
+  // the DURABLE copy of an identity that otherwise lives only in
+  // AsyncLocalStorage, so work that outlives the request — the URL-pull worker,
+  // metadata extraction, a queue message drained after a process restart — can
+  // re-enter the same stack (`runWithPersistedStack`) and resolve the same
+  // repositories and object storage the request wrote to.
+  //
+  // Optional and immutable: absent on every job created before #1097 and on
+  // jobs created outside a request (boot wiring, sweeps, watch-folder), where
+  // there is no ambient stack to record. An absent value keeps TODAY's
+  // behaviour — the first-listed stack (`workspace-stack.ts resolve()`,
+  // no-stackName branch) — and the fallback is logged at debug level by the
+  // worker that takes it. Not present on UpdateJobInput: a job's stack never
+  // changes, so there is nothing to patch.
+  stackName?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -195,6 +214,12 @@ export type CreateJobInput = {
   // external correlation id at creation time.
   packagingId?: string;
   outputPrefix?: string;
+  // Explicit stack identity override (#1097). Normally omitted: the repository
+  // stamps `currentRequestStackName()` so every caller records the stack it is
+  // actually serving without having to pass anything. Supplied only by a caller
+  // that already KNOWS the stack and is not running inside its context (tests,
+  // and any future re-driver that recreates a job on a named stack).
+  stackName?: string;
 };
 
 // Fields the worker may patch as it makes progress. id/workspace/createdAt are
@@ -465,6 +490,10 @@ export class InMemoryJobRepository implements JobRepository {
       profile: input.profile,
       packagingId: input.packagingId,
       outputPrefix: input.outputPrefix,
+      // Durable stack identity (#1097): the stack this job is being created
+      // against. Undefined outside a request, which preserves the previous
+      // default-stack behaviour on boot/sweep paths.
+      stackName: input.stackName ?? currentRequestStackName(),
       createdAt: now,
       updatedAt: now
     };

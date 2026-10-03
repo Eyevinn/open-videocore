@@ -52,6 +52,55 @@ export function currentRequestStackName(): string | undefined {
   return stackContext.getStore()?.stackName;
 }
 
+// Minimal logger surface for the legacy-document fallback notice below. Declared
+// structurally so a Fastify/pino logger satisfies it without this module
+// depending on a logging library.
+export type StackContextLogger = {
+  debug(obj: unknown, msg?: string): void;
+};
+
+// Single spelling of the fallback notice (issue #1097), so every worker reports a
+// legacy document the same way and the text can be grepped in one place.
+export const PERSISTED_STACK_FALLBACK_MESSAGE =
+  'no persisted stackName on the document — resolving the default (first-listed) stack';
+
+// Re-enter the stack a PERSISTED document was created against (issue #1097).
+//
+// `runWithRequestStack` carries stack identity for the lifetime of a REQUEST.
+// Work that outlives the request — the URL-pull worker, fire-and-forget metadata
+// extraction — inherits that store only while the process lives; once the
+// process restarts, the queue message or job record is picked up with an EMPTY
+// store and every repository/storage resolution falls back to the first-listed
+// stack. The durable identity is the `stackName` now persisted on the Job and
+// Asset documents (src/data/job-repo.ts `Job.stackName`,
+// src/data/asset-repo.ts `Asset.stackName`), and this is how a worker re-enters
+// it.
+//
+// BACKWARD COMPATIBILITY: a document written before #1097 carries NO stackName.
+// Such a document must keep behaving exactly as it does today, which means two
+// things, both deliberate:
+//   1. we do NOT call `runWithRequestStack(undefined, fn)` — that would CLEAR an
+//      ambient stack the caller legitimately established (e.g. a pull detached
+//      from a request on a named stack), turning a correct resolution into a
+//      first-listed-stack one. We run `fn` in the caller's own context instead.
+//   2. with no ambient context either (the restart case) resolution falls back
+//      to the first-listed stack — `workspace-stack.ts resolve()`, no-stackName
+//      branch — which IS today's behaviour for these paths.
+// The fallback is reported through `onFallback` at DEBUG level by the caller, so
+// an operator can see that a legacy document took the default resolution without
+// adding noise to a normal run.
+export function runWithPersistedStack<T>(
+  stackName: string | undefined,
+  fn: () => T,
+  onFallback?: () => void
+): T {
+  if (stackName) {
+    return runWithRequestStack(stackName, fn);
+  }
+  onFallback?.();
+  return fn();
+}
+
 // Read the stack name off request headers. Single place the header name is
 // spelled on the data-plane side, mirroring the control-plane read in
 // src/routes/assets.ts (`request.headers['x-stack-name']`).
