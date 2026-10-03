@@ -501,6 +501,113 @@ tr.row-locked td:first-child {
   flex-wrap: wrap;
 }
 
+/* ── Export action (issue #945) ─────────────────────────────────────────────
+   Pinned by docs/design/export-action-states.md. The block gets its own left
+   rule — a different hue from the review block's — so the two action blocks in
+   the detail pane read as separate things; shape and the always-present
+   "Export" heading carry the distinction, so it survives monochrome rendering
+   (WCAG 1.4.1). */
+.export-block {
+  border-left: 3px solid var(--export-accent, #818cf8);
+  padding-left: 10px;
+}
+
+.export-intro,
+.export-role-note {
+  max-width: 60ch;
+}
+
+.export-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 420px;
+}
+
+.export-field-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.export-field-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* The global input rule signals focus with a border colour change only. For the
+   controls added here, add a real offset outline too, so the focus indicator
+   does not depend on distinguishing two similar border hues
+   (WCAG 2.4.7 Focus Visible / 1.4.11 Non-text Contrast). */
+.export-block select:focus-visible,
+.export-block input:focus-visible,
+.export-block button:focus-visible,
+.export-block a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.export-actions {
+  flex-wrap: wrap;
+}
+
+.export-result-link {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.export-result-id {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+/* "Export is not available on this deployment" (design spec §5).
+   Deliberately NOT .msg-error: in this UI red means "that failed, try again",
+   and a 501 is the deployment's standing configuration state, which no retry
+   changes. Also NOT .msg-unrecoverable, whose copy and
+   data-outcome="unrecoverable" semantics belong to the 410 tombstone. Same
+   shape as that component — heavy left rule, uppercase label row — in its own
+   palette, with data-outcome="not-configured" on the element so the two are
+   distinguishable without matching on prose. */
+.msg-not-configured {
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warning);
+}
+
+.msg-not-configured .not-configured-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.msg-not-configured .not-configured-title {
+  display: block;
+  font-weight: 600;
+}
+
+.msg-not-configured .not-configured-body {
+  display: block;
+  margin-top: 4px;
+}
+
+.msg-not-configured .not-configured-detail {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* Read-only tracks panel (issue #902). Sub-group headings sit a step below
    .section-title so "Editorial tracks" / "Source streams" read as parts of the
    Audio section rather than as sections of their own. */

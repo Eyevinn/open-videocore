@@ -76,6 +76,18 @@ import { mountAssetRename } from './asset-rename.js';
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
 
+// Export action (issue #945, broken out of #796): pick a container format,
+// optionally name the output, trigger POST /assets/{id}/export, and read the
+// outcome truthfully. Copy and visual treatment for the in-progress / exported /
+// failed / not-available states come from docs/design/export-action-states.md
+// (issue #911); the honesty guarantee behind the success state comes from
+// docs/findings/export-truthful-status-944.md (issue #944). The module header
+// carries the full contract grounding, including why this action offers NO
+// destination picker: `exportBodySchema` has no destination field, and the named
+// export-destinations registry is consumed only by POST /:id/package and
+// POST /:id/execute.
+import { mountExportAction } from './export-action.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -164,6 +176,18 @@ function canChangeDeleteLock() {
 // read-only (docs/findings/review-state-contract-897.md §4). Client-side mirror
 // only: the 403 is still handled if it arrives.
 function canChangeReviewState() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may export an asset (issue #945). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-92) maps
+// POST -> write, so POST /assets/{id}/export is refused to a `viewer` with 403
+// by `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1773). Client-side mirror only: the 403 is still handled
+// if it arrives.
+function canExportAsset() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -3084,6 +3108,55 @@ async function renderAssetDetailBody(id, bodyEl) {
       canChange: canChangeReviewState(),
       apiFetch: apiFetch,
       showMsg: showMsg,
+    });
+
+    // ── Export to another container format (issue #945) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/export-action.js:
+    //   POST /api/v1/assets/{id}/export — body REQUIRED, exactly
+    //        { targetFormat: 'mp4'|'mkv'|'mov'|'mxf'|'ts' (required),
+    //          outputName?: string(1..256), asVersion?: boolean },
+    //        additionalProperties: false (`exportBodySchema`,
+    //        src/routes/assets.ts:723-730). Responses are exactly
+    //        201 (the new CHILD asset), 400, 404 { error: 'not_found' },
+    //        409 { error: 'no_object' }, 501 { error: 'not_configured' },
+    //        502 { error: 'rewrap_failed', message } — src/routes/assets.ts:5204-5211.
+    //
+    // There is NO destination picker here, and that is a contract fact rather
+    // than an omission: `exportBodySchema` carries no destination field of any
+    // kind, and the named export-destinations registry
+    // (src/routes/export-destinations.ts) is consumed EXCLUSIVELY by the
+    // optional `destination` body property of POST /:id/package and
+    // POST /:id/execute (resolveJobDestination, src/routes/assets.ts:2137-2266).
+    // POST /:id/export always writes to the workspace's own provisioned storage.
+    // docs/design/export-action-states.md §0 establishes this and maps #945's
+    // "no destinations configured" criterion onto the condition this endpoint
+    // can actually produce — its own 501 not_configured, rendered as the §5
+    // "export is not available on this deployment" block.
+    //
+    // The success state may name the output because a 201 is falsifiable: the
+    // job-status allow-list, the object HEAD + non-empty check and only then the
+    // `ready` transition must all agree before it is sent
+    // (docs/findings/export-truthful-status-944.md §6). The failure state links
+    // to nothing, because a failed export leaves the child `failed` with no
+    // `objectKey` and there is no file to offer.
+    //
+    // The path takes the ULID (`asset.id`), which this pane holds even when it
+    // was opened by slug.
+    mountExportAction({
+      assetId: asset.id,
+      sourceName: asset.name,
+      anchorEl: actionsDiv,
+      host: body,
+      canExport: canExportAsset(),
+      apiFetch: apiFetch,
+      wireCopyIds: wireCopyIdButtons,
+      // Open the newly created export in this same pane — the existing
+      // "jump to a related asset" navigation, not a new route.
+      onOpenAsset: function (childId) {
+        void renderAssetDetailBody(childId, bodyEl);
+      },
     });
 
     // ── Delete protection: lock / unlock (issue #895) ──
