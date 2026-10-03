@@ -31,12 +31,18 @@
  * that build cell HTML strings (the existing app.js style) stay consistent.
  */
 
-// Optional column-visibility support (issue #959). The model, the per-operator
-// persistence and the chooser control all live in public/table-columns.js; this
-// primitive only mounts the control and paints the set it is given. Visibility is
-// VIEW state and is deliberately NOT part of the interaction store above: hiding
-// a column must not reset paging, change the sort, or trigger a refetch.
-import { createColumnChooser, normalizeVisibleColumns } from './table-columns.js';
+// Optional column-visibility support (issue #959; extended to every table in
+// #960). The model, the per-operator persistence and the chooser control all live
+// in public/table-columns.js; this primitive only mounts the control and paints
+// the set it is given. Visibility is VIEW state and is deliberately NOT part of
+// the interaction store above: hiding a column must not reset paging, change the
+// sort, or trigger a refetch.
+import {
+  createColumnChooser,
+  normalizeVisibleColumns,
+  resolveInitialColumns,
+  writeStoredColumns,
+} from './table-columns.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 // Mirrors escHtml() in app.js so the two modules encode identically. Kept local
@@ -291,6 +297,87 @@ export function createOpsTableState(config) {
   };
 }
 
+// ─── Column visibility wiring (issue #960) ────────────────────────────────────
+//
+// The chooser landed on the assets table first (#959). Everything about it that
+// is NOT assets-specific lives here now, so jobs and logs (and the next table)
+// opt in with three lines instead of re-deriving the precedence rule, the
+// storage write and the URL mirroring — three places where two tables would
+// otherwise drift apart.
+//
+// What is table-SPECIFIC stays the caller's: its declared `columns`, its
+// `requireAtLeastOne` groups and any `hideable: false` pins (a table's own
+// identifying column is nothing this primitive can guess), its namespace, and
+// what it does with `onChange` (each table owns its own URL sync).
+//
+// createColumnVisibility(options) -> { chooser, choice, getVisible, urlCols }
+//
+// options:
+//   ns                 storage/URL namespace, the SAME one the table passes to
+//                      table-url-state.js so params and preference cannot drift.
+//   columns            the table's declared columns.
+//   urlCols            the decoded `<ns>.cols` value (null/absent = unspecified).
+//   requireAtLeastOne  the table's own "cannot hide them all" groups.
+//   label              chooser button caption (default 'Columns').
+//   win                injectable window (tests / SSR-safety).
+//   stored             optional pre-read stored set; omit it (the normal case) to
+//                      have the stored default for `ns` read from storage.
+//   onChange(keys)     called AFTER the choice is recorded and persisted, so the
+//                      table can mirror it into the URL. Deliberately not a
+//                      refetch hook: the request is unchanged by definition.
+//
+// Returns:
+//   chooser     pass straight through as createOpsTable({ columnChooser }).
+//   choice      live { keys, explicit, source } — `explicit` is false until a
+//               real choice exists (see resolveInitialColumns).
+//   getVisible()  the current set (a copy).
+//   urlCols()   what to hand the URL encoder: the set once a choice exists, else
+//               null, which keeps a default view's query string clean.
+export function createColumnVisibility(options) {
+  const o = options || {};
+  const ns = o.ns;
+  const columns = Array.isArray(o.columns) ? o.columns : [];
+  const groups = Array.isArray(o.requireAtLeastOne) ? o.requireAtLeastOne : [];
+  const win = 'win' in o ? o.win : typeof window !== 'undefined' ? window : undefined;
+
+  // URL -> stored default -> every declared column (one rule, every table).
+  const choice = resolveInitialColumns({
+    urlCols: o.urlCols,
+    // Absent/undefined = read this browser's stored default for `ns`.
+    stored: o.stored,
+    ns,
+    columns,
+    requireAtLeastOne: groups,
+    win,
+  });
+
+  const chooser = {
+    visible: choice.keys,
+    requireAtLeastOne: groups,
+    label: o.label,
+    onChange: function (keys) {
+      choice.keys = keys;
+      // Any operator toggle is an explicit choice — including one that happens to
+      // select everything. "Absent" means "fall back to storage", which is a
+      // different instruction, so it has to be distinguishable.
+      choice.explicit = true;
+      choice.source = 'operator';
+      // This browser's default for the next bare visit. Best-effort: a blocked or
+      // full localStorage costs the operator a remembered preference, never the
+      // table.
+      writeStoredColumns(ns, keys, win);
+      if (typeof o.onChange === 'function') o.onChange(keys);
+    },
+  };
+
+  return {
+    chooser,
+    choice,
+    getVisible: function () { return choice.keys.slice(); },
+    urlCols: function () { return choice.explicit ? choice.keys.slice() : null; },
+  };
+}
+
 // ─── Component factory ────────────────────────────────────────────────────────
 //
 // createOpsTable(config) -> { el, state, render, setStatus, setRows, destroy }
@@ -321,6 +408,13 @@ export function createOpsTableState(config) {
 //   rowKey:     (row) => string   — stable key for a row (defaults to row.id)
 //   emptyText:  shown when a successful load returns zero rows
 //   caption:    optional table title text rendered above the filter bar
+//   onRowsRendered: (tbody) => void — called after EVERY repaint that paints data
+//               rows, so a consumer's per-row wiring (row click, action buttons,
+//               click-to-copy) survives a repaint it did not initiate. Needed
+//               because the column chooser rebuilds the tbody without a fetch
+//               (issue #960): a consumer that only re-wires after its own
+//               setRows() would silently lose its row handlers the first time an
+//               operator hid a column.
 //
 // The component does NOT fetch. The consumer subscribes to `state` (or passes
 // an onChange in config), fetches, then calls setRows()/setStatus() and
@@ -333,6 +427,10 @@ export function createOpsTable(config) {
   const filters = Array.isArray(cfg.filters) ? cfg.filters : [];
   const rowKey = typeof cfg.rowKey === 'function' ? cfg.rowKey : function(r) { return r && r.id; };
   const emptyText = cfg.emptyText || 'No results.';
+  // Per-row wiring hook (issue #960). Invoked after every repaint that produced
+  // data rows — including a column-visibility repaint, which is exactly the one a
+  // consumer cannot see coming.
+  const onRowsRendered = typeof cfg.onRowsRendered === 'function' ? cfg.onRowsRendered : null;
 
   const state = createOpsTableState({
     pagingMode: cfg.pagingMode,
@@ -580,6 +678,11 @@ export function createOpsTable(config) {
       });
       tbody.appendChild(tr);
     });
+
+    // Rows are brand-new elements after every repaint, so any listener the
+    // consumer attached to the previous ones is gone with them. Hand it the fresh
+    // tbody. Synchronous and last, so the consumer sees the finished DOM.
+    if (onRowsRendered) onRowsRendered(tbody);
   }
 
   function fullWidthRow(colspan, className, fill) {

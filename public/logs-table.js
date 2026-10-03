@@ -57,11 +57,25 @@
  * (This gap is logged as backend/OSC friction in the sibling agents repo at
  * docs/osc-feedback/incoming-logs-level-category-filter.md.)
  *
+ * COLUMN VISIBILITY (issue #960, lifted from the assets table's #959). The
+ * operator chooses which of the five declared columns are rendered. This is VIEW
+ * state and touches NO part of the request: buildLogsQuery() below reads only
+ * pageSize / cursor / sort / filters, none of which the chooser writes. Hiding
+ * Time does not stop the table ordering by `order=desc`, and hiding Message does
+ * not drop the `q` param — so which records match, in what order, and where the
+ * cursor sits are unchanged by definition, not by convention. The precedence rule
+ * on load (URL `logs.cols` -> this browser's stored default -> every declared
+ * column), the storage write and the chooser control all come from
+ * createColumnVisibility() in public/ops-ui-table.js; what is declared HERE is
+ * only what is logs-specific — LOGS_COLUMN_KEYS, the pinned Message column, and
+ * the lock rule in LOGS_REQUIRED_COLUMN_GROUPS.
+ *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
  */
 
 import {
+  createColumnVisibility,
   createOpsTable,
   escHtml,
   PAGING_CURSOR,
@@ -99,10 +113,45 @@ export const LOG_LEVELS = Object.freeze(['debug', 'info', 'warn', 'error']);
 
 // Per-table URL-state defaults. Natural order is newest-first (order=desc),
 // matching the endpoint default — the most useful default for operators.
+//
+// `cols` (issue #960) is deliberately left at the shared default of null
+// ("unspecified") rather than at the full column list: that is what lets the
+// encoder tell "this operator chose to show everything" from "this operator has
+// not chosen", and only the former belongs in a shared link.
 const URL_DEFAULTS = Object.freeze({
   sort: { field: SORT_KEY_TIMESTAMP, dir: SORT_DIR.desc },
   size: LOGS_PAGE_SIZE,
 });
+
+// ─── Column visibility contract (issue #960) ─────────────────────────────────
+
+// The declared column keys, in render order. Exported so consumers and tests name
+// the same vocabulary the `logs.cols` URL param and the stored preference use.
+export const LOGS_COLUMN_KEYS = Object.freeze([
+  'timestamp',
+  'level',
+  'category',
+  'message',
+  'seq',
+]);
+
+// This table's OWN "cannot hide" rules, which are NOT the assets table's (issue
+// #960's first note — the primitive takes them as configuration for exactly this
+// reason). A log table has no Actions column and no name: a row is a sentence
+// with a place in a sequence, so the two rules are different in kind.
+//
+// 1. `message` is PINNED (`hideable: false`, declared on the column itself). It
+//    is the only column that carries what the log actually says; a log view
+//    without it is a list of times and levels that tells an operator nothing, and
+//    there is no second column that could stand in for it the way Slug can stand
+//    in for Name on an asset.
+// 2. At least one of Time / Seq stays visible. Both are required fields on the
+//    record, and between them they are how a line gets LOCATED — read against the
+//    time range filter, or cited by its stable `seq` when reporting it. Lose both
+//    and a matching line can be read but never pointed at.
+export const LOGS_REQUIRED_COLUMN_GROUPS = Object.freeze([
+  Object.freeze(['timestamp', 'seq']),
+]);
 
 // ─── Pure param builder (exported for unit testing; no DOM, no fetch) ─────────
 
@@ -254,6 +303,10 @@ function buildColumns(renderCtx) {
     {
       key: 'message',
       label: 'Message',
+      // Pinned against the chooser (issue #960): see rule 1 in
+      // LOGS_REQUIRED_COLUMN_GROUPS above. The chooser disables this toggle and
+      // says why, rather than accepting a hide it would then have to repair.
+      hideable: false,
       render: (r) => '<span class="log-message">' + escHtml(r.message) + '</span>',
     },
     {
@@ -302,6 +355,28 @@ export function createLogsTable(deps) {
 
   const columns = buildColumns({ fmtDate });
 
+  // Column visibility (issue #960) via the shared primitive: it owns the
+  // precedence rule (URL `logs.cols` -> this browser's stored default -> every
+  // declared column), the storage write and the chooser control. This table
+  // supplies only what is ITS own — the column set, the pin/lock rules above, and
+  // the URL sync below.
+  const columnVisibility = createColumnVisibility({
+    ns: LOGS_NS,
+    columns,
+    urlCols: urlState.cols,
+    requireAtLeastOne: LOGS_REQUIRED_COLUMN_GROUPS,
+    label: 'Columns',
+    win,
+    // Mirror the choice into the URL so the view stays shareable. Deliberately
+    // syncUrl() and NOT reload(): the logs query is built from pageSize / cursor /
+    // sort / filters only, so the request would be byte-identical — re-issuing it
+    // would cost a round-trip, a loading flash, and (on a cursor table) a repaint
+    // of a page the operator is in the middle of reading.
+    onChange: function () {
+      syncUrl();
+    },
+  });
+
   const filters = [
     { name: 'from', control: dateFilterControl('from', 'From', initialFilters.from) },
     { name: 'to', control: dateFilterControl('to', 'To', initialFilters.to) },
@@ -318,6 +393,7 @@ export function createLogsTable(deps) {
     initialFilters,
     rowKey: (r) => r && r.seq,
     emptyText: 'No log entries match the current filters.',
+    columnChooser: columnVisibility.chooser,
   });
 
   // Seed the initial cursor from the URL so a shared deep-linked page restores.
@@ -330,6 +406,37 @@ export function createLogsTable(deps) {
   let initialCursorApplied = false;
 
   let loading = false;
+
+  // The cursor the URL currently describes — i.e. the one the request in hand was
+  // made with. Tracked so syncUrl() can be called OUTSIDE a fetch (the column
+  // chooser does exactly that) without dropping the deep-linked page the operator
+  // is on.
+  let urlCursor = null;
+
+  // Mirror the current view into the URL (shared contract) so a refresh/share
+  // reproduces it. Replace (not push) — control changes already re-render and we
+  // do not want a history entry per keystroke or per column toggle.
+  //
+  // `cols` is passed on EVERY call, not only from the chooser: encodeTableState
+  // clears this namespace's params before rewriting them, so omitting it here
+  // would have the first load wipe a `logs.cols` the URL arrived with. It is null
+  // until a choice actually exists, which keeps a default view's URL clean.
+  function syncUrl() {
+    const snap = table.state.getState();
+    return applyTableState(
+      {
+        sort: tableSortToUrlSort(snap.sort),
+        q: snap.filters.q || '',
+        from: snap.filters.from || null,
+        to: snap.filters.to || null,
+        cursor: urlCursor,
+        size: snap.pageSize,
+        cols: columnVisibility.urlCols(),
+      },
+      LOGS_NS,
+      { defaults: URL_DEFAULTS, replace: true, win }
+    );
+  }
 
   async function reload() {
     if (loading) return;
@@ -346,20 +453,9 @@ export function createLogsTable(deps) {
     initialCursorApplied = true;
 
     // 3) Mirror the current interaction state into the URL (shared contract) so a
-    //    refresh/share reproduces the view. Replace (not push) — control changes
-    //    already re-render; we do not want a history entry per keystroke.
-    applyTableState(
-      {
-        sort: tableSortToUrlSort(snap.sort),
-        q: snap.filters.q || '',
-        from: snap.filters.from || null,
-        to: snap.filters.to || null,
-        cursor: effectiveSnap.cursor || null,
-        size: snap.pageSize,
-      },
-      LOGS_NS,
-      { defaults: URL_DEFAULTS, replace: true, win }
-    );
+    //    refresh/share reproduces the view.
+    urlCursor = effectiveSnap.cursor || null;
+    syncUrl();
 
     table.setStatus('loading');
     try {
@@ -394,6 +490,10 @@ export function createLogsTable(deps) {
     destroy: table.destroy,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
+    // Column visibility (issue #960), for consumers/tests that want to read or
+    // drive the chosen set without going through the chooser's DOM.
+    getVisibleColumns: table.getVisibleColumns,
+    setVisibleColumns: table.setVisibleColumns,
     _table: table,
   };
 }
