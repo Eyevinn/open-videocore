@@ -452,7 +452,11 @@ describe('tracks block (pure render)', () => {
     expect(audio).toContain(TRACKS_COPY.audioProbedGroup + ' (2)');
   });
 
-  it('creates no control that could add or remove a track (read-only, #902)', () => {
+  // Issue #939 later gave the AUDIO section opt-in add/remove controls. They are
+  // strictly opt-in: a render that passes no `audioEdit` — which is every call
+  // in this file — must still produce the #902 block, control for control. The
+  // opted-in render is covered in test/tracks-panel-audio-edit.test.ts.
+  it('creates no control at all unless the caller opts in (read-only by default)', () => {
     const root = render({
       video: videoTracksFromAsset(ASSET),
       audioEditorial: EDITORIAL_AUDIO,
