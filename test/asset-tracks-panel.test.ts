@@ -68,19 +68,76 @@
 //     A DIFFERENT record set from the editorial audioTracks: no shared field, no
 //     shared id, so the panel lists them as two separately-counted groups and
 //     never publishes their sum.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// SUBTITLE ADD/REMOVE CONTROLS (issue #904) — CONTRACT GROUNDING
+//
+// Fetched from this repo's generated spec and route source before these tests
+// were written (CLAUDE.md rule 7), never from the issue text. The spec itself is
+// re-read at run time in "contract anchor" below, so a drift between the panel
+// and the published contract fails here rather than in a browser.
+//
+//   ADD — POST /api/v1/assets/{id}/subtitle-tracks
+//     openapi.json .paths["/api/v1/assets/{id}/subtitle-tracks"].post
+//     (no operationId is declared anywhere in this spec);
+//     handler src/routes/assets.ts:5390-5432.
+//     Body REQUIRED, additionalProperties: false — exactly
+//       { language: string 1..64 (required),
+//         format: "vtt"|"srt"|"ttml" (required),
+//         label?: string 1..128, default?: boolean }
+//     (`addSubtitleTrackSchema`, src/routes/assets.ts:829-834, over
+//      `subtitleFormatSchema` :808 / SUBTITLE_FORMATS src/data/asset-repo.ts:449).
+//     The id is server-generated (`randomUUID()` :5408) and the objectKey is
+//     derived by the route (:5411), so neither is accepted from a client.
+//     201 → { track, uploadUrl? } (:5398) — the ONE new track
+//     (`subtitleTrackOutSchema` :810-817), NOT the resulting list. `uploadUrl` is
+//     a presigned PUT (:5413-5416) and is credential-bearing, so it is never
+//     rendered. 404 → { error, message? } for an unknown asset.
+//     APPEND-ONLY: the handler spreads and pushes (:5428) and never clears
+//     `default` on the other tracks, so two default tracks are reachable.
+//
+//   REMOVE — DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId}
+//     handler src/routes/assets.ts:5438-5460. Two path params (:5443), no body
+//     and no query parameter. 204 → empty (`z.null()` :5444), so the resulting
+//     list must be re-read. 404 → { error, message } for an unknown asset AND
+//     for an unknown track id (:5450, :5455) — not machine-distinguishable.
+//     The stored object survives: the handler filters the list (:5453) and
+//     patches `subtitleTracks` alone (:5457, src/data/couch-asset-repo.ts:416-417),
+//     and says so in its own comment (:5434-5435).
+//
+//   REFRESH — GET /api/v1/assets/{id}/tracks → 200 { audioTracks, subtitleTracks },
+//     both required (`tracksSchema` :836-839; handler :5301-5320, repo.get at
+//     :5311). The panel refuses this read at RENDER time (it already holds the
+//     bytes) and needs it after a WRITE, when neither 201 nor 204 carries the
+//     list.
+//
+//   AUTHORISATION — editor|admin only: MATRIX (src/auth/authorize.ts:54-58) gives
+//     write+delete to editor and admin and neither to viewer; methodToAction
+//     (:79-93) maps POST→write and DELETE→delete; both routes sit under the
+//     assets router's authGate (src/routes/assets.ts:1738) and
+//     resourceAuthorizationPreHandler('asset') (:1748). Refusal is 403
+//     `forbidden_insufficient_role` (src/auth/authorize.ts:99). The client flag
+//     is a mirror, so a 403 that arrives anyway is still asserted below.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { renderAssetDetailBody } from '../public/app.js';
 import {
+  SUBTITLE_FORMATS,
   TRACKS_COPY,
   attr,
   bitrateLabel,
+  classifySubtitleTrackError,
   editorialTracksFromAsset,
   mountAssetTracks,
   probedAudioStreamsFromAsset,
   renderTracksBlock,
   resolutionLabel,
   sampleRateLabel,
+  subtitleAddBody,
+  subtitleRemoveConfirmSpec,
+  subtitleTrackName,
   videoTracksFromAsset,
 } from '../public/tracks-panel.js';
 
@@ -647,5 +704,887 @@ describe('asset detail — tracks panel (issue #902)', () => {
     const tracks = container.querySelector('#asset-tracks')!;
     const executions = container.querySelector('#executions-area')!;
     expect(tracks.compareDocumentPosition(executions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subtitle add/remove controls (issue #904)
+//
+// Acceptance criteria under test:
+//   1. An operator can add a subtitle track and remove an existing one.
+//   2. Remove requires an explicit confirmation step.
+//   3. A failed add/remove surfaces an INLINE error and the panel does not
+//      silently drop the change.
+//   4. A successful add/remove refreshes the subtitle section without a full
+//      page reload.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The published spec, re-read at run time so a contract drift fails here. */
+const OPENAPI = JSON.parse(readFileSync(resolve(process.cwd(), 'openapi.json'), 'utf8')) as any;
+const ADD_OP = OPENAPI.paths['/api/v1/assets/{id}/subtitle-tracks'];
+const REMOVE_OP = OPENAPI.paths['/api/v1/assets/{id}/subtitle-tracks/{trackId}'];
+const TRACKS_OP = OPENAPI.paths['/api/v1/assets/{id}/tracks'];
+
+describe('contract anchor — the operations the controls were written against', () => {
+  it('declares an add operation at POST /api/v1/assets/{id}/subtitle-tracks only', () => {
+    expect(Object.keys(ADD_OP)).toEqual(['post']);
+    expect(ADD_OP.post.parameters.map((p: any) => [p.in, p.name])).toEqual([['path', 'id']]);
+    expect(ADD_OP.post.requestBody.required).toBe(true);
+  });
+
+  it('accepts exactly the four body fields the add form offers, and no fifth', () => {
+    const body = ADD_OP.post.requestBody.content['application/json'].schema;
+    expect(Object.keys(body.properties).sort()).toEqual(['default', 'format', 'label', 'language']);
+    expect(body.required.sort()).toEqual(['format', 'language']);
+    // additionalProperties:false — a fifth key would be a 400, so subtitleAddBody
+    // must never invent one (asserted below).
+    expect(body.additionalProperties).toBe(false);
+    expect(body.properties.language.maxLength).toBe(64);
+    expect(body.properties.label.minLength).toBe(1);
+    expect(body.properties.label.maxLength).toBe(128);
+    // Neither id nor objectKey is client-supplied.
+    expect(body.properties.id).toBeUndefined();
+    expect(body.properties.objectKey).toBeUndefined();
+  });
+
+  it('offers exactly the format vocabulary the API accepts', () => {
+    const enumerated = ADD_OP.post.requestBody.content['application/json'].schema.properties.format.enum;
+    expect([...SUBTITLE_FORMATS]).toEqual(enumerated);
+  });
+
+  it('answers the add with the ONE new track, not the resulting list', () => {
+    const created = ADD_OP.post.responses['201'].content['application/json'].schema;
+    expect(Object.keys(created.properties).sort()).toEqual(['track', 'uploadUrl']);
+    expect(created.required).toEqual(['track']);
+    // No array of tracks anywhere in the 201 — hence the follow-up read.
+    expect(created.properties.track.type).toBe('object');
+    expect(ADD_OP.post.responses['404']).toBeTruthy();
+  });
+
+  it('declares a remove operation at DELETE …/{trackId} with two path params and no body', () => {
+    expect(Object.keys(REMOVE_OP)).toEqual(['delete']);
+    expect(REMOVE_OP.delete.parameters.map((p: any) => [p.in, p.name])).toEqual([
+      ['path', 'id'],
+      ['path', 'trackId'],
+    ]);
+    expect(REMOVE_OP.delete.requestBody).toBeUndefined();
+    // 204 carries nothing, so the resulting list must be re-read.
+    expect(REMOVE_OP.delete.responses['204']).toBeTruthy();
+    expect(REMOVE_OP.delete.responses['404']).toBeTruthy();
+  });
+
+  it('exposes the refresh read as GET /api/v1/assets/{id}/tracks with both arrays required', () => {
+    expect(Object.keys(TRACKS_OP)).toEqual(['get']);
+    const ok = TRACKS_OP.get.responses['200'].content['application/json'].schema;
+    expect(ok.required.sort()).toEqual(['audioTracks', 'subtitleTracks']);
+  });
+});
+
+describe('subtitleAddBody — the POST body, mirrored from addSubtitleTrackSchema', () => {
+  it('sends the declared keys and nothing else', () => {
+    const r = subtitleAddBody({ language: 'sv', format: 'vtt', label: 'Swedish', default: true });
+    expect(r).toEqual({
+      ok: true,
+      body: { language: 'sv', format: 'vtt', label: 'Swedish', default: true },
+    });
+  });
+
+  it('drops a blank label instead of sending "" (min(1) would be a refusal)', () => {
+    const r = subtitleAddBody({ language: 'sv', format: 'vtt', label: '   ' }) as any;
+    expect(r.ok).toBe(true);
+    expect('label' in r.body).toBe(false);
+  });
+
+  it('drops an unticked default instead of persisting default:false', () => {
+    // The route assigns `default: request.body.default` straight onto the stored
+    // track (src/routes/assets.ts:5426), so a false would be a flag nobody set.
+    const r = subtitleAddBody({ language: 'sv', format: 'vtt', default: false }) as any;
+    expect(r.ok).toBe(true);
+    expect('default' in r.body).toBe(false);
+    expect(Object.keys(r.body)).toEqual(['language', 'format']);
+  });
+
+  it('trims the language and refuses a blank one', () => {
+    expect((subtitleAddBody({ language: '  sv  ', format: 'srt' }) as any).body.language).toBe('sv');
+    expect(subtitleAddBody({ language: '   ', format: 'srt' })).toEqual({
+      ok: false,
+      message: TRACKS_COPY.errLanguageRequired,
+      field: 'language',
+    });
+    expect((subtitleAddBody({ format: 'srt' }) as any).ok).toBe(false);
+  });
+
+  it('refuses values the schema bounds would reject, before any request is built', () => {
+    expect(subtitleAddBody({ language: 'x'.repeat(65), format: 'vtt' })).toEqual({
+      ok: false,
+      message: TRACKS_COPY.errLanguageTooLong,
+      field: 'language',
+    });
+    expect(subtitleAddBody({ language: 'sv', format: 'vtt', label: 'y'.repeat(129) })).toEqual({
+      ok: false,
+      message: TRACKS_COPY.errLabelTooLong,
+      field: 'label',
+    });
+    expect(subtitleAddBody({ language: 'sv', format: 'dfxp' })).toEqual({
+      ok: false,
+      message: TRACKS_COPY.errFormatUnknown,
+      field: 'format',
+    });
+  });
+});
+
+describe('subtitleTrackName — a name an operator recognises, never an id', () => {
+  it('prefers the editorial label, then the language, then a phrase', () => {
+    expect(subtitleTrackName({ id: 'sub-1', label: 'Swedish', language: 'sv' })).toBe('Swedish');
+    expect(subtitleTrackName({ id: 'sub-2', language: 'en' })).toBe('en');
+    expect(subtitleTrackName({ id: 'sub-3' })).toBe(TRACKS_COPY.unnamedTrack);
+    // The server id is a randomUUID() (src/routes/assets.ts:5408) and is never a name.
+    expect(subtitleTrackName({ id: 'sub-3' })).not.toContain('sub-3');
+  });
+});
+
+describe('classifySubtitleTrackError — what a refusal says inline', () => {
+  it('names the role requirement on 403 (forbidden_insufficient_role)', () => {
+    expect(classifySubtitleTrackError({ status: 403, message: 'forbidden_insufficient_role' }, 'add'))
+      .toEqual({ kind: 'forbidden', message: TRACKS_COPY.errForbidden });
+  });
+
+  it('does not claim to tell an unknown asset from an unknown track on a 404 remove', () => {
+    // src/routes/assets.ts:5450 and :5455 both answer 404 and nothing in the
+    // body separates them.
+    const r = classifySubtitleTrackError({ status: 404 }, 'remove');
+    expect(r).toEqual({ kind: 'not-found', message: TRACKS_COPY.errRemoveNotFound });
+    expect(r.message).toContain('not distinguishable');
+    expect(classifySubtitleTrackError({ status: 404 }, 'add').message).toBe(
+      TRACKS_COPY.errAddNotFound
+    );
+  });
+
+  it('repeats the failure it was given for every other outcome, never swallowing it', () => {
+    expect(classifySubtitleTrackError({ status: 500, message: 'upstream exploded' }, 'add')).toEqual({
+      kind: 'failed',
+      message: TRACKS_COPY.errAddFailedPrefix + 'upstream exploded',
+    });
+    // A network failure carries no status at all.
+    expect(classifySubtitleTrackError(new Error('Failed to fetch') as any, 'remove').message).toBe(
+      TRACKS_COPY.errRemoveFailedPrefix + 'Failed to fetch'
+    );
+    expect(classifySubtitleTrackError(undefined as any, 'add').kind).toBe('failed');
+  });
+});
+
+describe('subtitleRemoveConfirmSpec — what the confirmation step states', () => {
+  const spec = subtitleRemoveConfirmSpec(EDITORIAL_SUBTITLES[0]) as any;
+
+  it('names the subject by its human-readable name, not its id', () => {
+    expect(spec.subject).toBe('Swedish');
+    expect(spec.question).toContain('Swedish');
+    // The track id is a randomUUID() (src/routes/assets.ts:5408) and never names
+    // the subject. It appears only inside the storage object key, which is a
+    // path the operator is being told about, not an identifier being used as a
+    // name.
+    expect(spec.subject).not.toContain('sub-1');
+    expect(spec.question).not.toContain('sub-1');
+    expect(spec.affected.join(' ')).not.toContain('sub-1');
+    expect(spec.unaffected.join(' ')).not.toContain('sub-1');
+  });
+
+  it('states what IS and what is NOT affected, both route-verified', () => {
+    expect(spec.affected.length).toBeGreaterThan(0);
+    expect(spec.unaffected.length).toBeGreaterThan(0);
+    // The handler filters the list and patches subtitleTracks alone
+    // (src/routes/assets.ts:5453, :5457).
+    expect(spec.affected.join(' ')).toContain('subtitle track list');
+    // "Leaves the subtitle object (if any) in storage" (:5434-5435).
+    expect(spec.unaffected.join(' ')).toContain('object storage');
+  });
+
+  it('says whether a stored subtitle file is involved at all', () => {
+    expect(spec.detail).toBe(
+      TRACKS_COPY.confirmFileDetailPrefix + 'ws/subtitles/' + ULID + '/sub-1.vtt'
+    );
+    expect((subtitleRemoveConfirmSpec(EDITORIAL_SUBTITLES[1]) as any).detail).toBe(
+      TRACKS_COPY.confirmNoFileDetail
+    );
+  });
+});
+
+// ─── The controls, driven through the mount ──────────────────────────────────
+
+type ApiCall = { path: string; method: string; body?: any };
+
+/**
+ * Mount an editable panel over a tiny in-memory "server" that behaves like the
+ * two routes: POST appends and answers with the ONE new track, DELETE answers
+ * 204 (null through apiFetch), and GET /tracks answers the resulting lists. The
+ * panel is never handed the resulting list by a write, so every refreshed row
+ * below can only have come from the follow-up read.
+ */
+function mountPanel(
+  host: HTMLElement,
+  options: {
+    subtitles?: any[];
+    canChange?: boolean;
+    withConfirm?: boolean;
+    confirmAnswer?: boolean;
+    failPost?: any;
+    failDelete?: any;
+    failGet?: any;
+    onChanged?: (e: any) => void;
+  } = {}
+) {
+  const server = { subtitles: [...(options.subtitles ?? EDITORIAL_SUBTITLES)] };
+  const calls: ApiCall[] = [];
+
+  const apiFetch = vi.fn(async (path: string, init: any = {}) => {
+    const method = String(init.method || 'GET').toUpperCase();
+    calls.push({ path, method, body: init.body ? JSON.parse(init.body) : undefined });
+    if (method === 'POST') {
+      if (options.failPost) throw options.failPost;
+      const track = { id: 'sub-new', ...JSON.parse(init.body) };
+      server.subtitles = [...server.subtitles, track];
+      return { track };
+    }
+    if (method === 'DELETE') {
+      if (options.failDelete) throw options.failDelete;
+      const id = decodeURIComponent(path.split('/').pop() as string);
+      server.subtitles = server.subtitles.filter((t) => t.id !== id);
+      return null;
+    }
+    if (options.failGet) throw options.failGet;
+    return { audioTracks: EDITORIAL_AUDIO, subtitleTracks: [...server.subtitles] };
+  });
+
+  const confirmModal = vi.fn(async () => options.confirmAnswer !== false);
+
+  const mounted = mountAssetTracks({
+    asset: {
+      id: ULID,
+      technicalMetadata: null,
+      audioTracks: [],
+      subtitleTracks: [...server.subtitles],
+    },
+    host,
+    assetId: ULID,
+    canChange: options.canChange !== false,
+    apiFetch,
+    confirmModal: options.withConfirm === false ? undefined : confirmModal,
+    onChanged: options.onChanged,
+  });
+
+  return { server, calls, apiFetch, confirmModal, mounted };
+}
+
+/** Rows of the subtitle table, found by its caption rather than by position. */
+function subtitleTable(root: ParentNode): HTMLTableElement | null {
+  const tables = Array.from(root.querySelectorAll('#asset-tracks table'));
+  return (tables.find(
+    (t) => (t.querySelector('caption')?.textContent || '') === 'Subtitle tracks'
+  ) ?? null) as HTMLTableElement | null;
+}
+
+function subtitleRows(root: ParentNode): string[][] {
+  const table = subtitleTable(root);
+  if (!table) return [];
+  return Array.from(table.querySelectorAll('tbody tr')).map((tr) =>
+    Array.from(tr.querySelectorAll('td')).map((td) => (td.textContent || '').trim())
+  );
+}
+
+function noticeEl(root: ParentNode): HTMLElement | null {
+  return root.querySelector('[data-subtitle-notice]') as HTMLElement | null;
+}
+
+function addForm(root: ParentNode) {
+  return {
+    language: root.querySelector('#subtitle-add-language') as HTMLInputElement,
+    format: root.querySelector('#subtitle-add-format') as HTMLSelectElement,
+    label: root.querySelector('#subtitle-add-label') as HTMLInputElement,
+    dflt: root.querySelector('#subtitle-add-default') as HTMLInputElement,
+    submit: root.querySelector('#btn-subtitle-add') as HTMLButtonElement,
+  };
+}
+
+function removeButton(root: ParentNode, trackId: string): HTMLButtonElement | null {
+  return root.querySelector('[data-remove-track="' + trackId + '"]') as HTMLButtonElement | null;
+}
+
+describe('subtitle controls — when they are offered at all (issue #904)', () => {
+  let host: HTMLElement;
+
+  beforeEach(() => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+  });
+
+  afterEach(() => {
+    host.remove();
+    vi.restoreAllMocks();
+  });
+
+  it('renders nothing writable unless the caller opts in', () => {
+    // The #902 mount is unchanged: no apiFetch, no control, no listener.
+    mountAssetTracks({ asset: ASSET, host, canChange: true });
+    const block = host.querySelector('#asset-tracks')!;
+    expect(block.querySelectorAll('button, input, select, textarea, form')).toHaveLength(0);
+  });
+
+  it('offers add and remove to a role that holds write+delete', () => {
+    mountPanel(host);
+    const form = addForm(host);
+    expect(form.language).toBeTruthy();
+    expect(form.format).toBeTruthy();
+    expect(form.submit).toBeTruthy();
+    expect(removeButton(host, 'sub-1')).toBeTruthy();
+    expect(removeButton(host, 'sub-2')).toBeTruthy();
+    // The intro no longer promises a read-only panel.
+    expect(host.querySelector('#asset-tracks')!.textContent).toContain(
+      TRACKS_COPY.introEditable
+    );
+  });
+
+  it('offers the three formats the API accepts and no free-text alternative', () => {
+    mountPanel(host);
+    const opts = Array.from(addForm(host).format.options).map((o) => o.value);
+    expect(opts).toEqual([...SUBTITLE_FORMATS]);
+  });
+
+  it('replaces the controls with a role note for a viewer', () => {
+    // MATRIX gives viewer neither write nor delete (src/auth/authorize.ts:54-58).
+    mountPanel(host, { canChange: false });
+    expect(addForm(host).submit).toBeNull();
+    expect(removeButton(host, 'sub-1')).toBeNull();
+    expect(host.querySelector('#asset-tracks')!.textContent).toContain(TRACKS_COPY.viewerNote);
+    // The tracks themselves are still readable — a viewer holds `read`.
+    expect(subtitleRows(host)).toHaveLength(2);
+  });
+
+  it('renders NO remove control when no confirmation gate was supplied', () => {
+    // AC2 structurally: without a confirm function there is no button, so there
+    // is no code path to an unconfirmed DELETE.
+    mountPanel(host, { withConfirm: false });
+    expect(removeButton(host, 'sub-1')).toBeNull();
+    expect(subtitleTable(host)!.querySelectorAll('thead th')).toHaveLength(6);
+    // Add is unaffected: it is not the destructive half.
+    expect(addForm(host).submit).toBeTruthy();
+  });
+
+  it('issues no request at all while merely rendering the controls', () => {
+    const { apiFetch } = mountPanel(host);
+    expect(apiFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('adding a subtitle track (issue #904 AC1/AC4)', () => {
+  let host: HTMLElement;
+  let marker: HTMLElement;
+
+  beforeEach(() => {
+    host = document.createElement('div');
+    // A sibling that a full page reload would take with it.
+    marker = document.createElement('div');
+    marker.id = 'reload-marker';
+    document.body.appendChild(host);
+    document.body.appendChild(marker);
+  });
+
+  afterEach(() => {
+    host.remove();
+    marker.remove();
+    vi.restoreAllMocks();
+  });
+
+  it('POSTs exactly the declared body to the subtitle-tracks path', async () => {
+    const { calls } = mountPanel(host);
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.format.value = 'ttml';
+    form.label.value = 'German';
+    form.dflt.checked = true;
+    form.submit.click();
+    await settle();
+
+    expect(calls[0]).toEqual({
+      path: '/assets/' + ULID + '/subtitle-tracks',
+      method: 'POST',
+      body: { language: 'de', format: 'ttml', label: 'German', default: true },
+    });
+  });
+
+  it('re-reads the list from the server and refreshes the section in place', async () => {
+    const { calls } = mountPanel(host);
+    const before = host.querySelector('#asset-tracks');
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.format.value = 'srt';
+    form.submit.click();
+    await settle();
+
+    // The 201 carries one track, never the list (openapi 201 schema above), so
+    // the refreshed rows can only have come from GET /tracks.
+    expect(calls[1]).toEqual({
+      path: '/assets/' + ULID + '/tracks',
+      method: 'GET',
+      body: undefined,
+    });
+    const rows = subtitleRows(host);
+    expect(rows).toHaveLength(3);
+    expect(rows[2][0]).toBe('de');
+    expect(rows[2][2]).toBe('srt');
+
+    // Refreshed WITHOUT a reload: same document, same host, one block, swapped
+    // in place — and the sibling a reload would have destroyed is still here.
+    expect(document.getElementById('reload-marker')).not.toBeNull();
+    expect(host.querySelectorAll('#asset-tracks')).toHaveLength(1);
+    expect(host.querySelector('#asset-tracks')).not.toBe(before);
+    expect(host.querySelector('#asset-tracks')!.parentNode).toBe(host);
+  });
+
+  it('adopts the audio half of the refresh read too, so both lists share one read', async () => {
+    // tracksSchema returns BOTH arrays as required (src/routes/assets.ts:836-839)
+    // and the response is authoritative for the pair — dropping the audio half
+    // would leave two lists on screen that were read at different times. The
+    // panel mounts with no editorial audio; the refresh read has two.
+    mountPanel(host);
+    // Neither editorial nor probed audio on the mounted body, so the whole kind
+    // is in its empty state.
+    expect(host.querySelector('[data-empty="audio-tracks"]')).not.toBeNull();
+
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.submit.click();
+    await settle();
+
+    expect(host.querySelector('#asset-tracks')!.textContent).toContain(
+      TRACKS_COPY.audioEditorialGroup + ' (2)'
+    );
+    expect(host.querySelector('#asset-tracks')!.textContent).toContain('Swedish 2.0');
+  });
+
+  it('reports the outcome inline and keeps the count in the heading honest', async () => {
+    mountPanel(host);
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.submit.click();
+    await settle();
+
+    const notice = noticeEl(host)!;
+    expect(notice.textContent).toBe(TRACKS_COPY.addedOne);
+    expect(notice.className).toContain('msg-success');
+    expect(notice.getAttribute('role')).toBe('alert');
+    expect(host.querySelector('#asset-tracks')!.textContent).toContain(
+      TRACKS_COPY.subtitleHeading + ' (3)'
+    );
+  });
+
+  it('tells the caller a write landed', async () => {
+    const onChanged = vi.fn();
+    mountPanel(host, { onChanged });
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.submit.click();
+    await settle();
+
+    expect(onChanged).toHaveBeenCalledTimes(1);
+    expect(onChanged.mock.calls[0][0].op).toBe('add');
+  });
+});
+
+describe('removing a subtitle track (issue #904 AC1/AC2/AC4)', () => {
+  let host: HTMLElement;
+
+  beforeEach(() => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+  });
+
+  afterEach(() => {
+    host.remove();
+    vi.restoreAllMocks();
+  });
+
+  it('asks for confirmation BEFORE issuing anything, naming the track', async () => {
+    const { calls, confirmModal } = mountPanel(host);
+    removeButton(host, 'sub-1')!.click();
+    await settle();
+
+    expect(confirmModal).toHaveBeenCalledTimes(1);
+    const spec = confirmModal.mock.calls[0][0] as any;
+    expect(spec.subject).toBe('Swedish');
+    expect(spec.affected.length).toBeGreaterThan(0);
+    expect(spec.unaffected.length).toBeGreaterThan(0);
+    expect(calls[0].method).toBe('DELETE');
+  });
+
+  it('sends DELETE to the track path and refreshes the section in place', async () => {
+    const { calls } = mountPanel(host);
+    removeButton(host, 'sub-1')!.click();
+    await settle();
+
+    expect(calls[0]).toEqual({
+      path: '/assets/' + ULID + '/subtitle-tracks/sub-1',
+      method: 'DELETE',
+      body: undefined,
+    });
+    // 204 carries nothing, so the remaining rows come from the follow-up read.
+    expect(calls[1].method).toBe('GET');
+    expect(calls[1].path).toBe('/assets/' + ULID + '/tracks');
+
+    const rows = subtitleRows(host);
+    expect(rows).toHaveLength(1);
+    expect(rows[0][5]).toBe('sub-2');
+    expect(host.querySelectorAll('#asset-tracks')).toHaveLength(1);
+    expect(noticeEl(host)!.textContent).toBe(TRACKS_COPY.removedOne);
+  });
+
+  it('sends NOTHING when the confirmation is dismissed', async () => {
+    const { calls, apiFetch } = mountPanel(host, { confirmAnswer: false });
+    removeButton(host, 'sub-1')!.click();
+    await settle();
+
+    expect(apiFetch).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+    // The list is exactly as it was, and nothing is reported as having happened.
+    expect(subtitleRows(host)).toHaveLength(2);
+    expect(noticeEl(host)!.style.display).toBe('none');
+  });
+
+  it('drops the last track to the explicit empty state rather than an empty table', async () => {
+    mountPanel(host, { subtitles: [EDITORIAL_SUBTITLES[1]] });
+    removeButton(host, 'sub-2')!.click();
+    await settle();
+
+    expect(subtitleTable(host)).toBeNull();
+    expect(host.querySelector('[data-empty="subtitle-tracks"]')!.textContent).toContain(
+      TRACKS_COPY.subtitleEmpty
+    );
+  });
+});
+
+describe('failed writes surface inline and change nothing (issue #904 AC3)', () => {
+  let host: HTMLElement;
+
+  beforeEach(() => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+  });
+
+  afterEach(() => {
+    host.remove();
+    vi.restoreAllMocks();
+  });
+
+  function failure(status: number, message: string) {
+    const err: any = new Error(message);
+    err.status = status;
+    return err;
+  }
+
+  it('refuses an unsendable add before the network, keeping what was typed', async () => {
+    const { apiFetch } = mountPanel(host);
+    const form = addForm(host);
+    form.label.value = 'German';
+    form.submit.click();
+    await settle();
+
+    expect(apiFetch).not.toHaveBeenCalled();
+    expect(noticeEl(host)!.textContent).toBe(TRACKS_COPY.errLanguageRequired);
+    expect(noticeEl(host)!.className).toContain('msg-error');
+    expect(form.label.value).toBe('German');
+    expect(document.activeElement).toBe(form.language);
+  });
+
+  it('reports a rejected add inline and does not show the track as added', async () => {
+    mountPanel(host, { failPost: failure(500, 'upstream exploded') });
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.submit.click();
+    await settle();
+
+    expect(noticeEl(host)!.textContent).toBe(
+      TRACKS_COPY.errAddFailedPrefix + 'upstream exploded'
+    );
+    expect(noticeEl(host)!.className).toContain('msg-error');
+    // Not optimistically appended, and the typed values survive for a retry.
+    expect(subtitleRows(host)).toHaveLength(2);
+    expect(addForm(host).language.value).toBe('de');
+    expect(addForm(host).submit.disabled).toBe(false);
+    expect(addForm(host).submit.textContent).toBe(TRACKS_COPY.btnAdd);
+  });
+
+  it('reports a rejected remove inline and leaves the row in place', async () => {
+    const { calls } = mountPanel(host, { failDelete: failure(404, 'subtitle track not found') });
+    removeButton(host, 'sub-1')!.click();
+    await settle();
+
+    expect(noticeEl(host)!.textContent).toBe(TRACKS_COPY.errRemoveNotFound);
+    expect(subtitleRows(host)).toHaveLength(2);
+    // No refresh was issued: nothing changed, so there is nothing to re-read.
+    expect(calls.map((c) => c.method)).toEqual(['DELETE']);
+    expect(removeButton(host, 'sub-1')!.disabled).toBe(false);
+    expect(removeButton(host, 'sub-1')!.textContent).toBe(TRACKS_COPY.btnRemove);
+  });
+
+  it('names the role requirement when the server answers 403', async () => {
+    mountPanel(host, { failPost: failure(403, 'forbidden_insufficient_role') });
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.submit.click();
+    await settle();
+
+    expect(noticeEl(host)!.textContent).toBe(TRACKS_COPY.errForbidden);
+  });
+
+  it('never reports a saved change as unsaved when only the re-read failed', async () => {
+    const { server } = mountPanel(host, { failGet: failure(503, 'unavailable') });
+    const form = addForm(host);
+    form.language.value = 'de';
+    form.submit.click();
+    await settle();
+
+    // The POST landed — the "server" holds three tracks.
+    expect(server.subtitles).toHaveLength(3);
+    const notice = noticeEl(host)!;
+    expect(notice.textContent).toBe(TRACKS_COPY.refreshFailed);
+    expect(notice.className).toContain('msg-info');
+    expect(notice.textContent).toContain('was saved');
+  });
+});
+
+describe('subtitle controls — accessibility (WCAG 2.1 AA)', () => {
+  let host: HTMLElement;
+
+  beforeEach(() => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+  });
+
+  afterEach(() => {
+    host.remove();
+    vi.restoreAllMocks();
+  });
+
+  it('binds every field to a visible label and keeps its help text programmatic', () => {
+    mountPanel(host);
+    const form = addForm(host);
+    [form.language, form.format, form.label, form.dflt].forEach((input) => {
+      const label = host.querySelector('label[for="' + input.id + '"]');
+      expect(label, input.id).toBeTruthy();
+      expect((label!.textContent || '').trim().length).toBeGreaterThan(0);
+    });
+    const describedBy = form.language.getAttribute('aria-describedby')!;
+    expect(host.querySelector('#' + describedBy)!.textContent).toBe(TRACKS_COPY.helpLanguage);
+  });
+
+  it('distinguishes the per-row Remove controls by accessible name', () => {
+    mountPanel(host);
+    expect(removeButton(host, 'sub-1')!.getAttribute('aria-label')).toBe(
+      TRACKS_COPY.btnRemove + ' subtitle track Swedish'
+    );
+    // sub-2 has no label, so the language names it — never the opaque id.
+    expect(removeButton(host, 'sub-2')!.getAttribute('aria-label')).toBe(
+      TRACKS_COPY.btnRemove + ' subtitle track en'
+    );
+  });
+
+  it('announces every outcome through one live region', () => {
+    mountPanel(host);
+    const notices = host.querySelectorAll('[data-subtitle-notice]');
+    expect(notices).toHaveLength(1);
+    expect(notices[0].getAttribute('role')).toBe('alert');
+  });
+
+  it('keeps the actions column headed and scoped like every other column', () => {
+    mountPanel(host);
+    const ths = Array.from(subtitleTable(host)!.querySelectorAll('thead th'));
+    expect(ths.map((t) => t.textContent)).toEqual([
+      'Language',
+      'Label',
+      'Format',
+      'Default',
+      'Object key',
+      'Track ID',
+      TRACKS_COPY.actionsColumn,
+    ]);
+    expect(ths.every((t) => t.getAttribute('scope') === 'col')).toBe(true);
+  });
+
+  it('renders a server-sent value as text, never as markup', () => {
+    mountPanel(host, {
+      subtitles: [{ id: 'sub-x', language: 'sv', format: 'vtt', label: '<img src=x onerror=1>' }],
+    });
+    const table = subtitleTable(host)!;
+    expect(table.querySelector('img')).toBeNull();
+    expect(table.textContent).toContain('<img src=x onerror=1>');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Detail view integration — the real renderer, the real confirmation dialog
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('asset detail — subtitle add/remove end to end (issue #904)', () => {
+  let container: HTMLElement;
+
+  /** Routes the real apiFetch URLs, mutating an in-memory subtitle list. */
+  function writableFetch(subtitles: any[]) {
+    const state = { subtitles: [...subtitles] };
+    const spy = vi.fn(async (url: string, init: any = {}) => {
+      const path = String(url);
+      const method = String(init?.method || 'GET').toUpperCase();
+      if (/\/subtitle-tracks$/.test(path) && method === 'POST') {
+        const body = JSON.parse(init.body);
+        const track = { id: 'sub-new', ...body };
+        state.subtitles = [...state.subtitles, track];
+        return json({ track }, 201);
+      }
+      if (/\/subtitle-tracks\/[^/]+$/.test(path) && method === 'DELETE') {
+        const id = decodeURIComponent(path.split('/').pop() as string);
+        state.subtitles = state.subtitles.filter((t) => t.id !== id);
+        return new Response(null, { status: 204 });
+      }
+      if (/\/tracks$/.test(path)) {
+        return json({ audioTracks: EDITORIAL_AUDIO, subtitleTracks: state.subtitles });
+      }
+      if (/\/review-state$/.test(path)) {
+        return json({ reviewState: 'draft', allowedTransitions: ['in-review'] });
+      }
+      if (/\/lock$/.test(path)) return json(ASSET);
+      if (/\/delivery$/.test(path)) return json({ urls: {} });
+      if (/\/executions$/.test(path)) return json([]);
+      if (/\/profiles$/.test(path)) return json({ profiles: ['program'] });
+      if (/\/files$/.test(path)) return json({ files: [], fileGroups: [] });
+      if (/\/assets\/[^/?]+(?:\?|$)/.test(path)) {
+        return json({ ...ASSET, subtitleTracks: state.subtitles });
+      }
+      return json({}, 200);
+    });
+    return { spy, state };
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+  });
+
+  afterEach(() => {
+    container.remove();
+    document.querySelectorAll('.modal-backdrop').forEach((el) => el.remove());
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('still issues no track request while rendering the detail view', async () => {
+    const { spy } = writableFetch(EDITORIAL_SUBTITLES);
+    vi.stubGlobal('fetch', spy);
+
+    await renderAssetDetailBody(ULID, container);
+    await settle();
+
+    const calls = spy.mock.calls.map((c) => String(c[0]));
+    expect(calls.some((u) => /\/tracks$/.test(u))).toBe(false);
+    expect(calls.some((u) => /subtitle-tracks/.test(u))).toBe(false);
+    // …and the controls are nonetheless there for the default (admin) role.
+    expect(container.querySelector('#btn-subtitle-add')).not.toBeNull();
+    expect(container.querySelector('[data-remove-track="sub-1"]')).not.toBeNull();
+  });
+
+  it('adds a track through the real API path and refreshes without a reload', async () => {
+    const { spy, state } = writableFetch(EDITORIAL_SUBTITLES);
+    vi.stubGlobal('fetch', spy);
+
+    await renderAssetDetailBody(ULID, container);
+    await settle();
+
+    const kvBefore = container.querySelector('.kv-grid');
+    const form = addForm(container);
+    form.language.value = 'de';
+    form.format.value = 'vtt';
+    form.submit.click();
+    await settle();
+
+    const writes = spy.mock.calls.filter((c) => String((c[1] as any)?.method) === 'POST');
+    expect(writes).toHaveLength(1);
+    expect(String(writes[0][0])).toBe(
+      window.location.origin + '/api/v1/assets/' + ULID + '/subtitle-tracks'
+    );
+    expect(JSON.parse(String((writes[0][1] as any).body))).toEqual({
+      language: 'de',
+      format: 'vtt',
+    });
+    expect(state.subtitles).toHaveLength(3);
+
+    const rows = subtitleRows(container);
+    expect(rows).toHaveLength(3);
+    expect(rows[2][0]).toBe('de');
+    // Nothing else on the detail view was torn down and rebuilt.
+    expect(container.querySelector('.kv-grid')).toBe(kvBefore);
+  });
+
+  it('removes a track only after the house confirmation dialog is accepted', async () => {
+    const { spy, state } = writableFetch(EDITORIAL_SUBTITLES);
+    vi.stubGlobal('fetch', spy);
+
+    await renderAssetDetailBody(ULID, container);
+    await settle();
+
+    const deletes = () => spy.mock.calls.filter((c) => String((c[1] as any)?.method) === 'DELETE');
+
+    // 1. The dialog opens and NOTHING is sent yet.
+    (container.querySelector('[data-remove-track="sub-1"]') as HTMLButtonElement).click();
+    await settle(5);
+    const dialog = document.querySelector('.confirm-dialog') as HTMLElement;
+    expect(dialog).toBeTruthy();
+    expect(dialog.textContent).toContain('Swedish');
+    expect(dialog.querySelector('.confirm-affected')).toBeTruthy();
+    expect(dialog.querySelector('.confirm-unaffected')).toBeTruthy();
+    expect(deletes()).toHaveLength(0);
+
+    // 2. Dismissing it sends nothing and leaves the row.
+    (dialog.querySelector('.confirm-cancel') as HTMLButtonElement).click();
+    await settle();
+    expect(deletes()).toHaveLength(0);
+    expect(subtitleRows(container)).toHaveLength(2);
+
+    // 3. Accepting it sends the DELETE and refreshes the section in place.
+    (container.querySelector('[data-remove-track="sub-1"]') as HTMLButtonElement).click();
+    await settle(5);
+    (document.querySelector('.confirm-accept') as HTMLButtonElement).click();
+    await settle();
+
+    expect(deletes()).toHaveLength(1);
+    expect(String(deletes()[0][0])).toBe(
+      window.location.origin + '/api/v1/assets/' + ULID + '/subtitle-tracks/sub-1'
+    );
+    expect(state.subtitles.map((t) => t.id)).toEqual(['sub-2']);
+    expect(subtitleRows(container)).toHaveLength(1);
+    expect(container.querySelectorAll('#asset-tracks')).toHaveLength(1);
+  });
+
+  it('surfaces a server refusal inline on the panel, never as an alert', async () => {
+    const { spy } = writableFetch(EDITORIAL_SUBTITLES);
+    const failing = vi.fn(async (url: string, init: any = {}) => {
+      if (/\/subtitle-tracks$/.test(String(url)) && String(init?.method) === 'POST') {
+        return json({ error: 'not_found', message: 'asset not found' }, 404);
+      }
+      return spy(url, init);
+    });
+    vi.stubGlobal('fetch', failing);
+    const alertSpy = vi.fn();
+    vi.stubGlobal('alert', alertSpy);
+
+    await renderAssetDetailBody(ULID, container);
+    await settle();
+
+    const form = addForm(container);
+    form.language.value = 'de';
+    form.submit.click();
+    await settle();
+
+    expect(noticeEl(container)!.textContent).toBe(TRACKS_COPY.errAddNotFound);
+    expect(alertSpy).not.toHaveBeenCalled();
+    // The change was NOT silently dropped: the list still shows what the server has.
+    expect(subtitleRows(container)).toHaveLength(2);
   });
 });

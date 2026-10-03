@@ -529,6 +529,71 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* Subtitle add/remove controls (issue #904). The only write surface in the
+   tracks panel; the video and audio sections stay read-only, so the editable
+   section is set apart by its own heading and form row rather than by restyling
+   the whole block. */
+
+/* Same step as .tracks-group-title but without a count: "Add a subtitle track"
+   heads a form, and there is nothing to count. */
+.tracks-group-title-plain {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 14px 0 6px;
+}
+
+.subtitle-add {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 4px;
+}
+
+/* Wraps on a narrow pane rather than overflowing: the four fields plus the
+   button are a single logical row, not a fixed-width one. */
+.subtitle-add-row {
+  align-items: flex-end;
+}
+
+.subtitle-add-row input[type="text"] {
+  min-width: 140px;
+}
+
+/* Field help sits under its input, quieter than the value it explains. */
+.tracks-field-help {
+  font-size: 11px;
+  max-width: 260px;
+}
+
+/* The default-track checkbox: label and box on one line, so the box is not
+   stranded above its own text. */
+.subtitle-default-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.subtitle-default-label input {
+  cursor: pointer;
+}
+
+/* Per-row Remove cell: keep the control tight against its row and stop the
+   column stretching with the table. */
+.tracks-row-actions {
+  white-space: nowrap;
+  width: 1%;
+}
+
+/* One inline outcome region per subtitle section. Reuses .msg/.msg-error etc.
+   for colour, so a failure here looks like a failure anywhere else in the UI. */
+.subtitle-notice {
+  margin-top: 10px;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
