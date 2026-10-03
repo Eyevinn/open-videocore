@@ -45,6 +45,10 @@ describe('schema constants', () => {
       sort: 'sort',
       status: 'status',
       q: 'q',
+      // Structured asset filters (issue #947). `tags` is a leaf param; `meta` is
+      // the PREFIX for the dynamic `<ns>.meta.<key>=<value>` pairs.
+      tags: 'tags',
+      meta: 'meta',
       from: 'from',
       to: 'to',
       page: 'page',
@@ -70,6 +74,10 @@ describe('decodeTableState — defaults & absent params', () => {
       sort: null,
       status: [],
       q: '',
+      // Structured asset filters (issue #947): an empty token set and an empty
+      // pair map both mean "no filter", unlike `cols` below.
+      tags: [],
+      meta: {},
       from: null,
       to: null,
       page: 1,
@@ -153,6 +161,101 @@ describe('decodeTableState — filters', () => {
 
   it('drops an unparseable date back to the default', () => {
     expect(decodeTableState('jobs.from=not-a-date', 'jobs').from).toBeNull();
+  });
+});
+
+// ─── tags + metadata filters (issue #947) ────────────────────────────────────
+
+describe('tags filter param', () => {
+  it('parses a comma-separated tag set, trimmed and de-duped', () => {
+    expect(decodeTableState('assets.tags=news,%20sports%20,news', 'assets').tags).toEqual([
+      'news',
+      'sports',
+    ]);
+  });
+
+  it('treats a blank tags param as no filter', () => {
+    expect(decodeTableState('assets.tags=', 'assets').tags).toEqual([]);
+    expect(decodeTableState('assets.tags=%20,%20', 'assets').tags).toEqual([]);
+  });
+
+  it('round-trips through encode as one comma-separated param', () => {
+    const p = encodeTableState({ tags: ['news', 'sports'] }, 'assets');
+    expect(p.get('assets.tags')).toBe('news,sports');
+    expect(decodeTableState('?' + p.toString(), 'assets').tags).toEqual(['news', 'sports']);
+  });
+
+  it('writes nothing when the tag set is empty', () => {
+    expect(encodeTableState({ tags: [] }, 'assets').get('assets.tags')).toBeNull();
+  });
+
+  it('bounds a hostile tag list rather than walking it', () => {
+    const many = Array.from({ length: 100 }, (_, i) => 't' + i);
+    expect(decodeTableState('assets.tags=' + many.join(','), 'assets').tags).toHaveLength(32);
+    expect(decodeTableState('assets.tags=' + 'x'.repeat(500), 'assets').tags).toEqual([]);
+  });
+});
+
+describe('metadata filter params (dynamic `<ns>.meta.<key>`)', () => {
+  it('collects every namespaced pair into one object', () => {
+    const s = decodeTableState(
+      'assets.meta.genre=documentary&assets.meta.language=sv&other.meta.x=y',
+      'assets',
+    );
+    expect(s.meta).toEqual({ genre: 'documentary', language: 'sv' });
+  });
+
+  it('ignores params outside the namespace and a prefix with no key', () => {
+    const s = decodeTableState('jobs.meta.genre=doc&assets.meta.=orphan', 'assets');
+    expect(s.meta).toEqual({});
+  });
+
+  it('keeps the first value for a repeated key, like the server does', () => {
+    const s = decodeTableState('assets.meta.genre=first&assets.meta.genre=second', 'assets');
+    expect(s.meta).toEqual({ genre: 'first' });
+  });
+
+  it('drops a pair with an empty value instead of filtering for empty string', () => {
+    expect(decodeTableState('assets.meta.genre=', 'assets').meta).toEqual({});
+  });
+
+  it('round-trips through encode as one param per pair', () => {
+    const p = encodeTableState({ meta: { genre: 'documentary', language: 'sv' } }, 'assets');
+    expect(p.get('assets.meta.genre')).toBe('documentary');
+    expect(p.get('assets.meta.language')).toBe('sv');
+    expect(decodeTableState('?' + p.toString(), 'assets').meta).toEqual({
+      genre: 'documentary',
+      language: 'sv',
+    });
+  });
+
+  it('survives a value containing the typed grammar separators', () => {
+    const p = encodeTableState({ meta: { note: 'a,b=c' } }, 'assets');
+    expect(decodeTableState('?' + p.toString(), 'assets').meta).toEqual({ note: 'a,b=c' });
+  });
+
+  it('clears stale pairs when re-encoding into a live URL', () => {
+    const into = new URLSearchParams('assets.meta.genre=documentary&unrelated=keep');
+    const out = encodeTableState({ meta: { language: 'sv' } }, 'assets', undefined, into);
+    expect(out.get('assets.meta.genre')).toBeNull();
+    expect(out.get('assets.meta.language')).toBe('sv');
+    expect(out.get('unrelated')).toBe('keep');
+  });
+
+  it('bounds a hostile pair list', () => {
+    const many = Array.from({ length: 100 }, (_, i) => 'assets.meta.k' + i + '=v').join('&');
+    expect(Object.keys(decodeTableState(many, 'assets').meta)).toHaveLength(32);
+  });
+
+  it('normalizes a non-object metadata filter to no filter', () => {
+    expect(normalizeTableState({ meta: 'genre=documentary' as unknown as object }).meta).toEqual({});
+    expect(normalizeTableState({ meta: ['genre'] as unknown as object }).meta).toEqual({});
+  });
+
+  it('coerces a numeric pair value, since a query string only carries text', () => {
+    expect(normalizeTableState({ meta: { season: 2 } as unknown as object }).meta).toEqual({
+      season: '2',
+    });
   });
 });
 
