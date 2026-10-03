@@ -1,6 +1,7 @@
 import {
   Context,
   getInstance,
+  listInstances,
   removeInstance
 } from '@osaas/client-core';
 import {
@@ -19,9 +20,10 @@ export type StoredService = { serviceId: string; instanceName: string };
 
 // Per-service outcome of a teardown attempt.
 //   removed    — instance existed and was removed this call
-//   not_found  — instance did not exist (already gone / never created) — this
-//                is a success from an idempotency standpoint
-//   failed     — the OSC call errored; the operation should be retried
+//   not_found  — instance was CONFIRMED absent (already gone / never created) —
+//                this is a success from an idempotency standpoint
+//   failed     — the OSC call errored, OR absence could not be confirmed; the
+//                operation should be retried (issue #1039)
 export type TeardownStatus = 'removed' | 'not_found' | 'failed';
 
 export type ServiceTeardownResult = {
@@ -49,9 +51,53 @@ export type StackTeardownResult = {
   services: ServiceTeardownResult[];
 };
 
+// Confirm an instance really is gone, rather than inferring it from a probe
+// that cannot tell "absent" from "could not check" (issue #1039).
+//
+// CONTRACT (verified in node_modules/@osaas/client-core/lib/core.js, SDK
+// 0.24.0):
+//   - `getInstance(context, serviceId, name, token)` (core.js:127-150) catches
+//     the instance GET and rethrows ONLY when the error is a `FetchError` with
+//     `httpCode === 401`; it returns `undefined` on 404 and then FALLS THROUGH
+//     to a bare `return undefined` for every other error. `createFetch`
+//     (lib/fetch.js:38-44) turns a rejected `fetch` — network fault, DNS
+//     failure, timeout — into `new FetchError({ message })` with NO httpCode,
+//     and a 5xx into a `FetchError` with that httpCode. All of those reach the
+//     caller as `undefined`, indistinguishable from a genuine 404.
+//   - `listInstances(context, serviceId, token)` (core.js:160-170) has NO catch
+//     at all: any transport or HTTP error rejects, and on success it resolves
+//     the raw JSON array from the instances endpoint whose elements carry
+//     `name`. That makes it a probe that can FAIL, which is exactly what is
+//     needed to tell absence from an unreachable control plane.
+//
+// Resolves true only when the instance list was read successfully and does not
+// contain `name`. Throws when the absence could not be established — the caller
+// turns that into `failed` so the config is kept and the teardown is retried.
+export async function confirmInstanceAbsent(
+  osc: Context,
+  serviceId: string,
+  name: string,
+  sat: string
+): Promise<boolean> {
+  const instances = await listInstances(osc, serviceId, sat);
+  if (!Array.isArray(instances)) {
+    throw new Error(
+      `could not confirm instance "${name}" of ${serviceId} is gone: ` +
+        'unexpected instance list payload'
+    );
+  }
+  return !instances.some(
+    (entry) => (entry as { name?: unknown } | null)?.name === name
+  );
+}
+
 // Tear down a single OSC service instance, tolerating the already-removed case.
-// We probe with getInstance first (returns undefined on 404) so a retry of a
-// partially-completed teardown reports not_found rather than re-erroring.
+// We probe with getInstance first; because that probe reports EVERY error as
+// `undefined` (see confirmInstanceAbsent), an empty probe result is re-checked
+// against the instance list before it is believed. Only a confirmed absence is
+// not_found, so a retry of a partially-completed teardown still converges while
+// a teardown attempted during a network fault or a 5xx reports failed — keeping
+// the stored config and surfacing the instance as a leftover (issue #1039).
 async function teardownService(
   osc: Context,
   service: StackService,
@@ -62,10 +108,13 @@ async function teardownService(
     const sat = await osc.getServiceAccessToken(serviceId);
 
     const existing = await getInstance(osc, serviceId, name, sat);
-    if (!existing) {
+    if (!existing && (await confirmInstanceAbsent(osc, serviceId, name, sat))) {
       return { serviceId, role, status: 'not_found' };
     }
 
+    // Either the probe returned the instance, or the probe came back empty but
+    // the list says the instance is still there (the empty probe was a swallowed
+    // error). Both mean there is something to remove.
     await removeInstance(osc, serviceId, name, sat);
     return { serviceId, role, status: 'removed' };
   } catch (err) {
@@ -131,7 +180,8 @@ function aggregate(
 // STACK_SERVICES list (legacy / fallback path). Failures do not abort the run:
 // every service is attempted so a single transient error does not strand the
 // rest of the stack. The whole operation is safe to retry (idempotent) because
-// each step probes for existence first and treats a missing instance as success.
+// each step probes for existence first and treats a CONFIRMED-missing instance
+// as success (an unconfirmable probe is a failure, not a success — issue #1039).
 export async function deprovisionStack(
   osc: Context,
   name: string
