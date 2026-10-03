@@ -347,7 +347,7 @@ Access Token as the OSC access token. Generate strong passwords for
     <tr><td><code>OSC_ACCESS_TOKEN</code></td><td>Yes</td><td>Injected</td><td>Personal Access Token. Injected automatically at deploy time on OSC.</td></tr>
     <tr><td><code>PARAMETER_STORE_API_KEY</code></td><td>Yes</td><td>Yes</td><td>Config API key of the connected parameter store.</td></tr>
     <tr><td><code>PARAMETER_STORE_INSTANCE_NAME</code></td><td>Yes</td><td>Yes</td><td>Name of the parameter store (default <code>ovcconfig</code>). On OSC this is the <code>ParameterStore</code> deploy-form field.</td></tr>
-    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning object storage instances.</td></tr>
+    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Deployment-level object-store credential material. Each provisioned stack gets its own object-store access key id and secret derived from this value, so a credential issued for one stack cannot read or write another stack&#39;s buckets. Treat it as a root secret; rotating it invalidates the derived credentials of already-provisioned stacks.</td></tr>
     <tr><td><code>COUCHDB_ADMIN_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning the metadata store.</td></tr>
     <tr><td><code>PORT</code></td><td>No</td><td>No</td><td>HTTP port (default <code>3000</code>). Fixed by the platform on OSC; self-hosted only.</td></tr>
     <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>).</td></tr>

@@ -156,7 +156,7 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `OSC_ACCESS_TOKEN` | **Yes** | Personal Access Token from [app.osaas.io/settings](https://app.osaas.io/settings). Injected automatically at deploy time on OSC. |
 | `PARAMETER_STORE_API_KEY` | **Yes** | `ConfigApiKey` of the `eyevinn-app-config-svc` instance. |
 | `PARAMETER_STORE_INSTANCE_NAME` | **Yes** | Name of the `eyevinn-app-config-svc` instance (default `ovcconfig`). |
-| `MINIO_ROOT_PASSWORD` | **Yes** | Admin password used when provisioning MinIO instances. |
+| `MINIO_ROOT_PASSWORD` | **Yes** | Deployment-level object-store credential material. Each stack provisioned from here gets its **own** object-store access key id and secret, derived from this value, so a credential issued for one stack cannot read or write another stack's buckets. Treat it as a root secret: it is never used as a stack credential itself, but it can derive every stack's credential. Rotating it invalidates the derived credentials of already-provisioned stacks (the live instances keep the credential they were created with), exactly as rotating it did before. A stack provisioned by an older build keeps its original deployment-wide credential until it is migrated. |
 | `COUCHDB_ADMIN_PASSWORD` | **Yes** | Admin password used when provisioning CouchDB instances. |
 | `PORT` | No | HTTP port (default `3000`). |
 | `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). |

@@ -45,6 +45,7 @@ import {
   type AuditRetentionRepository
 } from '../data/audit-repo.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
+import { resolveObjectStoreCredential } from './object-store-credentials.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
@@ -199,14 +200,32 @@ function buildConnectionsFromStack(
   const server = couchServer(couchUrl);
   const wc = () => new StackCouch(server, dbName);
 
+  // THIS stack's object-store credential (issue #1094). Resolved alongside the
+  // endpoint from the stack's own stored config: when the config carries a
+  // per-stack access key id, the secret is re-derived from it and the
+  // deployment seed; otherwise this returns the legacy deployment-wide
+  // `admin` + password pair, byte-identically to the pre-#1094 behaviour, for a
+  // stack not yet migrated by #1096. `minioPassword` serves as BOTH the
+  // derivation seed and the legacy secret — it is the same
+  // MINIO_ROOT_PASSWORD env value in either role (see the SEED note in
+  // services/object-store-credentials.ts).
+  //
+  // The secret is never logged and never leaves this function except into the
+  // S3 client and `s3Config` below, which feed the object-store clients only.
+  const objectStoreCredential = resolveObjectStoreCredential({
+    storedAccessKeyId: config.objectStoreAccessKeyId,
+    seed: minioPassword,
+    legacySecretAccessKey: minioPassword
+  });
+
   const url = new URL(config.minioEndpoint);
   const useSSL = url.protocol === 'https:';
   const minioClient = new MinioClient({
     endPoint: url.hostname,
     port: url.port ? Number(url.port) : useSSL ? 443 : 80,
     useSSL,
-    accessKey: 'admin',
-    secretKey: minioPassword
+    accessKey: objectStoreCredential.accessKeyId,
+    secretKey: objectStoreCredential.secretAccessKey
   });
 
   const assets = new CouchAssetRepository(wc);
@@ -259,7 +278,15 @@ function buildConnectionsFromStack(
     encore,
     sourceBucket: config.sourceBucket,
     packagedBucket: config.packagedBucket,
-    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword },
+    // Per-stack object-store credential (issue #1094) — the same pair the
+    // client above authenticates with, so every consumer of `s3Config` (the
+    // ephemeral per-job runners, pipeline/runner-option.ts) speaks to the stack
+    // with the stack's own key rather than a deployment-wide root credential.
+    s3Config: {
+      endpoint: config.minioEndpoint,
+      accessKey: objectStoreCredential.accessKeyId,
+      secretKey: objectStoreCredential.secretAccessKey
+    },
     // Carry the per-role storage backend metadata (issue #211) so the delivery
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
@@ -742,6 +769,11 @@ export class WorkspaceStackResolver {
   constructor(opts: {
     paramStore: ParamStore | undefined;
     oscContext: Context;
+    // MINIO_ROOT_PASSWORD. Since #1094 this value has TWO roles, both handled
+    // by resolveObjectStoreCredential in buildConnectionsFromStack: it is the
+    // HMAC seed the per-stack object-store credential is derived from, and it is
+    // the legacy deployment-wide secret used for a stack provisioned before
+    // #1094 (i.e. one whose stored config carries no objectStoreAccessKeyId).
     minioPassword: string;
     couchPassword: string;
     // Builders that activate the OPTIONAL subtitles/scene-detect steps from the

@@ -63,6 +63,10 @@
 //   - StackConfig.minioEndpoint: string (src/services/param-store.ts:52-95).
 //   - EncoreS3Config = { endpoint, accessKeyId, secretAccessKey, region? }
 //     (src/encore-scaler/types.ts:24-29).
+//   - StackConfig.objectStoreAccessKeyId?: string and
+//     resolveObjectStoreCredential({ storedAccessKeyId, seed,
+//     legacySecretAccessKey }): ObjectStoreCredential (issue #1094,
+//     src/services/param-store.ts and src/services/object-store-credentials.ts).
 //   - WorkspaceEncoreScalerRegistry option
 //     `resolveS3Config?: (stackKey: string) => Promise<EncoreS3Config |
 //     undefined>`, whose undefined result means "use the static s3Config"
@@ -70,14 +74,9 @@
 
 import { STACK_CONFIG_NAMESPACE } from './workspace-stack.js';
 import { OBJECT_STORE_SERVICE_ID } from './stack.js';
+import { resolveObjectStoreCredential } from './object-store-credentials.js';
 import type { ParamStore, StackConfig } from './param-store.js';
 import type { EncoreS3Config } from '../encore-scaler/types.js';
-
-// MinIO root user. Always `admin` in OSC-provisioned stacks — the provision
-// route creates the instance with that root user (src/routes/provision.ts) and
-// the stack resolver builds its own S3 client with the same literal
-// (src/services/workspace-stack.ts:249).
-const MINIO_ROOT_USER = 'admin';
 
 export type EncoreS3ConfigLogger = {
   error: (obj: unknown, msg?: string) => void;
@@ -85,9 +84,21 @@ export type EncoreS3ConfigLogger = {
 
 export type ResolveEncoreS3ConfigDeps = {
   paramStore: ParamStore | undefined;
-  // Object-store secret for the spawned instances. Absent means there are no
-  // credentials to hand Encore at all.
+  // LEGACY, deployment-wide object-store secret for the spawned instances
+  // (ENCORE_S3_SECRET_KEY / MINIO_SECRET_KEY / MINIO_ROOT_PASSWORD). Used for a
+  // stack provisioned BEFORE #1094 — one whose stored config carries no
+  // `objectStoreAccessKeyId` — and for the static env-var override. Absent
+  // together with `objectStoreCredentialSeed` means there are no credentials to
+  // hand Encore at all.
   secretAccessKey: string | undefined;
+  // Seed for the PER-STACK object-store credential (issue #1094;
+  // MINIO_ROOT_PASSWORD). When the resolved stack's config carries an
+  // `objectStoreAccessKeyId`, the credential handed to the spawned transcoder is
+  // derived from that id and this seed — so a transcoder spawned for stack A
+  // gets a key that only opens stack A's object store. Optional: without it (or
+  // for a not-yet-migrated stack) the legacy pair above is used, byte-identical
+  // to the pre-#1094 behaviour.
+  objectStoreCredentialSeed?: string | undefined;
   // True when a complete static ENCORE_S3_ENDPOINT + secret pair was configured
   // (local dev / ops override). That is an intentional, complete configuration,
   // so this resolver defers to it by returning undefined rather than throwing.
@@ -177,9 +188,16 @@ export async function resolveEncoreS3Config(
   deps: ResolveEncoreS3ConfigDeps,
   stackKey: string
 ): Promise<EncoreS3Config | undefined> {
-  const { paramStore, secretAccessKey, staticFallbackConfigured, log, resolveEndpoint } = deps;
+  const {
+    paramStore,
+    secretAccessKey,
+    objectStoreCredentialSeed,
+    staticFallbackConfigured,
+    log,
+    resolveEndpoint
+  } = deps;
 
-  if (!secretAccessKey) {
+  if (!secretAccessKey && !objectStoreCredentialSeed) {
     if (staticFallbackConfigured) return undefined;
     throw new Error(
       'encore-scaler: cannot resolve object-store credentials for transcoding — none of ENCORE_S3_SECRET_KEY, MINIO_SECRET_KEY or MINIO_ROOT_PASSWORD is set. ' +
@@ -225,6 +243,20 @@ export async function resolveEncoreS3Config(
       (s) => s.serviceId === OBJECT_STORE_SERVICE_ID
     )?.instanceName;
 
+    // Resolve the CREDENTIAL alongside the endpoint, from the SAME stack config
+    // (issue #1094). A stack that carries a per-stack access key id hands the
+    // spawned transcoder that key and its derived secret; a stack provisioned
+    // before #1094 falls back to the legacy deployment-wide `admin` + secret
+    // pair, exactly as before. The secret is returned to the scaler (which puts
+    // it in the Encore create body, instance-pool.ts:618-622) and is never
+    // logged here — note that every log line in this module carries only the
+    // endpoint, stack key and namespace.
+    const credential = resolveObjectStoreCredential({
+      storedAccessKeyId: config.objectStoreAccessKeyId,
+      seed: objectStoreCredentialSeed,
+      legacySecretAccessKey: secretAccessKey
+    });
+
     return {
       endpoint: await mapEndpointForTranscoder(
         config.minioEndpoint,
@@ -232,8 +264,8 @@ export async function resolveEncoreS3Config(
         objectStoreInstanceName,
         log
       ),
-      accessKeyId: MINIO_ROOT_USER,
-      secretAccessKey
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey
     };
   }
 
