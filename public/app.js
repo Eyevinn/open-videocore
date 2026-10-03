@@ -76,6 +76,21 @@ import { mountAssetRename } from './asset-rename.js';
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
 
+// External identifiers panel (issue #908, broken out of #796): the
+// `{ namespace, id }` correlations to upstream systems of record, which until now
+// were reachable only by whatever integration wrote them. The sub-resource is the
+// ONLY surface that exposes them — `assetSchema` declares no
+// `externalIdentifiers` property, so the GET /assets/{id} body this renderer
+// already holds cannot supply them.
+//
+// The panel offers exactly the affordances the verified contract can perform:
+// `GET` + `POST` on /assets/{id}/external-ids and `DELETE` on
+// /{namespace}/{externalId}. There is NO PUT and NO PATCH, so "edit" is POST +
+// DELETE, two requests, and the form says so. Full contract grounding — including
+// why POST appends rather than replaces, and why a 409 can only be handled
+// reactively — is in that module's header.
+import { mountAssetExternalIds } from './external-ids.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -176,6 +191,23 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add/edit/remove an asset's external
+// identifiers (issue #908). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` AND `delete` to `editor` and `admin`
+// only, and `methodToAction` (:79-93) maps POST -> write and DELETE -> delete, so
+// BOTH mutating operations on this sub-resource — POST /assets/{id}/external-ids
+// and DELETE /assets/{id}/external-ids/{namespace}/{externalId} — are refused to a
+// `viewer` with 403 by `resourceAuthorizationPreHandler('asset')`
+// (src/auth/authorize.ts:126, registered src/routes/assets.ts:1748). One predicate
+// covers both because the matrix grants the two actions to exactly the same roles.
+// GET on the same sub-resource is `read`, which a viewer DOES hold — hence a
+// viewer still sees every namespace and value, read-only. Client-side mirror
+// only: the 403 is still handled if it arrives.
+function canChangeExternalIds() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -3083,6 +3115,54 @@ async function renderAssetDetailBody(id, bodyEl) {
       host: body,
       canChange: canChangeReviewState(),
       apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
+
+    // ── External identifiers: upstream { namespace, id } correlations (issue #908) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/external-ids.js. `openapi.json .paths` carries
+    // EXACTLY three operations for this sub-resource — checked key by key:
+    //   GET  /api/v1/assets/{id}/external-ids — 200 is a bare ARRAY of
+    //        { namespace, id } (both `required`, additionalProperties: false),
+    //        "in persisted order … no dedup, sort, or reformatting"; 404 { error }
+    //        only when the ASSET is unknown (an asset with none is 200 []).
+    //        (…].get; src/routes/assets.ts:3315-3362)
+    //   POST /api/v1/assets/{id}/external-ids — body REQUIRED
+    //        { namespace (1..256), id (1..1024) }; 200 = the full asset,
+    //        400 { error }, 404 { error }, 409 { error, reason:
+    //        'external_id_conflict', namespace, externalId, conflictingAssetId }.
+    //        (…].post; src/routes/assets.ts:3173-3209, schema :501-518, 409
+    //        envelope :524-531 sent at :2696-2704)
+    //   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId} — no
+    //        body; 204 idempotently whether or not the pair was attached,
+    //        400/404 { error }. (…].delete; src/routes/assets.ts:3247-3294)
+    //
+    // THERE IS NO PUT AND NO PATCH on either path, and POST cannot substitute for
+    // one: it APPENDS to the set (src/data/asset-repo.ts:1546-1551) rather than
+    // replacing within a namespace. So the panel's "edit" is POST-then-DELETE —
+    // two requests, not atomic, add first so a failure between them leaves both
+    // pairs rather than neither — and the edit form says so on screen. The remove
+    // affordance exists only because DELETE does; nothing here is offered for a
+    // method the spec does not declare.
+    //
+    // The panel must issue its own GET: `assetSchema` declares no
+    // `externalIdentifiers` property (openapi.json .paths["/api/v1/assets/{id}"]
+    // .get 200 schema, additionalProperties: false), which is precisely why the
+    // sub-resource exists (src/routes/assets.ts:3293-3299). For the same reason the
+    // POST's 200 asset body is NOT a read-back — the serializer strips the field —
+    // so every write re-reads the sub-resource.
+    //
+    // Mounted between the review block and the action controls, and the
+    // sub-resource path takes the ULID (`asset.id`) — GET/POST resolve with a
+    // plain `repo.get` and no slug fallback (:3353, :3195).
+    await mountAssetExternalIds({
+      assetId: asset.id,
+      anchorEl: actionsDiv,
+      host: body,
+      canChange: canChangeExternalIds(),
+      apiFetch: apiFetch,
+      confirmModal: confirmModal,
       showMsg: showMsg,
     });
 
@@ -7641,6 +7721,11 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirror of the ADR-018 write+delete gate for the external-ids
+  // sub-resource (issue #908). Exported so a DOM/unit test can assert the
+  // add/edit/remove controls are offered to exactly the roles that hold both
+  // `write` and `delete`, and that a viewer still sees the list.
+  canChangeExternalIds,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
