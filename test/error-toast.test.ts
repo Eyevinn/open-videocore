@@ -31,6 +31,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { ACTION_FAILURE_REASON_COPY, errorToast, TAB_RENDERERS } from '../public/app.js';
+// The shared reason deck (issue #920), which issue #921 moved into its own leaf
+// module so the pre-flight and post-flight paths read one source.
+import { actionFailureReasonCopy } from '../public/action-failure-reasons.js';
 
 // Read from the repo root (vitest runs with cwd = project root). `import.meta.url`
 // is not a file: URL under the happy-dom environment, so it cannot be used here.
@@ -206,10 +209,15 @@ describe('errorToast dismissal (issue #918)', () => {
 // ─── Smoke test: the one wired call site (issue #918 AC3) ──────────────────────
 
 describe('Collections tab delete failure uses errorToast (issue #918 AC3)', () => {
+  // EMPTY as the list read it. Since issue #921 a collection the list already
+  // shows as non-empty never reaches the request at all — it is explained before
+  // the confirmation instead — so the post-flight failure path is now reached
+  // only by a genuine race: someone added members between this read and the
+  // click, and the API answers the 409 below.
   const COLLECTION = {
     id: '01J8ZQF7TESTCOLLECTIONID',
     name: 'Summer campaign rushes',
-    assetIds: ['01J8A', '01J8B'],
+    assetIds: [] as string[],
     createdAt: '2026-03-01T00:00:00.000Z',
     updatedAt: '2026-03-01T00:00:00.000Z',
   };
@@ -262,12 +270,19 @@ describe('Collections tab delete failure uses errorToast (issue #918 AC3)', () =
     expect(el).toBeTruthy();
     expect(el!.querySelector('.error-action')!.textContent)
       .toBe('Delete collection failed.');
-    // The 409 carries a structured `reason` (src/routes/collections.ts:275), so
-    // the operator gets the humanized copy for it — NOT the server's internal
+    // The 409 carries a structured `reason` (src/routes/collections.ts:298-306),
+    // so the operator gets the humanized copy for it — NOT the server's internal
     // sentence (issue #920). The fallback to `message` is covered separately, in
     // test/error-reason-rendering.test.ts.
+    //
+    // Subject-specific wording (issue #921): `member_of_collection` from THIS
+    // router means "this collection still holds members", not "the subject is
+    // inside a collection", so the call site passes `subject: 'collection'` and
+    // gets the collections deck.
     expect(el!.querySelector('.msg-error')!.textContent)
-      .toBe(ACTION_FAILURE_REASON_COPY.member_of_collection);
+      .toBe(actionFailureReasonCopy('member_of_collection', { subject: 'collection' }));
+    expect(el!.querySelector('.msg-error')!.textContent)
+      .not.toBe(ACTION_FAILURE_REASON_COPY.member_of_collection);
     expect(el!.querySelector('.msg-error')!.textContent).not.toBe(BLOCKED.message);
     // Names the collection by name, and says plainly that nothing changed.
     expect(el!.querySelector('.error-detail')!.textContent)
