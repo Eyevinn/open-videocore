@@ -54,7 +54,11 @@ export const VideoTrackSchema = z.object({
   width: z.number(),
   height: z.number(),
   bitrateBps: z.number().optional(),
-  frameRate: z.number().optional()
+  frameRate: z.number().optional(),
+  // Start timecode of the source, e.g. "01:00:00:00" (issue #1066). Optional
+  // like `frameRate`: absent on documents written before the probe reported it
+  // and on sources that carry no timecode.
+  startTimecode: z.string().optional()
 });
 export type VideoTrack = z.infer<typeof VideoTrackSchema>;
 
@@ -399,8 +403,18 @@ function technicalFromAsset(asset: Asset): AssetDocument['technical'] {
   if (tm) {
     technical.container = tm.containerFormat;
     technical.durationMs = Math.round(tm.durationSeconds * 1000);
+    // `frameRate` / `startTimecode` are written only when the probe reported them
+    // (issue #1066) so an audio-only or timecode-less source stores no key at all
+    // rather than a misleading 0 / empty string.
     technical.video = [
-      { codec: tm.codec, width: tm.width, height: tm.height, bitrateBps: tm.bitrateBps }
+      {
+        codec: tm.codec,
+        width: tm.width,
+        height: tm.height,
+        bitrateBps: tm.bitrateBps,
+        ...(tm.frameRate !== undefined ? { frameRate: tm.frameRate } : {}),
+        ...(tm.startTimecode !== undefined ? { startTimecode: tm.startTimecode } : {})
+      }
     ];
     technical.audio = tm.audioTracks?.map((a) => ({
       index: a.index,
@@ -435,7 +449,11 @@ function technicalToAsset(
         channels: a.channels,
         sampleRateHz: a.sampleRateHz
       })),
-      extractedAt: technical.probe.probedAt
+      extractedAt: technical.probe.probedAt,
+      // Both optional on the document (issue #1066): a document written before
+      // the fields existed reads back with them absent, not zeroed.
+      ...(v.frameRate !== undefined ? { frameRate: v.frameRate } : {}),
+      ...(v.startTimecode !== undefined ? { startTimecode: v.startTimecode } : {})
     };
   }
   return { technicalMetadata, technicalMetadataError: technical.error };

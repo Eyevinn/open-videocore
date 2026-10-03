@@ -63,6 +63,15 @@ export function ffprobeExternalCmdLine(bucket: string, objectKey: string): strin
 //     Duration: 00:01:25.28, start: 0.000000, bitrate: 5131 kb/s
 //     Stream #0:0(und): Video: h264, yuv420p, 1920x1080, 4814 kb/s, 25 fps
 //     Stream #0:1(und): Audio: aac, 48000 Hz, stereo, 317 kb/s
+//
+// FRAME RATE (issue #1066): because this is ffmpeg's log and not ffprobe's JSON,
+// the rate arrives as the DECIMAL ffmpeg prints on the stream line ("25 fps",
+// "29.97 fps") — there is no `r_frame_rate` rational to read. We put that decimal
+// in `r_frame_rate` so the single parser in metadata-extractor.ts handles both
+// shapes, which also means the stored rate inherits ffmpeg's 2-decimal display
+// precision (29.97, not 29.970029…). Start timecode comes from the `timecode`
+// metadata line, which ffmpeg prints for a source that carries one. See
+// docs/osc-feedback/incoming-frame-rate-metadata.md.
 export function parseFfmpegLogToProbeResult(log: string): FfprobeResult {
   // Container format from "Input #0, <format_name>, from …"
   const formatMatch = log.match(/Input #\d+,\s*([^,]+)/);
@@ -98,13 +107,17 @@ export function parseFfmpegLogToProbeResult(log: string): FfprobeResult {
       const resMatch = rest.match(/(\d{2,5})x(\d{2,5})/);
       // Stream-level bitrate: NNN kb/s
       const brMatch = rest.match(/(\d+)\s*kb\/s/);
+      // Frame rate: "NN fps", or ffmpeg's "NN tbr" when it prints no fps for the
+      // stream (both are decimals, so either feeds parseFrameRate unchanged).
+      const fpsMatch = rest.match(/([\d.]+)\s*fps/) ?? rest.match(/([\d.]+)\s*tbr/);
       streams.push({
         codec_type: 'video',
         codec_name: codecName,
         width: resMatch ? Number(resMatch[1]) : undefined,
         height: resMatch ? Number(resMatch[2]) : undefined,
         bit_rate: brMatch ? Number(brMatch[1]) * 1000 : undefined,
-        duration: durationSeconds > 0 ? durationSeconds : undefined
+        duration: durationSeconds > 0 ? durationSeconds : undefined,
+        r_frame_rate: fpsMatch ? fpsMatch[1] : undefined
       });
     } else if (codecType === 'audio') {
       // Sample rate: NNN Hz
@@ -132,12 +145,19 @@ export function parseFfmpegLogToProbeResult(log: string): FfprobeResult {
     throw new Error('ffmpeg produced no recognisable stream information');
   }
 
+  // Start timecode from the `timecode` metadata line ffmpeg prints for a source
+  // that carries one (container metadata or a timecode track). Absent for most
+  // sources, which is normal.
+  const tcMatch = log.match(/^\s*timecode\s*:\s*(\d{2}:\d{2}:\d{2}[:;]\d{2})\s*$/m);
+  const startTimecode = tcMatch?.[1];
+
   return {
     streams,
     format: {
       format_name: formatName,
       duration: durationSeconds > 0 ? durationSeconds : undefined,
-      bit_rate: containerBitrate > 0 ? containerBitrate : undefined
+      bit_rate: containerBitrate > 0 ? containerBitrate : undefined,
+      ...(startTimecode ? { tags: { timecode: startTimecode } } : {})
     }
   };
 }
