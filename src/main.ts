@@ -52,6 +52,10 @@ import {
   type StorageQuotaStore
 } from './data/storage-quota.js';
 import { StorageQuotaReconciler } from './data/storage-quota-reconcile.js';
+import {
+  makePerStackQuotaSum,
+  PerStackQuotaSumIncomplete
+} from './data/storage-quota-stack-sum.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
 import {
@@ -60,6 +64,7 @@ import {
   runWithRequestStack,
   currentRequestStackName
 } from './services/request-stack-context.js';
+import { forEachStack, perStackSweepRunner } from './services/for-each-stack.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
   resolveStackRedisUrl,
@@ -959,6 +964,16 @@ let archiveRetentionMs = archiveRetentionMsFromEnv();
 // as archiveRetentionMs is.
 let auditRetentionMs = auditRetentionMsFromEnv();
 
+// Shared logger for every background sweep that runs once per provisioned stack
+// (issue #1098). Mirrors the varargs-collapsing wrappers the sweep loops already
+// take (`info: (...a) => app.log.info(a)`), so a per-stack failure is logged
+// exactly like the rest of a tick's output.
+const sweepLogger = {
+  info: (...a: unknown[]) => app.log.info(a),
+  warn: (...a: unknown[]) => app.log.warn(a),
+  error: (...a: unknown[]) => app.log.error(a)
+};
+
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
 const encoreProfilesUrl =
@@ -1309,6 +1324,10 @@ function activateScaler(redisUrl: string): void {
       // sweeps once inside EACH provisioned stack's context instead. With no
       // parameter store (env override / bare local run) the list is empty and the
       // single default resolution runs, byte-identical to before.
+      //
+      // #1098: the inline per-stack loop this used to carry is now the shared
+      // `forEachStack` helper, which the four retention/quota sweeps below use
+      // too — one mechanism, and it adds per-stack failure isolation here.
       const runSweepsForCurrentStack = async (): Promise<void> => {
         await reconcileFailedTranscodes({
           jobs: jobRepository,
@@ -1356,12 +1375,10 @@ function activateScaler(redisUrl: string): void {
           }
         });
       };
-      const stackNames = await stackResolver.listStackNames();
-      const stackContexts: Array<string | undefined> =
-        stackNames.length > 0 ? stackNames : [undefined];
-      for (const stackContext of stackContexts) {
-        await runWithRequestStack(stackContext, runSweepsForCurrentStack);
-      }
+      await forEachStack(
+        { resolver: stackResolver, label: 'encore-reconcile', logger: sweepLogger },
+        runSweepsForCurrentStack
+      );
     },
     // When the scaler's reconcile() detects that tracked jobs have silently
     // vanished from an Encore instance's live QUEUED/IN_PROGRESS set with no
@@ -2350,26 +2367,36 @@ await app.register(logsRouter, { prefix: '/api/v1/logs', logStore });
 // (started inside activateScaler above). It reads the LIVE `archiveRetentionMs`
 // each tick, so it honours PATCH /api/v1/retention/config and is skipped
 // entirely while retention is unset (0/disabled). All sweep deps are resolved
-// per tick from the (default) stack connections so the sweep targets the same
+// per tick from the CURRENT stack's connections so the sweep targets the same
 // concrete repo + buckets the request path uses.
+//
+// ONCE PER PROVISIONED STACK (issue #1098). A sweep runs outside a request, so
+// before #1098 every dep here resolved with NO stack name — the first listed
+// stack — and archived assets on stacks 2..N were never purged. `forEachStack`
+// re-reads listStackNames() each tick and runs the sweep inside each stack's
+// request-stack context, so `assetRepository` enumerates that stack's documents
+// and the deps below resolve that stack's connections. One stack's failure is
+// logged and the rest are still swept. Single-stack / no-parameter-store: one
+// iteration, unchanged.
 //
 // purgeToTombstone is NOT on the AssetRepository interface (it is a concrete
 // method on CouchAssetRepository / InMemoryAssetRepository), so the sweep's
 // `purge` callback resolves the concrete `.assets` repo and invokes it directly.
 const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
   retentionMs: () => archiveRetentionMs,
-  logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a),
-    error: (...a: unknown[]) => app.log.error(a)
-  },
+  logger: sweepLogger,
+  forEachStack: perStackSweepRunner({
+    resolver: stackResolver,
+    label: 'archived-asset-purge',
+    logger: sweepLogger
+  }),
   sweepDeps: {
     assets: assetRepository,
     // Resolve the concrete repo and call its purgeToTombstone (doc-replace to a
     // tombstone). Present on both concrete implementations; typed loosely here
     // because it is not on the shared AssetRepository interface.
     purge: async (assetId: string) => {
-      const conns = await stackResolver.resolve();
+      const conns = await stackResolver.resolve(currentRequestStackName());
       const concrete = conns.assets as unknown as {
         purgeToTombstone?: (id: string) => Promise<string | undefined> | boolean;
       };
@@ -2382,8 +2409,10 @@ const archivedAssetPurgeLoop = new ArchivedAssetPurgeLoop({
     // client (mirrors GET /:id/files). Returns undefined when object storage is
     // not configured — the sweep then records the tombstone without object
     // removal, and a later tick reclaims stragglers once storage is available.
+    // The cache entry for the swept stack is warmed by forEachStack before the
+    // sweep body runs, exactly as the request preHandler warms it per request.
     storageForBucket: (bucket: string): PurgeStorage | undefined => {
-      const conns = stackResolver.resolveCached();
+      const conns = stackResolver.resolveCached(currentRequestStackName());
       if (!conns?.storageClient) return undefined;
       return new WorkspaceStorage(conns.storageClient, bucket);
     },
@@ -2405,24 +2434,30 @@ archivedAssetPurgeLoop.start(archivePurgeIntervalMsFromEnv());
 // purgeEntry), so each tick resolves the active stack's audit store and drives
 // the sweep directly. On the in-memory fallback the store is empty, so the sweep
 // enumerates nothing and purges nothing — a natural no-op, not a special case.
+//
+// ONCE PER PROVISIONED STACK (issue #1098): each stack keeps its OWN audit log,
+// so the retention window has to be applied to each of them. Before #1098 only
+// the first-listed stack's log was expired and every other stack retained
+// indefinitely in spite of the configured policy.
 const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
   retentionMs: () => auditRetentionMs,
-  logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a),
-    error: (...a: unknown[]) => app.log.error(a)
-  },
+  logger: sweepLogger,
+  forEachStack: perStackSweepRunner({
+    resolver: stackResolver,
+    label: 'audit-retention-purge',
+    logger: sweepLogger
+  }),
   sweepDeps: {
-    // Resolve the active stack's audit store per tick. The sweep drives it via
+    // Resolve the CURRENT stack's audit store per call. The sweep drives it via
     // listOldestPage (enumerate aged tail) + purgeEntry (whole-entry expiry).
     // `conns.audit` is always present (issue #565), so no null-guard is needed.
     audit: {
       listOldestPage: async (opts: { limit: number; offset?: number }) => {
-        const conns = await stackResolver.resolve();
+        const conns = await stackResolver.resolve(currentRequestStackName());
         return conns.audit.listOldestPage(opts);
       },
       purgeEntry: async (id: string) => {
-        const conns = await stackResolver.resolve();
+        const conns = await stackResolver.resolve(currentRequestStackName());
         return conns.audit.purgeEntry(id);
       }
     }
@@ -2441,13 +2476,19 @@ auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
 // 0/disabled. `assetRepository` exposes both list() (enumerate `uploading`) and
 // update() (transition to `failed`) directly, so — unlike the archived purge —
 // no concrete-repo callback is needed.
+//
+// ONCE PER PROVISIONED STACK (issue #1098): an upload lands on whichever stack
+// the request named (#1058), so a wedged `uploading` record can be on any stack.
+// Before #1098 only the first-listed stack's wedged uploads were ever settled
+// and the others stayed in the asset list forever.
 const abandonedUploadSweepLoop = new AbandonedUploadSweepLoop({
   thresholdMs: abandonedUploadThresholdMsFromEnv,
-  logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a),
-    error: (...a: unknown[]) => app.log.error(a)
-  },
+  logger: sweepLogger,
+  forEachStack: perStackSweepRunner({
+    resolver: stackResolver,
+    label: 'abandoned-upload-sweep',
+    logger: sweepLogger
+  }),
   sweepDeps: {
     assets: assetRepository
   }
@@ -2581,30 +2622,57 @@ watchFolder?.start();
 // there is nothing to enforce or sweep. Runs one immediate sweep on boot then on
 // STORAGE_QUOTA_RECONCILE_INTERVAL_MS (default 6h).
 //
-// KNOWN GAP on a multi-stack install (#1090, found reviewing #1058). This resolves
-// `resolveCached()` with NO stack name at boot, so it sums only the FIRST listed
+// EVERY PROVISIONED STACK, ONE DEPLOYMENT-WIDE TOTAL (issue #1098, closing the
+// gap recorded as #1090). This used to build its buckets ONCE at boot from
+// `resolveCached()` with NO stack name, so it summed only the FIRST listed
 // stack's two buckets — but since #1058 the data plane writes bytes to whichever
-// stack the request named. Because the sweep OVERWRITES the committed total
-// rather than adding to it, usage on stacks 2..N is erased from the counter on
-// every sweep, so the cap silently UNDER-counts and admits more than the operator
-// configured. Fixing it needs the architect call #1090 is waiting on (is a quota
-// per deployment or per stack?): ADR-020 Decision 1 says one deployment is one
-// tenant, which argues for summing every provisioned stack via listStackNames()
-// here, but that is a behaviour change to a billing-adjacent number, not a bug
-// fix. Single-stack deployments — every one on OSC today — are unaffected.
+// stack the request named, and because the sweep OVERWRITES the committed total
+// rather than adding to it, usage on stacks 2..N was erased from the counter on
+// every sweep: the cap silently UNDER-counted and admitted more than the
+// operator configured.
+//
+// The architect call #1090 was waiting on is settled in #1098 (sweeps are
+// per-stack; ADR addendum docs/architecture/ADR-020-addendum-per-stack-sweeps.md).
+// For THIS sweep the per-stack rule applies to the ENUMERATION only: the counter
+// is a single deployment-wide number (ADR-020 Decision 1 — one deployment is one
+// tenant, keyed by DEPLOYMENT_CONTEXT), so makePerStackQuotaSum walks every
+// stack listed on each sweep and returns one total, which the reconciler writes
+// once. A sweep that could not read some stack throws instead of writing a short
+// total, so the cap is never re-armed on a partial number. Single-stack
+// deployments sum exactly the same two buckets as before.
 if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
-  const conns = stackResolver.resolveCached();
-  if (conns?.storageClient) {
-    const reconciler = new StorageQuotaReconciler({
-      store: quotaStore,
-      buckets: [
-        new WorkspaceStorage(conns.storageClient, conns.sourceBucket),
-        new WorkspaceStorage(conns.storageClient, conns.packagedBucket)
-      ],
-      onError: (err) => app.log.warn({ err }, 'storage-quota reconciliation sweep failed')
-    });
-    reconciler.start();
-  }
+  const reconciler = new StorageQuotaReconciler({
+    store: quotaStore,
+    buckets: [
+      makePerStackQuotaSum({
+        resolver: stackResolver,
+        logger: sweepLogger,
+        // The swept stack's OWN source + packaged buckets, from ITS connections
+        // (the per-stack bucket names persisted with the stack config), built on
+        // the same MinIO client the request path uses. No object storage on that
+        // stack -> no buckets, which contributes nothing instead of failing.
+        bucketsForStack: async (stackName) => {
+          const conns = await stackResolver.resolve(stackName);
+          if (!conns.storageClient) return [];
+          return [
+            new WorkspaceStorage(conns.storageClient, conns.sourceBucket),
+            new WorkspaceStorage(conns.storageClient, conns.packagedBucket)
+          ];
+        }
+      })
+    ],
+    onError: (err) => {
+      // A deployment with no object storage yet (fresh install, no stack
+      // provisioned) is the normal state, not a fault: the sweep correctly
+      // declines to overwrite the total and says so at info level.
+      if (err instanceof PerStackQuotaSumIncomplete && err.reason === 'no-object-storage') {
+        app.log.info({ err: err.message }, 'storage-quota reconciliation skipped');
+        return;
+      }
+      app.log.warn({ err }, 'storage-quota reconciliation sweep failed');
+    }
+  });
+  reconciler.start();
 }
 
 // Parameter-store path (Open Source Cloud, issue #643): if a stack was already
