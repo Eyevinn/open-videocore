@@ -18,6 +18,11 @@
 //       { instanceId, url, activeJobs, lastIdleAt }
 //   - listInstances(redis, workspaceId): src/encore-scaler/instance-pool.ts:46
 //   - ioredis Redis.scan / .llen: ioredis type definitions.
+//   - Durable scaler config (#1077): src/services/param-store.ts —
+//       SCALER_CONFIG_KEY ('openvideocore/scalerconfig'), the ScalerRuntimeConfig
+//       value shape, ScalerConfigStore.save/load and makeScalerConfigStore,
+//       which writes through ConfigKvStore.set (POST /api/v1/config {key,value},
+//       throwing `config kv write failed: <status> <body>` on a non-2xx).
 //   - JOBS_PER_INSTANCE: src/encore-scaler/types.ts — the per-instance job
 //     capacity the scaler loop itself treats as "busy"
 //     (scaler-loop.ts:245 `activeJobs >= JOBS_PER_INSTANCE`, :395 dispatch
@@ -30,6 +35,7 @@ import { z } from 'zod';
 import { JOBS_PER_INSTANCE, keys } from '../encore-scaler/types.js';
 import { listInstances } from '../encore-scaler/instance-pool.js';
 import { readSpawnFailure } from '../encore-scaler/spawn-failure.js';
+import type { ScalerConfigStore } from '../services/param-store.js';
 
 type ScalerRouterOptions = {
   // The Valkey connection used by the scaler. Undefined when the scaler is off
@@ -46,12 +52,24 @@ type ScalerRouterOptions = {
   idleTimeoutMs: number;
   // Callback to update the live scaler config at runtime.
   onConfigChange?: (cfg: { maxInstances: number; minInstances: number; idleTimeoutMs: number }) => void;
+  // Durable store for the scaler runtime config (#1077). PATCH /config writes
+  // here BEFORE it applies anything, so a restart does not lose an operator's
+  // change. Undefined when the parameter store is unconfigured
+  // (PARAMETER_STORE_API_KEY unset, or the config instance unresolvable) — PATCH
+  // then responds 501 rather than accepting a change it cannot make durable.
+  // Contract (key, value shape, error semantics): services/param-store.ts
+  // SCALER_CONFIG_KEY / ScalerRuntimeConfig / makeScalerConfigStore.
+  configStore?: ScalerConfigStore;
 };
 
 // Lower bound on the runtime idle timeout. A near-zero timeout would let the
 // scaler destroy an instance almost as soon as it goes idle, thrashing the
 // spawn/destroy cycle (spawns take 60-120s). 10s is a defensible floor.
 const MIN_IDLE_TIMEOUT_MS = 10_000;
+
+// Error body for the PATCH /config failure paths (#1077). Same { error, message }
+// shape the rest of the API uses (errorSchema, src/routes/storage.ts:65).
+const errorSchema = z.object({ error: z.string(), message: z.string().optional() });
 
 // Mirrors EncoreInstanceRecord (src/encore-scaler/types.ts) for the fields an
 // operator needs to reason about scaling decisions.
@@ -294,30 +312,84 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     }
   );
 
+  // PATCH /config — change the live scaler config AND persist it (#1077).
+  //
+  // WRITE-THEN-APPLY. The durable write happens BEFORE any live value moves, so
+  // the observable contract is "never 2xx without a durable write":
+  //   200 — the new values are in the parameter store and now live.
+  //   501 — no parameter store is configured, so nothing could be made durable.
+  //         Nothing is applied. Mirrors the registry routes' 501-when-unconfigured
+  //         idiom (src/routes/storage.ts:363). This is deliberately stricter than
+  //         the pre-#1077 behaviour, which returned 200 for a change that was
+  //         silently lost on restart.
+  //   503 — the store rejected or could not be reached. Nothing is applied, so
+  //         GET /config still reports the previous values and the caller can
+  //         retry.
+  // Validation is unchanged: the same `scalerConfigSchema.partial()` body schema
+  // rejects out-of-range values with a 400 before this handler runs, so only
+  // already-valid values ever reach the store.
   app.patch(
     '/config',
     {
       schema: {
         tags: ['admin'],
         body: scalerConfigSchema.partial(),
-        response: { 200: scalerConfigSchema }
+        response: { 200: scalerConfigSchema, 501: errorSchema, 503: errorSchema }
       }
     },
-    async (request) => {
+    async (request, reply) => {
       const { maxInstances, minInstances, idleTimeoutMs } = request.body;
-      if (maxInstances !== undefined) liveMaxInstances = maxInstances;
-      if (minInstances !== undefined) liveMinInstances = minInstances;
-      if (idleTimeoutMs !== undefined) liveIdleTimeoutMs = idleTimeoutMs;
-      opts.onConfigChange?.({
-        maxInstances: liveMaxInstances,
-        minInstances: liveMinInstances,
-        idleTimeoutMs: liveIdleTimeoutMs
-      });
-      return {
-        maxInstances: liveMaxInstances,
-        minInstances: liveMinInstances,
-        idleTimeoutMs: liveIdleTimeoutMs
+      // The complete config this request would establish: the validated fields
+      // it supplied, merged over the current live values. A full snapshot is
+      // what gets persisted (see SCALER_CONFIG_KEY in services/param-store.ts),
+      // so a one-field PATCH never leaves a partial record in the store.
+      const next = {
+        maxInstances: maxInstances ?? liveMaxInstances,
+        minInstances: minInstances ?? liveMinInstances,
+        idleTimeoutMs: idleTimeoutMs ?? liveIdleTimeoutMs
       };
+
+      const store = opts.configStore;
+      if (!store) {
+        return reply.code(501).send({
+          error: 'scaler_config_not_persistable',
+          message:
+            'no parameter store is configured, so a scaler config change cannot be ' +
+            'persisted and would be lost on restart; set PARAMETER_STORE_API_KEY'
+        });
+      }
+
+      try {
+        await store.save(next);
+      } catch (err) {
+        // Live values are untouched — the assignments below are only reached on
+        // a successful durable write.
+        request.log.warn(
+          {
+            op: 'patchScalerConfig',
+            err: err instanceof Error ? { message: err.message } : String(err)
+          },
+          'scaler config write to the parameter store failed; change not applied'
+        );
+        // The upstream failure text stays in the LOG, not on the wire. This
+        // router is deliberately unauthenticated (see the file header), and
+        // config-service error text can echo the request the write sent plus
+        // internal hostnames — the same reason spawn-failure messages are
+        // redacted at write time (#1071). The response carries the SHAPE of the
+        // failure; the detail is an operator-only log line.
+        return reply.code(503).send({
+          error: 'scaler_config_persist_failed',
+          message:
+            'the scaler config could not be written to the parameter store, so the ' +
+            'change was not applied; retry, and see the server log for the cause'
+        });
+      }
+
+      liveMaxInstances = next.maxInstances;
+      liveMinInstances = next.minInstances;
+      liveIdleTimeoutMs = next.idleTimeoutMs;
+      opts.onConfigChange?.(next);
+      return next;
     }
   );
 
