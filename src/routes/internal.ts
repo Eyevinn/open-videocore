@@ -63,6 +63,8 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from '../pipeline/transcode.js';
+// #1060: structured source-read failure detail for a failed `transcode` step.
+import { buildSourceReadErrorDetail } from '../pipeline/encore-source-read-failure.js';
 import type { PipelineLogSink } from '../services/pipeline-log.js';
 // #829: the terminal-transcode webhook events are owned by the shared module so
 // this route and the completion poller (src/pipeline/encore-callback-poller.ts)
@@ -688,10 +690,25 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
             const tIdx = steps.findIndex((s) => s.name === 'transcode' && s.encoreJobId === externalId);
 
             if (!success) {
+              const failureText = message ?? `encore status: ${status}`;
+              // #1060: attach the structured source-read detail when the
+              // transcoder's failure text is a source-read failure (storage
+              // answered 404/403 for the input object, or the connection to it
+              // failed). Same builder the other two settle paths use
+              // (src/pipeline/failed-transcode-reconciler.ts releasePipelineLock
+              // and src/pipeline/encore-callback-poller.ts), so the detail does
+              // not depend on which path observed the failure. `error` is
+              // unchanged.
+              const errorDetail = buildSourceReadErrorDetail({
+                failureText,
+                encoreJobId: externalId,
+                assetId: found.job.assetId
+              });
               steps[tIdx] = {
                 ...steps[tIdx],
                 status: 'failed',
-                error: message ?? `encore status: ${status}`,
+                error: failureText,
+                ...(errorDetail ? { errorDetail } : {}),
                 completedAt: now
               };
               await opts.pipelineRepository.update(execution.id, { steps, status: 'failed' });

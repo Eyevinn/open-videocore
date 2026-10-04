@@ -163,6 +163,10 @@ import {
 import { oscJobLog } from '../pipeline/osc-job-log.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
+// Structured step failure detail (issue #1060). ONE shared schema so this
+// router's copy of stepExecutionSchema and the pipelines router's copy
+// (src/routes/pipelines.ts) cannot drift on it.
+import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
 import {
   backendOutputDestination,
   DEFAULT_BACKEND_ID
@@ -1137,6 +1141,17 @@ const stepExecutionSchema = z.object({
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
+  // Machine-readable companion to `error` (issue #1060). ADDITIVE and OPTIONAL;
+  // present only for recognised failure classes (today `source_read_failed` — a
+  // transcode whose SOURCE object could not be read). Same shared schema the
+  // pipelines router uses, so the two step-schema copies cannot drift on it.
+  errorDetail: stepErrorDetailSchema
+    .optional()
+    .describe(
+      'Structured, machine-readable failure detail. Present only for ' +
+        'recognised failure classes; branch on `errorDetail.code` rather than ' +
+        'parsing `error`.'
+    ),
   skipReason: z.string().optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),

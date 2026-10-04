@@ -175,6 +175,15 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
       jobId: step['jobId'] as string | undefined,
       encoreJobId: step['encoreJobId'] as string | undefined,
       error: step['error'] as string | undefined,
+      // Structured failure detail (#1060). `toDoc` persists whole step objects,
+      // so the write side already round-trips it; this read side has to name it
+      // explicitly because the mapper rebuilds steps field by field. Hydrated
+      // only when the stored value is an object, so a malformed document
+      // degrades to "no detail" rather than putting a non-conforming value on
+      // the response (the route schema would reject it).
+      ...(isRecord(step['errorDetail'])
+        ? { errorDetail: step['errorDetail'] as StepExecution['errorDetail'] }
+        : {}),
       startedAt: step['startedAt'] as string | undefined,
       completedAt: step['completedAt'] as string | undefined,
       progress: step['progress'] as number | undefined
@@ -207,6 +216,13 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
 function stripPartition(id: string): string {
   const idx = id.indexOf(':');
   return idx >= 0 ? id.slice(idx + 1) : id;
+}
+
+// Is a stored value a plain object? Used to guard the step's `errorDetail`
+// (#1060) before it is hydrated onto a StepExecution, so a malformed/legacy
+// document degrades to "no detail" instead of yielding a partially-typed step.
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 // Narrow a stored value to the { bucket, prefix } resolved-location shape
