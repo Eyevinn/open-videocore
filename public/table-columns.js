@@ -29,7 +29,19 @@
  *       view exactly (same rule the rest of the table's state already follows);
  *     - with no param, the operator's own stored default applies, so their
  *       preferred shape survives a fresh visit to a bare URL;
- *     - with neither, every declared column is shown.
+ *     - with neither, the table's DEFAULT set is shown (see below).
+ *
+ * DECLARED vs DEFAULT (issue #961)
+ *   A table declares every column it CAN paint; it does not have to paint them
+ *   all out of the box. A column marked `defaultVisible: false` is declared,
+ *   listed in the chooser, and addressable by `cols` — but absent until someone
+ *   asks for it. That is what lets a table grow an optional column without
+ *   silently rearranging the view of every operator who never asked for it.
+ *   `defaultVisible` ONLY describes the no-choice-made case: once a URL param or
+ *   a stored preference exists, that set is honoured verbatim and the flag has
+ *   no further say. A column that is both `defaultVisible: false` and
+ *   `hideable: false` is a contradiction; pinning wins, since a column that
+ *   cannot be hidden has to be somewhere.
  *   A toggle writes BOTH: the stored default (so it persists) and the URL (so the
  *   view stays shareable). Storage is best-effort — private-mode and quota errors
  *   are swallowed, because losing a column preference must never break the table.
@@ -162,6 +174,38 @@ export function isHideable(col) {
   return !(col && col.hideable === false);
 }
 
+/**
+ * Is this column painted when nobody has chosen a set? (issue #961)
+ *
+ * True unless it opts out with `defaultVisible: false` — the flag is opt-IN to
+ * being hidden, so every column declared before this existed keeps its place.
+ */
+export function isDefaultVisible(col) {
+  return !(col && col.defaultVisible === false);
+}
+
+/**
+ * The keys a table paints with NO request of any kind: every declared column
+ * except the ones that opted out, plus any pinned (`hideable: false`) column
+ * regardless of its flag.
+ *
+ * Falls back to every declared key if that set would be empty — a table whose
+ * every column opted out of the default is a declaration bug, and the honest
+ * repair is to paint it rather than to render a headerless grid.
+ *
+ * @param {Array<{key:string,defaultVisible?:boolean,hideable?:boolean}>} columns
+ * @returns {string[]} keys in DECLARED order.
+ */
+export function defaultVisibleColumns(columns) {
+  const declared = declaredKeys(columns);
+  const byKey = new Map((Array.isArray(columns) ? columns : []).map((c) => [c && c.key, c]));
+  const out = declared.filter((k) => {
+    const col = byKey.get(k);
+    return isDefaultVisible(col) || !isHideable(col);
+  });
+  return out.length ? out : declared;
+}
+
 function groupsOf(options) {
   const raw = options && options.requireAtLeastOne;
   if (!Array.isArray(raw)) return [];
@@ -175,8 +219,10 @@ function groupsOf(options) {
  * Turn a REQUESTED key set into a LEGAL visible set.
  *
  * @param {string[]|null} requested  keys the URL / storage / operator asked for;
- *        null or unusable means "no request" -> every declared column.
- * @param {Array<{key:string,hideable?:boolean}>} columns  declared columns.
+ *        null or unusable means "no request" -> the table's DEFAULT set
+ *        (defaultVisibleColumns, i.e. every declared column that did not opt out
+ *        with `defaultVisible: false`).
+ * @param {Array<{key:string,hideable?:boolean,defaultVisible?:boolean}>} columns
  * @param {{requireAtLeastOne?:string[][]}} [options]
  * @returns {string[]} keys in DECLARED order (the order the table paints in).
  *
@@ -185,16 +231,19 @@ function groupsOf(options) {
  *     from before a column was renamed must not resurrect a phantom column);
  *   - `hideable: false` columns are always re-added;
  *   - a group with no surviving member gets its first declared member back;
- *   - an empty outcome falls all the way back to every declared column, so no
- *     input can produce a headerless table.
+ *   - an empty outcome falls all the way back to the default set, so no input
+ *     can produce a headerless table.
+ *
+ * Note that an explicit request is NOT filtered by `defaultVisible` — asking for
+ * an off-by-default column is exactly how it gets painted (issue #961).
  */
 export function normalizeVisibleColumns(requested, columns, options) {
   const declared = declaredKeys(columns);
   if (!declared.length) return [];
-  const all = () => declared.slice();
+  const fallback = () => defaultVisibleColumns(columns);
 
   const asked = cleanKeyList(requested);
-  if (!asked) return all();
+  if (!asked) return fallback();
 
   const askedSet = new Set(asked);
   const byKey = new Map((Array.isArray(columns) ? columns : []).map((c) => [c && c.key, c]));
@@ -216,7 +265,7 @@ export function normalizeVisibleColumns(requested, columns, options) {
   }
 
   const out = declared.filter((k) => visibleSet.has(k));
-  return out.length ? out : all();
+  return out.length ? out : fallback();
 }
 
 /**

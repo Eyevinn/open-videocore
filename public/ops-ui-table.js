@@ -297,16 +297,20 @@ export function createOpsTableState(config) {
 //
 // config:
 //   columns:    [{ key, label, sortable?, sortKey?, align?, width?, render?,
-//                  hideable?, chooserLabel? }]
+//                  hideable?, defaultVisible?, chooserLabel? }]
 //               `sortable` enables the tri-state header button; `sortKey` (falls
 //               back to `key`) is what toggleSort() tracks. `render(row)` returns
 //               an escaped HTML string for the cell (matches app.js style); when
 //               omitted the cell shows escaped row[key]. `hideable: false` pins a
-//               column against the chooser; `chooserLabel` names a column whose
-//               header caption is empty (e.g. a thumbnail column) in that list.
+//               column against the chooser; `defaultVisible: false` (issue #961)
+//               declares a column that the chooser offers but the table does not
+//               paint until someone asks for it; `chooserLabel` names a column
+//               whose header caption is empty (e.g. a thumbnail column) in that
+//               list.
 //   columnChooser: optional (issue #959) — { visible?, requireAtLeastOne?, label?,
 //               onChange? }. `visible` is the initial visible key set (null/absent
-//               = every declared column); `requireAtLeastOne` is a list of groups
+//               = the DEFAULT set, which is every declared column unless one
+//               opted out via `defaultVisible: false`); `requireAtLeastOne` is a list of groups
 //               that must each keep one visible member; `onChange(keys)` fires
 //               after an operator toggle so the consumer can persist it. Present =
 //               a "Columns" control is mounted in the filter bar. Toggling NEVER
@@ -356,8 +360,9 @@ export function createOpsTable(config) {
   const columnGroups = chooserCfg && Array.isArray(chooserCfg.requireAtLeastOne)
     ? chooserCfg.requireAtLeastOne
     : [];
-  // With no chooser configured, `null` normalizes to "every declared column", so
-  // a table that never opts in behaves exactly as it did before.
+  // With no chooser configured, `null` normalizes to the table's DEFAULT set,
+  // which for a table that declares no `defaultVisible: false` column is every
+  // declared column — so a table that never opts in behaves exactly as before.
   let visibleKeys = normalizeVisibleColumns(
     chooserCfg ? chooserCfg.visible : null,
     columns,
