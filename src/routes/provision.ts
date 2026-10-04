@@ -24,6 +24,7 @@ import nano from 'nano';
 import {
   deprovisionStack,
   deprovisionStackFromConfig,
+  type ServiceTeardownResult,
   type StackTeardownResult
 } from '../services/deprovision.js';
 import {
@@ -1292,13 +1293,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // call the tenant was never told to make. Tear them down best-effort
           // here, in dependency-safe order, reusing the SAME idempotent
           // teardown the DELETE route uses (deprovisionStackFromConfig ->
-          // teardownService: probes getInstance first, tolerates already-gone).
+          // teardownService: probes getInstance, CONFIRMS an empty probe against
+          // the instance list, and tolerates a confirmed already-gone instance).
           //
           // CRITICAL (issue #736 trap): only `created` is rolled back. provision()
           // is idempotent (#417) and ADOPTS a pre-existing instance on "already
           // taken"; those live in `provisioned` but NOT `created`, so a rollback
           // never deletes an instance the tenant already had.
           let rollback: StackTeardownResult | undefined;
+          let rollbackThrew: string | undefined;
           if (created.length > 0) {
             try {
               rollback = await deprovisionStackFromConfig(
@@ -1316,6 +1319,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             } catch (rollbackErr) {
+              rollbackThrew =
+                rollbackErr instanceof Error
+                  ? rollbackErr.message
+                  : String(rollbackErr);
               app.log.error(
                 { rollbackErr, name, created },
                 'rollback of created instances threw; some may still be running'
@@ -1323,10 +1330,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             }
           }
 
+          // A rollback that threw tore down NOTHING we can account for, so every
+          // created instance is unaccounted-for rather than gone (issue #1039:
+          // an unverifiable teardown must never read as "nothing left"). Report
+          // each one as a failed teardown so it lands in `leftovers`, in
+          // `stillRunning`, and in the persisted services[] a retry reads.
+          const rollbackServices: ServiceTeardownResult[] =
+            rollback?.services ??
+            created.map((c) => ({
+              serviceId: c.serviceId,
+              role: 'unknown',
+              status: 'failed' as const,
+              error: rollbackThrew ?? 'rollback did not run'
+            }));
+
           // Created instances that could NOT be torn down are still running and
           // still billing — surfaced in the operation result with the exact
           // deprovision call so the tenant can finish removing them.
-          const leftovers = (rollback?.services ?? []).filter(
+          const leftovers = rollbackServices.filter(
             (s) => s.status === 'failed'
           );
 
@@ -1376,20 +1397,43 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // Report the rollback outcome so the caller knows the created
             // instances were torn down (or, if teardown itself failed, exactly
             // which leftovers remain and how to remove them) — issue #736.
+            //
+            // When this operation created nothing there was nothing to roll
+            // back, which is NOT the same as "nothing is left": any instance the
+            // run ADOPTED is still running. That case reports `not_attempted`
+            // rather than the old `not_found`, which read as an empty stack
+            // (issue #1039). `stillRunning` lists everything that survives —
+            // adopted instances included — with the call that removes them.
             result: {
               name,
               failedService: currentService,
-              rollback: rollback
-                ? { status: rollback.status, services: rollback.services }
-                : { status: 'not_found', services: [] },
+              rollback:
+                created.length === 0
+                  ? {
+                      status: 'not_attempted',
+                      services: [],
+                      reason: 'this operation created no instances'
+                    }
+                  : {
+                      status: rollback?.status ?? 'failed',
+                      services: rollbackServices
+                    },
+              ...(stillRunning.length > 0
+                ? {
+                    stillRunning: stillRunning.map((p) => ({
+                      serviceId: p.serviceId,
+                      instanceName: p.name
+                    })),
+                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                  }
+                : {}),
               ...(leftovers.length > 0
                 ? {
                     leftovers: leftovers.map((s) => ({
                       serviceId: s.serviceId,
                       instanceName: name,
                       error: s.error
-                    })),
-                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                    }))
                   }
                 : {})
             }
