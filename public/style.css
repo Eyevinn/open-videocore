@@ -269,12 +269,25 @@ tbody td {
 }
 
 /* Click-to-copy button beside an identifier (issue #851). Always visible — the
-   id must be copyable without hovering for a tooltip. */
+   id must be copyable without hovering for a tooltip.
+
+   Icon button since issue #990: a square 24x24 box holding the CSS-drawn glyph
+   below, with the words kept in a `.visually-hidden` span (the live region the
+   outcome is announced through — see public/copy-id.js). The painted box is
+   24x24, the SC 2.5.8 Target Size (Minimum) floor, which the old 11px pill
+   missed on the vertical axis at ~20px tall; `::after` below then extends the
+   clickable region past the paint so the target does not shrink in area either.
+   Colour comes from `currentColor`, so the glyph follows the muted/hover/outcome
+   rules rather than hardcoding a hue. */
 .copy-id-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
   margin-left: 6px;
-  padding: 1px 6px;
-  font-size: 11px;
-  line-height: 16px;
+  padding: 0;
   vertical-align: middle;
   color: var(--text-muted);
   background: transparent;
@@ -283,9 +296,116 @@ tbody td {
   cursor: pointer;
 }
 
+/* Hit area, not decoration: the clickable region reaches 4px beyond the painted
+   box on every side (32x32 = 1024px², against the old pill's ~40x20 = 800px²),
+   so going from a worded pill to a square icon enlarges the target instead of
+   shrinking it. 4px fits inside the 6px gap to the id text, so neighbouring
+   controls are not overlapped. */
+.copy-id-btn::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+}
+
+.copy-id-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .copy-id-btn:hover {
   color: var(--text);
   border-color: var(--accent, var(--border));
+}
+
+/* Outcome states (issue #990). Order matters: these follow `:hover` at equal
+   specificity so a pointer resting on the button cannot repaint away the result
+   it just produced. Each state changes the glyph's SHAPE as well as its colour,
+   so success and failure are not told apart by hue alone (WCAG 1.4.1). */
+.copy-id-btn.is-copied {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.copy-id-btn.is-copy-failed {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* The glyph. Drawn from the two pseudo-elements of an empty, aria-hidden span —
+   `public/` has no icon set, no icon font and no inline SVG, and the magnifier at
+   `.ops-search-icon` below is built the same way. Everything is `currentColor`,
+   inherited from the rules above. */
+.copy-id-btn-icon {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+
+/* Resting: two offset sheets. The back sheet is drawn as its top and right edges
+   only, which keeps it clear of the front sheet entirely — no occluding fill, so
+   the icon sits on a row background of any colour. */
+.copy-id-btn-icon::before {
+  content: '';
+  position: absolute;
+  left: 3.5px;
+  top: 0;
+  width: 10.5px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-bottom: 0;
+  border-left: 0;
+  border-radius: 0 2px 0 0;
+}
+
+.copy-id-btn-icon::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 3.5px;
+  width: 9.5px;
+  height: 10.5px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+
+/* Copied: a tick — a left+bottom border corner rotated 45°. Offsets put the
+   unrotated box's centre at (7px, 6.25px) so the rotated glyph lands centred in
+   the 14px icon box rather than riding up against its top edge. */
+.copy-id-btn.is-copied .copy-id-btn-icon::before {
+  left: 2px;
+  top: 3.5px;
+  width: 10px;
+  height: 5.5px;
+  border: 1.5px solid currentColor;
+  border-top: 0;
+  border-right: 0;
+  border-radius: 0 0 1px 1px;
+  transform: rotate(-45deg);
+}
+
+.copy-id-btn.is-copied .copy-id-btn-icon::after {
+  content: none;
+}
+
+/* Not copied: a cross. Different shape, not just a different colour. */
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::before,
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::after {
+  left: 1px;
+  top: 6.25px;
+  width: 12px;
+  height: 1.5px;
+  background: currentColor;
+  border: 0;
+  border-radius: 1px;
+}
+
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::before {
+  transform: rotate(45deg);
+}
+
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::after {
+  transform: rotate(-45deg);
 }
 
 /* Jobs table Asset cell (issue #988): the asset's human-readable name leads,
