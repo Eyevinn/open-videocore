@@ -2077,7 +2077,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // than thrown because this is a fire-and-forget pipeline step: throwing here
   // would fail the whole execution, which an unconfigured optional step must
   // never do.
-  function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+  //
+  // `storage` has exactly the meaning it has on `triggerExtraction` above
+  // (issue #1051 review): a caller that already resolved a WorkspaceStorage
+  // hands it in instead of resolving a fresh one here. Callers running INSIDE
+  // the request may omit it and get the resolver-cache entry the onRequest hook
+  // warmed for this request's stack; a caller that reaches this AFTER the
+  // request's work has settled MUST pass the handle, because `storageFor()` is a
+  // cache read whose entry can age past the resolver TTL (`CACHE_TTL_MS`,
+  // services/workspace-stack.ts) during a long transfer — after which the
+  // factory THROWS rather than returning the wrong stack, and here that throw
+  // would land in a detached continuation. Same shape as
+  // `triggerExtraction(assetId, objectKey, externalSource?, storage?)` and
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts).
+  //
+  // Note this only covers the DATA plane. The runner factory is still built from
+  // `request.connections` (issue #1062), which is request-scoped state captured
+  // synchronously here rather than a TTL'd cache read, so it stays correct for a
+  // non-default `x-stack-name` even when called from a detached continuation.
+  function triggerThumbnail(
+    assetId: string,
+    objectKey: string,
+    request: import('fastify').FastifyRequest,
+    storage?: WorkspaceStorage
+  ): boolean {
     if (!opts.thumbnailExtractor || !storageFor) {
       return false;
     }
@@ -2097,7 +2120,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     void thumbnailRunner(
       { assetId, objectKey, timecodes: [1] },
-      { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
+      {
+        assets: repo,
+        storage: storage ?? storageFor(),
+        extractor: resolvedExtractor,
+        ...opts.thumbnailDeps
+      }
     ).catch(() => {
       /* thumbnail failures are recorded on the asset by the runner */
     });
@@ -3166,8 +3194,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
-      // extraction against the now-stored object (issue #6); we only extract if
-      // the asset actually advanced to `processing` (pull succeeded).
+      // extraction AND poster-frame extraction against the now-stored object
+      // (issues #6, #1050); we only run either if the asset actually advanced to
+      // `processing` (pull succeeded).
+      //
+      // issue #1050: this branch previously ran extraction only, so a
+      // URL-ingested asset never got a `thumbnails` entry while an uploaded one
+      // did (main.ts onObjectStored runs both). The pull lands the bytes in
+      // OSC-managed storage under our own `ingest/<id>` key, so the thumbnail
+      // runner's presignedGet of that key resolves exactly as it does for an
+      // upload — the two paths are now at parity.
+      //
+      // Deliberately NOT applied to the external-backend branch above: there
+      // objectKey is `s3://<foreign-bucket>/<key>`, and the thumbnail runner
+      // resolves its source via deps.storage.presignedGet (thumbnail.ts:119),
+      // which cannot presign a bucket this deployment's storage does not own.
+      // triggerExtraction takes an externalSource for that case; triggerThumbnail
+      // has no equivalent, so calling it there would fail silently. Giving the
+      // thumbnail path the same external-source treatment is a separate change.
       void runner(
         { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
         {
@@ -3195,6 +3239,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           const settled = await repo.get(asset.id);
           if (settled?.status === 'processing') {
             triggerExtraction(asset.id, objectKey, undefined, pullStorage);
+            // Same `pullStorage` handle, for the same reason (issue #1051
+            // review): this runs AFTER the request's work has settled, so
+            // `storageFor()` can have aged past the resolver TTL and would throw
+            // inside this detached continuation. Passing the handle resolved at
+            // request time keeps the thumbnail path symmetric with the
+            // extraction path immediately above instead of silently depending on
+            // the ambient request-stack context.
+            triggerThumbnail(asset.id, objectKey, request, pullStorage);
           }
         })
         // This continuation outlives the request, so nothing is left to surface
@@ -3206,7 +3258,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         .catch((err: unknown) => {
           request.log.error(
             { err, assetId: asset.id, jobId: job.id },
-            'post-pull metadata extraction could not be started'
+            'post-pull metadata/thumbnail extraction could not be started'
           );
         });
 
