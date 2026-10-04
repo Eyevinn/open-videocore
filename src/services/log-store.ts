@@ -3,8 +3,9 @@
 //
 // Backs GET /api/v1/logs — a cursor/sequence-paged, append-only, time-ordered
 // log stream: a single append-only sequence with message/level/category records
-// and monotonic sequence numbers so paging is stable against concurrent appends
-// (no offset drift).
+// and monotonic record ids so paging is stable against concurrent appends (no
+// offset drift, and — since the #996 review — no key collisions between two
+// store instances over one database either; see `LogRecord.id`).
 //
 // The DURABLE implementation is CouchLogStore (src/data/couch-log-repo.ts,
 // issue #996), which persists each record as its own immutable document the way
@@ -31,17 +32,55 @@
 //   - Shared-pure-query device for a Couch + in-memory store pair:
 //     `applyAuditQuery(all, query)` at src/data/audit-repo.ts:141-162.
 
+import { monotonicFactory } from 'ulid';
+
 // Optional severity carried by a log record. Absent when the underlying source
 // does not classify the entry.
 export const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
 
-// One log record. `seq` is a monotonic, gap-free sequence number assigned at
-// append time; it is the stable pagination key (cursors encode a `seq`
-// boundary, never an array offset, so newly appended entries never shift an
-// in-flight page). `timestamp` is an ISO-8601 instant. `level`/`category` are
-// optional metadata the source may attach.
+// Record-id minter shared by EVERY store in the process (#996 review finding 1).
+//
+// `monotonicFactory()` (not bare `ulid()`) because log records arrive in
+// same-millisecond bursts and plain ULIDs randomise the low bits, so two ids
+// minted in one millisecond are not ordered by mint time. Monotonic ids are
+// strictly increasing within this process, which is what makes `id` a usable
+// total order (see `LogRecord.id`).
+//
+// MODULE level, deliberately: the durable CouchLogStore is reconstructed on
+// every resolver cache miss (buildConnectionsFromStack,
+// src/services/workspace-stack.ts:249, CACHE_TTL_MS), so two store instances can
+// be live over ONE database at once. A per-instance minter would let them mint
+// colliding keys; one module-level minter cannot.
+const mintId = monotonicFactory();
+
+// Mint the next log record id. Exported so the durable store can use the SAME
+// sequence for the record id and the CouchDB document `_id` — the two must be
+// the same value, because ascending `_id` order is what the store's oldest-first
+// scans mean by "append order" (src/data/couch-log-repo.ts).
+export function mintLogRecordId(): string {
+  return mintId();
+}
+
+// One log record.
+//
+// `id` is a monotonic ULID minted at append time and is the AUTHORITATIVE
+// ordering and pagination key (#996 review finding 1): it is unique per record
+// across every store instance in the process, so sorting and cursor resumption
+// can never skip a record. On the durable store it is also the CouchDB document
+// `_id`. It is internal — the HTTP response schema (src/routes/logs.ts:55-63)
+// does not include it, and the zod serializer strips it, so the wire contract is
+// unchanged.
+//
+// `seq` is a per-store counter kept for DISPLAY only. It is NOT unique: a fresh
+// store instance seeds it from the persisted high-water mark, so two instances
+// over one database can mint the same `seq`. Nothing may order or paginate on
+// it (that is exactly the bug finding 1 describes).
+//
+// `timestamp` is an ISO-8601 instant. `level`/`category` are optional metadata
+// the source may attach.
 export type LogRecord = {
+  id: string;
   seq: number;
   timestamp: string;
   message: string;
@@ -63,7 +102,7 @@ export type ListLogsOptions = {
   // defends with its own clamp so a direct (non-route) caller cannot request an
   // unbounded page.
   limit?: number;
-  // Opaque forward cursor from a previous page's `nextCursor`. Encodes the `seq`
+  // Opaque forward cursor from a previous page's `nextCursor`. Encodes the `id`
   // boundary already returned, so paging resumes strictly after it regardless of
   // appends since. Invalid/garbage cursors are treated as "from the start".
   cursor?: string;
@@ -80,6 +119,13 @@ export type ListLogsResult = {
   items: LogRecord[];
   // Opaque token to fetch the next page, or null when this page is the last.
   nextCursor: string | null;
+  // Set when the store could not scan the whole retained window for this read,
+  // so the answer is a bounded view rather than the complete one (#996 review
+  // finding 2). Only the durable store sets it; the in-memory store always holds
+  // its whole window. NOT part of the HTTP body — the response schema
+  // (src/routes/logs.ts:81-85) does not include it and the zod serializer strips
+  // it; the route turns it into a response header instead.
+  degraded?: boolean;
 };
 
 const DEFAULT_LIMIT = 50;
@@ -103,17 +149,44 @@ export type LogStoreOptions = {
   maxRecords?: number;
 };
 
-// Cursors are opaque to callers. We encode the last-returned `seq` as a
-// base64url token so it survives round-tripping through a query string and is
-// clearly not an offset. Decoding is tolerant: anything that does not parse to a
-// finite integer is treated as "no cursor".
-const CURSOR_PREFIX = 'seq:';
-
-function encodeCursor(seq: number): string {
-  return Buffer.from(`${CURSOR_PREFIX}${seq}`, 'utf8').toString('base64url');
+// Minimal error-logging surface a store writes its own failures to (#996 review
+// finding 2: a log store must never swallow its own errors). Structurally
+// satisfied by the Fastify/pino logger and by StackResolverLogger
+// (src/services/workspace-stack.ts:89-93), which is what the resolver passes to
+// the durable store, so no adapter is needed. Same shape as
+// `PipelineLogErrorLog` (src/services/pipeline-log.ts:60-62) — kept separate
+// because that one is the PRODUCER's seam and this one is the STORE's.
+export interface LogStoreErrorLog {
+  error(obj: unknown, msg?: string): void;
 }
 
-function decodeCursor(cursor: string | undefined): number | undefined {
+// Cursors are opaque to callers. We encode the last-returned record's `id` as a
+// base64url token so it survives round-tripping through a query string and is
+// clearly not an offset. Decoding is tolerant: anything that does not parse is
+// treated as "no cursor".
+//
+// The key is `id`, not `seq` (#996 review finding 1). `seq` is minted by a
+// per-store counter, so two store instances over one database can mint the same
+// value; because paging resumes STRICTLY past the boundary, a duplicate `seq`
+// straddling a page boundary made a durably-written record unreachable. `id` is
+// a monotonic ULID that is unique per record, so no record can be skipped.
+const CURSOR_PREFIX = 'id:';
+
+// Cursors minted BEFORE this change encoded a `seq` boundary. They are still
+// honoured, with the old semantics, so a page in flight across a deploy keeps
+// paging forward instead of silently restarting at page one. New cursors are
+// never minted in this form.
+const LEGACY_SEQ_CURSOR_PREFIX = 'seq:';
+
+// The decoded paging boundary: an `id` from a current cursor, or a `seq` from a
+// pre-#996-review one.
+type CursorBoundary = { kind: 'id'; id: string } | { kind: 'seq'; seq: number };
+
+function encodeCursor(id: string): string {
+  return Buffer.from(`${CURSOR_PREFIX}${id}`, 'utf8').toString('base64url');
+}
+
+function decodeCursor(cursor: string | undefined): CursorBoundary | undefined {
   if (!cursor) return undefined;
   let decoded: string;
   try {
@@ -121,9 +194,38 @@ function decodeCursor(cursor: string | undefined): number | undefined {
   } catch {
     return undefined;
   }
-  if (!decoded.startsWith(CURSOR_PREFIX)) return undefined;
-  const parsed = Number.parseInt(decoded.slice(CURSOR_PREFIX.length), 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  if (decoded.startsWith(CURSOR_PREFIX)) {
+    const id = decoded.slice(CURSOR_PREFIX.length);
+    return id ? { kind: 'id', id } : undefined;
+  }
+  if (decoded.startsWith(LEGACY_SEQ_CURSOR_PREFIX)) {
+    const parsed = Number.parseInt(decoded.slice(LEGACY_SEQ_CURSOR_PREFIX.length), 10);
+    return Number.isFinite(parsed) ? { kind: 'seq', seq: parsed } : undefined;
+  }
+  return undefined;
+}
+
+// Total order on record ids. ULIDs are fixed-length Crockford base32, so a plain
+// codepoint comparison is their time order; `localeCompare` is deliberately NOT
+// used here (it is locale-sensitive, and this comparison must be stable).
+function compareIds(a: string, b: string): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
+// Is this record strictly past the paging boundary, in the direction of travel?
+function isAfterBoundary(
+  record: LogRecord,
+  boundary: CursorBoundary,
+  order: 'asc' | 'desc'
+): boolean {
+  if (boundary.kind === 'id') {
+    return order === 'desc'
+      ? compareIds(record.id, boundary.id) < 0
+      : compareIds(record.id, boundary.id) > 0;
+  }
+  // Legacy `seq` boundary — the pre-review semantics, verbatim.
+  return order === 'desc' ? record.seq < boundary.seq : record.seq > boundary.seq;
 }
 
 function clampLimit(limit: number | undefined): number {
@@ -147,7 +249,7 @@ export function applyLogQuery(
 ): ListLogsResult {
   const limit = clampLimit(opts.limit);
   const order = opts.order === 'asc' ? 'asc' : 'desc';
-  const cursorSeq = decodeCursor(opts.cursor);
+  const boundary = decodeCursor(opts.cursor);
   const q = opts.q?.toLowerCase();
 
   // Apply the server-side filters first. Filtering never changes the underlying
@@ -159,24 +261,27 @@ export function applyLogQuery(
     return true;
   });
 
-  // Newest-first by default. Sequence order is the tie-break-free ordering
-  // authority (timestamps can collide; `seq` cannot), so we order by `seq`.
-  // `filtered` is already a fresh array owned by this call, so it is sorted in
-  // place — the caller's array is never reordered.
-  const ordered = filtered.sort((a, b) => (order === 'desc' ? b.seq - a.seq : a.seq - b.seq));
+  // Newest-first by default, ordered by `id`. `id` is the tie-break-free
+  // ordering authority: it is a monotonic ULID minted per record, so it is
+  // unique across store instances (timestamps can collide, and so can `seq` —
+  // see LogRecord). `filtered` is already a fresh array owned by this call, so
+  // it is sorted in place — the caller's array is never reordered.
+  const ordered = filtered.sort((a, b) =>
+    order === 'desc' ? compareIds(b.id, a.id) : compareIds(a.id, b.id)
+  );
 
-  // Resume strictly AFTER the cursor's seq boundary, respecting direction.
+  // Resume strictly AFTER the cursor's boundary, respecting direction. Because
+  // the boundary is a unique `id`, "strictly after" can only ever exclude the
+  // boundary record itself — never a second record that happened to share a key.
   const afterCursor =
-    cursorSeq === undefined
-      ? ordered
-      : ordered.filter((r) => (order === 'desc' ? r.seq < cursorSeq : r.seq > cursorSeq));
+    boundary === undefined ? ordered : ordered.filter((r) => isAfterBoundary(r, boundary, order));
 
   const page = afterCursor.slice(0, limit);
   // There is a next page iff the filtered/ordered stream had more entries than
-  // this page returned. The cursor is the last returned record's seq.
+  // this page returned. The cursor is the last returned record's id.
   const hasMore = afterCursor.length > page.length;
   const last = page[page.length - 1];
-  const nextCursor = hasMore && last ? encodeCursor(last.seq) : null;
+  const nextCursor = hasMore && last ? encodeCursor(last.id) : null;
 
   return { items: page.map((r) => ({ ...r })), nextCursor };
 }
@@ -205,11 +310,11 @@ export interface LogSink {
 // (src/data/audit-repo.ts:312). Process-local: records do NOT survive a restart
 // — that is what CouchLogStore (src/data/couch-log-repo.ts, issue #996) is for.
 export class LogStore {
-  // Append order == sequence order, so the array is intrinsically ordered by
-  // `seq` ascending. We never reorder entries, and the only removal is
-  // oldest-first eviction at the cap (see maxRecords) — so the held window is
-  // always a contiguous, ascending `seq` tail, which is what keeps cursor paging
-  // drift-free: a cursor is a `seq` boundary, never an array offset, so appends
+  // Append order == id order, so the array is intrinsically ordered by `id`
+  // ascending. We never reorder entries, and the only removal is oldest-first
+  // eviction at the cap (see maxRecords) — so the held window is always a
+  // contiguous, ascending `id` tail, which is what keeps cursor paging
+  // drift-free: a cursor is an `id` boundary, never an array offset, so appends
   // AND evictions both leave an in-flight page's boundary meaningful.
   private readonly records: LogRecord[] = [];
   private seq = 0;
@@ -228,6 +333,10 @@ export class LogStore {
 
   append(input: AppendLogInput): LogRecord {
     const record: LogRecord = {
+      // Authoritative ordering/cursor key, from the process-wide monotonic
+      // minter so it cannot collide with any other store's ids (#996 review
+      // finding 1).
+      id: mintLogRecordId(),
       seq: ++this.seq,
       timestamp: input.timestamp ?? new Date().toISOString(),
       message: input.message,
@@ -235,8 +344,8 @@ export class LogStore {
       ...(input.category !== undefined ? { category: input.category } : {})
     };
     this.records.push(record);
-    // Evict oldest-first past the cap. `seq` is NEVER reset or reused, so the
-    // monotonic sequence contract survives eviction: an aged-out cursor
+    // Evict oldest-first past the cap. Ids are NEVER reset or reused, so the
+    // monotonic ordering contract survives eviction: an aged-out cursor
     // boundary simply has no records on its older side, which `list()` already
     // handles (a desc page resuming after an evicted boundary returns the
     // remaining older records, or an empty last page with nextCursor null).

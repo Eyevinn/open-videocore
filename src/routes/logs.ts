@@ -53,8 +53,12 @@ import { authGate } from '../auth/middleware.js';
 // (src/services/log-store.ts). `level`/`category` are optional — present only
 // when the underlying source classifies the entry.
 const logRecordSchema = z.object({
-  // Monotonic, gap-free sequence number. The stable pagination key: cursors
-  // encode a `seq` boundary, so appends never shift an in-flight page.
+  // Per-store display sequence number. NOT the pagination key: cursors encode
+  // the record's internal monotonic id (`LogRecord.id`,
+  // src/services/log-store.ts), which is unique across store instances, so
+  // appends never shift an in-flight page and no record can be skipped at a page
+  // boundary. The internal id is deliberately absent from this schema, so the
+  // zod serializer strips it and the wire contract is unchanged.
   seq: z.number().int(),
   timestamp: z.string(),
   message: z.string(),
@@ -115,18 +119,32 @@ export const logsRouter: FastifyPluginAsync<LogsRouterOptions> = async (fastify,
           'null `nextCursor` marks the last page. Filter server-side with ' +
           '`from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-' +
           'insensitive message substring). Set `order=asc` to reverse the default ' +
-          'newest-first sort. This endpoint is cursor/sequence-only: there is no ' +
-          'offset or page-number param, so newly appended entries never shift an ' +
-          'in-flight page (#371, #473).',
+          'newest-first sort. This endpoint is cursor-only: there is no offset or ' +
+          'page-number param, so newly appended entries never shift an in-flight ' +
+          'page (#371, #473). Response header `x-log-window-degraded: true` means ' +
+          'the durable store could not scan its whole retained window for this ' +
+          'read and the page covers the newest records only; the body and 200 ' +
+          'status are unchanged by this header (#996).',
         querystring: listLogsQuerySchema,
         response: { 200: listLogsResponseSchema }
       }
     },
-    async (request) => {
+    async (request, reply) => {
       const { limit, cursor, from, to, q, order } = request.query;
       // Awaited so a promised read (the durable CouchDB store) and a
       // synchronous one (in-memory) both serialise to the same body.
-      return await logStore.list({ limit, cursor, from, to, q, order });
+      const result = await logStore.list({ limit, cursor, from, to, q, order });
+      // The durable store sets `degraded` when the log partition overshot its
+      // bounded read window, so the page is the newest records rather than the
+      // whole retained window (#996 review finding 2 — this used to be served as
+      // an ordinary 200 with no hint at all). Surfaced as a RESPONSE HEADER, the
+      // way the profiles router reports `x-profile-count`
+      // (src/routes/profiles.ts:171): the body schema below is unchanged, and
+      // the zod serializer strips the flag from the payload.
+      if (result.degraded) {
+        reply.header('x-log-window-degraded', 'true');
+      }
+      return result;
     }
   );
 };

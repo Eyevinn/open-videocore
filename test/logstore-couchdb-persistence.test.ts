@@ -32,7 +32,7 @@ import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod
 import type { StoredDoc } from '../src/data/couchdb.js';
 import type { StackCouch } from '../src/data/couchdb.js';
 import { CouchLogStore } from '../src/data/couch-log-repo.js';
-import { LogStore, type ListLogsOptions } from '../src/services/log-store.js';
+import { LogStore, type ListLogsOptions, type LogRecord } from '../src/services/log-store.js';
 import { logsRouter } from '../src/routes/logs.js';
 import { logPipelineEvent } from '../src/services/pipeline-log.js';
 
@@ -45,6 +45,9 @@ class FakeCouch {
   readonly docs = new Map<string, StoredDoc>();
   private rev = 0;
   puts = 0;
+  // When set, `remove` rejects — standing in for a CouchDB that accepts writes
+  // but fails the eviction delete (#996 review finding 2).
+  removeError: Error | undefined;
 
   async put(localId: string, body: Record<string, unknown>): Promise<{ id: string; rev: string }> {
     this.rev += 1;
@@ -82,6 +85,7 @@ class FakeCouch {
   }
 
   async remove(localId: string): Promise<void> {
+    if (this.removeError) throw this.removeError;
     this.docs.delete(localId);
   }
 
@@ -92,6 +96,31 @@ class FakeCouch {
 
 function couchFactory(fake: FakeCouch): () => StackCouch {
   return () => fake as unknown as StackCouch;
+}
+
+// Drop the internal ordering key before comparing records. `LogRecord.id`
+// (src/services/log-store.ts) is the monotonic ULID the sort and the cursor use;
+// it is deliberately NOT in the HTTP response schema (src/routes/logs.ts:55-63),
+// so two stores over different databases have different ids for equivalent
+// records.
+function withoutId(record: LogRecord | undefined): Omit<LogRecord, 'id'> | undefined {
+  if (!record) return undefined;
+  const { id: _id, ...rest } = record;
+  return rest;
+}
+
+// A logger spy matching LogStoreErrorLog (src/services/log-store.ts) — the same
+// shape `StackResolverLogger` satisfies, which is what the resolver passes in.
+function errorLogSpy(): { log: { error: (obj: unknown, msg?: string) => void }; calls: unknown[] } {
+  const calls: unknown[] = [];
+  return {
+    calls,
+    log: {
+      error: (obj: unknown, msg?: string) => {
+        calls.push({ obj, msg });
+      }
+    }
+  };
 }
 
 // Deterministic, strictly-increasing ISO timestamps, as in src/routes/logs.test.ts:38.
@@ -174,10 +203,13 @@ describe('CouchLogStore — records survive a process restart (issue #996)', () 
 
     const reopened = new CouchLogStore(couchFactory(couch));
     const { items } = await reopened.list({ limit: 50, order: 'asc' });
-    expect(items[0]).toEqual({ seq: 1, timestamp: ts(1), message: 'bare' });
+    // `id` is the internal ordering/cursor key (#996 review finding 1) and is
+    // stripped from the HTTP body by the response schema — asserted separately
+    // below — so the record comparison here is over the public fields.
+    expect(withoutId(items[0])).toEqual({ seq: 1, timestamp: ts(1), message: 'bare' });
     expect(items[0]).not.toHaveProperty('level');
     expect(items[0]).not.toHaveProperty('category');
-    expect(items[1]).toEqual({
+    expect(withoutId(items[1])).toEqual({
       seq: 2,
       timestamp: ts(2),
       message: 'classified',
@@ -304,7 +336,14 @@ describe('GET /api/v1/logs contract is unchanged by persistence (issue #996)', (
     }
 
     for (const query of queries) {
-      expect(await durable.list(query)).toEqual(memory.list(query));
+      const fromDurable = await durable.list(query);
+      const fromMemory = memory.list(query);
+      // Public fields, in order: the two stores must answer identically.
+      expect(fromDurable.items.map(withoutId)).toEqual(fromMemory.items.map(withoutId));
+      // The cursor is opaque and now keys on the per-record id, so the two
+      // stores mint different tokens for the same position — but they must agree
+      // on WHETHER there is a next page.
+      expect(fromDurable.nextCursor === null).toBe(fromMemory.nextCursor === null);
     }
   });
 
@@ -345,6 +384,200 @@ describe('GET /api/v1/logs contract is unchanged by persistence (issue #996)', (
     const res = await app.inject({ method: 'GET', url: '/api/v1/logs?limit=500' });
     expect(res.statusCode).toBe(400);
     await app.close();
+  });
+});
+
+// Review finding 1 (#996): `seq` was minted by a per-instance counter, but a new
+// CouchLogStore is constructed on every resolver cache miss
+// (buildConnectionsFromStack -> new CouchLogStore,
+// src/services/workspace-stack.ts, CACHE_TTL_MS), so two live instances over one
+// database mint the SAME next `seq`. Paging resumed strictly past the cursor's
+// `seq` (`applyLogQuery`, src/services/log-store.ts), so a duplicate straddling a
+// page boundary silently dropped a durably-written record from the stream.
+describe('CouchLogStore — paging never drops a record when two stores share a database (#996 review)', () => {
+  // Two stores over ONE database, appending interleaved: exactly the shape the
+  // resolver cache produces.
+  async function seedTwoStores(couch: FakeCouch, rounds: number): Promise<string[]> {
+    const a = new CouchLogStore(couchFactory(couch));
+    const b = new CouchLogStore(couchFactory(couch));
+    const written: string[] = [];
+    for (let i = 1; i <= rounds; i += 1) {
+      written.push((await a.append({ message: `a${i}`, timestamp: ts(i) })).message);
+      written.push((await b.append({ message: `b${i}`, timestamp: ts(i) })).message);
+    }
+    return written;
+  }
+
+  // Walk `nextCursor` to the end exactly as a client does, returning every
+  // message the stream yielded.
+  async function walkAll(store: CouchLogStore, limit: number, order: 'asc' | 'desc') {
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    // Generous bound so a paging bug shows up as a failed assertion below, not
+    // as a hung test.
+    for (let page = 0; page < 100; page += 1) {
+      const result: { items: LogRecord[]; nextCursor: string | null } = await store.list({
+        limit,
+        order,
+        ...(cursor !== undefined ? { cursor } : {})
+      });
+      seen.push(...result.items.map((r) => r.message));
+      if (result.nextCursor === null) return seen;
+      cursor = result.nextCursor;
+    }
+    throw new Error('cursor walk did not terminate');
+  }
+
+  it('actually mints duplicate seq values across the two stores (the precondition)', async () => {
+    const couch = new FakeCouch();
+    await seedTwoStores(couch, 4);
+    const seqs = couch.logDocs().map((d) => d['seq'] as number);
+    expect(seqs).toHaveLength(8);
+    // Duplicates exist — which is why `seq` must not be the cursor key.
+    expect(new Set(seqs).size).toBeLessThan(seqs.length);
+  });
+
+  it.each([1, 2, 3])(
+    'reaches every persisted record walking nextCursor with limit %i',
+    async (limit) => {
+      const couch = new FakeCouch();
+      const written = await seedTwoStores(couch, 6);
+      const reader = new CouchLogStore(couchFactory(couch));
+
+      const desc = await walkAll(reader, limit, 'desc');
+      expect(desc).toHaveLength(written.length);
+      expect(new Set(desc)).toEqual(new Set(written));
+      // No record is yielded twice either.
+      expect(new Set(desc).size).toBe(desc.length);
+
+      const asc = await walkAll(reader, limit, 'asc');
+      expect(asc).toEqual([...desc].reverse());
+    }
+  );
+
+  it('keeps paging after a restart that re-seeds seq from the high-water mark', async () => {
+    const couch = new FakeCouch();
+    const written = await seedTwoStores(couch, 3);
+    // A third store "restarts": it seeds `seq` from the persisted high-water
+    // mark and so re-mints numbers the live stores may also still be using.
+    const restarted = new CouchLogStore(couchFactory(couch));
+    written.push((await restarted.append({ message: 'after-restart', timestamp: ts(9) })).message);
+
+    const seen = await walkAll(restarted, 2, 'desc');
+    expect(new Set(seen)).toEqual(new Set(written));
+  });
+
+  it('keeps the cursor out of the response body and the record id out of the wire', async () => {
+    const couch = new FakeCouch();
+    await seedTwoStores(couch, 2);
+    const app = await buildApp(new CouchLogStore(couchFactory(couch)));
+    const first = (
+      await app.inject({ method: 'GET', url: '/api/v1/logs?limit=1' })
+    ).json() as LogPage;
+    // The public record shape is unchanged: no `id` key leaks through the
+    // response schema (src/routes/logs.ts:55-63).
+    expect(Object.keys(first.items[0] ?? {}).sort()).toEqual([
+      'message',
+      'seq',
+      'timestamp'
+    ]);
+    expect(first.nextCursor).toEqual(expect.any(String));
+
+    // And the whole stream is still reachable over HTTP.
+    const seen: string[] = [...first.items.map((r) => r.message)];
+    let cursor = first.nextCursor;
+    while (cursor) {
+      const page = (
+        await app.inject({
+          method: 'GET',
+          url: `/api/v1/logs?limit=1&cursor=${encodeURIComponent(cursor)}`
+        })
+      ).json() as LogPage;
+      seen.push(...page.items.map((r) => r.message));
+      cursor = page.nextCursor;
+    }
+    expect(new Set(seen)).toEqual(new Set(['a1', 'b1', 'a2', 'b2']));
+    await app.close();
+  });
+});
+
+// Review finding 2 (#996): `list()` served a stale window past the fetch cap with
+// an ordinary 200, and the eviction that kept the partition inside that cap
+// swallowed every error.
+describe('CouchLogStore — an over-cap window and a failed eviction are reported (#996 review)', () => {
+  it('still returns the NEWEST records when the partition exceeds one fetch', async () => {
+    const couch = new FakeCouch();
+    const spy = errorLogSpy();
+    // fetchCap 3 with no eviction (maxRecords far above the record count): the
+    // partition outgrows a single capped, oldest-first fetch.
+    const store = new CouchLogStore(couchFactory(couch), {
+      fetchCap: 3,
+      maxRecords: 100,
+      log: spy.log
+    });
+    for (let i = 1; i <= 7; i += 1) {
+      await store.append({ message: `m${i}`, timestamp: ts(i) });
+    }
+
+    const page = await store.list({ limit: 3 });
+    // Before the fix a single oldest-first fetch of 3 made m4..m7 invisible.
+    expect(page.items.map((r) => r.message)).toEqual(['m7', 'm6', 'm5']);
+    // The caller is told the window was not scanned in one go...
+    expect(page.degraded).toBe(true);
+    // ...and the condition is on the operator's error log, not swallowed.
+    expect(spy.calls).not.toHaveLength(0);
+    expect(spy.calls[0]).toMatchObject({ obj: { fetchCap: 3, hitPageLimit: false } });
+  });
+
+  it('serves the response header when the window is degraded, body unchanged', async () => {
+    const couch = new FakeCouch();
+    const store = new CouchLogStore(couchFactory(couch), { fetchCap: 2, maxRecords: 100 });
+    for (let i = 1; i <= 5; i += 1) {
+      await store.append({ message: `m${i}`, timestamp: ts(i) });
+    }
+    const app = await buildApp(store);
+    const res = await app.inject({ method: 'GET', url: '/api/v1/logs?limit=2' });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['x-log-window-degraded']).toBe('true');
+    const body = res.json() as LogPage;
+    // `{ items, nextCursor }` and nothing else — the contract is untouched.
+    expect(Object.keys(body).sort()).toEqual(['items', 'nextCursor']);
+    expect(body.items.map((r) => r.message)).toEqual(['m5', 'm4']);
+    await app.close();
+  });
+
+  it('omits the header and the flag on a healthy single-fetch window', async () => {
+    const couch = new FakeCouch();
+    const store = new CouchLogStore(couchFactory(couch), { fetchCap: 50 });
+    await store.append({ message: 'only', timestamp: ts(1) });
+    expect(await store.list({ limit: 10 })).not.toHaveProperty('degraded');
+
+    const app = await buildApp(store);
+    const res = await app.inject({ method: 'GET', url: '/api/v1/logs' });
+    expect(res.headers['x-log-window-degraded']).toBeUndefined();
+    await app.close();
+  });
+
+  it('logs a failed overflow eviction at error level instead of swallowing it', async () => {
+    const couch = new FakeCouch();
+    const spy = errorLogSpy();
+    const store = new CouchLogStore(couchFactory(couch), { maxRecords: 1, log: spy.log });
+    await store.append({ message: 'first', timestamp: ts(1) });
+    couch.removeError = new Error('couch unreachable');
+
+    // The append itself still succeeds — the record is already durable, so a
+    // failed eviction must not fail the write that triggered it.
+    const written = await store.append({ message: 'second', timestamp: ts(2) });
+    expect(written.message).toBe('second');
+
+    expect(spy.calls).toHaveLength(1);
+    expect(spy.calls[0]).toMatchObject({
+      obj: { err: couch.removeError, maxRecords: 1 },
+      msg: expect.stringContaining('eviction failed')
+    });
+    // Nothing was evicted, so both records are still listed.
+    const { items } = await store.list({ limit: 10 });
+    expect(items.map((r) => r.message)).toEqual(['second', 'first']);
   });
 });
 

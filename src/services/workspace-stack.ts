@@ -208,7 +208,10 @@ function buildConnectionsFromStack(
   optionalSteps: OptionalStepBuilders,
   // The parameter-store name this config was loaded under (issue #1058).
   // Carried onto the connections as their stack identity.
-  stackName: string | undefined
+  stackName: string | undefined,
+  // Where the durable log store reports its own failures (#996 review finding
+  // 2). Optional so the existing callers/tests are unaffected.
+  log?: StackResolverLogger
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -246,7 +249,9 @@ function buildConnectionsFromStack(
   // Operational log store over the SAME per-stack CouchDB connection (issue
   // #996), so log records land in the stack the request resolved to and survive
   // a restart of this process.
-  const logs = new CouchLogStore(wc);
+  // `log` so a failed overflow eviction or an over-cap read window is reported
+  // instead of swallowed (#996 review finding 2).
+  const logs = new CouchLogStore(wc, { log });
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -336,7 +341,12 @@ export function stackResolvedMinioEndpoint(
 // bypassing the parameter store. The env values are used verbatim — COUCHDB_URL
 // is expected to already carry any credentials it needs, and MinIO uses the
 // MINIO_ACCESS_KEY/MINIO_SECRET_KEY pair.
-function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefined {
+function buildEnvConnections(
+  oscContext: Context,
+  // Where the durable log store reports its own failures (#996 review finding
+  // 2). Optional so the existing callers/tests are unaffected.
+  log?: StackResolverLogger
+): WorkspaceConnections | undefined {
   const couchUrl = process.env['COUCHDB_URL'];
   const minioUrl = process.env['MINIO_URL'];
   if (!couchUrl && !minioUrl) return undefined;
@@ -375,7 +385,9 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
     audit = new CouchAuditRepository(wc);
-    logs = new CouchLogStore(wc);
+    // `log` so a failed overflow eviction or an over-cap read window is reported
+    // instead of swallowed (#996 review finding 2).
+    logs = new CouchLogStore(wc, { log });
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -868,7 +880,7 @@ export class WorkspaceStackResolver {
     // Explicit env-var override (local dev / ops). When COUCHDB_URL or MINIO_URL
     // is set we build connections from the environment for ALL workspaces,
     // bypassing the parameter store entirely.
-    const envConnections = buildEnvConnections(this.oscContext);
+    const envConnections = buildEnvConnections(this.oscContext, this.log);
     if (envConnections) {
       // Explicit env override is an intended, healthy configuration — not a
       // degraded fallback. Clear any prior degraded gauge (issue #422).
@@ -1007,7 +1019,7 @@ export class WorkspaceStackResolver {
     // to no-op in-memory connections so /health and infra routes stay up.
     const built =
       config && isReadyStack(config)
-        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, resolvedName)
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, resolvedName, this.log)
         : null;
 
     // Emit the aggregate degraded-resolution signal (issue #422): a null build
