@@ -38,7 +38,8 @@ import {
   type AssetAudioTrack,
   type AssetRepository,
   type PackagedOutput,
-  type SubtitleTrack
+  type SubtitleTrack,
+  type VideoTrack
 } from '../data/asset-repo.js';
 // Created-at range filtering (issue #833). The wire grammar, the inclusive
 // bound semantics and the normalisation to canonical UTC instants live in ONE
@@ -838,7 +839,47 @@ const addSubtitleTrackSchema = z.object({
   default: z.boolean().optional()
 });
 
+// Machine-probed video tracks (issue #978). Mirrors the PERSISTED per-track
+// shape one-for-one — `VideoTrackSchema` in src/data/asset-document.ts
+// (index?, codec, width, height, bitrateBps?, frameRate?), stored at
+// `technical.video[]` — so the read API reports exactly what the probe wrote,
+// including the `index` / `frameRate` that `technicalMetadata` cannot carry.
+// Unlike `audioTrackOutSchema` above there is no `id`: these are stream
+// descriptors, not editorial records, so they are read-only and not individually
+// addressable.
+const videoTrackOutSchema = z.object({
+  index: z.number().optional(),
+  codec: z.string(),
+  width: z.number(),
+  height: z.number(),
+  bitrateBps: z.number().optional(),
+  frameRate: z.number().optional()
+});
+
+// Project an asset's video tracks for the read API (issue #978). The canonical
+// source is `asset.videoTracks`, mapped straight off the persisted
+// `technical.video[]` (asset-document.ts `fromAssetDocument`). A repository that
+// keeps flat assets without a document round-trip (the in-memory tier) has no
+// such array, so fall back to the single track `technicalFromAsset` would
+// persist for that asset (asset-document.ts: codec, width, height, bitrateBps
+// off `technicalMetadata`) — the same bytes either tier would store, so both
+// backends answer identically. Unprobed asset: empty array, never undefined.
+function videoTracksOf(asset: Asset): VideoTrack[] {
+  if (asset.videoTracks) {
+    return asset.videoTracks;
+  }
+  const tm = asset.technicalMetadata;
+  if (!tm) {
+    return [];
+  }
+  return [{ codec: tm.codec, width: tm.width, height: tm.height, bitrateBps: tm.bitrateBps }];
+}
+
 const tracksSchema = z.object({
+  // Always present, like the two arrays below: empty when the asset has not
+  // been probed (or carries no video stream). Additive — adding a required
+  // property to a RESPONSE does not break existing readers.
+  videoTracks: z.array(videoTrackOutSchema),
   audioTracks: z.array(audioTrackOutSchema),
   subtitleTracks: z.array(subtitleTrackOutSchema)
 });
@@ -5689,9 +5730,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // omitted from the response.
   // -------------------------------------------------------------------------
 
-  // List an asset's audio + subtitle tracks.
-  //   200 — { audioTracks, subtitleTracks } (each possibly empty)
+  // List an asset's video + audio + subtitle tracks.
+  //   200 — { videoTracks, audioTracks, subtitleTracks } (each possibly empty)
   //   404 — unknown/foreign asset
+  //
+  // `videoTracks` (issue #978) is the machine-probed set, projected from the
+  // persisted `technical.video[]` (asset-document.ts) onto `asset.videoTracks`;
+  // the other two are editorial records managed through the POST/DELETE routes
+  // below. Read-only: there is no write path for video tracks.
   app.get(
     '/:id/tracks',
     {
@@ -5707,6 +5753,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send({
+        videoTracks: videoTracksOf(asset),
         audioTracks: asset.audioTracks ?? [],
         subtitleTracks: asset.subtitleTracks ?? []
       });

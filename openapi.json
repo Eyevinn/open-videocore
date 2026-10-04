@@ -11543,6 +11543,38 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "videoTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          },
+                          "frameRate": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "codec",
+                          "width",
+                          "height"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
                     "audioTracks": {
                       "type": "array",
                       "items": {
@@ -11613,6 +11645,7 @@
                     }
                   },
                   "required": [
+                    "videoTracks",
                     "audioTracks",
                     "subtitleTracks"
                   ],
