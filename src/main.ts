@@ -119,7 +119,8 @@ import { usageRouter } from './routes/usage.js';
 import {
   retentionRouter,
   archiveRetentionMsFromEnv,
-  auditRetentionMsFromEnv
+  auditRetentionMsFromEnv,
+  logRetentionMsFromEnv
 } from './routes/retention.js';
 import { logsRouter } from './routes/logs.js';
 import type { LogReader, LogSink } from './services/log-store.js';
@@ -132,6 +133,10 @@ import {
   AuditRetentionPurgeLoop,
   auditPurgeIntervalMsFromEnv
 } from './pipeline/audit-retention-purge-loop.js';
+import {
+  LogRetentionPurgeLoop,
+  logPurgeIntervalMsFromEnv
+} from './pipeline/log-retention-purge-loop.js';
 import {
   AbandonedUploadSweepLoop,
   abandonedUploadIntervalMsFromEnv,
@@ -956,6 +961,14 @@ let archiveRetentionMs = archiveRetentionMsFromEnv();
 // var so PATCH /api/v1/retention/config hot-swaps it with no restart, exactly
 // as archiveRetentionMs is.
 let auditRetentionMs = auditRetentionMsFromEnv();
+
+// Instance-global OPERATIONAL-LOG retention window in ms (issue #1067),
+// parallel to `auditRetentionMs` above. Read from LOG_RETENTION_MS at boot;
+// unset/0 = indefinite retention (never purge), preserving #996's persist-only
+// behaviour for every deployment that does not opt in. Held as a live mutable
+// var so PATCH /api/v1/retention/config hot-swaps it with no restart, exactly as
+// the other two windows are.
+let logRetentionMs = logRetentionMsFromEnv();
 
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
@@ -2316,9 +2329,14 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
   // Boot-time audit-log retention window (issue #566). Exposed on GET
   // /api/v1/retention/config so an operator can see the effective policy.
   auditRetentionMs: auditRetentionMsFromEnv(),
+  // Boot-time operational-log retention window (issue #1067). Exposed on the
+  // same GET /api/v1/retention/config surface so an operator sees one policy
+  // view across archived assets, the audit partition and the log partition.
+  logRetentionMs: logRetentionMsFromEnv(),
   onConfigChange: (cfg) => {
     archiveRetentionMs = cfg.retentionMs;
     auditRetentionMs = cfg.auditRetentionMs;
+    logRetentionMs = cfg.logRetentionMs;
   }
 };
 await app.register(retentionRouter, retentionRouterOptions);
@@ -2416,6 +2434,49 @@ const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
   }
 });
 auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
+
+// Operational-log retention purge sweep (issue #1067), parallel to the
+// audit-retention sweep above and built on the same shape (unref'd,
+// overlap-guarded interval; NOT a new mechanism). It expires WHOLE log records
+// aged past the log-retention window from the persisted log partition
+// (CouchLogStore, src/data/couch-log-repo.ts, issue #996), which until now had
+// no age-based retention at all — its only removal path bounds the record COUNT
+// (the retained-window eviction), not record AGE.
+//
+// It reads the LIVE `logRetentionMs` each tick, so it honours PATCH
+// /api/v1/retention/config and is skipped entirely while the log window is unset
+// (0 = indefinite retention). The log store is ALWAYS present on the resolved
+// connection (issue #996: CouchLogStore on Couch-backed stacks, the
+// process-local LogStore on the no-Couch dev/test paths) and both concrete
+// stores implement the retention surface (listOldestPage / purgeEntry,
+// src/services/log-store.ts `LogRetentionStore`), so each tick resolves the
+// active stack's log store and drives the sweep directly — the same per-tick
+// resolution the audit loop uses, rather than going through the request-scoped
+// PerWorkspaceLogStore.
+const logRetentionPurgeLoop = new LogRetentionPurgeLoop({
+  retentionMs: () => logRetentionMs,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    // Resolve the active stack's log store per tick. The sweep drives it via
+    // listOldestPage (enumerate the aged tail) + purgeEntry (whole-record
+    // expiry). `conns.logs` is always present (issue #996), so no null-guard.
+    logs: {
+      listOldestPage: async (opts: { limit: number; offset?: number }) => {
+        const conns = await stackResolver.resolve();
+        return conns.logs.listOldestPage(opts);
+      },
+      purgeEntry: async (id: string) => {
+        const conns = await stackResolver.resolve();
+        return conns.logs.purgeEntry(id);
+      }
+    }
+  }
+});
+logRetentionPurgeLoop.start(logPurgeIntervalMsFromEnv());
 
 // Abandoned-upload settle sweep (issue #726). An INDEPENDENT unref'd, overlap-
 // guarded interval (mirrors ArchivedAssetPurgeLoop, NOT a parallel mechanism)
