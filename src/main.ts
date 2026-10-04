@@ -519,12 +519,47 @@ const operationStore = new OperationStore();
 // router reads; the GET /api/v1/logs request/response contract is unchanged.
 const logStore: LogSink & LogReader = new PerWorkspaceLogStore(stackResolver);
 
+// Parse a millisecond override that must be a finite, strictly positive
+// integer. A malformed value (e.g. a non-numeric PROVISION_READY_TIMEOUT_MS,
+// which parseInt turns into NaN) falls back to undefined so the route keeps its
+// built-in default. waitForInstanceReadyBounded validates again before its poll
+// loop, so a bad value can never reach the loop even if a future caller skips
+// this — but warn loudly HERE so the operator sees the misconfiguration at boot
+// rather than silently running on the default (issue #1038 review).
+const parsePositiveMsEnv = (name: string): number | undefined => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  const parsed = parseInt(raw, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  app.log.warn(
+    { env: name, value: raw },
+    'ignoring malformed %s (expected a positive integer in ms); using the built-in default',
+    name
+  );
+  return undefined;
+};
+const provisionReadyTimeoutMs = parsePositiveMsEnv('PROVISION_READY_TIMEOUT_MS');
+const provisionReadyPollIntervalMs = parsePositiveMsEnv(
+  'PROVISION_READY_POLL_INTERVAL_MS'
+);
+
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
   osc: oscContext,
   paramStore,
   operationStore,
   publicBaseUrl: resolvePublicBaseUrl(),
+  // Bound (ms) on each backing instance's readiness wait during provisioning
+  // (issue #1038). Unset leaves the route on its own 5-minute default
+  // (DEFAULT_INSTANCE_READY_TIMEOUT_MS); a timeout routes into the existing
+  // rollback with an error naming the service and the last probe error, instead
+  // of the unbounded SDK wait that a single dropped poll could abort.
+  ...(provisionReadyTimeoutMs !== undefined
+    ? { readyTimeoutMs: provisionReadyTimeoutMs }
+    : {}),
+  ...(provisionReadyPollIntervalMs !== undefined
+    ? { readyPollIntervalMs: provisionReadyPollIntervalMs }
+    : {}),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
