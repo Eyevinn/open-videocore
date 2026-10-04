@@ -173,7 +173,7 @@ type InternalRouterOptions = {
   listStackNames?: () => Promise<string[]>;
   // Best-effort operational log emission (issue #995). Passed to
   // completeTranscode so the transcode job's terminal transition also appends one
-  // record to the in-memory LogStore GET /api/v1/logs reads (src/main.ts,
+  // record to the log store GET /api/v1/logs reads (src/main.ts,
   // `logStore`; read path src/routes/logs.ts:94). Absent => no log record.
   pipelineLog?: PipelineLogSink;
 };

@@ -41,7 +41,7 @@
 //                       name: string, token: string): Promise<string>
 //   lib/core.d.ts:153 waitForInstanceReady(serviceId: string, name: string,
 //                       ctx: Context): Promise<void>   (the helper replaced)
-//   lib/context.d.ts:25 Context.getServiceAccessToken(serviceId): Promise<string>
+//   lib/context.d.ts  Context.getServiceAccessToken(serviceId): Promise<string>
 // 'running' is the exact ready state the SDK's own helper gates on
 // (lib/core.js:347-349), so this is behaviour-compatible on the happy path and
 // no chattier than it (same 1s cadence).
@@ -57,53 +57,14 @@ export const DEFAULT_INSTANCE_READY_TIMEOUT_MS = 5 * 60_000;
 // ends on time.
 export const DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS = 1_000;
 
-// The logger subset resolveReadinessDurationMs warns through. Deliberately the
-// same shape BootstrapLogger uses (src/services/profile-bootstrap.ts:39-42), so
-// Fastify's `app.log` satisfies it directly with no adapter.
-export type InstanceReadinessLogger = {
-  warn: (obj: unknown, msg?: string) => void;
-};
-
-// Resolve a readiness duration (ms) from a raw environment string, rejecting
-// anything that would not actually bound the wait.
-//
-// WHY THIS EXISTS (#1055 review, blocking finding 2). Callers used to read the
-// env directly — `parseInt(process.env['PROVISION_READY_TIMEOUT_MS'], 10)` —
-// and leave the default to the `??` fallbacks downstream
-// (src/routes/provision.ts readinessOptions, and `options.timeoutMs ??
-// DEFAULT_INSTANCE_READY_TIMEOUT_MS` in waitForInstanceReadyBounded below).
-// That does not hold, because `parseInt('abc', 10)` is `NaN` and NaN is NOT
-// nullish: it survives every `??` and lands in `timeoutMs`, where it kills all
-// three loop guards at once —
-//   * `remaining <= 0` is false for NaN, so the loop never breaks there;
-//   * `Math.min(pollIntervalMs, NaN)` is NaN, so setTimeout fires immediately
-//     instead of waiting out the poll interval; and
-//   * `Date.now() >= deadline` is never true for a NaN deadline.
-// The result is the opposite of this module's purpose: an unbounded hot loop
-// issuing hundreds of getInstanceHealth calls a second for the life of the
-// process. `'0'` was a milder variant of the same hole — truthy, so it was
-// forwarded, putting the deadline in the past and timing the wait out before
-// its first probe.
-//
-// So only a finite, strictly positive duration is accepted. Anything else
-// (unparseable, zero, negative) falls back to `defaultMs`, and a value the
-// operator actually set is warn-logged naming the rejected input so a typo is
-// visible at boot rather than silently changing the deadline.
-export function resolveReadinessDurationMs(
-  raw: string | undefined,
-  defaultMs: number,
-  envName: string,
-  log?: InstanceReadinessLogger
-): number {
-  if (raw === undefined || raw.trim() === '') return defaultMs;
-  const parsed = parseInt(raw, 10);
-  if (Number.isFinite(parsed) && parsed > 0) return parsed;
-  log?.warn(
-    { env: envName, value: raw, fallbackMs: defaultMs },
-    `${envName} must be a positive number of milliseconds; ignoring ` +
-      `"${raw}" and using the default of ${defaultMs}ms`
-  );
-  return defaultMs;
+// A millisecond bound/cadence is usable only if it is a finite, strictly
+// positive number; anything else (NaN from a bad parseInt, 0, a negative, or
+// Infinity) is not a real deadline and must not reach the poll loop. Falls back
+// to `fallback` in that case.
+function finitePositiveOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : fallback;
 }
 
 export type InstanceReadinessOptions = {
@@ -117,6 +78,14 @@ export type InstanceReadinessOptions = {
   // message (e.g. 'object storage'). Unset => the serviceId alone identifies
   // it. Never include credentials here.
   label?: string;
+  // Build the Error thrown when the deadline passes. Lets a caller carry its
+  // own typed failure (e.g. the scaler's SpawnReadyTimeoutError, which the spawn
+  // cleanup path keys off via `instanceof` — #1071) without this helper having
+  // to know about it. Receives the fully composed timeout message. Unset => a
+  // plain Error with that message. ONLY the deadline path uses this; an error
+  // raised before the loop (e.g. getServiceAccessToken failing) still
+  // propagates unchanged.
+  makeTimeoutError?: (message: string) => Error;
 };
 
 // Wait for an OSC instance to report `running`, with a hard deadline.
@@ -131,9 +100,23 @@ export async function waitForInstanceReadyBounded(
   name: string,
   options: InstanceReadinessOptions = {}
 ): Promise<void> {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_INSTANCE_READY_TIMEOUT_MS;
-  const pollIntervalMs =
-    options.pollIntervalMs ?? DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS;
+  // Validate the resolved bound/cadence HERE so every caller — provision, the
+  // scaler, any future one — is covered. An unvalidated env parse upstream
+  // (parseInt of a non-numeric PROVISION_READY_TIMEOUT_MS yields NaN) would
+  // otherwise defeat every guard in the loop below: `remaining <= 0` is false
+  // for NaN, `Date.now() >= deadline` is false against a NaN deadline, and
+  // `Math.min(pollIntervalMs, remaining)` is NaN — which setTimeout coerces to
+  // 0 — so a bad value turned a bounded wait back into the unbounded, 0-delay
+  // probe flood this helper exists to prevent. A non-finite or non-positive
+  // value is not a usable deadline/cadence, so fall back to the default.
+  const timeoutMs = finitePositiveOr(
+    options.timeoutMs,
+    DEFAULT_INSTANCE_READY_TIMEOUT_MS
+  );
+  const pollIntervalMs = finitePositiveOr(
+    options.pollIntervalMs,
+    DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS
+  );
   const deadline = Date.now() + timeoutMs;
   const sat = await context.getServiceAccessToken(serviceId);
 
@@ -172,8 +155,10 @@ export async function waitForInstanceReadyBounded(
   const what = options.label
     ? `${options.label}, service ${serviceId}`
     : `service ${serviceId}`;
-  throw new Error(
+  const message =
     `timed out after ${timeoutMs}ms waiting for OSC instance ${name} ` +
-      `(${what}) to report running${detail}`
-  );
+    `(${what}) to report running${detail}`;
+  throw options.makeTimeoutError
+    ? options.makeTimeoutError(message)
+    : new Error(message);
 }

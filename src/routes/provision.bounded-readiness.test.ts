@@ -27,7 +27,7 @@
 //     what the per-service assertions below index into.
 //   - lib/core.js:347-349  'running' is the exact ready state the SDK's own
 //     helper gates on, so the bounded helper is behaviour-compatible.
-//   - lib/core.d.ts:153 waitForInstanceReady(serviceId, name, ctx): Promise<void>
+//   - lib/core.d.ts:152 waitForInstanceReady(serviceId, name, ctx): Promise<void>
 //     — the helper being replaced; provision.ts no longer imports it.
 //   - lib/core.d.ts:32/46/51 createInstance / removeInstance / getInstance
 //     signatures, as already relied on by src/services/deprovision.ts:69.
@@ -56,10 +56,9 @@ vi.mock('@osaas/client-core', () => ({
   getPortsForInstance: (...args: unknown[]) =>
     getPortsForInstance(...(args as [])),
   getInstanceHealth: (...args: unknown[]) => getInstanceHealth(...(args as [])),
-  // Nothing under src/ imports the SDK's waitForInstanceReady any more (#1038
-  // for provision.ts, #1055 for the packager and the config-queue bootstrap).
-  // Kept on the mock so a future reintroduction fails loudly on assertions
-  // rather than on a missing export.
+  // provision.ts no longer imports waitForInstanceReady (that is the point of
+  // #1038), but services/packager-provisioning.ts — which provision.ts does
+  // import — still does, so the mocked module must export it.
   waitForInstanceReady: vi.fn(async () => undefined),
   saveSecret: (...args: unknown[]) => saveSecret(...(args as [])),
   Context: class {}

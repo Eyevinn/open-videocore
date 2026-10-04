@@ -38,6 +38,8 @@ import {
 } from '../src/services/request-stack-context.js';
 import type { WorkspaceConnections, WorkspaceStackResolver } from '../src/services/workspace-stack.js';
 import type { EncoreClient, EncoreSubmitInput } from '../src/pipeline/encore-client.js';
+import { runnerFactory, type RunnerS3Config } from '../src/pipeline/runner-option.js';
+import { thumbnailObjectKey, type FrameTarget } from '../src/pipeline/thumbnail.js';
 
 // Every provisioned stack gets a bucket with the SAME literal name
 // (src/routes/provision.ts), which is what makes the divergence silent.
@@ -62,8 +64,19 @@ class FakeStackStorage {
     this.stored.push(key);
     return { etag: `etag-${this.stack}`, bytesTransferred: transferred };
   }
+  // The pull worker clears any orphaned multipart upload for the key before it
+  // writes (issue #1088). Nothing is ever left in progress here.
+  async abortIncompleteMultipartUploads(): Promise<number> {
+    return 0;
+  }
   async presignedGet(key: string): Promise<string> {
     return `https://${this.stack}.minio-minio.example/${SOURCE_BUCKET}/${key}?signed=1`;
+  }
+  // The thumbnail orchestrator presigns one PUT per frame
+  // (src/pipeline/thumbnail.ts:133). Same stack-identifying host as the GET, so
+  // a URL alone says which instance the frame would be written to.
+  async presignedPut(key: string): Promise<string> {
+    return `https://${this.stack}.minio-minio.example/${SOURCE_BUCKET}/${key}?signed=put`;
   }
   async statObject(): Promise<{ size: number; etag: string }> {
     return { size: 1, etag: `etag-${this.stack}` };
@@ -110,6 +123,11 @@ type Harness = {
   expireResolverCache: () => void;
   // Storage handles the extractor was actually invoked with, in order.
   extractedWith: Array<{ assetId: string; storage: unknown }>;
+  // Every thumbnail dispatch, in order: the credentials the runner FACTORY was
+  // built from (control plane, issue #1062) and the presigned source URL the
+  // orchestrator read through (data plane, issue #1058). Both carry the stack
+  // identity, so one array proves which stack each plane resolved.
+  thumbnailedWith: Array<{ s3: RunnerS3Config; sourceUrl: string; frames: FrameTarget[] }>;
 };
 
 // Resolver stub keyed exactly like WorkspaceStackResolver: a name with a stored
@@ -137,6 +155,18 @@ async function buildApp(
   // assert the handle came from the right stack rather than only that an
   // extraction happened.
   const extractedWith: Array<{ assetId: string; storage: unknown }> = [];
+
+  // Thumbnails are injected as a FACTORY, exactly as production does
+  // (src/main.ts builds the eyevinn-ffmpeg-s3 runner from the stack's MinIO
+  // credentials), so the test exercises resolveRunnerOption rather than the
+  // plain-runner shortcut tests usually take.
+  const thumbnailedWith: Array<{ s3: RunnerS3Config; sourceUrl: string; frames: FrameTarget[] }> =
+    [];
+  const thumbnailExtractor = runnerFactory<
+    (sourceUrl: string, frames: FrameTarget[]) => Promise<void>
+  >((s3) => async (sourceUrl, frames) => {
+    thumbnailedWith.push({ s3, sourceUrl, frames });
+  });
 
   const submitted: EncoreSubmitInput[] = [];
   const encore: EncoreClient = {
@@ -177,6 +207,7 @@ async function buildApp(
     extract: (async (params: { assetId: string }, deps: { storage: unknown }) => {
       extractedWith.push({ assetId: params.assetId, storage: deps.storage });
     }) as never,
+    thumbnailExtractor,
     resolveStackContext:
       opts.resolveStackContext ??
       (async (requested?: string) => (requested && stacks[requested] ? requested : names[0]))
@@ -190,16 +221,23 @@ async function buildApp(
     expireResolverCache: () => {
       cacheCold = true;
     },
-    extractedWith
+    extractedWith,
+    thumbnailedWith
   };
 }
 
 const AUTH = { authorization: 'Bearer test-token' };
 
-async function waitFor(check: () => boolean, timeoutMs = 2000): Promise<void> {
+// `check` may be async (a repository read). The result is AWAITED — a returned
+// promise is always truthy, so testing it directly would make every async
+// predicate pass on the first tick.
+async function waitFor(
+  check: () => boolean | Promise<boolean>,
+  timeoutMs = 2000
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (check()) return;
+    if (await check()) return;
     await new Promise((r) => setTimeout(r, 5));
   }
   throw new Error('condition not met in time');
@@ -297,6 +335,131 @@ describe('data plane resolves the stack the request names (issue #1058)', () => 
       expect(h.extractedWith[0]!.storage).not.toBe(h.stacks['a']!.storage);
 
       // Give any stray rejection a turn of the loop to surface before asserting.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // Issue #1050 / PR review point 3. The URL-ingest poster frame runs from the
+  // SAME detached post-pull continuation as the metadata extraction above, so it
+  // inherits both of that continuation's stack hazards. Every earlier #1050 test
+  // ran on a single default stack, which cannot tell a correctly-threaded handle
+  // from an ambient one — on one stack every resolution answers the same thing.
+  // These two pin it with a NON-DEFAULT `x-stack-name: b` against stacks
+  // ['a','b'], so 'a' (first listed = default) is what a missed thread resolves
+  // to and the assertion fails loudly rather than vacuously passing.
+  it('extracts the URL-ingest poster frame on the NAMED stack, not the default one', async () => {
+    const payload = Buffer.from('hello-video-bytes');
+    const fetch = vi.fn(
+      async () => new Response(payload, { headers: { 'content-length': String(payload.length) } })
+    ) as unknown as typeof globalThis.fetch;
+
+    const h = await buildApp(['a', 'b']);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetch;
+    try {
+      const res = await h.app.inject({
+        method: 'POST',
+        url: '/api/v1/assets/ingest-url',
+        headers: { ...AUTH, 'x-stack-name': 'b' },
+        payload: { sourceUrl: 'https://example.com/clip.mp4', name: 'clip' }
+      });
+      expect(res.statusCode).toBe(202);
+      const { assetId } = res.json();
+
+      await waitFor(() => h.thumbnailedWith.length > 0);
+      expect(h.thumbnailedWith).toHaveLength(1);
+      const run = h.thumbnailedWith[0]!;
+
+      // Control plane: the runner factory was built from stack b's MinIO
+      // coordinates (requestRunnerS3Config off request.connections, issue #1062).
+      expect(run.s3.endpoint).toBe('https://b.minio-minio.example');
+      expect(run.s3.endpoint).not.toBe('https://a.minio-minio.example');
+
+      // Data plane: the source it reads, and the destinations it writes, are
+      // presigned by stack b's OWN storage handle — the one threaded in as
+      // `pullStorage`, not a fresh ambient resolution.
+      expect(run.sourceUrl).toContain('https://b.minio-minio.example/');
+      expect(run.sourceUrl).toContain(`ingest/${assetId}`);
+      expect(run.frames.map((f) => f.timecodeSeconds)).toEqual([1]);
+      expect(run.frames.map((f) => f.objectKey)).toEqual([thumbnailObjectKey(assetId, 1)]);
+      for (const f of run.frames) {
+        expect(f.putUrl).toContain('https://b.minio-minio.example/');
+      }
+
+      // ...and the recorded keys land on the named stack's asset document only.
+      await waitFor(async () => {
+        const a = await h.stacks['b']!.assets.get(assetId);
+        return (a?.thumbnails?.length ?? 0) > 0;
+      });
+      expect((await h.stacks['b']!.assets.get(assetId))!.thumbnails).toEqual([
+        thumbnailObjectKey(assetId, 1)
+      ]);
+      expect(await h.stacks['a']!.assets.get(assetId)).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('still extracts the poster frame on the NAMED stack when the resolver cache expires mid-pull', async () => {
+    // The reason triggerThumbnail needed the `storage?` parameter at all: it used
+    // to call `storageFor()` itself, from inside the detached continuation. That
+    // factory is a cache read, so on a pull longer than the resolver TTL it
+    // THROWS — silently losing the poster frame and raising an unhandled
+    // rejection, the identical failure #1058 fixed for the extraction beside it.
+    const payload = Buffer.from('hello-video-bytes');
+    // Gated body: the pull is provably still open when the cache goes cold.
+    const body = new Readable({ read() {} });
+    const fetch = vi.fn(
+      async () =>
+        new Response(Readable.toWeb(body) as ReadableStream<Uint8Array>, {
+          headers: { 'content-length': String(payload.length) }
+        })
+    ) as unknown as typeof globalThis.fetch;
+
+    const h = await buildApp(['a', 'b']);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetch;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown): void => {
+      unhandled.push(err);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const res = await h.app.inject({
+        method: 'POST',
+        url: '/api/v1/assets/ingest-url',
+        headers: { ...AUTH, 'x-stack-name': 'b' },
+        payload: { sourceUrl: 'https://example.com/clip.mp4', name: 'clip' }
+      });
+      expect(res.statusCode).toBe(202);
+      const { assetId } = res.json();
+
+      h.expireResolverCache();
+      body.push(payload);
+      body.push(null);
+
+      // Pre-fix this stayed empty: the `storageFor()` call inside the
+      // continuation threw instead of returning stack b's handle.
+      await waitFor(() => h.thumbnailedWith.length > 0);
+      expect(h.thumbnailedWith[0]!.sourceUrl).toContain('https://b.minio-minio.example/');
+      expect(h.thumbnailedWith[0]!.sourceUrl).toContain(`ingest/${assetId}`);
+
+      // The orchestrator records confirmed keys asynchronously after dispatch
+      // (statObject, then assets.update), so poll rather than assert straight off
+      // the extractor call.
+      await waitFor(async () => {
+        const a = await h.stacks['b']!.assets.get(assetId);
+        return (a?.thumbnails?.length ?? 0) > 0;
+      });
+      expect((await h.stacks['b']!.assets.get(assetId))!.thumbnails).toEqual([
+        thumbnailObjectKey(assetId, 1)
+      ]);
+
+      // Give any stray rejection a turn of the loop before asserting.
       await new Promise((r) => setTimeout(r, 20));
       expect(unhandled).toEqual([]);
     } finally {

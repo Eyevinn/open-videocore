@@ -19854,6 +19854,35 @@
                               ],
                               "additionalProperties": false
                             }
+                          },
+                          "spawnFailure": {
+                            "type": "object",
+                            "properties": {
+                              "at": {
+                                "type": "number",
+                                "description": "Epoch milliseconds at which the failed scale-up was recorded."
+                              },
+                              "attempts": {
+                                "type": "number",
+                                "description": "Total instance-create calls the failed spawn made, across both the transcoder instance and its paired callback listener. Not the attempt number of a single retry loop: it can exceed the per-loop retry limit."
+                              },
+                              "consecutiveFailures": {
+                                "type": "number",
+                                "description": "How many scale-ups have failed in a row for this workspace. Reset to 0 by a successful spawn, so 1 is a fresh blip while a climbing number means the scaler has been unable to grow for a while."
+                              },
+                              "message": {
+                                "type": "string",
+                                "description": "Error text from the failed spawn, redacted at write time: credentials, tokens, URLs and bare network locations (host, host:port, IP:port) are stripped, as is any HTML markup, because upstream error text can echo the request the spawn sent. This endpoint is unauthenticated, so the field carries the SHAPE of the failure, not its details."
+                              }
+                            },
+                            "required": [
+                              "at",
+                              "attempts",
+                              "consecutiveFailures",
+                              "message"
+                            ],
+                            "additionalProperties": false,
+                            "description": "The last scale-up for this workspace that could not create an instance. Absent when the most recent spawn succeeded, or when none has failed recently. This is what distinguishes \"the pool is at maxInstances\" from \"the pool cannot grow\", which are otherwise identical on the wire."
                           }
                         },
                         "required": [
@@ -20178,7 +20207,7 @@
         "tags": [
           "logs"
         ],
-        "description": "List operational log records as a cursor-paged, newest-first stream. Pass `cursor` (from a prior response `nextCursor`) to page forward; a null `nextCursor` marks the last page. Filter server-side with `from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-insensitive message substring). Set `order=asc` to reverse the default newest-first sort. This endpoint is cursor/sequence-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473).",
+        "description": "List operational log records as a cursor-paged, newest-first stream. Pass `cursor` (from a prior response `nextCursor`) to page forward; a null `nextCursor` marks the last page. Filter server-side with `from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-insensitive message substring). Set `order=asc` to reverse the default newest-first sort. This endpoint is cursor-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473). Response header `x-log-window-degraded: true` means the durable store could not scan its whole retained window for this read and the page covers the newest records only; the body and 200 status are unchanged by this header (#996).",
         "parameters": [
           {
             "schema": {

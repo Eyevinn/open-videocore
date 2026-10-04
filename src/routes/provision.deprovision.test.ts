@@ -6,6 +6,11 @@ import {
 } from 'fastify-type-provider-zod';
 
 const getInstance = vi.fn();
+// Teardown confirms an empty getInstance probe against listInstances before it
+// believes the instance is gone (issue #1039) — getInstance returns `undefined`
+// for ANY non-401 error (@osaas/client-core lib/core.js:127-150), while
+// listInstances (lib/core.js:160-170) rejects on error instead of swallowing it.
+const listInstances = vi.fn();
 const removeInstance = vi.fn();
 
 // These routes are not caller-authenticated: the OSC SDK authenticates to OSC
@@ -18,6 +23,7 @@ vi.mock('@osaas/client-core', () => ({
   // DELETE path under test does not invoke them.
   createInstance: vi.fn(),
   getInstance: (...args: unknown[]) => getInstance(...args),
+  listInstances: (...args: unknown[]) => listInstances(...args),
   removeInstance: (...args: unknown[]) => removeInstance(...args),
   getPortsForInstance: vi.fn(),
   listSubscriptions: vi.fn(async () => {
@@ -98,8 +104,12 @@ async function deprovisionAndWait(
 
 beforeEach(() => {
   getInstance.mockReset();
+  listInstances.mockReset();
   removeInstance.mockReset();
   getServiceAccessToken.mockClear();
+  // Default: the confirming read succeeds and shows nothing, so an empty probe
+  // means the instance really is gone.
+  listInstances.mockResolvedValue([]);
 });
 
 // A StackConfig as it would be returned from the parameter store. The
@@ -195,6 +205,31 @@ describe('DELETE /api/v1/provision/:name (param store, issue #29)', () => {
     expect(op.result.status).toBe('failed');
     // Entry retained so a retry can re-read services[] and finish teardown.
     expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+
+  // Issue #1039: the probe used to read ANY fault as "already gone", so a DELETE
+  // during a network fault reported success, removed nothing, and deleted the
+  // stored config — the only record of what was left to clean up.
+  it('keeps the store entry when the teardown probe cannot be verified', async () => {
+    // getInstance resolves undefined because its request errored, not because
+    // the instance is gone; the confirming read fails for the same reason.
+    getInstance.mockResolvedValue(undefined);
+    listInstances.mockRejectedValue(new Error('fetch failed'));
+    const paramStore = makeParamStore(STORED_CONFIG);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(app, 'mystack');
+
+    expect(op.status).toBe('done');
+    // Unverifiable, therefore failed — NOT the old silent not_found success.
+    expect(op.result.status).toBe('failed');
+    const services = (op.result.services ?? []) as { status: string }[];
+    expect(services).toHaveLength(STORED_CONFIG.services.length);
+    expect(services.every((s) => s.status === 'failed')).toBe(true);
+    // The record of what still needs removing survives, so a retry can finish.
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+    // And nothing was deleted on the strength of an unverified probe.
+    expect(removeInstance).not.toHaveBeenCalled();
   });
 });
 
