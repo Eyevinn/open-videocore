@@ -937,6 +937,29 @@ pre.code-block {
   margin-top: 8px;
 }
 
+/* Collapsed "Raw" disclosure holding a full API document (issue #964). The
+   curated view above it is the primary reading surface; this keeps the raw JSON
+   available without it dominating the panel. Native <details>/<summary>, so the
+   expand/collapse is keyboard-operable and announced as a disclosure with no
+   ARIA of our own. The focus ring is kept (never `outline: none`) so keyboard
+   users can see where they are — WCAG 2.1 SC 2.4.7. */
+.raw-disclosure > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 2px 0;
+  user-select: none;
+}
+
+.raw-disclosure > summary:hover {
+  color: var(--text);
+}
+
+.raw-disclosure > summary:focus-visible {
+  outline: 2px solid var(--accent, var(--border));
+  outline-offset: 2px;
+}
+
 /* Inline thumbnail in asset list */
 .thumb-xs {
   width: 48px;

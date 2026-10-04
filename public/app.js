@@ -3744,18 +3744,69 @@ async function renderJobDetailBody(id, bodyEl, opts) {
 }
 
 // ─── PIPELINE EXECUTION DETAIL ────────────────────────────────────────────────
+
+// Marker class on the collapsed "Raw" disclosure (issue #964). One constant so
+// the open-state preservation below, the CSS, and the DOM test all name the
+// same element instead of restating the string.
+const RAW_DISCLOSURE_CLASS = 'raw-disclosure';
+
+// A collapsed-by-default disclosure holding the pretty-printed raw document.
+// The curated view above it is the primary reading surface; the full object
+// stays one click away rather than being the first thing an operator sees
+// (issue #964).
+//
+// ACCESSIBILITY: native <details>/<summary> — keyboard-operable and exposed as
+// a disclosure to assistive tech with no ARIA of our own, matching the existing
+// disclosure idiom in renderCollectionAssetPicker(). The value is written with
+// textContent, never interpolated into an HTML string.
+//
+// @param {unknown} value   object to serialise
+// @param {boolean} [open]  restore a previously-expanded state (poll re-render)
+// @returns {HTMLElement} detached <details>
+function rawJsonDisclosure(value, open) {
+  const details = document.createElement('details');
+  details.className = RAW_DISCLOSURE_CLASS + ' mt12';
+  if (open) details.open = true;
+
+  const summary = document.createElement('summary');
+  summary.textContent = 'Raw';
+  details.appendChild(summary);
+
+  const pre = document.createElement('pre');
+  pre.className = 'code-block';
+  pre.textContent = JSON.stringify(value, null, 2);
+  details.appendChild(pre);
+
+  return details;
+}
+
 // Fetch and render a single PipelineExecution (issue #193) into `bodyEl`.
 // Contract: GET /api/v1/pipelines/:executionId — response `pipelineExecutionSchema`
-// in src/routes/pipelines.ts (id, assetId, assetName?, pipelineName, status
-// [running|done|failed], steps[], createdAt, updatedAt). Each step (per
-// stepExecutionSchema): name, status [pending|running|done|failed], jobId?,
-// encoreJobId?, error?, startedAt?, completedAt?, progress?.
+// in src/routes/pipelines.ts:32-41 (id, assetId, assetName?, pipelineName,
+// status [running|done|failed], steps[], createdAt, updatedAt), mirrored in
+// openapi.json .paths["/api/v1/pipelines/{executionId}"].get 200. Each step, per
+// `stepExecutionSchema` (src/routes/pipelines.ts:17-30): name, status
+// [pending|running|done|failed|skipped], jobId?, encoreJobId?, error?,
+// skipReason?, startedAt?, completedAt?, progress? — only `name` and `status`
+// are required, so every other cell tolerates an absent value.
+//
+// The steps render as a per-step timeline (issue #964): one row per step with
+// its job id, Encore job id, and start/completion timestamps, each
+// identifier click-to-copy via the shared copy-id control. The full execution
+// document is still here, behind the collapsed "Raw" disclosure at the bottom.
 //
 // All server-provided text is inserted via escHtml before interpolation. Returns
 // the fetched execution so callers (detail.js) can derive the window title and
 // decide whether to keep polling.
 async function renderPipelineDetailBody(id, bodyEl) {
   const body = bodyEl;
+  // detail.js tick() re-renders this body on every poll while the execution is
+  // running. Carry the operator's Raw disclosure state across that refresh so a
+  // poll does not snap an expanded dump shut under them.
+  const prevRaw = typeof body.querySelector === 'function'
+    ? body.querySelector('.' + RAW_DISCLOSURE_CLASS)
+    : null;
+  const rawWasOpen = !!(prevRaw && prevRaw.open);
   body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
@@ -3787,8 +3838,9 @@ async function renderPipelineDetailBody(id, bodyEl) {
     }).join('');
     body.appendChild(kvDiv);
 
-    // Per-step list: status, progress, timestamps, and the FULL error text for
-    // failed steps (inline, not tooltip-only). All fields escaped via escHtml.
+    // Per-step timeline: status, progress, both job identifiers, timestamps, and
+    // the FULL error text for failed steps (inline, not tooltip-only). All
+    // fields escaped via escHtml.
     const stepsTitle = document.createElement('div');
     stepsTitle.className = 'section-title mt12';
     stepsTitle.textContent = 'Steps';
@@ -3804,33 +3856,44 @@ async function renderPipelineDetailBody(id, bodyEl) {
       const rows = steps.map(function(s) {
         const cells = [];
         cells.push('<td>' + escHtml(s.name) + '</td>');
+        // Status is never colour-ALONE: the word itself is the status (WCAG 1.4.1).
         cells.push('<td><span style="color:' + stepColor(s.status) + '">' + escHtml(s.status) + '</span></td>');
         cells.push('<td>' + (s.progress != null ? escHtml(s.progress + '%') : '—') + '</td>');
-        cells.push('<td>' + (s.jobId ? '<span class="text-mono">' + escHtml(s.jobId) + '</span>' : '—') + '</td>');
+        // Both identifiers are click-to-copy via the shared control (copy-id.js):
+        // tracing a run means pasting these into GET /jobs/{id} or the
+        // transcoder's own API, and neither should have to be retyped. Both are
+        // optional in stepExecutionSchema — copyableIdCellHtml() renders the
+        // em-dash placeholder when the step has not reached that stage. The
+        // column label mirrors the contract field name (`encoreJobId`) and the
+        // "Encore Instance" row the job detail already shows.
+        cells.push('<td>' + copyableIdCellHtml(s.jobId, 'Copy job id for step ' + s.name) + '</td>');
+        cells.push('<td>' + copyableIdCellHtml(s.encoreJobId, 'Copy Encore job id for step ' + s.name) + '</td>');
         cells.push('<td>' + escHtml(fmtDate(s.startedAt)) + '</td>');
         cells.push('<td>' + escHtml(fmtDate(s.completedAt)) + '</td>');
-        var row = '<tr>' + cells.join('') + '</tr>';
+        var row = '<tr class="step-row">' + cells.join('') + '</tr>';
         // Full error text on its own spanning row so long strings wrap and are
         // fully visible (acceptance criterion: not tooltip-only).
         if (s.error) {
-          row += '<tr class="step-error-row"><td colspan="6" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
+          row += '<tr class="step-error-row"><td colspan="7" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
         }
         return row;
       }).join('');
 
       const table = document.createElement('table');
       table.className = 'mini-table';
+      table.id = 'pipeline-step-timeline';
       table.innerHTML =
         '<thead><tr>' +
-        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Started</th><th>Completed</th>' +
+        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Encore job</th><th>Started</th><th>Completed</th>' +
         '</tr></thead><tbody>' + rows + '</tbody>';
       body.appendChild(table);
+      // Bind the copy buttons for every identifier cell just rendered.
+      wireCopyIdButtons(table);
     }
 
-    const pre = document.createElement('pre');
-    pre.className = 'code-block mt12';
-    pre.textContent = JSON.stringify(exec, null, 2);
-    body.appendChild(pre);
+    // Raw execution document — present, but collapsed behind a disclosure so the
+    // timeline above is what an operator reads first (issue #964).
+    body.appendChild(rawJsonDisclosure(exec, rawWasOpen));
     return exec;
   } catch (err) {
     body.innerHTML = '';
