@@ -109,6 +109,10 @@ table.params th, table.env th, table.model th{color:var(--text-dim); font-weight
 .endpoint h3 .path{background:none; padding:0; color:var(--text); font-size:14.5px}
 .endpoint-desc{color:var(--text-dim); margin:0 0 4px}
 .endpoint h4{font-size:12.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); margin:18px 0 6px; border:none}
+.endpoint-detail{margin:8px 0 4px; font-size:14px}
+.endpoint-detail p{margin:0 0 8px}
+.prose-steps{margin:0 0 8px; padding-left:20px; font-size:14px}
+.prose-steps li{margin-bottom:4px}
 .field-notes{background:var(--bg-side); border-radius:8px; padding:10px 14px; margin:8px 0 4px; font-size:13px}
 .field-notes ul{margin:6px 0 0; padding-left:18px}
 .field-notes li{margin-bottom:4px}
@@ -299,6 +303,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   <p class="endpoint-desc"></p>
   
   
+  
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;backends&quot;: [
     {
@@ -321,11 +326,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     }
   ]
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-storage-backends">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/storage/backends</code></h3>
   <p class="endpoint-desc"></p>
+  
   
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;name&quot;: &quot;string&quot;,
@@ -356,11 +363,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;endpointUrl&quot;: &quot;string&quot;,
   &quot;region&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-storage-backends-id">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/storage/backends/{id}</code></h3>
   <p class="endpoint-desc"></p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -381,11 +390,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;endpointUrl&quot;: &quot;string&quot;,
   &quot;region&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="patch-api-v1-storage-backends-id">
   <h3><span class="badge badge-PATCH">PATCH</span> <code class="path">/api/v1/storage/backends/{id}</code></h3>
   <p class="endpoint-desc"></p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;name&quot;: &quot;string&quot;,
@@ -417,19 +428,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;endpointUrl&quot;: &quot;string&quot;,
   &quot;region&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-storage-backends-id">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/storage/backends/{id}</code></h3>
   <p class="endpoint-desc"></p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-storage-backends-id-test-connection">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/storage/backends/{id}/test-connection</code></h3>
   <p class="endpoint-desc"></p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;secretAccessKey&quot;: &quot;string&quot;,
@@ -439,11 +454,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;status&quot;: &quot;connected&quot;,
   &quot;message&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-storage-buckets">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/storage/buckets</code></h3>
   <p class="endpoint-desc">List object storage buckets.</p>
+  
   
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>[
@@ -452,11 +469,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;role&quot;: &quot;source&quot;
   }
 ]</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-storage-buckets">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/storage/buckets</code></h3>
   <p class="endpoint-desc">Create a bucket.</p>
+  
   
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;name&quot;: &quot;string&quot;
@@ -465,11 +484,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;name&quot;: &quot;string&quot;,
   &quot;role&quot;: &quot;custom&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-storage-buckets-bucket-objects">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/storage/buckets/{bucket}/objects</code></h3>
   <p class="endpoint-desc">List objects in a bucket.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>prefix</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td></tr><tr><td><code>limit</code></td><td><span class="tag-query">query</span></td><td>integer</td><td>optional</td></tr><tr><td><code>bucket</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -484,19 +505,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;prefix&quot;: &quot;string&quot;,
   &quot;bucket&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-storage-buckets-bucket-objects">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/storage/buckets/{bucket}/objects/{*}</code></h3>
   <p class="endpoint-desc">Delete an object from a bucket.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>bucket</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>*</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-storage-buckets-bucket-watch-folder">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/storage/buckets/{bucket}/watch-folder</code></h3>
   <p class="endpoint-desc">Get watch-folder status for a bucket.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>bucket</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -504,11 +529,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;running&quot;: true,
   &quot;bucket&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-storage-buckets-bucket-watch-folder-toggle">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/storage/buckets/{bucket}/watch-folder/toggle</code></h3>
   <p class="endpoint-desc">Toggle watch-folder ingest for a bucket.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>bucket</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -516,6 +543,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;running&quot;: true,
   &quot;bucket&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
     
