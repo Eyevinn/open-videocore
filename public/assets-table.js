@@ -102,6 +102,16 @@
  * on a minimum term length. Enter is a shortcut that flushes a debounce still in
  * flight, never a requirement. See searchFilterControl() below.
  *
+ * COLUMN VISIBILITY (issue #959). The operator chooses which of the eight declared
+ * columns are rendered. This is VIEW state and touches NO part of the request: the
+ * two tiers above, their params, the client sort and the paging window are all
+ * computed from `snap.sort` / `snap.filters` / `snap.offset`, none of which the
+ * chooser writes. Hiding the Created column does not stop the table sorting by
+ * createdAt, and hiding Status does not drop the `status` param — so `total` and
+ * which rows a page reaches are unchanged by definition, not by convention.
+ * Resolution order on load is URL -> stored per-operator default -> all columns;
+ * see resolveInitialColumns() below.
+ *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
  */
@@ -118,6 +128,14 @@ import {
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
+// Column visibility (issue #959). Model + per-operator persistence + the chooser
+// control all live in one module so any ops table can adopt the same pattern; see
+// the COLUMN VISIBILITY block below for how this table resolves its set.
+import {
+  normalizeVisibleColumns,
+  readStoredColumns,
+  writeStoredColumns,
+} from './table-columns.js';
 // Presigned thumbnail loading (issue #801). The thumbnail cell is rendered
 // src-less and filled in after each render — see hydrateThumbnails() below and
 // the contract grounding in public/thumbnail-url.js.
@@ -165,10 +183,41 @@ const SORT_KEY_TITLE = 'title';
 
 // Per-table URL-state defaults. Natural order is created DESC (newest first) —
 // the most useful default for operators — expressed against the shared contract.
+//
+// `cols` is deliberately left at the shared default of null ("unspecified"), NOT
+// at the full column list: that is what lets the encoder tell "this operator chose
+// to show everything" from "this operator has not chosen", and only the former
+// belongs in a shared link (see the `cols` note in encodeTableState).
 const URL_DEFAULTS = Object.freeze({
   sort: { field: SORT_KEY_CREATED, dir: SORT_DIR.desc },
   size: ASSETS_PAGE_SIZE,
 });
+
+// ─── Column visibility contract (issue #959) ─────────────────────────────────
+
+// The declared column keys, in render order. Exported so consumers and tests name
+// the same vocabulary the `assets.cols` URL param and the stored preference use.
+export const ASSETS_COLUMN_KEYS = Object.freeze([
+  'thumb',
+  'id',
+  'slug',
+  'title',
+  'status',
+  'tags',
+  'created',
+  'actions',
+]);
+
+// The legality rule from the issue: the Actions column and the identifying
+// columns must never ALL be hidden at once, or the table becomes a grid of
+// unnamed rows you cannot act on — a view with no way back out of itself.
+// Expressed as one `requireAtLeastOne` group, so the chooser disables the last
+// survivor instead of letting the operator reach that state and then explaining
+// the mistake. "Identifying" is all three of ID, Slug and Name / Title: any one
+// of them lets an operator say WHICH asset a row is.
+export const ASSETS_REQUIRED_COLUMN_GROUPS = Object.freeze([
+  Object.freeze(['id', 'slug', 'title', 'actions']),
+]);
 
 // ─── Small mappers between the URL contract and the primitive's state ─────────
 
@@ -539,6 +588,10 @@ function buildColumns(renderCtx) {
     {
       key: 'thumb',
       label: '',
+      // The header caption is empty by design (a 52px column of pictures needs no
+      // word over it), so the column names itself for the chooser list, where an
+      // unlabelled entry would be unpickable (issue #959).
+      chooserLabel: 'Thumbnail',
       width: '52px',
       // Rendered WITHOUT a src (issue #801): pointing an <img> at the API's
       // thumbnail byte route can never work, because the browser's <img> GET
@@ -674,6 +727,39 @@ function buildColumns(renderCtx) {
   ];
 }
 
+// ─── Column visibility resolution (issue #959) ────────────────────────────────
+//
+// Decide the initial visible set and whether it counts as an EXPLICIT choice.
+// Precedence, highest first:
+//   1. `assets.cols` in the URL — a shared link must reproduce the sender's view,
+//      the same rule sort/filter/page already follow. Beats storage so that
+//      opening a colleague's link does not silently apply your own preference.
+//   2. this browser's stored default — an operator who shaped the table once
+//      should not have to reshape it on every bare visit.
+//   3. every declared column.
+//
+// `explicit` is what decides whether the set is mirrored into the URL: cases 1 and
+// 2 are real choices worth encoding, case 3 is the absence of one and stays out of
+// the query string so a default view still has a clean URL.
+//
+// Both stored and URL values are passed through normalizeVisibleColumns(), so a
+// hand-edited param, a set saved before a column was renamed, or one that would
+// empty the required group is repaired rather than honoured or rejected.
+function resolveInitialColumns(urlCols, storedCols, columns) {
+  const opts = { requireAtLeastOne: ASSETS_REQUIRED_COLUMN_GROUPS };
+  if (urlCols && urlCols.length) {
+    return { keys: normalizeVisibleColumns(urlCols, columns, opts), explicit: true, source: 'url' };
+  }
+  if (storedCols && storedCols.length) {
+    return {
+      keys: normalizeVisibleColumns(storedCols, columns, opts),
+      explicit: true,
+      source: 'stored',
+    };
+  }
+  return { keys: normalizeVisibleColumns(null, columns, opts), explicit: false, source: 'default' };
+}
+
 // ─── Thumbnail hydration (issue #801) ─────────────────────────────────────────
 //
 // Fill in the src of every thumbnail <img> on the page of rows just rendered.
@@ -758,6 +844,13 @@ export function createAssetsTable(deps) {
     projection,
   });
 
+  // Initial visible column set (issue #959): URL -> stored default -> all.
+  const columnChoice = resolveInitialColumns(
+    urlState.cols,
+    readStoredColumns(ASSETS_NS, win),
+    columns
+  );
+
   const filters = [
     { name: 'status', control: asSlot(statusFilterControl(initialFilters.status)) },
     { name: 'from', control: asSlot(dateFilterControl('from', 'Created from', initialFilters.from)) },
@@ -775,6 +868,25 @@ export function createAssetsTable(deps) {
     initialFilters,
     rowKey: (a) => a && a.id,
     emptyText: 'No assets found.',
+    // Column chooser (issue #959). The primitive mounts the control and repaints;
+    // this callback owns the two places the choice is remembered.
+    columnChooser: {
+      visible: columnChoice.keys,
+      requireAtLeastOne: ASSETS_REQUIRED_COLUMN_GROUPS,
+      label: 'Columns',
+      onChange: function (keys) {
+        columnChoice.keys = keys;
+        columnChoice.explicit = true;
+        // This browser's default for the next bare visit. Best-effort: a blocked
+        // or full localStorage costs the operator a remembered preference, never
+        // the table.
+        writeStoredColumns(ASSETS_NS, keys, win);
+        // And the URL, so the view stays shareable. Deliberately syncUrl() and
+        // NOT reload(): the request is identical, so re-issuing it would be a
+        // wasted round-trip and a visible loading flash for a repaint.
+        syncUrl(table.state.getState());
+      },
+    },
   });
 
   // No page-scoped-narrowing caveat here by design: status and from/to are
@@ -798,6 +910,33 @@ export function createAssetsTable(deps) {
   // new request would re-fetch forever.
   let loadingSignature = null;
 
+  // Mirror the current view into the URL (shared contract) so a refresh/share
+  // reproduces it. Replace (not push) — control changes already re-render and we
+  // do not want a history entry per keystroke or per column toggle.
+  //
+  // `cols` has to be passed on EVERY call, not only from the chooser: the encoder
+  // clears all of this namespace's params before rewriting them, so omitting it
+  // here would have the first load wipe a `cols` the URL arrived with. It is sent
+  // as null until the operator (or their stored default) actually chose something,
+  // which is what keeps a virgin default view's URL clean.
+  function syncUrl(snap) {
+    const page = Math.floor((snap.offset || 0) / snap.pageSize) + 1;
+    return applyTableState(
+      {
+        sort: tableSortToUrlSort(snap.sort),
+        status: snap.filters.status ? [snap.filters.status] : [],
+        q: snap.filters.q || '',
+        from: snap.filters.from || null,
+        to: snap.filters.to || null,
+        page,
+        size: snap.pageSize,
+        cols: columnChoice.explicit ? columnChoice.keys : null,
+      },
+      ASSETS_NS,
+      { defaults: URL_DEFAULTS, replace: true, win }
+    );
+  }
+
   async function reload() {
     const snap = table.state.getState();
     if (loading) {
@@ -811,22 +950,8 @@ export function createAssetsTable(deps) {
     loadingSignature = stateSignature(snap);
 
     // 3) Mirror the current interaction state into the URL (shared contract) so a
-    //    refresh/share reproduces the view. Replace (not push) — control changes
-    //    already re-render; we do not want a history entry per keystroke.
-    const page = Math.floor((snap.offset || 0) / snap.pageSize) + 1;
-    applyTableState(
-      {
-        sort: tableSortToUrlSort(snap.sort),
-        status: snap.filters.status ? [snap.filters.status] : [],
-        q: snap.filters.q || '',
-        from: snap.filters.from || null,
-        to: snap.filters.to || null,
-        page,
-        size: snap.pageSize,
-      },
-      ASSETS_NS,
-      { defaults: URL_DEFAULTS, replace: true, win }
-    );
+    //    refresh/share reproduces the view.
+    syncUrl(snap);
 
     table.setStatus('loading');
     try {
@@ -928,6 +1053,9 @@ export function createAssetsTable(deps) {
     destroy: table.destroy,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
+    // Column visibility (issue #959), for consumers/tests that want to read or
+    // drive the chosen set without going through the chooser's DOM.
+    getVisibleColumns: table.getVisibleColumns,
     _table: table,
   };
 }

@@ -39,6 +39,16 @@
  *   cursor opaque cursor token (cursor-style paging). Mutually informative with
  *          `page`; a table uses whichever it declares in defaults.
  *   size   page size (rows per page).
+ *   cols   VIEW state, not query state (issue #959): the ordered, comma-separated
+ *          set of column keys the operator has chosen to SHOW, e.g.
+ *          `assets.cols=id,title,status,actions`. It never reaches a backend — it
+ *          only decides which of the table's declared columns are rendered — so it
+ *          can never change which rows match or in what order they arrive.
+ *          `null` means UNSPECIFIED (use the table's own default set), which is
+ *          why an empty/blank `cols` decodes to null rather than to "show nothing":
+ *          a garbled param must never produce a headerless table. Column keys are
+ *          the table's own vocabulary, so the consumer is responsible for dropping
+ *          keys it does not declare — this module only parses the list.
  */
 
 // ─── Schema constants ────────────────────────────────────────────────────────
@@ -57,6 +67,7 @@ const PARAM_KEYS = Object.freeze({
   page: 'page',
   cursor: 'cursor',
   size: 'size',
+  cols: 'cols',
 });
 
 const SORT_DIR = Object.freeze({ asc: 'asc', desc: 'desc' });
@@ -75,6 +86,7 @@ const BASE_DEFAULTS = Object.freeze({
   page: 1, // 1-based
   cursor: null, // string | null
   size: 20, // rows per page
+  cols: null, // string[] | null  (null = unspecified -> table's own default set)
 });
 
 // Guardrails so a hostile/garbled URL can never blow up a table.
@@ -82,6 +94,10 @@ const SIZE_MIN = 1;
 const SIZE_MAX = 500;
 const PAGE_MIN = 1;
 const PAGE_MAX = 1_000_000;
+// A column set is bounded by how many columns a table can plausibly declare. A
+// hostile `cols` with thousands of entries is truncated rather than walked.
+const COLS_MAX = 64;
+const COL_KEY_MAX_LEN = 64;
 
 // ─── Small pure helpers ──────────────────────────────────────────────────────
 
@@ -107,6 +123,7 @@ function resolveDefaults(defaults) {
     page: clampInt(d.page, BASE_DEFAULTS.page, PAGE_MIN, PAGE_MAX),
     cursor: typeof d.cursor === 'string' && d.cursor.length > 0 ? d.cursor : BASE_DEFAULTS.cursor,
     size: clampInt(d.size, BASE_DEFAULTS.size, SIZE_MIN, SIZE_MAX),
+    cols: normalizeColumnsValue('cols' in d ? d.cols : BASE_DEFAULTS.cols),
   };
 }
 
@@ -180,6 +197,40 @@ function normalizeStatusValue(v) {
     out.push(t);
   }
   return out;
+}
+
+/**
+ * Normalize a visible-column set into a de-duped, order-preserving string[], or
+ * null when nothing usable was supplied.
+ *
+ * Deliberately NOT normalizeStatusValue: that one maps empty to `[]`, meaning
+ * "no filter". Here `[]` would have to mean "render no columns at all", which is
+ * not a view any table should be talked into by a blank or hostile param — so an
+ * empty result collapses to null ("unspecified"), and the caller falls back to
+ * its own default set. Order is preserved because the operator's chosen order is
+ * data in its own right for a consumer that wants to honour it; consumers that
+ * render in declared order simply ignore it.
+ */
+function normalizeColumnsValue(v) {
+  let parts;
+  if (Array.isArray(v)) {
+    parts = v;
+  } else if (typeof v === 'string') {
+    parts = v.split(',');
+  } else {
+    return null;
+  }
+  const out = [];
+  const seen = new Set();
+  for (const p of parts) {
+    if (typeof p !== 'string') continue;
+    const t = p.trim();
+    if (!t || t.length > COL_KEY_MAX_LEN || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+    if (out.length >= COLS_MAX) break;
+  }
+  return out.length ? out : null;
 }
 
 /**
@@ -291,7 +342,12 @@ function decodeTableState(input, ns, defaults) {
   const sizeRaw = readParam(params, ns, PARAM_KEYS.size);
   const size = sizeRaw != null ? clampInt(sizeRaw, def.size, SIZE_MIN, SIZE_MAX) : def.size;
 
-  return { sort, status, q, from, to, page, cursor, size };
+  // Visible column set (view state). A present-but-unusable value degrades to the
+  // table's default set, exactly like every other param here.
+  const colsRaw = readParam(params, ns, PARAM_KEYS.cols);
+  const cols = colsRaw != null ? normalizeColumnsValue(colsRaw) ?? def.cols : def.cols;
+
+  return { sort, status, q, from, to, page, cursor, size, cols };
 }
 
 // ─── Core: encode (state -> URL params) ──────────────────────────────────────
@@ -361,6 +417,15 @@ function encodeTableState(state, ns, defaults, into) {
   if (s.size !== def.size) {
     set(PARAM_KEYS.size, String(s.size));
   }
+  // `cols` is written whenever a set is present AND differs from the table's
+  // declared default. A table whose default is `null` (unspecified) therefore gets
+  // a `cols` param as soon as the operator makes ANY explicit choice — including
+  // "show everything". That is on purpose: the link has to describe the view it
+  // came from, and "explicitly all columns" is a different intent from "whatever
+  // this browser last stored", which is what an absent param falls back to.
+  if (!shallowEqualStringArray(s.cols, def.cols) && s.cols && s.cols.length) {
+    set(PARAM_KEYS.cols, s.cols.join(','));
+  }
 
   return params;
 }
@@ -386,6 +451,7 @@ function normalizeState(state, def) {
           : null
         : def.cursor,
     size: 'size' in st ? clampInt(st.size, def.size, SIZE_MIN, SIZE_MAX) : def.size,
+    cols: 'cols' in st ? normalizeColumnsValue(st.cols) : def.cols,
   };
 }
 

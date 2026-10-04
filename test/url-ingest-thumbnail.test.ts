@@ -3,9 +3,15 @@
 // POST /api/v1/assets/ingest-url completed without ever triggering thumbnail
 // extraction: the HTTP/S pull branch fired technical metadata extraction only,
 // so a URL-ingested asset never got `thumbnails` while an uploaded one did
-// (src/main.ts:1976/:1981 onObjectStored runs BOTH). These tests lock the two
-// paths together and, just as importantly, pin the deliberate asymmetry: the
+// (src/main.ts:2105 onObjectStored runs BOTH). These tests lock the two paths
+// together and, just as importantly, pin the deliberate asymmetry: the
 // external-backend branch must still NOT attempt a thumbnail.
+//
+// Multi-stack coverage for this trigger lives in
+// test/stack-routing-data-plane.test.ts (non-default `x-stack-name: b` against
+// stacks ['a','b'], plus a resolver-cache expiry mid-pull). The harness here is
+// deliberately single-stack, which cannot distinguish a correctly threaded
+// storage handle from an ambient one.
 //
 // Why the external branch is excluded (and must stay excluded): there the
 // recorded objectKey is `s3://<foreign-bucket>/<key>`, and the thumbnail
@@ -16,13 +22,17 @@
 // equivalent, so a call there would fail silently rather than loudly.
 //
 // Contract sources verified against the tree under test (no guessing):
-//   - POST /ingest-url handler, HTTP/S branch: src/routes/assets.ts:2899-2923
-//     (`void runner(...).then(...)`, guarded on `settled?.status === 'processing'`).
-//   - POST /ingest-url handler, external-backend branch: src/routes/assets.ts:2809
-//     -> :2860 `triggerExtraction(extAsset.id, extObjectKey, source)`.
-//   - triggerThumbnail(assetId, objectKey, request): src/routes/assets.ts:2009;
-//     dispatches timecodes `[1]` (:2028) through `thumbnailRunner`.
-//   - triggerExtraction(assetId, objectKey, externalSource?): src/routes/assets.ts:1822.
+//   - POST /ingest-url handler, HTTP/S branch: src/routes/assets.ts:3207-3256
+//     (`void runner(...).then(...)`, guarded on `settled?.status === 'processing'`,
+//     firing `triggerExtraction(...)` :3241 then `triggerThumbnail(...)` :3249 —
+//     both handed the `pullStorage` handle resolved at :3133).
+//   - POST /ingest-url handler, external-backend branch: src/routes/assets.ts:3109
+//     `triggerExtraction(extAsset.id, extObjectKey, source)` — no thumbnail.
+//   - triggerThumbnail(assetId, objectKey, request, storage?):
+//     src/routes/assets.ts:2098; dispatches timecodes `[1]` (:2122) through
+//     `thumbnailRunner` with `storage ?? storageFor()` (:2125).
+//   - triggerExtraction(assetId, objectKey, externalSource?, storage?):
+//     src/routes/assets.ts:1892, same `storage ?? storageFor()` shape (:1905).
 //   - extractThumbnails + thumbnailObjectKey + FrameExtractor/FrameTarget:
 //     src/pipeline/thumbnail.ts:102, :72, :64, :49. Source URL comes from
 //     `storage.presignedGet` (:119); recorded keys are only those confirmed by
@@ -30,7 +40,9 @@
 //     `assets.update` (:165).
 //   - assetsRouter options `thumbnailExtractor` / `extractThumbnails` /
 //     `probe` / `extract` / `storageBackendRegistry` / `storageFor` / `pullDeps`:
-//     src/routes/assets.ts:1002, :1005, :951, :954, :963.
+//     src/routes/assets.ts:1007, :1010, :956, :959, :968, :942, :946.
+//   - WorkspaceStorage (the `storage?` parameter's type), incl. presignedGet /
+//     presignedPut / statObject / putStream: src/data/storage.ts:118.
 //   - StorageBackendRegistry.resolveSourceCredentials(workspaceId, ref) ->
 //     SourceBackendJobCredentials { bucket, awsAccessKeyId, awsSecretAccessKey,
 //     ... }: src/services/storage-backend-registry.ts:901.

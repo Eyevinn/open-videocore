@@ -288,6 +288,34 @@ tbody td {
   border-color: var(--accent, var(--border));
 }
 
+/* Jobs table Asset cell (issue #988): the asset's human-readable name leads,
+   with its ULID — the value the API accepts — on a second line beneath it, in
+   the same monospace/muted treatment other identifier cells use. The name is
+   full-strength text so the column is scannable; the id stays subordinate but
+   readable in full (`.cell-id-value` lifts the 140px ellipsis cap) and keeps
+   its click-to-copy button. Not colour-coded: the two values are distinguished
+   by position, size and typeface, never by hue alone (WCAG 1.4.1). */
+.job-asset-name {
+  display: block;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.job-asset-id {
+  display: block;
+  margin-top: 2px;
+}
+
+/* Same pairing in the job detail panel, where the kv row is a single line: the
+   ULID trails the named link rather than sitting under it. */
+.job-asset-id-inline {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 /* Status badges */
 .badge {
   display: inline-block;
@@ -2115,6 +2143,152 @@ body.detail-standalone .assets-side {
   display: none;
 }
 
+/* Column chooser (issue #959). A disclosure button in the shared
+   .ops-table-filters bar, opening a non-modal checkbox list. Non-modal on purpose:
+   choosing columns is an adjustment made WHILE reading the table, so the rows being
+   adjusted for must stay on screen. It sits last in the bar and is marked as a view
+   control, not a filter — it changes what you see, never what is requested. */
+.ops-columns-slot {
+  /* Push it to the end of the bar, away from the controls that DO change the
+     query, so the two kinds of control do not read as one group. */
+  margin-left: auto;
+  align-self: flex-end;
+}
+
+.ops-columns {
+  position: relative;
+}
+
+.ops-columns-btn {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  font-size: 13px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+/* "6 of 8" — so "am I hiding anything?" is answerable without opening the panel,
+   and is part of the button's accessible name. */
+.ops-columns-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ops-columns-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  /* Anchored to the right edge: the control sits at the right of the filter bar,
+     so a left-anchored panel would hang off the viewport on a narrow window. */
+  right: 0;
+  min-width: 220px;
+  padding: 10px 12px;
+  background: var(--surface, #1a1a1a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.ops-columns-panel[hidden] {
+  display: none;
+}
+
+.ops-columns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Each row is a <label>, and the chooser mounts inside the filter bar
+   (public/ops-ui-table.js appends it to `.ops-table-filters`), so every row is
+   also matched by `.ops-table-filters label` above — a (0,1,1) rule that stacks a
+   caption over an input and mutes it. A bare `.ops-columns-item` is only (0,1,0),
+   so it loses and the rows collapse into checkbox-over-caption stacks. Qualify
+   with the ancestor to reach (0,2,0), the same way the checkbox and the row label
+   below already do. */
+.ops-table-filters .ops-columns-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  color: var(--text, #eee);
+  cursor: pointer;
+}
+
+.ops-table-filters .ops-columns-item:hover {
+  background: var(--border);
+}
+
+/* Selector-qualified to outrank `.ops-table-filters input { padding: 5px 8px }`
+   above, which is written for text/date inputs and would otherwise inflate every
+   checkbox in this list. */
+.ops-table-filters .ops-columns-item input {
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* A column that has to stay visible. Muted and not-allowed rather than absent:
+   an entry that vanished would read as "this column does not exist". Qualified the
+   same way as the row rule above, so "muted" beats the row's `color: var(--text)`
+   on specificity (0,3,0 vs 0,2,0) rather than on source order — a locked row has
+   to stay visibly distinct from an unlocked one wherever this block ends up. */
+.ops-table-filters .ops-columns-item.is-locked,
+.ops-table-filters .ops-columns-item.is-locked input {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+/* Outranks `.ops-table-filters label > span { font-weight: 500 }`: those are
+   filter captions, these are pickable column names and read as body text. */
+.ops-table-filters .ops-columns-item-label {
+  font-weight: 400;
+}
+
+/* A column can be hidden while the table is still sorted by it — sort is not
+   coupled to visibility. This flag is the only place that fact is visible, and
+   this list is where the column can be brought back. */
+.ops-columns-note {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 20px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent, #6366f1);
+  border: 1px solid var(--accent, #6366f1);
+}
+
+.ops-columns-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.ops-columns-hint[hidden] {
+  display: none;
+}
+
+.ops-columns-actions {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border, #333);
+}
+
+.ops-columns-showall {
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.ops-columns-showall:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Logs table — level badges (issue #371). `level` is an OPTIONAL log field; the
    cell shows a coloured pill per severity when present, else a dash. */
 .log-level {
@@ -2146,5 +2320,65 @@ body.detail-standalone .assets-side {
 /* The message column carries the free-text search target; let it breathe. */
 .log-message {
   white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ─── Audit table (issue #987) ──────────────────────────────────────────────
+   The Audit tab reuses the Jobs filter-bar controls verbatim (.ops-filter-*
+   above), so nothing below restyles the bar — these rules cover only the
+   audit-specific cells and the identity note. */
+
+/* Identity note above the filter bar: `actor.principalId` is a nullable
+   placeholder until read-auth lands, so the Actor column is empty on every
+   entry and the reason is stated once rather than left to be guessed. */
+.audit-note {
+  margin: 0 0 4px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* The action string is the primary "what happened" value — monospace so
+   dotted action names line up and scan vertically. */
+.audit-action {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* Coarse actor origin (user | system | ai). Three visually distinct pills so
+   "who caused this" is answerable at a glance; contrast against --surface is
+   kept above 4.5:1 for WCAG 2.1 AA body text. */
+.audit-origin {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.audit-origin-user {
+  background: rgba(99, 102, 241, 0.18);
+  color: #a5b4fc;
+}
+.audit-origin-system {
+  background: rgba(148, 163, 184, 0.18);
+  color: #cbd5e1;
+}
+.audit-origin-ai {
+  background: rgba(34, 197, 94, 0.16);
+  color: #6ee7a8;
+}
+
+/* The free-form detail bag is summarised to one line; let it wrap rather than
+   stretch the table, and keep it visually secondary to the action. */
+.audit-detail {
+  font-size: 12px;
+  color: var(--text-muted);
   word-break: break-word;
 }
