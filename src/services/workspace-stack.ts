@@ -27,6 +27,8 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import { CouchCommentRepository } from '../data/couch-comment-repo.js';
+import { InMemoryCommentRepository, type CommentRepository } from '../data/comment-repo.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -133,6 +135,15 @@ export type WorkspaceConnections = {
   logs: LogSink & LogReader;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
+  // Asset comments for this stack (issue #135, made durable by issue #1046).
+  // ALWAYS present: CouchCommentRepository when the resolved stack (or the env
+  // override) has a CouchDB, InMemoryCommentRepository otherwise — the same
+  // always-present shape `audit` above uses, so PerWorkspaceCommentRepository
+  // never has to branch on undefined. Review comments are durable editorial
+  // content, so the Couch-backed implementation must be reachable on the
+  // PARAMETER-STORE path (a stack provisioned via POST /api/v1/provision sets no
+  // COUCHDB_URL), not only under the env override.
+  comments: CommentRepository;
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
@@ -209,9 +220,12 @@ function buildConnectionsFromStack(
   // The parameter-store name this config was loaded under (issue #1058).
   // Carried onto the connections as their stack identity.
   stackName: string | undefined,
-  // Where the durable log store reports its own failures (#996 review finding
-  // 2). Optional so the existing callers/tests are unaffected.
-  log?: StackResolverLogger
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them. Required, like the other module-private helpers here: the sole caller
+  // is the resolver, whose own `log` field always holds a logger (noopLogger
+  // when none was injected).
+  log: StackResolverLogger
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -244,6 +258,10 @@ function buildConnectionsFromStack(
   const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  // Asset comments over the same per-stack CouchDB connection (issue #1046), so
+  // a stack provisioned through POST /api/v1/provision gets the DURABLE comment
+  // store without any COUCHDB_URL env var being set.
+  const comments = new CouchCommentRepository(wc, log);
   // Audit store over the same per-stack CouchDB connection (issue #564).
   const audit = new CouchAuditRepository(wc);
   // Operational log store over the SAME per-stack CouchDB connection (issue
@@ -286,6 +304,7 @@ function buildConnectionsFromStack(
     logs,
     profiles,
     pipelines,
+    comments,
     storageFor,
     storageClient: minioClient,
     encore,
@@ -343,9 +362,10 @@ export function stackResolvedMinioEndpoint(
 // MINIO_ACCESS_KEY/MINIO_SECRET_KEY pair.
 function buildEnvConnections(
   oscContext: Context,
-  // Where the durable log store reports its own failures (#996 review finding
-  // 2). Optional so the existing callers/tests are unaffected.
-  log?: StackResolverLogger
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them.
+  log: StackResolverLogger
 ): WorkspaceConnections | undefined {
   const couchUrl = process.env['COUCHDB_URL'];
   const minioUrl = process.env['MINIO_URL'];
@@ -371,6 +391,9 @@ function buildEnvConnections(
   let logs: LogSink & LogReader;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
+  // Asset comments: always present, Couch-backed on the couch env path and
+  // in-memory otherwise (issue #1046) — same always-present shape as `audit`.
+  let comments: CommentRepository;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -384,6 +407,7 @@ function buildEnvConnections(
     webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    comments = new CouchCommentRepository(wc, log);
     audit = new CouchAuditRepository(wc);
     // `log` so a failed overflow eviction or an over-cap read window is reported
     // instead of swallowed (#996 review finding 2).
@@ -402,6 +426,10 @@ function buildEnvConnections(
     search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
+    // MINIO_URL set but no COUCHDB_URL: nothing durable to store comments in on
+    // this path, so they are ephemeral. PerWorkspaceCommentRepository warns when
+    // it resolves to this implementation.
+    comments = new InMemoryCommentRepository();
   }
 
   let storageFor: StorageFactory | undefined;
@@ -431,7 +459,7 @@ function buildEnvConnections(
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -464,8 +492,11 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
+  // No stack resolved (no parameter store / non-ready / invalid config): comments
+  // are ephemeral here, which PerWorkspaceCommentRepository warns about.
+  const comments = new InMemoryCommentRepository();
   return {
-    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
