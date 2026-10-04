@@ -691,12 +691,41 @@ function buildColumns(renderCtx) {
       label: 'Actions',
       render: (a) => {
         const wedged = isAssetWedged(a);
+        const redriveBtn = wedged
+          ? '<button class="btn-ghost asset-redrive-btn" data-id="' +
+            escHtml(a.id) +
+            '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
+          : '';
+
+        // Archive is IMPOSSIBLE on an asset that is already `archived`, and the
+        // app can tell locally, so the control is withheld rather than offered
+        // as a confirm-then-fail (issue #955, broken out from #853).
+        //   - `archived` is terminal: ALLOWED_TRANSITIONS.archived = []
+        //     (src/data/asset-repo.ts:40). DELETE /:id is a soft delete that runs
+        //     repo.remove -> update({ status: 'archived' }) -> applyStatus(
+        //     'archived', 'archived') -> InvalidStateTransitionError
+        //     (src/data/asset-repo.ts:1158, :1824), which maps to 422 — never a
+        //     409 the archive handler classifies, so the operator would just get
+        //     a bare failure toast AFTER confirming the dialog.
+        //   - The determination is purely LOCAL and not racy: `status` is a core
+        //     projection column present on every row and in every search tier
+        //     (unlike the lock flag, #896, whose free-text projection omits
+        //     `deleteLock`), and a terminal state has no outbound transition to
+        //     race against. So there is no analogue of the "enabled + 409
+        //     explains it" argument (spec §5.1) here — the answer cannot change.
+        //   - This mirrors the two sibling controls that already gate on locally
+        //     known status: the jobs table omits Cancel on a settled job
+        //     (public/jobs-table.js:483) and the detail panel omits Restore on a
+        //     non-archived asset (public/app.js:2914). Restore remains reachable
+        //     for the archived asset from its detail panel (a row click).
+        // Re-drive is independent of the lifecycle axis (it is a metadata-
+        // extraction recovery), so a wedged archived row still offers it.
+        if (a.status === 'archived') {
+          return redriveBtn;
+        }
+
         return (
-          (wedged
-            ? '<button class="btn-ghost asset-redrive-btn" data-id="' +
-              escHtml(a.id) +
-              '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
-            : '') +
+          redriveBtn +
           // `data-name` carries the SAME human-readable label the "Name / Title"
           // column renders (a.name || a.slug) so the archive confirmation can
           // name its subject without a second lookup (issue #919). Empty when the
@@ -710,9 +739,11 @@ function buildColumns(renderCtx) {
           // projection actually carries `deleteLock` — an UNKNOWN row (free-text
           // search tier) falls through to the 409 path instead of guessing.
           //
-          // The button is deliberately NOT `disabled`: a disabled control is
-          // unfocusable and carries no explanation, which is precisely what this
-          // issue asks the UI to provide (spec §5.1).
+          // Unlike the archived case above, the lock is only one of four archive
+          // guards and the search tier cannot always see it, so the button is
+          // deliberately NOT `disabled` here: a disabled control is unfocusable
+          // and carries no explanation, which is precisely what #896 asks the UI
+          // to provide (spec §5.1).
           '<button class="btn-danger asset-delete-btn" data-id="' +
           escHtml(a.id) +
           '" data-name="' +
