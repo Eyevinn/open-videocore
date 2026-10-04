@@ -7,7 +7,13 @@ import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
-import { Context, createInstance, getInstance, waitForInstanceReady, getPortsForInstance } from '@osaas/client-core';
+import { Context, createInstance, getInstance, getPortsForInstance } from '@osaas/client-core';
+// The config-service Valkey readiness wait goes through this bounded helper, NOT
+// @osaas/client-core's waitForInstanceReady (issue #1055, follow-up to #1038).
+// The SDK helper has no deadline (lib/core.js:343-353, v0.24.0), so a Valkey
+// that never reported `running` hung this deployment's startup bootstrap with no
+// error at all.
+import { waitForInstanceReadyBounded } from './services/instance-readiness.js';
 import {
   jsonSchemaTransform,
   serializerCompiler,
@@ -351,7 +357,16 @@ if (!paramStore) {
       getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
       getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat),
       createInstance: (serviceId, sat, body) => createInstance(oscContext, serviceId, sat, body),
-      waitForInstanceReady: (serviceId, name) => waitForInstanceReady(serviceId, name, oscContext),
+      // Bounded (#1055): the bootstrap waits for the config service's dedicated
+      // Valkey. With the SDK's unbounded helper a Valkey that never reported
+      // `running` hung startup forever; this gives up at the shared 5-minute
+      // deadline (DEFAULT_INSTANCE_READY_TIMEOUT_MS) with an error naming the
+      // instance, which ensureParameterStore already warn-logs and swallows
+      // (param-store.ts catch block), so startup continues without the store.
+      waitForInstanceReady: (serviceId, name) =>
+        waitForInstanceReadyBounded(oscContext, serviceId, name, {
+          label: 'config queue'
+        }),
       getPortsForInstance: (serviceId, name, sat) => getPortsForInstance(oscContext, serviceId, name, sat)
     },
     log: app.log
