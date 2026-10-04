@@ -131,7 +131,7 @@ export async function runPull(
     quota?: StorageQuotaGuard;
     // Best-effort operational log emission for the `ingest` stage (issue #995).
     // Optional: when absent no log record is appended and behaviour is unchanged.
-    // Wired to the in-memory LogStore that backs GET /api/v1/logs (src/main.ts,
+    // Wired to the log store that backs GET /api/v1/logs (src/main.ts,
     // `logStore`). `logPipelineEvent` never throws, so this cannot make the
     // never-throws contract of runPull (see the doc comment above) any weaker.
     pipelineLog?: PipelineLogSink;
