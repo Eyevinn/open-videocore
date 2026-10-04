@@ -104,9 +104,10 @@ import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
 import { checkProfilesIndexReachable } from './services/profiles-reachability.js';
-import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
-import { InMemoryCommentRepository, type CommentRepository } from './data/comment-repo.js';
-import { CouchCommentRepository } from './data/couch-comment-repo.js';
+import {
+  PerWorkspaceCommentRepository,
+  PerWorkspacePipelineRepository
+} from './data/per-workspace-repos.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { usageRouter } from './routes/usage.js';
@@ -975,19 +976,20 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 const pipelineRepository = new PerWorkspacePipelineRepository(stackResolver);
 
 // Asset comments (issue #135), persisted since issue #1046. Review comments are
-// durable editorial content, so they are stored in the stack's CouchDB and
-// survive a restart. Selected on the SAME env condition as every other Couch
-// repository — COUCHDB_URL present means the Couch-backed implementation, absent
-// means the in-memory fallback (see buildEnvConnections,
-// src/services/workspace-stack.ts:300,321-345), using the env-read + direct
-// StackCouch construction convention the quota store above follows.
+// durable editorial content, so they live in the resolved stack's CouchDB and
+// survive a restart.
+//
+// Wired through the SAME per-workspace path as every other durable repository —
+// the `comments` field on WorkspaceConnections (src/services/workspace-stack.ts),
+// reached through this facade exactly like pipelineRepository above. NOT gated on
+// COUCHDB_URL: that env var only activates the deployment-global override
+// (buildEnvConnections), so a deployment that provisions its stack via
+// POST /api/v1/provision — where the CouchDB URL comes from the parameter store
+// via buildConnectionsFromStack — would never have reached the Couch-backed store
+// and #1046 would reproduce. The facade warns (app.log) on any resolution that
+// lands on the in-memory implementation, naming the reason.
 // Shared with the assets router, which owns POST/GET /:id/comments.
-const commentCouchUrl = process.env['COUCHDB_URL'];
-const commentCouchServer = commentCouchUrl ? couchServer(commentCouchUrl) : undefined;
-const commentCouchDb = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
-const commentRepository: CommentRepository = commentCouchServer
-  ? new CouchCommentRepository(() => new StackCouch(commentCouchServer, commentCouchDb))
-  : new InMemoryCommentRepository();
+const commentRepository = new PerWorkspaceCommentRepository(stackResolver, app.log);
 
 // Read the first provisioned stack's Valkey URL from the parameter store, or a
 // classified reason why none could be resolved. Self-discovered: there is no

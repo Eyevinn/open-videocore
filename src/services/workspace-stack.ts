@@ -27,6 +27,8 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import { CouchCommentRepository } from '../data/couch-comment-repo.js';
+import { InMemoryCommentRepository, type CommentRepository } from '../data/comment-repo.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -111,6 +113,15 @@ export type WorkspaceConnections = {
   audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
+  // Asset comments for this stack (issue #135, made durable by issue #1046).
+  // ALWAYS present: CouchCommentRepository when the resolved stack (or the env
+  // override) has a CouchDB, InMemoryCommentRepository otherwise — the same
+  // always-present shape `audit` above uses, so PerWorkspaceCommentRepository
+  // never has to branch on undefined. Review comments are durable editorial
+  // content, so the Couch-backed implementation must be reachable on the
+  // PARAMETER-STORE path (a stack provisioned via POST /api/v1/provision sets no
+  // COUCHDB_URL), not only under the env override.
+  comments: CommentRepository;
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
@@ -174,7 +185,8 @@ function buildConnectionsFromStack(
   minioPassword: string,
   couchPassword: string,
   oscContext: Context,
-  optionalSteps: OptionalStepBuilders
+  optionalSteps: OptionalStepBuilders,
+  log: StackResolverLogger
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -207,6 +219,10 @@ function buildConnectionsFromStack(
   const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  // Asset comments over the same per-stack CouchDB connection (issue #1046), so
+  // a stack provisioned through POST /api/v1/provision gets the DURABLE comment
+  // store without any COUCHDB_URL env var being set.
+  const comments = new CouchCommentRepository(wc, log);
   // Audit store over the same per-stack CouchDB connection (issue #564).
   const audit = new CouchAuditRepository(wc);
 
@@ -242,6 +258,7 @@ function buildConnectionsFromStack(
     audit,
     profiles,
     pipelines,
+    comments,
     storageFor,
     storageClient: minioClient,
     encore,
@@ -296,7 +313,10 @@ export function stackResolvedMinioEndpoint(
 // bypassing the parameter store. The env values are used verbatim — COUCHDB_URL
 // is expected to already carry any credentials it needs, and MinIO uses the
 // MINIO_ACCESS_KEY/MINIO_SECRET_KEY pair.
-function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefined {
+function buildEnvConnections(
+  oscContext: Context,
+  log: StackResolverLogger
+): WorkspaceConnections | undefined {
   const couchUrl = process.env['COUCHDB_URL'];
   const minioUrl = process.env['MINIO_URL'];
   if (!couchUrl && !minioUrl) return undefined;
@@ -317,6 +337,9 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
   let audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
+  // Asset comments: always present, Couch-backed on the couch env path and
+  // in-memory otherwise (issue #1046) — same always-present shape as `audit`.
+  let comments: CommentRepository;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -330,6 +353,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    comments = new CouchCommentRepository(wc, log);
     audit = new CouchAuditRepository(wc);
   } else {
     const mem = new InMemoryAssetRepository();
@@ -342,6 +366,10 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
+    // MINIO_URL set but no COUCHDB_URL: nothing durable to store comments in on
+    // this path, so they are ephemeral. PerWorkspaceCommentRepository warns when
+    // it resolves to this implementation.
+    comments = new InMemoryCommentRepository();
   }
 
   let storageFor: StorageFactory | undefined;
@@ -371,7 +399,7 @@ function buildEnvConnections(oscContext: Context): WorkspaceConnections | undefi
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines, comments,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -397,8 +425,11 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
+  // No stack resolved (no parameter store / non-ready / invalid config): comments
+  // are ephemeral here, which PerWorkspaceCommentRepository warns about.
+  const comments = new InMemoryCommentRepository();
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, profiles, pipelines, comments,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
@@ -811,7 +842,7 @@ export class WorkspaceStackResolver {
     // Explicit env-var override (local dev / ops). When COUCHDB_URL or MINIO_URL
     // is set we build connections from the environment for ALL workspaces,
     // bypassing the parameter store entirely.
-    const envConnections = buildEnvConnections(this.oscContext);
+    const envConnections = buildEnvConnections(this.oscContext, this.log);
     if (envConnections) {
       // Explicit env override is an intended, healthy configuration — not a
       // degraded fallback. Clear any prior degraded gauge (issue #422).
@@ -943,7 +974,7 @@ export class WorkspaceStackResolver {
     // to no-op in-memory connections so /health and infra routes stay up.
     const built =
       config && isReadyStack(config)
-        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps)
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, this.log)
         : null;
 
     // Emit the aggregate degraded-resolution signal (issue #422): a null build
