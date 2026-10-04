@@ -320,6 +320,15 @@ export function createOpsTableState(config) {
 //   pageSize:   bounded, visible page size (default DEFAULT_PAGE_SIZE)
 //   rowKey:     (row) => string   — stable key for a row (defaults to row.id)
 //   emptyText:  shown when a successful load returns zero rows
+//   emptyState: optional (issue #997) — () => ({ text?, detail?, kind? }), resolved
+//               on EVERY paint of the empty row. For a table whose empty row has
+//               more than one meaning (e.g. "the store has never been written to"
+//               vs "the current filters match nothing"): `text` replaces
+//               emptyText, `detail` is rendered as a secondary line under it, and
+//               `kind` is written to the cell's `data-empty` attribute so CSS and
+//               tests can tell the two states apart. Mirrors the headline+detail
+//               +data-empty empty state in public/tracks-panel.js:344-351. Absent
+//               (or a resolver returning nothing) keeps the plain emptyText row.
 //   caption:    optional table title text rendered above the filter bar
 //
 // The component does NOT fetch. The consumer subscribes to `state` (or passes
@@ -333,6 +342,10 @@ export function createOpsTable(config) {
   const filters = Array.isArray(cfg.filters) ? cfg.filters : [];
   const rowKey = typeof cfg.rowKey === 'function' ? cfg.rowKey : function(r) { return r && r.id; };
   const emptyText = cfg.emptyText || 'No results.';
+  // Optional per-paint resolver for the empty row (issue #997). Kept out of the
+  // interaction store: it is view state the consumer derives from the last
+  // response, so resolving it at paint time needs no emit and no refetch.
+  const emptyStateFor = typeof cfg.emptyState === 'function' ? cfg.emptyState : null;
 
   const state = createOpsTableState({
     pagingMode: cfg.pagingMode,
@@ -548,10 +561,23 @@ export function createOpsTable(config) {
       return;
     }
     if (status === 'empty' || (status === 'ready' && rows.length === 0)) {
+      // A consumer-supplied resolver can name WHICH empty state this is; with no
+      // resolver (every table before #997) this is the plain emptyText row.
+      const resolved = (emptyStateFor ? emptyStateFor() : null) || {};
+      const text = typeof resolved.text === 'string' && resolved.text !== '' ? resolved.text : emptyText;
+      const detail = typeof resolved.detail === 'string' ? resolved.detail : '';
+      const kind = typeof resolved.kind === 'string' ? resolved.kind : '';
       tbody.appendChild(fullWidthRow(colspan, 'ops-table-empty',
         function(td) {
           td.classList.add('empty');
-          td.textContent = emptyText;
+          if (kind) td.setAttribute('data-empty', kind);
+          td.textContent = text;
+          if (detail) {
+            const d = document.createElement('div');
+            d.className = 'ops-table-empty-detail';
+            d.textContent = detail;
+            td.appendChild(d);
+          }
         }));
       return;
     }
