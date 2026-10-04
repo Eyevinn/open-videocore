@@ -1974,9 +1974,19 @@ body.detail-standalone .assets-side {
   color: var(--text-muted);
 }
 
+/* One colour system for every control in the shared bar (issue #983). The Jobs
+ * controls carry the `.ops-filter-*` classes; the Assets (public/assets-table.js)
+ * and Logs (public/logs-table.js) controls are bare `select` / `input[type=date]`
+ * / `input[type=search]` nested in the bar, so match them by type here rather than
+ * leaving them to fall through to the white user-agent defaults. Typed input
+ * selectors are deliberate: a bare `input` would also paint the column-chooser
+ * checkboxes (.ops-columns-item input). */
 .ops-filter-select,
 .ops-filter-date,
-.ops-filter-search {
+.ops-filter-search,
+.ops-table-filters select,
+.ops-table-filters input[type='date'],
+.ops-table-filters input[type='search'] {
   font: inherit;
   font-size: 13px;
   padding: 5px 8px;
