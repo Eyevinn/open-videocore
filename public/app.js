@@ -66,6 +66,14 @@ import { mountReviewState } from './review-state.js';
 // is in that module's header.
 import { mountAssetRename } from './asset-rename.js';
 
+// Collection rename affordance (issue #958). The collection-side mirror of the
+// asset rename above: the operator-facing control for the `name` field that
+// PATCH /api/v1/collections/{id} accepts (updateBodySchema.name,
+// src/routes/collections.ts:224). Contract grounding and the stability
+// guarantees (a rename never touches the id or membership) are in that module's
+// header.
+import { mountCollectionRename } from './collection-rename.js';
+
 // Read-only tracks panel (issue #902, broken out of #794): one section per track
 // kind — video, audio, subtitle — each listing only the attributes the API
 // exposes for that kind, each with an explicit empty state. All of it comes from
@@ -176,6 +184,18 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may rename a collection (issue #958). Same
+// matrix, checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58)
+// gives `write` to `editor` and `admin` only, and `methodToAction` (:79-93) maps
+// PATCH -> write, so PATCH /collections/{id} is refused to a `viewer` with 403 by
+// `resourceAuthorizationPreHandler('collection')` (registered
+// src/routes/collections.ts:267). Client-side mirror only: the 403 is still
+// handled if it arrives.
+function canRenameCollection() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -4409,10 +4429,58 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
     kvDiv.className = 'kv-grid';
     kvDiv.innerHTML = [
       '<span class="kv-key">ID</span><span class="kv-val text-mono">' + escHtml(coll.id) + '</span>',
-      '<span class="kv-key">Name</span><span class="kv-val">' + escHtml(coll.name || '—') + '</span>',
+      '<span class="kv-key">Name</span><span class="kv-val" id="coll-detail-name">' + escHtml(coll.name || '—') + '</span>',
       '<span class="kv-key">Created</span><span class="kv-val">' + escHtml(fmtDate(coll.createdAt)) + '</span>',
     ].join('');
     body.appendChild(kvDiv);
+
+    // Action row: operator affordances that act on the collection as a whole
+    // (as opposed to its membership, which the picker + member table below own).
+    // Mirrors the asset detail's `.mt12 flex-gap` action row.
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'mt12 flex-gap';
+    const actionMsgEl = document.createElement('div');
+    actionMsgEl.id = 'coll-action-msg';
+    body.appendChild(actionsDiv);
+    body.appendChild(actionMsgEl);
+
+    // ── Rename: edit the collection's title (issue #958) ──
+    //
+    // The collection-side mirror of the asset rename (issue #956). Contract is
+    // fetched and cited in full in public/collection-rename.js: PATCH
+    // /api/v1/collections/{id} accepts EXACTLY `name`
+    // (`updateBodySchema.name = z.string().min(1).max(256).optional()`,
+    // src/routes/collections.ts:224, applied at :407 via
+    // applyCollectionUpdate, src/data/collection-repo.ts:97-98); 200 returns the
+    // stored collection, 400 = validation error (empty/over-long name), 404 =
+    // { error }. No API change is involved: this is the affordance for a field
+    // the route already accepts and round-trips.
+    //
+    // The path param is the collection id (PATCH /:id looks the document up by
+    // id; collections have no slug), which the detail pane holds as `coll.id`.
+    mountCollectionRename({
+      collection: coll,
+      actionsRow: actionsDiv,
+      canChange: canRenameCollection(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      showMsg: showMsg,
+      messageHost: function () { return detailPanel.querySelector('#coll-action-msg'); },
+      onRenamed: async function (updated, message) {
+        // The list and the search tier both project the same `name` field from
+        // the live collection document, so reloading the list (onRefresh) makes
+        // the new name appear there (issue #958 AC1). Re-render the pane's Name
+        // row from the server's returned document rather than the typed value,
+        // so a silently different stored value becomes visible.
+        const nameCell = detailPanel.querySelector('#coll-detail-name');
+        if (nameCell && updated && typeof updated.name === 'string') {
+          nameCell.textContent = updated.name;
+        }
+        const host = detailPanel.querySelector('#coll-action-msg');
+        if (host) showMsg(host, message, updated ? 'success' : 'error');
+        if (typeof onRefresh === 'function') onRefresh();
+      },
+    });
 
     // Add-asset control: searchable multi-select picker with the raw-id field
     // kept as a fallback (issue #915). Adding refreshes only the member list
@@ -7641,6 +7709,10 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirror of the ADR-018 write gate for PATCH /collections/{id}
+  // (issue #958). Exported so a DOM/unit test can assert the collection Rename
+  // control is offered to exactly the roles that hold `write`.
+  canRenameCollection,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
