@@ -60,6 +60,7 @@ import {
   runWithRequestStack,
   currentRequestStackName
 } from './services/request-stack-context.js';
+import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
   resolveStackRedisUrl,
@@ -92,18 +93,12 @@ import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
 import { makeOscSceneDetector } from './pipeline/osc-scene-detect.js';
 import type { SceneDetector } from './pipeline/scene-detector.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
-import { extractThumbnails } from './pipeline/thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
-import {
-  runnerFactory,
-  resolveRunnerOption,
-  runnerS3Config,
-  RunnerFactoryUnresolvedError
-} from './pipeline/runner-option.js';
+import { runnerFactory } from './pipeline/runner-option.js';
 import { registerPrincipal } from './auth/principal.js';
 import { registerAuth } from './auth/middleware.js';
 import { internalRouter } from './routes/internal.js';
@@ -2097,11 +2092,27 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
 };
 await app.register(internalRouter, internalRouterOptions);
 
+// Poster frame on ingest (issue #7). The stack's object-store coordinates are
+// resolved INSIDE the detached continuation with the full resolve() keyed by
+// the stack name captured at trigger time, not with a cache read — a cache read
+// returns undefined once the resolver TTL has passed and silently demoted the
+// write to the boot-default bucket (issue #1100). See
+// services/post-upload-thumbnail.ts.
+const triggerPostUploadThumbnail = thumbnailExtractor
+  ? makePostUploadThumbnailTrigger({
+      resolver: stackResolver,
+      assets: assetRepository,
+      extractor: thumbnailExtractor,
+      defaultSourceBucket: sourceBucket,
+      log: app.log
+    })
+  : undefined;
+
 // On object storage (upload-complete OR watch-folder ingest), fire-and-forget
 // ffprobe extraction (issue #6) and thumbnail extraction (issue #7). Shared by
 // the upload route and the watch-folder service. The upload route resolves the
-// caller's workspace before invoking this, so the resolver cache is warm and
-// the sync storageFor() and resolveCached() can be read synchronously.
+// caller's workspace before invoking this, so the sync storageFor() can be read
+// synchronously.
 const onObjectStored =
   storageAvailable
     ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) => {
@@ -2112,43 +2123,7 @@ const onObjectStored =
             { assets: assetRepository, storage: effectiveStorage, probe }
           );
         }
-        if (thumbnailExtractor) {
-          // Read s3Config from the already-warm resolver cache, for the stack
-          // this request named (issue #1058). The upload preHandler called
-          // resolve() with the same name, so resolveCached() is valid here.
-          // CAVEAT (#1090): this is a CACHE read, so it returns undefined if the
-          // entry has aged past the resolver TTL between the preHandler and this
-          // fire-and-forget continuation, in which case the thumbnail runner
-          // falls back to the boot-default bucket. Fine for the request path
-          // (the entry was just written); recorded on #1090 with the rest of the
-          // non-request resolution gaps.
-          const conns = stackResolver.resolveCached(currentRequestStackName());
-          const bucket = conns?.sourceBucket ?? sourceBucket;
-          // Same resolution helper the asset routes use (issue #838). This path
-          // is fire-and-forget on upload, so an unresolvable factory is logged
-          // at error level and skipped rather than thrown at the uploader — but
-          // it is logged, not silently treated as "no thumbnails configured".
-          try {
-            const extractor = resolveRunnerOption(
-              thumbnailExtractor,
-              runnerS3Config(conns?.s3Config, bucket),
-              'thumbnailExtractor'
-            );
-            void extractThumbnails(
-              { assetId, objectKey, timecodes: [1] },
-              { assets: assetRepository, storage: effectiveStorage, extractor }
-            ).catch(() => { /* failures recorded on asset */ });
-          } catch (err) {
-            if (err instanceof RunnerFactoryUnresolvedError) {
-              app.log.error(
-                { err, assetId },
-                'skipping post-upload thumbnail extraction: runner factory could not be resolved'
-              );
-            } else {
-              throw err;
-            }
-          }
-        }
+        triggerPostUploadThumbnail?.(assetId, objectKey, effectiveStorage);
       }
     : undefined;
 
