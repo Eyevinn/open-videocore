@@ -3042,8 +3042,41 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           assetId: extAsset.id,
           sourceUrl: extObjectKey
         });
+        // Audit: ingest-url job submitted (issue #1000). One entry, targetId = the
+        // new job id, emitted right after the durable job record exists — the same
+        // moment and the same shape the transcode submission uses
+        // (src/pipeline/transcode.ts:104-114). `system` origin matches every other
+        // `job.*` entry (transcode + package), so the job lifecycle reads as one
+        // consistent origin regardless of which surface triggered it.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.submitted',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         await jobs.update(extJob.id, { status: 'running' });
         await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Audit: this branch settles the job terminally INLINE (the bytes already
+        // live in the external bucket, so no pull worker runs and nothing else can
+        // ever emit the terminal entry for it). Same shape as the pull worker's
+        // success entry (src/pipeline/url-pull-worker.ts) minus `bytesTransferred`,
+        // which is meaningless when no bytes were transferred.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.completed',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         // Fire-and-forget probe against the external source (job reads in place).
         triggerExtraction(extAsset.id, extObjectKey, source);
         return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
@@ -3107,6 +3140,29 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // TTL of its own, so holding it across the pull is safe.
       const pullStorage = storageFor();
 
+      // Audit: ingest-url job submitted (issue #1000). See the external-backend
+      // branch above for the shape rationale. Emitted BEFORE the detached pull
+      // runner starts, so the audit trail records the submission regardless of the
+      // pull outcome — and the asset's history no longer starts mid-pipeline.
+      // `sourceUrl` is deliberately NOT in the detail bag: a pull source may be a
+      // pre-signed URL carrying credentials in its query string.
+      // This submission and the terminal job.completed/job.failed the worker emits
+      // can land in the same millisecond (equal `at`); the audit store mints
+      // monotonic ULID ids so GET /api/v1/audit's equal-`at` tiebreak resolves to
+      // true write order and never renders the lifecycle inverted (issue #1000
+      // review; CONTRACT: monotonic id minting in src/data/audit-repo.ts record()).
+      emitAudit(
+        audit,
+        {
+          actor: originActor('system'),
+          action: 'job.submitted',
+          targetType: 'job',
+          targetId: job.id,
+          detail: { jobType: 'ingest-url', assetId: asset.id }
+        },
+        request.log
+      );
+
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
@@ -3126,7 +3182,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // the Logs tab gets of a URL-pull ingest, which runs detached and
           // therefore outlives this request.
           pipelineLog,
-          pipelineLogErrors: request.log
+          pipelineLogErrors: request.log,
+          // Terminal `job.completed` / `job.failed` emission for this job happens
+          // inside the worker, where the pull actually settles (issue #1000).
+          // Threaded after the `pullDeps` spread so an injected test dep bag can
+          // never silently drop the emitter.
+          audit,
+          auditLog: request.log
         }
       )
         .then(async () => {
