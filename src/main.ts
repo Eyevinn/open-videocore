@@ -2454,11 +2454,44 @@ abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
 // cleanup is #1086 — and does NOT re-queue the pull. Idempotent, so a crash
 // between boots cannot double-settle. Detached + swallowed: a reconcile failure
 // must never block the API from serving.
+//
+// The settle is the job's TERMINAL transition, so it carries the same `job.failed`
+// audit entry the in-process worker emits when it settles a pull itself
+// (src/pipeline/url-pull-worker.ts:324-334, issue #1000/#1032) — otherwise a
+// reconciler-settled job would keep its `job.submitted` entry and never get a
+// closing one. The scan also runs once per provisioned stack (#1058/#1062): both
+// the job repository and the audit emitter resolve the AMBIENT stack, and boot has
+// no request, so without this it would see the first-listed stack only and leave
+// every other stack's interrupted jobs stuck forever.
+// Adapter for the printf-style sweep loggers: pino takes the format string as
+// its MESSAGE and the remaining values as interpolation args, so '%s'/'%d'/'%o'
+// actually interpolate. Handing pino the whole arg ARRAY instead (as the older
+// sweep wiring above does) makes it treat the array as a merging object and log
+// {"0":"...","1":"..."} with the format string never interpolated.
+function printfToPino(
+  sink: (msg: string, ...args: unknown[]) => void,
+  args: unknown[]
+): void {
+  const [format, ...rest] = args;
+  sink(typeof format === 'string' ? format : String(format), ...rest);
+}
+
 void reconcileInterruptedIngests({
   jobs: jobRepository,
+  audit: auditEmitter,
+  auditLog: app.log,
+  stacks: {
+    listStackNames: () => stackResolver.listStackNames(),
+    runInStack: (stackName, fn) => runWithRequestStack(stackName, fn)
+  },
   logger: {
-    info: (...a: unknown[]) => app.log.info(a),
-    warn: (...a: unknown[]) => app.log.warn(a)
+    // The reconciler logs printf-style ('%s'/'%d'/'%o'), and pino's info/warn
+    // take (msg, ...interpolationArgs) — so SPREAD the args instead of handing
+    // pino the array as its first argument, which it would treat as a merging
+    // OBJECT and render as {"0":"...","1":"..."} with the format string never
+    // interpolated.
+    info: (...a: unknown[]) => printfToPino(app.log.info.bind(app.log), a),
+    warn: (...a: unknown[]) => printfToPino(app.log.warn.bind(app.log), a)
   }
 }).catch((err) => app.log.warn({ err }, 'interrupted-ingest reconciliation on boot failed'));
 

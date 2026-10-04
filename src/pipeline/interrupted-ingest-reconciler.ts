@@ -20,16 +20,33 @@
 // right now, so it is left strictly alone — that boundary is what keeps a live
 // pull from being mistaken for a dead one.
 //
-// SCOPE (issue #1084): the JOB RECORD ONLY. The job is settled to `failed` with a
-// reason naming the interruption. It is deliberately NOT re-queued, the asset is
-// NOT moved out of `uploading` (issue #1085) and partially-written bytes are NOT
-// cleaned up (issue #1086).
+// SCOPE (issue #1084): the JOB RECORD ONLY — settled to `failed` with a reason
+// naming the interruption, plus the matching terminal audit entry (below). It is
+// deliberately NOT re-queued and the asset is NOT moved out of `uploading`
+// (issue #1085).
+//
+// Partially-written bytes are also NOT cleaned up here (issue #1086). That gap
+// does not need new machinery: the in-process terminal-failure path already
+// discards the staged multipart upload for exactly this reason
+// (`discardOrphanedUpload` -> `storage.abortIncompleteMultipartUploads(objectKey)`,
+// src/pipeline/url-pull-worker.ts:102-127, called on terminal failure at :302 per
+// issue #1088). #1086 is the work of giving this reconciler the same two inputs
+// that helper needs — a WorkspaceStorage for the job's stack and the job's
+// `objectKey` — and calling it; it is out of scope for #1084 because the object
+// key is not on the Job record (src/data/job-repo.ts) and deriving it is its own
+// decision.
 //
 // IDEMPOTENT and safe to run more than once: the settle re-reads each job
 // immediately before writing and only acts while it is STILL `running` and STILL
 // stamped before process start. A job this reconciler settles becomes `failed`
 // (terminal) and is stamped with a fresh `updatedAt`, so a second run matches
 // nothing.
+//
+// MULTI-STACK: the job repository resolves the ambient request stack, of which
+// boot has none, so an unassisted scan sees only the first-listed stack
+// (issue #1062). The caller therefore passes `deps.stacks` and the scan+settle
+// runs once inside EACH provisioned stack's context — the same remedy the
+// transcode/package sweeps adopted for this defect (src/main.ts:1346-1352).
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - Job.type / JOB_TYPES incl. 'ingest-url': src/data/job-repo.ts:84-85, :94
@@ -48,8 +65,25 @@
 //   - Sweep shape (deps-driven fn, { scanned, settled } result, best-effort per
 //     record, re-read before write, paged offset walk):
 //     src/pipeline/abandoned-upload-sweep.ts:93-166
+//   - Terminal audit entry: emitAudit(emitter, RecordAuditInput, log) +
+//     originActor('user'|'system'|'ai') + AuditEmitter.record / AuditErrorLog.error:
+//     src/data/audit-emit.ts:28-30, :35-36, :44-48, :59-63; the `job.failed` entry shape
+//     this reconciler must match: src/pipeline/url-pull-worker.ts:320-334
+//   - RecordAuditInput fields (actor/action/targetType/targetId/detail) and the
+//     closed AUDIT_TARGET_TYPES enum incl. 'job': src/data/audit-repo.ts:53, :96-105
+//   - Per-stack scan: WorkspaceStackResolver.listStackNames() (returns [] with no
+//     param store, never throws — src/services/workspace-stack.ts:1155-1170) and
+//     runWithRequestStack(stackName, fn) (src/services/request-stack-context.ts:46-48),
+//     the pair the sibling boot/tick sweeps already use for this exact defect
+//     (src/main.ts:1346-1352, issue #1058/#1062)
 
 import type { Job, JobRepository } from '../data/job-repo.js';
+import {
+  emitAudit,
+  originActor,
+  type AuditEmitter,
+  type AuditErrorLog
+} from '../data/audit-emit.js';
 
 // The reason written to Job.error for a pull whose owning process died. Exported
 // so callers and tests assert on the same string rather than duplicating it.
@@ -64,8 +98,12 @@ const SCAN_PAGE_SIZE = 200;
 // Defensive bound on the offset walk. The reconciler only needs to reach the
 // jobs that could possibly predate process start, and it must never turn into an
 // unbounded enumeration of a large historical job list at boot. Pages beyond this
-// are not scanned (logged once) — a job missed here stays exactly as it is today
-// and the next boot gets another chance.
+// are not scanned, and the cut is logged as a WARNING because it is permanent for
+// the jobs it hides: list() orders newest-first (src/data/job-repo.ts:539-540) and
+// the job list only grows, so the records the cap truncates are the OLDEST ones
+// and a later boot scanning the same leading pages will not reach them either.
+// Such a job keeps the behaviour it has today — `running` forever, unsettled —
+// so the cap trades an unbounded boot scan for a logged, bounded blind spot.
 const MAX_SCAN_PAGES = 50;
 
 type Logger = {
@@ -94,6 +132,36 @@ export type ReconcileInterruptedIngestsDeps = {
   processStartedAtMs?: number;
   // The reason recorded on Job.error. Defaults to INTERRUPTED_PULL_ERROR.
   reason?: string;
+  // Best-effort terminal audit emission (issues #1000/#1032). This reconciler is
+  // a SETTLE SITE for the ingest-url job's terminal transition, so it owes the
+  // same `job.failed` entry the in-process worker emits when IT settles the job
+  // (src/pipeline/url-pull-worker.ts:320-334). Without it a reconciler-settled
+  // job keeps its `job.submitted` entry and never gets a closing one — exactly
+  // the "history that never closes" defect #1000 fixed. Optional: when no
+  // emitter is wired (an in-memory test that does not assert audit) emission is
+  // a no-op, and a failed audit write is logged, never propagated
+  // (src/data/audit-emit.ts:59-63).
+  audit?: AuditEmitter;
+  auditLog?: AuditErrorLog;
+  // Multi-stack scan (issues #1058/#1062). The repository passed above is
+  // normally PerWorkspaceJobRepository, which resolves the AMBIENT request stack
+  // (src/data/per-workspace-repos.ts:164-168) — and boot has no request, so
+  // currentRequestStackName() is undefined and the repo resolves the FIRST
+  // LISTED stack only (src/services/request-stack-context.ts:51-53,
+  // src/services/workspace-stack.ts resolve() no-stackName branch). On a
+  // multi-stack install that would leave every non-default stack's interrupted
+  // jobs stuck forever. Supplying this runs the whole scan+settle ONCE INSIDE
+  // EACH provisioned stack's context, the same shape the transcode/package
+  // sweeps use for this defect (src/main.ts:1346-1352). Omit it (or let
+  // listStackNames() return []) and the scan runs exactly once against the
+  // default resolution, byte-identical to not having it.
+  stacks?: {
+    // Provisioned stack names; [] when no parameter store is configured.
+    listStackNames(): Promise<string[]>;
+    // Run `fn` with `stackName` as the ambient stack for every resolution made
+    // inside it.
+    runInStack<T>(stackName: string | undefined, fn: () => Promise<T>): Promise<T>;
+  };
   logger?: Logger;
 };
 
@@ -102,11 +170,52 @@ export type ReconcileInterruptedIngestsResult = {
   settled: number;
 };
 
-// Settle every ingest-url job left `running` by a previous process. Best-effort
-// per job: one job's error is logged and skipped and never aborts the run. Never
-// throws for a per-job failure; a failure to enumerate jobs at all does propagate
-// to the caller, which decides whether that is fatal (it is not, at boot).
+// Settle every ingest-url job left `running` by a previous process, in EVERY
+// provisioned stack when `deps.stacks` is supplied (and in the default-resolved
+// stack only when it is not — see the `stacks` doc comment). Best-effort per job:
+// one job's error is logged and skipped and never aborts the run; likewise
+// per-stack, so one unreachable stack cannot hide the others' interrupted jobs.
+// Never throws for a per-job or per-stack failure; only a failure to enumerate
+// jobs in the single no-`stacks` case propagates to the caller, which decides
+// whether that is fatal (it is not, at boot).
 export async function reconcileInterruptedIngests(
+  deps: ReconcileInterruptedIngestsDeps
+): Promise<ReconcileInterruptedIngestsResult> {
+  if (!deps.stacks) {
+    return settleInterruptedIngestsInCurrentStack(deps);
+  }
+
+  // listStackNames() swallows its own errors and returns [] (workspace-stack.ts:1155-1170),
+  // so an empty list means "no stack configs visible" — either a single fixed
+  // deployment context or an unreadable store. Both want the one default-resolved
+  // pass, which is the pre-#1062 behaviour.
+  const names = await deps.stacks.listStackNames();
+  const contexts: Array<string | undefined> = names.length > 0 ? names : [undefined];
+
+  const totals: ReconcileInterruptedIngestsResult = { scanned: 0, settled: 0 };
+  for (const stackName of contexts) {
+    try {
+      const result = await deps.stacks.runInStack(stackName, () =>
+        settleInterruptedIngestsInCurrentStack(deps)
+      );
+      totals.scanned += result.scanned;
+      totals.settled += result.settled;
+    } catch (err) {
+      // One stack whose job store cannot even be enumerated must not stop the
+      // remaining stacks from being reconciled.
+      deps.logger?.warn?.(
+        '[interrupted-ingest-reconciler] failed to scan stack %s: %o',
+        stackName ?? '(default)',
+        err
+      );
+    }
+  }
+  return totals;
+}
+
+// One stack's scan + settle, run under whatever stack context is ambient at call
+// time (the repositories resolve it themselves).
+async function settleInterruptedIngestsInCurrentStack(
   deps: ReconcileInterruptedIngestsDeps
 ): Promise<ReconcileInterruptedIngestsResult> {
   const processStartedAtMs = deps.processStartedAtMs ?? processStartTimeMs();
@@ -146,6 +255,28 @@ export async function reconcileInterruptedIngests(
         continue;
       }
       settled += 1;
+      // Audit: this reconciler just performed the job's TERMINAL transition, so it
+      // emits the terminal entry the (dead) in-process worker never got to write —
+      // identical shape to url-pull-worker.ts:324-334, down to targetId = the job
+      // id the `job.submitted` entry used at creation (src/routes/assets.ts POST
+      // /ingest-url), so the ingest job's audit history opens and closes on the
+      // same object (issue #1000/#1032). Emitted AFTER the durable write and only
+      // on the branch that actually settled, and the settle is guarded by the
+      // re-read above, so exactly ONE `job.failed` entry exists per settled job no
+      // matter how often the reconciler runs. No `sourceUrl` in `detail`: a pull
+      // source may be a pre-signed URL carrying credentials and the audit store is
+      // queryable.
+      emitAudit(
+        deps.audit,
+        {
+          actor: originActor('system'),
+          action: 'job.failed',
+          targetType: 'job',
+          targetId: job.id,
+          detail: { jobType: 'ingest-url', assetId: job.assetId, error: reason }
+        },
+        deps.auditLog
+      );
       deps.logger?.info?.(
         '[interrupted-ingest-reconciler] settled interrupted ingest job %s (asset %s) to failed: %s',
         job.id,
@@ -206,7 +337,7 @@ async function listInterruptedCandidates(
     }
     if (page === MAX_SCAN_PAGES - 1) {
       deps.logger?.warn?.(
-        '[interrupted-ingest-reconciler] stopped scanning at %d jobs (page cap); any remaining interrupted job is reconciled on the next boot',
+        '[interrupted-ingest-reconciler] stopped scanning at %d jobs (page cap); older jobs beyond this point are NOT scanned here or on a later boot and stay running if interrupted',
         offset
       );
     }
