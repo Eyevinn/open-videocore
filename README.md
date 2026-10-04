@@ -502,6 +502,14 @@ reclaim. Give each deployment its own workspace identity.
 | `POST` | `/api/v1/admin/watch-folder/start` | Start the watch-folder poller |
 | `POST` | `/api/v1/admin/watch-folder/stop` | Stop the watch-folder poller |
 
+Watch-folder ingest runs one poller per provisioned stack, each watching that
+stack's own source bucket, so a file dropped into any stack's bucket is ingested
+into that stack. `WATCH_FOLDER_ENABLED` and `WATCH_FOLDER_POLL_INTERVAL_SECONDS`
+are deployment-wide; the bucket each poller watches comes from the stack's own
+provisioning record, so a newly provisioned stack is picked up with no restart.
+The three admin endpoints above report and control the default stack's poller
+(the stack a request with no `X-Stack-Name` resolves to).
+
 **Internal** (called by OSC services, not for direct client use)
 
 | Method | Path | Description |
