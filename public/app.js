@@ -4666,16 +4666,41 @@ const SEARCH_FORMAT_PLACEHOLDER = 'video/mp4';
 const SEARCH_FORMAT_HINT =
   'Matches the extracted container format — "video/mp4", "mp4" and "mov" all match an MP4.';
 
+// Why this tab exists alongside the Assets tab's filter box (issue #948). The
+// two surfaces look alike now that both take structured filters, so the copy
+// has to carry the distinction:
+//   - GET /api/v1/search returns BOTH kinds of hit — `assets` (type: 'asset')
+//     and `collections` (type: 'collection', issue #561); see the verified
+//     contract note above normaliseSearchResults and src/routes/search.ts:112
+//     (collectionHitSchema) / :123 (searchResultSchema).
+//   - The Assets tab's free-text box hits the same endpoint but reads only
+//     `res.assets` and drops the collection hits (public/assets-table.js:315-326),
+//     so it can never surface a collection.
+//   - The Collections tab lists every collection via GET /api/v1/collections
+//     (public/app.js:3901) with no query at all.
+// So this tab is the only place a search can return a collection, and the copy
+// below says exactly that.
+const SEARCH_TAB_TITLE = 'Search everything';
+const SEARCH_TAB_INTRO =
+  'Searches across everything and returns collections as well as assets. It is the ' +
+  'only search that returns collections — the filter box on the Assets tab narrows ' +
+  'the asset list only, and the Collections tab just lists collections.';
+
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
-  title.textContent = 'Search';
+  title.textContent = SEARCH_TAB_TITLE;
   container.appendChild(title);
+
+  const intro = document.createElement('p');
+  intro.className = 'text-muted search-tab-intro';
+  intro.textContent = SEARCH_TAB_INTRO;
+  container.appendChild(intro);
 
   const section = document.createElement('div');
   section.className = 'section';
   section.innerHTML = [
-    '<div class="section-title">Search assets</div>',
+    '<div class="section-title">Search assets and collections</div>',
     '<div class="form-row">',
     '  <div class="form-field grow">',
     '    <label for="search-q">Query</label>',
@@ -7728,6 +7753,11 @@ export {
   renderSearchTab,
   SEARCH_FORMAT_LABEL,
   SEARCH_FORMAT_PLACEHOLDER,
+  // The copy that tells the two search-ish surfaces apart (issue #948).
+  // Exported so a DOM/unit test can assert the Search tab still says it
+  // returns collections, rather than re-typing the sentence.
+  SEARCH_TAB_TITLE,
+  SEARCH_TAB_INTRO,
   // Per-instance capacity is read from the wire, not inferred (issue #979).
   // Exported so a DOM/unit test can assert the card reports the server's
   // `jobsPerInstance`.

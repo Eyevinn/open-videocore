@@ -1614,6 +1614,17 @@ pre.code-block {
   margin-top: 16px;
 }
 
+/* Search tab intro copy (issue #948) — sits between the panel title and the
+   first section, and says what this tab does that the Assets tab filter does
+   not. .panel-title already carries a 16px bottom margin, so this pulls up
+   under it and keeps its own gap before the section. */
+.search-tab-intro {
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 70ch;
+  margin: -8px 0 16px;
+}
+
 /* Utility */
 .mt8 { margin-top: 8px; }
 .mt12 { margin-top: 12px; }
