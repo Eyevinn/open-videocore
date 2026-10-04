@@ -7442,9 +7442,39 @@ async function renderTranscodersTab(container) {
       });
     });
 
+    // Waiting + in-flight work across all workspaces (issue #981). The pool's
+    // instance count alone cannot tell a saturated pool from an idle one: "3 of
+    // 3 active" reads the same whether 0 or 12 jobs are backed up behind it.
+    // queueDepth is work accepted but not yet dispatched to an instance;
+    // inflightDepth is work dispatched and running. Both are per-workspace
+    // numbers (workspaceSchema.queueDepth / .inflightDepth, GET
+    // /api/v1/scaler/status in src/routes/scaler.ts), so sum them across the
+    // returned workspaces. Same `Number(x) || 0` coercion the cards use, so a
+    // junk value reads as 0 rather than NaN-ing the whole summary.
+    let totalQueued = 0;
+    let totalInflight = 0;
+    workspaces.forEach(function(ws) {
+      totalQueued += Number(ws && ws.queueDepth) || 0;
+      totalInflight += Number(ws && ws.inflightDepth) || 0;
+    });
+
     // Pool-capacity context using maxInstances from the response.
-    summaryEl.textContent = flatInstances.length + ' of ' + maxInstances +
+    const activeText = flatInstances.length + ' of ' + maxInstances +
       ' instance' + (maxInstances === 1 ? '' : 's') + ' active';
+    // Only append a work clause when there IS waiting/in-flight work, so an idle
+    // pool still reads cleanly as "N of N active" and a backlog is impossible to
+    // miss next to it (issue #981).
+    const workParts = [];
+    if (totalQueued > 0) workParts.push(totalQueued + ' queued');
+    if (totalInflight > 0) workParts.push(totalInflight + ' in flight');
+    summaryEl.textContent = workParts.length
+      ? activeText + ' · ' + workParts.join(', ')
+      : activeText;
+    // The clause is terse by design; the full meaning lives in a tooltip so the
+    // distinction is readable without hovering being required to act on it.
+    summaryEl.title = workParts.length
+      ? 'Queued = accepted but not yet dispatched to an instance. In flight = dispatched and running.'
+      : '';
 
     if (!scalerActive || flatInstances.length === 0) {
       const empty = document.createElement('div');
