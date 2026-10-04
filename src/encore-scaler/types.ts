@@ -212,6 +212,24 @@ export type EncoreScalerConfig = {
   // externalId (same id onDispatched/onJobsDropped resolve by). Best-effort: the
   // scaler swallows a thrown hook so a repo hiccup never blocks the re-enqueue.
   onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
+  // Operational log store the control loop appends its spawn/dispatch/reap/tick
+  // FAILURES to (issue #998, parent #985). Before this the loop reported those
+  // failures with `console.error` only — visible in the container's stdout and
+  // nowhere else, so the one subsystem with no API/UI visibility stayed invisible
+  // exactly when an operator needed it.
+  //
+  // Narrowed to the single write method (`ScalerLogSink.append`,
+  // src/encore-scaler/scaler-log.ts) so the loop can never reach the store's
+  // read/pagination surface. Satisfied by the in-memory `LogStore`, the durable
+  // `CouchLogStore` (#996) and the stack-delegating `PerWorkspaceLogStore` that
+  // main.ts registers — the SAME instance GET /api/v1/logs reads and the
+  // pipeline-step producer (#995) writes to.
+  //
+  // Optional, and emission is a no-op when unset: tests and embedders that have
+  // not wired a store behave exactly as before. Every append is fire-and-forget
+  // and never throws (see logScalerEvent), and the existing `console.error` at
+  // each call site is kept, so this is purely additive.
+  logSink?: import('./scaler-log.js').ScalerLogSink;
 };
 
 export type EncoreInstanceRecord = {

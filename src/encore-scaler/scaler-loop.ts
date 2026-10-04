@@ -39,6 +39,7 @@ import {
   requeueInterruptedByScaleDown
 } from './retry-store.js';
 import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
+import { logScalerEvent, type ScalerLogPhase } from './scaler-log.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
   ACTIVE_PAGE_SIZE,
@@ -171,6 +172,31 @@ export class EncoreScalerLoop {
 
   constructor(private config: EncoreScalerConfig) {}
 
+  // Mirror a control-loop FAILURE into the operational log store (issue #998,
+  // parent #985) so it is visible through GET /api/v1/logs and the Logs tab,
+  // not just in this container's stdout.
+  //
+  // Every call site below keeps its existing `console.error` verbatim — this is
+  // strictly additive — and this helper never throws, never awaits and is a
+  // no-op when no `logSink` is configured (see logScalerEvent,
+  // src/encore-scaler/scaler-log.ts), so no error path it instruments can
+  // change behaviour. `phase` is what makes the entry filterable: it becomes the
+  // `encore-scaler/<phase>: ` message prefix the `q` substring filter matches
+  // (src/services/log-store.ts applyLogQuery).
+  private logFailure(
+    phase: ScalerLogPhase,
+    message: string,
+    err?: unknown
+  ): void {
+    logScalerEvent(this.config.logSink, {
+      phase,
+      level: 'error',
+      workspaceId: this.config.workspaceId,
+      message,
+      err
+    });
+  }
+
   start(intervalMs = 10_000): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
@@ -182,6 +208,9 @@ export class EncoreScalerLoop {
           // A tick failure must not kill the interval; the next tick retries.
           // Log so spawn/dispatch errors are visible rather than silently lost.
           console.error('[encore-scaler] tick error (workspace=%s):', this.config.workspaceId, err);
+          // ...and durably, through the API/UI (#998): an operator reviewing an
+          // incident after the fact cannot read this container's stdout.
+          this.logFailure('tick', 'control-loop tick failed; the next tick retries', err);
         })
         .finally(() => {
           this.running = false;
@@ -231,6 +260,11 @@ export class EncoreScalerLoop {
           this.config.workspaceId,
           err
         );
+        this.logFailure(
+          'tick',
+          'failed-transcode reconcile sweep errored (scaling and dispatch continue)',
+          err
+        );
       }
     }
 
@@ -252,6 +286,11 @@ export class EncoreScalerLoop {
       console.error(
         '[encore-scaler] pending-spawn resolve error (workspace=%s):',
         workspaceId,
+        err
+      );
+      this.logFailure(
+        'spawn',
+        'pending-spawn resolution failed; a half-ready instance stays pending for the next tick',
         err
       );
     }
@@ -303,6 +342,15 @@ export class EncoreScalerLoop {
           pending,
           instances.length,
           maxInstances,
+          err
+        );
+        // #998: this is the signal that distinguishes "pool is at maxInstances"
+        // from "OSC will not create the instance" — the exact ambiguity #1071
+        // described — so it must reach the API/UI, not only pod logs.
+        this.logFailure(
+          'spawn',
+          `scale-up spawn failed (pending=${pending} instances=${instances.length} ` +
+            `max=${maxInstances}); continuing the tick with the existing pool`,
           err
         );
       }
@@ -557,6 +605,13 @@ export class EncoreScalerLoop {
       console.error(
         '[encore-scaler] orphan reap error (workspace=%s):',
         this.config.workspaceId,
+        err
+      );
+      // #998: a sweep that keeps failing means orphaned instances keep billing,
+      // and nothing else can tear them down — so it needs operator visibility.
+      this.logFailure(
+        'reap',
+        'orphan instance sweep failed; instances with no pool record may still be running',
         err
       );
     }
@@ -859,6 +914,12 @@ export class EncoreScalerLoop {
         '[encore-scaler] scale-down interruption re-enqueue error (workspace=%s, instance=%s):',
         workspaceId,
         instanceId,
+        err
+      );
+      this.logFailure(
+        'reap',
+        `scale-down interruption re-enqueue failed for instance ${instanceId}; ` +
+          'jobs lost to this teardown may not have been re-queued',
         err
       );
     }
@@ -1518,6 +1579,12 @@ export class EncoreScalerLoop {
           workspaceId,
           err
         );
+        this.logFailure(
+          'tick',
+          `dropped-job settle hook failed for ${droppedJobs.length} job(s); ` +
+            'they may still be stuck non-terminal',
+          err
+        );
       }
     }
   }
@@ -1642,6 +1709,12 @@ export class EncoreScalerLoop {
           degraded: true
         }
       );
+      this.logFailure(
+        'dispatch',
+        `callback path NOT usable for instance ${inst.instanceId} ` +
+          `(ingress ${hostname} answered ${result.status} for the whole ${timeoutMs}ms ` +
+          'bounded wait); dispatching anyway with sweep-only completion'
+      );
       return true;
     }
 
@@ -1661,6 +1734,12 @@ export class EncoreScalerLoop {
         timeoutMs,
         elapsedMs
       }
+    );
+    this.logFailure(
+      'dispatch',
+      `callback-trust bounded wait exceeded for instance ${inst.instanceId} ` +
+        `(ingress ${hostname}, errorClass=${String(result.errorClass)}); ` +
+        'instance quarantined from job assignment'
     );
     return false;
   }
@@ -1706,7 +1785,26 @@ export class EncoreScalerLoop {
         },
         body: JSON.stringify(payload)
       });
-      if (!res.ok) return false;
+      if (!res.ok) {
+        // #998: dispatch failure was the ONE loop error with no log line at all
+        // — `return false` re-queued the job silently, so a pool that could not
+        // accept work looked identical to an idle one from outside the
+        // container. Report it on both channels now. Still returns false: the
+        // caller re-queues the job for the next tick exactly as before.
+        console.error(
+          '[encore-scaler] dispatch: Encore POST /encoreJobs returned %d for job %s on instance %s (workspace=%s); re-queueing',
+          res.status,
+          job.jobId,
+          inst.instanceId,
+          workspaceId
+        );
+        this.logFailure(
+          'dispatch',
+          `job ${job.jobId} rejected by instance ${inst.instanceId} with HTTP ` +
+            `${res.status}; re-queued for the next tick`
+        );
+        return false;
+      }
 
       // Capture the Encore-assigned UUID so the packaging step can construct a
       // valid encoreJobs/{uuid} URL. We store it separately (not in our Job table,
@@ -1809,7 +1907,24 @@ export class EncoreScalerLoop {
         }
       }
       return true;
-    } catch {
+    } catch (err) {
+      // Transport-class failure (or any throw from the writes above). Same
+      // contract as before — return false so the caller re-queues the job — but
+      // no longer silent (#998): this is the path a wedged pool takes, and it
+      // used to leave nothing behind anywhere.
+      console.error(
+        '[encore-scaler] dispatch: POST /encoreJobs threw for job %s on instance %s (workspace=%s); re-queueing:',
+        job.jobId,
+        inst.instanceId,
+        workspaceId,
+        err
+      );
+      this.logFailure(
+        'dispatch',
+        `job ${job.jobId} could not be dispatched to instance ${inst.instanceId}; ` +
+          're-queued for the next tick',
+        err
+      );
       return false;
     }
   }

@@ -1380,6 +1380,18 @@ function activateScaler(redisUrl: string): void {
         interruptionReason: reason
       });
     },
+    // Second operational-log producer (issue #998, parent #985): every scaler
+    // control-loop spawn/dispatch/reap/tick FAILURE is appended here as well as
+    // written to the container's stdout. The SAME store GET /api/v1/logs reads
+    // (`logStore` above, durable since #996) and the pipeline-step producer
+    // (#995) writes to — scaler entries carry `category: 'encore-scaler'` and an
+    // `encore-scaler/<phase>: ` message prefix, so they are filterable with the
+    // existing `q` parameter and never confusable with pipeline-step entries.
+    //
+    // Additive, not a substitute for the pipeline-step producer (architect's
+    // note on #998): the scaler is opt-in per deployment, so it does not fire on
+    // every ingest run and cannot alone populate the tab.
+    logSink: logStore,
     onJobsDropped: async (drops) => {
       for (const { encoreJobId, reason } of drops) {
         try {
