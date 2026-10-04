@@ -296,35 +296,35 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     
 <article class="endpoint" id="get-api-v1-scaler-config">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/scaler/config</code></h3>
-  <p class="endpoint-desc">Get auto-scaler configuration.</p>
+  <p class="endpoint-desc">Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been sent since startup, otherwise the boot-time values from `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. The response does not say which of the two a value came from.</p>
   
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;maxInstances&quot;: 0,
   &quot;minInstances&quot;: 0,
   &quot;idleTimeoutMs&quot;: 0
-}</code></pre></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>maxInstances</code> — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).</li><li><code>minInstances</code> — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here — it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.</li><li><code>idleTimeoutMs</code> — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).</li></ul></div>
 </article>
 
 <article class="endpoint" id="patch-api-v1-scaler-config">
   <h3><span class="badge badge-PATCH">PATCH</span> <code class="path">/api/v1/scaler/config</code></h3>
-  <p class="endpoint-desc">Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).</p>
+  <p class="endpoint-desc">Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is echoed back but not applied to the running scaler (change the warm floor via `ENCORE_MIN_INSTANCES` and a restart). Values are held in memory in the serving process only — nothing is persisted, so a change is lost on restart, which reverts to `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. There is no reset endpoint: restart, or send the environment values back explicitly.</p>
   
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;maxInstances&quot;: 0,
   &quot;minInstances&quot;: 0,
   &quot;idleTimeoutMs&quot;: 0
-}</code></pre></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>maxInstances</code> — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).</li><li><code>minInstances</code> — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here — it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.</li><li><code>idleTimeoutMs</code> — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).</li></ul></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;maxInstances&quot;: 0,
   &quot;minInstances&quot;: 0,
   &quot;idleTimeoutMs&quot;: 0
-}</code></pre></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>maxInstances</code> — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).</li><li><code>minInstances</code> — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here — it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.</li><li><code>idleTimeoutMs</code> — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).</li></ul></div>
 </article>
 
 <article class="endpoint" id="get-api-v1-scaler-status">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/scaler/status</code></h3>
-  <p class="endpoint-desc">Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).</p>
+  <p class="endpoint-desc">Current transcoder instance pool status. `maxInstances` and `idleTimeoutMs` are the values in force in the serving process — a runtime `PATCH` if one has been sent since startup, otherwise the boot-time environment values.</p>
   
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -355,7 +355,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;jobsPerInstance&quot;: 0,
   &quot;idleTimeoutMs&quot;: 0,
   &quot;scalerActive&quot;: true
-}</code></pre></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>maxInstances</code> — Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been sent since startup, otherwise ENCORE_MAX_INSTANCES from boot. Not persisted — reverts to the environment value on restart. Reported even when scalerActive is false.</li><li><code>idleTimeoutMs</code> — Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been sent since startup, otherwise ENCORE_IDLE_TIMEOUT_MS from boot. Not persisted — reverts to the environment value on restart.</li></ul></div>
 </article>
 
     

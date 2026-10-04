@@ -19895,13 +19895,15 @@
                       }
                     },
                     "maxInstances": {
-                      "type": "number"
+                      "type": "number",
+                      "description": "Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been sent since startup, otherwise ENCORE_MAX_INSTANCES from boot. Not persisted \u2014 reverts to the environment value on restart. Reported even when scalerActive is false."
                     },
                     "jobsPerInstance": {
                       "type": "number"
                     },
                     "idleTimeoutMs": {
-                      "type": "number"
+                      "type": "number",
+                      "description": "Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been sent since startup, otherwise ENCORE_IDLE_TIMEOUT_MS from boot. Not persisted \u2014 reverts to the environment value on restart."
                     },
                     "scalerActive": {
                       "type": "boolean"
@@ -19924,9 +19926,11 @@
     },
     "/api/v1/scaler/config": {
       "patch": {
+        "summary": "Update auto-scaler configuration at runtime",
         "tags": [
           "admin"
         ],
+        "description": "Override the auto-scaler settings of the process serving this request. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick, with no restart.\n\n**Storage.** The values are kept in memory, in this process only. Nothing is written to Valkey, the parameter store, or disk, so a change is lost on restart or redeploy and is not shared with any other replica. A 200 here means \"applied\", not \"saved\".\n\n**Precedence.** The most recent PATCH received by this process wins. Until one arrives, the values read at boot from `ENCORE_MAX_INSTANCES` (default 3) and `ENCORE_IDLE_TIMEOUT_MS` (default 300000) apply. There is no persisted layer in between, so the order is simply: runtime PATCH, else environment.\n\n**Reset to the environment default.** There is no reset endpoint and no sentinel value. Restart the process (which re-reads the environment), or PATCH the environment value back explicitly \u2014 `GET /api/v1/scaler/config` shows what is in force, but not whether it came from a PATCH or from the environment.\n\n**Caveats.** `minInstances` is recorded and echoed back but is not applied to the running scaler loops (see the field description). A PATCH sent while `GET /api/v1/scaler/status` reports `scalerActive: false` is accepted and reported back, but is not carried into the scaler that later activates against a newly provisioned stack \u2014 that activation uses the environment values, so re-send the PATCH afterwards.",
         "requestBody": {
           "required": true,
           "content": {
@@ -19937,16 +19941,19 @@
                   "maxInstances": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 20
+                    "maximum": 20,
+                    "description": "Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset)."
                   },
                   "minInstances": {
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": 10
+                    "maximum": 10,
+                    "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here \u2014 it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart."
                   },
                   "idleTimeoutMs": {
                     "type": "integer",
-                    "minimum": 10000
+                    "minimum": 10000,
+                    "description": "Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset)."
                   }
                 },
                 "additionalProperties": false
@@ -19956,7 +19963,7 @@
         },
         "responses": {
           "200": {
-            "description": "Default Response",
+            "description": "The auto-scaler configuration this process is using right now. Held in memory only: it is not persisted anywhere, so these values revert to the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values on restart.",
             "content": {
               "application/json": {
                 "schema": {
@@ -19965,16 +19972,19 @@
                     "maxInstances": {
                       "type": "integer",
                       "minimum": 1,
-                      "maximum": 20
+                      "maximum": 20,
+                      "description": "Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset)."
                     },
                     "minInstances": {
                       "type": "integer",
                       "minimum": 0,
-                      "maximum": 10
+                      "maximum": 10,
+                      "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here \u2014 it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart."
                     },
                     "idleTimeoutMs": {
                       "type": "integer",
-                      "minimum": 10000
+                      "minimum": 10000,
+                      "description": "Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset)."
                     }
                   },
                   "required": [
@@ -19982,7 +19992,8 @@
                     "minInstances",
                     "idleTimeoutMs"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "description": "The auto-scaler configuration this process is using right now. Held in memory only: it is not persisted anywhere, so these values revert to the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values on restart."
                 }
               }
             }
@@ -19990,12 +20001,14 @@
         }
       },
       "get": {
+        "summary": "Get the auto-scaler configuration in force",
         "tags": [
           "admin"
         ],
+        "description": "Report the auto-scaler settings this process is using. These are the in-memory values: the most recent `PATCH /api/v1/scaler/config` if one has been sent since startup, otherwise the boot values from `ENCORE_MAX_INSTANCES` and `ENCORE_IDLE_TIMEOUT_MS`. Nothing is persisted, so after a restart this reports the environment values again. The response does not distinguish the two sources; `minInstances` is reported from this endpoint's own record and is not the floor the scaler loops enforce (see the field description).",
         "responses": {
           "200": {
-            "description": "Default Response",
+            "description": "The auto-scaler configuration this process is using right now. Held in memory only: it is not persisted anywhere, so these values revert to the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values on restart.",
             "content": {
               "application/json": {
                 "schema": {
@@ -20004,16 +20017,19 @@
                     "maxInstances": {
                       "type": "integer",
                       "minimum": 1,
-                      "maximum": 20
+                      "maximum": 20,
+                      "description": "Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset)."
                     },
                     "minInstances": {
                       "type": "integer",
                       "minimum": 0,
-                      "maximum": 10
+                      "maximum": 10,
+                      "description": "Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here \u2014 it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart."
                     },
                     "idleTimeoutMs": {
                       "type": "integer",
-                      "minimum": 10000
+                      "minimum": 10000,
+                      "description": "Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset)."
                     }
                   },
                   "required": [
@@ -20021,7 +20037,8 @@
                     "minInstances",
                     "idleTimeoutMs"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "description": "The auto-scaler configuration this process is using right now. Held in memory only: it is not persisted anywhere, so these values revert to the ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS environment values on restart."
                 }
               }
             }

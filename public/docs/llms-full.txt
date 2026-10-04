@@ -2539,7 +2539,7 @@ Auto-scaler
 
   GET /api/v1/scaler/config
 
-  Get auto-scaler configuration.
+  Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been sent since startup, otherwise the boot-time values from `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. The response does not say which of the two a value came from.
 
   Response
 Response 200 (application/json)
@@ -2548,10 +2548,13 @@ Response 200 (application/json)
   "minInstances": 0,
   "idleTimeoutMs": 0
 }
+Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here — it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 
   PATCH /api/v1/scaler/config
 
-  Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).
+  Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is echoed back but not applied to the running scaler (change the warm floor via `ENCORE_MIN_INSTANCES` and a restart). Values are held in memory in the serving process only — nothing is persisted, so a change is lost on restart, which reverts to `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. There is no reset endpoint: restart, or send the environment values back explicitly.
 
   Request
 Request body (application/json)
@@ -2560,6 +2563,9 @@ Request body (application/json)
   "minInstances": 0,
   "idleTimeoutMs": 0
 }
+Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here — it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 
   Response
 Response 200 (application/json)
@@ -2568,10 +2574,13 @@ Response 200 (application/json)
   "minInstances": 0,
   "idleTimeoutMs": 0
 }
+Field notes- maxInstances — Upper bound on transcoder instances in one workspace pool. Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_MAX_INSTANCES (3 when unset).
+- minInstances — Warm floor of instances kept running while a pool is idle. NOTE: unlike the other two fields this one is only recorded and reported back here — it is NOT fanned out to the running scaler loops, which keep enforcing the floor from ENCORE_MIN_INSTANCES as read at boot. It also reads as 0 until it is PATCHed, whatever ENCORE_MIN_INSTANCES is set to. Change the enforced floor via ENCORE_MIN_INSTANCES and a restart.
+- idleTimeoutMs — Idle time before an idle instance is torn down, in milliseconds (minimum 10000). Applied to every running scaler loop as soon as it is set. Boot default: ENCORE_IDLE_TIMEOUT_MS (300000 when unset).
 
   GET /api/v1/scaler/status
 
-  Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).
+  Current transcoder instance pool status. `maxInstances` and `idleTimeoutMs` are the values in force in the serving process — a runtime `PATCH` if one has been sent since startup, otherwise the boot-time environment values.
 
   Response
 Response 200 (application/json)
@@ -2604,6 +2613,8 @@ Response 200 (application/json)
   "idleTimeoutMs": 0,
   "scalerActive": true
 }
+Field notes- maxInstances — Instance cap per workspace pool in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been sent since startup, otherwise ENCORE_MAX_INSTANCES from boot. Not persisted — reverts to the environment value on restart. Reported even when scalerActive is false.
+- idleTimeoutMs — Idle teardown timeout (ms) in force in this process: the most recent PATCH /api/v1/scaler/config value if one has been sent since startup, otherwise ENCORE_IDLE_TIMEOUT_MS from boot. Not persisted — reverts to the environment value on restart.
 
 ---
 
@@ -3918,9 +3929,13 @@ The auto-scaler keeps a per-workspace pool of transcoder instances and scales it
 Request
 curl -X PATCH https://<your-instance>/api/v1/scaler/config \
   -H "Content-Type: application/json" \
-  -d '{"minInstances": 1, "maxInstances": 3, "idleTimeoutMs": 300000}'
+  -d '{"maxInstances": 3, "idleTimeoutMs": 300000}'
 
-Set minInstances to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
+This changes maxInstances and idleTimeoutMs from the next scaler tick, with no restart.
+
+Runtime config is in-memory only. The values are held in the process that served the request — nothing is written to a datastore or to disk — so a restart or redeploy discards them and the deployment goes back to ENCORE_MAX_INSTANCES and ENCORE_IDLE_TIMEOUT_MS. Precedence is just those two layers: the most recent PATCH wins, otherwise the boot-time environment value. There is no reset endpoint — restart, or send the environment values back explicitly. For a change that must outlive a restart, set the environment variable and redeploy.
+
+The warm floor is the exception: set ENCORE_MIN_INSTANCES to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A minInstances sent to the config endpoint is validated and echoed back, but the running scaler keeps enforcing the floor it read at boot. See GET /api/v1/scaler/status for the pool's live state and the Auto-scaler reference for every field.
 
 Optional services
 
@@ -4337,11 +4352,11 @@ On Open Source Cloud only the settings exposed by the service's deploy form are 
 
     PORTNoNoHTTP port (default 3000). Fixed by the platform on OSC; self-hosted only.
 
-    ENCORE_MAX_INSTANCESNoYesMax transcoder instances the auto-scaler may run per workspace (default 3).
+    ENCORE_MAX_INSTANCESNoYesMax transcoder instances the auto-scaler may run per workspace (default 3). Can be overridden at runtime with PATCH /api/v1/scaler/config, but that override is in-memory only and is lost on restart, which reverts to this value. See Operating a workspace.
 
-    ENCORE_MIN_INSTANCESNoYesWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
+    ENCORE_MIN_INSTANCESNoYesWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). The only way to change the floor the scaler enforces: a minInstances sent to the runtime config endpoint is echoed back but not applied. See Operating a workspace.
 
-    ENCORE_IDLE_TIMEOUT_MSNoYesIdle time before a transcoder instance is torn down (default 300000).
+    ENCORE_IDLE_TIMEOUT_MSNoYesIdle time before a transcoder instance is torn down (default 300000). Can be overridden at runtime with PATCH /api/v1/scaler/config, with the same in-memory, lost-on-restart caveat.
 
     PUBLIC_BASE_URLNoNoPublicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
 

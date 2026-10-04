@@ -307,8 +307,10 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <p>The auto-scaler keeps a per-workspace pool of transcoder instances and scales it on demand. By default it scales to zero when idle, trading standing cost for cold-start latency on the first job of a burst.</p>
 <div class="code-block"><div class="code-label">Request</div><pre><code>curl -X PATCH https://&lt;your-instance&gt;/api/v1/scaler/config \
   -H &quot;Content-Type: application/json&quot; \
-  -d '{&quot;minInstances&quot;: 1, &quot;maxInstances&quot;: 3, &quot;idleTimeoutMs&quot;: 300000}'</code></pre></div>
-<p>Set <code>minInstances</code> to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See <code>GET /api/v1/scaler/status</code> for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
+  -d '{&quot;maxInstances&quot;: 3, &quot;idleTimeoutMs&quot;: 300000}'</code></pre></div>
+<p>This changes <code>maxInstances</code> and <code>idleTimeoutMs</code> from the next scaler tick, with no restart.</p>
+<div class="callout"><strong>Runtime config is in-memory only.</strong> The values are held in the process that served the request — nothing is written to a datastore or to disk — so a restart or redeploy discards them and the deployment goes back to <code>ENCORE_MAX_INSTANCES</code> and <code>ENCORE_IDLE_TIMEOUT_MS</code>. Precedence is just those two layers: the most recent <code>PATCH</code> wins, otherwise the boot-time environment value. There is no reset endpoint — restart, or send the environment values back explicitly. For a change that must outlive a restart, set the environment variable and redeploy.</div>
+<p>The warm floor is the exception: set <code>ENCORE_MIN_INSTANCES</code> to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A <code>minInstances</code> sent to the config endpoint is validated and echoed back, but the running scaler keeps enforcing the floor it read at boot. See <code>GET /api/v1/scaler/status</code> for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
 
 <h2 id="optional-services">Optional services</h2>
 <p>Add-on capabilities beyond the core stack are provisioned per workspace, on demand:</p>

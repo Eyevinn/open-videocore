@@ -211,10 +211,11 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/admin/watch-folder/start': 'Start the watch-folder ingest poller.',
   'POST /api/v1/admin/watch-folder/stop': 'Stop the watch-folder ingest poller.',
   'GET /api/v1/scaler/status':
-    'Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).',
+    'Current transcoder instance pool status. `maxInstances` and `idleTimeoutMs` are the values in force in the serving process — a runtime `PATCH` if one has been sent since startup, otherwise the boot-time environment values.',
   'PATCH /api/v1/scaler/config':
-    'Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).',
-  'GET /api/v1/scaler/config': 'Get auto-scaler configuration.',
+    'Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is echoed back but not applied to the running scaler (change the warm floor via `ENCORE_MIN_INSTANCES` and a restart). Values are held in memory in the serving process only — nothing is persisted, so a change is lost on restart, which reverts to `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. There is no reset endpoint: restart, or send the environment values back explicitly.',
+  'GET /api/v1/scaler/config':
+    'Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been sent since startup, otherwise the boot-time values from `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. The response does not say which of the two a value came from.',
   'GET /api/v1/retention/config': 'Get the soft-delete retention window configuration.',
   'PATCH /api/v1/retention/config': 'Update the soft-delete retention window configuration.',
   'GET /api/v1/logs/': 'Query structured application logs.',
@@ -556,8 +557,10 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/provis
 
 <h2 id="scaler">Tune the transcoder auto-scaler</h2>
 <p>The auto-scaler keeps a per-workspace pool of transcoder instances and scales it on demand. By default it scales to zero when idle, trading standing cost for cold-start latency on the first job of a burst.</p>
-${renderCurlBlock('Request', 'curl -X PATCH https://<your-instance>/api/v1/scaler/config \\\n  -H "Content-Type: application/json" \\\n  -d \'{"minInstances": 1, "maxInstances": 3, "idleTimeoutMs": 300000}\'')}
-<p>Set <code>minInstances</code> to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See ${refEx('GET', '/api/v1/scaler/status')} for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
+${renderCurlBlock('Request', 'curl -X PATCH https://<your-instance>/api/v1/scaler/config \\\n  -H "Content-Type: application/json" \\\n  -d \'{"maxInstances": 3, "idleTimeoutMs": 300000}\'')}
+<p>This changes <code>maxInstances</code> and <code>idleTimeoutMs</code> from the next scaler tick, with no restart.</p>
+<div class="callout"><strong>Runtime config is in-memory only.</strong> The values are held in the process that served the request — nothing is written to a datastore or to disk — so a restart or redeploy discards them and the deployment goes back to <code>ENCORE_MAX_INSTANCES</code> and <code>ENCORE_IDLE_TIMEOUT_MS</code>. Precedence is just those two layers: the most recent <code>PATCH</code> wins, otherwise the boot-time environment value. There is no reset endpoint — restart, or send the environment values back explicitly. For a change that must outlive a restart, set the environment variable and redeploy.</div>
+<p>The warm floor is the exception: set <code>ENCORE_MIN_INSTANCES</code> to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A <code>minInstances</code> sent to the config endpoint is validated and echoed back, but the running scaler keeps enforcing the floor it read at boot. See ${refEx('GET', '/api/v1/scaler/status')} for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
 
 <h2 id="optional-services">Optional services</h2>
 <p>Add-on capabilities beyond the core stack are provisioned per workspace, on demand:</p>
@@ -1419,9 +1422,9 @@ Access Token as the OSC access token. Generate strong passwords for
     <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning object storage instances.</td></tr>
     <tr><td><code>COUCHDB_ADMIN_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning the metadata store.</td></tr>
     <tr><td><code>PORT</code></td><td>No</td><td>No</td><td>HTTP port (default <code>3000</code>). Fixed by the platform on OSC; self-hosted only.</td></tr>
-    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>).</td></tr>
-    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Yes</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
-    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Yes</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>).</td></tr>
+    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>). Can be overridden at runtime with <a href="ref-scaler.html">PATCH /api/v1/scaler/config</a>, but that override is in-memory only and is lost on restart, which reverts to this value. See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Yes</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). The only way to change the floor the scaler enforces: a <code>minInstances</code> sent to the runtime config endpoint is echoed back but not applied. See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Yes</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>). Can be overridden at runtime with <a href="ref-scaler.html">PATCH /api/v1/scaler/config</a>, with the same in-memory, lost-on-restart caveat.</td></tr>
     <tr><td><code>PUBLIC_BASE_URL</code></td><td>No</td><td>No</td><td>Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. <strong>Self-hosted only — not configurable on Open Source Cloud</strong> (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.</td></tr>
   </tbody>
 </table>
