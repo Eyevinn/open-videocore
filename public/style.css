@@ -580,6 +580,10 @@ tr.row-locked td:first-child {
 input[type="text"],
 input[type="url"],
 input[type="password"],
+/* Numeric fields (the autoscaler bounds, and the clip in/out points added in
+   issue #793) were the one input type the house rules never covered, so they
+   rendered as raw browser controls inside otherwise-styled forms. */
+input[type="number"],
 select,
 textarea {
   background: var(--bg);
@@ -596,6 +600,7 @@ textarea {
 input[type="text"]:focus,
 input[type="url"]:focus,
 input[type="password"]:focus,
+input[type="number"]:focus,
 select:focus,
 textarea:focus {
   border-color: var(--accent);
@@ -1612,6 +1617,46 @@ pre.code-block {
   gap: 8px;
   justify-content: flex-end;
   margin-top: 16px;
+}
+
+/* Clip-asset dialog (issue #793). Same furniture again — .form-row/.form-field
+   for the in/out pair, .msg.msg-error for the inline refusal. */
+.clip-dialog .clip-dialog-intro,
+.clip-dialog .clip-dialog-sync,
+.clip-dialog .clip-dialog-duration,
+.clip-dialog .clip-dialog-duration-unknown {
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+.clip-dialog .clip-dialog-sync,
+.clip-dialog .clip-dialog-duration,
+.clip-dialog .clip-dialog-duration-unknown {
+  color: var(--text-muted);
+}
+.clip-dialog .clip-field-help {
+  font-size: 11px;
+}
+.clip-dialog .clip-dialog-error-detail {
+  margin-top: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+}
+.clip-dialog .modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* Clip outcome block. Persistent (it carries the link to the produced clip),
+   unlike showMsg's six-second notices. */
+.clip-result .clip-result-link {
+  color: var(--accent);
+}
+.clip-result .clip-result-detail {
+  margin-top: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
 }
 
 /* Utility */

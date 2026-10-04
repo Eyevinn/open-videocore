@@ -66,6 +66,13 @@ import { mountReviewState } from './review-state.js';
 // is in that module's header.
 import { mountAssetRename } from './asset-rename.js';
 
+// Clip / trim affordance (issue #793): a control for POST
+// /api/v1/assets/{id}/clip, which the API has served since issue #17 but which
+// nothing in this UI could reach. UI only — no route or schema changes. Full
+// contract grounding, including where the duration bound comes from and why a
+// 502 is reported as an outright failure, is in that module's header.
+import { mountAssetClip } from './asset-clip.js';
+
 // Read-only tracks panel (issue #902, broken out of #794): one section per track
 // kind — video, audio, subtitle — each listing only the attributes the API
 // exposes for that kind, each with an explicit empty state. All of it comes from
@@ -176,6 +183,18 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may clip an asset (issue #793). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-93) maps
+// POST -> write, so POST /assets/{id}/clip is refused to a `viewer` with 403 by
+// `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
+// if it arrives.
+function canClipAsset() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -1911,11 +1930,20 @@ function loadingEl() {
 // detached window renders ONLY that one detail view, self-polls, and shares no
 // state with this window. The active stack is passed explicitly so the detached
 // window targets the same stack without depending on the opener's localStorage.
-function openDetailWindow(type, id) {
-  const params = 'type=' + encodeURIComponent(type) +
+// The URL of that standalone view. Broken out (issue #793) so a link to another
+// resource's detail — e.g. the child asset a clip produced — can be a REAL
+// anchor href (openable in a new tab, copyable) rather than a click handler
+// that only works in the window it was built in. `getActiveStack()` already
+// resolves the window-scoped override first, so a link built inside a detached
+// window targets that window's stack.
+function detailWindowUrl(type, id) {
+  return 'detail.html?type=' + encodeURIComponent(type) +
     '&id=' + encodeURIComponent(id) +
     '&stack=' + encodeURIComponent(getActiveStack());
-  window.open('detail.html?' + params, '_blank', 'width=680,height=800,noopener');
+}
+
+function openDetailWindow(type, id) {
+  window.open(detailWindowUrl(type, id), '_blank', 'width=680,height=800,noopener');
 }
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
@@ -3181,6 +3209,76 @@ async function renderAssetDetailBody(id, bodyEl) {
         // full asset, and re-rendering from the server is the only way a
         // silently different stored value becomes visible.
         await rerenderThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
+    // ── Clip: cut an in/out window into a child asset (issue #793) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/asset-clip.js:
+    //   POST /api/v1/assets/{id}/clip — body REQUIRED, `startSeconds` +
+    //        `endSeconds` (both numbers, `endSeconds > startSeconds` enforced by
+    //        the schema's own refinement) and optional `outputName` (1..256);
+    //        `additionalProperties: false`. 201 = the FULL child asset
+    //        (`parentId` = this asset); 400 / 404 / 409 `no_object` / 501
+    //        `not_configured` / 502 `clip_failed` are all { error, message? }.
+    //        (openapi.json .paths["/api/v1/assets/{id}/clip"].post — the spec
+    //        declares no operationId; clipBodySchema src/routes/assets.ts:734-746,
+    //        handler app.post('/:id/clip') :5389-5464.)
+    //
+    // The in/out bound comes from the asset's OWN probed duration —
+    // `technicalMetadata.durationSeconds` (technicalMetadataSchema,
+    // src/routes/assets.ts:761-770), the same field the "Duration" row above
+    // renders. The API does NOT bound the window itself, so this is a
+    // client-side guard against asking for a window that cannot exist; when the
+    // asset has no extracted metadata the dialog says the check could not be
+    // made rather than inventing a limit.
+    //
+    // A 502 is reported as an outright failure. The pipeline only advances the
+    // child to `ready` after VERIFYING the written object exists and is
+    // non-empty, and marks it `failed` otherwise (src/pipeline/clip.ts:166-209,
+    // the issue #786 honesty fix) — so a failed clip must never be reported as
+    // a usable one, and even on a 201 the child's own `status` is read back
+    // rather than assumed.
+    //
+    // The path takes the ULID (`asset.id`), which this pane holds even when it
+    // was opened by slug: the handler passes the raw param to `repo.get` with no
+    // slug fallback.
+    mountAssetClip({
+      asset: asset,
+      actionsRow: actionsDiv,
+      // Sits with the other produce-something actions:
+      // [Restore?] [Lock | Unlock] [Rename] [Clip] [Extract Metadata] [Thumbnails].
+      beforeEl: actionsDiv.querySelector('#btn-extract-meta'),
+      canChange: canClipAsset(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      messageHost: function () { return bodyEl.querySelector('#action-msg') || bodyEl; },
+      // Where "Open clip" goes. In the main window it swaps this side panel
+      // over to the child asset (the same move the job → asset link makes); in
+      // the detached detail window there is no panel, so the anchor's own href
+      // — a standalone detail URL for the child — carries the navigation.
+      openAsset: function (childId) {
+        const panel = document.getElementById('asset-detail');
+        if (!panel) {
+          window.location.href = detailWindowUrl('asset', childId);
+          return;
+        }
+        switchTab('assets');
+        showAssetDetail(childId, panel);
+      },
+      assetHref: function (childId) { return detailWindowUrl('asset', childId); },
+      // The standalone detail window (detail.html, `body.detail-standalone`)
+      // re-renders this whole body every DETAIL_POLL_INTERVAL_MS, which would
+      // throw the outcome link away a few seconds after it appeared. There, the
+      // clip is followed as soon as it is ready; in the main window the side
+      // panel is not polled, so the link stays put until the operator uses it.
+      navigateOnSuccess: document.body.classList.contains('detail-standalone'),
+      onClipped: function () {
+        // A successful clip adds an asset to the list; a failed one adds a
+        // `failed` child record. Either way the table is now stale. Harmless in
+        // the detached detail window, which has no table.
+        if (assetsTable) assetsTable.reload();
       },
     });
 
@@ -7641,6 +7739,13 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirror of the ADR-018 write gate for POST /assets/{id}/clip
+  // (issue #793). Exported so a DOM/unit test can assert the Clip control is
+  // offered to exactly the roles that hold `write`.
+  canClipAsset,
+  // Standalone detail URL builder (issue #793). Exported so a DOM/unit test can
+  // assert a cross-asset link points at the right resource and stack.
+  detailWindowUrl,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
