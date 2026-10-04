@@ -54,6 +54,12 @@ import {
 import { StorageQuotaReconciler } from './data/storage-quota-reconcile.js';
 import { makeS3Reader } from './pipeline/source.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE, type WorkspaceConnections } from './services/workspace-stack.js';
+import {
+  makeRequestScopedStorageFactory,
+  requestStackNameFromHeaders,
+  runWithRequestStack,
+  currentRequestStackName
+} from './services/request-stack-context.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
   resolveStackRedisUrl,
@@ -455,12 +461,23 @@ const stackResolver = new WorkspaceStackResolver({
 // app.authenticate at registration time.
 registerAuth(app);
 
+// Establish the request-scoped stack identity BEFORE anything resolves a stack
+// (issue #1058). Everything the data plane resolves while serving this request —
+// the PerWorkspace* repositories and the object-storage factory — reads this
+// ambient name, so asset/job documents and object bytes land on the SAME stack
+// the transcode control plane routes to (issue #615). Running `done()` inside
+// the AsyncLocalStorage scope keeps the store attached for every later hook, the
+// handler, and any work the handler detaches (the URL-pull worker and its
+// follow-on metadata extraction).
+app.addHook('onRequest', (request, _reply, done) => {
+  runWithRequestStack(requestStackNameFromHeaders(request.headers), done);
+});
+
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
 // the app trusts every request that reaches it.
 app.decorateRequest('connections', null);
 app.addHook('preHandler', async (request) => {
-  const stackHeader = request.headers['x-stack-name'];
-  const stackName = typeof stackHeader === 'string' && stackHeader.length > 0 ? stackHeader : undefined;
+  const stackName = currentRequestStackName();
   try {
     request.connections = await stackResolver.resolve(stackName);
   } catch (err) {
@@ -655,13 +672,13 @@ const auditEmitter = new PerWorkspaceAuditEmitter(stackResolver);
 // the resolved stack has no object storage (in-memory fallback) it throws — the
 // routes only call this when the asset has an objectKey, and upload routes are
 // gated by `storageAvailable` below.
-const storageFor: StorageFactory = (): WorkspaceStorage => {
-  const conns = stackResolver.resolveCached();
-  if (!conns?.storageFor) {
-    throw new Error('object storage is not configured for this stack');
-  }
-  return conns.storageFor();
-};
+//
+// Keyed by the REQUEST's stack (issue #1058): the factory reads the ambient
+// request stack name, so the bytes it writes/presigns live on the same stack as
+// the documents the repositories write and the stack the transcoder is pointed
+// at. Outside a request the name is undefined and the workspace default
+// resolves, unchanged.
+const storageFor: StorageFactory = makeRequestScopedStorageFactory(stackResolver);
 
 // Whether any object storage is reachable at all (explicit env override OR a
 // provisioned stack). Upload/URL-pull routes and the watch-folder are only
@@ -854,6 +871,24 @@ const encoreCallbackTrustTimeoutMs = parseInt(process.env['ENCORE_CALLBACK_TRUST
 // than re-raising it as silently dropped. Defaults to 10s; override via
 // ENCORE_RECONCILE_GRACE_MS.
 const encoreReconcileGraceMs = parseInt(process.env['ENCORE_RECONCILE_GRACE_MS'] || String(10 * 1000), 10);
+// Bounded wait (issue #1071) for a freshly created Encore instance (and its
+// paired callback listener) to report `running` before the spawn gives up. This
+// has to cover OSC provisioning a NEW WORKER NODE to place the instance on, not
+// just a pod starting on a node that already exists — the same latency that makes
+// createInstance answer 504 while the create continues behind the gateway. A
+// budget sized for pod start made every node-provisioning spawn fail and destroy
+// the instance it had just waited minutes for. Defaults to 15 minutes
+// (DEFAULT_SPAWN_READY_TIMEOUT_MS); lower it with ENCORE_SPAWN_READY_TIMEOUT_MS
+// on a cluster that always has spare capacity. Invalid/absent => the built-in
+// default.
+const encoreSpawnReadyTimeoutMsRaw = parseInt(
+  process.env['ENCORE_SPAWN_READY_TIMEOUT_MS'] || '',
+  10
+);
+const encoreSpawnReadyTimeoutMs =
+  Number.isFinite(encoreSpawnReadyTimeoutMsRaw) && encoreSpawnReadyTimeoutMsRaw > 0
+    ? encoreSpawnReadyTimeoutMsRaw
+    : undefined;
 // Bounded timeout (issue #273) for the failed-transcode reconciliation sweep: a
 // transcode still non-terminal after this long whose Encore record has been
 // garbage-collected (getJobStatus -> 404/undefined) is declared failed rather
@@ -1119,6 +1154,9 @@ function activateScaler(redisUrl: string): void {
     // callback poller recorded completing (keys.jobCompletionSeen) within this
     // window rather than re-raising them as silently dropped.
     reconcileGraceMs: encoreReconcileGraceMs,
+    // Readiness budget for a freshly created instance (issue #1071): sized for
+    // OSC provisioning a new worker node, not just a pod start.
+    spawnReadyTimeoutMs: encoreSpawnReadyTimeoutMs,
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
@@ -1211,51 +1249,67 @@ function activateScaler(redisUrl: string): void {
     // whose getJobStatus() polls Encore. Best-effort: errors are swallowed inside
     // the sweep so a reconcile failure never breaks the tick.
     reconcileFailedTranscodes: async () => {
-      await reconcileFailedTranscodes({
-        jobs: jobRepository,
-        assets: assetRepository,
-        pipeline: pipelineRepository,
-        // scalerRegistry implements EncoreClient; getJobStatus() decodes the
-        // workspace from the encore job id and polls the right instance. It is
-        // assigned below (encore = scalerRegistry) before any tick fires.
-        encore: scalerRegistry!,
-        stallTimeoutMs: encoreStallTimeoutMs,
-        // #829: this sweep is one of the three paths that apply a transcode
-        // terminal state, and the only one that can see a job whose Encore
-        // record was garbage-collected (404 past the stall timeout) — the
-        // completion poller's sweep cannot, since it only reconciles jobs Encore
-        // still reports. Same dispatcher instance the internal router and the
-        // poller get, so the failure events are identical whichever path noticed.
-        webhookDispatcher,
-        logger: {
-          info: (...a: unknown[]) => app.log.info(a),
-          warn: (...a: unknown[]) => app.log.warn(a)
-        }
-      });
-      // Bound the `package` pipeline step (issue #336) on the same tick: a
-      // `package` step still `running` past packageStallTimeoutMs is failed with
-      // a diagnostic distinguishing "no packager instance" from "no completion
-      // signal". The packager step is advanced ONLY by the packager completion
-      // callback, so without this bound a missing packager / lost callback /
-      // stalled packager job leaves it running forever. Best-effort: the sweep
-      // swallows per-execution errors and never throws into the tick.
-      await reconcileStalledPackages({
-        pipeline: pipelineRepository,
-        // #976: settle the stalled step's `package` job with the same
-        // diagnostic, so a swept run is explained in GET /api/v1/jobs too.
-        jobs: jobRepository,
-        // Best-effort presence probe used ONLY to shape the diagnostic message.
-        // It resolves the stack name (the packager instance shares it) and asks
-        // OSC whether a packager instance exists. Any failure -> undefined, and
-        // the message degrades to present=unknown rather than mis-attributing a
-        // cause. Never gates the timeout.
-        packagerPresent: probePackagerPresent,
-        stallTimeoutMs: packageStallTimeoutMs,
-        logger: {
-          info: (...a: unknown[]) => app.log.info(a),
-          warn: (...a: unknown[]) => app.log.warn(a)
-        }
-      });
+      // Both sweeps below are repository-driven, and the repositories resolve the
+      // AMBIENT request stack (issue #1058) — of which a scaler tick has none, so
+      // they previously only ever enumerated the first-listed stack. A transcode
+      // on any other stack then had no terminal-state path at all: the
+      // reproduction in #1058 was settled by exactly this reconciler. Run the
+      // sweeps once inside EACH provisioned stack's context instead. With no
+      // parameter store (env override / bare local run) the list is empty and the
+      // single default resolution runs, byte-identical to before.
+      const runSweepsForCurrentStack = async (): Promise<void> => {
+        await reconcileFailedTranscodes({
+          jobs: jobRepository,
+          assets: assetRepository,
+          pipeline: pipelineRepository,
+          // scalerRegistry implements EncoreClient; getJobStatus() decodes the
+          // workspace from the encore job id and polls the right instance. It is
+          // assigned below (encore = scalerRegistry) before any tick fires.
+          encore: scalerRegistry!,
+          stallTimeoutMs: encoreStallTimeoutMs,
+          // #829: this sweep is one of the three paths that apply a transcode
+          // terminal state, and the only one that can see a job whose Encore
+          // record was garbage-collected (404 past the stall timeout) — the
+          // completion poller's sweep cannot, since it only reconciles jobs Encore
+          // still reports. Same dispatcher instance the internal router and the
+          // poller get, so the failure events are identical whichever path noticed.
+          webhookDispatcher,
+          logger: {
+            info: (...a: unknown[]) => app.log.info(a),
+            warn: (...a: unknown[]) => app.log.warn(a)
+          }
+        });
+        // Bound the `package` pipeline step (issue #336) on the same tick: a
+        // `package` step still `running` past packageStallTimeoutMs is failed with
+        // a diagnostic distinguishing "no packager instance" from "no completion
+        // signal". The packager step is advanced ONLY by the packager completion
+        // callback, so without this bound a missing packager / lost callback /
+        // stalled packager job leaves it running forever. Best-effort: the sweep
+        // swallows per-execution errors and never throws into the tick.
+        await reconcileStalledPackages({
+          pipeline: pipelineRepository,
+          // #976: settle the stalled step's `package` job with the same
+          // diagnostic, so a swept run is explained in GET /api/v1/jobs too.
+          jobs: jobRepository,
+          // Best-effort presence probe used ONLY to shape the diagnostic message.
+          // It resolves the stack name (the packager instance shares it) and asks
+          // OSC whether a packager instance exists. Any failure -> undefined, and
+          // the message degrades to present=unknown rather than mis-attributing a
+          // cause. Never gates the timeout.
+          packagerPresent: probePackagerPresent,
+          stallTimeoutMs: packageStallTimeoutMs,
+          logger: {
+            info: (...a: unknown[]) => app.log.info(a),
+            warn: (...a: unknown[]) => app.log.warn(a)
+          }
+        });
+      };
+      const stackNames = await stackResolver.listStackNames();
+      const stackContexts: Array<string | undefined> =
+        stackNames.length > 0 ? stackNames : [undefined];
+      for (const stackContext of stackContexts) {
+        await runWithRequestStack(stackContext, runSweepsForCurrentStack);
+      }
     },
     // When the scaler's reconcile() detects that tracked jobs have silently
     // vanished from an Encore instance's live QUEUED/IN_PROGRESS set with no
@@ -1474,7 +1528,11 @@ function activateScaler(redisUrl: string): void {
     // Best-effort package-job audit emission (issue #564): submit + terminal
     // (success/failure) callbacks each emit one entry, fire-and-forget.
     audit: auditEmitter,
-    auditLog: app.log
+    auditLog: app.log,
+    // Operational log records for the `package` stage (issue #995): the enqueue
+    // and the packager's success/failure callbacks each append one entry to the
+    // SAME in-memory store GET /api/v1/logs reads (`logStore` above).
+    pipelineLog: logStore
   });
 
   // On-demand packager provisioning (epic #226, issue #244). The packager is no
@@ -1692,6 +1750,10 @@ function activateScaler(redisUrl: string): void {
     // (see the internalRouter registration below), so both terminal-state paths
     // deliver identical payloads to the same registrations.
     webhookDispatcher,
+    // Operational log records for the `transcode` stage (issue #995). The SAME
+    // in-memory store GET /api/v1/logs reads (`logStore` above), so a transcode
+    // that settles through this poller shows up in the Logs tab.
+    pipelineLog: logStore,
     logger: app.log
   });
 
@@ -1896,7 +1958,14 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // hot-swapped by PATCH /api/v1/retention/config), read per request — so the
   // window a read reports and the window the sweep enforces are one value, and a
   // config change is reflected on the next read with no restart.
-  retentionMs: () => archiveRetentionMs
+  retentionMs: () => archiveRetentionMs,
+  // Operational log records for the pipeline steps this router drives (issue
+  // #995): the `ingest` stage (URL-pull worker + the synchronous
+  // extract-metadata / thumbnail / subtitles / scene-detect steps) and the
+  // `transcode` submission. Appends to the SAME in-memory store
+  // GET /api/v1/logs reads (`logStore` above), which is what makes the Logs tab
+  // populate during a normal run.
+  pipelineLog: logStore
 };
 await app.register(assetsRouter, assetRouterOptions);
 
@@ -1904,7 +1973,11 @@ const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } =
   prefix: '/api/v1/jobs',
   repository: jobRepository,
   redis: sharedRedis,
-  pipelineRepository
+  pipelineRepository,
+  // Read-time `assetName` enrichment on the jobs listing + detail (issue #988).
+  // The SAME repository instance the pipelines router below resolves its own
+  // `assetName` from, so the two listings can never name an asset differently.
+  assetRepository
 };
 await app.register(jobsRouter, jobsRouterOptions);
 
@@ -1965,7 +2038,15 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
     return { client: conns.storageClient, packagedBucket: conns.packagedBucket };
   },
   // Best-effort audit emission for the transcode terminal-state callback (#564).
-  audit: auditEmitter
+  audit: auditEmitter,
+  // The packager's callbacks carry no stack identity of ours (issue #1058), so
+  // they search the provisioned stacks for the asset/execution the callback
+  // belongs to. The Encore callback needs no list — its stack is encoded in the
+  // externalId we issued.
+  listStackNames: () => stackResolver.listStackNames(),
+  // Operational log record for the transcode terminal-state callback (issue
+  // #995). Same store GET /api/v1/logs reads (`logStore` above).
+  pipelineLog: logStore
 };
 await app.register(internalRouter, internalRouterOptions);
 
@@ -1985,9 +2066,16 @@ const onObjectStored =
           );
         }
         if (thumbnailExtractor) {
-          // Read s3Config from the already-warm resolver cache. The upload
-          // preHandler called resolve() so resolveCached() is valid here.
-          const conns = stackResolver.resolveCached();
+          // Read s3Config from the already-warm resolver cache, for the stack
+          // this request named (issue #1058). The upload preHandler called
+          // resolve() with the same name, so resolveCached() is valid here.
+          // CAVEAT (#1090): this is a CACHE read, so it returns undefined if the
+          // entry has aged past the resolver TTL between the preHandler and this
+          // fire-and-forget continuation, in which case the thumbnail runner
+          // falls back to the boot-default bucket. Fine for the request path
+          // (the entry was just written); recorded on #1090 with the rest of the
+          // non-request resolution gaps.
+          const conns = stackResolver.resolveCached(currentRequestStackName());
           const bucket = conns?.sourceBucket ?? sourceBucket;
           // Same resolution helper the asset routes use (issue #838). This path
           // is fire-and-forget on upload, so an unresolvable factory is logged
@@ -2444,6 +2532,18 @@ watchFolder?.start();
 // started when a cap is configured AND object storage is reachable; otherwise
 // there is nothing to enforce or sweep. Runs one immediate sweep on boot then on
 // STORAGE_QUOTA_RECONCILE_INTERVAL_MS (default 6h).
+//
+// KNOWN GAP on a multi-stack install (#1090, found reviewing #1058). This resolves
+// `resolveCached()` with NO stack name at boot, so it sums only the FIRST listed
+// stack's two buckets — but since #1058 the data plane writes bytes to whichever
+// stack the request named. Because the sweep OVERWRITES the committed total
+// rather than adding to it, usage on stacks 2..N is erased from the counter on
+// every sweep, so the cap silently UNDER-counts and admits more than the operator
+// configured. Fixing it needs the architect call #1090 is waiting on (is a quota
+// per deployment or per stack?): ADR-020 Decision 1 says one deployment is one
+// tenant, which argues for summing every provisioned stack via listStackNames()
+// here, but that is a behaviour change to a billing-adjacent number, not a bug
+// fix. Single-stack deployments — every one on OSC today — are unaffected.
 if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
   const conns = stackResolver.resolveCached();
   if (conns?.storageClient) {

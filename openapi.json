@@ -15808,6 +15808,10 @@
                           "assetId": {
                             "type": "string"
                           },
+                          "assetName": {
+                            "type": "string",
+                            "description": "Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to `assetId`, which is always present."
+                          },
                           "sourceUrl": {
                             "type": "string"
                           },
@@ -15978,6 +15982,10 @@
                     },
                     "assetId": {
                       "type": "string"
+                    },
+                    "assetName": {
+                      "type": "string",
+                      "description": "Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to `assetId`, which is always present."
                     },
                     "sourceUrl": {
                       "type": "string"
@@ -16159,6 +16167,10 @@
                     },
                     "assetId": {
                       "type": "string"
+                    },
+                    "assetName": {
+                      "type": "string",
+                      "description": "Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to `assetId`, which is always present."
                     },
                     "sourceUrl": {
                       "type": "string"
@@ -20310,6 +20322,35 @@
                               ],
                               "additionalProperties": false
                             }
+                          },
+                          "spawnFailure": {
+                            "type": "object",
+                            "properties": {
+                              "at": {
+                                "type": "number",
+                                "description": "Epoch milliseconds at which the failed scale-up was recorded."
+                              },
+                              "attempts": {
+                                "type": "number",
+                                "description": "Total instance-create calls the failed spawn made, across both the transcoder instance and its paired callback listener. Not the attempt number of a single retry loop: it can exceed the per-loop retry limit."
+                              },
+                              "consecutiveFailures": {
+                                "type": "number",
+                                "description": "How many scale-ups have failed in a row for this workspace. Reset to 0 by a successful spawn, so 1 is a fresh blip while a climbing number means the scaler has been unable to grow for a while."
+                              },
+                              "message": {
+                                "type": "string",
+                                "description": "Error text from the failed spawn, redacted at write time: credentials, tokens, URLs and bare network locations (host, host:port, IP:port) are stripped, as is any HTML markup, because upstream error text can echo the request the spawn sent. This endpoint is unauthenticated, so the field carries the SHAPE of the failure, not its details."
+                              }
+                            },
+                            "required": [
+                              "at",
+                              "attempts",
+                              "consecutiveFailures",
+                              "message"
+                            ],
+                            "additionalProperties": false,
+                            "description": "The last scale-up for this workspace that could not create an instance. Absent when the most recent spawn succeeded, or when none has failed recently. This is what distinguishes \"the pool is at maxInstances\" from \"the pool cannot grow\", which are otherwise identical on the wire."
                           }
                         },
                         "required": [

@@ -9,6 +9,12 @@
 // message/level/category records and monotonic sequence numbers so paging is
 // stable against concurrent appends (no offset drift).
 //
+// The retained window is CAPPED (LOG_STORE_MAX_RECORDS, issue #995 review):
+// records are evicted oldest-first once the cap is reached, so a long-running
+// process with a busy pipeline producer cannot grow this array without bound.
+// Sequence numbers are never reset or reused, so eviction does not weaken the
+// paging contract.
+//
 // Modelled on OperationStore (src/services/operation-store.ts): a plain in-memory
 // class holding records in a Map/array, injected into its router the same way
 // the OperationStore is injected into provisionRouter (src/main.ts:301-307).
@@ -74,6 +80,24 @@ export type ListLogsResult = {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 
+// Hard cap on records held in memory (issue #995 review). The store is process
+// memory with no retention sweep behind it, and now that the pipeline producer
+// (src/services/pipeline-log.ts) writes ~8 records per asset run, an
+// authenticated client repeating POST /api/v1/assets/:id/execute would otherwise
+// grow it without bound for the lifetime of the process. Appends past the cap
+// evict oldest-first (a ring buffer over the append-ordered array), which is the
+// right trade for an operational log tail: the newest entries are the ones
+// operators read, and `list()` work stays bounded too (it filters/sorts the held
+// array). 5000 records is ~600 asset runs of pipeline history.
+export const LOG_STORE_MAX_RECORDS = 5000;
+
+export type LogStoreOptions = {
+  // Override the retained-record cap. Values below 1 are clamped to 1. Exposed
+  // so tests can drive eviction cheaply and so a deployment can tune the tail
+  // depth without touching this module.
+  maxRecords?: number;
+};
+
 // Cursors are opaque to callers. We encode the last-returned `seq` as a
 // base64url token so it survives round-tripping through a query string and is
 // clearly not an offset. Decoding is tolerant: anything that does not parse to a
@@ -104,10 +128,25 @@ function clampLimit(limit: number | undefined): number {
 
 export class LogStore {
   // Append order == sequence order, so the array is intrinsically ordered by
-  // `seq` ascending. We never remove or reorder entries, which is what makes
-  // cursor paging drift-free.
+  // `seq` ascending. We never reorder entries, and the only removal is
+  // oldest-first eviction at the cap (see maxRecords) — so the held window is
+  // always a contiguous, ascending `seq` tail, which is what keeps cursor paging
+  // drift-free: a cursor is a `seq` boundary, never an array offset, so appends
+  // AND evictions both leave an in-flight page's boundary meaningful.
   private readonly records: LogRecord[] = [];
   private seq = 0;
+  private readonly maxRecords: number;
+
+  constructor(opts: LogStoreOptions = {}) {
+    this.maxRecords = Math.max(
+      1,
+      Math.trunc(
+        opts.maxRecords !== undefined && Number.isFinite(opts.maxRecords)
+          ? opts.maxRecords
+          : LOG_STORE_MAX_RECORDS
+      )
+    );
+  }
 
   append(input: AppendLogInput): LogRecord {
     const record: LogRecord = {
@@ -118,10 +157,19 @@ export class LogStore {
       ...(input.category !== undefined ? { category: input.category } : {})
     };
     this.records.push(record);
+    // Evict oldest-first past the cap. `seq` is NEVER reset or reused, so the
+    // monotonic sequence contract survives eviction: an aged-out cursor
+    // boundary simply has no records on its older side, which `list()` already
+    // handles (a desc page resuming after an evicted boundary returns the
+    // remaining older records, or an empty last page with nextCursor null).
+    if (this.records.length > this.maxRecords) {
+      this.records.splice(0, this.records.length - this.maxRecords);
+    }
     return { ...record };
   }
 
-  // Total number of records held. Exposed for tests/observability only; the
+  // Total number of records currently HELD (not the number ever appended —
+  // oldest records are evicted at the cap). Exposed for tests/observability only; the
   // listing endpoint intentionally does NOT return a total (it is a cursor-paged
   // stream, not an offset-paged collection).
   size(): number {
@@ -146,10 +194,9 @@ export class LogStore {
 
     // Newest-first by default. Sequence order is the tie-break-free ordering
     // authority (timestamps can collide; `seq` cannot), so we order by `seq`.
-    const ordered =
-      order === 'desc'
-        ? [...filtered].sort((a, b) => b.seq - a.seq)
-        : [...filtered].sort((a, b) => a.seq - b.seq);
+    // `filtered` is already a fresh array owned by this call, so it is sorted in
+    // place — the held `records` array is never reordered.
+    const ordered = filtered.sort((a, b) => (order === 'desc' ? b.seq - a.seq : a.seq - b.seq));
 
     // Resume strictly AFTER the cursor's seq boundary, respecting direction.
     const afterCursor =
