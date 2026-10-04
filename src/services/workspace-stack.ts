@@ -46,6 +46,11 @@ import {
   type AuditRepository,
   type AuditRetentionRepository
 } from '../data/audit-repo.js';
+// Operational log store (issue #996): durable CouchLogStore on the Couch paths,
+// in-memory LogStore on the no-Couch paths — the same Couch/in-memory pairing
+// `audit` uses above.
+import { CouchLogStore } from '../data/couch-log-repo.js';
+import { LogStore, type LogReader, type LogSink } from './log-store.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
@@ -68,6 +73,15 @@ export type OptionalStepBuilders = {
 };
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+
+// Process-wide in-memory operational log store for the NO-COUCH paths only
+// (issue #996). Deliberately a module singleton rather than one per built
+// connection set: the resolver rebuilds connections on every cache miss (and the
+// no-parameter-store branch rebuilds on EVERY resolve), so a per-resolution store
+// would discard records that the pre-#996 wiring — one global `new LogStore()`
+// in main.ts, held for the process lifetime — kept. Couch-backed paths never
+// touch this; they get a durable CouchLogStore.
+const fallbackLogStore = new LogStore();
 
 // Minimal logger surface (compatible with Fastify's logger). Injected so the
 // read-path diagnostics (issue #415, info/warn) and a transient parameter-store
@@ -111,6 +125,14 @@ export type WorkspaceConnections = {
   // purge sweep drives per tick. Typed as the intersection so the single field
   // serves all three consumers; both concrete repos satisfy it.
   audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
+  // Operational log store for this stack (issue #996). Backed by CouchLogStore
+  // on every Couch-backed path, so records written by the pipeline producer
+  // survive a restart and are still returned by GET /api/v1/logs; the in-memory
+  // LogStore backs the no-Couch dev/test paths. ALWAYS present, like `audit`.
+  // Carries both the `append()` write primitive the pipeline producer uses
+  // (src/services/pipeline-log.ts) and the `list()` read the logs router uses
+  // (src/routes/logs.ts), so one field serves both consumers.
+  logs: LogSink & LogReader;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   // Asset comments for this stack (issue #135, made durable by issue #1046).
@@ -144,6 +166,15 @@ export type WorkspaceConnections = {
   // `scene-detect` step skips gracefully — fire-and-forget, never throws.
   subtitleGenerator: SubtitleGenerator | undefined;
   sceneDetector: SceneDetector | undefined;
+  // The stack identity these connections were built from (issue #1058): the
+  // parameter-store stack name, i.e. the same identity `resolveStackName()`
+  // returns for the transcode control plane. Undefined on the env-override and
+  // in-memory fallback paths, which are not stack records. Callers compare this
+  // against the control plane's resolved stack to detect a data-plane /
+  // control-plane split; they MUST NOT compare endpoint hostnames, which
+  // legitimately differ for the same stack (in-cluster vs public ingress,
+  // issue #991).
+  stackName: string | undefined;
 };
 
 // A cached resolution. `fromReadyStack` records whether `connections` were
@@ -186,6 +217,14 @@ function buildConnectionsFromStack(
   couchPassword: string,
   oscContext: Context,
   optionalSteps: OptionalStepBuilders,
+  // The parameter-store name this config was loaded under (issue #1058).
+  // Carried onto the connections as their stack identity.
+  stackName: string | undefined,
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them. Required, like the other module-private helpers here: the sole caller
+  // is the resolver, whose own `log` field always holds a logger (noopLogger
+  // when none was injected).
   log: StackResolverLogger
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
@@ -225,6 +264,12 @@ function buildConnectionsFromStack(
   const comments = new CouchCommentRepository(wc, log);
   // Audit store over the same per-stack CouchDB connection (issue #564).
   const audit = new CouchAuditRepository(wc);
+  // Operational log store over the SAME per-stack CouchDB connection (issue
+  // #996), so log records land in the stack the request resolved to and survive
+  // a restart of this process.
+  // `log` so a failed overflow eviction or an over-cap read window is reported
+  // instead of swallowed (#996 review finding 2).
+  const logs = new CouchLogStore(wc, { log });
 
   const storageFor: StorageFactory = () =>
     new WorkspaceStorage(minioClient, config.sourceBucket);
@@ -256,6 +301,7 @@ function buildConnectionsFromStack(
     webhooks,
     collections,
     audit,
+    logs,
     profiles,
     pipelines,
     comments,
@@ -269,7 +315,8 @@ function buildConnectionsFromStack(
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
     subtitleGenerator,
-    sceneDetector
+    sceneDetector,
+    stackName
   };
 }
 
@@ -315,6 +362,9 @@ export function stackResolvedMinioEndpoint(
 // MINIO_ACCESS_KEY/MINIO_SECRET_KEY pair.
 function buildEnvConnections(
   oscContext: Context,
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them.
   log: StackResolverLogger
 ): WorkspaceConnections | undefined {
   const couchUrl = process.env['COUCHDB_URL'];
@@ -335,6 +385,10 @@ function buildEnvConnections(
   // (listOldestPage/purgeEntry) — so the retention sweep runs on the in-memory
   // env path too, not just Couch.
   let audit: AuditRepository & AuditEmitter & AuditRetentionRepository;
+  // Operational log store (issue #996): durable on the Couch env path so
+  // GET /api/v1/logs survives a restart there too, in-memory when no COUCHDB_URL
+  // is configured.
+  let logs: LogSink & LogReader;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
   // Asset comments: always present, Couch-backed on the couch env path and
@@ -355,6 +409,9 @@ function buildEnvConnections(
     pipelines = new CouchPipelineRepository(wc);
     comments = new CouchCommentRepository(wc, log);
     audit = new CouchAuditRepository(wc);
+    // `log` so a failed overflow eviction or an over-cap read window is reported
+    // instead of swallowed (#996 review finding 2).
+    logs = new CouchLogStore(wc, { log });
   } else {
     const mem = new InMemoryAssetRepository();
     assets = mem;
@@ -362,6 +419,9 @@ function buildEnvConnections(
     webhooks = new InMemoryWebhookRepository();
     collections = new InMemoryCollectionRepository();
     audit = new InMemoryAuditRepository();
+    // No COUCHDB_URL on the env-override path: nothing to persist to, so the
+    // process-local store (shared for the process, see fallbackLogStore).
+    logs = fallbackLogStore;
     // Search projects assets + collections (issue #561).
     search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
@@ -399,7 +459,7 @@ function buildEnvConnections(
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines, comments,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
     s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
@@ -411,7 +471,10 @@ function buildEnvConnections(
     // OPTIONAL subtitles/scene-detect steps stay disabled here and skip
     // gracefully, exactly as when the name is absent from a record.
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    // Not a stack record: the env override is one global set of coordinates, so
+    // there is no stack identity to compare against (issue #1058).
+    stackName: undefined
   };
 }
 
@@ -421,6 +484,10 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const webhooks = new InMemoryWebhookRepository();
   const collections = new InMemoryCollectionRepository();
   const audit = new InMemoryAuditRepository();
+  // No stack => no durable store: the process-local log store (issue #996),
+  // shared across rebuilds (see fallbackLogStore). The no-storage fallback
+  // persists nothing else either.
+  const logs = fallbackLogStore;
   // Search projects assets + collections (issue #561).
   const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
@@ -429,7 +496,7 @@ function buildInMemoryConnections(): WorkspaceConnections {
   // are ephemeral here, which PerWorkspaceCommentRepository warns about.
   const comments = new InMemoryCommentRepository();
   return {
-    assets, jobs, search, webhooks, collections, audit, profiles, pipelines, comments,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
@@ -437,7 +504,9 @@ function buildInMemoryConnections(): WorkspaceConnections {
     s3Config: undefined,
     storage: undefined,
     subtitleGenerator: undefined,
-    sceneDetector: undefined
+    sceneDetector: undefined,
+    // No stack record behind the no-storage fallback (issue #1058).
+    stackName: undefined
   };
 }
 
@@ -877,6 +946,10 @@ export class WorkspaceStackResolver {
     // directly; otherwise use the first provisioned stack as the workspace
     // default.
     let config: StackConfig | undefined;
+    // The name the config was actually loaded under (issue #1058). Carried onto
+    // the built connections so the data plane's stack identity is observable
+    // and comparable with the control plane's (resolveStackName).
+    let resolvedName: string | undefined;
     try {
       if (stackName) {
         // READ-PATH diagnostic (issue #415): the resolver reads by the
@@ -888,6 +961,7 @@ export class WorkspaceStackResolver {
           'resolver reading stack config by requested name'
         );
         config = await this.loadStackConfigWithMigration(ps, stackName);
+        if (config) resolvedName = stackName;
         // If the requested stack name isn't found, fall back to the default
         // (first provisioned) stack rather than degrading to in-memory
         // connections. This prevents stale UI stack selections from breaking
@@ -900,6 +974,7 @@ export class WorkspaceStackResolver {
           );
           if (names.length > 0) {
             config = await this.loadStackConfigWithMigration(ps, names[0]!);
+            if (config) resolvedName = names[0]!;
           }
         }
       } else {
@@ -914,6 +989,7 @@ export class WorkspaceStackResolver {
         );
         if (names.length > 0) {
           config = await this.loadStackConfigWithMigration(ps, names[0]!);
+          if (config) resolvedName = names[0]!;
         }
       }
     } catch (err) {
@@ -974,7 +1050,7 @@ export class WorkspaceStackResolver {
     // to no-op in-memory connections so /health and infra routes stay up.
     const built =
       config && isReadyStack(config)
-        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, this.log)
+        ? buildConnectionsFromStack(config, this.minioPassword, this.couchPassword, this.oscContext, this.optionalSteps, resolvedName, this.log)
         : null;
 
     // Emit the aggregate degraded-resolution signal (issue #422): a null build
@@ -1093,6 +1169,35 @@ export class WorkspaceStackResolver {
     const names = await this.listStackNamesWithMigration(ps);
     if (names.length === 0) return undefined;
     return this.loadStackConfigWithMigration(ps, names[0]!);
+  }
+
+  // The provisioned stack names, in parameter-store listing order (issue #1058).
+  //
+  // Exposes the SAME listing the resolution paths use — including the bounded
+  // one-shot migration fallback for a pre-#804 stack — so a caller that must run
+  // once per stack (the scaler-tick reconcilers, the stack-less packager
+  // callbacks) enumerates exactly the stacks `resolve()` can address. Empty when
+  // no parameter store is configured (env-override / bare local run), in which
+  // case callers fall back to the single default resolution.
+  //
+  // A read failure is logged and reported as "no stacks" rather than thrown: the
+  // callers are best-effort sweeps and unauthenticated callbacks, and a
+  // parameter-store blip must not break a tick or fail a callback.
+  async listStackNames(): Promise<string[]> {
+    const ps = this.paramStore;
+    if (!ps) return [];
+    try {
+      return await this.listStackNamesWithMigration(ps);
+    } catch (err) {
+      this.log.error(
+        {
+          err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
+          namespace: STACK_CONFIG_NAMESPACE
+        },
+        'stack resolver: failed to list stack names'
+      );
+      return [];
+    }
   }
 
   // Synchronous read of already-resolved connections from cache. Returns

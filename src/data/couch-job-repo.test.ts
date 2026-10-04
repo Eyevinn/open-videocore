@@ -157,3 +157,64 @@ describe('CouchJobRepository concurrent-write safety (#451)', () => {
     expect(after!.encodeAttemptLog).toHaveLength(1);
   });
 });
+
+// The drop-correction trace has to survive on the PRODUCTION backend, not just
+// in memory (issue #1023): completeTranscode records `droppedThenRecovered` /
+// `correctedDropError` on the job record so a corrected drop is traceable on
+// every correction path, including the callback poller, which wires no audit
+// emitter. That only holds if CouchJobRepository's document mapping carries the
+// two fields in BOTH directions — toDoc (write) and fromDoc (read).
+//
+// Contracts verified before writing (CLAUDE.md rule 7):
+//   - Job.droppedThenRecovered?: boolean; Job.correctedDropError?: string and
+//     UpdateJobInput's matching members + UpdateJobInput.clearError
+//     (src/data/job-repo.ts type Job / type UpdateJobInput / applyJobPatch).
+//   - toDoc / fromDoc field lists (src/data/couch-job-repo.ts).
+describe('CouchJobRepository drop-correction trace (#1023)', () => {
+  const DROP_ERROR = 'dropped by Encore: gone from active set with no completion';
+
+  it('round-trips the corrected-drop annotation through the document mapping', async () => {
+    // A job settled `failed` by drop detection, as the conditional settle leaves it.
+    const { couch } = makeCouch({
+      ...JOB_DOC,
+      status: 'failed',
+      error: DROP_ERROR,
+      droppedByScaler: true
+    });
+    const repo = new CouchJobRepository(() => couch);
+
+    // Exactly the patch completeTranscode's success write issues when a genuine
+    // SUCCESSFUL completion corrects a conditional drop.
+    const corrected = await repo.update('job-abc123', {
+      status: 'done',
+      progress: 100,
+      droppedByScaler: false,
+      clearError: true,
+      droppedThenRecovered: true,
+      correctedDropError: DROP_ERROR
+    });
+    expect(corrected!.status).toBe('done');
+    expect(corrected!.error).toBeUndefined();
+
+    // Read back THROUGH the document mapping: a fresh fromDoc of what toDoc
+    // persisted. Pre-fix both fields were absent from toDoc, so the trace was
+    // written to the record in memory and then dropped on the way to disk.
+    const after = await repo.get('job-abc123');
+    expect(after!.droppedThenRecovered).toBe(true);
+    expect(after!.correctedDropError).toBe(DROP_ERROR);
+    // And the failure text really is gone from the persisted document.
+    expect(after!.error).toBeUndefined();
+  });
+
+  it('leaves the annotation absent on a job that was never dropped', async () => {
+    const { couch } = makeCouch(JOB_DOC);
+    const repo = new CouchJobRepository(() => couch);
+
+    await repo.update('job-abc123', { status: 'running' });
+    await repo.update('job-abc123', { status: 'done', progress: 100, droppedByScaler: false, clearError: true });
+
+    const after = await repo.get('job-abc123');
+    expect(after!.droppedThenRecovered).toBeUndefined();
+    expect(after!.correctedDropError).toBeUndefined();
+  });
+});

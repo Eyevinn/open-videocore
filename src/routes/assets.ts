@@ -111,6 +111,11 @@ import {
   stackResolvedMinioEndpoint
 } from '../services/workspace-stack.js';
 import { submitTranscode } from '../pipeline/transcode.js';
+import {
+  logPipelineEvent,
+  type PipelineLogSink,
+  type PipelineLogStage
+} from '../services/pipeline-log.js';
 import { validateProfileParams } from '../pipeline/profile-params.js';
 import { resolveProfileYaml } from '../pipeline/resolve-profile-yaml.js';
 import {
@@ -1073,6 +1078,13 @@ type AssetsRouterOptions = {
   // un-audited (no-op). Emission is fire-and-forget: a failed audit write is
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
+  // Best-effort operational log emission for pipeline steps (issue #995). Wired
+  // to the log store's `append()` write primitive — the same instance
+  // GET /api/v1/logs reads (src/main.ts, `logStore`; read path
+  // src/routes/logs.ts:94). When absent, pipeline execution proceeds without
+  // appending log records (no-op), so existing tests are unaffected. Emission
+  // never throws, so no route becomes newly failable.
+  pipelineLog?: PipelineLogSink;
 };
 
 // Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
@@ -1083,6 +1095,19 @@ type AssetsRouterOptions = {
 // asset (`subtitlesError` / `sceneDetectionError`) so the skip is explainable
 // after the fact.
 type OptionalStepOutcome = { started: true } | { started: false; reason: string };
+
+// Map a pipeline step to the coarse, operator-facing log stage (issue #995).
+// The Logs tab is a stage-level view, not a step-level one: `transcode` and
+// `package` are the two asynchronous steps that settle from an OSC callback and
+// get their own stage, and every other step (extract-metadata, thumbnail, and the
+// optional subtitles / scene-detect) is part of getting the asset in, so it
+// reports as `ingest`. CONTRACT: `PipelineStepName` — src/pipeline/pipelines.ts:22-23;
+// `PipelineLogStage` — src/services/pipeline-log.ts (PIPELINE_LOG_STAGES).
+function logStageForStep(name: PipelineStepName): PipelineLogStage {
+  if (name === 'transcode') return 'transcode';
+  if (name === 'package') return 'package';
+  return 'ingest';
+}
 
 // Skip reasons. They name the operator-facing knob that activates the step: the
 // per-stack instance name (StackConfig.autoSubtitlesInstanceName /
@@ -1760,6 +1785,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   const storageFor = opts.storageFor;
   // Best-effort audit emitter (issue #564). Undefined => mutations run un-audited.
   const audit = opts.audit;
+  // Best-effort operational log sink (issue #995). Undefined => pipeline steps
+  // run without appending to the log store GET /api/v1/logs reads.
+  const pipelineLog = opts.pipelineLog;
 
   // Resolve the scaler/Encore context key for a transcode request (issue #615).
   // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
@@ -1773,11 +1801,42 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // env-override) or when it resolves undefined (no provisioned stack), leaving
   // single-stack behaviour byte-identical.
   async function transcodeContext(request: import('fastify').FastifyRequest): Promise<string> {
-    if (!opts.resolveStackContext) return DEPLOYMENT_CONTEXT;
+    return (await transcodeStackIdentity(request)).contextId;
+  }
+
+  // The control plane's stack identity for this request (issue #1058).
+  // `contextId` is what keys the scaler (unchanged); `resolved` is the stack
+  // NAME the resolver reported, or undefined when no resolver is wired or no
+  // stack is provisioned — the two cases where there is no identity to compare.
+  async function transcodeStackIdentity(
+    request: import('fastify').FastifyRequest
+  ): Promise<{ contextId: string; resolved: string | undefined }> {
+    if (!opts.resolveStackContext) return { contextId: DEPLOYMENT_CONTEXT, resolved: undefined };
     const header = request.headers['x-stack-name'];
     const requested = typeof header === 'string' && header.length > 0 ? header : undefined;
     const resolved = await opts.resolveStackContext(requested);
-    return resolved ?? DEPLOYMENT_CONTEXT;
+    return { contextId: resolved ?? DEPLOYMENT_CONTEXT, resolved };
+  }
+
+  // Fail loud when the data plane and the transcode control plane resolved
+  // DIFFERENT stacks (issue #1058). The source bytes live wherever the data
+  // plane wrote them (`request.connections`, keyed by the request's stack since
+  // this issue's fix); the transcoder is created with the S3 endpoint of the
+  // stack the control plane resolved. If those two identities disagree, the
+  // transcoder reads a bucket of the same literal name on the wrong instance and
+  // reports an indistinguishable 404 — so we refuse to submit instead.
+  //
+  // Compares stack IDENTITY, never endpoint hostnames: the transcoder correctly
+  // uses the in-cluster address while the API uses the public ingress for the
+  // same instance (issue #991), so hostnames legitimately differ.
+  function stackRoutingMismatch(
+    request: import('fastify').FastifyRequest,
+    controlPlaneStack: string | undefined
+  ): { dataPlaneStack: string; controlPlaneStack: string } | undefined {
+    const dataPlaneStack = request.connections?.stackName;
+    if (!dataPlaneStack || !controlPlaneStack) return undefined;
+    if (dataPlaneStack === controlPlaneStack) return undefined;
+    return { dataPlaneStack, controlPlaneStack };
   }
 
   // Resolve whether a named transcode profile can execute on this platform tier
@@ -1819,10 +1878,22 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // blocks the caller, and the extractor itself never throws (records failures
   // on the asset). No-op when the probe runner or object storage is not
   // configured. Returns true when an extraction was actually kicked off.
+  //
+  // `storage` lets a caller hand in a WorkspaceStorage it already resolved
+  // instead of resolving a fresh one here. Callers that run INSIDE the request
+  // can omit it — `storageFor()` reads the resolver cache entry the onRequest
+  // hook just warmed for this request's stack (issue #1058). A caller that
+  // reaches this AFTER the request's work has settled must pass the handle,
+  // because `makeRequestScopedStorageFactory` is a cache read and the entry can
+  // age past the resolver TTL (`CACHE_TTL_MS`, services/workspace-stack.ts)
+  // during a long transfer — after which the factory THROWS rather than
+  // returning the wrong stack. Same reason, and the same shape, as
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts:83).
   function triggerExtraction(
     assetId: string,
     objectKey: string,
-    externalSource?: ExternalProbeSource
+    externalSource?: ExternalProbeSource,
+    storage?: WorkspaceStorage
   ): boolean {
     if (!opts.probe || !storageFor) {
       return false;
@@ -1831,7 +1902,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       { assetId, objectKey, ...(externalSource ? { externalSource } : {}) },
       {
         assets: repo,
-        storage: storageFor(),
+        storage: storage ?? storageFor(),
         probe: opts.probe,
         ...opts.extractDeps
       }
@@ -2229,6 +2300,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
 
     const firstStep = steps[0];
 
+    // Data-plane / control-plane stack agreement (issue #1058), for ANY pipeline
+    // that contains a transcode step — not just one that starts with it, since
+    // `abr-vod` and `full` reach transcode later and the live reproduction used
+    // `abr-vod`. Resolved BEFORE the execution record is created, so a split
+    // never leaves a dangling execution with a step marked running against a
+    // source the transcoder cannot read. Reused verbatim as the scaler context
+    // in the step loop below, so the identity we verified is the identity we
+    // submit with.
+    const controlPlane = await transcodeStackIdentity(request);
+    if (steps.includes('transcode')) {
+      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
+      if (mismatch) {
+        request.log.error(
+          {
+            assetId: asset.id,
+            pipeline: pipelineName,
+            dataPlaneStack: mismatch.dataPlaneStack,
+            controlPlaneStack: mismatch.controlPlaneStack
+          },
+          'refusing to start pipeline: the source bytes and the transcoder resolve different stacks (issue #1058)'
+        );
+        reply.code(409).send({
+          error: 'stack_routing_mismatch',
+          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+        });
+        return undefined;
+      }
+    }
+
     // Pre-flight the first step's requirements before creating the execution so
     // an un-runnable pipeline never leaves a dangling running execution.
     if (firstStep === 'transcode' || firstStep === 'package') {
@@ -2431,6 +2531,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     const resolvedSource = tryResolveSourceObject(asset);
     const sourceObjectKey = resolvedSource?.objectKey ?? '';
 
+    // Operational log (issue #995): one entry per SYNCHRONOUS step that settles
+    // inside the loop below. The two asynchronous steps are NOT logged here —
+    // `transcode` is logged by submitTranscode/completeTranscode and `package` by
+    // PackagingService, at the same points those modules emit their audit
+    // entries, so a run that settles from an OSC callback is covered even though
+    // this request has long since returned. Stage-mapped via logStageForStep, so
+    // the whole `ingest` pipeline reports under the `ingest` stage.
+    const logSettledStep = (
+      name: PipelineStepName,
+      outcome: 'done' | 'skipped',
+      reason?: string
+    ): void => {
+      logPipelineEvent(
+        pipelineLog,
+        {
+          stage: logStageForStep(name),
+          // A skip is not a failure (issue #789) but it IS the absence of work an
+          // operator would otherwise assume happened, so it is a `warn` rather
+          // than an `info`.
+          level: outcome === 'skipped' ? 'warn' : 'info',
+          message:
+            outcome === 'skipped'
+              ? `${name} step skipped for asset ${asset.id} (execution ${execution.id}): ${reason ?? 'no reason recorded'}`
+              : `${name} step completed for asset ${asset.id} (execution ${execution.id})`
+        },
+        request.log
+      );
+    };
+
     // Execute steps synchronously until we hit an asynchronous step (transcode/
     // package) which completes via an OSC callback, or run out of steps. The
     // fire-and-forget steps (extract-metadata, thumbnail) settle immediately.
@@ -2440,11 +2569,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         if (step.name === 'extract-metadata') {
           triggerExtraction(asset.id, sourceObjectKey);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          logSettledStep(step.name, 'done');
           continue;
         }
         if (step.name === 'thumbnail') {
           triggerThumbnail(asset.id, sourceObjectKey, request);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+          logSettledStep(step.name, 'done');
           continue;
         }
         if (step.name === 'subtitles') {
@@ -2455,6 +2586,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           const outcome = triggerSubtitles(asset.id, sourceObjectKey, request);
           if (outcome.started) {
             stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+            logSettledStep(step.name, 'done');
           } else {
             // #789: nothing ran, so `done` would be a lie. Settle as `skipped`
             // (a terminal, non-failing state) and record WHY on the asset.
@@ -2466,6 +2598,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               startedAt: now(),
               completedAt: now()
             };
+            logSettledStep(step.name, 'skipped', outcome.reason);
           }
           continue;
         }
@@ -2477,6 +2610,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           const outcome = triggerSceneDetect(asset.id, sourceObjectKey, request);
           if (outcome.started) {
             stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
+            logSettledStep(step.name, 'done');
           } else {
             // #789: see the subtitles branch above.
             await recordOptionalStepSkip('scene-detect', asset.id, outcome.reason, request);
@@ -2487,6 +2621,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               startedAt: now(),
               completedAt: now()
             };
+            logSettledStep(step.name, 'skipped', outcome.reason);
           }
           continue;
         }
@@ -2507,7 +2642,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               // this request routes to (issue #615), not the fixed deployment
               // context, so a pipeline execution against a healthy named stack
               // is not pinned to whichever stack was provisioned first.
-              workspaceId: await transcodeContext(request),
+              workspaceId: controlPlane.contextId,
               sourceAssetId: asset.id,
               sourceObjectKey,
               // Read the transcode INPUT from the resolved stack's per-stack
@@ -2530,7 +2665,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               // execute behaviour unchanged.
               profileParams: encodeOpts?.profileParams
             },
-            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log }
+            { jobs, assets: repo, encore: opts.encore!, audit, auditLog: request.log, pipelineLog }
           );
           stepsCopy[i] = {
             ...step,
@@ -2653,8 +2788,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       const message = err instanceof Error ? err.message : String(err);
       const idx = stepsCopy.findIndex((s) => s.status === 'pending');
       const failIdx = idx >= 0 ? idx : stepsCopy.length - 1;
-      stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      // `failIdx` is -1 only when the execution has no steps at all, in which
+      // case there is no step record to mark failed — the execution-level
+      // `status: 'failed'` below is the whole story. Guard the write so we never
+      // stamp a bogus index on the array.
+      if (failIdx >= 0) {
+        stepsCopy[failIdx] = { ...stepsCopy[failIdx], status: 'failed', error: message, startedAt: now(), completedAt: now() };
+      }
+      // Step name for the log/stage, with a literal fallback for the no-steps
+      // case (which would otherwise read "undefined step failed"). `PipelineStepName`
+      // CONTRACT: src/pipeline/pipelines.ts:22-23; logStageForStep maps any
+      // non-transcode/package name to the `ingest` stage (src/routes/assets.ts:1106-1110),
+      // which is the correct coarse stage for an execution that never started a step.
+      const failedStep = failIdx >= 0 ? stepsCopy[failIdx] : undefined;
+      const failedStepLabel = failedStep ? failedStep.name : 'pipeline';
       await pipelineRepo.update(execution.id, { steps: stepsCopy, status: 'failed' });
+      // Operational log (issue #995): the step that failed the execution. This is
+      // the synchronous failure path — a step that threw before handing off to an
+      // OSC callback — so it is the only record of the failure the Logs tab would
+      // otherwise get (the callback-driven failures are logged by
+      // completeTranscode / PackagingService.handleFailure).
+      logPipelineEvent(
+        pipelineLog,
+        {
+          stage: failedStep ? logStageForStep(failedStep.name) : 'ingest',
+          level: 'error',
+          message: `${failedStepLabel} step failed for asset ${asset.id} (execution ${execution.id}): ${message}`
+        },
+        request.log
+      );
       reply.code(502).send({ error: 'pipeline_step_failed', message });
       return undefined;
     }
@@ -2844,18 +3006,77 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           description,
           tags
         });
+        // Audit: asset created (issue #999, instrumentation convention of #564).
+        // Same shape as POST / (assets.ts:2762-2772) — one entry, targetId = the
+        // new asset id, `detail.name`/`detail.status` read off the asset as
+        // created — plus `sourceUrl`, so an ingest-by-URL creation is
+        // distinguishable from a plain POST / in the queryable trail
+        // (GET /api/v1/audit). Emitted here, directly after repo.create and
+        // BEFORE the objectKey/status update below, for the same reason the
+        // default branch does: the asset exists from this point on, so a failure
+        // in any later step must not swallow the creation record. `detail.status`
+        // is therefore the status at creation, not the post-update one.
+        //
+        // `sourceUrl` here is the credential-free `s3://bucket/key` locator built
+        // below — the exact value the ingest job records (`sourceUrl`, CONTRACT:
+        // src/data/job-repo.ts:100) — never the registered external credential,
+        // which this path never holds as a literal anyway (#548).
+        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
+        emitAudit(
+          audit,
+          {
+            actor: originActor('user'),
+            action: 'asset.created',
+            targetType: 'asset',
+            targetId: extAsset.id,
+            detail: { name: extAsset.name, status: extAsset.status, sourceUrl: extObjectKey }
+          },
+          request.log
+        );
         // The recorded source is the credential-free `s3://bucket/key` locator;
         // the object already lives in the external bucket, so no byte-pull runs
         // and the asset advances straight to `processing`.
-        const extObjectKey = `s3://${source.bucket}/${source.objectKey}`;
         await repo.update(extAsset.id, { objectKey: extObjectKey, status: 'processing' });
         const extJob = await jobs.create({
           type: 'ingest-url',
           assetId: extAsset.id,
           sourceUrl: extObjectKey
         });
+        // Audit: ingest-url job submitted (issue #1000). One entry, targetId = the
+        // new job id, emitted right after the durable job record exists — the same
+        // moment and the same shape the transcode submission uses
+        // (src/pipeline/transcode.ts:104-114). `system` origin matches every other
+        // `job.*` entry (transcode + package), so the job lifecycle reads as one
+        // consistent origin regardless of which surface triggered it.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.submitted',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         await jobs.update(extJob.id, { status: 'running' });
         await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Audit: this branch settles the job terminally INLINE (the bytes already
+        // live in the external bucket, so no pull worker runs and nothing else can
+        // ever emit the terminal entry for it). Same shape as the pull worker's
+        // success entry (src/pipeline/url-pull-worker.ts) minus `bytesTransferred`,
+        // which is meaningless when no bytes were transferred.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.completed',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         // Fire-and-forget probe against the external source (job reads in place).
         triggerExtraction(extAsset.id, extObjectKey, source);
         return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
@@ -2882,6 +3103,24 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         description,
         tags
       });
+      // Audit: asset created (issue #999). Identical shape + placement to the
+      // external-backend branch above and to POST / (assets.ts:2762-2772), so an
+      // ingest-by-URL creation produces one `asset.created` entry no matter which
+      // branch served the request. The recorded `sourceUrl` is the request's own
+      // pull URL — the same value already persisted on the ingest job below
+      // (`sourceUrl`, CONTRACT: src/data/job-repo.ts:100), so this adds no value
+      // the API did not already store.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.created',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: { name: asset.name, status: asset.status, sourceUrl }
+        },
+        request.log
+      );
       const objectKey = `ingest/${asset.id}`;
       await repo.update(asset.id, { objectKey });
 
@@ -2891,6 +3130,39 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         sourceUrl
       });
 
+      // Resolved ONCE, here, while the request is still in flight — and reused
+      // for both the pull and the extraction that follows it (issue #1058
+      // review). `storageFor()` is a cache read keyed on this request's stack
+      // name, and a large pull can outlive the resolver TTL; resolving again
+      // from the `.then()` below would throw inside a detached promise (silent
+      // loss of the extraction plus an unhandled rejection) rather than return
+      // the right stack. The handle itself is a plain client wrapper with no
+      // TTL of its own, so holding it across the pull is safe.
+      const pullStorage = storageFor();
+
+      // Audit: ingest-url job submitted (issue #1000). See the external-backend
+      // branch above for the shape rationale. Emitted BEFORE the detached pull
+      // runner starts, so the audit trail records the submission regardless of the
+      // pull outcome — and the asset's history no longer starts mid-pipeline.
+      // `sourceUrl` is deliberately NOT in the detail bag: a pull source may be a
+      // pre-signed URL carrying credentials in its query string.
+      // This submission and the terminal job.completed/job.failed the worker emits
+      // can land in the same millisecond (equal `at`); the audit store mints
+      // monotonic ULID ids so GET /api/v1/audit's equal-`at` tiebreak resolves to
+      // true write order and never renders the lifecycle inverted (issue #1000
+      // review; CONTRACT: monotonic id minting in src/data/audit-repo.ts record()).
+      emitAudit(
+        audit,
+        {
+          actor: originActor('system'),
+          action: 'job.submitted',
+          targetType: 'job',
+          targetId: job.id,
+          detail: { jobType: 'ingest-url', assetId: asset.id }
+        },
+        request.log
+      );
+
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
@@ -2898,13 +3170,45 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset actually advanced to `processing` (pull succeeded).
       void runner(
         { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
-        { jobs, assets: repo, storage: storageFor(), quota: opts.quota, ...opts.pullDeps }
-      ).then(async () => {
-        const settled = await repo.get(asset.id);
-        if (settled?.status === 'processing') {
-          triggerExtraction(asset.id, objectKey);
+        {
+          jobs,
+          assets: repo,
+          storage: pullStorage,
+          quota: opts.quota,
+          ...opts.pullDeps,
+          // Operational log for the `ingest` stage (issue #995). Threaded after
+          // the `pullDeps` spread because `PullDeps` carries no log sink of its
+          // own — the worker's start/success/failure entries are the only record
+          // the Logs tab gets of a URL-pull ingest, which runs detached and
+          // therefore outlives this request.
+          pipelineLog,
+          pipelineLogErrors: request.log,
+          // Terminal `job.completed` / `job.failed` emission for this job happens
+          // inside the worker, where the pull actually settles (issue #1000).
+          // Threaded after the `pullDeps` spread so an injected test dep bag can
+          // never silently drop the emitter.
+          audit,
+          auditLog: request.log
         }
-      });
+      )
+        .then(async () => {
+          const settled = await repo.get(asset.id);
+          if (settled?.status === 'processing') {
+            triggerExtraction(asset.id, objectKey, undefined, pullStorage);
+          }
+        })
+        // This continuation outlives the request, so nothing is left to surface
+        // a rejection: `repo.get` resolves the stack through the ambient context
+        // and can fail on its own (a dead CouchDB, a stack de-provisioned mid
+        // pull). Logged rather than swallowed, and never rethrown, so an ingest
+        // whose extraction could not be kicked off is visible in the operational
+        // log instead of arriving as an unhandled rejection (issue #1058 review).
+        .catch((err: unknown) => {
+          request.log.error(
+            { err, assetId: asset.id, jobId: job.id },
+            'post-pull metadata extraction could not be started'
+          );
+        });
 
       return reply.code(202).send({ assetId: asset.id, jobId: job.id });
     }
@@ -4168,7 +4472,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // caller polls GET /api/v1/jobs/:id and the Encore callback finishes the work.
   //   202 — accepted, transcode submitted
   //   404 — unknown/foreign source asset (existence not leaked)
-  //   409 — the source asset has no stored object to transcode
+  //   409 — `no_object` — the source asset has no stored object to transcode
+  //         (pipeline/source-object.ts NO_SOURCE_OBJECT_ERROR);
+  //         `burn_in_source_not_ready` / `burn_in_source_not_available` — a
+  //         burn-in was asked for but its caption source has no key yet, or the
+  //         key's bytes have not landed (issues #388 / #389);
+  //         `stack_routing_mismatch` — the source bytes and the transcoder would
+  //         resolve DIFFERENT stacks, so the transcode would fail with an
+  //         indistinguishable 404 (issue #1058). Refused up front rather than
+  //         submitted; retry naming one stack consistently via `X-Stack-Name`.
   //   501 — transcoding is not configured on this deployment
   //   502 — Encore rejected the submission
   app.post(
@@ -4388,6 +4700,27 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // per-stack value exists. Output PATH template is unchanged.
       const resolvedOutputBucket =
         request.connections?.packagedBucket ?? opts.outputBucket;
+
+      // Data-plane / control-plane stack agreement (issue #1058). Resolved once
+      // here and reused as the scaler context below, so the identity we verified
+      // is the identity we submit with.
+      const controlPlane = await transcodeStackIdentity(request);
+      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
+      if (mismatch) {
+        request.log.error(
+          {
+            assetId: asset.id,
+            objectKey: source.objectKey,
+            dataPlaneStack: mismatch.dataPlaneStack,
+            controlPlaneStack: mismatch.controlPlaneStack
+          },
+          'refusing to submit transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+        );
+        return reply.code(409).send({
+          error: 'stack_routing_mismatch',
+          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+        });
+      }
       try {
         // FAST reachability preflight (issue #617): before enqueuing work, probe
         // the stack's dependencies (queue/Valkey via the shared IORedis ping,
@@ -4412,7 +4745,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             ...(request.connections?.s3Config
               ? { minioEndpoint: request.connections.s3Config.endpoint }
               : {}),
-            bucket: opts.sourceBucket
+            // Probe the bucket the transcode will actually read — the resolved
+            // stack's source bucket (issue #639/#1058) — not the deployment-wide
+            // boot default.
+            bucket: request.connections?.sourceBucket ?? opts.sourceBucket
           },
           {
             ...(opts.packagingRedis ? { queueClient: opts.packagingRedis } : {}),
@@ -4430,7 +4766,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             // request routes to (issue #615), resolved from X-Stack-Name, not
             // the fixed deployment context — so a transcode against a healthy
             // named stack reaches that stack regardless of provisioning order.
-            workspaceId: await transcodeContext(request),
+            workspaceId: controlPlane.contextId,
             sourceAssetId: asset.id,
             sourceObjectKey: source.objectKey,
             preset: request.body.profile,
@@ -4448,7 +4784,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceBucket: request.connections?.sourceBucket ?? opts.sourceBucket,
             outputBucket: resolvedOutputBucket
           },
-          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log }
+          { jobs, assets: repo, encore: opts.encore, audit, auditLog: request.log, pipelineLog }
         );
         return reply
           .code(202)
@@ -4496,7 +4832,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //
   //   202 — packaging enqueued (or pipeline started)
   //   404 — unknown/foreign asset (existence not leaked)
-  //   409 — pipeline already running / job not found / instance unavailable
+  //   409 — pipeline already running / job not found / instance unavailable /
+  //         `stack_routing_mismatch` (issue #1058, pipeline mode only — it shares
+  //         `startPipelineExecution` with POST /:id/execute, whose abr-vod
+  //         pipeline contains a transcode step)
   //   501 — required service not configured on this deployment
   //   502 — Encore submission failed
   app.post(
@@ -4611,7 +4950,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         (package-only, issue #739) `no_renditions` — nothing to package,
   //         `no_transcode_job` — no recorded completed transcode to package from,
   //         `instance_not_found` — the transcode's Encore instance is no longer
-  //         pooled, so the job URL the packager needs cannot be resolved
+  //         pooled, so the job URL the packager needs cannot be resolved /
+  //         `stack_routing_mismatch` (issue #1058) — for any pipeline CONTAINING
+  //         a transcode step, the source bytes and the transcoder would resolve
+  //         different stacks; refused before the execution record is created
   //   501 — pipeline execution or the required OSC service is not configured
   //   502 — the first step's submission failed
   app.post(
