@@ -1043,9 +1043,8 @@ Response 201 (application/json)
   POST /api/v1/assets/{id}/deliver
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
