@@ -168,6 +168,15 @@ import {
 // SERVER-SIDE; it is never put in the response body.
 import { oscJobLog } from '../pipeline/osc-job-log.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
+// Deliver an existing asset object to a registered export destination (issue
+// #1131). The module owns the byte movement (server-side CopyObject) and the
+// landing verification that makes the endpoint's terminal status truthful.
+import {
+  deliverAssetObject,
+  destinationEndpointRefusal,
+  type DeliveryFailureReason,
+  type DeliveryObjectClient
+} from '../pipeline/asset-delivery.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
 import {
   backendOutputDestination,
@@ -734,6 +743,65 @@ const exportBodySchema = z.object({
   // export is additionally recorded as a version of the source asset.
   asVersion: z.boolean().optional()
 });
+
+// Deliver request (issue #1131): WHICH registered export destination the
+// asset's existing source object is to be delivered to. `destination` is the
+// stable id OR the human name of a registered output-role destination — the
+// SAME reference form the named-destination job path accepts
+// (`resolveJobDestination`, below) and the same records
+// GET /api/v1/export-destinations lists (src/routes/export-destinations.ts:
+// 279-288). Nothing else is accepted: this endpoint delivers bytes that already
+// exist, so there is no format, profile or output-name to choose. The bound
+// mirrors the destination id/name bound on the export-destinations surface
+// (`z.string().min(1).max(256)`, export-destinations.ts:301).
+const deliverBodySchema = z.object({
+  destination: z.string().min(1).max(256)
+});
+
+// Deliver result (issue #1131). Describes the object AS VERIFIED at the
+// destination after the copy: the bucket + key it was re-read at, its byte
+// count and etag. `status` is a single terminal value — the endpoint answers
+// 200 only when the object really landed, so a 200 can never mean "submitted"
+// or "probably".
+const deliverResultSchema = z.object({
+  assetId: z.string(),
+  status: z.literal('delivered'),
+  destination: z.object({
+    id: z.string(),
+    name: z.string(),
+    role: z.enum(['packaged', 'both'])
+  }),
+  bucket: z.string(),
+  objectKey: z.string(),
+  bytes: z.number(),
+  etag: z.string(),
+  deliveredAt: z.string()
+});
+
+// How each delivery failure reason (src/pipeline/asset-delivery.ts) surfaces as
+// HTTP. Exhaustive by type, so a new reason cannot be added without deciding
+// how it is reported — and none of them can be reported as a 200.
+//   - a destination we cannot write to / verify, and an over-size source, are
+//     caller-actionable 422s (the same code the #209 destination pre-flight
+//     uses for an unreachable destination bucket);
+//   - missing source BYTES are a 409: the asset document named an object that
+//     is not in the bucket, so there was nothing to deliver;
+//   - a failed copy, or a copy that did not land, is a 502 — the store is
+//     downstream of us and reported (or silently produced) a failure;
+//   - an unsettled delivery is a 504: we genuinely do not know the outcome, so
+//     it must not be dressed up as either success or a clean failure.
+const DELIVERY_FAILURE_RESPONSE: Record<
+  DeliveryFailureReason,
+  { status: 409 | 422 | 502 | 504; error: string }
+> = {
+  destination_unreachable: { status: 422, error: 'destination_unreachable' },
+  source_missing: { status: 409, error: 'source_missing' },
+  source_too_large: { status: 422, error: 'source_too_large' },
+  copy_failed: { status: 502, error: 'delivery_failed' },
+  not_landed: { status: 502, error: 'delivery_failed' },
+  timeout: { status: 504, error: 'delivery_timeout' }
+};
+
 // Clip / trim request (issue #17): a time window in seconds. `endSeconds` must
 // be strictly greater than `startSeconds`. Optional `outputName` names the new
 // child asset.
@@ -1131,6 +1199,24 @@ type AssetsRouterOptions = {
   // appending log records (no-op), so existing tests are unaffected. Emission
   // never throws, so no route becomes newly failable.
   pipelineLog?: PipelineLogSink;
+  // Asset delivery to a named export destination (issue #1131).
+  //
+  // `deliveryClient` is the object-store client POST /:id/deliver performs the
+  // server-side copy + landing verification with. In PRODUCTION the route uses
+  // the per-request stack client (`request.connections.storageClient`,
+  // src/services/workspace-stack.ts:148) so a delivery always runs against the
+  // same store this request's bytes live in; this option exists so a test can
+  // inject a fake, and when both are present the injected one wins — the same
+  // precedence `opts.subtitleGenerator ?? request.connections?.subtitleGenerator`
+  // uses. When neither is available the route answers 501.
+  deliveryClient?: DeliveryObjectClient;
+  // The object-storage endpoint `deliveryClient` is authenticated against, used
+  // to refuse a destination that declares a DIFFERENT endpoint (whose
+  // credentials this API cannot hold — see destinationEndpointRefusal in
+  // src/pipeline/asset-delivery.ts). Production reads it from the resolved
+  // stack (`request.connections.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:152); injectable here for tests.
+  deliveryEndpoint?: string;
 };
 
 // Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
@@ -5531,6 +5617,263 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'rewrap_failed', message });
       }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Deliver an EXISTING asset to a registered export destination (issue #1131).
+  //
+  // Prerequisite for #945 (and the #910/#911 export-from-detail UI): the caller
+  // supplies `(assetId, destination)` and gets back a terminal, truthful answer
+  // about whether the asset's source object is now AT that destination.
+  //
+  // WHY A NEW ENDPOINT AND NOT A `destination` FIELD ON POST /:id/export.
+  // `/:id/export` is a container re-wrap/transmux: it dispatches an OSC ffmpeg
+  // `-c copy` job via `rewrapRunner` and answers 201 with a NEW CHILD ASSET
+  // (`exportBodySchema` = `{ targetFormat, outputName?, asVersion? }`, handler
+  // above). Its output location is the workspace's own bucket, fixed by the
+  // runner's `s3Config` (`requestRunnerS3Config`), and the ffmpeg-s3 job body
+  // carries exactly ONE S3 identity (`ffmpegS3CredentialMapping`,
+  // src/services/external-storage-credentials.ts:155-180) — so that job cannot
+  // be pointed at a separately-credentialed destination, and a `destination`
+  // field there would have to mean "transmux, then relocate", i.e. two
+  // operations with two failure modes behind one 201-with-an-asset contract.
+  // Delivery has a different terminal condition ("the object is present at the
+  // destination"), so it gets its own endpoint and its own 200 body, and
+  // `/:id/export` keeps its current meaning unchanged.
+  //
+  // COMPOSITION (all pre-existing contracts, nothing new invented):
+  //   - the destination reference is resolved by `resolveJobDestination`
+  //     (above) — the SAME #573/#574 path POST /:id/package and
+  //     POST /:id/execute use, so a destination's optional path template
+  //     (`StorageBackendRegistry.resolveDestinationBucket`,
+  //     src/services/storage-backend-registry.ts:982-998) keys a delivered
+  //     object exactly as it keys packaged output;
+  //   - the resolved string is split by `parseDestination`
+  //     (src/pipeline/output-relocation.ts:57-80) into { bucket, prefix };
+  //   - the bytes move by server-side CopyObject and the landing is VERIFIED by
+  //     re-reading the destination object (src/pipeline/asset-delivery.ts).
+  //
+  // TRUTHFUL TERMINAL STATUS. 200 `{ status: 'delivered' }` is sent only after
+  // the object has been re-read at the destination with the source's byte
+  // count. Everything else is an error naming what went wrong:
+  //   400 — the reference names no registered export destination (or names the
+  //         OSC-managed default, which is where the asset already is)
+  //   404 — unknown/foreign asset (existence is not leaked)
+  //   409 — the asset has no stored source object (`no_object`, the shared
+  //         source-resolution contract), or its bytes are gone from the source
+  //         bucket (`source_missing`) so there was nothing to copy
+  //   422 — the destination is registered for a non-output role, or is not
+  //         writable/verifiable with the credentials this API holds
+  //   501 — no storage-backend registry, or no object storage, on this
+  //         deployment
+  //   502 — the copy failed, or the store reported success but the object is
+  //         not actually at the destination
+  //   504 — the delivery did not settle within the bound, so its outcome could
+  //         not be confirmed
+  app.post(
+    '/:id/deliver',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: deliverBodySchema,
+        response: {
+          200: deliverResultSchema,
+          400: errorSchema,
+          404: errorSchema,
+          409: errorSchema,
+          422: errorSchema,
+          501: errorSchema,
+          502: errorSchema,
+          504: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // Unified source-object resolution (issue #612): a source-less asset
+      // fails here the same way it fails for every other source-consuming
+      // operation (409 `no_object`).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
+
+      const registry = opts.storageBackendRegistry;
+      if (!registry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+
+      const ref = request.body.destination;
+      // The implicit OSC-managed default (ADR-017 D3) is the store the asset
+      // already lives in, not somewhere to deliver TO. `resolveForOutput`
+      // answers undefined for it by design
+      // (storage-backend-registry.ts:1040-1042), so name it explicitly rather
+      // than reporting it as an unknown destination.
+      if (ref === DEFAULT_BACKEND_ID) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: `"${DEFAULT_BACKEND_ID}" is the platform-managed default store the asset already lives in, not an export destination; name a destination registered via POST /api/v1/export-destinations`
+        });
+      }
+      // Resolve the destination RECORD first, under the SAME workspace
+      // namespace the export-destinations surface registers records in
+      // (`workspaceId = STACK_CONFIG_NAMESPACE`,
+      // src/routes/export-destinations.ts:187), so this endpoint addresses
+      // exactly the destinations GET /api/v1/export-destinations lists.
+      // Resolving the record up front (rather than going straight to
+      // `resolveJobDestination`) is what lets a registered-but-wrong-role
+      // backend get its own, accurate error: `resolveDestinationBucket` folds
+      // that case into the generic "no destination matches" 400
+      // (storage-backend-registry.ts:988-991), which would misreport a
+      // destination that IS registered.
+      const record = await registry.resolveForOutput(STACK_CONFIG_NAMESPACE, ref);
+      if (!record) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: new UnknownDestinationBackendError(ref).message
+        });
+      }
+      // Only output-role backends are export destinations (ADR-018 D1 —
+      // `isExportDestination`, src/routes/export-destinations.ts:174-176). A
+      // 'source'/'archive' backend is read/cold storage; delivering to it would
+      // silently cross the two surfaces, so it is refused with the same
+      // `backend_role`-style 422 the job path uses (`resolveJobDestination`
+      // above).
+      if (record.role !== 'packaged' && record.role !== 'both') {
+        return reply.code(422).send({
+          error: 'backend_role',
+          message: `storage backend "${ref}" is registered for the "${record.role}" role and cannot receive a delivery; register it with role "packaged" or "both"`
+        });
+      }
+
+      // Resolve the destination to the SAME `<bucket>/<prefix>/` string the
+      // relocation path consumes, through the SAME resolver the package/execute
+      // jobs use — so a #574 path template applies to a delivery identically.
+      // An error (unknown reference, unrenderable template, no registry) has
+      // already been sent by the resolver.
+      const resolved = await resolveJobDestination(
+        { destination: ref, assetId: asset.id },
+        reply
+      );
+      if (!resolved.ok) return reply;
+      const target =
+        resolved.destinationBucket !== undefined
+          ? parseDestination(resolved.destinationBucket)
+          : undefined;
+      if (!target) {
+        // A named destination always resolves to a non-empty bucket string, so
+        // this is defence in depth: refuse rather than copy to an unparseable
+        // location.
+        request.log.error(
+          { assetId: asset.id, destinationId: record.id },
+          'destination reference resolved to no usable bucket path'
+        );
+        return reply.code(422).send({
+          error: 'destination_unresolved',
+          message: `export destination "${ref}" did not resolve to a usable bucket path`
+        });
+      }
+
+      // A destination that declares its OWN endpoint cannot be delivered to
+      // from here: its secret access key lives write-only in OSC per-service
+      // secrets, so this process holds no credential for that endpoint, and
+      // copying to a same-named bucket on our own store would report a success
+      // for bytes that never reached the operator (see
+      // `destinationEndpointRefusal`, src/pipeline/asset-delivery.ts). Refuse
+      // instead of producing a false success.
+      const deploymentEndpoint = opts.deliveryEndpoint ?? request.connections?.s3Config?.endpoint;
+      const endpointRefusal = destinationEndpointRefusal(record.endpointUrl, deploymentEndpoint);
+      if (endpointRefusal) {
+        request.log.warn(
+          { assetId: asset.id, destinationId: record.id },
+          'refusing delivery: the destination is registered at an endpoint this API holds no credentials for (issue #1131)'
+        );
+        return reply.code(422).send({
+          error: 'destination_unreachable',
+          message: endpointRefusal
+        });
+      }
+
+      // The copy client: the per-request stack client in production, an
+      // injected fake in tests (see the option docs).
+      const client = opts.deliveryClient ?? request.connections?.storageClient;
+      if (!client) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured; asset delivery is unavailable'
+        });
+      }
+
+      // Where the source bytes are now. A rendition/external source is stored
+      // as an `s3://bucket/key` URI (`parseS3Uri`, above); a plain key lives in
+      // THIS request's stack source bucket (`WorkspaceConnections.sourceBucket`,
+      // src/services/workspace-stack.ts:150), falling back to the router's
+      // configured bucket and finally the documented default.
+      const s3Source = parseS3Uri(source.objectKey);
+      const sourceLocation = s3Source
+        ? { bucket: s3Source.bucket, key: s3Source.key }
+        : {
+            bucket:
+              request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET,
+            key: source.objectKey
+          };
+
+      const outcome = await deliverAssetObject(client, {
+        source: sourceLocation,
+        target
+      });
+      if (!outcome.ok) {
+        const mapped = DELIVERY_FAILURE_RESPONSE[outcome.reason];
+        request.log.warn(
+          {
+            assetId: asset.id,
+            destinationId: record.id,
+            reason: outcome.reason,
+            bucket: target.bucket
+          },
+          'asset delivery did not land at the destination'
+        );
+        return reply.code(mapped.status).send({
+          error: mapped.error,
+          message: outcome.message
+        });
+      }
+
+      // Audit the delivery (issue #564 emitter): emitted ONLY on a verified
+      // landing, so the audit trail cannot claim a delivery that did not
+      // happen. Fire-and-forget — a failed audit write never fails the request.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.delivered',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: {
+            destinationId: record.id,
+            destinationName: record.name,
+            bucket: outcome.bucket,
+            objectKey: outcome.objectKey,
+            bytes: outcome.bytes
+          }
+        },
+        request.log
+      );
+      return reply.code(200).send({
+        assetId: asset.id,
+        status: 'delivered' as const,
+        destination: { id: record.id, name: record.name, role: record.role },
+        bucket: outcome.bucket,
+        objectKey: outcome.objectKey,
+        bytes: outcome.bytes,
+        etag: outcome.etag,
+        deliveredAt: new Date().toISOString()
+      });
     }
   );
 
