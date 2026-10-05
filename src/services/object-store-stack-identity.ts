@@ -25,6 +25,29 @@
 // A mismatch is a fail-fast error naming the expected and actual stack ids,
 // instead of a 404/NoSuchKey hours later.
 //
+// WHERE THE TWO ASSERTIONS LIVE — read this before adding a third.
+//
+//   PRIMARY (#1093 mitigation). services/encore-s3-config.ts
+//   resolveEncoreS3Config resolves the credential the SPAWNED TRANSCODER is
+//   actually created with, independently of request.connections. When the
+//   direct read for the routed stack misses, it used to fall back silently to
+//   the FIRST provisioned stack's config — that is the production-reachable
+//   mis-route, and it is the one that ends as NoSuchKey. It now refuses with
+//   ObjectStoreStackMismatchError (below), keeping the fallback only for the
+//   documented single-provisioned-stack deployment whose key is the fixed
+//   DEPLOYMENT_CONTEXT rather than a stack name.
+//
+//   DEFENCE IN DEPTH. routes/assets.ts compares
+//   request.connections.s3Config.stackName against the routed stack via
+//   objectStoreStackMismatch below. Today those two are equal by construction
+//   at every producer in workspace-stack.ts (both are set from the same
+//   `stackName` local), so this check cannot fire on any path that exists now.
+//   It is kept because the credential is carried, cached, re-read from the
+//   resolver cache and handed to runner factories separately from the
+//   connections — a future path that rebuilds, copies or injects an s3Config
+//   can break that equality, and this is the cheap guard that catches it at the
+//   edge. Do NOT cite it as the #1093 mitigation.
+//
 // IDENTITY, NOT HOSTNAME. The comparison is always on the parameter-store stack
 // name. Endpoint HOSTNAMES legitimately differ for one and the same stack — the
 // transcoder reads over the in-cluster Service address while the API uses the
@@ -201,4 +224,37 @@ export function objectStoreStackMismatchMessage(
     'would fail as a missing-object error that names nothing. Retry naming one stack ' +
     'consistently via X-Stack-Name.'
   );
+}
+
+// Thrown when the object-store credential a transcode would actually be spawned
+// with belongs to a stack OTHER than the one the request routes to
+// (services/encore-s3-config.ts). A distinct type, not a bare Error, so the
+// submit path can answer the SAME `409 stack_routing_mismatch` the document
+// split (#1058) answers instead of a generic 502 — one error code for every
+// routing split, as documented on POST /assets/:id/transcode.
+//
+// Carries identity ONLY: two stack ids and an endpoint HOST. No credential
+// field exists on this class, so an error serialised into a log or a response
+// body cannot carry the secret.
+export class ObjectStoreStackMismatchError extends Error {
+  readonly expectedStack: string;
+  readonly actualStack: string;
+  readonly actualEndpointHost: string | undefined;
+
+  constructor(mismatch: ObjectStoreStackMismatch, messagePrefix?: string) {
+    super(
+      (messagePrefix ? `${messagePrefix}: ` : '') +
+        objectStoreStackMismatchMessage(mismatch)
+    );
+    this.name = 'ObjectStoreStackMismatchError';
+    this.expectedStack = mismatch.expectedStack;
+    this.actualStack = mismatch.actualStack;
+    this.actualEndpointHost = mismatch.actualEndpointHost;
+  }
+}
+
+export function isObjectStoreStackMismatchError(
+  err: unknown
+): err is ObjectStoreStackMismatchError {
+  return err instanceof ObjectStoreStackMismatchError;
 }

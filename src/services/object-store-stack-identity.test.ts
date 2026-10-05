@@ -26,6 +26,9 @@
 //   - resolveEncoreS3Config(deps, stackKey): Promise<EncoreS3Config | undefined>
 //     with deps { paramStore, secretAccessKey, staticFallbackConfigured, log,
 //     resolveEndpoint? } (src/services/encore-s3-config.ts).
+//   - ObjectStoreStackMismatchError { expectedStack, actualStack,
+//     actualEndpointHost } / isObjectStoreStackMismatchError
+//     (src/services/object-store-stack-identity.ts).
 //   - EncoreS3Config = { endpoint, accessKeyId, secretAccessKey, region? }
 //     (src/encore-scaler/types.ts).
 
@@ -37,6 +40,8 @@ import {
   objectStoreStackMismatch,
   objectStoreStackMismatchMessage,
   logObjectStoreClient,
+  isObjectStoreStackMismatchError,
+  ObjectStoreStackMismatchError,
   OBJECT_STORE_CLIENT_EVENT
 } from './object-store-stack-identity.js';
 import { WorkspaceStackResolver, STACK_CONFIG_NAMESPACE } from './workspace-stack.js';
@@ -332,13 +337,15 @@ describe("the transcoder's object-store config (issue #1093)", () => {
     expect(logger.lines()).not.toContain(SECRET);
   });
 
-  it('names BOTH stacks when the requested key fell back to the first provisioned stack', async () => {
+  it('names BOTH stacks when the deployment-context key fell back to the first provisioned stack', async () => {
     const logger = makeLogger();
-    // `default` is the fixed deployment context of a single-stack deployment —
-    // not a stack name — so the documented fallback applies. Pre-#1093 that was
-    // invisible; now the line says which stack the transcoder actually got.
+    // `default` is the fixed DEPLOYMENT_CONTEXT (auth/workspace.ts) — the key
+    // the submit path uses when NO stack identity was resolved, so it is not a
+    // stack name and there is no stack for it to disagree with. The documented
+    // fallback therefore still applies. Pre-#1093 that was invisible; now the
+    // line says which stack the transcoder actually got.
     const s3 = await resolveEncoreS3Config(
-      deps(makeParamStore(['primary', 'secondary']), logger.log),
+      deps(makeParamStore(['primary']), logger.log),
       'default'
     );
     expect(s3?.endpoint).toBe('https://primary-minio.example.test');
@@ -380,6 +387,148 @@ describe("the transcoder's object-store config (issue #1093)", () => {
       )!.obj as { stackName: string }).stackName
     ).toBe('primary');
     expect(logger.lines()).not.toContain(SECRET);
+  });
+
+  // THE REAL #1093 REFUSAL. Driven through the production path it occurs on —
+  // `loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey)` MISSING for the routed
+  // stack — not through a hand-built credential. This is the seam the spawned
+  // transcoder's object-store client is actually built from (the scaler's
+  // `resolveS3Config` callback, src/main.ts), so a substitution here is what
+  // ends as a NoSuchKey the operator cannot attribute.
+  describe('refuses to substitute another stack credential (issue #1093)', () => {
+    // A stack record that exists but whose config does NOT load under the
+    // constant namespace: the pre-#804 stale-namespace deployment, a renamed or
+    // deleted record, a parameter store restored from an older snapshot. The
+    // routed stack is real; its config is simply not where this read looks.
+    function storeMissing(routed: string, provisioned: string[]): ParamStore {
+      const store = makeParamStore(provisioned);
+      return {
+        ...store,
+        async loadStackConfig(ws, name) {
+          if (name === routed) return undefined;
+          return store.loadStackConfig(ws, name);
+        }
+      };
+    }
+
+    it('fails with a stack-mismatch error naming both ids, not with the other stack credential', async () => {
+      const logger = makeLogger();
+      // The routed stack is 'secondary'; 'primary' is merely first in the list.
+      const paramStore = storeMissing('secondary', ['primary', 'secondary']);
+
+      const err = await resolveEncoreS3Config(
+        deps(paramStore, logger.log),
+        'secondary'
+      ).then(
+        (ok) => ok,
+        (e: unknown) => e
+      );
+
+      expect(isObjectStoreStackMismatchError(err)).toBe(true);
+      const mismatch = err as ObjectStoreStackMismatchError;
+      expect(mismatch.expectedStack).toBe('secondary');
+      expect(mismatch.actualStack).toBe('primary');
+      expect(mismatch.actualEndpointHost).toBe('primary-minio.example.test');
+      // Both ids are in the message the caller surfaces.
+      expect(mismatch.message).toContain('belong to stack "primary"');
+      expect(mismatch.message).toContain('routes to stack "secondary"');
+      // Refused BEFORE any client was constructed: no construction log, and
+      // nothing a transcoder could have been spawned with.
+      expect(
+        logger.entries.filter(
+          (e) => (e.obj as { event?: string }).event === OBJECT_STORE_CLIENT_EVENT
+        )
+      ).toHaveLength(0);
+      // Identity and host only — never the credential — in the error or the log.
+      expect(mismatch.message).not.toContain(SECRET);
+      expect(logger.lines()).not.toContain(SECRET);
+      expect(logger.lines()).toContain('"actualStack":"primary"');
+    });
+
+    it('substitutes nothing when the ONE provisioned stack is the one that failed to load', async () => {
+      // The list says the stack exists, the config read says it does not. There
+      // is nothing else to fall back to, so this stays the pre-existing #804
+      // fail-loud rather than becoming a mismatch — the point is that no
+      // credential is invented either way.
+      const logger = makeLogger();
+      const paramStore = storeMissing('only', ['only']);
+      await expect(
+        resolveEncoreS3Config(deps(paramStore, logger.log), 'only')
+      ).rejects.toThrow(/no object-store endpoint resolvable/);
+      expect(logger.lines()).not.toContain(SECRET);
+    });
+
+    it('never probes the wrong instance: the in-cluster endpoint hook is not called', async () => {
+      // The #991 hook maps a PUBLIC endpoint to the in-cluster address and can
+      // probe it. On a mis-route that would be a probe against the wrong
+      // stack's object store, so the refusal happens first.
+      const logger = makeLogger();
+      let probed = 0;
+      await expect(
+        resolveEncoreS3Config(
+          {
+            ...deps(storeMissing('secondary', ['primary', 'secondary']), logger.log),
+            resolveEndpoint: async (endpoint) => {
+              probed += 1;
+              return endpoint;
+            }
+          },
+          'secondary'
+        )
+      ).rejects.toThrow(ObjectStoreStackMismatchError);
+      expect(probed).toBe(0);
+    });
+
+    it('defers to a complete static object-store configuration instead of failing it', async () => {
+      // ENCORE_S3_ENDPOINT + secret configured: one global object store, no
+      // per-stack routing to violate. Returning undefined hands the scaler its
+      // own static config (workspace-registry.ts getOrCreate), exactly as every
+      // other unresolvable branch of this resolver does.
+      const logger = makeLogger();
+      await expect(
+        resolveEncoreS3Config(
+          {
+            ...deps(storeMissing('secondary', ['primary', 'secondary']), logger.log),
+            staticFallbackConfigured: true
+          },
+          'secondary'
+        )
+      ).resolves.toBeUndefined();
+      // The miss is still on the record.
+      expect(logger.lines()).toContain('"expectedStack":"secondary"');
+      expect(logger.lines()).not.toContain(SECRET);
+    });
+
+    it('still falls back for the deployment-context key, which is not a stack identity', async () => {
+      // Deliberate limit of the refusal. `default` means "no stack identity was
+      // resolved" (routes/assets.ts transcodeStackIdentity), so there is
+      // nothing to contradict and the pre-#1093 behaviour is preserved —
+      // including on a deployment that has more than one stack but no resolver
+      // wired. The construction log still names the requested key and the stack
+      // actually used, so the choice is visible.
+      const logger = makeLogger();
+      const s3 = await resolveEncoreS3Config(
+        deps(storeMissing('secondary', ['primary', 'secondary']), logger.log),
+        'default'
+      );
+      expect(s3?.endpoint).toBe('https://primary-minio.example.test');
+      expect(logger.lines()).toContain('"requestedStackName":"default"');
+      expect(logger.lines()).not.toContain(SECRET);
+    });
+
+    it('leaves a correctly routed request untouched', async () => {
+      const logger = makeLogger();
+      const s3 = await resolveEncoreS3Config(
+        deps(makeParamStore(['primary', 'secondary']), logger.log),
+        'secondary'
+      );
+      expect(s3).toEqual({
+        endpoint: 'https://secondary-minio.example.test',
+        accessKeyId: 'admin',
+        secretAccessKey: SECRET
+      });
+      expect(logger.lines()).not.toContain(SECRET);
+    });
   });
 
   it('logs nothing on the failure paths that construct no client', async () => {
