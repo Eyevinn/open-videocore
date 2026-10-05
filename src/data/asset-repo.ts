@@ -339,6 +339,14 @@ export type TechnicalMetadata = {
   containerFormat: string;
   audioTracks: AudioTrack[];
   extractedAt: string; // ISO timestamp of when extraction completed
+  // Frames per second of the primary video stream (issue #1066), needed by
+  // frame-by-frame stepping. OPTIONAL: absent for a source with no video stream
+  // and for documents written before the probe reported it, so a legacy document
+  // still reads back.
+  frameRate?: number;
+  // The source's start timecode as reported by the probe, e.g. "01:00:00:00"
+  // (issue #1066). OPTIONAL: most sources carry none.
+  startTimecode?: string;
 };
 
 // One scene/shot boundary produced by the scene-detection pipeline (issue #115,

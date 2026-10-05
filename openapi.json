@@ -2199,6 +2199,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -2745,6 +2753,14 @@
                               },
                               "extractedAt": {
                                 "type": "string"
+                              },
+                              "frameRate": {
+                                "type": "number",
+                                "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                              },
+                              "startTimecode": {
+                                "type": "string",
+                                "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                               }
                             },
                             "required": [
@@ -3434,6 +3450,14 @@
                               },
                               "extractedAt": {
                                 "type": "string"
+                              },
+                              "frameRate": {
+                                "type": "number",
+                                "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                              },
+                              "startTimecode": {
+                                "type": "string",
+                                "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                               }
                             },
                             "required": [
@@ -3946,6 +3970,14 @@
                               },
                               "extractedAt": {
                                 "type": "string"
+                              },
+                              "frameRate": {
+                                "type": "number",
+                                "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                              },
+                              "startTimecode": {
+                                "type": "string",
+                                "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                               }
                             },
                             "required": [
@@ -4533,6 +4565,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -5096,6 +5136,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -5835,6 +5883,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -6415,6 +6471,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -7094,6 +7158,14 @@
                               },
                               "extractedAt": {
                                 "type": "string"
+                              },
+                              "frameRate": {
+                                "type": "number",
+                                "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                              },
+                              "startTimecode": {
+                                "type": "string",
+                                "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                               }
                             },
                             "required": [
@@ -9888,6 +9960,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -10520,6 +10600,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -11285,6 +11373,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -11543,6 +11639,40 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "videoTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "codec": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          },
+                          "frameRate": {
+                            "type": "number",
+                            "description": "Frames per second of this video track, as reported by the probe. Omitted when the asset was probed before the frame rate was extracted."
+                          },
+                          "startTimecode": {
+                            "type": "string",
+                            "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
+                          }
+                        },
+                        "required": [
+                          "codec",
+                          "width",
+                          "height"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
                     "audioTracks": {
                       "type": "array",
                       "items": {
@@ -11613,6 +11743,7 @@
                     }
                   },
                   "required": [
+                    "videoTracks",
                     "audioTracks",
                     "subtitleTracks"
                   ],
@@ -12315,6 +12446,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -12834,6 +12973,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -13445,6 +13592,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -13999,6 +14154,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -14507,6 +14670,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -15017,6 +15188,14 @@
                         },
                         "extractedAt": {
                           "type": "string"
+                        },
+                        "frameRate": {
+                          "type": "number",
+                          "description": "Frames per second of the primary video stream, as reported by the probe. Omitted when the source carries no video stream or was probed before the frame rate was extracted."
+                        },
+                        "startTimecode": {
+                          "type": "string",
+                          "description": "Start timecode of the source (e.g. \"01:00:00:00\"), when it carries one."
                         }
                       },
                       "required": [
@@ -20555,6 +20734,12 @@
                                 }
                               },
                               "extractedAt": {
+                                "type": "string"
+                              },
+                              "frameRate": {
+                                "type": "number"
+                              },
+                              "startTimecode": {
                                 "type": "string"
                               }
                             },
