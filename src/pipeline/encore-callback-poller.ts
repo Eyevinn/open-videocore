@@ -38,6 +38,7 @@ import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
 import { completeTranscode, type CallbackRendition } from './transcode.js';
+import type { PipelineLogSink } from '../services/pipeline-log.js';
 import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
@@ -161,6 +162,12 @@ type PollerDeps = {
   // disabled, in which case emission is a no-op exactly as before.
   // Fire-and-forget — a delivery failure never affects the completion flow.
   webhookDispatcher?: WebhookDispatcher;
+  // Best-effort operational log sink (issue #995). Handed to completeTranscode so
+  // the terminal transcode transition appends one record to the in-memory
+  // LogStore GET /api/v1/logs reads (src/main.ts, `logStore`; read path
+  // src/routes/logs.ts:94). Optional: absent => no log record, behaviour
+  // unchanged. Emission never throws (src/services/pipeline-log.ts).
+  pipelineLog?: PipelineLogSink;
   logger: Logger;
 };
 
@@ -630,7 +637,16 @@ async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
       error: success ? undefined : (job.message ?? `encore status: ${status}`),
       renditions: success ? normaliseRenditions(job.output) : []
     },
-    { jobs: deps.jobRepository, assets: deps.assetRepository }
+    {
+      jobs: deps.jobRepository,
+      assets: deps.assetRepository,
+      // Operational log for the `transcode` stage's terminal state (issue #995).
+      // This module is one of the three paths that can apply a transcode terminal
+      // state (enumerated in src/pipeline/transcode-completion-events.ts) and it
+      // is the OSC-native one a normal run settles through, so it must append too
+      // or the Logs tab shows a stage that started and never finished.
+      pipelineLog: deps.pipelineLog
+    }
   );
 
   // #829: notify webhook subscribers that this transcode reached a terminal

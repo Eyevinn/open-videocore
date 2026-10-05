@@ -28,6 +28,10 @@ function makeOscApi(overrides: Partial<PackagerOscApi> = {}): PackagerOscApi {
   return {
     getServiceAccessToken: vi.fn(async () => 'sat-token'),
     getInstance: vi.fn(async () => undefined),
+    // Teardown confirms an empty getInstance probe against the instance list
+    // before believing it (issue #1056). The ensure path under test here never
+    // calls it; it is present so the fake still satisfies PackagerOscApi.
+    listInstances: vi.fn(async () => []),
     createInstance: vi.fn(async () => ({ name: 'stack-1' })),
     waitForInstanceReady: vi.fn(async () => undefined),
     saveSecret: vi.fn(async () => undefined),
