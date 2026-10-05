@@ -30,6 +30,10 @@ vi.mock('@osaas/client-core', () => ({
     throw new Error('listSubscriptions must never be called for namespace resolution (#804)');
   }),
   waitForInstanceReady: vi.fn(),
+  // Readiness waits go through the bounded helper, which polls
+  // getInstanceHealth (src/services/instance-readiness.ts, issue #1038). The
+  // DELETE path under test never reaches it.
+  getInstanceHealth: vi.fn(async () => 'running'),
   saveSecret: vi.fn(),
   Context: class {}
 }));

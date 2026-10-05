@@ -8,9 +8,17 @@ import {
   createInstance,
   getInstance,
   getPortsForInstance,
-  saveSecret,
-  waitForInstanceReady
+  saveSecret
 } from '@osaas/client-core';
+// Readiness waits go through this bounded helper, NOT @osaas/client-core's
+// waitForInstanceReady (issue #1038). The SDK helper has no deadline and does
+// not wrap its getInstanceHealth call in a try (lib/core.js:343-353, v0.24.0),
+// so one transient `fetch failed` mid-wait aborted the entire stack provision.
+import {
+  DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS,
+  DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+  waitForInstanceReadyBounded
+} from '../services/instance-readiness.js';
 import { Client as MinioClient } from 'minio';
 import nano from 'nano';
 import {
@@ -286,6 +294,14 @@ type ProvisionRouterOptions = {
   // operator can retry via POST /api/v1/profiles/bootstrap. Optional: when
   // omitted (e.g. no profile repository wired) seeding is skipped.
   seedProfiles?: () => Promise<void>;
+  // Bound (ms) on how long each backing instance's readiness wait polls before
+  // the provision gives up and rolls back (issue #1038). Unset uses
+  // DEFAULT_INSTANCE_READY_TIMEOUT_MS (5 min). main.ts wires
+  // PROVISION_READY_TIMEOUT_MS; tests inject a few milliseconds.
+  readyTimeoutMs?: number;
+  // Cadence (ms) between health probes inside that wait. Unset uses
+  // DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
+  readyPollIntervalMs?: number;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -537,8 +553,33 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     getScalerRegistry,
     operationStore: ops,
     publicBaseUrl,
-    seedProfiles
+    seedProfiles,
+    readyTimeoutMs,
+    readyPollIntervalMs
   } = opts;
+
+  // Readiness-wait budget shared by every backing instance this route creates
+  // (issue #1038). Resolved once here so all five waits use one bound, and so
+  // tests can drive the deadline without touching the environment.
+  const readinessOptions = {
+    timeoutMs: readyTimeoutMs ?? DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+    pollIntervalMs: readyPollIntervalMs ?? DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS
+  } as const;
+
+  // Wait for one backing instance to report `running`, bounded. Every readiness
+  // wait in this route goes through here: @osaas/client-core's
+  // waitForInstanceReady polls getInstanceHealth in a `while (!instanceOk)` loop
+  // with no deadline AND no try (lib/core.js:343-353, v0.24.0), so a single
+  // dropped poll (`fetch failed`) rejected the wait and aborted the whole stack
+  // even when the instance came up moments later. The shared helper retries a
+  // failed probe until the deadline and, on timeout, throws an error naming the
+  // service plus the last probe error — which lands in the catch below and runs
+  // the existing rollback instead of surfacing a bare `fetch failed`.
+  const awaitReady = (serviceId: string, instanceName: string, label: string) =>
+    waitForInstanceReadyBounded(osc, serviceId, instanceName, {
+      ...readinessOptions,
+      label
+    });
 
   // The parameter-store namespace this route WRITES under (issue #804): the
   // deployment-wide CONSTANT, identical to the one the runtime resolver reads
@@ -873,11 +914,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           RootUser: 'admin',
           RootPassword: minioRootPasswordRef
         });
-        await waitForInstanceReady('minio-minio', name, osc);
+        await awaitReady('minio-minio', name, 'object storage');
         const minioEndpoint = instanceUrl(minio);
 
         // 1b. Create the source and packaged buckets on the live MinIO instance.
-        // waitForInstanceReady passes when the container health check is green,
+        // The readiness wait passes when the container health check is green,
         // but the MinIO S3 API may still be initialising. Retry with backoff
         // until S3 is actually accepting connections.
         const minioUrl = new URL(minioEndpoint);
@@ -1001,11 +1042,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         const couchdb = await provision('apache-couchdb', {
           AdminPassword: couchdbAdminPasswordRef
         });
-        await waitForInstanceReady('apache-couchdb', name, osc);
+        await awaitReady('apache-couchdb', name, 'document store');
         const couchdbUrl = instanceUrl(couchdb);
 
-        // 2b. Create the required CouchDB databases. waitForInstanceReady
-        // passes when the container is healthy but the HTTP API may still be
+        // 2b. Create the required CouchDB databases. The readiness wait passes
+        // when the container is healthy but the HTTP API may still be
         // starting up — retry with backoff the same way we do for MinIO.
         const couchAdminUrl = couchdbUrl
           .replace(/\/$/, '')
@@ -1037,7 +1078,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // 3. Valkey — queue / coordination backbone.
         currentService = 'valkey-io-valkey';
         await provision('valkey-io-valkey', {});
-        await waitForInstanceReady('valkey-io-valkey', name, osc);
+        await awaitReady('valkey-io-valkey', name, 'queue');
         const redisUrl = await redisUrlFrom(osc, 'valkey-io-valkey', name);
 
         // Encore and its paired callback listener are NOT provisioned here: the
@@ -1056,7 +1097,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // Each is created ONLY when the request opted in — opted-out means zero
         // cost (nothing is provisioned). Both flow through the same provision()
         // helper (so they land in provisioned[] and are covered by the
-        // partial-failure cleanup below) and waitForInstanceReady, and their
+        // partial-failure cleanup below) and the same bounded readiness wait as
+        // the core stack (awaitReady, #1038), and their
         // instance names are recorded into the StackConfig persisted below.
 
         // 5a. eyevinn-auto-subtitles ("Subtitle Generator") — Whisper transcription.
@@ -1084,7 +1126,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           await provision(AUTO_SUBTITLES_SERVICE_ID, {
             openaikey: openaiKeyRef
           });
-          await waitForInstanceReady(AUTO_SUBTITLES_SERVICE_ID, name, osc);
+          await awaitReady(
+            AUTO_SUBTITLES_SERVICE_ID,
+            name,
+            'subtitle generation'
+          );
           autoSubtitlesInstanceName = name;
         }
 
@@ -1094,7 +1140,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         if (wantSceneDetect) {
           currentService = SCENE_DETECT_SERVICE_ID;
           await provision(SCENE_DETECT_SERVICE_ID, {});
-          await waitForInstanceReady(SCENE_DETECT_SERVICE_ID, name, osc);
+          await awaitReady(SCENE_DETECT_SERVICE_ID, name, 'scene detection');
           sceneDetectInstanceName = name;
         }
 

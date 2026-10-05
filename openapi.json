@@ -20207,7 +20207,7 @@
         "tags": [
           "logs"
         ],
-        "description": "List operational log records as a cursor-paged, newest-first stream. Pass `cursor` (from a prior response `nextCursor`) to page forward; a null `nextCursor` marks the last page. Filter server-side with `from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-insensitive message substring). Set `order=asc` to reverse the default newest-first sort. This endpoint is cursor/sequence-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473).",
+        "description": "List operational log records as a cursor-paged, newest-first stream. Pass `cursor` (from a prior response `nextCursor`) to page forward; a null `nextCursor` marks the last page. Filter server-side with `from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-insensitive message substring). Set `order=asc` to reverse the default newest-first sort. This endpoint is cursor-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473). Response header `x-log-window-degraded: true` means the durable store could not scan its whole retained window for this read and the page covers the newest records only; the body and 200 status are unchanged by this header (#996).",
         "parameters": [
           {
             "schema": {

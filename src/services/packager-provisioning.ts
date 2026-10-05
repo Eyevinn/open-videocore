@@ -47,9 +47,17 @@ import {
   getInstance,
   listInstances,
   removeInstance,
-  saveSecret,
-  waitForInstanceReady
+  saveSecret
 } from '@osaas/client-core';
+// The readiness wait goes through this bounded helper, NOT @osaas/client-core's
+// waitForInstanceReady (issue #1055, follow-up to #1038). The SDK helper has no
+// deadline and does not wrap its getInstanceHealth probe in a try
+// (lib/core.js:343-353, v0.24.0), so ONE dropped poll failed a stack's first
+// packaging job even though the packager came up moments later.
+import {
+  waitForInstanceReadyBounded,
+  type InstanceReadinessOptions
+} from './instance-readiness.js';
 import { PACKAGER_SERVICE_ID, PACKAGER_TEARDOWN_ROLE } from './stack.js';
 import {
   confirmInstanceAbsentVia,
@@ -125,9 +133,10 @@ export type EnsurePackagerResult = {
 // OSC. Signatures mirror @osaas/client-core lib/core.d.ts (verified 2026-07-13):
 //   getInstance(ctx, serviceId, name, token)            -> Promise<any | undefined>
 //   createInstance(ctx, serviceId, token, body)         -> Promise<any>
-//   waitForInstanceReady(serviceId, name, ctx)          -> Promise<void>
 //   saveSecret(serviceId, name, value, ctx)             -> Promise<void>
 //   listInstances(ctx, serviceId, token)                -> Promise<any>
+// waitForInstanceReady below is NOT the SDK function of the same name: the
+// adapter below fulfils it with waitForInstanceReadyBounded (#1055).
 export interface PackagerOscApi {
   getServiceAccessToken(serviceId: string): Promise<string>;
   getInstance(
@@ -160,7 +169,14 @@ export interface PackagerOscApi {
 
 // Adapt an @osaas/client-core Context into the narrow PackagerOscApi. Keeps the
 // SDK's positional-arg calling convention isolated behind one place.
-export function packagerOscApiFromContext(osc: Context): PackagerOscApi {
+//
+// `readiness` bounds the readiness wait (issue #1055). Unset uses the shared
+// defaults in src/services/instance-readiness.ts — the same 5-minute deadline
+// and 1s cadence the provisioning route uses. Tests collapse the cadence.
+export function packagerOscApiFromContext(
+  osc: Context,
+  readiness: InstanceReadinessOptions = {}
+): PackagerOscApi {
   return {
     getServiceAccessToken: (serviceId) => osc.getServiceAccessToken(serviceId),
     getInstance: (serviceId, name, token) =>
@@ -168,8 +184,15 @@ export function packagerOscApiFromContext(osc: Context): PackagerOscApi {
     listInstances: (serviceId, token) => listInstances(osc, serviceId, token),
     createInstance: (serviceId, token, body) =>
       createInstance(osc, serviceId, token, body),
+    // Bounded (#1055): a transient probe failure is retried until the deadline,
+    // and a timeout throws an error naming the service plus the last probe
+    // error. ensurePackagerProvisioned logs and rethrows that, so the package
+    // step fails loudly instead of hanging.
     waitForInstanceReady: (serviceId, name) =>
-      waitForInstanceReady(serviceId, name, osc),
+      waitForInstanceReadyBounded(osc, serviceId, name, {
+        ...readiness,
+        label: 'packager'
+      }),
     saveSecret: (serviceId, name, value) =>
       saveSecret(serviceId, name, value, osc),
     removeInstance: (serviceId, name, token) =>
