@@ -472,10 +472,36 @@ export function renderCommentsBlock(read, opts) {
 // is user content, and this UI persists nothing to browser storage beyond the
 // stack/role selectors), and dropped the moment the comment is accepted.
 
+// The map is keyed by asset id and an operator can walk through many assets in
+// one session, so it is capped rather than left to grow for the lifetime of the
+// page. Insertion order is Map's own iteration order, and setDraft re-inserts
+// the key it writes, so the entry evicted when the cap is reached is the
+// least-recently-written draft — never the one being typed into right now.
+const DRAFTS_MAX = 20;
+
 const drafts = new Map();
 
 function draftRecord(assetKey) {
   return drafts.get(assetKey) || { text: '', selStart: null, selEnd: null, focused: false };
+}
+
+/** Write one draft record, keeping `drafts` bounded at DRAFTS_MAX entries. */
+function setDraft(assetKey, record) {
+  // An empty, unfocused draft is the same as no draft: drop it instead of
+  // holding a slot. An empty but FOCUSED field is still kept, because the
+  // record is also what restores focus across a poll-driven re-render.
+  if (!record.text && !record.focused) {
+    drafts.delete(assetKey);
+    return;
+  }
+  // Delete-then-set so this key moves to the end of the iteration order.
+  drafts.delete(assetKey);
+  drafts.set(assetKey, record);
+  while (drafts.size > DRAFTS_MAX) {
+    const oldest = drafts.keys().next();
+    if (oldest.done) break;
+    drafts.delete(oldest.value);
+  }
 }
 
 /** The pending draft text for an asset, or '' when there is none. */
@@ -551,7 +577,7 @@ export async function mountAssetComments(opts) {
   function saveDraft() {
     if (!rendered || !rendered.textarea) return;
     const ta = rendered.textarea;
-    drafts.set(assetKey, {
+    setDraft(assetKey, {
       text: ta.value,
       selStart: typeof ta.selectionStart === 'number' ? ta.selectionStart : null,
       selEnd: typeof ta.selectionEnd === 'number' ? ta.selectionEnd : null,
@@ -566,7 +592,7 @@ export async function mountAssetComments(opts) {
     saveDraft();
     if (rendered.counter) {
       rendered.counter.textContent = state.tooLong
-        ? COMMENTS_COPY.overLimit + -state.remaining + COMMENTS_COPY.overLimitSuffix
+        ? COMMENTS_COPY.overLimit + Math.abs(state.remaining) + COMMENTS_COPY.overLimitSuffix
         : state.remaining + COMMENTS_COPY.counterSuffix;
       rendered.counter.className = state.tooLong
         ? 'comments-counter comments-counter--over'
