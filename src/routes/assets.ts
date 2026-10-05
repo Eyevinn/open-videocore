@@ -178,6 +178,12 @@ import {
   type DeliveryObjectClient
 } from '../pipeline/asset-delivery.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
+// Pre-dispatch verification that the transcode source object is actually present
+// and readable in the bucket the transcoder will read (issue #1059).
+import {
+  checkTranscodeSourceReadable,
+  type SourceStatReader
+} from '../pipeline/source-readiness.js';
 import {
   backendOutputDestination,
   DEFAULT_BACKEND_ID
@@ -2682,6 +2688,163 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     }
 
+    // #1059: the resolver above proves the asset RECORDS a source key. It does
+    // NOT prove the BYTES are still in the bucket the transcoder reads — and for
+    // large sources they sometimes are not (#1057 / #1058). Without this check
+    // the execution is accepted, the scaler spawns a transcoder, and the run
+    // fails ~2 minutes later with an opaque probe 404 that names nothing. So HEAD
+    // (stat) the EXACT bucket + key the transcode step is about to put in the
+    // job's `s3://<bucket>/<key>` input (transcode.ts:120) and fail here, before
+    // any execution record exists, with an error naming bucket, key and endpoint.
+    //
+    // Gated on the pipeline CONTAINING a transcode step (`transcode`, `abr-vod`,
+    // `full`), the same condition the profile pre-flights below use — a transcode
+    // reads this object store location whether it is the first step or runs after
+    // the fire-and-forget ones. Pipelines with no transcode step are untouched:
+    // `package` reads the transcoder's OUTPUT, not the source (see above), and the
+    // fire-and-forget steps record their own per-step outcome on the asset.
+    //
+    // The stat goes through the per-request StorageFactory, which is bound to the
+    // SAME per-stack `config.sourceBucket` (workspace-stack.ts:213-214) that the
+    // input URI's bucket is taken from (:248, carried as
+    // WorkspaceConnections.sourceBucket) — so it addresses exactly the object the
+    // transcoder will read. OPT-IN, fail-open: a deployment with no object store
+    // wired cannot verify presence, and must keep submitting exactly as before,
+    // so the guard is skipped with a warning rather than blocking the pipeline.
+    if (steps.includes('transcode')) {
+      const preflightSource = tryResolveSourceObject(asset);
+      const transcodeSourceBucket =
+        request.connections?.sourceBucket ?? opts.sourceBucket;
+      // Same per-stack endpoint the spawned transcoder is configured with
+      // (StackConfig.minioEndpoint -> EncoreS3Config.endpoint, see
+      // services/encore-s3-config.ts); undefined on the env-override path.
+      const transcodeSourceEndpoint = stackResolvedMinioEndpoint(request.connections);
+      let sourceStatReader: SourceStatReader | undefined;
+      try {
+        // Take the stat reader from the SAME resolution the bucket and the
+        // endpoint above come from: this request's already-resolved connections
+        // (`WorkspaceConnections.storageFor`, services/workspace-stack.ts:147,
+        // bound to that stack's `config.sourceBucket` at :274, the same field
+        // the input URI's bucket is read from at :248). The router-level factory
+        // reaches the same stack by a different route — the ambient request stack
+        // name plus a CACHED read (`makeRequestScopedStorageFactory`,
+        // services/request-stack-context.ts:78-92) — which yields nothing and
+        // THROWS once that cache entry goes cold, degrading the check to
+        // "submitting unverified" on a stack whose connections this request
+        // already holds. Resolving the probe, the bucket and the reported
+        // endpoint from one object removes that second resolution entirely, so
+        // the diagnostic can never name an endpoint the probe did not address.
+        // Fall back to the router-level factory only where `connections` carries
+        // no storage (env-override path). The invariant is "same resolved
+        // stack", not "same URL" — the spawned transcoder is legitimately handed
+        // an in-cluster alias of that same object store
+        // (services/internal-minio-endpoint.ts).
+        const connectionsStorageFor = request.connections?.storageFor;
+        sourceStatReader = connectionsStorageFor
+          ? connectionsStorageFor()
+          : storageFor
+            ? storageFor()
+            : undefined;
+      } catch (err) {
+        // storageFor() throws when the resolved stack has no object storage
+        // (main.ts:658-664). Treated as "cannot verify", not as a failure.
+        request.log.warn(
+          { err, bucket: transcodeSourceBucket },
+          'could not open object storage to verify the transcode source object (issue #1059) — submitting unverified'
+        );
+        sourceStatReader = undefined;
+      }
+      // An `s3://<bucket>/<key>` objectKey is an EXTERNAL-bucket registration
+      // (assets.ts:3166/3182 store the full locator, not a workspace-local key),
+      // which lives outside the stack source bucket this stat addresses. Stat'ing
+      // the locator as a local key would 409 against the wrong bucket with a
+      // message that misdescribes the cause, so leave those sources to the
+      // transcode step (pipeline/transcode.ts composes its own URI for them).
+      const externalSourceLocator = preflightSource?.objectKey.startsWith('s3://') ?? false;
+      if (externalSourceLocator) {
+        request.log.info(
+          { assetId: asset.id, objectKey: preflightSource?.objectKey },
+          'source is an external-bucket locator — starting the transcode pipeline WITHOUT verifying the source object (issue #1059)'
+        );
+      }
+      // No bucket resolved at all (no stack connections AND no configured source
+      // bucket): there is nothing to name in a diagnostic and nothing to stat
+      // against, so this is the same "cannot verify" case as having no object
+      // store wired. The 501 guard above only covers `firstStep === 'transcode'`,
+      // so a `full` pipeline can reach here with neither bucket source set.
+      if (preflightSource && sourceStatReader && transcodeSourceBucket && !externalSourceLocator) {
+        const readiness = await checkTranscodeSourceReadable(
+          {
+            bucket: transcodeSourceBucket,
+            objectKey: preflightSource.objectKey,
+            ...(transcodeSourceEndpoint ? { endpoint: transcodeSourceEndpoint } : {}),
+            // The stack identity #1058's gate just RESOLVED for this request,
+            // not the deployment-wide default: the gate above has already proved
+            // the data plane and the control plane agree, so `controlPlane`
+            // names the one stack this submission concerns. Falling back to
+            // DEPLOYMENT_CONTEXT only where #1058 also does — no resolver wired
+            // or no provisioned stack (transcodeStackIdentity, assets.ts) —
+            // keeps single-stack and env-override deployments byte-identical.
+            stackName: controlPlane.resolved ?? request.connections?.stackName ?? DEPLOYMENT_CONTEXT,
+            // The size recorded when ingest completed (issue #1059): the URL
+            // pull worker's `bytesTransferred` (pipeline/url-pull-worker.ts) or
+            // the upload route's (routes/asset-upload.ts), persisted on the
+            // asset as `Asset.sourceSizeBytes` (data/asset-repo.ts) via the
+            // document's `administrative.storage.sizeBytes`
+            // (data/asset-document.ts). Undefined for assets ingested before
+            // #1059, and for paths that never learn the length (external-bucket
+            // registration) — the size comparison is then skipped and presence
+            // alone is enforced. The length always describes
+            // `preflightSource.objectKey`: the repositories clear it when
+            // `objectKey` is patched to a DIFFERENT key with no new size, and
+            // every ingest-completion path that can replace the object under the
+            // same deterministic key writes the object's true length in the same
+            // patch (routes/asset-upload.ts `finalizedSourceSizeBytes`, used by
+            // the presigned single-part and multipart finalizes, plus the
+            // streamed PUT and the URL-pull worker's `bytesTransferred`).
+            ...(asset.sourceSizeBytes !== undefined
+              ? { expectedSizeBytes: asset.sourceSizeBytes }
+              : {})
+          },
+          sourceStatReader
+        );
+        if (!readiness.readable) {
+          request.log.warn(
+            {
+              assetId: asset.id,
+              bucket: transcodeSourceBucket,
+              objectKey: preflightSource.objectKey,
+              endpoint: transcodeSourceEndpoint,
+              stack: controlPlane.resolved ?? request.connections?.stackName,
+              reason: readiness.reason,
+              expectedSizeBytes: asset.sourceSizeBytes,
+              observedSizeBytes: readiness.sizeBytes
+            },
+            'refusing to start a transcode pipeline: the source object is not readable (issue #1059)'
+          );
+          // `probe-failed` means the object store could not be asked at all —
+          // a dependency failure (502), not a conflict with the asset's state.
+          // Everything else is a definite answer ABOUT the asset's source, so it
+          // takes the same 409 shape as the other source-related refusals above.
+          if (readiness.reason === 'probe-failed') {
+            reply
+              .code(502)
+              .send({ error: 'source_verification_failed', message: readiness.message });
+          } else {
+            reply.code(409).send({ error: 'source_unreadable', message: readiness.message });
+          }
+          return undefined;
+        }
+      } else if (!sourceStatReader || !transcodeSourceBucket) {
+        request.log.warn(
+          { assetId: asset.id, bucket: transcodeSourceBucket },
+          !transcodeSourceBucket
+            ? 'no source bucket resolved for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+            : 'no object storage wired for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+        );
+      }
+    }
+
     void firstStep; // pre-flight above used firstStep; execution drives the loop
 
     // Reject a named GPU-only (NVENC/CUDA) profile the platform cannot execute
@@ -5121,9 +5284,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //   409 — pipeline already running / job not found / instance unavailable /
   //         `stack_routing_mismatch` (issue #1058, pipeline mode only — it shares
   //         `startPipelineExecution` with POST /:id/execute, whose abr-vod
-  //         pipeline contains a transcode step)
+  //         pipeline contains a transcode step),
+  //         (pipeline mode, issue #1059) `source_unreadable` — the source object
+  //         is missing from the bucket the transcode step would read. The #1058
+  //         stack-routing gate runs FIRST (is this the right stack at all?), then
+  //         the #1059 readiness gate (are the bytes actually there?).
   //   501 — required service not configured on this deployment
-  //   502 — Encore submission failed
+  //   502 — Encore submission failed, or (pipeline mode, issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
   app.post(
     '/:id/package',
     {
@@ -5239,9 +5407,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         pooled, so the job URL the packager needs cannot be resolved /
   //         `stack_routing_mismatch` (issue #1058) — for any pipeline CONTAINING
   //         a transcode step, the source bytes and the transcoder would resolve
-  //         different stacks; refused before the execution record is created
+  //         different stacks; refused before the execution record is created /
+  //         `source_unreadable` (issue #1059) — the asset records a source key but
+  //         the object is missing / empty / the wrong size in the bucket the
+  //         transcode step would read. The two gates run in that order: #1058
+  //         settles WHICH stack, then #1059 checks the bytes are there on it
   //   501 — pipeline execution or the required OSC service is not configured
-  //   502 — the first step's submission failed
+  //   502 — the first step's submission failed, or (issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
+  //         whether the transcode source exists
   app.post(
     '/:id/execute',
     {

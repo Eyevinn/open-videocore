@@ -538,8 +538,27 @@ export type Asset = {
   //     documents without them remain valid (backward compatible).
   versionOfAssetId?: string;
   versionGroupId?: string;
-  // MinIO object key (workspace-local) for the asset payload, if any.
+  // Object key (workspace-local) for the asset payload, if any.
   objectKey?: string;
+  // Byte length of the object at `objectKey` AS RECORDED WHEN INGEST COMPLETED
+  // (issue #1059) — the pull worker's `bytesTransferred` on a URL pull, the
+  // upload route's `bytesTransferred` on a direct upload. Persisted in the
+  // document's existing `administrative.storage.sizeBytes` slot
+  // (asset-document.ts), which until now was always written as 0 and never read
+  // back.
+  //
+  // It exists so the pre-dispatch source readiness check can compare the size
+  // the object store reports NOW against the size we know we stored, and refuse
+  // a transcode whose source has been truncated or replaced — not just one whose
+  // source is missing (checkTranscodeSourceReadable, pipeline/source-readiness.ts).
+  //
+  // INVARIANT: the recorded size belongs to the recorded key. Any patch that
+  // changes `objectKey` without supplying a new size CLEARS this field (see
+  // update()/applyPatch()), so a relocated or replaced object can never be
+  // compared against a stale length. Optional: absent on assets ingested before
+  // #1059 and on paths that do not learn the size (e.g. a presigned-PUT
+  // completion), where the size comparison is simply skipped.
+  sourceSizeBytes?: number;
   // Append-only audit trail of every status change (issue #3 deliverable 5).
   statusHistory: StatusTransition[];
   // Technical metadata from the ffprobe extraction pipeline (issue #6).
@@ -665,6 +684,12 @@ export type UpdateAssetInput = {
   name?: string;
   description?: string;
   objectKey?: string;
+  // Byte length recorded at ingest completion (issue #1059). Written by the
+  // ingest paths that actually know the transferred length — the URL-pull worker
+  // and the streaming upload route — normally in the SAME patch that sets
+  // `objectKey`. Patching `objectKey` without it clears any previously recorded
+  // size, so the stored length always describes the stored key.
+  sourceSizeBytes?: number;
   status?: AssetStatus;
   // Version-chain linkage backfill (issue #118). Set only when a clip/export/
   // rewrap run with `asVersion` seeds a lineage on a source asset that had no
@@ -1655,6 +1680,21 @@ export class InMemoryAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    // Recorded ingest size (issue #1059). A new object key with no accompanying
+    // size invalidates whatever length we had recorded for the OLD key, so clear
+    // it rather than let the readiness check compare a fresh object against a
+    // stale length and refuse a perfectly good transcode.
+    if (patch.sourceSizeBytes !== undefined) {
+      // A non-positive size is the "nothing recorded" sentinel, not a real
+      // zero-length source — the same meaning the persisted document gives a
+      // stored `0` (fromAssetDocument, data/asset-document.ts). An ingest
+      // finalize that could not learn the length writes it to CLEAR whatever was
+      // recorded for the previous object under this (deterministic) key, so the
+      // readiness check falls back to presence only.
+      next.sourceSizeBytes = patch.sourceSizeBytes > 0 ? patch.sourceSizeBytes : undefined;
+    } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
+      next.sourceSizeBytes = undefined;
+    }
     if (patch.technicalMetadata !== undefined) {
       next.technicalMetadata = patch.technicalMetadata;
       // A successful extraction clears any stale error.
