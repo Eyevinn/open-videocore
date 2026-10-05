@@ -340,8 +340,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;workspaces&quot;: [
     {
       &quot;workspaceId&quot;: &quot;string&quot;,
-      &quot;queueDepth&quot;: 0,
-      &quot;inflightDepth&quot;: 0,
+      &quot;observed&quot;: true,
       &quot;instances&quot;: [
         {
           &quot;instanceId&quot;: null,
@@ -352,12 +351,26 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
           &quot;draining&quot;: null
         }
       ],
+      &quot;connectionId&quot;: &quot;string&quot;,
+      &quot;unobservedReason&quot;: &quot;string&quot;,
+      &quot;queueDepth&quot;: 0,
+      &quot;inflightDepth&quot;: 0,
       &quot;spawnFailure&quot;: {
         &quot;at&quot;: 0,
         &quot;attempts&quot;: 0,
         &quot;consecutiveFailures&quot;: 0,
         &quot;message&quot;: &quot;string&quot;
       }
+    }
+  ],
+  &quot;connections&quot;: [
+    {
+      &quot;stacks&quot;: [
+        &quot;string&quot;
+      ],
+      &quot;observed&quot;: true,
+      &quot;connectionId&quot;: &quot;string&quot;,
+      &quot;unobservedReason&quot;: &quot;string&quot;
     }
   ],
   &quot;maxInstances&quot;: 0,

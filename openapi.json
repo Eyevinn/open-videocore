@@ -19850,6 +19850,16 @@
                           "workspaceId": {
                             "type": "string"
                           },
+                          "connectionId": {
+                            "type": "string"
+                          },
+                          "observed": {
+                            "type": "boolean"
+                          },
+                          "unobservedReason": {
+                            "type": "string",
+                            "description": "Why this workspace could not be queried. Carries the shape of the fault only \u2014 connection strings and error text stay in the server log, since this endpoint is unauthenticated."
+                          },
                           "queueDepth": {
                             "type": "number"
                           },
@@ -19920,9 +19930,38 @@
                         },
                         "required": [
                           "workspaceId",
-                          "queueDepth",
-                          "inflightDepth",
+                          "observed",
                           "instances"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "connections": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "connectionId": {
+                            "type": "string",
+                            "description": "Stable non-secret identifier for a physical Valkey. Equal for every stack sharing a store, different for different stores. Absent when the connection could not be resolved at all."
+                          },
+                          "stacks": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "Provisioned stacks whose scaler loop uses this connection. Empty for the process-global connection when no stack resolved to it."
+                          },
+                          "observed": {
+                            "type": "boolean"
+                          },
+                          "unobservedReason": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "stacks",
+                          "observed"
                         ],
                         "additionalProperties": false
                       }
@@ -19942,6 +19981,7 @@
                   },
                   "required": [
                     "workspaces",
+                    "connections",
                     "maxInstances",
                     "jobsPerInstance",
                     "idleTimeoutMs",

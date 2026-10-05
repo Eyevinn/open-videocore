@@ -2544,8 +2544,7 @@ Response 200 (application/json)
   "workspaces": [
     {
       "workspaceId": "string",
-      "queueDepth": 0,
-      "inflightDepth": 0,
+      "observed": true,
       "instances": [
         {
           "instanceId": null,
@@ -2556,12 +2555,26 @@ Response 200 (application/json)
           "draining": null
         }
       ],
+      "connectionId": "string",
+      "unobservedReason": "string",
+      "queueDepth": 0,
+      "inflightDepth": 0,
       "spawnFailure": {
         "at": 0,
         "attempts": 0,
         "consecutiveFailures": 0,
         "message": "string"
       }
+    }
+  ],
+  "connections": [
+    {
+      "stacks": [
+        "string"
+      ],
+      "observed": true,
+      "connectionId": "string",
+      "unobservedReason": "string"
     }
   ],
   "maxInstances": 0,
