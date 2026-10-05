@@ -781,6 +781,78 @@ tr.row-locked td:first-child {
   margin: 1px 2px;
 }
 
+/* ── Editorial tags: add / remove (issue #899) ──────────────────────────────
+   The `.tag` pill above is shared with the assets and search tables and is left
+   untouched; an editable pill only gains a remove affordance inside it. The
+   remove button is a real <button> with an aria-label naming the tag (an "×"
+   alone announces as "times"), and it keeps the pill's own colour so the pill
+   still reads as one object. A tag the remove URL cannot carry (a `/`, `?`, `#`
+   or `%` in the value) is still shown, with its button disabled. */
+.tag-editable {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tag-list {
+  line-height: 1.9;
+}
+
+button.tag-remove {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+
+button.tag-remove:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+button.tag-remove:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+button.tag-remove:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.tag-overflow-toggle {
+  margin-top: 6px;
+}
+
+.tag-input-row {
+  flex-wrap: wrap;
+}
+
+.tag-input-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.tag-add-input {
+  min-width: 180px;
+  flex: 1 1 180px;
+}
+
+.tag-help,
+.tag-note,
+.tag-role-note {
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.tag-note-line {
+  color: var(--warning, #fbbf24);
+}
+
 /* Forms */
 .form-row {
   display: flex;
