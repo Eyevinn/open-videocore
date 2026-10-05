@@ -529,6 +529,45 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* Editorial-audio add/remove controls in the tracks panel (issue #939). Reuses
+   the house form furniture (.form-row, .form-field, .checkbox-label, .msg) —
+   only the disclosure spacing, the per-row action cell and the collapsed form
+   need rules of their own. */
+.tracks-audio-add {
+  margin-top: 10px;
+}
+
+.tracks-audio-add-form {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-top: 8px;
+}
+
+.tracks-audio-add-form .tracks-field-help {
+  font-size: 11px;
+}
+
+.tracks-audio-add-form .modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* The action cell must not stretch with the data columns, and its control must
+   not inherit the table cell's text wrapping. */
+td.cell-actions {
+  white-space: nowrap;
+  width: 1%;
+}
+
+/* Outcome lines sit with the list they describe, not in the pane-level strip. */
+.tracks-audio-error,
+.tracks-audio-notice {
+  margin-top: 8px;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
@@ -580,6 +619,7 @@ tr.row-locked td:first-child {
 input[type="text"],
 input[type="url"],
 input[type="password"],
+input[type="number"],
 select,
 textarea {
   background: var(--bg);
@@ -596,6 +636,7 @@ textarea {
 input[type="text"]:focus,
 input[type="url"]:focus,
 input[type="password"]:focus,
+input[type="number"]:focus,
 select:focus,
 textarea:focus {
   border-color: var(--accent);

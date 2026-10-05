@@ -180,6 +180,22 @@ function canRenameAsset() {
   return r === 'editor' || r === 'admin';
 }
 
+// Whether the current client role may add or remove an asset's editorial audio
+// tracks (issue #939). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` and
+// `delete` to the same two, and neither to `viewer`; `methodToAction` (:79-93)
+// maps POST -> write and DELETE -> delete, so both
+// POST /assets/{id}/audio-tracks and DELETE /assets/{id}/audio-tracks/{trackId}
+// are refused to a `viewer` with 403 by `resourceAuthorizationPreHandler('asset')`
+// (:126, registered src/routes/assets.ts:1773). A viewer still SEES the tracks —
+// GET is `read`, which a viewer holds — so the panel stays fully readable and
+// only loses its controls. Client-side mirror only: the 403 is still handled if
+// it arrives.
+function canEditAudioTracks() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
 // Window-scoped stack override for detached windows (e.g. detail.html). Unlike
 // setActiveStack, this does NOT touch the shared localStorage key, so popping
 // out a detail for a different stack cannot switch the opener window's active
@@ -2764,13 +2780,50 @@ async function renderAssetDetailBody(id, bodyEl) {
     // document (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would
     // cost a round-trip for bytes this renderer is holding.
     //
-    // Mounted here, with the other read-only information blocks (status history,
-    // metadata, scenes) and ABOVE the action controls, because it is reporting
-    // only: #902 is explicitly read-only, so the panel creates no add/remove
-    // affordance for the POST/DELETE track routes that do exist.
+    // Mounted here, with the other information blocks (status history,
+    // metadata, scenes) and ABOVE the action controls, because it is mostly
+    // reporting. The one exception is the editorial AUDIO list (issue #939),
+    // whose add/remove controls live inside the audio section itself rather
+    // than in the pane's action row: they act on one row of one sub-list, not
+    // on the asset, so putting them next to the Lock/Rename buttons would
+    // misstate their scope.
+    //
+    // Contract for those two writes, fetched before they were wired (CLAUDE.md
+    // rule 7), cited in full in public/tracks-panel.js and additionally
+    // exercised against the live in-process router:
+    //   POST /api/v1/assets/{id}/audio-tracks — body
+    //        `{ language (required, 1..64), codec?, channels? (int 1..64),
+    //          label?, default? }` (`addAudioTrackSchema`,
+    //        src/routes/assets.ts:826-832); 201 returns
+    //        `{ audioTracks: [...] }`, the WHOLE updated list (:5436, :5454),
+    //        404 `{ error: 'not_found' }`. The id is server-minted
+    //        (randomUUID, :5447) and is NOT accepted from the client.
+    //   DELETE /api/v1/assets/{id}/audio-tracks/{trackId} — no body; 204 empty
+    //        (:5469) or 404 `{ error, message: 'audio track not found' }`
+    //        (:5480). Metadata only: the handler's sole effect is
+    //        `repo.update(asset.id, { audioTracks })` (:5482) and an editorial
+    //        audio track carries no objectKey (:804-811), so no stored object
+    //        is touched.
+    // Neither write is followed by a re-read: the POST's 201 is the new list,
+    // and the DELETE's effect is the handler's own filter (:5478).
+    //
+    // `confirmModal` is handed in rather than imported so the destructive
+    // remove goes through the ONE house confirmation dialog — no native
+    // confirm(), and no second primitive.
     mountAssetTracks({
       asset: asset,
       host: body,
+      canEditAudio: canEditAudioTracks(),
+      apiFetch: apiFetch,
+      confirmModal: confirmModal,
+      onAudioTracksChanged: function (audioTracks, message, kind) {
+        // The panel has already re-rendered itself from the authoritative list,
+        // so this only mirrors the outcome into the pane's shared message strip
+        // — the place an operator looks for "did my action work" everywhere
+        // else in this view.
+        const host = bodyEl.querySelector('#action-msg');
+        if (host && message) showMsg(host, message, kind || 'success');
+      },
     });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
@@ -7641,6 +7694,11 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirror of the ADR-018 write/delete gate for
+  // POST|DELETE /assets/{id}/audio-tracks (issue #939). Exported so a DOM/unit
+  // test can assert the add/remove controls are offered to exactly the roles
+  // that hold those actions, and to no one else.
+  canEditAudioTracks,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
