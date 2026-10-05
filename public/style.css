@@ -2156,6 +2156,18 @@ body.detail-standalone .assets-side {
   display: none;
 }
 
+/* Secondary line under an empty-state headline (issue #997), for a table whose
+ * empty row has to explain WHY it is empty. Mirrors `.empty .tracks-note`: the
+ * headline stays the primary line and this reads as its body text. */
+.ops-table-empty-detail {
+  max-width: 56ch;
+  margin: 6px auto 0;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
+  color: var(--text-muted);
+}
+
 .ops-table-filters {
   display: flex;
   flex-wrap: wrap;
@@ -2603,6 +2615,23 @@ body.detail-standalone .assets-side {
 .log-message {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* The two Logs empty states (issue #997) must not look alike. The ordinary
+   filtered-to-nothing row keeps the plain muted `.empty` look; the
+   never-been-written-to row is boxed and left-ruled so it reads as an
+   explanation of the store's state rather than as a filter result. Colour is not
+   the only cue — the headline wording and the detail line differ too. */
+td[data-empty='logs-never-written'] {
+  padding: 24px 16px;
+  border-left: 3px solid var(--accent, #6366f1);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+}
+
+td[data-empty='logs-never-written'] .ops-table-empty-detail {
+  margin-left: 0;
 }
 
 /* ─── Audit table (issue #987) ──────────────────────────────────────────────
