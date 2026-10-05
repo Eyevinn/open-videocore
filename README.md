@@ -460,9 +460,29 @@ reclaim. Give each deployment its own workspace identity.
 | `POST` | `/api/v1/collections` | Create a collection |
 | `GET` | `/api/v1/collections` | List collections |
 | `GET` | `/api/v1/collections/:id` | Get a collection |
-| `DELETE` | `/api/v1/collections/:id` | Delete a collection |
+| `DELETE` | `/api/v1/collections/:id` | Delete a collection (confirm the member count to delete a non-empty one) |
 | `PUT` | `/api/v1/collections/:id/assets/:assetId` | Add an asset to a collection |
 | `DELETE` | `/api/v1/collections/:id/assets/:assetId` | Remove an asset from a collection |
+
+Deleting a collection never deletes its member assets — it only unlinks them.
+An empty collection deletes outright. A non-empty one is refused with `409`,
+`error: "delete_blocked"`, `reason: "member_of_collection"`, and a `memberCount`
+telling you how many assets are in it. Echo that number back to confirm:
+
+```
+DELETE /api/v1/collections/:id?confirmMemberCount=7   ->  204
+```
+
+The count must match the collection's *current* membership. If it changed in
+between, you get the same `409 member_of_collection` carrying the new
+authoritative `memberCount` rather than a silent delete — re-confirm with that
+value and retry. `?force=true` is the blind alternative that skips the check.
+
+A `409` with `reason: "delete_protected"` is a different condition: the
+collection carries an explicit delete lock, it has no `memberCount`, and neither
+`?confirmMemberCount=` nor `?force=true` gets past it. Clear the lock with
+`DELETE /api/v1/collections/:id/lock` first. Branch on `reason`, not on the
+status code.
 
 **Webhooks**
 
