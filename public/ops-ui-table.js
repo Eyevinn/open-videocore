@@ -31,6 +31,13 @@
  * that build cell HTML strings (the existing app.js style) stay consistent.
  */
 
+// Optional column-visibility support (issue #959). The model, the per-operator
+// persistence and the chooser control all live in public/table-columns.js; this
+// primitive only mounts the control and paints the set it is given. Visibility is
+// VIEW state and is deliberately NOT part of the interaction store above: hiding
+// a column must not reset paging, change the sort, or trigger a refetch.
+import { createColumnChooser, normalizeVisibleColumns } from './table-columns.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 // Mirrors escHtml() in app.js so the two modules encode identically. Kept local
 // (not imported) so this primitive has zero coupling to app.js and can be unit
@@ -289,11 +296,29 @@ export function createOpsTableState(config) {
 // createOpsTable(config) -> { el, state, render, setStatus, setRows, destroy }
 //
 // config:
-//   columns:    [{ key, label, sortable?, sortKey?, align?, width?, render? }]
+//   columns:    [{ key, label, sortable?, sortKey?, align?, width?, render?,
+//                  hideable?, chooserLabel? }]
 //               `sortable` enables the tri-state header button; `sortKey` (falls
 //               back to `key`) is what toggleSort() tracks. `render(row)` returns
 //               an escaped HTML string for the cell (matches app.js style); when
-//               omitted the cell shows escaped row[key].
+//               omitted the cell shows escaped row[key]. `hideable: false` pins a
+//               column against the chooser; `chooserLabel` names a column whose
+//               header caption is empty (e.g. a thumbnail column) in that list.
+//   columnChooser: optional (issue #959) — { visible?, requireAtLeastOne?, label?,
+//               onChange?, onReset?, isCustomized? }. `visible` is the initial
+//               visible key set (null/absent = every declared column);
+//               `requireAtLeastOne` is a list of groups that must each keep one
+//               visible member; `onChange(keys)` fires after an operator toggle so
+//               the consumer can persist it. `onReset(keys)` fires when the
+//               operator resets (issue #962) and receives the DECLARED default
+//               set — the consumer's job there is to CLEAR whatever it persisted
+//               in onChange, not to persist again; it falls back to `onChange`
+//               when absent. `isCustomized()` reports whether there is anything
+//               left to reset, which greys the action out when there is not.
+//               Present = a "Columns" control is mounted in the filter bar.
+//               Toggling NEVER touches the interaction store, so paging/sort/
+//               filters and the in-flight request are all unaffected — and
+//               neither does a reset: it is the same repaint-only path.
 //   filters:    [{ name, control(state, onChange) -> HTMLElement }] — slot-based.
 //               Each table populates its own column-appropriate controls (status
 //               select, date-range, free-text). The primitive owns no filter
@@ -302,6 +327,15 @@ export function createOpsTableState(config) {
 //   pageSize:   bounded, visible page size (default DEFAULT_PAGE_SIZE)
 //   rowKey:     (row) => string   — stable key for a row (defaults to row.id)
 //   emptyText:  shown when a successful load returns zero rows
+//   emptyState: optional (issue #997) — () => ({ text?, detail?, kind? }), resolved
+//               on EVERY paint of the empty row. For a table whose empty row has
+//               more than one meaning (e.g. "the store has never been written to"
+//               vs "the current filters match nothing"): `text` replaces
+//               emptyText, `detail` is rendered as a secondary line under it, and
+//               `kind` is written to the cell's `data-empty` attribute so CSS and
+//               tests can tell the two states apart. Mirrors the headline+detail
+//               +data-empty empty state in public/tracks-panel.js:344-351. Absent
+//               (or a resolver returning nothing) keeps the plain emptyText row.
 //   caption:    optional table title text rendered above the filter bar
 //
 // The component does NOT fetch. The consumer subscribes to `state` (or passes
@@ -309,10 +343,16 @@ export function createOpsTableState(config) {
 // state.setPageInfo(). This keeps ALL table-specific logic out of the primitive.
 export function createOpsTable(config) {
   const cfg = config || {};
+  // Every column the table DECLARES. What it PAINTS is visibleColumns() below —
+  // the two are the same until a column chooser narrows the set (issue #959).
   const columns = Array.isArray(cfg.columns) ? cfg.columns : [];
   const filters = Array.isArray(cfg.filters) ? cfg.filters : [];
   const rowKey = typeof cfg.rowKey === 'function' ? cfg.rowKey : function(r) { return r && r.id; };
   const emptyText = cfg.emptyText || 'No results.';
+  // Optional per-paint resolver for the empty row (issue #997). Kept out of the
+  // interaction store: it is view state the consumer derives from the last
+  // response, so resolving it at paint time needs no emit and no refetch.
+  const emptyStateFor = typeof cfg.emptyState === 'function' ? cfg.emptyState : null;
 
   const state = createOpsTableState({
     pagingMode: cfg.pagingMode,
@@ -325,6 +365,34 @@ export function createOpsTable(config) {
   let status = 'idle';
   let rows = [];
   let errorMessage = '';
+
+  // ── Column visibility (issue #959) ──
+  // Held outside the interaction store on purpose: it is view state. A change
+  // repaints the header and body and nothing else — no emit, so no paging reset
+  // and no consumer refetch.
+  const chooserCfg = cfg.columnChooser && typeof cfg.columnChooser === 'object'
+    ? cfg.columnChooser
+    : null;
+  const columnGroups = chooserCfg && Array.isArray(chooserCfg.requireAtLeastOne)
+    ? chooserCfg.requireAtLeastOne
+    : [];
+  // With no chooser configured, `null` normalizes to "every declared column", so
+  // a table that never opts in behaves exactly as it did before.
+  let visibleKeys = normalizeVisibleColumns(
+    chooserCfg ? chooserCfg.visible : null,
+    columns,
+    { requireAtLeastOne: columnGroups }
+  );
+
+  // The columns actually painted, in DECLARED order. Visibility is keyed, so a
+  // column set that declares no keys at all falls back to painting everything
+  // rather than to painting nothing — this primitive predates `key` being
+  // load-bearing and must not start silently blanking such a table.
+  function visibleColumns() {
+    if (!visibleKeys.length) return columns.slice();
+    const set = new Set(visibleKeys);
+    return columns.filter(function (c) { return c && set.has(c.key); });
+  }
 
   // ── DOM scaffold (mirrors the assets/jobs tab structure) ──
   const el = document.createElement('div');
@@ -379,7 +447,7 @@ export function createOpsTable(config) {
   function renderHeader() {
     headerRow.innerHTML = '';
     const snap = state.getState();
-    columns.forEach(function(col) {
+    visibleColumns().forEach(function(col) {
       const th = document.createElement('th');
       if (col.align) th.style.textAlign = col.align;
       if (col.width) th.style.width = col.width;
@@ -416,7 +484,7 @@ export function createOpsTable(config) {
   // own event handling and simply call the provided onChange.
   function renderFilters() {
     filterBar.innerHTML = '';
-    if (!filters.length) { filterBar.style.display = 'none'; return; }
+    if (!filters.length && !chooserCfg) { filterBar.style.display = 'none'; return; }
     filterBar.style.display = '';
     filters.forEach(function(f) {
       if (typeof f.control !== 'function') return;
@@ -430,12 +498,73 @@ export function createOpsTable(config) {
         filterBar.appendChild(slot);
       }
     });
+    if (columnChooser) {
+      // Last in the bar, and marked as a view control rather than a filter: it
+      // changes what you SEE, not what the table asks the backend for. Keeping it
+      // out of the `filters` array is what keeps it out of state.setFilter() —
+      // and therefore out of the paging reset that every real filter triggers.
+      const slot = document.createElement('div');
+      slot.className = 'ops-filter-slot ops-columns-slot';
+      slot.dataset.control = 'columns';
+      slot.appendChild(columnChooser.el);
+      filterBar.appendChild(slot);
+    }
   }
+
+  // ── Column chooser (issue #959) ──
+  // Built before renderFilters() runs so the bar can mount it. `setVisibleColumns`
+  // is the single place visibility changes, whether the change came from the
+  // chooser or from a consumer restoring a persisted set.
+  function setVisibleColumns(keys) {
+    visibleKeys = normalizeVisibleColumns(keys, columns, {
+      requireAtLeastOne: columnGroups,
+    });
+    renderHeader();
+    renderBody();
+    if (columnChooser) columnChooser.refresh();
+    return visibleKeys.slice();
+  }
+
+  const columnChooser = chooserCfg
+    ? createColumnChooser({
+        columns,
+        requireAtLeastOne: columnGroups,
+        label: chooserCfg.label,
+        getVisible: function () { return visibleKeys.slice(); },
+        // A hidden column can still be the active sort column — visibility and
+        // sort are intentionally uncoupled — so the chooser can flag it.
+        getActiveSortKey: function () { return state.getState().sort.columnKey; },
+        onChange: function (keys) {
+          const applied = setVisibleColumns(keys);
+          if (typeof chooserCfg.onChange === 'function') chooserCfg.onChange(applied);
+        },
+        // Reset (issue #962) takes the SAME repaint path as a toggle — `null`
+        // normalizes to the declared default set, so "default" is derived here
+        // exactly as it is on a first load with no stored/URL choice. Only the
+        // callback differs: the consumer clears its persistence instead of
+        // writing to it. Falling back to onChange keeps the action live for a
+        // consumer that has not wired onReset, at the cost of re-persisting the
+        // default set rather than forgetting the choice.
+        onReset: function () {
+          const applied = setVisibleColumns(null);
+          const cb =
+            typeof chooserCfg.onReset === 'function'
+              ? chooserCfg.onReset
+              : chooserCfg.onChange;
+          if (typeof cb === 'function') cb(applied);
+        },
+        getIsCustomized:
+          typeof chooserCfg.isCustomized === 'function' ? chooserCfg.isCustomized : undefined,
+      })
+    : null;
 
   // ── Body (shared loading / empty / error states) ──
   function renderBody() {
     tbody.innerHTML = '';
-    const colspan = columns.length || 1;
+    // Span the columns actually on screen, so the loading/empty/error row still
+    // spans the full table width after the chooser narrows the set.
+    const cols = visibleColumns();
+    const colspan = cols.length || 1;
 
     if (status === 'loading') {
       tbody.appendChild(fullWidthRow(colspan, 'ops-table-loading',
@@ -456,10 +585,23 @@ export function createOpsTable(config) {
       return;
     }
     if (status === 'empty' || (status === 'ready' && rows.length === 0)) {
+      // A consumer-supplied resolver can name WHICH empty state this is; with no
+      // resolver (every table before #997) this is the plain emptyText row.
+      const resolved = (emptyStateFor ? emptyStateFor() : null) || {};
+      const text = typeof resolved.text === 'string' && resolved.text !== '' ? resolved.text : emptyText;
+      const detail = typeof resolved.detail === 'string' ? resolved.detail : '';
+      const kind = typeof resolved.kind === 'string' ? resolved.kind : '';
       tbody.appendChild(fullWidthRow(colspan, 'ops-table-empty',
         function(td) {
           td.classList.add('empty');
-          td.textContent = emptyText;
+          if (kind) td.setAttribute('data-empty', kind);
+          td.textContent = text;
+          if (detail) {
+            const d = document.createElement('div');
+            d.className = 'ops-table-empty-detail';
+            d.textContent = detail;
+            td.appendChild(d);
+          }
         }));
       return;
     }
@@ -472,7 +614,7 @@ export function createOpsTable(config) {
       const tr = document.createElement('tr');
       const key = rowKey(row);
       if (key != null) tr.dataset.rowKey = String(key);
-      columns.forEach(function(col) {
+      cols.forEach(function(col) {
         const td = document.createElement('td');
         if (col.align) td.style.textAlign = col.align;
         if (typeof col.render === 'function') {
@@ -536,6 +678,9 @@ export function createOpsTable(config) {
   state.subscribe(function() {
     renderHeader();
     renderPagination();
+    // Keeps the chooser's "sorted" flag on a hidden column honest when the sort
+    // changes while the panel is open.
+    if (columnChooser) columnChooser.refresh();
   });
 
   // ── Public setters the consumer drives after a fetch ──
@@ -554,6 +699,9 @@ export function createOpsTable(config) {
   }
 
   function destroy() {
+    // The chooser owns a document-level click listener (to close on an outside
+    // click), so it has to be told to let go or it outlives the table.
+    if (columnChooser) columnChooser.destroy();
     if (el.parentNode) el.parentNode.removeChild(el);
   }
 
@@ -570,5 +718,18 @@ export function createOpsTable(config) {
     destroy,
     // Exposed for consumers/tests that want to read current view status.
     getStatus: function() { return status; },
+    // Column visibility (issue #959). `setVisibleColumns` repaints only — it never
+    // emits, so a consumer can restore a persisted set without provoking a fetch.
+    getVisibleColumns: function() { return visibleKeys.slice(); },
+    setVisibleColumns,
+    // Reset to the declared default set (issue #962) — the same action the
+    // chooser's own button runs, including the consumer's clear-what-you-stored
+    // callback, so a caller never has to re-implement half of it. No-op without a
+    // chooser configured, where there is no customization to undo.
+    resetVisibleColumns: function() {
+      return columnChooser ? columnChooser.reset() : visibleKeys.slice();
+    },
+    // Exposed so a consumer/test can drive the chooser panel directly.
+    columnChooser,
   };
 }

@@ -326,6 +326,22 @@ export type AudioTrack = {
   sampleRateHz: number;
 };
 
+// One video track within a container, as reported by ffprobe. The flat mirror
+// of the persisted `technical.video[]` entries (VideoTrackSchema,
+// asset-document.ts) — field names and optionality match that schema exactly:
+// `index`, `bitrateBps` and `frameRate` are optional because a probe may not
+// report them. Distinct from `TechnicalMetadata` below, which flattens only the
+// FIRST video track's four always-probed attributes alongside container-level
+// data; this array is the per-track view (issue #978).
+export type VideoTrack = {
+  index?: number;
+  codec: string;
+  width: number;
+  height: number;
+  bitrateBps?: number;
+  frameRate?: number;
+};
+
 // Technical metadata extracted from the stored object by an ephemeral ffprobe
 // job (issue #6). Populated asynchronously after ingest; null until the first
 // successful extraction (or after a failed extraction — see
@@ -532,6 +548,14 @@ export type Asset = {
   // Extraction never blocks the asset record, so both fields are optional.
   technicalMetadata?: TechnicalMetadata | null;
   technicalMetadataError?: string;
+  // Per-track video streams as probed, mirroring the persisted
+  // `technical.video[]` array (issue #978). Where `technicalMetadata` flattens
+  // the FIRST video track's four always-probed attributes, this carries every
+  // track with the optional `index` / `frameRate` the stored schema allows.
+  // Undefined until the first successful extraction; populated on read from the
+  // document (asset-document.ts `fromAssetDocument`), so it is a projection of
+  // persisted state rather than an independently writable field.
+  videoTracks?: VideoTrack[];
   // Streaming manifest URLs from the packaging pipeline (issue #9). Undefined
   // until packaging completes successfully; `packagingError` is set instead
   // when the last packaging attempt failed. Packaging never changes the

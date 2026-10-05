@@ -1,11 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock the OSC client-core surface used by the deprovision service.
+//
+// CONTRACT (node_modules/@osaas/client-core/lib/core.js, SDK 0.24.0):
+//   getInstance(context, serviceId, name, token)  (core.js:127)  — resolves the
+//     instance, or `undefined` for a 404 AND for every other non-401 error.
+//   listInstances(context, serviceId, token)      (core.js:160)  — resolves the
+//     raw JSON array of instances (elements carry `name`); REJECTS on any error.
+//   removeInstance(context, serviceId, name, token) (core.js:106) — resolves void.
+// Because getInstance cannot tell absence from a fault, teardown confirms an
+// empty probe against listInstances (issue #1039); the default below is an
+// empty list, i.e. "confirmed absent".
 const getInstance = vi.fn();
+const listInstances = vi.fn();
 const removeInstance = vi.fn();
 
 vi.mock('@osaas/client-core', () => ({
   getInstance: (...args: unknown[]) => getInstance(...args),
+  listInstances: (...args: unknown[]) => listInstances(...args),
   removeInstance: (...args: unknown[]) => removeInstance(...args)
 }));
 
@@ -21,7 +33,11 @@ const NAME = 'mystack';
 
 beforeEach(() => {
   getInstance.mockReset();
+  listInstances.mockReset();
   removeInstance.mockReset();
+  // Default: the confirming read succeeds and shows no instance, so an empty
+  // probe means "really gone".
+  listInstances.mockResolvedValue([]);
 });
 
 describe('deprovisionStack', () => {
@@ -98,6 +114,35 @@ describe('deprovisionStack', () => {
     expect(
       result.services.filter((s) => s.status === 'removed').length
     ).toBe(TEARDOWN_ORDER.length - 1);
+  });
+
+  // Issue #1039: an empty probe is only believed when a second read confirms it.
+  it('an unconfirmable probe reports failed and never skips the removal silently', async () => {
+    // getInstance resolves undefined because the request errored (the SDK
+    // swallows everything but a 401), and the confirming read errors too.
+    getInstance.mockResolvedValue(undefined);
+    listInstances.mockRejectedValue(new Error('fetch failed'));
+
+    const result = await deprovisionStack(osc, NAME);
+
+    expect(result.status).toBe('failed');
+    expect(result.services.every((s) => s.status === 'failed')).toBe(true);
+    expect(result.services[0]?.error).toContain('fetch failed');
+    // Nothing was deleted on the strength of an unverified probe...
+    expect(removeInstance).not.toHaveBeenCalled();
+    // ...and nothing was written off as already gone.
+    expect(result.services.some((s) => s.status === 'not_found')).toBe(false);
+  });
+
+  it('removes an instance the confirming read still lists despite an empty probe', async () => {
+    getInstance.mockResolvedValue(undefined);
+    listInstances.mockResolvedValue([{ name: NAME, url: 'https://live' }]);
+    removeInstance.mockResolvedValue(undefined);
+
+    const result = await deprovisionStack(osc, NAME);
+
+    expect(result.status).toBe('removed');
+    expect(removeInstance).toHaveBeenCalledTimes(TEARDOWN_ORDER.length);
   });
 
   it('is idempotent: a second run after success reports not_found', async () => {
