@@ -4024,6 +4024,53 @@ function openCollectionFromSearch(id) {
   switchTab('collections');
 }
 
+// Selector for every interactive control that may live INSIDE a collection row.
+// A click or key press that lands on one of these is that control's own
+// activation, never a row activation (issue #917) — so View/Delete can never
+// double-trigger the detail panel.
+const COLLECTION_ROW_CONTROL_SELECTOR = 'button, a, input, select, textarea, label, [role="button"]';
+
+// Row activation for the collections list (issue #917). The whole row opens the
+// detail panel, by pointer OR by keyboard, with the View button kept as a
+// redundant explicit control.
+//
+// Accessibility notes:
+//   - `tabindex="0"` on the `<tr>` puts the row in the tab order. We deliberately
+//     do NOT put `role="button"` on the row: that would replace the row/cell
+//     semantics a screen reader needs to read a 5-column table, and the cells
+//     carry the only description of WHICH collection this is. The row keeps
+//     `role="row"` and gains an action; the View button inside it remains the
+//     named, unambiguous affordance for assistive tech.
+//   - Enter and Space both activate, matching the platform convention for an
+//     activatable widget. Space is `preventDefault`ed so activating a row does
+//     not also scroll the page.
+//   - Keydowns are only honoured when the row ITSELF has focus (`e.target === tr`).
+//     Without that check, pressing Enter on the focused View button would bubble
+//     a keydown to the row and open the detail panel twice.
+function wireCollectionRowActivation(root, onOpen) {
+  root.querySelectorAll('tr.coll-row').forEach(function(tr) {
+    const id = tr.dataset.id;
+    function activate() {
+      root.querySelectorAll('tr.coll-row').forEach((r) => r.classList.remove('row-selected'));
+      tr.classList.add('row-selected');
+      onOpen(id);
+    }
+    tr.addEventListener('click', function(e) {
+      if (e.target.closest(COLLECTION_ROW_CONTROL_SELECTOR)) return;
+      activate();
+    });
+    tr.addEventListener('keydown', function(e) {
+      if (e.target !== tr) return;
+      if (e.key === 'Enter') {
+        activate();
+      } else if (e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        activate();
+      }
+    });
+  });
+}
+
 async function renderCollectionsTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
@@ -4106,7 +4153,9 @@ async function renderCollectionsTab(container) {
       // :90) and is
       // returned by GET /collections (:315-324), so the list already knows.
       const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
-      return '<tr data-id="' + escHtml(c.id) + '">' +
+      // `coll-row` + `tabindex="0"`: the whole row activates the detail panel by
+      // pointer or keyboard (issue #917). See wireCollectionRowActivation().
+      return '<tr class="coll-row" data-id="' + escHtml(c.id) + '" tabindex="0">' +
         '<td class="cell-id">' + escHtml(c.id) + '</td>' +
         '<td>' + escHtml(c.name || '—') + '</td>' +
         '<td>' + escHtml(String(assetCount)) + '</td>' +
@@ -4125,6 +4174,13 @@ async function renderCollectionsTab(container) {
       '<tbody>' + rows + '</tbody>' +
       '</table>';
     wrap.appendChild(tableWrap);
+
+    // Whole-row activation (issue #917). Bound alongside the View button, which
+    // stays as a redundant explicit control; the row handler ignores events that
+    // originate on any inner control, so the two cannot double-trigger.
+    wireCollectionRowActivation(tableWrap, function(id) {
+      showCollectionDetail(id, detailPanel, loadCollections);
+    });
 
     tableWrap.querySelectorAll('.coll-view-btn').forEach(function(btn) {
       btn.addEventListener('click', function() { showCollectionDetail(btn.dataset.id, detailPanel, loadCollections); });
@@ -7893,6 +7949,13 @@ export {
   assetPickerTotal,
   assetPickerResultNote,
   ASSET_PICKER_PAGE_SIZE,
+  // Whole-row activation on the collections list (issue #917). Exported so a
+  // DOM test can assert a click anywhere on the row opens the detail, that the
+  // View/Delete buttons do not double-trigger it, and that the row is reachable
+  // and activatable by keyboard.
+  wireCollectionRowActivation,
+  COLLECTION_ROW_CONTROL_SELECTOR,
+  renderCollectionsTab,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
