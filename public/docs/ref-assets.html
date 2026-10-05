@@ -814,24 +814,11 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;pipeline&quot;: &quot;transcode&quot;,
   &quot;profile&quot;: &quot;string&quot;,
-  &quot;customProfile&quot;: {
-    &quot;name&quot;: &quot;string&quot;,
-    &quot;outputs&quot;: [
-      {
-        &quot;label&quot;: &quot;string&quot;,
-        &quot;width&quot;: 0,
-        &quot;height&quot;: 0,
-        &quot;videoBitrateBps&quot;: 0,
-        &quot;audioBitrateBps&quot;: 0,
-        &quot;format&quot;: &quot;string&quot;
-      }
-    ]
-  },
   &quot;profileParams&quot;: {},
   &quot;destinationBucket&quot;: &quot;string&quot;,
   &quot;destination&quot;: &quot;string&quot;,
   &quot;externalBackend&quot;: &quot;string&quot;
-}</code></pre></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>customProfile</code> — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline `outputs` array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.</li></ul></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
   &quot;id&quot;: &quot;string&quot;,
   &quot;assetId&quot;: &quot;string&quot;,
@@ -1650,25 +1637,12 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;profile&quot;: &quot;string&quot;,
-  &quot;customProfile&quot;: {
-    &quot;name&quot;: &quot;string&quot;,
-    &quot;outputs&quot;: [
-      {
-        &quot;label&quot;: &quot;string&quot;,
-        &quot;width&quot;: 0,
-        &quot;height&quot;: 0,
-        &quot;videoBitrateBps&quot;: 0,
-        &quot;audioBitrateBps&quot;: 0,
-        &quot;format&quot;: &quot;string&quot;
-      }
-    ]
-  },
   &quot;profileParams&quot;: {},
   &quot;burnIn&quot;: {
     &quot;source&quot;: null,
     &quot;forceStyle&quot;: &quot;string&quot;
   }
-}</code></pre></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>profile</code> — Name of a profile registered on this deployment (list them with GET /api/v1/profiles). The encoding ladder lives in the profile; the transcoding service resolves this name against the profile index it loads. A name this deployment does not hold is rejected with a 400 `unknown_profile` at submit time rather than failing later as a dropped job (issue #1022). Omitted: the deployment default profile is used, and the job record reports whichever profile was actually submitted.</li><li><code>customProfile</code> — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline `outputs` array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.</li></ul></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
   &quot;jobId&quot;: &quot;string&quot;,
   &quot;encoreJobId&quot;: &quot;string&quot;,
@@ -1680,7 +1654,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
       &quot;string&quot;
     ]
   }
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>warning</code> — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (a custom profile not in the store, or the profile store was unreachable). The request was still accepted and the keys were forwarded to Encore unchecked.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>warning</code> — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (the profile store was unreachable, or no profile was named and the default profile is not in the store). A caller-named profile that a reachable store does not hold is rejected with a 400 instead. The request was still accepted and the keys were forwarded to Encore unchecked.</li></ul></div>
 </article>
 
 <article class="endpoint" id="put-api-v1-assets-id-upload">

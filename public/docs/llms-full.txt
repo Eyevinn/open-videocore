@@ -1100,24 +1100,12 @@ Request body (application/json)
 {
   "pipeline": "transcode",
   "profile": "string",
-  "customProfile": {
-    "name": "string",
-    "outputs": [
-      {
-        "label": "string",
-        "width": 0,
-        "height": 0,
-        "videoBitrateBps": 0,
-        "audioBitrateBps": 0,
-        "format": "string"
-      }
-    ]
-  },
   "profileParams": {},
   "destinationBucket": "string",
   "destination": "string",
   "externalBackend": "string"
 }
+Field notes- customProfile — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline `outputs` array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.
 
   Response
 Response 202 (application/json)
@@ -2117,25 +2105,14 @@ idpathstringrequired
 Request body (application/json)
 {
   "profile": "string",
-  "customProfile": {
-    "name": "string",
-    "outputs": [
-      {
-        "label": "string",
-        "width": 0,
-        "height": 0,
-        "videoBitrateBps": 0,
-        "audioBitrateBps": 0,
-        "format": "string"
-      }
-    ]
-  },
   "profileParams": {},
   "burnIn": {
     "source": null,
     "forceStyle": "string"
   }
 }
+Field notes- profile — Name of a profile registered on this deployment (list them with GET /api/v1/profiles). The encoding ladder lives in the profile; the transcoding service resolves this name against the profile index it loads. A name this deployment does not hold is rejected with a 400 `unknown_profile` at submit time rather than failing later as a dropped job (issue #1022). Omitted: the deployment default profile is used, and the job record reports whichever profile was actually submitted.
+- customProfile — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline `outputs` array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.
 
   Response
 Response 202 (application/json)
@@ -2151,7 +2128,7 @@ Response 202 (application/json)
     ]
   }
 }
-Field notes- warning — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (a custom profile not in the store, or the profile store was unreachable). The request was still accepted and the keys were forwarded to Encore unchecked.
+Field notes- warning — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (the profile store was unreachable, or no profile was named and the default profile is not in the store). A caller-named profile that a reachable store does not hold is rejected with a 400 instead. The request was still accepted and the keys were forwarded to Encore unchecked.
 
   PUT /api/v1/assets/{id}/upload
 

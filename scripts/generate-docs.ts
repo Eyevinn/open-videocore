@@ -280,6 +280,15 @@ for (const eps of groups.values()) {
   });
 }
 
+// True when a JSON Schema accepts no value at all (`{ "not": {} }` — what a
+// never/undefined-typed field compiles to). Such a field exists in the contract
+// only to be REJECTED, so it must not appear in a request example.
+function rejectsEveryValue(schema: JsonSchema | undefined): boolean {
+  if (!schema || typeof schema !== 'object') return false;
+  const not = (schema as JsonSchema)['not'];
+  return typeof not === 'object' && not !== null && Object.keys(not).length === 0;
+}
+
 function exampleForSchema(schema: JsonSchema | undefined, depth = 0): any {
   if (depth > 4 || !schema || typeof schema !== 'object') return null;
   if ('example' in schema) return schema.example;
@@ -291,6 +300,13 @@ function exampleForSchema(schema: JsonSchema | undefined, depth = 0): any {
     const keys = [...Object.keys(props).filter((k) => required.has(k)), ...Object.keys(props).filter((k) => !required.has(k))];
     const out: Record<string, any> = {};
     for (const k of keys.slice(0, 12)) {
+      // A property whose schema is `{ "not": {} }` accepts NO value — it is a
+      // field the API rejects (e.g. a removed field kept in the contract so
+      // supplying it is an error rather than silently ignored, issue #1022).
+      // Showing it in a request example would invite callers to send something
+      // that is guaranteed to 400, so it is omitted from the example; its
+      // `description` still appears in the field notes below the example.
+      if (rejectsEveryValue(props[k])) continue;
       out[k] = exampleForSchema(props[k], depth + 1);
     }
     return out;
