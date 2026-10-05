@@ -529,6 +529,162 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* ── Version chain on asset detail (issue #907) ────────────────────────────
+   The chain is a TREE: `versionOfAssetId` names each member's immediate source
+   and two versions can be cut from one master, so depth is drawn with an indent
+   plus a connector rule. The indent is decorative only — the same relationship
+   is stated in a visually-hidden "Source version: …" line on every indented
+   row, so the structure survives without the layout (WCAG 1.3.1). */
+.version-chain-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.version-group-id {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.version-group-key {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.version-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+
+/* "No version is ready yet" — advisory, not an error: the API still names a
+   head of the lineage. Amber matches the house "needs attention" signal, and
+   the sentence says it in words so colour is never the only carrier. */
+.version-note--attention {
+  color: var(--warning);
+}
+
+.version-truncated {
+  font-size: 12px;
+  color: var(--warning);
+  border-left: 3px solid var(--warning);
+  padding-left: 10px;
+  margin: 8px 0;
+}
+
+/* Rows are not clickable as a whole — the version NAME is the link — so the
+   shared `tbody tr:hover { cursor: pointer }` would promise a target the row
+   does not have. */
+.version-chain-table tbody tr:hover {
+  cursor: default;
+}
+
+.version-name-cell {
+  white-space: nowrap;
+}
+
+.version-indent {
+  display: inline-block;
+}
+
+.version-connector {
+  color: var(--text-muted);
+  font-family: 'Courier New', monospace;
+  margin-right: 4px;
+}
+
+.version-link,
+.version-name {
+  font-weight: 500;
+}
+
+.version-link {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.version-link:hover,
+.version-link:focus {
+  color: var(--text);
+}
+
+/* Archived members stay in the list and stay navigable — this is lineage
+   history, not a live listing — but sit at reduced emphasis. Never below the
+   AA contrast floor: --text-muted on --surface is the same pairing used for
+   every secondary line in the panel. */
+.version-row--archived .version-link,
+.version-row--archived .version-name,
+.version-row--archived .version-created {
+  color: var(--text-muted);
+}
+
+/* The Current badge. A deliberate-state variant in the .badge family, like
+   .badge-locked — NOT a status colour, because Current is orthogonal to
+   `status` and both badges share a row. Cyan keeps it distinct from the ready /
+   pending / failed palette above and from the lock's indigo. The badge carries
+   the word "Current" plus a visually-hidden consequence clause, so the state is
+   never carried by colour alone (WCAG 1.4.1). */
+.badge-current {
+  background: rgba(34, 211, 238, 0.18);
+  color: #67e8f9;
+  border: 1px solid rgba(34, 211, 238, 0.5);
+  margin-left: 8px;
+}
+
+/* "You are here" is a DIFFERENT fact from Current and frequently lands on a
+   different row, so it is a different shape as well as a different word: plain
+   bracketed text, not a pill. The two must be able to coexist on one row. */
+.version-here {
+  margin-left: 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border-bottom: 1px dotted var(--text-muted);
+}
+
+.version-orphans {
+  margin-top: 12px;
+}
+
+.version-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 12px 0 6px;
+}
+
+/* Previous / Next step through the server's array order (oldest -> newest). */
+.version-steps {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.version-step-position {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.version-step[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.empty .version-note {
+  margin-top: 4px;
+  margin-bottom: 0;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
