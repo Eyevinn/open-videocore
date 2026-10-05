@@ -2546,8 +2546,23 @@ Response 200 (application/json)
 {
   "maxInstances": 0,
   "minInstances": 0,
-  "idleTimeoutMs": 0
+  "idleTimeoutMs": 0,
+  "sources": {
+    "maxInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "minInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "idleTimeoutMs": {
+      "source": "env",
+      "updatedAt": "string"
+    }
+  }
 }
+Field notes- sources — Where each config value in this response came from (#1079).
 
   PATCH /api/v1/scaler/config
 
@@ -2566,8 +2581,23 @@ Response 200 (application/json)
 {
   "maxInstances": 0,
   "minInstances": 0,
-  "idleTimeoutMs": 0
+  "idleTimeoutMs": 0,
+  "sources": {
+    "maxInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "minInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "idleTimeoutMs": {
+      "source": "env",
+      "updatedAt": "string"
+    }
+  }
 }
+Field notes- sources — Where each config value in this response came from (#1079).
 
   GET /api/v1/scaler/status
 
@@ -2602,8 +2632,19 @@ Response 200 (application/json)
   "maxInstances": 0,
   "jobsPerInstance": 0,
   "idleTimeoutMs": 0,
-  "scalerActive": true
+  "scalerActive": true,
+  "sources": {
+    "maxInstances": {
+      "source": "env",
+      "updatedAt": "string"
+    },
+    "idleTimeoutMs": {
+      "source": "env",
+      "updatedAt": "string"
+    }
+  }
 }
+Field notes- sources — Where the config values in this response came from (#1079). Covers the values this endpoint reports that an operator can change; see GET /config for the full set, including minInstances.
 
 ---
 
