@@ -111,6 +111,11 @@ import {
   STACK_CONFIG_NAMESPACE,
   stackResolvedMinioEndpoint
 } from '../services/workspace-stack.js';
+import {
+  objectStoreStackMismatch,
+  objectStoreStackMismatchMessage,
+  isObjectStoreStackMismatchError
+} from '../services/object-store-stack-identity.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import {
   logPipelineEvent,
@@ -1880,6 +1885,83 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return { dataPlaneStack, controlPlaneStack };
   }
 
+  // The single submit-time routing assertion for any path that dispatches a
+  // transcode (issues #1058 and #1093). Returns the refusal to send, or
+  // undefined when the request is correctly routed — which is every
+  // single-stack, env-override and no-resolver deployment, whose behaviour is
+  // therefore unchanged.
+  //
+  // TWO independent splits, both of which end as the same indistinguishable
+  // missing-object error from the transcoder (every stack's source bucket
+  // carries the identical literal name, routes/provision.ts), and both answered
+  // with the same 409 `stack_routing_mismatch` so the client contract is one
+  // error code:
+  //
+  //   1. DOCUMENTS vs control plane (issue #1058): the stack the asset/job
+  //      documents were resolved from (WorkspaceConnections.stackName) is not
+  //      the stack the transcoder will be created against.
+  //   2. REQUEST CREDENTIAL vs control plane — DEFENCE IN DEPTH, not the #1093
+  //      mitigation. `WorkspaceConnections.s3Config` is tagged with the stack
+  //      identity it was built for, and that tag is compared here. Today the
+  //      tag and `connections.stackName` are set from the same local at every
+  //      producer (workspace-stack.ts buildConnectionsFromStack /
+  //      buildEnvConnections / buildInMemoryConnections), so after check (1) has
+  //      passed this one cannot fire on any path that exists now. It is kept
+  //      because the credential is carried, cached, re-read from the resolver
+  //      cache and handed to runner factories separately from the document
+  //      connections — a future path that rebuilds or injects an s3Config can
+  //      break that equality, and this catches it at the edge for the cost of a
+  //      string compare.
+  //
+  //      The PRODUCTION-REACHABLE #1093 mis-route is NOT visible from here: the
+  //      credential the spawned transcoder is actually created with is resolved
+  //      by services/encore-s3-config.ts resolveEncoreS3Config, from the
+  //      parameter store, against the routed stack key — never from
+  //      request.connections. That resolver now refuses the first-provisioned
+  //      substitution itself (ObjectStoreStackMismatchError), and the submit
+  //      path below maps that refusal onto this same 409.
+  //
+  // Both compare stack IDENTITY, never endpoint hostnames: the transcoder uses
+  // the in-cluster address while the API uses the public ingress for the SAME
+  // instance (issue #991), so hostnames legitimately differ.
+  function transcodeRoutingRefusal(
+    request: import('fastify').FastifyRequest,
+    controlPlaneStack: string | undefined
+  ): { message: string; logFields: Record<string, unknown>; logMessage: string } | undefined {
+    const documents = stackRoutingMismatch(request, controlPlaneStack);
+    if (documents) {
+      return {
+        message: `the source object was written to stack "${documents.dataPlaneStack}" but the transcoder would be created against stack "${documents.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`,
+        logFields: {
+          reason: 'documents',
+          dataPlaneStack: documents.dataPlaneStack,
+          controlPlaneStack: documents.controlPlaneStack
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+      };
+    }
+    const credential = objectStoreStackMismatch(
+      request.connections?.s3Config,
+      controlPlaneStack
+    );
+    if (credential) {
+      return {
+        message: objectStoreStackMismatchMessage(credential),
+        logFields: {
+          reason: 'request-object-store-credential',
+          expectedStack: credential.expectedStack,
+          actualStack: credential.actualStack,
+          // Endpoint HOST only — the resolved secret is never logged.
+          actualEndpointHost: credential.actualEndpointHost
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the resolved object-store credential belongs to a different stack than the request routes to (issue #1093)'
+      };
+    }
+    return undefined;
+  }
+
   // Resolve whether a named transcode profile can execute on this platform tier
   // (issue #286). Returns a human message when the profile is a stored GPU-only
   // (NVENC/CUDA) profile that cannot run on OSC's CPU-only Encore instances, so
@@ -2379,20 +2461,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     // submit with.
     const controlPlane = await transcodeStackIdentity(request);
     if (steps.includes('transcode')) {
-      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
-      if (mismatch) {
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the bytes would actually be read with (#1093).
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
         request.log.error(
-          {
-            assetId: asset.id,
-            pipeline: pipelineName,
-            dataPlaneStack: mismatch.dataPlaneStack,
-            controlPlaneStack: mismatch.controlPlaneStack
-          },
-          'refusing to start pipeline: the source bytes and the transcoder resolve different stacks (issue #1058)'
+          { assetId: asset.id, pipeline: pipelineName, ...refusal.logFields },
+          refusal.logMessage
         );
         reply.code(409).send({
           error: 'stack_routing_mismatch',
-          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+          message: refusal.message
         });
         return undefined;
       }
@@ -4572,7 +4651,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         key's bytes have not landed (issues #388 / #389);
   //         `stack_routing_mismatch` — the source bytes and the transcoder would
   //         resolve DIFFERENT stacks, so the transcode would fail with an
-  //         indistinguishable 404 (issue #1058). Refused up front rather than
+  //         indistinguishable 404 (issue #1058), or the object-store credential
+  //         the transcoder would be spawned with belongs to another stack than
+  //         this request routes to (issue #1093). Refused rather than
   //         submitted; retry naming one stack consistently via `X-Stack-Name`.
   //   501 — transcoding is not configured on this deployment
   //   502 — Encore rejected the submission
@@ -4798,20 +4879,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // here and reused as the scaler context below, so the identity we verified
       // is the identity we submit with.
       const controlPlane = await transcodeStackIdentity(request);
-      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
-      if (mismatch) {
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the source read would actually use (#1093). Asserted BEFORE the
+      // reachability preflight below, so a mis-routed credential is named as
+      // such rather than probing the wrong instance first.
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
         request.log.error(
-          {
-            assetId: asset.id,
-            objectKey: source.objectKey,
-            dataPlaneStack: mismatch.dataPlaneStack,
-            controlPlaneStack: mismatch.controlPlaneStack
-          },
-          'refusing to submit transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+          { assetId: asset.id, objectKey: source.objectKey, ...refusal.logFields },
+          refusal.logMessage
         );
         return reply.code(409).send({
           error: 'stack_routing_mismatch',
-          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+          message: refusal.message
         });
       }
       try {
@@ -4909,6 +4989,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // client can back off, rather than silently queueing unboundedly.
         if (isJobThroughputCapExceededError(err)) {
           return reply.code(err.statusCode).send(err.toResponseBody());
+        }
+        // The credential the TRANSCODER would be spawned with belongs to a
+        // different stack than this request routes to (issue #1093). Resolved
+        // deep in the scaler's `resolveS3Config` callback
+        // (services/encore-s3-config.ts), which refuses rather than silently
+        // substituting the first-provisioned stack's object store. Answer the
+        // SAME 409 `stack_routing_mismatch` the edge checks above answer — it
+        // is the same class of fault, and a client must not have to distinguish
+        // "mis-routed, retry naming one stack" from a 502 transcoder failure.
+        // The error carries two stack ids and an endpoint host; it has no
+        // credential field, so nothing secret can reach the body or the log.
+        if (isObjectStoreStackMismatchError(err)) {
+          request.log.error(
+            {
+              assetId: asset.id,
+              objectKey: source.objectKey,
+              reason: 'transcoder-object-store-credential',
+              expectedStack: err.expectedStack,
+              actualStack: err.actualStack,
+              actualEndpointHost: err.actualEndpointHost
+            },
+            'refusing to dispatch a transcode: the object-store credential the transcoder would be spawned with belongs to a different stack than the request routes to (issue #1093)'
+          );
+          return reply.code(409).send({
+            error: 'stack_routing_mismatch',
+            message: err.message
+          });
         }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
