@@ -7,7 +7,13 @@ import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
-import { Context, createInstance, getInstance, waitForInstanceReady, getPortsForInstance } from '@osaas/client-core';
+import { Context, createInstance, getInstance, getPortsForInstance } from '@osaas/client-core';
+// The config-service Valkey readiness wait goes through this bounded helper, NOT
+// @osaas/client-core's waitForInstanceReady (issue #1055, follow-up to #1038).
+// The SDK helper has no deadline (lib/core.js:343-353, v0.24.0), so a Valkey
+// that never reported `running` hung this deployment's startup bootstrap with no
+// error at all.
+import { waitForInstanceReadyBounded } from './services/instance-readiness.js';
 import {
   jsonSchemaTransform,
   serializerCompiler,
@@ -60,6 +66,7 @@ import {
   runWithRequestStack,
   currentRequestStackName
 } from './services/request-stack-context.js';
+import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
   resolveStackRedisUrl,
@@ -81,7 +88,8 @@ import {
   PerWorkspaceCollectionRepository,
   PerWorkspaceAuditRepository,
   PerWorkspaceProfileRepository,
-  PerWorkspaceAuditEmitter
+  PerWorkspaceAuditEmitter,
+  PerWorkspaceLogStore
 } from './data/per-workspace-repos.js';
 import type { AssetRepository } from './data/asset-repo.js';
 import { withTamsReadyIndexing, isTamsConfigured, type AssetIndexer } from './tams/tams-ready-hook.js';
@@ -92,18 +100,12 @@ import type { SubtitleGenerator } from './pipeline/subtitle-generator.js';
 import { makeOscSceneDetector } from './pipeline/osc-scene-detect.js';
 import type { SceneDetector } from './pipeline/scene-detector.js';
 import { makeOscThumbnailExtractor } from './pipeline/osc-thumbnail.js';
-import { extractThumbnails } from './pipeline/thumbnail.js';
 import type { FrameExtractor } from './pipeline/thumbnail.js';
 import { makeOscRewrapRunner } from './pipeline/osc-rewrap.js';
 import type { RewrapRunner } from './pipeline/rewrap.js';
 import { makeOscClipRunner } from './pipeline/osc-clip.js';
 import type { ClipRunner } from './pipeline/clip.js';
-import {
-  runnerFactory,
-  resolveRunnerOption,
-  runnerS3Config,
-  RunnerFactoryUnresolvedError
-} from './pipeline/runner-option.js';
+import { runnerFactory } from './pipeline/runner-option.js';
 import { registerPrincipal } from './auth/principal.js';
 import { registerAuth } from './auth/middleware.js';
 import { internalRouter } from './routes/internal.js';
@@ -111,8 +113,10 @@ import { encoreCompatRouter } from './routes/encore-compat.js';
 import { profilesRouter } from './routes/profiles.js';
 import { bootstrapProfiles } from './services/profile-bootstrap.js';
 import { checkProfilesIndexReachable } from './services/profiles-reachability.js';
-import { PerWorkspacePipelineRepository } from './data/per-workspace-repos.js';
-import { InMemoryCommentRepository } from './data/comment-repo.js';
+import {
+  PerWorkspaceCommentRepository,
+  PerWorkspacePipelineRepository
+} from './data/per-workspace-repos.js';
 import { adminRouter } from './routes/admin.js';
 import { scalerRouter } from './routes/scaler.js';
 import { usageRouter } from './routes/usage.js';
@@ -122,7 +126,7 @@ import {
   auditRetentionMsFromEnv
 } from './routes/retention.js';
 import { logsRouter } from './routes/logs.js';
-import { LogStore } from './services/log-store.js';
+import type { LogReader, LogSink } from './services/log-store.js';
 import {
   ArchivedAssetPurgeLoop,
   archivePurgeIntervalMsFromEnv
@@ -151,6 +155,7 @@ import {
   settleFailedTranscode
 } from './pipeline/failed-transcode-reconciler.js';
 import { reconcileStalledPackages } from './pipeline/stalled-package-reconciler.js';
+import { reconcileInterruptedIngests } from './pipeline/interrupted-ingest-reconciler.js';
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
@@ -167,6 +172,7 @@ import { Redis as IORedis } from 'ioredis';
 import { Client as MinioClient } from 'minio';
 import type { StackReachabilityDeps } from './services/stack-reachability.js';
 import { WorkspaceEncoreScalerRegistry } from './encore-scaler/workspace-registry.js';
+import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
@@ -349,7 +355,16 @@ if (!paramStore) {
       getServiceAccessToken: (serviceId) => oscContext.getServiceAccessToken(serviceId),
       getInstance: (serviceId, name, sat) => getInstance(oscContext, serviceId, name, sat),
       createInstance: (serviceId, sat, body) => createInstance(oscContext, serviceId, sat, body),
-      waitForInstanceReady: (serviceId, name) => waitForInstanceReady(serviceId, name, oscContext),
+      // Bounded (#1055): the bootstrap waits for the config service's dedicated
+      // Valkey. With the SDK's unbounded helper a Valkey that never reported
+      // `running` hung startup forever; this gives up at the shared 5-minute
+      // deadline (DEFAULT_INSTANCE_READY_TIMEOUT_MS) with an error naming the
+      // instance, which ensureParameterStore already warn-logs and swallows
+      // (param-store.ts catch block), so startup continues without the store.
+      waitForInstanceReady: (serviceId, name) =>
+        waitForInstanceReadyBounded(oscContext, serviceId, name, {
+          label: 'config queue'
+        }),
       getPortsForInstance: (serviceId, name, sat) => getPortsForInstance(oscContext, serviceId, name, sat)
     },
     log: app.log
@@ -509,12 +524,39 @@ registerPrincipal(app, {
 
 const operationStore = new OperationStore();
 
-// In-memory operational log store backing GET /api/v1/logs (issue #473). There
-// is no persistent log store today; this is the minimal append-only, sequence-
-// keyed source that satisfies cursor paging + the log record shape, modelled on
-// operationStore above. Registered by reference so future producers can append
-// to the same instance the router reads.
-const logStore = new LogStore();
+// Operational log store backing GET /api/v1/logs (issue #473), PERSISTED to the
+// resolved stack's CouchDB since issue #996: it was a process-local array, so
+// every restart emptied the Logs tab. This wrapper holds no connection — each
+// append/list resolves the active stack and delegates to its CouchLogStore
+// (src/data/couch-log-repo.ts, the CouchAuditRepository document pattern), or to
+// the process-local LogStore on the no-Couch dev paths. Registered by reference,
+// exactly as before, so every producer below appends to the same store the
+// router reads; the GET /api/v1/logs request/response contract is unchanged.
+const logStore: LogSink & LogReader = new PerWorkspaceLogStore(stackResolver);
+
+// Parse a millisecond override that must be a finite, strictly positive
+// integer. A malformed value (e.g. a non-numeric PROVISION_READY_TIMEOUT_MS,
+// which parseInt turns into NaN) falls back to undefined so the route keeps its
+// built-in default. waitForInstanceReadyBounded validates again before its poll
+// loop, so a bad value can never reach the loop even if a future caller skips
+// this — but warn loudly HERE so the operator sees the misconfiguration at boot
+// rather than silently running on the default (issue #1038 review).
+const parsePositiveMsEnv = (name: string): number | undefined => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return undefined;
+  const parsed = parseInt(raw, 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  app.log.warn(
+    { env: name, value: raw },
+    'ignoring malformed %s (expected a positive integer in ms); using the built-in default',
+    name
+  );
+  return undefined;
+};
+const provisionReadyTimeoutMs = parsePositiveMsEnv('PROVISION_READY_TIMEOUT_MS');
+const provisionReadyPollIntervalMs = parsePositiveMsEnv(
+  'PROVISION_READY_POLL_INTERVAL_MS'
+);
 
 await app.register(provisionRouter, {
   prefix: '/api/v1/provision',
@@ -522,6 +564,17 @@ await app.register(provisionRouter, {
   paramStore,
   operationStore,
   publicBaseUrl: resolvePublicBaseUrl(),
+  // Bound (ms) on each backing instance's readiness wait during provisioning
+  // (issue #1038). Unset leaves the route on its own 5-minute default
+  // (DEFAULT_INSTANCE_READY_TIMEOUT_MS); a timeout routes into the existing
+  // rollback with an error naming the service and the last probe error, instead
+  // of the unbounded SDK wait that a single dropped poll could abort.
+  ...(provisionReadyTimeoutMs !== undefined
+    ? { readyTimeoutMs: provisionReadyTimeoutMs }
+    : {}),
+  ...(provisionReadyPollIntervalMs !== undefined
+    ? { readyPollIntervalMs: provisionReadyPollIntervalMs }
+    : {}),
   // Invalidate the resolver cache after a successful provision/teardown so the
   // new (or removed) stack is picked up on the next request without a restart.
   // Then reconcile the scaler/queue wiring: activate it against the freshly
@@ -1021,10 +1074,21 @@ const pullDeps = envMinioClient ? { openS3: makeS3Reader(envMinioClient) } : und
 // callback poller (started on scaler activation) can advance executions.
 const pipelineRepository = new PerWorkspacePipelineRepository(stackResolver);
 
-// Asset comments (issue #135). In-memory: comments are a simple free-text
-// sub-resource for this iteration (mirrors the ephemeral pipeline repo above).
+// Asset comments (issue #135), persisted since issue #1046. Review comments are
+// durable editorial content, so they live in the resolved stack's CouchDB and
+// survive a restart.
+//
+// Wired through the SAME per-workspace path as every other durable repository —
+// the `comments` field on WorkspaceConnections (src/services/workspace-stack.ts),
+// reached through this facade exactly like pipelineRepository above. NOT gated on
+// COUCHDB_URL: that env var only activates the deployment-global override
+// (buildEnvConnections), so a deployment that provisions its stack via
+// POST /api/v1/provision — where the CouchDB URL comes from the parameter store
+// via buildConnectionsFromStack — would never have reached the Couch-backed store
+// and #1046 would reproduce. The facade warns (app.log) on any resolution that
+// lands on the in-memory implementation, naming the reason.
 // Shared with the assets router, which owns POST/GET /:id/comments.
-const commentRepository = new InMemoryCommentRepository();
+const commentRepository = new PerWorkspaceCommentRepository(stackResolver, app.log);
 
 // Read the first provisioned stack's Valkey URL from the parameter store, or a
 // classified reason why none could be resolved. Self-discovered: there is no
@@ -1152,6 +1216,16 @@ function activateScaler(redisUrl: string): void {
     // construction as the process-global connection in activateScaler above so
     // lifecycle semantics (lazyConnect, unbounded per-request retries) match.
     makeRedis: (url: string) => new IORedis(url, { lazyConnect: true, maxRetriesPerRequest: null }),
+    // Enumerate the provisioned stacks so a read-only observer can cover a stack
+    // whose loop has not been created in this process yet (issue #1074). Same
+    // namespace and same read path as resolveRedisUrl above, so the two cannot
+    // disagree about which stacks exist. Returns [] when the parameter store is
+    // unconfigured; the registry then reports only the stacks it already holds a
+    // connection for.
+    listStackKeys: async (): Promise<string[]> => {
+      if (!paramStore) return [];
+      return paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+    },
     minInstances: parseInt(process.env['ENCORE_MIN_INSTANCES'] || '0', 10),
     oscContext,
     maxInstances: encoreMaxInstances,
@@ -1549,7 +1623,8 @@ function activateScaler(redisUrl: string): void {
     auditLog: app.log,
     // Operational log records for the `package` stage (issue #995): the enqueue
     // and the packager's success/failure callbacks each append one entry to the
-    // SAME in-memory store GET /api/v1/logs reads (`logStore` above).
+    // SAME store GET /api/v1/logs reads (`logStore` above) — durable since
+    // issue #996.
     pipelineLog: logStore
   });
 
@@ -1786,7 +1861,7 @@ function activateScaler(redisUrl: string): void {
     // deliver identical payloads to the same registrations.
     webhookDispatcher,
     // Operational log records for the `transcode` stage (issue #995). The SAME
-    // in-memory store GET /api/v1/logs reads (`logStore` above), so a transcode
+    // store GET /api/v1/logs reads (`logStore` above, durable since #996), so a transcode
     // that settles through this poller shows up in the Logs tab.
     pipelineLog: logStore,
     logger: app.log
@@ -1803,6 +1878,11 @@ function activateScaler(redisUrl: string): void {
   internalRouterOptions.packaging = packaging;
   internalRouterOptions.redis = redis;
   scalerRouterOptions.redis = redis;
+  // Label the process-global connection with the same non-secret identifier the
+  // registry derives for a per-stack connection (issue #1074), so a stack that
+  // falls back to this Valkey reports the SAME connectionId instead of looking
+  // like a second store. The URL itself never reaches the wire.
+  scalerRouterOptions.redisConnectionId = valkeyConnectionId(redisUrl);
   usageRouterOptions.redis = redis;
 
   // Start loops for any workspaces that had pool entries from a previous run.
@@ -1856,6 +1936,7 @@ async function deactivateScaler(): Promise<void> {
   internalRouterOptions.packaging = undefined;
   internalRouterOptions.redis = undefined;
   scalerRouterOptions.redis = undefined;
+  scalerRouterOptions.redisConnectionId = undefined;
   usageRouterOptions.redis = undefined;
 
   try {
@@ -1957,6 +2038,16 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   probe,
   // External storage-backend registry (issue #548): lets POST /ingest-url
   // reference a registered external backend as the source (ADR-017 D4).
+  //
+  // Also the registry POST /:id/deliver resolves its `destination` reference
+  // through (issue #1131) — the SAME records /api/v1/export-destinations
+  // registers and lists, so an operator-registered destination is deliverable
+  // with no second registration. The delivery route deliberately takes NO
+  // client option here: its copy + landing verification must run against the
+  // store THIS request's bytes live in, so it uses the per-request stack client
+  // and endpoint (`request.connections.storageClient` / `.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:148,152) rather than a process-wide handle
+  // that could belong to a different stack (the issue #1058 class of split).
   storageBackendRegistry,
   encore,
   // Resolve the EFFECTIVE stack identity a transcode request routes to (issue
@@ -1991,7 +2082,7 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // Operational log records for the pipeline steps this router drives (issue
   // #995): the `ingest` stage (URL-pull worker + the synchronous
   // extract-metadata / thumbnail / subtitles / scene-detect steps) and the
-  // `transcode` submission. Appends to the SAME in-memory store
+  // `transcode` submission. Appends to the SAME store
   // GET /api/v1/logs reads (`logStore` above), which is what makes the Logs tab
   // populate during a normal run.
   pipelineLog: logStore
@@ -2079,11 +2170,27 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
 };
 await app.register(internalRouter, internalRouterOptions);
 
+// Poster frame on ingest (issue #7). The stack's object-store coordinates are
+// resolved INSIDE the detached continuation with the full resolve() keyed by
+// the stack name captured at trigger time, not with a cache read — a cache read
+// returns undefined once the resolver TTL has passed and silently demoted the
+// write to the boot-default bucket (issue #1100). See
+// services/post-upload-thumbnail.ts.
+const triggerPostUploadThumbnail = thumbnailExtractor
+  ? makePostUploadThumbnailTrigger({
+      resolver: stackResolver,
+      assets: assetRepository,
+      extractor: thumbnailExtractor,
+      defaultSourceBucket: sourceBucket,
+      log: app.log
+    })
+  : undefined;
+
 // On object storage (upload-complete OR watch-folder ingest), fire-and-forget
 // ffprobe extraction (issue #6) and thumbnail extraction (issue #7). Shared by
 // the upload route and the watch-folder service. The upload route resolves the
-// caller's workspace before invoking this, so the resolver cache is warm and
-// the sync storageFor() and resolveCached() can be read synchronously.
+// caller's workspace before invoking this, so the sync storageFor() can be read
+// synchronously.
 const onObjectStored =
   storageAvailable
     ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) => {
@@ -2094,43 +2201,7 @@ const onObjectStored =
             { assets: assetRepository, storage: effectiveStorage, probe }
           );
         }
-        if (thumbnailExtractor) {
-          // Read s3Config from the already-warm resolver cache, for the stack
-          // this request named (issue #1058). The upload preHandler called
-          // resolve() with the same name, so resolveCached() is valid here.
-          // CAVEAT (#1090): this is a CACHE read, so it returns undefined if the
-          // entry has aged past the resolver TTL between the preHandler and this
-          // fire-and-forget continuation, in which case the thumbnail runner
-          // falls back to the boot-default bucket. Fine for the request path
-          // (the entry was just written); recorded on #1090 with the rest of the
-          // non-request resolution gaps.
-          const conns = stackResolver.resolveCached(currentRequestStackName());
-          const bucket = conns?.sourceBucket ?? sourceBucket;
-          // Same resolution helper the asset routes use (issue #838). This path
-          // is fire-and-forget on upload, so an unresolvable factory is logged
-          // at error level and skipped rather than thrown at the uploader — but
-          // it is logged, not silently treated as "no thumbnails configured".
-          try {
-            const extractor = resolveRunnerOption(
-              thumbnailExtractor,
-              runnerS3Config(conns?.s3Config, bucket),
-              'thumbnailExtractor'
-            );
-            void extractThumbnails(
-              { assetId, objectKey, timecodes: [1] },
-              { assets: assetRepository, storage: effectiveStorage, extractor }
-            ).catch(() => { /* failures recorded on asset */ });
-          } catch (err) {
-            if (err instanceof RunnerFactoryUnresolvedError) {
-              app.log.error(
-                { err, assetId },
-                'skipping post-upload thumbnail extraction: runner factory could not be resolved'
-              );
-            } else {
-              throw err;
-            }
-          }
-        }
+        triggerPostUploadThumbnail?.(assetId, objectKey, effectiveStorage);
       }
     : undefined;
 
@@ -2267,6 +2338,13 @@ await app.register(adminRouter, {
 const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string } = {
   prefix: '/api/v1/scaler',
   redis: sharedRedis,
+  // Fan the status read out over the SAME per-stack Valkeys the scaler loops use
+  // (issue #1074). `scalerRegistry` is a module-level binding assigned by
+  // activateScaler, so the closure picks up the live registry (or its absence)
+  // per request, exactly like onConfigChange below. Returns [] while the scaler
+  // is off, which leaves the response reporting the process-global connection
+  // only — and `connections` states that explicitly.
+  listStackConnections: async () => (scalerRegistry ? scalerRegistry.listStackConnections() : []),
   maxInstances: encoreMaxInstances,
   minInstances: 0,
   idleTimeoutMs: encoreIdleTimeoutMs,
@@ -2319,7 +2397,8 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
 await app.register(retentionRouter, retentionRouterOptions);
 
 // Operational logs listing (issue #473). Cursor/sequence-paged, newest-first,
-// append-only log stream over the in-memory logStore. Offset paging is
+// append-only log stream over the durable `logStore` above (CouchDB-backed per
+// issue #996). Offset paging is
 // deliberately excluded (#371): only a bounded `limit` + opaque `cursor`, so
 // appended entries never shift an in-flight page.
 await app.register(logsRouter, { prefix: '/api/v1/logs', logStore });
@@ -2434,6 +2513,59 @@ const abandonedUploadSweepLoop = new AbandonedUploadSweepLoop({
   }
 });
 abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
+
+// Interrupted-ingest reconciliation (issue #1084). A ONE-SHOT boot-time scan, not
+// a loop: an ingest-url job's lifecycle is owned in-process by runPull
+// (src/pipeline/url-pull-worker.ts), so a job left `running` by a process that
+// died mid-pull has nobody left to settle it and no existing sweep covers it
+// (reconcileFailedTranscodes above handles transcode jobs only). The boundary is
+// this process's start time: a `running` ingest-url job stamped before it cannot
+// belong to a live worker here, while anything stamped at or after it may be a
+// pull streaming bytes right now and is left strictly alone. Settles the JOB
+// record only — moving the asset out of `uploading` is #1085 and partial-byte
+// cleanup is #1086 — and does NOT re-queue the pull. Idempotent, so a crash
+// between boots cannot double-settle. Detached + swallowed: a reconcile failure
+// must never block the API from serving.
+//
+// The settle is the job's TERMINAL transition, so it carries the same `job.failed`
+// audit entry the in-process worker emits when it settles a pull itself
+// (src/pipeline/url-pull-worker.ts:324-334, issue #1000/#1032) — otherwise a
+// reconciler-settled job would keep its `job.submitted` entry and never get a
+// closing one. The scan also runs once per provisioned stack (#1058/#1062): both
+// the job repository and the audit emitter resolve the AMBIENT stack, and boot has
+// no request, so without this it would see the first-listed stack only and leave
+// every other stack's interrupted jobs stuck forever.
+// Adapter for the printf-style sweep loggers: pino takes the format string as
+// its MESSAGE and the remaining values as interpolation args, so '%s'/'%d'/'%o'
+// actually interpolate. Handing pino the whole arg ARRAY instead (as the older
+// sweep wiring above does) makes it treat the array as a merging object and log
+// {"0":"...","1":"..."} with the format string never interpolated.
+function printfToPino(
+  sink: (msg: string, ...args: unknown[]) => void,
+  args: unknown[]
+): void {
+  const [format, ...rest] = args;
+  sink(typeof format === 'string' ? format : String(format), ...rest);
+}
+
+void reconcileInterruptedIngests({
+  jobs: jobRepository,
+  audit: auditEmitter,
+  auditLog: app.log,
+  stacks: {
+    listStackNames: () => stackResolver.listStackNames(),
+    runInStack: (stackName, fn) => runWithRequestStack(stackName, fn)
+  },
+  logger: {
+    // The reconciler logs printf-style ('%s'/'%d'/'%o'), and pino's info/warn
+    // take (msg, ...interpolationArgs) — so SPREAD the args instead of handing
+    // pino the array as its first argument, which it would treat as a merging
+    // OBJECT and render as {"0":"...","1":"..."} with the format string never
+    // interpolated.
+    info: (...a: unknown[]) => printfToPino(app.log.info.bind(app.log), a),
+    warn: (...a: unknown[]) => printfToPino(app.log.warn.bind(app.log), a)
+  }
+}).catch((err) => app.log.warn({ err }, 'interrupted-ingest reconciliation on boot failed'));
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
 await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });

@@ -847,6 +847,12 @@ export interface OscInstanceApi {
     sat: string,
     body: Record<string, unknown>
   ): Promise<{ name?: string }>;
+  // Readiness wait for an instance this module just created. NOT
+  // @osaas/client-core's waitForInstanceReady: main.ts fulfils this with the
+  // bounded waitForInstanceReadyBounded (src/services/instance-readiness.ts,
+  // issue #1055), so a Valkey that never reports `running` gives up at a
+  // deadline instead of hanging the startup bootstrap forever. The rejection is
+  // caught by the warn-and-continue handler at the end of ensureParameterStore.
   waitForInstanceReady(serviceId: string, name: string): Promise<void>;
   getPortsForInstance(
     serviceId: string,

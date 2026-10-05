@@ -159,6 +159,8 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `MINIO_ROOT_PASSWORD` | **Yes** | Deployment-level object-store credential material. Each stack provisioned from here gets its **own** object-store access key id and secret, derived from this value, so a credential issued for one stack cannot read or write another stack's buckets. Treat it as a root secret: it is never used as a stack credential itself, but it can derive every stack's credential. Rotating it invalidates the derived credentials of already-provisioned stacks (the live instances keep the credential they were created with), exactly as rotating it did before. A stack provisioned by an older build keeps its original deployment-wide credential until it is migrated. |
 | `COUCHDB_ADMIN_PASSWORD` | **Yes** | Admin password used when provisioning CouchDB instances. |
 | `PORT` | No | HTTP port (default `3000`). |
+| `PROVISION_READY_TIMEOUT_MS` | No | How long provisioning waits for each backing instance to report healthy, in milliseconds (default `300000`, i.e. 5 minutes). The wait polls instance health on its own loop and treats a dropped poll as "not ready yet", so a single network blip no longer aborts the stack; on timeout the error names the service and the last probe error, and the usual rollback tears down what that run created. |
+| `PROVISION_READY_POLL_INTERVAL_MS` | No | How often that readiness wait re-checks instance health, in milliseconds (default `1000`). |
 | `ENCORE_MAX_INSTANCES` | No | Maximum Encore instances the auto-scaler may run per workspace (default `3`). |
 | `ENCORE_MIN_INSTANCES` | No | Minimum Encore instances the auto-scaler keeps warm per workspace even when idle (default `0` — scale to zero). Set to `1` or more to keep a warm floor for production / latency-sensitive shared pools. See [Auto-scaler warm floor](#auto-scaler-warm-floor-cost-vs-reliability) for the cost-vs-reliability trade-off. |
 | `ENCORE_IDLE_TIMEOUT_MS` | No | Idle time before an Encore instance is torn down, in milliseconds (default `300000`, i.e. 5 minutes). Sets the boot-time default; it can be overridden at runtime without a restart via `PATCH /api/v1/scaler/config` (`idleTimeoutMs`, minimum `10000`). |
@@ -168,6 +170,7 @@ Seeds the profile store from the default Encore test profiles. The ops dashboard
 | `ENCORE_S3_INTERNAL_PROBE_TIMEOUT_MS` | No | Timeout for the in-cluster endpoint health probe, in milliseconds (default `3000`). On timeout the public endpoint is used. |
 | `ENCORE_PROFILES_URL` | No | Default Encore profile index used to seed the profile store on first startup / bootstrap (default: the Eyevinn `encore-test-profiles` index). |
 | `PUBLIC_BASE_URL` | No | Publicly-reachable base URL of this API (e.g. `https://ovc.example.com`). Used to build the `profilesUrl` handed to each Encore instance the auto-scaler spawns, pointing at `GET /api/v1/profiles/index.yml` so Encore loads the operator-managed profiles from CouchDB. If unset, Encore instances fall back to `ENCORE_PROFILES_URL`. |
+| `OVC_TRUST_ROLE_HEADER` | No | Opt in to per-caller roles by trusting the `X-OVC-Role` request header (`viewer` / `editor` / `admin`) as the caller's authenticated role. Default **off**: only the exact string `true` enables it, so a typo (`TRUE`, `1`, `yes`, ` true`) fails safe and leaves the deployment untrusted. **Only enable it behind a fronting layer — a reverse proxy or self-deployed identity provider — that strips any client-supplied `X-OVC-Role` and injects the authenticated caller's role itself.** Enabled without such a layer, the header is attacker-controlled: any caller can send `X-OVC-Role: admin`, and a caller who sends no header at all still resolves to `admin` (the single-operator default), so every caller is effectively an admin and the role gate stops protecting anything. Left off, the header is deleted at the trust boundary before it is read, every caller resolves to `admin`, and behaviour is identical to the existing authenticated-⇒-full-access model. The planned OSC catalog option for this is `TrustRoleHeader` (string `"true"` / `"false"`, default `"false"`); it is not in the service manifest yet, so for now set the environment variable directly. |
 
 ## API reference
 
@@ -265,6 +268,7 @@ The OpenAPI document's `info.version` deliberately stays pinned to
 | `GET` | `/api/v1/assets/:id/thumbnails/:index` | Get a single thumbnail |
 | `POST` | `/api/v1/assets/:id/clip` | Clip a time segment into a new asset |
 | `POST` | `/api/v1/assets/:id/export` | Re-wrap into a different container format |
+| `POST` | `/api/v1/assets/:id/deliver` | Deliver the asset's source object to a registered export destination |
 | `GET` | `/api/v1/assets/:id/delivery` | Get playback URLs (see [ADR-003](docs/architecture/ADR-003-delivery-and-stream-url-contract.md)) |
 | `GET` | `/api/v1/assets/:id/stream/*` | Proxy-stream packaged HLS/DASH manifests and segments (see [ADR-003](docs/architecture/ADR-003-delivery-and-stream-url-contract.md)) |
 | `PUT` | `/api/v1/assets/:id/metadata` | Replace free-form metadata |
@@ -361,7 +365,7 @@ a restart.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances`, `jobsPerInstance` — concurrent jobs one instance can take — and `idleTimeoutMs`; each instance carries `draining: true` while it is being drained ahead of teardown). Returns `scalerActive: false` until a stack is provisioned; the auto-scaler activates against the provisioned stack's Valkey immediately after `POST /api/v1/provision` completes, with no restart. |
+| `GET` | `/api/v1/scaler/status` | Current Encore instance pool status (reports the effective `maxInstances`, `jobsPerInstance` — concurrent jobs one instance can take — and `idleTimeoutMs`; each instance carries `draining: true` while it is being drained ahead of teardown). Returns `scalerActive: false` until a stack is provisioned; the auto-scaler activates against the provisioned stack's Valkey immediately after `POST /api/v1/provision` completes, with no restart. Each provisioned stack has its own Valkey, so the read fans out over all of them: every entry in `workspaces[]` carries the `connectionId` its `queueDepth`/`inflightDepth`/`instances` were read from, and `connections[]` lists every store the read covered. A pool that could not be queried is reported with `observed: false` and an `unobservedReason` — its state is unknown, not empty — rather than being left out of the response. `connectionId` is a stable non-secret label; no connection string, host, port or credential is ever returned. |
 | `GET` | `/api/v1/scaler/config` | Get auto-scaler configuration |
 | `PATCH` | `/api/v1/scaler/config` | Update auto-scaler configuration (`maxInstances`, `minInstances`, `idleTimeoutMs`) at runtime; `idleTimeoutMs` must be at least `10000` ms |
 
@@ -458,9 +462,29 @@ reclaim. Give each deployment its own workspace identity.
 | `POST` | `/api/v1/collections` | Create a collection |
 | `GET` | `/api/v1/collections` | List collections |
 | `GET` | `/api/v1/collections/:id` | Get a collection |
-| `DELETE` | `/api/v1/collections/:id` | Delete a collection |
+| `DELETE` | `/api/v1/collections/:id` | Delete a collection (confirm the member count to delete a non-empty one) |
 | `PUT` | `/api/v1/collections/:id/assets/:assetId` | Add an asset to a collection |
 | `DELETE` | `/api/v1/collections/:id/assets/:assetId` | Remove an asset from a collection |
+
+Deleting a collection never deletes its member assets — it only unlinks them.
+An empty collection deletes outright. A non-empty one is refused with `409`,
+`error: "delete_blocked"`, `reason: "member_of_collection"`, and a `memberCount`
+telling you how many assets are in it. Echo that number back to confirm:
+
+```
+DELETE /api/v1/collections/:id?confirmMemberCount=7   ->  204
+```
+
+The count must match the collection's *current* membership. If it changed in
+between, you get the same `409 member_of_collection` carrying the new
+authoritative `memberCount` rather than a silent delete — re-confirm with that
+value and retry. `?force=true` is the blind alternative that skips the check.
+
+A `409` with `reason: "delete_protected"` is a different condition: the
+collection carries an explicit delete lock, it has no `memberCount`, and neither
+`?confirmMemberCount=` nor `?force=true` gets past it. Clear the lock with
+`DELETE /api/v1/collections/:id/lock` first. Branch on `reason`, not on the
+status code.
 
 **Webhooks**
 

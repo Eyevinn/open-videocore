@@ -300,6 +300,33 @@ export type EncoreInstanceRecord = {
   //     act on an unconfirmable instance.
   // Absent on every normal record.
   pendingReadySince?: number;
+  // #1109: back-off bookkeeping for the ONE piece of work resolvePendingSpawns
+  // does on a pending record — creating (or adopting) the paired callback
+  // listener the timed-out spawn never got to. Only ever set while
+  // `pendingReadySince` is set, and cleared the moment the listener exists.
+  //
+  // Without these the resolver re-attempted the create on EVERY tick until the
+  // readiness deadline: ~90 createInstance calls per stuck instance at a 10s
+  // tick and a 15-minute budget, with no distinction between a 500 that will
+  // pass and a 422 that never will. The spawn path has always classified its
+  // own create failures (spawnPooledInstance, instance-pool.ts) — these fields
+  // give the resolver, which retries ACROSS ticks rather than inside one call,
+  // somewhere to keep the same decision between ticks.
+  //
+  // How many listener creates the resolver has attempted for this instance.
+  // Drives the exponential back-off interval.
+  listenerCreateAttempts?: number;
+  // Epoch ms before which the resolver must not attempt another listener
+  // create. Set after a RETRYABLE failure (5xx/408/429/transport, or a "name
+  // already taken" the follow-up getInstance could not confirm).
+  listenerCreateNextAttemptAt?: number;
+  // Epoch ms at which a listener create failed PERMANENTLY (a rejected body, a
+  // bad token, an exhausted quota — anything isTransientOscError calls
+  // non-transient). No further create is attempted for this instance: it stays
+  // pending, is never dispatched to, and is destroyed on its normal deadline so
+  // a clean spawn can replace it. Recorded rather than inferred so the
+  // condition is visible on the record instead of being a silent stall.
+  listenerCreateBlockedAt?: number;
 };
 
 export type QueuedJob = {
