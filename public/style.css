@@ -288,6 +288,34 @@ tbody td {
   border-color: var(--accent, var(--border));
 }
 
+/* Jobs table Asset cell (issue #988): the asset's human-readable name leads,
+   with its ULID — the value the API accepts — on a second line beneath it, in
+   the same monospace/muted treatment other identifier cells use. The name is
+   full-strength text so the column is scannable; the id stays subordinate but
+   readable in full (`.cell-id-value` lifts the 140px ellipsis cap) and keeps
+   its click-to-copy button. Not colour-coded: the two values are distinguished
+   by position, size and typeface, never by hue alone (WCAG 1.4.1). */
+.job-asset-name {
+  display: block;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.job-asset-id {
+  display: block;
+  margin-top: 2px;
+}
+
+/* Same pairing in the job detail panel, where the kv row is a single line: the
+   ULID trails the named link rather than sitting under it. */
+.job-asset-id-inline {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 /* Status badges */
 .badge {
   display: inline-block;

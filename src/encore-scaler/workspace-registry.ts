@@ -55,6 +55,11 @@ export type WorkspaceEncoreScalerConfig = {
   // #778: how long (ms) an instance must be continuously observed orphaned
   // before it is reaped. Undefined uses DEFAULT_ORPHAN_GRACE_MS (instance-pool).
   orphanGraceMs?: number;
+  // #1071: bounded wait (ms) forwarded to every per-workspace loop for a freshly
+  // created OSC instance to report `running`. Must cover OSC provisioning a new
+  // worker node, not just a pod starting on an existing one. Undefined uses
+  // DEFAULT_SPAWN_READY_TIMEOUT_MS (instance-pool, 15 min).
+  spawnReadyTimeoutMs?: number;
   // Redis connection string forwarded to each spawned callback listener.
   redisUrl: string;
   // Optional per-stack Valkey resolver (issue #615). When supplied, called once
@@ -228,6 +233,10 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       orphanReapIntervalMs:
         this.config.orphanReapIntervalMs ?? DEFAULT_ORPHAN_REAP_INTERVAL_MS,
       orphanGraceMs: this.config.orphanGraceMs,
+      // #1071: node provisioning can take minutes; a spawn must be allowed to
+      // wait for it rather than timing out and tearing the half-born instance
+      // down.
+      spawnReadyTimeoutMs: this.config.spawnReadyTimeoutMs,
       oscContext: this.config.oscContext,
       redis,
       redisUrl,

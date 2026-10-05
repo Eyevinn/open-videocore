@@ -3594,11 +3594,22 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       ['Type', escHtml(job.type || '—')],
       ['Status', renderBadge(job.status)],
     ];
+    // Asset row (issue #988): GET /api/v1/jobs/:id now resolves `assetName`
+    // (OPTIONAL on the wire — src/routes/jobs.ts:62; absent when the asset has
+    // been deleted), so the link reads as the asset's name when there is one.
+    // The ULID stays on screen either way: it is the value every asset-id
+    // endpoint accepts, and it is what a deleted asset degrades to.
     if (job.assetId) {
-      kvRows.push(['Asset ID',
-        '<a href="#" class="job-asset-link text-mono" data-asset-id="' + escHtml(job.assetId) + '" style="color:var(--accent)">' + escHtml(job.assetId) + '</a>']);
+      const assetLinkHtml =
+        '<a href="#" class="job-asset-link' + (job.assetName ? '' : ' text-mono') +
+        '" data-asset-id="' + escHtml(job.assetId) + '" style="color:var(--accent)">' +
+        escHtml(job.assetName || job.assetId) + '</a>';
+      kvRows.push(['Asset',
+        job.assetName
+          ? assetLinkHtml + ' <span class="text-mono job-asset-id-inline">' + escHtml(job.assetId) + '</span>'
+          : assetLinkHtml]);
     } else {
-      kvRows.push(['Asset ID', '<span class="text-mono">—</span>']);
+      kvRows.push(['Asset', '<span class="text-mono">—</span>']);
     }
     if (job.profile) kvRows.push(['Profile', escHtml(job.profile)]);
     if (job.progress != null) kvRows.push(['Progress', escHtml(job.progress + '%')]);

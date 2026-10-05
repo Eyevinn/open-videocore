@@ -9,14 +9,29 @@
 //   pending --start--> running --(stream ok)--> done   (asset -> processing)
 //                              \--(error)------> failed (asset -> failed)
 //
+// Because the worker owns the terminal transition, it also emits the job's
+// TERMINAL audit entry (`job.completed` / `job.failed`, issue #1000) — the
+// matching `job.submitted` is emitted by POST /ingest-url where the job record is
+// created. Same actor/action/target shape the transcode and packaging pipelines
+// use, so an ingest -> transcode -> package run reads as one contiguous trail
+// instead of starting mid-pipeline.
+//
 // Resilience: transient pull failures are retried up to MAX_ATTEMPTS with
 // exponential backoff. A SourceTooLargeError or SourceValidationError is
 // permanent and fails the job immediately without retry. Progress events
 // (% bytes) are persisted to the job as the stream advances, throttled so we do
-// not write to CouchDB on every chunk.
+// not write to CouchDB on every chunk. Every attempt starts from a clean slate:
+// any multipart upload still open for the object key is discarded first, so a
+// retry writes a fresh upload instead of resuming the dead one (issue #1088).
 
 import type { AssetRepository } from '../data/asset-repo.js';
 import type { JobRepository } from '../data/job-repo.js';
+import {
+  emitAudit,
+  originActor,
+  type AuditEmitter,
+  type AuditErrorLog
+} from '../data/audit-emit.js';
 import { SourceTooLargeError, type WorkspaceStorage } from '../data/storage.js';
 import { QuotaExceededError, type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
@@ -26,6 +41,11 @@ import {
   SourceValidationError,
   type SourceDeps
 } from './source.js';
+import {
+  logPipelineEvent,
+  type PipelineLogErrorLog,
+  type PipelineLogSink
+} from '../services/pipeline-log.js';
 
 // Default 50 GB cap; configurable via INGEST_MAX_SOURCE_BYTES.
 export const DEFAULT_MAX_SOURCE_BYTES = 50 * 1024 * 1024 * 1024;
@@ -72,6 +92,40 @@ export type PullParams = {
   sourceUrl: string;
 };
 
+// Clear any multipart upload left open for this object key (issue #1088), so a
+// write never resumes a half-finished one. Best-effort by design: a cleanup that
+// cannot reach storage is reported as a warning on the operational log and
+// nothing more, because the pull itself is either about to run (and will fail on
+// its own terms if storage is really unreachable) or has already failed with the
+// error the job must report. It never throws, which keeps the never-throws
+// contract of runPull intact.
+async function discardOrphanedUpload(
+  deps: {
+    storage: WorkspaceStorage;
+    pipelineLog?: PipelineLogSink;
+    pipelineLogErrors?: PipelineLogErrorLog;
+  },
+  objectKey: string,
+  jobId: string
+): Promise<void> {
+  try {
+    await deps.storage.abortIncompleteMultipartUploads(objectKey);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    logPipelineEvent(
+      deps.pipelineLog,
+      {
+        stage: 'ingest',
+        level: 'warn',
+        message:
+          `could not discard an incomplete multipart upload for ${objectKey} ` +
+          `(job ${jobId}): ${message}`
+      },
+      deps.pipelineLogErrors
+    );
+  }
+}
+
 // Run one pull job to a terminal state. Resolves when the job is done/failed;
 // it never throws (failures are recorded on the job), so it is safe to invoke
 // detached with `void runPull(...)`.
@@ -88,6 +142,20 @@ export async function runPull(
     // a PERMANENT failure (QuotaExceededError), recorded on the job without
     // retry. Absent => no cap, behaviour unchanged (opt-in).
     quota?: StorageQuotaGuard;
+    // Best-effort operational log emission for the `ingest` stage (issue #995).
+    // Optional: when absent no log record is appended and behaviour is unchanged.
+    // Wired to the log store that backs GET /api/v1/logs (src/main.ts,
+    // `logStore`). `logPipelineEvent` never throws, so this cannot make the
+    // never-throws contract of runPull (see the doc comment above) any weaker.
+    pipelineLog?: PipelineLogSink;
+    pipelineLogErrors?: PipelineLogErrorLog;
+    // Best-effort audit emission (issue #1000), mirroring the transcode and
+    // packaging pipelines (src/pipeline/transcode.ts:281,332;
+    // src/pipeline/packaging.ts:589,616). Optional so existing callers / tests
+    // that do not assert audit are unaffected; when absent, emission is a no-op.
+    // A failed audit write is logged, never propagated (src/data/audit-emit.ts).
+    audit?: AuditEmitter;
+    auditLog?: AuditErrorLog;
   } & PullDeps
 ): Promise<void> {
   const { jobId, assetId, objectKey, sourceUrl } = params;
@@ -97,8 +165,26 @@ export async function runPull(
 
   await deps.jobs.update(jobId, { status: 'running' });
 
+  // Operational log: the `ingest` stage started (issue #995). Emitted once the
+  // job is `running` — the point from which this worker owns the job's lifecycle
+  // — and NOT per retry attempt, so a run appends a bounded number of entries.
+  logPipelineEvent(
+    deps.pipelineLog,
+    {
+      stage: 'ingest',
+      level: 'info',
+      message: `pulling source for asset ${assetId} (job ${jobId})`
+    },
+    deps.pipelineLogErrors
+  );
+
   let lastError: unknown;
+  // Attempts actually consumed, so the terminal-failure log entry reports the
+  // real count (a permanent error breaks out at attempt 1 and never reaches
+  // MAX_ATTEMPTS).
+  let attemptsUsed = 0;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    attemptsUsed = attempt;
     await deps.jobs.update(jobId, { attempts: attempt });
     let reservation;
     try {
@@ -114,6 +200,25 @@ export async function runPull(
       // terminal failure below. A missing Content-Length reserves 0 and relies
       // on the commit-time true size + reconciliation.
       reservation = deps.quota ? await deps.quota.admit(opened.totalBytes ?? 0) : undefined;
+
+      // Start this write from a clean slate (issue #1088). A source bigger than
+      // the storage client's part size is written as a multipart upload, and a
+      // transfer that dies part-way leaves that upload open with its staged
+      // parts intact. The client does not start fresh on the next write to the
+      // same key — it RESUMES the open upload under part numbers that sit one
+      // off the numbers the server staged the parts under, so the object can be
+      // assembled from a duplicated or wrong-offset part (the full mechanism is
+      // in WorkspaceStorage.abortIncompleteMultipartUploads). Discarding the
+      // upload here removes the resume path entirely: every attempt gets a
+      // fresh uploadId.
+      //
+      // Deliberately BEFORE the write rather than only after a failed attempt,
+      // so it also clears an orphan this run did not create — one left by an
+      // earlier job for the same object key, or by an abandoned client-driven
+      // multipart session. This worker owns the object key for the asset it was
+      // created with, so there is no concurrent writer to disturb. One list
+      // call ahead of a potentially multi-gigabyte transfer.
+      await discardOrphanedUpload(deps, objectKey, jobId);
 
       let lastWrite = 0;
       const { bytesTransferred } = await deps.storage.putStream(objectKey, opened.stream, {
@@ -143,6 +248,37 @@ export async function runPull(
         progress: 100
       });
       await deps.assets.update(assetId, { status: 'processing' });
+      // Operational log: the `ingest` stage reached terminal success (issue #995).
+      logPipelineEvent(
+        deps.pipelineLog,
+        {
+          stage: 'ingest',
+          level: 'info',
+          message: `asset ${assetId} (job ${jobId}) stored ${bytesTransferred} byte(s) to ${objectKey}`
+        },
+        deps.pipelineLogErrors
+      );
+      // Audit: ingest-url job reached terminal `done` (issue #1000). One entry,
+      // targetId = the job id — the same target the `job.submitted` entry used at
+      // creation time (src/routes/assets.ts POST /ingest-url), so the audit trail
+      // for an ingest job opens and closes on the same object. `system` origin +
+      // action/targetType/detail shape mirror the transcode completion entry
+      // (src/pipeline/transcode.ts:326-340). Emitted AFTER the durable job +
+      // asset writes, and only on the single attempt that actually succeeded (we
+      // return immediately), so a retried pull emits exactly one terminal entry.
+      emitAudit(
+        deps.audit,
+        {
+          actor: originActor('system'),
+          action: 'job.completed',
+          targetType: 'job',
+          targetId: jobId,
+          // No `sourceUrl`: a pull source may be a pre-signed URL carrying
+          // credentials in its query string, and the audit store is queryable.
+          detail: { jobType: 'ingest-url', assetId, bytesTransferred }
+        },
+        deps.auditLog
+      );
       return;
     } catch (err) {
       // Release any reservation taken this attempt so a failed/retried pull
@@ -158,8 +294,42 @@ export async function runPull(
     }
   }
 
-  // Terminal failure: record the error on the job and move the asset to failed.
+  // Terminal failure: nothing more will be written to this object key under
+  // this job, so give back the multipart upload the last attempt left open
+  // (issue #1088). The next write would have discarded it anyway, but a job
+  // that is never redriven would otherwise leave staged part bytes sitting in
+  // the bucket indefinitely.
+  await discardOrphanedUpload(deps, objectKey, jobId);
+
+  // Record the error on the job and move the asset to failed.
   const message = lastError instanceof Error ? lastError.message : String(lastError);
   await deps.jobs.update(jobId, { status: 'failed', error: message });
   await deps.assets.update(assetId, { status: 'failed' });
+  // Operational log: the `ingest` stage reached terminal failure (issue #995).
+  // One entry for the run's terminal outcome — the per-attempt errors stay on
+  // `onAttemptError` so the log is not flooded by the retry loop.
+  logPipelineEvent(
+    deps.pipelineLog,
+    {
+      stage: 'ingest',
+      level: 'error',
+      message: `asset ${assetId} (job ${jobId}) failed after ${attemptsUsed} attempt(s): ${message}`
+    },
+    deps.pipelineLogErrors
+  );
+  // Audit: ingest-url job reached terminal `failed` (issue #1000). Reached only
+  // after the retry loop is exhausted or a permanent error short-circuits it, so
+  // a retried attempt does NOT emit — exactly one terminal entry per job, same
+  // shape as the transcode failure entry (src/pipeline/transcode.ts:275-288).
+  emitAudit(
+    deps.audit,
+    {
+      actor: originActor('system'),
+      action: 'job.failed',
+      targetType: 'job',
+      targetId: jobId,
+      detail: { jobType: 'ingest-url', assetId, error: message }
+    },
+    deps.auditLog
+  );
 }
