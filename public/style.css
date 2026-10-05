@@ -553,26 +553,68 @@ tr.row-locked td:first-child {
   flex-wrap: wrap;
 }
 
-.export-result-link {
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.export-result-id {
+/* The selected destination's non-secret coordinates (under the picker), and the
+   verified coordinates of a completed export (in the success message). Same
+   label/value pair treatment in both places, so "where it would go" and "where
+   it went" read as the same kind of fact. */
+.export-destination-detail,
+.export-result-facts {
   display: flex;
-  align-items: center;
-  gap: 6px;
+  flex-direction: column;
+  gap: 2px;
   margin-top: 6px;
   font-size: 12px;
 }
 
-/* "Export is not available on this deployment" (design spec §5).
+.export-fact {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.export-fact-label {
+  color: var(--text-muted);
+  min-width: 92px;
+}
+
+.export-fact-value {
+  /* An object key or bucket name can be long and must stay readable rather than
+     stretch the detail pane. */
+  overflow-wrap: anywhere;
+}
+
+.export-result-line {
+  font-weight: 600;
+}
+
+.export-retry {
+  margin-top: 8px;
+}
+
+/* An export whose outcome is UNKNOWN (504 delivery_timeout) — the copy may still
+   complete at the destination. Deliberately neither .msg-success nor .msg-error:
+   amber, because the honest statement is "we do not know", and dressing it as
+   either a success or a settled failure is exactly the false report this feature
+   exists to avoid. */
+.msg-warn {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+/* The three standing states of the export block (design spec §5 and the two
+   variants it deferred until a destination-carrying endpoint existed):
+   data-outcome="not-configured" (501 — no destination storage on this
+   deployment), "no-destinations" (configured, but nothing registered) and
+   "destinations-unreadable" (the list could not be read, so nothing can be
+   claimed either way).
    Deliberately NOT .msg-error: in this UI red means "that failed, try again",
-   and a 501 is the deployment's standing configuration state, which no retry
-   changes. Also NOT .msg-unrecoverable, whose copy and
+   and the first two are the deployment's standing configuration state, which no
+   retry changes. Also NOT .msg-unrecoverable, whose copy and
    data-outcome="unrecoverable" semantics belong to the 410 tombstone. Same
    shape as that component — heavy left rule, uppercase label row — in its own
-   palette, with data-outcome="not-configured" on the element so the two are
+   palette, with its own data-outcome on the element so all of them are
    distinguishable without matching on prose. */
 .msg-not-configured {
   background: rgba(148, 163, 184, 0.08);

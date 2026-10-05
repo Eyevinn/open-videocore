@@ -2,167 +2,271 @@
  * open-videocore ops dashboard — export-action.js
  *
  * The "Export" block on the asset detail view (issue #945, broken out of #796):
- * pick a container format, optionally name the output, trigger the export, and
- * read the outcome truthfully.
+ * pick one of the export destinations this deployment has registered, trigger
+ * the export, and read the outcome truthfully.
  *
- * Copy and visual treatment for the four states below are NOT invented here.
- * They are taken from the interaction spec written for the prerequisite design
- * ticket #911 — `docs/design/export-action-states.md` (§1 vocabulary, §2 in
- * progress, §3 succeeded, §4 failed, §5 not available). Where this module
- * departs from the letter of that spec it says so inline, with the reason.
+ * Copy and visual treatment follow the interaction spec written for the
+ * prerequisite design ticket #911 — `docs/design/export-action-states.md`
+ * (§1 vocabulary, §2 in progress, §3 succeeded, §4 failed, §5 not available),
+ * which lands with that ticket's own branch (`issue-911/export-action-states`).
+ * That spec was written BEFORE a destination-carrying endpoint existed and said
+ * so explicitly: its §0 note "Named export destinations are a different
+ * contract" ends with *"If a future ticket wires the export action to accept a
+ * named `destination` …, this document's §4 state needs a second variant for
+ * 'destinations registry configured but nothing registered'"*. Issue #1131 is
+ * that ticket, so this module implements the spec's shape against the
+ * destination endpoint and adds the two states the spec deferred:
+ * "no destinations are registered" and "the destination list could not be
+ * read".
  *
  * Everything operator-visible is written with `textContent` / `createElement`.
- * No server string ever reaches `innerHTML` — including the 502 `message`,
+ * No server string ever reaches `innerHTML` — including a 502/504 `message`,
  * which is third-party-derived text.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CONTRACT GROUNDING (CLAUDE.md rule 7 — fetched before any call was written)
  *
- * Read from this repo's generated spec and route source on this branch, plus the
- * contract note written for the outcome-honesty prerequisite (#944). Nothing is
- * taken from issue text.
+ * Read from route source and the generated spec in this repo. Nothing is taken
+ * from issue text.
  *
- *   Write — `openapi.json .paths["/api/v1/assets/{id}/export"].post`
+ *   Read — `GET /api/v1/export-destinations`
+ *     Handler: `app.get('/')`, src/routes/export-destinations.ts:279-288,
+ *       mounted at prefix `/api/v1/export-destinations` (src/main.ts:2448-2449);
+ *       `openapi.json .paths["/api/v1/export-destinations/"].get`.
+ *     No parameters. Responses: exactly `200` and `501`.
+ *       200 = `destinationListSchema` (export-destinations.ts:125-127):
+ *         `{ destinations: DestinationView[] }`.
+ *         `DestinationView` = `destinationViewSchema` (:95-123):
+ *           `{ id, name, role: 'source'|'packaged'|'both'|'archive',
+ *              backend: 'external', bucket, accessKeyId, endpointUrl?,
+ *              region?, publicBaseUrl?, pathTemplate?, hasSessionToken,
+ *              deletable, createdAt,
+ *              credentials: { accessKeyId, secretAccessKey: '***redacted***',
+ *                             sessionToken?: '***redacted***' } }`.
+ *         The list is ALREADY filtered server-side to the two output-serving
+ *         roles (`isExportDestination`, :174-176), so no role filtering is
+ *         strictly needed here; the client filter below is defence only.
+ *       501 = `{ error: 'not_configured', message: 'export destinations are not
+ *         configured' }` (:236-239, sent at :283) — no storage-backend registry
+ *         (and therefore no credential store) on this deployment.
+ *     THE IMPLICIT OSC-MANAGED DEFAULT IS ALWAYS IN THIS LIST.
+ *       `StorageBackendRegistry.list` unconditionally prepends
+ *       `defaultBackendView()` (src/services/storage-backend-registry.ts:686-693
+ *       and :138-153): `{ id: 'default', name: 'OSC-managed default',
+ *       role: 'both', deletable: false }`, and role `'both'` passes the
+ *       destinations view's own filter. So `200 { destinations: [] }` is NOT
+ *       reachable while the registry is wired — "nothing is registered" shows up
+ *       as a list containing ONLY that default entry. It is filtered out of the
+ *       picker here because the export endpoint REFUSES it by name (below): it
+ *       is the store the asset already lives in, not somewhere to export to.
+ *       Its id is `DEFAULT_BACKEND_ID = 'default'`
+ *       (storage-backend-registry.ts:57), mirrored as
+ *       `OSC_MANAGED_DEFAULT_ID` below.
+ *
+ *   Write — `POST /api/v1/assets/{id}/deliver` (issue #1131, PR #1158)
+ *     Handler: `app.post('/:id/deliver', …)`, src/routes/assets.ts (the
+ *       "Deliver an EXISTING asset to a registered export destination" block).
+ *       Verified on branch `issue-1131/deliver-endpoint`, which also adds
+ *       `openapi.json .paths["/api/v1/assets/{id}/deliver"].post`. That PR is
+ *       open at the time of writing, so this module is written against the
+ *       endpoint's declared contract and its tests stub it; nothing here
+ *       requires a live backend.
  *     parameters: exactly one — path `id` (string, required). No query params.
  *     requestBody: `required: true`, `application/json`, schema
- *       `{ targetFormat: 'mp4'|'mkv'|'mov'|'mxf'|'ts'` (the ONLY required
- *       property)`, outputName?: string(minLength 1, maxLength 256),
- *       asVersion?: boolean }`, `additionalProperties: false`.
- *       Source of truth: `exportBodySchema`, src/routes/assets.ts:723-730.
- *     responses: exactly `201, 400, 404, 409, 501, 502`
- *       (src/routes/assets.ts:5204-5211).
- *       201 = `assetSchema` — the NEW CHILD asset (`src/routes/assets.ts:5255`,
- *         `return reply.code(201).send(child)`). Fields this module reads:
- *         `id`, `name`, `status` (`'ready'` on a 201), `objectKey`.
- *       400 = `errorSchema` `{ error, message? }` — unsupported `targetFormat`
- *         (Zod enum at the edge; `UnsupportedFormatError` defensively in
- *         src/pipeline/rewrap.ts).
- *       404 = `{ error: 'not_found' }` (src/routes/assets.ts:5215-5217).
- *         Existence is deliberately not distinguished from "not yours".
- *       409 = `{ error: 'no_object', message: 'asset has no stored source
- *         object to process' }` — `NO_SOURCE_OBJECT_ERROR` /
- *         `NO_SOURCE_OBJECT_MESSAGE`, src/pipeline/source-object.ts:31/37, sent
- *         by the shared `requireSourceObject` (:96-104) called at
- *         src/routes/assets.ts:5220-5221.
- *       501 = `{ error: 'not_configured', message: 'export / re-wrap is not
- *         configured' }` (src/routes/assets.ts:5222-5227, fired when
- *         `!opts.rewrapRunner || !storageFor`). The SAME `error` code is sent by
- *         `resolveConfiguredRunner` (src/routes/assets.ts:2053-2069, the 501 at
- *         :2064) when the stack cannot supply the runner's S3 config, carrying
- *         the factory's own `message` — both are the one condition this module
- *         calls "not available on this deployment".
- *       502 = `{ error: 'rewrap_failed', message: <single sentence> }`
- *         (src/routes/assets.ts:5268-5269). The ffmpeg log is logged
- *         SERVER-SIDE ONLY (`oscJobLog(err)` at :5262-5265) and is NEVER in
- *         `message` — a deliberate security position, so there is no extra
- *         failure detail for this UI to fetch or offer.
- *
- *   Format vocabulary — `REWRAP_FORMATS = ['mp4','mkv','mov','mxf','ts']`,
- *     src/pipeline/rewrap.ts:30, consumed by `exportBodySchema` via
- *     `z.enum(REWRAP_FORMATS)` (src/routes/assets.ts:724). `EXPORT_FORMATS`
- *     below mirrors that list and nothing else; the picker can therefore only
- *     ever submit a value the enum accepts.
- *
- *   Synchronous, so there is nothing to poll — the route AWAITS the runner
- *     (src/routes/assets.ts:5238-5255) and the response IS the outcome. No job
- *     id, no callback, no `processing` child to follow. Hence §2's indeterminate
- *     busy state and no progress bar.
- *
- *   `201` is falsifiable (docs/findings/export-truthful-status-944.md §6):
- *     a job-status allow-list (`SUCCESS_STATUSES`, src/pipeline/osc-rewrap.ts:85),
- *     an object HEAD + non-empty check (src/pipeline/rewrap.ts:171-176), and only
- *     then the `ready` transition. A 201 therefore means the output object has been
- *     confirmed present and non-empty, so the success copy may name it. A failed
- *     export leaves the child `failed` with NO `objectKey`, so it can never
- *     serve a plausible-looking link to bytes that do not exist — which is why
- *     the failure state links to nothing.
+ *       `{ destination: string(minLength 1, maxLength 256) }` — the ONLY
+ *       property, `additionalProperties: false` (`deliverBodySchema`). The value
+ *       is the stable id OR the human name of a registered output-role
+ *       destination; this module always sends the id it read from the list.
+ *     responses: exactly `200, 400, 404, 409, 422, 501, 502, 504`.
+ *       200 = `deliverResultSchema`:
+ *         `{ assetId, status: 'delivered', destination: { id, name,
+ *            role: 'packaged'|'both' }, bucket, objectKey, bytes, etag,
+ *            deliveredAt }`.
+ *         `status` has the single literal value `'delivered'` and is sent ONLY
+ *         after the object was re-read at the destination with the source's byte
+ *         count, so a 200 cannot mean "submitted" or "probably". The success
+ *         state below therefore names the verified coordinates — and still
+ *         checks the literal, rather than treating any 2xx as a success.
+ *       400 = `errorSchema` `{ error: 'bad_request', message }` — the reference
+ *         names no registered destination, or names the OSC-managed default.
+ *       404 = `{ error: 'not_found' }` — unknown/foreign asset; existence is
+ *         deliberately not distinguished from "not yours".
+ *       409 = `{ error: 'no_object', message: 'asset has no stored source object
+ *         to process' }` (`NO_SOURCE_OBJECT_ERROR`,
+ *         src/pipeline/source-object.ts:31/37, via the shared
+ *         `requireSourceObject`), or `{ error: 'source_missing', message }` —
+ *         the document named an object the source bucket does not have, so there
+ *         was nothing to copy.
+ *       422 = `{ error: 'backend_role' | 'destination_unreachable' |
+ *         'destination_unresolved' | 'source_too_large', message }` — refusals
+ *         decided BEFORE any bytes moved. `destination_unreachable` is the
+ *         common one in practice: a destination registered at its own
+ *         `endpointUrl` cannot be delivered to from here, because its secret
+ *         access key is stored write-only in OSC per-service secrets and cannot
+ *         be read back (`destinationEndpointRefusal`,
+ *         src/pipeline/asset-delivery.ts) — the endpoint refuses rather than
+ *         copying to a same-named bucket on our own store and reporting a
+ *         success for bytes the operator never received.
+ *       501 = `{ error: 'not_configured', message }` — no storage-backend
+ *         registry, or no object storage, on this deployment.
+ *       502 = `{ error: 'delivery_failed', message }` — the copy failed, or the
+ *         store reported success and the object is not actually there
+ *         (`copy_failed` / `not_landed`, `DELIVERY_FAILURE_RESPONSE`).
+ *       504 = `{ error: 'delivery_timeout', message }` — the delivery did not
+ *         settle within the bound, so the outcome is GENUINELY UNKNOWN. This is
+ *         the one case that must be reported as neither success nor clean
+ *         failure; `EXPORT_COPY.unsettled` + `unsettledAdvice` below say exactly
+ *         that, and the module never falls back to "export failed" for it.
+ *     The honesty rule applied to all of the above — report what was verified,
+ *       and never derive an outcome from "the call returned without throwing" —
+ *       is the one `docs/findings/export-truthful-status-944.md` (issue #944,
+ *       this ticket's stated prerequisite) established for the other export
+ *       endpoint.
  *
  *   Authorisation — the role×action matrix `MATRIX` (src/auth/authorize.ts:54-58:
  *     `viewer { read: true, write: false }`, editor/admin all true) with the
  *     action derived by `methodToAction` (:79-92: POST -> `write`), applied by
- *     `resourceAuthorizationPreHandler('asset')` (:126, registered
- *     src/routes/assets.ts:1773). A `viewer` is refused the POST with 403
- *     `AUTHZ_FORBIDDEN_ERROR = 'forbidden_insufficient_role'` (:99). `canExport`
- *     is the caller's client-role mirror; the 403 path below runs regardless,
- *     because the server is the authority. (403 is not in the route's declared
- *     response map because the preHandler sends it ahead of the handler.)
+ *     `resourceAuthorizationPreHandler('asset')` (:126, registered in
+ *     src/routes/assets.ts). A `viewer` is refused the POST with 403
+ *     `AUTHZ_FORBIDDEN_ERROR = 'forbidden_insufficient_role'` (:99) — but may
+ *     still READ the destinations list, so the list is fetched for every role and
+ *     the picker is simply not offered to a `viewer`. `canExport` is the caller's
+ *     client-role mirror; the 403 path below runs regardless, because the server
+ *     is the authority. (403 is not in the route's declared response map because
+ *     the preHandler sends it ahead of the handler.)
  *
  *   NOT rendered, because the contract does not support it:
  *
- *   1. A DESTINATION PICKER. `exportBodySchema` has NO destination field of any
- *      kind (see above). The named export-destinations registry
- *      (`GET /api/v1/export-destinations`, src/routes/export-destinations.ts) is
- *      consumed EXCLUSIVELY by `POST /:id/package` and `POST /:id/execute` via
- *      their optional `destination` body property, resolved by
- *      `resolveJobDestination` / `StorageBackendRegistry.resolveDestinationBucket`
- *      (src/routes/assets.ts:2137-2266). `POST /:id/export` never consults that
- *      registry and cannot be gated by it: it always writes to the workspace's
- *      own provisioned storage (`storageFor()`), at
- *      `exports/<newAssetId>.<format>` (`rewrapObjectKey`,
- *      src/pipeline/rewrap.ts:62). Offering destinations here would present a
- *      choice the request cannot carry. `docs/design/export-action-states.md`
- *      §0 ("Named export destinations are a different contract — do not
- *      conflate them") establishes this and maps the issue's
- *      "no destinations configured" criterion onto the condition this endpoint
- *      can actually produce: its own `501 not_configured` (§5).
- *   2. A PROGRESS BAR OR ELAPSED-TIME ESTIMATE. No partial-progress signal
- *      exists (see "Synchronous" above).
- *   3. AN IMMEDIATE DOWNLOAD LINK. `assetFileSchema.type` declares an `'export'`
- *      member (src/routes/assets.ts:665) that NO code path ever assigns — the
- *      files handler (:4210 onwards) only pushes `'source'` or `'rendition'` — so a
- *      `.filter(f => f.type === 'export')` would silently match nothing. This
- *      module reads `id`/`name`/`objectKey` straight off the 201 body instead
- *      and links to the child's detail view, which needs no second request.
- *   4. THE FFMPEG REASON for a 502. Server-side only, by design.
+ *   1. A CONTAINER-FORMAT PICKER. `deliverBodySchema` has exactly one property
+ *      (above): this endpoint moves the bytes that already exist, so there is no
+ *      format, profile or output name to choose. Re-wrapping into another
+ *      container is a DIFFERENT contract — `POST /:id/export`
+ *      (`exportBodySchema` = `{ targetFormat, outputName?, asVersion? }`), which
+ *      in turn has no destination field and always writes to the workspace's own
+ *      storage. The two are not conflated here.
+ *   2. A PROGRESS BAR OR PERCENTAGE. The endpoint awaits the copy and the
+ *      response IS the outcome; there is no job id, no poll route and no
+ *      partial-progress signal, so §2's busy state is deliberately
+ *      indeterminate.
+ *   3. A LINK TO A NEW ASSET. A delivery creates NO asset — it copies an
+ *      existing object to another bucket. The success state names the verified
+ *      bucket/key instead, which is what the response actually carries.
+ *   4. A DOWNLOAD LINK AT THE DESTINATION. The response carries no URL, and a
+ *      destination's `publicBaseUrl` is optional operator config that this
+ *      endpoint does not claim the delivered object is reachable under. Guessing
+ *      one would be inventing a location.
  */
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
 
 /**
- * The container formats the endpoint accepts, mirroring `REWRAP_FORMATS`
- * (src/pipeline/rewrap.ts:30) in order. The picker is built from this list and
- * from nothing else, so the client cannot submit a value the `z.enum` rejects.
+ * The id of the implicit OSC-managed default backend, mirroring
+ * `DEFAULT_BACKEND_ID` (src/services/storage-backend-registry.ts:57).
+ *
+ * It is always present in `GET /api/v1/export-destinations` and the export
+ * endpoint refuses it with a 400 ("the platform-managed default store the asset
+ * already lives in, not an export destination"), so it must never reach the
+ * picker.
  */
-export const EXPORT_FORMATS = Object.freeze(['mp4', 'mkv', 'mov', 'mxf', 'ts']);
+export const OSC_MANAGED_DEFAULT_ID = 'default';
 
 /**
- * Operator-visible copy, fixed by `docs/design/export-action-states.md`.
+ * The destination roles that can receive an export: the output-serving roles.
  *
- * §1 pins the vocabulary: the action is "Export" (never "re-wrap" — that is the
- * pipeline's internal name), what `targetFormat` picks is a "container format"
- * (never a "codec": a rewrap copies streams, nothing is re-encoded), and the
+ * Mirrors `isExportDestination` (src/routes/export-destinations.ts:174-176) and
+ * the export endpoint's own role refusal (422 `backend_role`). The listing
+ * endpoint already applies this filter, so this is defence in depth only.
+ */
+export const DELIVERABLE_ROLES = Object.freeze(['packaged', 'both']);
+
+/**
+ * The remaining two members of the declared role enum
+ * (`destinationViewSchema.role`, src/routes/export-destinations.ts:98):
+ * read/cold storage, which the export endpoint refuses with a 422
+ * `backend_role`.
+ *
+ * The filter below excludes THESE rather than keeping only
+ * `DELIVERABLE_ROLES`, so a role value added to the server's enum in future is
+ * still offered: the listing endpoint has already decided the entry is a
+ * destination, and the API is the authority on its own vocabulary. Excluding
+ * the two known-bad values keeps the defence where it is actually needed.
+ */
+export const NON_DELIVERABLE_ROLES = Object.freeze(['source', 'archive']);
+
+/** `GET`/`POST` paths, relative to the UI's `/api/v1` base (`apiFetch`). */
+export const DESTINATIONS_PATH = '/export-destinations';
+
+/**
+ * The asset-scoped export path. Takes the ULID: sub-resource routes do not
+ * resolve slugs.
+ *
+ * @param {string} assetId
+ * @returns {string}
+ */
+export function exportPathFor(assetId) {
+  return '/assets/' + encodeURIComponent(String(assetId)) + '/deliver';
+}
+
+/**
+ * Operator-visible copy.
+ *
+ * `docs/design/export-action-states.md` §1 pins the vocabulary: the action is
+ * "Export" (never the pipeline's internal "deliver"/"re-wrap" names), and the
  * asset being exported is the "source" (never "original"/"parent").
  */
 export const EXPORT_COPY = Object.freeze({
   heading: 'Export',
-  /** Explains what the action does and where the output goes. */
+  /** Explains what the action does, where the output goes, and what a success means. */
   intro:
-    'Export copies this asset’s source into another container format without ' +
-    're-encoding it. The result is saved as a new asset in this deployment’s ' +
-    'own storage.',
-  formatLabel: 'Container format',
-  nameLabel: 'Export name (optional)',
-  nameHint:
-    'Leave blank to name the export after its source and the chosen format.',
+    'Export copies this asset’s stored file to one of the export destinations ' +
+    'registered on this deployment. The file is copied as-is — nothing is ' +
+    're-encoded. The result is reported only after the object has been re-read ' +
+    'at the destination.',
+  destinationLabel: 'Destination',
+  destinationHint:
+    'Destinations registered on this deployment. The platform-managed default ' +
+    'store is not listed: it is where this asset already lives.',
   submit: 'Export',
   busy: 'Exporting…',
+  loading: 'Loading destinations…',
   /** §2 — in progress. */
-  inProgress: function (format) {
-    return 'Exporting to ' + formatLabel(format) + '…';
+  inProgress: function (destination) {
+    return 'Exporting to ' + destinationLabel(destination) + '…';
   },
-  /** §3 — succeeded (201). The child's name follows, as a link. */
-  succeeded: function (format) {
-    return 'Exported to ' + formatLabel(format) + '.';
+  /** §3 — succeeded (200, `status: 'delivered'`). The verified coordinates follow. */
+  succeeded: function (destination) {
+    return 'Exported to ' + destinationLabel(destination) + '.';
   },
+  /** §3 — labels for the verified facts the 200 body carries. */
+  factBucket: 'Bucket',
+  factObjectKey: 'Object key',
+  factBytes: 'Size',
+  factEtag: 'ETag',
+  factDeliveredAt: 'Verified at',
   /** §4 — failed (502). The server's own sentence follows, verbatim. */
-  failed: function (format) {
-    return 'Export to ' + formatLabel(format) + ' failed:';
+  failed: function (destination) {
+    return 'Export to ' + destinationLabel(destination) + ' failed:';
   },
-  /** §4 table — 400. Defensive: the picker only offers accepted values. */
-  errUnsupportedFormat: 'Unsupported export format.',
+  /** §4 (new variant) — refused before any bytes moved (422). */
+  refused: function (destination) {
+    return 'Export to ' + destinationLabel(destination) + ' was refused:';
+  },
+  /**
+   * §4 (new variant) — 504. The outcome is genuinely unknown, so this must read
+   * as neither a success nor a clean failure.
+   */
+  unsettled: function (destination) {
+    return 'Export to ' + destinationLabel(destination) + ' did not settle:';
+  },
+  unsettledAdvice:
+    'The outcome is unknown — the copy may still complete at the destination. ' +
+    'Check the destination bucket before exporting again.',
+  /** §4 table — 400: the picker offered a destination the API does not have. */
+  errUnknownDestination:
+    'That destination is no longer registered. The list has been reloaded.',
   /** §4 table — 404. Does not narrow which of "gone" or "not yours". */
   errNotFound: 'This asset no longer exists.',
-  /** §4 table — 409. Prefers naming the asset over the generic server sentence. */
+  /** §4 table — 409 `no_object`. Prefers naming the asset over the generic sentence. */
   errNoObject: function (sourceName) {
     return (sourceName && String(sourceName).trim()
       ? String(sourceName).trim()
@@ -176,8 +280,19 @@ export const EXPORT_COPY = Object.freeze({
    */
   errNetwork: 'Could not reach the API. Nothing was exported.',
   /**
-   * 403 from `resourceAuthorizationPreHandler` (see CONTRACT GROUNDING). Not a
-   * state the design spec covers, because it is not an export outcome — the
+   * A 2xx whose body does not carry the one terminal value the contract
+   * declares. Reported rather than assumed, because "the call returned" is not
+   * evidence that an object landed.
+   */
+  errUnconfirmed: function (status) {
+    return (
+      'The API answered without confirming the export' +
+      (status ? ' (status “' + String(status) + '”)' : '') +
+      '. Check the destination before assuming anything landed.'
+    );
+  },
+  /**
+   * 403 from `resourceAuthorizationPreHandler`. Not an export outcome — the
    * request never reached the handler. Wording mirrors the house precedent for
    * the identical gate on the review-state and lock blocks.
    */
@@ -187,90 +302,181 @@ export const EXPORT_COPY = Object.freeze({
   readOnly:
     'Your role can see this asset but cannot export it. Ask an editor or ' +
     'administrator.',
-  /** §5 — not available on this deployment (501). */
+  /** §5 — no destination storage configured at all (501). */
   notConfiguredLabel: 'Export not available',
   notConfiguredTitle: 'Export is not available on this deployment',
   notConfiguredBody:
-    'This deployment has not configured an export service. Ask an operator to ' +
-    'provision export before this action can be used here.',
+    'This deployment has no export destination storage configured. Ask an ' +
+    'operator to configure it before this action can be used here.',
   /** Prefix for the server's own 501 sentence, when it carries one. */
   notConfiguredDetailPrefix: 'The API reported: ',
+  /**
+   * §5 second variant (the one the design spec deferred until a destination
+   * endpoint existed): destination storage IS configured, but no destination has
+   * been registered, so there is nowhere to export to. Distinct from the 501
+   * above, because the operator action that fixes it is different.
+   */
+  noDestinationsLabel: 'No destinations',
+  noDestinationsTitle: 'No export destinations are registered',
+  noDestinationsBody:
+    'This deployment has export destination storage configured but no ' +
+    'destination registered, so there is nowhere to export to. An operator can ' +
+    'register one with POST /api/v1/export-destinations; it will appear here.',
+  noDestinationsDefaultNote:
+    'The platform-managed default store is not an export destination — it is ' +
+    'where this asset already lives.',
+  /**
+   * The list itself could not be read (anything other than a 200 or the 501
+   * above). NOT reported as "no destinations are registered": we do not know
+   * that, and claiming it would be the same class of false statement this
+   * feature exists to avoid.
+   */
+  unreadableLabel: 'Destinations unavailable',
+  unreadableTitle: 'Could not load the export destinations',
+  unreadableBody:
+    'The destination list could not be read, so no destination can be offered. ' +
+    'This says nothing about whether destinations are registered.',
+  retry: 'Retry',
 });
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────
 
 /**
- * The display rendering of a container format: the wire value, uppercased.
+ * The display label for a destination: its operator-chosen `name`, falling back
+ * to its stable `id`.
  *
- * §2/§3 of the spec: uppercase for display only — never a longer, invented
- * format name the contract does not carry. A value this build has not heard of
- * still renders (uppercased) rather than becoming "unknown": the API is the
- * authority on the vocabulary.
+ * Accepts either a destination view or a plain string (the label already
+ * resolved), so the copy helpers can be called with whichever the caller holds.
  *
- * @param {unknown} format
+ * @param {unknown} destination
  * @returns {string}
  */
-export function formatLabel(format) {
-  if (typeof format !== 'string' || format === '') return '';
-  return format.toUpperCase();
+export function destinationLabel(destination) {
+  if (destination == null) return '';
+  if (typeof destination === 'string') return destination;
+  const d = /** @type {{ name?: unknown, id?: unknown }} */ (destination);
+  if (typeof d.name === 'string' && d.name.trim()) return d.name.trim();
+  if (typeof d.id === 'string' && d.id.trim()) return d.id.trim();
+  return '';
 }
 
 /**
- * Normalise the optional `outputName` for the request body.
+ * The destinations from a `GET /api/v1/export-destinations` 200 body that this
+ * action may offer.
  *
- * `outputName` is `string().min(1).max(256)` (src/routes/assets.ts:725), so an
- * empty or whitespace-only field must be OMITTED rather than sent as `''` —
- * sending `''` would be a 400 for a field the operator left blank on purpose.
- * Over-long input is NOT silently truncated (that would export under a name the
- * operator did not choose); it is reported as invalid so the field can be
- * corrected.
+ * Two exclusions, each for a reason the export endpoint itself enforces:
+ *   - the implicit OSC-managed default (`id === 'default'`), which the endpoint
+ *     refuses with a 400 because it is the store the asset already lives in. It
+ *     is ALWAYS in the list (see CONTRACT GROUNDING), so without this filter the
+ *     picker's first entry would be a guaranteed 400;
+ *   - an entry whose `role` is one of the two read/cold roles
+ *     (`NON_DELIVERABLE_ROLES`), which the endpoint refuses with a 422
+ *     `backend_role`. The listing endpoint already filters these out, so this
+ *     only fires if that ever changes.
+ * An entry whose `role` is absent or is a value this build has not heard of is
+ * KEPT: the API is the authority on its own vocabulary, and the listing endpoint
+ * has already decided the entry is a destination.
  *
- * @param {unknown} raw
- * @returns {{ ok: true, value?: string } | { ok: false, reason: 'too-long' }}
+ * Anything without a usable `id` is dropped — there would be nothing to send.
+ *
+ * @param {unknown} body the parsed 200 body, or an array of views
+ * @returns {Array<object>}
  */
-export function normaliseOutputName(raw) {
-  if (raw == null) return { ok: true };
-  const trimmed = String(raw).trim();
-  if (trimmed === '') return { ok: true };
-  if (trimmed.length > 256) return { ok: false, reason: 'too-long' };
-  return { ok: true, value: trimmed };
+export function deliverableDestinations(body) {
+  const list = Array.isArray(body)
+    ? body
+    : body && Array.isArray(/** @type {{destinations?: unknown}} */ (body).destinations)
+      ? /** @type {{destinations: Array<unknown>}} */ (body).destinations
+      : [];
+  return list.filter(function (entry) {
+    if (!entry || typeof entry !== 'object') return false;
+    const d = /** @type {{ id?: unknown, role?: unknown }} */ (entry);
+    if (typeof d.id !== 'string' || d.id.trim() === '') return false;
+    if (d.id === OSC_MANAGED_DEFAULT_ID) return false;
+    if (typeof d.role === 'string' && NON_DELIVERABLE_ROLES.includes(d.role)) return false;
+    return true;
+  });
 }
 
 /**
- * Build the request body for `POST /api/v1/assets/{id}/export`.
+ * The non-secret coordinates of a destination, as fact/value pairs for the
+ * detail line under the picker.
  *
- * Exactly the declared properties and no others — the schema is
- * `additionalProperties: false`. `asVersion` is deliberately not offered by this
- * block: it changes how the export is LINKED to its source (version chain,
- * issue #118) rather than what is exported, and is the version-chain surface's
- * concern, not this action's. Omitting it takes the documented default
- * (`false`).
+ * Only fields the view actually declares are shown, and only non-secret ones:
+ * `bucket`, `pathTemplate` (operator config, echoed by design), `endpointUrl`
+ * and `role`. The `credentials` object is never read — its `secretAccessKey` is
+ * the fixed redaction marker, and echoing a marker would only suggest there is
+ * a secret here to look at.
  *
- * @param {string} format
- * @param {string} [outputName] already normalised by `normaliseOutputName`
- * @returns {{ targetFormat: string, outputName?: string }}
+ * @param {object} destination
+ * @returns {Array<{ label: string, value: string }>}
  */
-export function buildExportBody(format, outputName) {
-  const body = { targetFormat: format };
-  if (outputName) body.outputName = outputName;
-  return body;
+export function describeDestination(destination) {
+  const d = /** @type {Record<string, unknown>} */ (destination || {});
+  const facts = [];
+  const push = function (label, value) {
+    if (typeof value === 'string' && value.trim()) facts.push({ label, value: value.trim() });
+  };
+  push('Bucket', /** @type {string} */ (d['bucket']));
+  push('Path template', /** @type {string} */ (d['pathTemplate']));
+  push('Endpoint', /** @type {string} */ (d['endpointUrl']));
+  push('Role', /** @type {string} */ (d['role']));
+  push('Id', /** @type {string} */ (d['id']));
+  return facts;
 }
 
 /**
- * Classify a thrown `apiFetch` error into the state this block should enter.
+ * Build the request body for `POST /api/v1/assets/{id}/deliver`.
+ *
+ * Exactly the one declared property and no others — the schema is
+ * `additionalProperties: false`, so an invented key would be a 400. The value is
+ * the destination's stable `id` (the endpoint also accepts its name; the id is
+ * sent because it cannot be ambiguous).
+ *
+ * @param {string} destinationId
+ * @returns {{ destination: string }}
+ */
+export function buildDeliverBody(destinationId) {
+  return { destination: String(destinationId) };
+}
+
+/**
+ * Human-readable byte count for the verified size in a 200 body. Decimal units,
+ * matching the house `formatBytes` convention in public/app.js.
+ *
+ * @param {unknown} bytes
+ * @returns {string}
+ */
+export function formatDeliveredBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '';
+  if (bytes < 1000) return bytes + ' B';
+  const units = ['kB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1000;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value = value / 1000;
+    unit += 1;
+  }
+  return (value < 10 ? value.toFixed(1) : Math.round(value)) + ' ' + units[unit];
+}
+
+/**
+ * Classify a thrown `apiFetch` error from the EXPORT request into the state this
+ * block should enter.
  *
  * `apiFetch` (public/app.js) attaches `err.status` and the parsed `err.body`,
  * and sets `err.message` to `body.message || body.error || 'HTTP <status>'` —
- * so for a 502 `err.message` IS the server's `message` field verbatim, which is
- * what §4 requires the UI to print.
+ * so for a 502/504 `err.message` IS the server's `message` field verbatim, which
+ * is what §4 requires the UI to print.
  *
  * `notConfigured` is keyed on the status AND on the `error` code, because the
- * same 501 condition is reachable from two call sites with different `message`
- * text (see CONTRACT GROUNDING).
+ * 501 condition is reachable from two call sites with different `message` text
+ * (no registry; no object storage).
  *
  * @param {{status?: number, body?: {error?: string, message?: string}, message?: string}} err
- * @param {{format?: string, sourceName?: string}} [ctx]
- * @returns {{ kind: string, message: string, detail?: string, notConfigured: boolean, forbidden: boolean }}
+ * @param {{destination?: unknown, sourceName?: string}} [ctx]
+ * @returns {{ kind: string, message: string, detail?: string, notConfigured: boolean,
+ *             forbidden: boolean, unsettled: boolean, staleList: boolean }}
  */
 export function classifyExportError(err, ctx) {
   const e = err || {};
@@ -278,76 +484,125 @@ export function classifyExportError(err, ctx) {
   const status = typeof e.status === 'number' ? e.status : undefined;
   const code = e.body && typeof e.body.error === 'string' ? e.body.error : '';
   const serverMessage = typeof e.message === 'string' ? e.message : '';
+  const dest = c.destination;
+  const base = {
+    notConfigured: false,
+    forbidden: false,
+    unsettled: false,
+    staleList: false,
+  };
 
   if (status === 501 || code === 'not_configured') {
-    return {
+    return Object.assign({}, base, {
       kind: 'not-configured',
       message: EXPORT_COPY.notConfiguredTitle,
       // The server's own sentence, shown as supporting detail rather than as
       // the headline: the headline must name the condition (acceptance
-      // criterion), and 'export / re-wrap is not configured' leaks the
-      // pipeline's internal name, which §1 keeps out of primary copy.
+      // criterion), and the API's wording names internal machinery.
       detail: serverMessage,
       notConfigured: true,
-      forbidden: false,
-    };
+    });
   }
   if (status === 403) {
-    return {
+    return Object.assign({}, base, {
       kind: 'forbidden',
       message: EXPORT_COPY.errForbidden,
-      notConfigured: false,
       forbidden: true,
-    };
+    });
   }
   if (status === 400) {
-    return {
-      kind: 'bad-format',
-      message: EXPORT_COPY.errUnsupportedFormat,
-      notConfigured: false,
-      forbidden: false,
-    };
+    // The picker offered something the API does not have (removed between the
+    // list and the click). The list is reloaded by the caller, so say so.
+    return Object.assign({}, base, {
+      kind: 'unknown-destination',
+      message: EXPORT_COPY.errUnknownDestination,
+      detail: serverMessage,
+      staleList: true,
+    });
   }
   if (status === 404) {
-    return {
+    return Object.assign({}, base, {
       kind: 'not-found',
       message: EXPORT_COPY.errNotFound,
-      notConfigured: false,
-      forbidden: false,
-    };
+    });
   }
-  if (status === 409 || code === 'no_object') {
-    return {
+  if (code === 'no_object') {
+    return Object.assign({}, base, {
       kind: 'no-object',
       message: EXPORT_COPY.errNoObject(c.sourceName),
-      notConfigured: false,
-      forbidden: false,
-    };
+    });
   }
-  if (status === 502 || code === 'rewrap_failed') {
+  if (status === 409) {
+    // `source_missing`: the document named an object the bucket does not have.
+    // The server's sentence says which, so it is printed verbatim.
+    return Object.assign({}, base, {
+      kind: 'source-missing',
+      message: EXPORT_COPY.failed(dest) + ' ' + serverMessage,
+    });
+  }
+  if (status === 422) {
+    // Refused before any bytes moved — a destination this API cannot write to or
+    // verify, a non-output role, or an over-size source. All caller-actionable,
+    // and none of them mean a partial copy happened.
+    return Object.assign({}, base, {
+      kind: 'refused',
+      message: EXPORT_COPY.refused(dest) + ' ' + serverMessage,
+    });
+  }
+  if (status === 504 || code === 'delivery_timeout') {
+    // The one outcome that is neither success nor clean failure. Never collapse
+    // this into "failed": the copy may still complete store-side.
+    return Object.assign({}, base, {
+      kind: 'unsettled',
+      message:
+        EXPORT_COPY.unsettled(dest) +
+        ' ' +
+        serverMessage +
+        ' ' +
+        EXPORT_COPY.unsettledAdvice,
+      unsettled: true,
+    });
+  }
+  if (status === 502 || code === 'delivery_failed') {
     // §4: print the server's sentence, never a generic "Export failed".
-    return {
+    return Object.assign({}, base, {
       kind: 'failed',
-      message: EXPORT_COPY.failed(c.format) + ' ' + serverMessage,
-      notConfigured: false,
-      forbidden: false,
-    };
+      message: EXPORT_COPY.failed(dest) + ' ' + serverMessage,
+    });
   }
   if (status === undefined) {
-    return {
+    return Object.assign({}, base, {
       kind: 'network',
       message: EXPORT_COPY.errNetwork,
-      notConfigured: false,
-      forbidden: false,
-    };
+    });
   }
   // Any other status: report what the API said rather than inventing a cause.
-  return {
+  return Object.assign({}, base, {
     kind: 'other',
-    message: EXPORT_COPY.failed(c.format) + ' ' + (serverMessage || 'HTTP ' + status),
-    notConfigured: false,
-    forbidden: false,
-  };
+    message: EXPORT_COPY.failed(dest) + ' ' + (serverMessage || 'HTTP ' + status),
+  });
+}
+
+/**
+ * Classify a thrown `apiFetch` error from the DESTINATION LIST request.
+ *
+ * The list has exactly two declared responses, so there are exactly two states:
+ * the deployment has no destination storage (501), or we could not read the list
+ * (anything else, including a transport failure). The second is deliberately NOT
+ * folded into "no destinations are registered" — we do not know that.
+ *
+ * @param {{status?: number, body?: {error?: string, message?: string}, message?: string}} err
+ * @returns {{ notConfigured: boolean, message: string }}
+ */
+export function classifyDestinationsError(err) {
+  const e = err || {};
+  const status = typeof e.status === 'number' ? e.status : undefined;
+  const code = e.body && typeof e.body.error === 'string' ? e.body.error : '';
+  const serverMessage = typeof e.message === 'string' ? e.message : '';
+  if (status === 501 || code === 'not_configured') {
+    return { notConfigured: true, message: serverMessage };
+  }
+  return { notConfigured: false, message: serverMessage };
 }
 
 // ─── DOM helpers ─────────────────────────────────────────────────────────────
@@ -359,79 +614,127 @@ function el(tag, className, text) {
   return node;
 }
 
+/**
+ * The shared shape for the three standing-state blocks below: an uppercase label
+ * row, a title, a body, and optional extra lines.
+ *
+ * Deliberately NOT a `.msg-error` (none of these is something that just failed
+ * and might work on retry) and NOT `.msg-unrecoverable` (that component's copy
+ * and `data-outcome="unrecoverable"` semantics belong to the 410 tombstone and
+ * talk about purging). It borrows that component's SHAPE through its own
+ * `.msg-not-configured` class and carries its own `data-outcome` value, so a
+ * test or a future view can tell them apart without matching on prose.
+ */
+function standingState(outcome, label, title, body, extras) {
+  const block = el('div', 'msg msg-not-configured');
+  block.setAttribute('data-outcome', outcome);
+  // Programmatically focusable WITHOUT entering the tab order, so the mount can
+  // move focus here when this state replaces a form the operator had just
+  // submitted — otherwise the control they activated disappears and the
+  // explanation is never announced. Nothing inside it is interactive (the
+  // unreadable state adds its own button, which is a tab stop in its own
+  // right), so the block itself is not a tab stop (WCAG 2.4.3).
+  block.setAttribute('tabindex', '-1');
+  block.setAttribute('role', 'status');
+  block.appendChild(el('span', 'not-configured-label', label));
+  block.appendChild(el('span', 'not-configured-title', title));
+  block.appendChild(el('span', 'not-configured-body', body));
+  (extras || []).forEach(function (line) {
+    if (line) block.appendChild(el('span', 'not-configured-detail', line));
+  });
+  return block;
+}
+
 // ─── Rendering ───────────────────────────────────────────────────────────────
 
 /**
- * The §5 "export is not available on this deployment" block.
+ * §5 — "export is not available on this deployment" (a 501 from either call).
  *
- * PURE: no fetch, no listeners. Deliberately NOT a `.msg-error` (this is the
- * deployment's standing state, not something that just failed and might work on
- * retry) and NOT `.msg-unrecoverable` (that component's copy and
- * `data-outcome="unrecoverable"` semantics belong to the 410 tombstone and talk
- * about purging, which does not apply). It borrows that component's SHAPE — a
- * heavy left rule and an uppercase label row — through its own
- * `.msg-not-configured` class, and carries `data-outcome="not-configured"` so a
- * test or a future view can tell the two apart without matching on prose.
- *
- * No format picker, no name field and no submit button are rendered in this
- * state: greying out live inputs would imply "temporarily disabled", which
- * contradicts the explanation.
+ * PURE: no fetch, no listeners. No picker and no submit button are rendered in
+ * this state: greying out live controls would imply "temporarily disabled",
+ * which contradicts the explanation.
  *
  * @param {string} [serverMessage] the 501 body's `message`, if one was seen
  * @returns {HTMLElement}
  */
 export function renderExportNotConfigured(serverMessage) {
-  const block = el('div', 'msg msg-not-configured');
-  block.setAttribute('data-outcome', 'not-configured');
-  // Programmatically focusable WITHOUT entering the tab order, so the mount can
-  // move focus here when this state replaces a form the operator had just
-  // submitted — otherwise the control they activated disappears and the
-  // explanation is never announced. Nothing inside it is interactive, so it is
-  // not a tab stop (WCAG 2.4.3).
-  block.setAttribute('tabindex', '-1');
-  block.setAttribute('role', 'status');
-  block.appendChild(
-    el('span', 'not-configured-label', EXPORT_COPY.notConfiguredLabel)
-  );
-  block.appendChild(
-    el('span', 'not-configured-title', EXPORT_COPY.notConfiguredTitle)
-  );
-  block.appendChild(
-    el('span', 'not-configured-body', EXPORT_COPY.notConfiguredBody)
-  );
   const detail = serverMessage == null ? '' : String(serverMessage).trim();
-  if (detail) {
-    block.appendChild(
-      el(
-        'span',
-        'not-configured-detail',
-        EXPORT_COPY.notConfiguredDetailPrefix + detail
-      )
-    );
-  }
+  return standingState(
+    'not-configured',
+    EXPORT_COPY.notConfiguredLabel,
+    EXPORT_COPY.notConfiguredTitle,
+    EXPORT_COPY.notConfiguredBody,
+    [detail ? EXPORT_COPY.notConfiguredDetailPrefix + detail : '']
+  );
+}
+
+/**
+ * §5 second variant — destination storage is configured, but nothing is
+ * registered (a 200 whose only entries are ones this action may not use).
+ *
+ * This is issue #945's "if no destinations are configured, the UI explains that
+ * plainly instead of presenting an empty or failing action": no empty `<select>`,
+ * no submit button that could only 400.
+ *
+ * @returns {HTMLElement}
+ */
+export function renderNoDestinations() {
+  return standingState(
+    'no-destinations',
+    EXPORT_COPY.noDestinationsLabel,
+    EXPORT_COPY.noDestinationsTitle,
+    EXPORT_COPY.noDestinationsBody,
+    [EXPORT_COPY.noDestinationsDefaultNote]
+  );
+}
+
+/**
+ * The list could not be read. Says only that, and offers a retry — the one
+ * state here that a retry can change.
+ *
+ * @param {string} [serverMessage]
+ * @returns {HTMLElement}
+ */
+export function renderDestinationsUnreadable(serverMessage) {
+  const detail = serverMessage == null ? '' : String(serverMessage).trim();
+  const block = standingState(
+    'destinations-unreadable',
+    EXPORT_COPY.unreadableLabel,
+    EXPORT_COPY.unreadableTitle,
+    EXPORT_COPY.unreadableBody,
+    [detail ? EXPORT_COPY.notConfiguredDetailPrefix + detail : '']
+  );
+  const retry = el('button', 'btn-ghost export-retry', EXPORT_COPY.retry);
+  retry.type = 'button';
+  retry.id = 'btn-export-destinations-retry';
+  block.appendChild(retry);
   return block;
 }
 
 /**
  * Build the whole Export block for one render.
  *
- * PURE: no fetch, no listeners — `mountExportAction` wires the form it returns.
+ * PURE: no fetch, no listeners — `mountExportAction` wires what it returns.
  *
- * THE GATE on `targetFormat`: one `<option>` per entry of `EXPORT_FORMATS` and
- * by no other route — no free-text field, no "other format" affordance — so a
- * value the endpoint's `z.enum` would reject has no control to originate from.
+ * THE GATE on `destination`: one `<option>` per entry of the live list and by no
+ * other route — no free-text field — so the submitted value is always an id the
+ * API just said it has.
  *
- * ACCESSIBILITY: a real `<form>` (so Enter submits), every control bound to a
+ * ACCESSIBILITY: a real `<form>` (so Enter submits), the select bound to a
  * visible `<label for>`, the message host an `aria-live="polite"` region so an
  * outcome that does not move focus is still announced (WCAG 2.1 AA 4.1.3), and
  * the submit control described by the intro text so it announces what it does.
  *
- * @param {{ canExport?: boolean, notConfigured?: boolean, notConfiguredMessage?: string }} [opts]
- * @returns {{ block: HTMLElement, form: HTMLElement|null, formatSelect: HTMLElement|null,
- *             nameInput: HTMLElement|null, submitBtn: HTMLElement|null, msgHost: HTMLElement }}
+ * @param {{ destinations?: Array<object>, canExport?: boolean, loading?: boolean,
+ *           notConfigured?: boolean, notConfiguredMessage?: string,
+ *           unreadable?: boolean, unreadableMessage?: string }} [opts]
+ * @returns {{ block: HTMLElement, form: HTMLElement|null, destinationSelect: HTMLElement|null,
+ *             submitBtn: HTMLElement|null, retryBtn: HTMLElement|null,
+ *             detailHost: HTMLElement|null, msgHost: HTMLElement }}
  */
 export function renderExportBlock(opts) {
   const o = opts || {};
+  const destinations = Array.isArray(o.destinations) ? o.destinations : [];
 
   const block = el('div', 'mt12 export-block');
   block.id = 'export-action';
@@ -448,37 +751,59 @@ export function renderExportBlock(opts) {
   msgHost.id = 'export-msg';
   msgHost.setAttribute('aria-live', 'polite');
 
+  const bare = function (extra) {
+    block.appendChild(msgHost);
+    return Object.assign(
+      {
+        block,
+        form: null,
+        destinationSelect: null,
+        submitBtn: null,
+        retryBtn: null,
+        detailHost: null,
+        msgHost,
+      },
+      extra || {}
+    );
+  };
+
   if (o.notConfigured) {
     // §5: the form is not rendered at all in this state.
     block.appendChild(renderExportNotConfigured(o.notConfiguredMessage));
-    block.appendChild(msgHost);
-    return {
-      block,
-      form: null,
-      formatSelect: null,
-      nameInput: null,
-      submitBtn: null,
-      msgHost,
-    };
+    return bare();
+  }
+
+  if (o.unreadable) {
+    const notice = renderDestinationsUnreadable(o.unreadableMessage);
+    block.appendChild(notice);
+    return bare({ retryBtn: notice.querySelector('#btn-export-destinations-retry') });
+  }
+
+  if (o.loading) {
+    const pending = el('div', 'mt8 text-muted export-loading', EXPORT_COPY.loading);
+    pending.id = 'export-loading';
+    pending.setAttribute('role', 'status');
+    pending.style.fontSize = '12px';
+    block.appendChild(pending);
+    return bare();
   }
 
   if (o.canExport === false) {
-    // Pre-emptive mirror of the ADR-018 role matrix: a `viewer` holds `read`
-    // but not `write`, so the POST would be a guaranteed 403. Explaining the
-    // absence beats offering a control that cannot work.
+    // Pre-emptive mirror of the role matrix: a `viewer` holds `read` but not
+    // `write`, so the POST would be a guaranteed 403. Explaining the absence
+    // beats offering a control that cannot work.
     const roleNote = el('div', 'mt8 export-role-note', EXPORT_COPY.readOnly);
     roleNote.id = 'export-role-note';
     roleNote.style.fontSize = '12px';
     block.appendChild(roleNote);
-    block.appendChild(msgHost);
-    return {
-      block,
-      form: null,
-      formatSelect: null,
-      nameInput: null,
-      submitBtn: null,
-      msgHost,
-    };
+    return bare();
+  }
+
+  if (destinations.length === 0) {
+    // §5 second variant — explained plainly, with no empty picker and no
+    // submit button that could only fail.
+    block.appendChild(renderNoDestinations());
+    return bare();
   }
 
   const form = el('form', 'mt8 export-form');
@@ -488,38 +813,28 @@ export function renderExportBlock(opts) {
   // in the one aria-live region.
   form.setAttribute('novalidate', 'novalidate');
 
-  const formatRow = el('div', 'export-field');
-  const formatLabelEl = el('label', 'export-field-label', EXPORT_COPY.formatLabel);
-  formatLabelEl.setAttribute('for', 'export-format');
-  const formatSelect = el('select', 'export-format-select');
-  formatSelect.id = 'export-format';
-  formatSelect.name = 'targetFormat';
-  EXPORT_FORMATS.forEach(function (fmt) {
-    const option = el('option', null, formatLabel(fmt));
-    option.value = fmt;
-    formatSelect.appendChild(option);
+  const row = el('div', 'export-field');
+  const labelEl = el('label', 'export-field-label', EXPORT_COPY.destinationLabel);
+  labelEl.setAttribute('for', 'export-destination');
+  const select = el('select', 'export-destination-select');
+  select.id = 'export-destination';
+  select.name = 'destination';
+  destinations.forEach(function (dest) {
+    const option = el('option', null, destinationLabel(dest));
+    // The value is the stable id, which is what the request carries.
+    option.value = String(dest.id);
+    select.appendChild(option);
   });
-  formatRow.appendChild(formatLabelEl);
-  formatRow.appendChild(formatSelect);
-  form.appendChild(formatRow);
-
-  const nameRow = el('div', 'mt8 export-field');
-  const nameLabelEl = el('label', 'export-field-label', EXPORT_COPY.nameLabel);
-  nameLabelEl.setAttribute('for', 'export-output-name');
-  const nameInput = el('input', 'export-name-input');
-  nameInput.id = 'export-output-name';
-  nameInput.name = 'outputName';
-  nameInput.type = 'text';
-  // The schema's own bound (src/routes/assets.ts:725), so the field cannot hold
-  // a value the API would reject for length.
-  nameInput.setAttribute('maxlength', '256');
-  const nameHint = el('div', 'export-field-hint', EXPORT_COPY.nameHint);
-  nameHint.id = 'export-name-hint';
-  nameInput.setAttribute('aria-describedby', nameHint.id);
-  nameRow.appendChild(nameLabelEl);
-  nameRow.appendChild(nameInput);
-  nameRow.appendChild(nameHint);
-  form.appendChild(nameRow);
+  const hint = el('div', 'export-field-hint', EXPORT_COPY.destinationHint);
+  hint.id = 'export-destination-hint';
+  const detailHost = el('div', 'export-destination-detail');
+  detailHost.id = 'export-destination-detail';
+  select.setAttribute('aria-describedby', hint.id + ' ' + detailHost.id);
+  row.appendChild(labelEl);
+  row.appendChild(select);
+  row.appendChild(hint);
+  row.appendChild(detailHost);
+  form.appendChild(row);
 
   const submitBtn = el('button', 'btn-ghost export-submit', EXPORT_COPY.submit);
   submitBtn.id = 'btn-export-asset';
@@ -530,25 +845,42 @@ export function renderExportBlock(opts) {
   form.appendChild(actions);
 
   block.appendChild(form);
-  block.appendChild(msgHost);
-  return { block, form, formatSelect, nameInput, submitBtn, msgHost };
+  return Object.assign(bare(), { form, destinationSelect: select, submitBtn, detailHost });
+}
+
+/**
+ * Fill the detail line under the picker with the selected destination's
+ * non-secret coordinates.
+ *
+ * PURE apart from writing into `host`. Every value goes in as `textContent`.
+ *
+ * @param {HTMLElement|null} host
+ * @param {object|undefined} destination
+ */
+export function renderDestinationDetail(host, destination) {
+  if (!host) return;
+  while (host.firstChild) host.removeChild(host.firstChild);
+  if (!destination) return;
+  describeDestination(destination).forEach(function (fact) {
+    const line = el('span', 'export-fact');
+    line.appendChild(el('span', 'export-fact-label', fact.label));
+    line.appendChild(el('span', 'export-fact-value text-mono', fact.value));
+    host.appendChild(line);
+  });
 }
 
 // ─── Mount ───────────────────────────────────────────────────────────────────
 
 /**
- * Whether a 501 has already been seen in this page session.
+ * Whether a 501 has already been seen in this page session, and the sentence it
+ * carried.
  *
- * §5 asks for the unavailable state to be detected "ahead of the click, not
- * after". The API exposes NO capability probe for export (there is no
- * capabilities endpoint, and the only way to ask `/export` is to perform one,
- * which would create a child asset), so a pre-flight probe cannot be built
- * without fabricating a request. §5 explicitly permits lazy detection on first
- * submit, with the same wording. This memo makes that detection stick: the
- * first 501 anywhere in the session means every later render of this block
- * opens in the §5 state instead of offering the form again — which is the
- * "once per session" timing §5 asks for, reached by the only honest route the
- * contract leaves open.
+ * §5 asks for the unavailable state to be detected ahead of the click. The
+ * destination list IS that probe — it declares the same 501 the export call
+ * does — so this block always opens in the right state rather than discovering
+ * it on submit. The memo makes a 501 from the EXPORT call stick too: the first
+ * one anywhere in the session means every later render opens in the §5 state
+ * instead of offering the form again.
  */
 let notConfiguredSeen = false;
 let notConfiguredMessage = '';
@@ -565,7 +897,7 @@ export function resetExportAvailability() {
 }
 
 /**
- * Render the "Export" block and wire its form.
+ * Render the "Export" block, load the live destination list, and wire the form.
  *
  * The block is inserted before `anchorEl` when given, else appended to `host`.
  *
@@ -580,17 +912,21 @@ export function resetExportAvailability() {
  * @param {boolean}     [opts.canExport] client-role mirror of the role matrix
  * @param {Function}    opts.apiFetch
  * @param {(root: ParentNode) => void} [opts.wireCopyIds] house click-to-copy wiring
- * @param {(assetId: string) => any}   [opts.onOpenAsset] open the new child's detail
- * @param {(child: object) => any}     [opts.onExported] called with the 201 body
- * @returns {{ block: HTMLElement }}
+ * @param {(result: object) => any}    [opts.onExported] called with the 200 body
+ * @returns {{ block: HTMLElement|null, reload: () => Promise<void> }}
  */
 export function mountExportAction(opts) {
   const o = opts || {};
   const apiFetch = o.apiFetch;
-  const path = '/assets/' + encodeURIComponent(String(o.assetId)) + '/export';
+  const path = exportPathFor(o.assetId);
 
   let rendered = null;
   let placed = false;
+  /** The live list, as last read. */
+  let destinations = [];
+  let unreadable = false;
+  let unreadableMessage = '';
+  let loading = true;
 
   function place(block) {
     if (!placed) {
@@ -612,9 +948,9 @@ export function mountExportAction(opts) {
    * REPLACES the in-progress message, so a stale "Exporting…" can never sit
    * next to the result that contradicts it. This is also why the house
    * `showMsg` helper is not used here: it appends and self-removes after 6s,
-   * and it writes `textContent` only, so it cannot carry §3's link to the new
-   * asset. The `.msg .msg-<kind>` classes it applies ARE reused, so the visual
-   * treatment is the house one.
+   * and it writes `textContent` only, so it cannot carry §3's fact list. The
+   * `.msg .msg-<kind>` classes it applies ARE reused, so the visual treatment
+   * is the house one.
    */
   function setMsg(kind) {
     const host = rendered ? rendered.msgHost : null;
@@ -625,11 +961,24 @@ export function mountExportAction(opts) {
     return msg;
   }
 
+  function selectedDestination() {
+    if (!rendered || !rendered.destinationSelect) return undefined;
+    const id = rendered.destinationSelect.value;
+    for (let i = 0; i < destinations.length; i++) {
+      if (String(destinations[i].id) === String(id)) return destinations[i];
+    }
+    return undefined;
+  }
+
   function draw() {
     const next = renderExportBlock({
+      destinations: destinations,
       canExport: o.canExport !== false,
+      loading: loading,
       notConfigured: notConfiguredSeen,
       notConfiguredMessage: notConfiguredMessage,
+      unreadable: unreadable,
+      unreadableMessage: unreadableMessage,
     });
     place(next.block);
     rendered = next;
@@ -639,45 +988,126 @@ export function mountExportAction(opts) {
         void submit();
       });
     }
+    if (next.destinationSelect) {
+      next.destinationSelect.addEventListener('change', function () {
+        renderDestinationDetail(rendered.detailHost, selectedDestination());
+      });
+      renderDestinationDetail(next.detailHost, selectedDestination());
+    }
+    if (next.retryBtn) {
+      next.retryBtn.addEventListener('click', function () {
+        void load();
+      });
+    }
   }
 
-  /** §3 — the success block: the outcome sentence, the child's name as a link,
-   *  and its ULID as click-to-copy monospace text. */
-  function reportSuccess(format, child) {
+  /**
+   * Load the live destination list.
+   *
+   * Called on mount and by the retry control. The list is re-read rather than
+   * cached across asset views, because the acceptance criterion is the
+   * CURRENTLY configured destinations.
+   */
+  async function load() {
+    if (notConfiguredSeen) {
+      loading = false;
+      draw();
+      return;
+    }
+    if (!loading) {
+      // A retry (or a reload after a stale-list 400): show the pending state
+      // again. On the first load the block is already in it, so it is not
+      // re-rendered for nothing.
+      loading = true;
+      unreadable = false;
+      unreadableMessage = '';
+      draw();
+    }
+    let body;
+    try {
+      body = await apiFetch(DESTINATIONS_PATH);
+    } catch (err) {
+      const c = classifyDestinationsError(err);
+      loading = false;
+      if (c.notConfigured) {
+        notConfiguredSeen = true;
+        notConfiguredMessage = c.message || '';
+      } else {
+        // NOT reported as "no destinations are registered" — we do not know
+        // that, and saying so would be the false statement this feature exists
+        // to avoid.
+        unreadable = true;
+        unreadableMessage = c.message || '';
+      }
+      draw();
+      return;
+    }
+    destinations = deliverableDestinations(body);
+    loading = false;
+    draw();
+  }
+
+  /** §3 — the success block: the outcome sentence plus the verified coordinates. */
+  function reportSuccess(label, result) {
     const msg = setMsg('success');
     if (!msg) return;
-    msg.appendChild(document.createTextNode(EXPORT_COPY.succeeded(format) + ' '));
-    const id = child && child.id != null ? String(child.id) : '';
-    const name = child && child.name != null && String(child.name).trim()
-      ? String(child.name)
-      : id;
-    if (name) {
-      const link = el('a', 'export-result-link', name);
-      link.href = '#';
-      link.setAttribute('data-asset-id', id);
-      if (typeof o.onOpenAsset === 'function' && id) {
-        link.addEventListener('click', function (event) {
-          if (event && typeof event.preventDefault === 'function') event.preventDefault();
-          o.onOpenAsset(id);
-        });
+    const r = /** @type {Record<string, unknown>} */ (result || {});
+    // Prefer the destination name the SERVER resolved (`destination.name` on the
+    // 200 body) over the client's label: it comes from the record the bytes
+    // actually went to.
+    const serverDest = r['destination'];
+    const resolvedLabel =
+      serverDest && typeof serverDest === 'object'
+        ? destinationLabel(serverDest) || label
+        : label;
+    msg.appendChild(el('div', 'export-result-line', EXPORT_COPY.succeeded(resolvedLabel)));
+
+    const facts = [];
+    if (typeof r['bucket'] === 'string') {
+      facts.push({ label: EXPORT_COPY.factBucket, value: String(r['bucket']), copy: false });
+    }
+    if (typeof r['objectKey'] === 'string') {
+      facts.push({
+        label: EXPORT_COPY.factObjectKey,
+        value: String(r['objectKey']),
+        // The one value a developer wants to paste into a client or an
+        // `aws s3` call, so it gets the house click-to-copy affordance.
+        copy: true,
+      });
+    }
+    const bytes = formatDeliveredBytes(r['bytes']);
+    if (bytes) facts.push({ label: EXPORT_COPY.factBytes, value: bytes, copy: false });
+    if (typeof r['etag'] === 'string' && r['etag']) {
+      facts.push({ label: EXPORT_COPY.factEtag, value: String(r['etag']), copy: false });
+    }
+    if (typeof r['deliveredAt'] === 'string' && r['deliveredAt']) {
+      facts.push({
+        label: EXPORT_COPY.factDeliveredAt,
+        value: String(r['deliveredAt']),
+        copy: false,
+      });
+    }
+
+    const list = el('div', 'export-result-facts');
+    facts.forEach(function (fact) {
+      const line = el('div', 'export-fact');
+      line.appendChild(el('span', 'export-fact-label', fact.label));
+      line.appendChild(el('span', 'export-fact-value text-mono', fact.value));
+      if (fact.copy) {
+        // Same click-to-copy convention the rest of the UI uses
+        // (public/copy-id.js). Built with DOM rather than that module's HTML
+        // helper so no string concatenation reaches innerHTML here.
+        const copyBtn = el('button', 'copy-id-btn', 'Copy');
+        copyBtn.type = 'button';
+        copyBtn.setAttribute('data-copy-id', fact.value);
+        copyBtn.setAttribute('aria-live', 'polite');
+        copyBtn.setAttribute('aria-label', 'Copy exported object key ' + fact.value);
+        line.appendChild(copyBtn);
       }
-      msg.appendChild(link);
-    }
-    if (id) {
-      // Same click-to-copy id convention the rest of the UI uses
-      // (public/copy-id.js). Built with DOM rather than that module's HTML
-      // helper so no string concatenation reaches innerHTML here.
-      const idRow = el('div', 'export-result-id');
-      idRow.appendChild(el('span', 'cell-id cell-id-value text-mono', id));
-      const copyBtn = el('button', 'copy-id-btn', 'Copy');
-      copyBtn.type = 'button';
-      copyBtn.setAttribute('data-copy-id', id);
-      copyBtn.setAttribute('aria-live', 'polite');
-      copyBtn.setAttribute('aria-label', 'Copy export asset id ' + id);
-      idRow.appendChild(copyBtn);
-      msg.appendChild(idRow);
-      if (typeof o.wireCopyIds === 'function') o.wireCopyIds(idRow);
-    }
+      list.appendChild(line);
+    });
+    msg.appendChild(list);
+    if (typeof o.wireCopyIds === 'function') o.wireCopyIds(list);
   }
 
   function reportError(text, kind) {
@@ -687,35 +1117,32 @@ export function mountExportAction(opts) {
 
   async function submit() {
     if (!rendered || !rendered.form) return;
-    const format = rendered.formatSelect.value;
-    const name = normaliseOutputName(rendered.nameInput.value);
-    if (!name.ok) {
-      // Refused locally against the schema's own bound, so an over-long name is
-      // never silently truncated into an export nobody asked for.
-      reportError(
-        'Export name must be 256 characters or fewer. Shorten it and try again.'
-      );
-      rendered.nameInput.focus();
+    const dest = selectedDestination();
+    const ref = rendered.destinationSelect.value;
+    if (!ref) {
+      // Defensive: the picker is only rendered with at least one entry.
+      reportError(EXPORT_COPY.noDestinationsTitle);
       return;
     }
+    const label = destinationLabel(dest) || ref;
 
-    const controls = [rendered.submitBtn, rendered.formatSelect, rendered.nameInput];
+    const controls = [rendered.submitBtn, rendered.destinationSelect];
     const prevLabel = rendered.submitBtn.textContent;
-    // §2: disable the submit control AND the inputs for the duration. There is
+    // §2: disable the submit control AND the picker for the duration. There is
     // nothing to interrupt (no job id, no cancel contract), and a second submit
-    // in flight would create a second, unrelated child asset.
+    // in flight would start a second, unrelated copy.
     controls.forEach(function (c) { c.disabled = true; });
     rendered.submitBtn.textContent = EXPORT_COPY.busy;
-    reportError(EXPORT_COPY.inProgress(format), 'info');
+    reportError(EXPORT_COPY.inProgress(label), 'info');
 
-    let child;
+    let result;
     try {
-      child = await apiFetch(path, {
+      result = await apiFetch(path, {
         method: 'POST',
-        body: JSON.stringify(buildExportBody(format, name.value)),
+        body: JSON.stringify(buildDeliverBody(ref)),
       });
     } catch (err) {
-      const c = classifyExportError(err, { format: format, sourceName: o.sourceName });
+      const c = classifyExportError(err, { destination: label, sourceName: o.sourceName });
       if (c.notConfigured) {
         // §5: this is the deployment's standing state, so the form stops being
         // offered for the rest of the session rather than being re-enabled.
@@ -731,8 +1158,8 @@ export function mountExportAction(opts) {
         if (notice && typeof notice.focus === 'function') notice.focus();
         return;
       }
-      // §4: the inputs stay as the operator left them — nothing about a 502
-      // says they were wrong — and the action stays retryable.
+      // The inputs stay as the operator left them — nothing about a 502/504
+      // says the destination choice was wrong — and the action stays retryable.
       controls.forEach(function (ctl) { ctl.disabled = false; });
       rendered.submitBtn.textContent = prevLabel;
       if (c.forbidden) {
@@ -751,23 +1178,42 @@ export function mountExportAction(opts) {
         }
         return;
       }
-      reportError(c.message);
+      // The 504 outcome is unknown, not failed: it gets the warning treatment
+      // rather than the error one, so it does not read as a settled failure.
+      reportError(c.message, c.unsettled ? 'warn' : 'error');
+      if (c.staleList) {
+        // The API no longer has the destination the picker offered. Re-read the
+        // list so the stale entry stops being offered — but keep the message,
+        // which `load()`'s re-render would otherwise drop.
+        const text = c.message;
+        await load();
+        reportError(text);
+      }
       return;
     }
 
     controls.forEach(function (c) { c.disabled = false; });
     rendered.submitBtn.textContent = prevLabel;
-    // The name field is cleared because the export it named now exists; keeping
-    // it would invite a second export under a name already taken.
-    rendered.nameInput.value = '';
-    reportSuccess(format, child);
-    if (typeof o.onExported === 'function') await o.onExported(child);
+    const status = result && typeof result === 'object'
+      ? /** @type {{status?: unknown}} */ (result).status
+      : undefined;
+    if (status !== 'delivered') {
+      // The contract declares exactly one terminal value for a 200. Anything
+      // else is reported as unconfirmed rather than celebrated: "the call
+      // returned" is not evidence that an object landed.
+      reportError(EXPORT_COPY.errUnconfirmed(typeof status === 'string' ? status : ''));
+      return;
+    }
+    reportSuccess(label, result);
+    if (typeof o.onExported === 'function') await o.onExported(result);
   }
 
   draw();
+  void load();
   return {
     get block() {
       return rendered ? rendered.block : null;
     },
+    reload: load,
   };
 }
