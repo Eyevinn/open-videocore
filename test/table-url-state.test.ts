@@ -16,7 +16,8 @@
 //     PARAM_KEYS, SORT_DIR, BASE_DEFAULTS
 //
 // Param schema (namespaced as `<ns>.<key>`): sort (`field`/`-field`), status
-// (comma set), q (text), from/to (ISO dates), page (1-based), cursor, size.
+// (comma set), q (text), from/to (ISO dates), page (1-based), cursor, size,
+// cols (comma set of column keys — VIEW state, issue #959).
 //
 // We assert: (1) encode/decode round-trips, (2) namespacing keeps sibling
 // tables from colliding, (3) tolerant parsing of malformed/absent params
@@ -49,6 +50,7 @@ describe('schema constants', () => {
       page: 'page',
       cursor: 'cursor',
       size: 'size',
+      cols: 'cols',
     });
   });
 
@@ -68,11 +70,17 @@ describe('decodeTableState — defaults & absent params', () => {
       sort: null,
       status: [],
       q: '',
+      // Structured asset filters (issue #914). Both default to [] = NO filter,
+      // like `status` — an absent param must never narrow a list.
+      tags: [],
+      meta: [],
       from: null,
       to: null,
       page: 1,
       cursor: null,
       size: 20,
+      // `cols` defaults to null = UNSPECIFIED, not [] — see the cols block below.
+      cols: null,
     });
   });
 
@@ -182,6 +190,95 @@ describe('decodeTableState — paging & tolerant parsing', () => {
     expect(() => decodeTableState('%%%&&&=&assets.size=%zz', 'assets')).not.toThrow();
     const s = decodeTableState('%%%&&&=&assets.size=%zz', 'assets');
     expect(s.size).toBe(20); // degraded to default
+  });
+});
+
+// ─── decode/encode: cols (visible column set — VIEW state, issue #959) ───────
+//
+// `cols` is the only param in the schema that is NOT query state: it decides what
+// the table PAINTS, never what it requests. The tests below pin the two rules that
+// distinguishes it from `status` (the other comma-set param):
+//   - empty/garbled decodes to null ("unspecified" -> the table's own default set),
+//     NEVER to [] — "render no columns" is not a view a bad URL may impose;
+//   - a set that differs from the table's declared default IS written, including
+//     when it happens to be every column, because "explicitly all" and "no choice
+//     recorded" resolve differently (the latter falls back to stored prefs).
+
+describe('cols — visible column set', () => {
+  it('decodes a comma-separated set, preserving order and de-duping', () => {
+    const s = decodeTableState('assets.cols=id,title,id,status', 'assets');
+    expect(s.cols).toEqual(['id', 'title', 'status']);
+  });
+
+  it('trims whitespace around each key', () => {
+    expect(decodeTableState('assets.cols=%20id%20,%20title%20', 'assets').cols).toEqual([
+      'id',
+      'title',
+    ]);
+  });
+
+  it('degrades an empty or comma-only value to null, never to an empty set', () => {
+    expect(decodeTableState('assets.cols=', 'assets').cols).toBeNull();
+    expect(decodeTableState('assets.cols=,,,', 'assets').cols).toBeNull();
+    expect(decodeTableState('assets.cols=%20', 'assets').cols).toBeNull();
+  });
+
+  it('falls back to the table default when the param is unusable', () => {
+    const defaults = { cols: ['id', 'title'] };
+    expect(decodeTableState('assets.cols=,,', 'assets', defaults).cols).toEqual(['id', 'title']);
+    expect(decodeTableState('', 'assets', defaults).cols).toEqual(['id', 'title']);
+  });
+
+  it('truncates a hostile list and drops absurdly long keys', () => {
+    const many = Array.from({ length: 300 }, (_, i) => 'c' + i).join(',');
+    const cols = decodeTableState('assets.cols=' + many, 'assets').cols as string[];
+    expect(cols.length).toBe(64);
+    const long = 'x'.repeat(200);
+    expect(decodeTableState('assets.cols=id,' + long, 'assets').cols).toEqual(['id']);
+  });
+
+  it('writes cols when it differs from the default, including "all columns"', () => {
+    // Default is null (unspecified), so ANY explicit set is worth encoding.
+    const p = encodeTableState({ cols: ['thumb', 'id', 'title'] }, 'assets');
+    expect(p.get('assets.cols')).toBe('thumb,id,title');
+  });
+
+  it('omits cols when it matches the table default', () => {
+    const defaults = { cols: ['id', 'title'] };
+    const p = encodeTableState({ cols: ['id', 'title'] }, 'assets', defaults);
+    expect(p.get('assets.cols')).toBeNull();
+  });
+
+  it('omits cols when unspecified', () => {
+    expect(encodeTableState({ cols: null }, 'assets').get('assets.cols')).toBeNull();
+    expect(encodeTableState({}, 'assets').get('assets.cols')).toBeNull();
+  });
+
+  it('round-trips through encode -> decode', () => {
+    const cols = ['id', 'status', 'actions'];
+    const qs = encodeTableStateToQuery({ cols }, 'assets');
+    expect(decodeTableState(qs, 'assets').cols).toEqual(cols);
+  });
+
+  it('is namespaced like every other param', () => {
+    const q = 'assets.cols=id,title&jobs.cols=status';
+    expect(decodeTableState(q, 'assets').cols).toEqual(['id', 'title']);
+    expect(decodeTableState(q, 'jobs').cols).toEqual(['status']);
+  });
+
+  it('clears a stale cols when re-encoding into a live URL without one', () => {
+    // encodeTableState deletes the whole namespace before rewriting, so a table
+    // that stops passing cols leaves no orphan param behind.
+    const into = new URLSearchParams('assets.cols=id&other=keep');
+    const out = encodeTableState({ cols: null }, 'assets', undefined, into);
+    expect(out.get('assets.cols')).toBeNull();
+    expect(out.get('other')).toBe('keep');
+  });
+
+  it('normalizeTableState applies the same coercion in memory', () => {
+    expect(normalizeTableState({ cols: 'id, title ,id' }).cols).toEqual(['id', 'title']);
+    expect(normalizeTableState({ cols: [] }).cols).toBeNull();
+    expect(normalizeTableState({ cols: 42 as unknown as string[] }).cols).toBeNull();
   });
 });
 

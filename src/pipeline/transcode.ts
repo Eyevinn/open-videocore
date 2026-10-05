@@ -29,6 +29,7 @@ import type { EncoreProfile } from './encode-presets.js';
 import type { EncoreClient } from './encore-client.js';
 import { BURN_IN_PROFILE_PARAM_KEY } from './burn-in.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
+import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
 
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
 
@@ -83,6 +84,11 @@ export async function submitTranscode(
     // no-op. A failed audit write is logged, never propagated.
     audit?: AuditEmitter;
     auditLog?: AuditErrorLog;
+    // Best-effort operational log emission (issue #995). Optional, exactly like
+    // `audit` above: when absent no log record is appended and behaviour is
+    // unchanged. Wired to the log store that backs GET /api/v1/logs
+    // (src/main.ts, `logStore`).
+    pipelineLog?: PipelineLogSink;
   }
 ): Promise<SubmitTranscodeResult> {
   // Profile name forwarded verbatim to Encore. Falls back to 'program' —
@@ -109,6 +115,20 @@ export async function submitTranscode(
       targetType: 'job',
       targetId: job.id,
       detail: { jobType: 'transcode', assetId: params.sourceAssetId, profile: profileName }
+    },
+    deps.auditLog
+  );
+
+  // Operational log: the `transcode` stage started (issue #995). Emitted at the
+  // SAME point as the audit entry above — the moment the durable job record
+  // exists — so the Logs tab shows the stage beginning even if the Encore enqueue
+  // below then fails.
+  logPipelineEvent(
+    deps.pipelineLog,
+    {
+      stage: 'transcode',
+      level: 'info',
+      message: `submitted job ${job.id} for asset ${params.sourceAssetId} with profile ${profileName}`
     },
     deps.auditLog
   );
@@ -151,6 +171,21 @@ export async function submitTranscode(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await deps.jobs.update(job.id, { status: 'failed', error: message });
+    // Operational log: the submission itself was rejected (issue #995). This
+    // point has no audit entry (the audit trail records the submission, then the
+    // terminal state from the callback), but for an operator reading the Logs tab
+    // a submit-time rejection is the whole story of the run — it never reaches a
+    // callback, so without this entry the stage would appear to have started and
+    // then gone silent.
+    logPipelineEvent(
+      deps.pipelineLog,
+      {
+        stage: 'transcode',
+        level: 'error',
+        message: `job ${job.id} for asset ${params.sourceAssetId} could not be submitted: ${message}`
+      },
+      deps.auditLog
+    );
     // Best-effort revert: the source could not be transcoded. Under ADR-006 the
     // submit only ENQUEUES the job on the scaler's local queue and does NOT move
     // the source out of `ready` (the scaler's onDispatched advances it to
@@ -225,6 +260,9 @@ export async function completeTranscode(
     // Best-effort audit emission (issue #564). Optional; when absent, no-op.
     audit?: AuditEmitter;
     auditLog?: AuditErrorLog;
+    // Best-effort operational log emission (issue #995). Optional; when absent,
+    // no-op. See submitTranscode's identical dep.
+    pipelineLog?: PipelineLogSink;
   }
 ): Promise<CompleteTranscodeResult> {
   const job = await deps.jobs.get(params.jobId);
@@ -285,6 +323,17 @@ export async function completeTranscode(
       },
       deps.auditLog
     );
+    // Operational log: terminal failure (issue #995). Same first-terminal-write
+    // guard as the audit entry, so a duplicate/late callback appends nothing.
+    logPipelineEvent(
+      deps.pipelineLog,
+      {
+        stage: 'transcode',
+        level: 'error',
+        message: `job ${job.id} for asset ${params.sourceAssetId} failed: ${params.error ?? 'transcode failed'}`
+      },
+      deps.auditLog
+    );
     return { applied: true, renditionCount: 0, renditions: [] };
   }
 
@@ -315,12 +364,43 @@ export async function completeTranscode(
     await deps.assets.update(params.sourceAssetId, { status: 'processing' });
     await deps.assets.update(params.sourceAssetId, { status: 'ready' });
   }
+  // #1023: the failure text the conditional drop settle wrote (if any), captured
+  // BEFORE it is cleared below so the audit entry can still carry it. On a job
+  // that never hit drop-detection this is undefined and nothing changes.
+  const clearedDropError = isConditionalDropFailed ? job.error : undefined;
   await deps.jobs.update(params.jobId, {
     status: 'done',
     progress: 100,
     // #709: a successful completion is a real terminal outcome — clear the
     // conditional-drop marker so the job is no longer flagged reversible.
-    droppedByScaler: false
+    droppedByScaler: false,
+    // #1023: ...and clear the failure text with it, in the SAME write. #709
+    // corrected the status but left `error` in place, so a job that recovered
+    // from a spurious drop settled `done` + `progress: 100` while still carrying
+    // "dropped by Encore: gone from active set with no completion". That is a
+    // terminal success that reads as a failure to every consumer of `error`, and
+    // it poisons "find jobs with an error" triage with drops that recovered.
+    // Applies to the whole success path, not just the correction: a job that ends
+    // `done` carries no error message, whatever happened on the way there.
+    clearError: true,
+    // #1023: ...but the spurious drop must not vanish with the text. Record the
+    // correction ON THE JOB RECORD, in this same write, so it is present on
+    // EVERY correction path and in BOTH repository backends. The audit entry
+    // below is NOT sufficient on its own: `deps.audit` is optional and the
+    // callback poller (src/pipeline/encore-callback-poller.ts) applies
+    // completions with only `{ jobs, assets }`, so emitAudit no-ops there and an
+    // audit-only trace would exist for corrections observed by the internal
+    // callback route and for nothing else. With these two fields a corrected
+    // drop stays diagnosable — and so does a too-short reconcile grace period —
+    // from the job record alone, however the correction arrived. Written only
+    // when this completion actually corrected a conditional drop; a normal
+    // completion leaves both fields absent.
+    ...(isConditionalDropFailed
+      ? {
+          droppedThenRecovered: true,
+          ...(clearedDropError ? { correctedDropError: clearedDropError } : {})
+        }
+      : {})
   });
 
   // Audit: transcode job reached terminal `done` (issue #564). One entry per
@@ -332,7 +412,40 @@ export async function completeTranscode(
       action: 'job.completed',
       targetType: 'job',
       targetId: job.id,
-      detail: { jobType: 'transcode', assetId: params.sourceAssetId, renditionCount: renditions.length }
+      detail: {
+        jobType: 'transcode',
+        assetId: params.sourceAssetId,
+        renditionCount: renditions.length,
+        // #1023: when this completion CORRECTED a conditional drop-detection
+        // failure (#709), note that on the audit entry too — including the
+        // failure text just cleared off the job — so the correction shows up in
+        // the actor/timeline view an operator reads the audit trail for. This is
+        // a SECOND copy of a diagnostic that already lives durably on the job
+        // record (`droppedThenRecovered` / `correctedDropError` in the write
+        // above), not the only copy: this entry is emitted only when a caller
+        // wired `deps.audit`, which the callback poller does not. The audit
+        // detail bag is deliberately free-form (src/data/audit-repo.ts
+        // AuditDetailSchema), so these keys need no schema change. Omitted
+        // entirely on a normal completion.
+        ...(isConditionalDropFailed
+          ? {
+              correctedConditionalDrop: true,
+              ...(clearedDropError ? { clearedDropError } : {})
+            }
+          : {})
+      }
+    },
+    deps.auditLog
+  );
+
+  // Operational log: terminal success (issue #995). One entry per first terminal
+  // transition, matching the audit entry above.
+  logPipelineEvent(
+    deps.pipelineLog,
+    {
+      stage: 'transcode',
+      level: 'info',
+      message: `job ${job.id} for asset ${params.sourceAssetId} completed with ${renditions.length} rendition(s)`
     },
     deps.auditLog
   );
