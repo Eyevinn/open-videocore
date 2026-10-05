@@ -67,7 +67,7 @@ import {
   toTombstoneDocument
 } from './asset-tombstone.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
-import { currentRequestStackName } from '../services/request-stack-context.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 const RESOURCE_TYPE = 'asset';
 
@@ -117,7 +117,7 @@ export class CouchAssetRepository implements AssetRepository {
       // created against, so post-upload work (metadata extraction, thumbnails)
       // can re-enter it even with no ambient context. Undefined outside a
       // request, which preserves the previous default-stack behaviour.
-      stackName: input.stackName ?? currentRequestStackName(),
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };

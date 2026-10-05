@@ -173,7 +173,7 @@ type InternalRouterOptions = {
   listStackNames?: () => Promise<string[]>;
   // Best-effort operational log emission (issue #995). Passed to
   // completeTranscode so the transcode job's terminal transition also appends one
-  // record to the in-memory LogStore GET /api/v1/logs reads (src/main.ts,
+  // record to the log store GET /api/v1/logs reads (src/main.ts,
   // `logStore`; read path src/routes/logs.ts:94). Absent => no log record.
   pipelineLog?: PipelineLogSink;
 };
@@ -286,25 +286,33 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
   // for every asset on the first-listed stack) that is one lookup and the
   // behaviour is exactly as before — and only then try the other provisioned
   // stacks. Returns undefined when no stack owns the asset (the handler then
-  // 404s as before), when there is no asset repo wired at all, or when the asset
-  // found on the default resolution carries no persisted stack name.
+  // 404s as before), or when there is no asset repo wired at all.
   //
-  // Issue #1097: the asset itself now records the stack it was created against
-  // (`Asset.stackName`, src/data/asset-repo.ts), so when a probe finds the asset
-  // we prefer that persisted value over the name we probed under. That pins the
-  // handler to an EXPLICIT stack instead of leaving the default resolution to
-  // re-derive "first listed" on every call inside the handler. An asset written
-  // before #1097 has no such value, which falls back to exactly the previous
-  // behaviour (undefined for the default stack, the probed name otherwise).
+  // WHERE THE DOCUMENT WAS FOUND IS AUTHORITATIVE (issue #1097 review, BLOCKING
+  // 1). The probe PROVES ownership: the asset was read out of that stack's
+  // CouchDB. `Asset.stackName` (issue #1097) is a label stamped at create time,
+  // and this function must never prefer the label over the location — if the two
+  // ever disagreed, preferring the label would resolve a stack that does not
+  // hold the bytes, which is exactly the #1058 symptom this line of work exists
+  // to remove. So the default probe returns undefined (keep the default
+  // resolution, and with it the `''` resolver cache key the callback path has
+  // always used — no second client set is built) and a named probe returns the
+  // name it probed under.
+  //
+  // `Asset.stackName` therefore deliberately plays no part in this function. It
+  // could legitimately be used to SEED the probe order (try the labelled stack
+  // first, saving a scan on a multi-stack install), but not to decide the
+  // answer; that optimisation is not built here because the label is only
+  // readable once the asset has already been found.
   async function stackOwningAsset(assetId: string): Promise<string | undefined> {
     const assets = opts.repository;
     if (!assets) return undefined;
     try {
       const onDefaultStack = await assets.get(assetId);
-      if (onDefaultStack) return onDefaultStack.stackName;
+      if (onDefaultStack) return undefined;
       for (const name of await listStackNamesSafely(opts)) {
         const found = await runWithRequestStack(name, async () => assets.get(assetId));
-        if (found) return found.stackName ?? name;
+        if (found) return name;
       }
     } catch (err) {
       // Best-effort: a lookup failure degrades to the default resolution rather

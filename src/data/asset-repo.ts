@@ -14,7 +14,7 @@
 // ADR-003/#59: workspace guard removed (structural OSC isolation).
 import { ulid } from 'ulid';
 import { withinCreatedRange } from './created-range.js';
-import { currentRequestStackName } from '../services/request-stack-context.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 // ---------------------------------------------------------------------------
 // Asset model + lifecycle
@@ -327,6 +327,22 @@ export type AudioTrack = {
   sampleRateHz: number;
 };
 
+// One video track within a container, as reported by ffprobe. The flat mirror
+// of the persisted `technical.video[]` entries (VideoTrackSchema,
+// asset-document.ts) — field names and optionality match that schema exactly:
+// `index`, `bitrateBps` and `frameRate` are optional because a probe may not
+// report them. Distinct from `TechnicalMetadata` below, which flattens only the
+// FIRST video track's four always-probed attributes alongside container-level
+// data; this array is the per-track view (issue #978).
+export type VideoTrack = {
+  index?: number;
+  codec: string;
+  width: number;
+  height: number;
+  bitrateBps?: number;
+  frameRate?: number;
+};
+
 // Technical metadata extracted from the stored object by an ephemeral ffprobe
 // job (issue #6). Populated asynchronously after ingest; null until the first
 // successful extraction (or after a failed extraction — see
@@ -533,6 +549,14 @@ export type Asset = {
   // Extraction never blocks the asset record, so both fields are optional.
   technicalMetadata?: TechnicalMetadata | null;
   technicalMetadataError?: string;
+  // Per-track video streams as probed, mirroring the persisted
+  // `technical.video[]` array (issue #978). Where `technicalMetadata` flattens
+  // the FIRST video track's four always-probed attributes, this carries every
+  // track with the optional `index` / `frameRate` the stored schema allows.
+  // Undefined until the first successful extraction; populated on read from the
+  // document (asset-document.ts `fromAssetDocument`), so it is a projection of
+  // persisted state rather than an independently writable field.
+  videoTracks?: VideoTrack[];
   // Streaming manifest URLs from the packaging pipeline (issue #9). Undefined
   // until packaging completes successfully; `packagingError` is set instead
   // when the last packaging attempt failed. Packaging never changes the
@@ -609,7 +633,7 @@ export type Asset = {
   tamsTimerange?: string;
   // The provisioned stack this asset was created against (issue #1097),
   // captured from the ambient request stack context at create time
-  // (`currentRequestStackName()`, src/services/request-stack-context.ts) and
+  // (`currentDocumentStackName()`, src/services/request-stack-context.ts) and
   // persisted in the ADR-005 `administrative` namespace (system-owned
   // provenance, NOT editorial — see asset-document.ts).
   //
@@ -652,7 +676,7 @@ export type CreateAssetInput = {
   sourceMethod?: AssetSourceMethod;
   originUri?: string;
   // Explicit stack identity override (issue #1097). Normally omitted — the
-  // repository stamps `currentRequestStackName()` — and supplied only by a
+  // repository stamps `currentDocumentStackName()` — and supplied only by a
   // caller that knows the stack while not running inside its context (tests).
   stackName?: string;
 };
@@ -1462,7 +1486,7 @@ export class InMemoryAssetRepository implements AssetRepository {
       provenance: initialProvenance(now, method),
       // Durable stack identity (issue #1097). Undefined outside a request,
       // which preserves the previous default-stack behaviour.
-      stackName: input.stackName ?? currentRequestStackName(),
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };

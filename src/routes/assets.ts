@@ -38,7 +38,8 @@ import {
   type AssetAudioTrack,
   type AssetRepository,
   type PackagedOutput,
-  type SubtitleTrack
+  type SubtitleTrack,
+  type VideoTrack
 } from '../data/asset-repo.js';
 // Created-at range filtering (issue #833). The wire grammar, the inclusive
 // bound semantics and the normalisation to canonical UTC instants live in ONE
@@ -111,6 +112,11 @@ import {
   STACK_CONFIG_NAMESPACE,
   stackResolvedMinioEndpoint
 } from '../services/workspace-stack.js';
+import {
+  objectStoreStackMismatch,
+  objectStoreStackMismatchMessage,
+  isObjectStoreStackMismatchError
+} from '../services/object-store-stack-identity.js';
 import { submitTranscode } from '../pipeline/transcode.js';
 import {
   logPipelineEvent,
@@ -839,7 +845,47 @@ const addSubtitleTrackSchema = z.object({
   default: z.boolean().optional()
 });
 
+// Machine-probed video tracks (issue #978). Mirrors the PERSISTED per-track
+// shape one-for-one — `VideoTrackSchema` in src/data/asset-document.ts
+// (index?, codec, width, height, bitrateBps?, frameRate?), stored at
+// `technical.video[]` — so the read API reports exactly what the probe wrote,
+// including the `index` / `frameRate` that `technicalMetadata` cannot carry.
+// Unlike `audioTrackOutSchema` above there is no `id`: these are stream
+// descriptors, not editorial records, so they are read-only and not individually
+// addressable.
+const videoTrackOutSchema = z.object({
+  index: z.number().optional(),
+  codec: z.string(),
+  width: z.number(),
+  height: z.number(),
+  bitrateBps: z.number().optional(),
+  frameRate: z.number().optional()
+});
+
+// Project an asset's video tracks for the read API (issue #978). The canonical
+// source is `asset.videoTracks`, mapped straight off the persisted
+// `technical.video[]` (asset-document.ts `fromAssetDocument`). A repository that
+// keeps flat assets without a document round-trip (the in-memory tier) has no
+// such array, so fall back to the single track `technicalFromAsset` would
+// persist for that asset (asset-document.ts: codec, width, height, bitrateBps
+// off `technicalMetadata`) — the same bytes either tier would store, so both
+// backends answer identically. Unprobed asset: empty array, never undefined.
+function videoTracksOf(asset: Asset): VideoTrack[] {
+  if (asset.videoTracks) {
+    return asset.videoTracks;
+  }
+  const tm = asset.technicalMetadata;
+  if (!tm) {
+    return [];
+  }
+  return [{ codec: tm.codec, width: tm.width, height: tm.height, bitrateBps: tm.bitrateBps }];
+}
+
 const tracksSchema = z.object({
+  // Always present, like the two arrays below: empty when the asset has not
+  // been probed (or carries no video stream). Additive — adding a required
+  // property to a RESPONSE does not break existing readers.
+  videoTracks: z.array(videoTrackOutSchema),
   audioTracks: z.array(audioTrackOutSchema),
   subtitleTracks: z.array(subtitleTrackOutSchema)
 });
@@ -1080,7 +1126,7 @@ type AssetsRouterOptions = {
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
   // Best-effort operational log emission for pipeline steps (issue #995). Wired
-  // to the in-memory LogStore's `append()` write primitive — the same instance
+  // to the log store's `append()` write primitive — the same instance
   // GET /api/v1/logs reads (src/main.ts, `logStore`; read path
   // src/routes/logs.ts:94). When absent, pipeline execution proceeds without
   // appending log records (no-op), so existing tests are unaffected. Emission
@@ -1840,6 +1886,83 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return { dataPlaneStack, controlPlaneStack };
   }
 
+  // The single submit-time routing assertion for any path that dispatches a
+  // transcode (issues #1058 and #1093). Returns the refusal to send, or
+  // undefined when the request is correctly routed — which is every
+  // single-stack, env-override and no-resolver deployment, whose behaviour is
+  // therefore unchanged.
+  //
+  // TWO independent splits, both of which end as the same indistinguishable
+  // missing-object error from the transcoder (every stack's source bucket
+  // carries the identical literal name, routes/provision.ts), and both answered
+  // with the same 409 `stack_routing_mismatch` so the client contract is one
+  // error code:
+  //
+  //   1. DOCUMENTS vs control plane (issue #1058): the stack the asset/job
+  //      documents were resolved from (WorkspaceConnections.stackName) is not
+  //      the stack the transcoder will be created against.
+  //   2. REQUEST CREDENTIAL vs control plane — DEFENCE IN DEPTH, not the #1093
+  //      mitigation. `WorkspaceConnections.s3Config` is tagged with the stack
+  //      identity it was built for, and that tag is compared here. Today the
+  //      tag and `connections.stackName` are set from the same local at every
+  //      producer (workspace-stack.ts buildConnectionsFromStack /
+  //      buildEnvConnections / buildInMemoryConnections), so after check (1) has
+  //      passed this one cannot fire on any path that exists now. It is kept
+  //      because the credential is carried, cached, re-read from the resolver
+  //      cache and handed to runner factories separately from the document
+  //      connections — a future path that rebuilds or injects an s3Config can
+  //      break that equality, and this catches it at the edge for the cost of a
+  //      string compare.
+  //
+  //      The PRODUCTION-REACHABLE #1093 mis-route is NOT visible from here: the
+  //      credential the spawned transcoder is actually created with is resolved
+  //      by services/encore-s3-config.ts resolveEncoreS3Config, from the
+  //      parameter store, against the routed stack key — never from
+  //      request.connections. That resolver now refuses the first-provisioned
+  //      substitution itself (ObjectStoreStackMismatchError), and the submit
+  //      path below maps that refusal onto this same 409.
+  //
+  // Both compare stack IDENTITY, never endpoint hostnames: the transcoder uses
+  // the in-cluster address while the API uses the public ingress for the SAME
+  // instance (issue #991), so hostnames legitimately differ.
+  function transcodeRoutingRefusal(
+    request: import('fastify').FastifyRequest,
+    controlPlaneStack: string | undefined
+  ): { message: string; logFields: Record<string, unknown>; logMessage: string } | undefined {
+    const documents = stackRoutingMismatch(request, controlPlaneStack);
+    if (documents) {
+      return {
+        message: `the source object was written to stack "${documents.dataPlaneStack}" but the transcoder would be created against stack "${documents.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`,
+        logFields: {
+          reason: 'documents',
+          dataPlaneStack: documents.dataPlaneStack,
+          controlPlaneStack: documents.controlPlaneStack
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+      };
+    }
+    const credential = objectStoreStackMismatch(
+      request.connections?.s3Config,
+      controlPlaneStack
+    );
+    if (credential) {
+      return {
+        message: objectStoreStackMismatchMessage(credential),
+        logFields: {
+          reason: 'request-object-store-credential',
+          expectedStack: credential.expectedStack,
+          actualStack: credential.actualStack,
+          // Endpoint HOST only — the resolved secret is never logged.
+          actualEndpointHost: credential.actualEndpointHost
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the resolved object-store credential belongs to a different stack than the request routes to (issue #1093)'
+      };
+    }
+    return undefined;
+  }
+
   // Resolve whether a named transcode profile can execute on this platform tier
   // (issue #286). Returns a human message when the profile is a stored GPU-only
   // (NVENC/CUDA) profile that cannot run on OSC's CPU-only Encore instances, so
@@ -2096,7 +2219,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // than thrown because this is a fire-and-forget pipeline step: throwing here
   // would fail the whole execution, which an unconfigured optional step must
   // never do.
-  function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+  //
+  // `storage` has exactly the meaning it has on `triggerExtraction` above
+  // (issue #1051 review): a caller that already resolved a WorkspaceStorage
+  // hands it in instead of resolving a fresh one here. Callers running INSIDE
+  // the request may omit it and get the resolver-cache entry the onRequest hook
+  // warmed for this request's stack; a caller that reaches this AFTER the
+  // request's work has settled MUST pass the handle, because `storageFor()` is a
+  // cache read whose entry can age past the resolver TTL (`CACHE_TTL_MS`,
+  // services/workspace-stack.ts) during a long transfer — after which the
+  // factory THROWS rather than returning the wrong stack, and here that throw
+  // would land in a detached continuation. Same shape as
+  // `triggerExtraction(assetId, objectKey, externalSource?, storage?)` and
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts).
+  //
+  // Note this only covers the DATA plane. The runner factory is still built from
+  // `request.connections` (issue #1062), which is request-scoped state captured
+  // synchronously here rather than a TTL'd cache read, so it stays correct for a
+  // non-default `x-stack-name` even when called from a detached continuation.
+  function triggerThumbnail(
+    assetId: string,
+    objectKey: string,
+    request: import('fastify').FastifyRequest,
+    storage?: WorkspaceStorage
+  ): boolean {
     if (!opts.thumbnailExtractor || !storageFor) {
       return false;
     }
@@ -2116,7 +2262,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     void thumbnailRunner(
       { assetId, objectKey, timecodes: [1] },
-      { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
+      {
+        assets: repo,
+        storage: storage ?? storageFor(),
+        extractor: resolvedExtractor,
+        ...opts.thumbnailDeps
+      }
     ).catch(() => {
       /* thumbnail failures are recorded on the asset by the runner */
     });
@@ -2329,20 +2480,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     // submit with.
     const controlPlane = await transcodeStackIdentity(request);
     if (steps.includes('transcode')) {
-      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
-      if (mismatch) {
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the bytes would actually be read with (#1093).
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
         request.log.error(
-          {
-            assetId: asset.id,
-            pipeline: pipelineName,
-            dataPlaneStack: mismatch.dataPlaneStack,
-            controlPlaneStack: mismatch.controlPlaneStack
-          },
-          'refusing to start pipeline: the source bytes and the transcoder resolve different stacks (issue #1058)'
+          { assetId: asset.id, pipeline: pipelineName, ...refusal.logFields },
+          refusal.logMessage
         );
         reply.code(409).send({
           error: 'stack_routing_mismatch',
-          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+          message: refusal.message
         });
         return undefined;
       }
@@ -3063,8 +3211,41 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           assetId: extAsset.id,
           sourceUrl: extObjectKey
         });
+        // Audit: ingest-url job submitted (issue #1000). One entry, targetId = the
+        // new job id, emitted right after the durable job record exists — the same
+        // moment and the same shape the transcode submission uses
+        // (src/pipeline/transcode.ts:104-114). `system` origin matches every other
+        // `job.*` entry (transcode + package), so the job lifecycle reads as one
+        // consistent origin regardless of which surface triggered it.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.submitted',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         await jobs.update(extJob.id, { status: 'running' });
         await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Audit: this branch settles the job terminally INLINE (the bytes already
+        // live in the external bucket, so no pull worker runs and nothing else can
+        // ever emit the terminal entry for it). Same shape as the pull worker's
+        // success entry (src/pipeline/url-pull-worker.ts) minus `bytesTransferred`,
+        // which is meaningless when no bytes were transferred.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.completed',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         // Fire-and-forget probe against the external source (job reads in place).
         // Carries the job's persisted stack (issue #1097) so the detached probe's
         // asset write resolves this stack and not the first-listed one.
@@ -3130,11 +3311,50 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // TTL of its own, so holding it across the pull is safe.
       const pullStorage = storageFor();
 
+      // Audit: ingest-url job submitted (issue #1000). See the external-backend
+      // branch above for the shape rationale. Emitted BEFORE the detached pull
+      // runner starts, so the audit trail records the submission regardless of the
+      // pull outcome — and the asset's history no longer starts mid-pipeline.
+      // `sourceUrl` is deliberately NOT in the detail bag: a pull source may be a
+      // pre-signed URL carrying credentials in its query string.
+      // This submission and the terminal job.completed/job.failed the worker emits
+      // can land in the same millisecond (equal `at`); the audit store mints
+      // monotonic ULID ids so GET /api/v1/audit's equal-`at` tiebreak resolves to
+      // true write order and never renders the lifecycle inverted (issue #1000
+      // review; CONTRACT: monotonic id minting in src/data/audit-repo.ts record()).
+      emitAudit(
+        audit,
+        {
+          actor: originActor('system'),
+          action: 'job.submitted',
+          targetType: 'job',
+          targetId: job.id,
+          detail: { jobType: 'ingest-url', assetId: asset.id }
+        },
+        request.log
+      );
+
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
-      // extraction against the now-stored object (issue #6); we only extract if
-      // the asset actually advanced to `processing` (pull succeeded).
+      // extraction AND poster-frame extraction against the now-stored object
+      // (issues #6, #1050); we only run either if the asset actually advanced to
+      // `processing` (pull succeeded).
+      //
+      // issue #1050: this branch previously ran extraction only, so a
+      // URL-ingested asset never got a `thumbnails` entry while an uploaded one
+      // did (main.ts onObjectStored runs both). The pull lands the bytes in
+      // OSC-managed storage under our own `ingest/<id>` key, so the thumbnail
+      // runner's presignedGet of that key resolves exactly as it does for an
+      // upload — the two paths are now at parity.
+      //
+      // Deliberately NOT applied to the external-backend branch above: there
+      // objectKey is `s3://<foreign-bucket>/<key>`, and the thumbnail runner
+      // resolves its source via deps.storage.presignedGet (thumbnail.ts:119),
+      // which cannot presign a bucket this deployment's storage does not own.
+      // triggerExtraction takes an externalSource for that case; triggerThumbnail
+      // has no equivalent, so calling it there would fail silently. Giving the
+      // thumbnail path the same external-source treatment is a separate change.
       void runner(
         {
           jobId: job.id,
@@ -3160,7 +3380,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // therefore outlives this request.
           pipelineLog,
           pipelineLogErrors: request.log,
-          stackLog: request.log
+          stackLog: request.log,
+          // Terminal `job.completed` / `job.failed` emission for this job happens
+          // inside the worker, where the pull actually settles (issue #1000).
+          // Threaded after the `pullDeps` spread so an injected test dep bag can
+          // never silently drop the emitter.
+          audit,
+          auditLog: request.log
         }
       )
         // The read-back runs in the job's PERSISTED stack (issue #1097) rather
@@ -3171,6 +3397,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             const settled = await repo.get(asset.id);
             if (settled?.status === 'processing') {
               triggerExtraction(asset.id, objectKey, undefined, pullStorage, job.stackName);
+              // Same `pullStorage` handle, for the same reason (issue #1051
+              // review): this runs AFTER the request's work has settled, so
+              // `storageFor()` can have aged past the resolver TTL and would throw
+              // inside this detached continuation. Passing the handle resolved at
+              // request time keeps the thumbnail path symmetric with the
+              // extraction path immediately above instead of silently depending on
+              // the ambient request-stack context.
+              triggerThumbnail(asset.id, objectKey, request, pullStorage);
             }
           })
         )
@@ -3183,7 +3417,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         .catch((err: unknown) => {
           request.log.error(
             { err, assetId: asset.id, jobId: job.id },
-            'post-pull metadata extraction could not be started'
+            'post-pull metadata/thumbnail extraction could not be started'
           );
         });
 
@@ -4456,7 +4690,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         key's bytes have not landed (issues #388 / #389);
   //         `stack_routing_mismatch` — the source bytes and the transcoder would
   //         resolve DIFFERENT stacks, so the transcode would fail with an
-  //         indistinguishable 404 (issue #1058). Refused up front rather than
+  //         indistinguishable 404 (issue #1058), or the object-store credential
+  //         the transcoder would be spawned with belongs to another stack than
+  //         this request routes to (issue #1093). Refused rather than
   //         submitted; retry naming one stack consistently via `X-Stack-Name`.
   //   501 — transcoding is not configured on this deployment
   //   502 — Encore rejected the submission
@@ -4682,20 +4918,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // here and reused as the scaler context below, so the identity we verified
       // is the identity we submit with.
       const controlPlane = await transcodeStackIdentity(request);
-      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
-      if (mismatch) {
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the source read would actually use (#1093). Asserted BEFORE the
+      // reachability preflight below, so a mis-routed credential is named as
+      // such rather than probing the wrong instance first.
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
         request.log.error(
-          {
-            assetId: asset.id,
-            objectKey: source.objectKey,
-            dataPlaneStack: mismatch.dataPlaneStack,
-            controlPlaneStack: mismatch.controlPlaneStack
-          },
-          'refusing to submit transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+          { assetId: asset.id, objectKey: source.objectKey, ...refusal.logFields },
+          refusal.logMessage
         );
         return reply.code(409).send({
           error: 'stack_routing_mismatch',
-          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+          message: refusal.message
         });
       }
       try {
@@ -4793,6 +5028,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // client can back off, rather than silently queueing unboundedly.
         if (isJobThroughputCapExceededError(err)) {
           return reply.code(err.statusCode).send(err.toResponseBody());
+        }
+        // The credential the TRANSCODER would be spawned with belongs to a
+        // different stack than this request routes to (issue #1093). Resolved
+        // deep in the scaler's `resolveS3Config` callback
+        // (services/encore-s3-config.ts), which refuses rather than silently
+        // substituting the first-provisioned stack's object store. Answer the
+        // SAME 409 `stack_routing_mismatch` the edge checks above answer — it
+        // is the same class of fault, and a client must not have to distinguish
+        // "mis-routed, retry naming one stack" from a 502 transcoder failure.
+        // The error carries two stack ids and an endpoint host; it has no
+        // credential field, so nothing secret can reach the body or the log.
+        if (isObjectStoreStackMismatchError(err)) {
+          request.log.error(
+            {
+              assetId: asset.id,
+              objectKey: source.objectKey,
+              reason: 'transcoder-object-store-credential',
+              expectedStack: err.expectedStack,
+              actualStack: err.actualStack,
+              actualEndpointHost: err.actualEndpointHost
+            },
+            'refusing to dispatch a transcode: the object-store credential the transcoder would be spawned with belongs to a different stack than the request routes to (issue #1093)'
+          );
+          return reply.code(409).send({
+            error: 'stack_routing_mismatch',
+            message: err.message
+          });
         }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
@@ -5614,9 +5876,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // omitted from the response.
   // -------------------------------------------------------------------------
 
-  // List an asset's audio + subtitle tracks.
-  //   200 — { audioTracks, subtitleTracks } (each possibly empty)
+  // List an asset's video + audio + subtitle tracks.
+  //   200 — { videoTracks, audioTracks, subtitleTracks } (each possibly empty)
   //   404 — unknown/foreign asset
+  //
+  // `videoTracks` (issue #978) is the machine-probed set, projected from the
+  // persisted `technical.video[]` (asset-document.ts) onto `asset.videoTracks`;
+  // the other two are editorial records managed through the POST/DELETE routes
+  // below. Read-only: there is no write path for video tracks.
   app.get(
     '/:id/tracks',
     {
@@ -5632,6 +5899,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send({
+        videoTracks: videoTracksOf(asset),
         audioTracks: asset.audioTracks ?? [],
         subtitleTracks: asset.subtitleTracks ?? []
       });

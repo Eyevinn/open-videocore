@@ -21,6 +21,11 @@
 //       ("Service X not found in your subscriptions", or any FetchError from
 //       /mysubscriptions) propagates, as does UnauthorizedError on a 401.
 //   getInstanceHealth(context, serviceId, name, token): Promise<string>  (:86)
+// The bounded readiness poll loop (its own getInstanceHealth contract and the
+// full rationale) was lifted out of this module in #1038 and now lives in
+// src/services/instance-readiness.ts (waitForInstanceReadyBounded), so the
+// provisioning route can reuse the same loop; getInstanceHealth stays imported
+// here for the pending-spawn / destroy-decision paths that read health directly.
 // The Encore serviceId is 'encore' (src/services/stack.ts:25). The returned
 // instance object carries `name` (instance id) and `url` — same fields the
 // provision route reads via instanceUrl() (src/routes/provision.ts:129).
@@ -34,6 +39,10 @@ import {
   listInstances as oscListInstances,
   removeInstance
 } from '@osaas/client-core';
+import {
+  DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS,
+  waitForInstanceReadyBounded
+} from '../services/instance-readiness.js';
 import { keys, type EncoreInstanceRecord, type EncoreScalerConfig } from './types.js';
 import { fetchEncoreActiveState } from './encore-active-state.js';
 import { hasPendingPackaging } from './packaging-pin.js';
@@ -360,81 +369,39 @@ export class SpawnReadyTimeoutError extends Error {
 // the 1s cadence @osaas/client-core's own waitForInstanceReady uses
 // (lib/core.js:343-353, v0.24.0) so this is no chattier than the helper it
 // replaces. The final sleep is clamped to the remaining budget, so a timeout
-// shorter than one interval still ends on time.
-export const DEFAULT_SPAWN_READY_POLL_INTERVAL_MS = 1_000;
+// shorter than one interval still ends on time. Aliases the shared helper's
+// default (src/services/instance-readiness.ts) — same 1s value, one source.
+export const DEFAULT_SPAWN_READY_POLL_INTERVAL_MS =
+  DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS;
 
-// Wait for an OSC instance to report `running`, with a hard deadline.
+// Wait for a spawned OSC instance to report `running`, with the scaler's own
+// hard deadline/cadence.
 //
-// This polls getInstanceHealth directly rather than racing a timer against
-// @osaas/client-core's waitForInstanceReady (review round 2, non-blocking
-// finding on instance-pool.ts:285). Racing left the helper's internal
-// `while (!instanceOk)` loop running after we stopped waiting — the SDK offers
-// no AbortSignal and no cancellation — so every timed-out spawn leaked one
-// getInstanceHealth request per second for the lifetime of the process. Owning
-// the loop means the polling stops exactly when the deadline passes.
-//
-// Contract (verified, @osaas/client-core@0.24.0 lib/core.d.ts:86):
-//   getInstanceHealth(context: Context, serviceId: string, name: string,
-//                     token: string): Promise<string>
-// It resolves the instance's health string; 'running' is the ready state the
-// SDK's own helper gates on (lib/core.js:347-349). Transient health-probe
-// failures (a 404/503 while the instance is still being scheduled) are treated
-// as "not ready yet" and retried until the deadline rather than aborting the
-// spawn, with the last error folded into the timeout message.
-//
-// Both limitations are logged as OSC friction (CLAUDE.md rule 6):
-// docs/osc-feedback/incoming-waitforinstanceready-unbounded.md.
-async function waitForInstanceReadyBounded(
+// The poll loop itself (own loop over getInstanceHealth, failed probe treated as
+// "not ready yet", last error folded into the timeout message, deadline
+// cancellation) is the shared helper in src/services/instance-readiness.ts; see
+// its header for the verified @osaas/client-core contracts and the full
+// rationale. #1038 lifted that loop out of this module so the provisioning route
+// could reuse it. This wrapper only maps EncoreScalerConfig onto the helper's
+// options AND injects SpawnReadyTimeoutError on a timeout: the spawn cleanup
+// path below keys off `instanceof SpawnReadyTimeoutError` (#1071) to tell a
+// still-coming-up instance (keep + record pending) apart from a broken one
+// (destroy), so the timeout must carry the service and instance ids. Only the
+// deadline path is remapped — a getServiceAccessToken failure before the loop
+// still propagates as itself, which the cleanup path correctly treats as "not a
+// readiness timeout".
+async function waitForSpawnedInstanceReady(
   serviceId: string,
   instanceId: string,
   config: EncoreScalerConfig
 ): Promise<void> {
-  const timeoutMs = config.spawnReadyTimeoutMs ?? DEFAULT_SPAWN_READY_TIMEOUT_MS;
-  const pollIntervalMs =
-    config.spawnReadyPollIntervalMs ?? DEFAULT_SPAWN_READY_POLL_INTERVAL_MS;
-  const deadline = Date.now() + timeoutMs;
-  const sat = await config.oscContext.getServiceAccessToken(serviceId);
-
-  let lastError: unknown;
-  let lastStatus: string | undefined;
-  for (;;) {
-    // Sleep first, as the SDK helper does: a just-created instance is never
-    // healthy on the same tick it was created.
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, Math.min(pollIntervalMs, remaining));
-      timer.unref?.();
-    });
-
-    try {
-      const status = await getInstanceHealth(
-        config.oscContext,
-        serviceId,
-        instanceId,
-        sat
-      );
-      lastStatus = status;
-      if (status === 'running') return;
-    } catch (err) {
-      lastError = err;
-    }
-    if (Date.now() >= deadline) break;
-  }
-
-  const detail = lastError
-    ? `; last health check error: ${
-        lastError instanceof Error ? lastError.message : String(lastError)
-      }`
-    : lastStatus
-      ? `; last reported health: ${lastStatus}`
-      : '';
-  throw new SpawnReadyTimeoutError(
-    serviceId,
-    instanceId,
-    `timed out after ${timeoutMs}ms waiting for OSC instance ${instanceId} ` +
-      `(service ${serviceId}) to report running${detail}`
-  );
+  await waitForInstanceReadyBounded(config.oscContext, serviceId, instanceId, {
+    timeoutMs: config.spawnReadyTimeoutMs ?? DEFAULT_SPAWN_READY_TIMEOUT_MS,
+    pollIntervalMs:
+      config.spawnReadyPollIntervalMs ?? DEFAULT_SPAWN_READY_POLL_INTERVAL_MS,
+    makeTimeoutError: (message) =>
+      new SpawnReadyTimeoutError(serviceId, instanceId, message)
+  });
 }
 
 // Mutable bookkeeping threaded through a single spawn so its failure path can
@@ -708,7 +675,7 @@ async function spawnPooledInstance(
   // sit outside, so an instance that never became `running` was left live on OSC
   // with no pool record and no cleanup.
   try {
-    await waitForInstanceReadyBounded(ENCORE_SERVICE_ID, instanceId, config);
+    await waitForSpawnedInstanceReady(ENCORE_SERVICE_ID, instanceId, config);
     // Pair this Encore instance with a dedicated callback listener (same name)
     // configured with this exact Encore URL, so completion callbacks are routed
     // to the scaler-managed instance rather than a static one. RedisQueue is set
@@ -750,7 +717,7 @@ async function spawnPooledInstance(
     if (!callback) throw lastCallbackErr;
     listenerCreated = true;
     listenerUrl = instanceUrl(callback);
-    await waitForInstanceReadyBounded(
+    await waitForSpawnedInstanceReady(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID,
       instanceId,
       config
@@ -914,6 +881,29 @@ async function serviceTokenOrUndefined(
   }
 }
 
+// #1109: back-off between the resolver's callback-listener create attempts for
+// one pending instance. Exponential from 30s, capped at 5 minutes — the resolver
+// runs once per tick (10s by default) against a readiness budget of 15 minutes
+// (DEFAULT_SPAWN_READY_TIMEOUT_MS), so an uncapped per-tick retry meant ~90
+// failing creates per stuck instance. With this it is at most a handful, and a
+// listener that becomes creatable a minute in is still picked up well inside the
+// budget. The schedule is deliberately coarser than spawnPooledInstance's
+// 5s/10s: that loop blocks a single spawn and has to finish, this one spans
+// ticks and only has to beat the deadline.
+export const PENDING_LISTENER_CREATE_BACKOFF_BASE_MS = 30_000;
+export const PENDING_LISTENER_CREATE_BACKOFF_MAX_MS = 300_000;
+
+export function pendingListenerCreateBackoffMs(attempt: number): number {
+  const n = Math.max(1, Math.floor(attempt));
+  // 2 ** (n - 1) is clamped before the multiply so a wild attempt count cannot
+  // overflow into Infinity on the way to the cap.
+  const factor = Math.min(2 ** Math.min(n - 1, 20), Number.MAX_SAFE_INTEGER);
+  return Math.min(
+    PENDING_LISTENER_CREATE_BACKOFF_BASE_MS * factor,
+    PENDING_LISTENER_CREATE_BACKOFF_MAX_MS
+  );
+}
+
 // Resolve every PENDING pool entry for this workspace (#1071): FINISH the spawns
 // that can be finished, destroy the ones that have run out of time.
 //
@@ -996,34 +986,99 @@ export async function resolvePendingSpawns(
       // one. Best effort per tick; a failure leaves the record pending and is
       // retried on the next tick until the deadline.
       if (!record.callbackListenerUrl) {
-        try {
-          const callbackSat = await config.oscContext.getServiceAccessToken(
-            ENCORE_CALLBACK_LISTENER_SERVICE_ID
-          );
-          const { instance: listener } = await createOrAdoptCallbackListener(
-            config,
-            record.instanceId,
-            record.url,
-            callbackSat
-          );
-          record = { ...record, callbackListenerUrl: instanceUrl(listener) };
-          await updateInstance(config.redis, config.workspaceId, record);
-          console.warn(
-            '[encore-scaler] pending spawn %s (workspace=%s): created the paired ' +
-              'callback listener its timed-out spawn never got to (#1071)',
-            record.instanceId,
-            config.workspaceId
-          );
-        } catch (err) {
-          blockedBy = 'callback listener could not be created';
-          console.error(
-            '[encore-scaler] pending spawn %s (workspace=%s): could not create its ' +
-              'paired callback listener — NOT promoted, because an instance with no ' +
-              'listener completes jobs into nowhere (#1071):',
-            record.instanceId,
-            config.workspaceId,
-            err
-          );
+        // #1109: this create is retried ACROSS ticks, so the "should I try
+        // again?" decision the spawn path makes inside its own loop has to be
+        // persisted on the record instead. Two gates come first:
+        //
+        //   a) a create that already failed PERMANENTLY is never attempted
+        //      again — the instance simply runs out its deadline below;
+        //   b) a create that failed transiently waits out its back-off.
+        //
+        // Previously neither existed and the resolver issued one create per
+        // tick until the deadline (~90 against the OSC API for a 15-minute
+        // budget at a 10s tick), including for errors that could never succeed.
+        const now = Date.now();
+        if (record.listenerCreateBlockedAt !== undefined) {
+          blockedBy = 'callback listener create failed permanently';
+        } else if (
+          record.listenerCreateNextAttemptAt !== undefined &&
+          now < record.listenerCreateNextAttemptAt
+        ) {
+          blockedBy = 'callback listener create backing off';
+        } else {
+          try {
+            const callbackSat = await config.oscContext.getServiceAccessToken(
+              ENCORE_CALLBACK_LISTENER_SERVICE_ID
+            );
+            const { instance: listener } = await createOrAdoptCallbackListener(
+              config,
+              record.instanceId,
+              record.url,
+              callbackSat
+            );
+            // The listener exists: drop the back-off bookkeeping so the record
+            // that gets promoted is a normal one.
+            const {
+              listenerCreateAttempts: _attempts,
+              listenerCreateNextAttemptAt: _nextAttemptAt,
+              ...completed
+            } = record;
+            record = { ...completed, callbackListenerUrl: instanceUrl(listener) };
+            await updateInstance(config.redis, config.workspaceId, record);
+            console.warn(
+              '[encore-scaler] pending spawn %s (workspace=%s): created the paired ' +
+                'callback listener its timed-out spawn never got to (#1071)',
+              record.instanceId,
+              config.workspaceId
+            );
+          } catch (err) {
+            // EXACTLY the spawn path's classification (spawnPooledInstance
+            // above), not a second one: isTransientOscError on the error's
+            // structural httpCode, plus the "name is already taken but
+            // getInstance could not confirm it" case the spawn loop also treats
+            // as retry-worthy — the name being taken is strong evidence the
+            // listener exists, and the name is fixed so a retry cannot
+            // duplicate it. createOrAdoptCallbackListener has already tried the
+            // adoption and re-thrown, so reaching here means unconfirmed.
+            const retryable =
+              isTransientOscError(err) || isNameAlreadyTakenError(err);
+            const attempts = (record.listenerCreateAttempts ?? 0) + 1;
+            record = retryable
+              ? {
+                  ...record,
+                  listenerCreateAttempts: attempts,
+                  listenerCreateNextAttemptAt:
+                    now + pendingListenerCreateBackoffMs(attempts)
+                }
+              : {
+                  ...record,
+                  listenerCreateAttempts: attempts,
+                  listenerCreateBlockedAt: now
+                };
+            // Best effort: a failed bookkeeping write only costs the back-off
+            // (the next tick retries as it always did) and must never take out
+            // the tick — this function does not throw.
+            await updateInstance(config.redis, config.workspaceId, record).catch(
+              () => undefined
+            );
+            blockedBy = retryable
+              ? 'callback listener could not be created'
+              : 'callback listener create failed permanently';
+            console.error(
+              '[encore-scaler] pending spawn %s (workspace=%s): could not create its ' +
+                'paired callback listener (attempt=%d retryable=%s) — NOT promoted, ' +
+                'because an instance with no listener completes jobs into nowhere; ' +
+                '%s (#1071/#1109):',
+              record.instanceId,
+              config.workspaceId,
+              attempts,
+              String(retryable),
+              retryable
+                ? `retrying no sooner than ${pendingListenerCreateBackoffMs(attempts)}ms from now`
+                : 'no further attempts will be made, it will be destroyed on its deadline',
+              err
+            );
+          }
         }
       }
 

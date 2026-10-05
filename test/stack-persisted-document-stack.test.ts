@@ -53,11 +53,20 @@ import {
   PerWorkspaceJobRepository
 } from '../src/data/per-workspace-repos.js';
 import {
+  adoptResolvedStackName,
+  currentDocumentStackName,
   currentRequestStackName,
   makeRequestScopedStorageFactory,
-  runWithRequestStack
+  requestStackNameFromHeaders,
+  runWithRequestStack,
+  runWithRequestedStack,
+  PERSISTED_STACK_FALLBACK_MESSAGE
 } from '../src/services/request-stack-context.js';
 import { runPull } from '../src/pipeline/url-pull-worker.js';
+import {
+  extractTechnicalMetadata,
+  type ProbeRunner
+} from '../src/pipeline/metadata-extractor.js';
 import { stackForQueueMessage, type PollerDeps } from '../src/pipeline/encore-callback-poller.js';
 import { keys } from '../src/encore-scaler/types.js';
 import type { WorkspaceConnections, WorkspaceStackResolver } from '../src/services/workspace-stack.js';
@@ -513,5 +522,180 @@ describe('a completion message drained after a restart resolves the job stack (i
     await expect(
       stackForQueueMessage(broken, JSON.stringify({ jobId: 'u' }))
     ).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Only a RESOLVER-CONFIRMED identity is persisted (issue #1097 review,
+// BLOCKING 2). `X-Stack-Name` is client-supplied; before this split the raw
+// header was written into `administrative.stackName` / `Job.stackName` verbatim,
+// and that stored string is then fed back into a parameter-store lookup key and
+// into the resolver's per-name cache (`workspace-stack.ts` resolve cache key
+// `stackName ?? ''`). Contracts verified:
+//   - `requestStackNameFromHeaders(headers)`, `runWithRequestedStack`,
+//     `adoptResolvedStackName`, `currentDocumentStackName`,
+//     `currentRequestStackName` (src/services/request-stack-context.ts).
+//   - `WorkspaceConnections.stackName: string | undefined` — "the stack identity
+//     these connections were built from ... the same identity resolveStackName()
+//     returns" (src/services/workspace-stack.ts).
+// ---------------------------------------------------------------------------
+
+describe('the stack name persisted on a document is resolver-confirmed, not client-supplied', () => {
+  it('drops a header that cannot name a stack instead of letting it reach storage', () => {
+    // The exact value the review proved reached a stored document verbatim.
+    expect(
+      requestStackNameFromHeaders({ 'x-stack-name': 'stack-that-does-not-exist$(whoami)' })
+    ).toBeUndefined();
+    // Path traversal / separators / whitespace / overlong: all unroutable.
+    expect(requestStackNameFromHeaders({ 'x-stack-name': '../../etc/passwd' })).toBeUndefined();
+    expect(requestStackNameFromHeaders({ 'x-stack-name': 'a/b' })).toBeUndefined();
+    expect(requestStackNameFromHeaders({ 'x-stack-name': 'two words' })).toBeUndefined();
+    expect(requestStackNameFromHeaders({ 'x-stack-name': '-leading-hyphen' })).toBeUndefined();
+    expect(requestStackNameFromHeaders({ 'x-stack-name': 'x'.repeat(64) })).toBeUndefined();
+    expect(requestStackNameFromHeaders({ 'x-stack-name': '' })).toBeUndefined();
+    // A repeated header names no single stack, so it names none.
+    expect(
+      requestStackNameFromHeaders({ 'x-stack-name': ['alpha', 'beta'] })
+    ).toBeUndefined();
+  });
+
+  it('accepts and normalises a well-formed stack name', () => {
+    expect(requestStackNameFromHeaders({ 'x-stack-name': 'stack-beta' })).toBe('stack-beta');
+    expect(requestStackNameFromHeaders({ 'x-stack-name': '  Stack-Beta ' })).toBe('stack-beta');
+    expect(requestStackNameFromHeaders({ 'x-stack-name': 'x'.repeat(63) })).toBe('x'.repeat(63));
+    expect(requestStackNameFromHeaders({})).toBeUndefined();
+  });
+
+  it('persists the stack the document was WRITTEN to, not the name the caller asked for', async () => {
+    // 'beta' is NOT provisioned here, so the resolver routes this request to the
+    // first-listed stack 'alpha' — `resolveStackName`'s documented "a stale UI
+    // selection must not break routing" fallback. The document therefore lives
+    // in alpha and must be LABELLED alpha; labelling it 'beta' is what would
+    // send a background worker to the wrong stack once a real 'beta' appears.
+    const h = buildHarness(['alpha']);
+
+    const { asset, job } = await runWithRequestedStack('beta', async () => {
+      // What the resolver preHandler does: resolve, then adopt the identity the
+      // connections were actually built from.
+      const conns = await h.resolver.resolve(currentRequestStackName());
+      adoptResolvedStackName(conns.stackName);
+      return {
+        asset: await h.assets.create({ name: 'clip' }),
+        job: await h.jobs.create({ type: 'ingest-url', assetId: 'asset-1' })
+      };
+    });
+
+    expect(asset.stackName).toBe('alpha');
+    expect(job.stackName).toBe('alpha');
+    // The bytes/documents really are in alpha, so the label agrees with reality.
+    expect(await h.stacks['alpha']!.assets.get(asset.id)).toBeTruthy();
+  });
+
+  it('still routes on the name the caller asked for when that stack exists', async () => {
+    const h = buildHarness(['alpha', 'beta']);
+
+    const asset = await runWithRequestedStack('beta', async () => {
+      const conns = await h.resolver.resolve(currentRequestStackName());
+      adoptResolvedStackName(conns.stackName);
+      return h.assets.create({ name: 'clip' });
+    });
+
+    expect(asset.stackName).toBe('beta');
+    expect(await h.stacks['beta']!.assets.get(asset.id)).toBeTruthy();
+    expect(await h.stacks['alpha']!.assets.get(asset.id)).toBeUndefined();
+  });
+
+  it('writes NO stack name when the request is served before any identity is confirmed', async () => {
+    // The resolver preHandler failed (degraded connections) or has not run yet.
+    // Routing still uses the requested name; nothing is persisted, which is the
+    // documented legacy behaviour rather than a guess.
+    const h = buildHarness(['alpha', 'beta']);
+
+    const asset = await runWithRequestedStack('beta', async () => {
+      expect(currentRequestStackName()).toBe('beta');
+      expect(currentDocumentStackName()).toBeUndefined();
+      return h.assets.create({ name: 'clip' });
+    });
+
+    expect(asset.stackName).toBeUndefined();
+    // It was still WRITTEN to beta — routing is unaffected by the split.
+    expect(await h.stacks['beta']!.assets.get(asset.id)).toBeTruthy();
+  });
+
+  it('treats an internal caller’s name as persistable, because it is already resolved', async () => {
+    // Sweeps/boot (src/main.ts), the poller, and `runWithPersistedStack` pass a
+    // name that came from `listStackNames()` or off a document — not from a
+    // client — so `runWithRequestStack` makes it both routable and persistable.
+    const h = buildHarness(['alpha', 'beta']);
+
+    const asset = await runWithRequestStack('beta', async () => {
+      expect(currentDocumentStackName()).toBe('beta');
+      return h.assets.create({ name: 'swept' });
+    });
+
+    expect(asset.stackName).toBe('beta');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metadata extraction re-enters the asset's persisted stack (review suggestion:
+// this contract was introduced by the PR and had no direct coverage).
+// Contracts verified: `ExtractParams.stackName`, `ExtractDeps`,
+// `ProbeRunner = (source: string | ExternalProbeSource) => Promise<FfprobeResult>`
+// (src/pipeline/metadata-extractor.ts).
+// ---------------------------------------------------------------------------
+
+describe('metadata extraction re-enters the asset stack (issue #1097)', () => {
+  // `ProbeRunner = (source: string | ExternalProbeSource) => Promise<FfprobeResult>`
+  // (src/pipeline/metadata-extractor.ts).
+  const probeStub: ProbeRunner = async () =>
+    ({
+      format: { duration: '12.5', format_name: 'mov,mp4', bit_rate: '800000' },
+      streams: [{ codec_type: 'video', codec_name: 'h264', width: 1920, height: 1080 }]
+    }) as unknown as Awaited<ReturnType<ProbeRunner>>;
+
+  // The only storage call the default (OSC-managed) extraction path makes is
+  // `presignedGet(objectKey, ttl)` (WorkspaceStorage, src/data/storage.ts:142).
+  const storageStub = {
+    presignedGet: async () => 'https://example.invalid/signed'
+  } as unknown as WorkspaceStorage;
+
+  it('writes technical metadata to the asset’s OWN stack with no ambient context', async () => {
+    const h = buildHarness(['alpha', 'beta']);
+    // The asset exists only on beta — the restart case: no ambient context.
+    const asset = await runWithRequestStack('beta', async () =>
+      h.assets.create({ name: 'on-beta' })
+    );
+    expect(currentRequestStackName()).toBeUndefined();
+
+    await extractTechnicalMetadata(
+      { assetId: asset.id, objectKey: 'k.mp4', stackName: asset.stackName },
+      { assets: h.assets, storage: storageStub, probe: probeStub }
+    );
+
+    // Resolved beta, not the first-listed alpha.
+    const onBeta = await h.stacks['beta']!.assets.get(asset.id);
+    expect(onBeta?.technicalMetadata?.durationSeconds).toBeCloseTo(12.5);
+    expect(onBeta?.technicalMetadataError).toBeFalsy();
+  });
+
+  it('falls back to the first-listed stack for a legacy asset and says so at debug level', async () => {
+    const h = buildHarness(['alpha', 'beta']);
+    // Pre-#1097 asset: lives on alpha, carries no stackName.
+    const asset = await h.assets.create({ name: 'legacy' });
+    expect(asset.stackName).toBeUndefined();
+    const debug = vi.fn();
+
+    await extractTechnicalMetadata(
+      { assetId: asset.id, objectKey: 'k.mp4', stackName: asset.stackName },
+      { assets: h.assets, storage: storageStub, probe: probeStub, stackLog: { debug } }
+    );
+
+    const onAlpha = await h.stacks['alpha']!.assets.get(asset.id);
+    expect(onAlpha?.technicalMetadata?.durationSeconds).toBeCloseTo(12.5);
+    expect(debug).toHaveBeenCalledWith(
+      expect.objectContaining({ assetId: asset.id }),
+      expect.stringContaining(PERSISTED_STACK_FALLBACK_MESSAGE)
+    );
   });
 });

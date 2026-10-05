@@ -34,6 +34,7 @@
 import type { Redis } from 'ioredis';
 import type { Context } from '@osaas/client-core';
 import type { JobRepository } from '../data/job-repo.js';
+import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
@@ -429,7 +430,16 @@ export async function stackForQueueMessage(
     const found = await runWithRequestStack(decoded, () =>
       deps.jobRepository.findByEncoreJobId(externalId)
     );
-    return found?.job.stackName ?? decoded;
+    if (found?.job.stackName) return found.job.stackName;
+    // The decoded contextId is the fixed DEPLOYMENT_CONTEXT ('default',
+    // src/auth/workspace.ts:46) — not a stack name — for a single-stack
+    // env-override deployment and for every job dispatched before stacks were
+    // provisioned. Returning it as if it WERE a stack name degrades safely (an
+    // unknown name resolves first-listed), but it suppresses the documented
+    // legacy-document debug notice on this path, so an operator grepping for
+    // pre-#1097 jobs would not see them. Report it as "no persisted identity"
+    // instead, which is what it is.
+    return decoded === DEPLOYMENT_CONTEXT ? undefined : decoded;
   } catch {
     // Best-effort: a corrupt message, a Valkey hiccup or a repository error here
     // must never stop the message from being processed. It degrades to the

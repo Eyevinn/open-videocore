@@ -24,6 +24,7 @@ import {
 import { makeScalingEncoreClient } from './index.js';
 import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance-pool.js';
 import { keys } from './types.js';
+import { valkeyConnectionId } from './valkey-connection-id.js';
 import type { DroppedJob, EncoreScalerConfig } from './types.js';
 
 export type WorkspaceEncoreScalerConfig = {
@@ -73,6 +74,14 @@ export type WorkspaceEncoreScalerConfig = {
   // falls back to the injected `redisUrl`/`redis` (unchanged single-Valkey
   // behaviour) rather than silently mis-routing.
   resolveRedisUrl?: (stackKey: string) => Promise<string | undefined>;
+  // Optional enumeration of the stacks that have been provisioned (issue #1074).
+  // Used ONLY by listStackConnections() below, so a read-only observer (GET
+  // /scaler/status) can cover a stack whose loop has not been created yet in this
+  // process — the case where a per-stack pool was invisible rather than reported
+  // empty. Returns the stack keys loops are keyed by (the same identity
+  // resolveRedisUrl is called with). When absent, listStackConnections() reports
+  // only the stacks this registry has already resolved a connection for.
+  listStackKeys?: () => Promise<string[]>;
   // Factory that opens a Valkey connection for a resolved per-stack URL (issue
   // #615). Injected (not `new IORedis` inline) so the registry stays free of a
   // hard ioredis dependency and tests can supply a fake connection. main.ts
@@ -121,6 +130,33 @@ export type WorkspaceEncoreScalerConfig = {
   onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
 };
 
+// How long a stack enumeration (listStackKeys) is reused before it is fetched
+// again (issue #1074). listStackConnections() is driven by GET /scaler/status,
+// which is deliberately unauthenticated, so without a window every status read
+// would be an external parameter-store call — one unauthenticated request
+// amplified into platform load. 30s is short enough that a freshly provisioned
+// stack shows up promptly (and its loop registers it immediately on first submit
+// regardless) and long enough that polling the endpoint costs nothing.
+const STACK_KEYS_CACHE_MS = 30_000;
+
+// One provisioned stack and the Valkey its scaler loop reads and writes (issue
+// #1074). Handed to read-only observers so they can query the SAME physical store
+// the loop uses instead of the process-global one.
+//
+// `redis` is undefined when the connection could not be resolved at all — the
+// stack is then reportable as UNOBSERVED (with `unobservedReason`) rather than
+// omitted, which is the whole point: "no instances in this pool" and "this pool
+// was never looked at" must not render identically.
+//
+// `connectionId` is the non-secret label from valkeyConnectionId() — never the
+// URL, because the status endpoint that consumes this is unauthenticated.
+export type ScalerStackConnection = {
+  stackKey: string;
+  connectionId?: string;
+  redis?: Redis;
+  unobservedReason?: string;
+};
+
 export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   private readonly loops = new Map<string, { client: EncoreClient; loop: EncoreScalerLoop }>();
 
@@ -136,6 +172,12 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     string,
     { redis: Redis; redisUrl: string; owned: boolean }
   >();
+
+  // Last stack enumeration and when it was taken (issue #1074). Bounds the
+  // external parameter-store reads an unauthenticated status poll can trigger,
+  // and doubles as the fallback when a later enumeration fails: reporting the
+  // previously known stacks beats reporting none.
+  private stackKeysCache?: { keys: string[]; at: number };
 
   constructor(private readonly config: WorkspaceEncoreScalerConfig) {}
 
@@ -197,6 +239,78 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       owned: true
     });
     return { redis, redisUrl: perStackUrl };
+  }
+
+  // Provisioned stack keys, cached for STACK_KEYS_CACHE_MS (issue #1074). Never
+  // throws: an enumeration failure yields the last known list, or an empty one,
+  // so listStackConnections() still reports the stacks this registry already
+  // holds connections for.
+  private async enumerateStackKeys(): Promise<string[]> {
+    if (!this.config.listStackKeys) return [];
+    const cached = this.stackKeysCache;
+    if (cached && Date.now() - cached.at < STACK_KEYS_CACHE_MS) return cached.keys;
+    try {
+      const keys = (await this.config.listStackKeys()).filter((key) => key.length > 0);
+      this.stackKeysCache = { keys, at: Date.now() };
+      return keys;
+    } catch {
+      // Parameter store unreachable: reuse the previous answer (stale beats
+      // blank) and retry on the next call rather than caching the failure.
+      return cached?.keys ?? [];
+    }
+  }
+
+  // Every stack this registry can observe, paired with the Valkey its loop uses
+  // (issue #1074).
+  //
+  // GET /scaler/status used to read the process-global connection only, so a pool
+  // living on a per-stack Valkey was ABSENT from the response rather than shown
+  // as empty, and a depth could be read from a different physical store than the
+  // loop evaluated. This is the accessor that lets the status route fan out over
+  // the same connections the loops actually use.
+  //
+  // The stack set is the union of:
+  //   - `listStackKeys()` (provisioned stacks, including ones with no loop in
+  //     this process yet — exactly the invisible case),
+  //   - the live loop keys, and
+  //   - the stack keys that already have a cached connection.
+  // so nothing already known is dropped if the enumeration hook is absent or
+  // fails.
+  //
+  // Resolution goes through resolveStackRedis(), NOT a re-implementation, so the
+  // observer is handed the identical connection object the loop uses. That can
+  // open a per-stack connection for a stack with no loop yet; it stays bounded by
+  // the number of provisioned stacks (the cache is keyed by stackKey), the clients
+  // are lazyConnect, and stopAll()/teardown() dispose the ones this registry owns.
+  // Resolved sequentially rather than in parallel so two concurrent observations
+  // cannot race the per-stack connection cache into opening duplicate sockets.
+  async listStackConnections(): Promise<ScalerStackConnection[]> {
+    const stackKeys = new Set<string>();
+    for (const key of await this.enumerateStackKeys()) stackKeys.add(key);
+    for (const key of this.loops.keys()) stackKeys.add(key);
+    for (const key of this.redisConnections.keys()) stackKeys.add(key);
+
+    const connections: ScalerStackConnection[] = [];
+    for (const stackKey of stackKeys) {
+      try {
+        const { redis, redisUrl } = await this.resolveStackRedis(stackKey);
+        connections.push({
+          stackKey,
+          connectionId: valkeyConnectionId(redisUrl),
+          redis
+        });
+      } catch {
+        // No error text is carried out of here. The consumer of this list is the
+        // unauthenticated status endpoint, and a connection-open failure quotes
+        // the connection string it failed on. The SHAPE of the fault is reported;
+        // the detail stays in the server log.
+        connections.push({
+          stackKey,
+          unobservedReason: "this stack's Valkey connection could not be resolved"
+        });
+      }
+    }
+    return connections;
   }
 
   // `workspaceId` here is the loop key: the EFFECTIVE stack identity the request
