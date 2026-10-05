@@ -69,6 +69,14 @@
 //     (:120) — the same guard the transcode path's reachability preflight uses
 //     (src/services/stack-reachability.ts), so the storage HEAD can never hang
 //     the request.
+//   - The recorded ingest size the stat is compared against is
+//     `Asset.sourceSizeBytes` (src/data/asset-repo.ts), round-tripped through
+//     the document's `administrative.storage.sizeBytes`
+//     (src/data/asset-document.ts) and written from the true transferred length
+//     at both ingest completion points: `bytesTransferred` from
+//     `WorkspaceStorage.putStream(): Promise<{ etag, bytesTransferred }>`
+//     (src/data/storage.ts) in src/pipeline/url-pull-worker.ts and
+//     src/routes/asset-upload.ts.
 
 import {
   resolveDependencyTimeoutMs,
@@ -96,9 +104,18 @@ export type TranscodeSourceTarget = {
   // because the env-override / in-memory connection paths carry no stack
   // `s3Config`; the messages then name the bucket and key only.
   endpoint?: string;
-  // Size recorded for this object at ingest/pull completion, when the deployment
-  // records one. When supplied (and > 0) a mismatch is a hard failure: the
-  // object present under the right key with the wrong length is a truncated or
+  // Size recorded for this object at ingest completion. In production this is
+  // `Asset.sourceSizeBytes` (src/data/asset-repo.ts), written from the true
+  // transferred length by the URL-pull worker (`bytesTransferred`,
+  // src/pipeline/url-pull-worker.ts) and the streaming upload route
+  // (src/routes/asset-upload.ts), and persisted in the asset document's
+  // `administrative.storage.sizeBytes` (src/data/asset-document.ts).
+  //
+  // Undefined for assets ingested before #1059 and for the ingest paths that
+  // never learn a length (presigned-PUT completion, external-bucket
+  // registration); the size comparison is then skipped and presence alone is
+  // enforced. When supplied (and > 0) a mismatch is a hard failure: the object
+  // present under the right key with the wrong length is a truncated or
   // replaced source, which the transcoder would either reject late or transcode
   // incorrectly.
   expectedSizeBytes?: number;

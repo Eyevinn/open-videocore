@@ -247,7 +247,15 @@ export async function runPull(
         totalBytes: opened.totalBytes ?? bytesTransferred,
         progress: 100
       });
-      await deps.assets.update(assetId, { status: 'processing' });
+      // Record the TRUE stored length on the asset alongside the status advance
+      // (issue #1059). This is the "size recorded at pull completion" the
+      // pre-dispatch source readiness check compares the object store's current
+      // answer against, so a source that is later truncated or replaced is
+      // refused at submit time instead of failing the transcode minutes later.
+      // Same value already written to the job above (`bytesTransferred`); the
+      // asset is where the transcode path can reach it without a job lookup, and
+      // the asset is also where the size stays tied to the key it describes.
+      await deps.assets.update(assetId, { status: 'processing', sourceSizeBytes: bytesTransferred });
       // Operational log: the `ingest` stage reached terminal success (issue #995).
       logPipelineEvent(
         deps.pipelineLog,

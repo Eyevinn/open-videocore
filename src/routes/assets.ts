@@ -2531,18 +2531,28 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             bucket: transcodeSourceBucket,
             objectKey: preflightSource.objectKey,
             ...(transcodeSourceEndpoint ? { endpoint: transcodeSourceEndpoint } : {}),
-            stackName: DEPLOYMENT_CONTEXT
-            // No `expectedSizeBytes`: no per-asset source size is recorded at
-            // ingest completion today. The pull worker records the transferred
-            // byte count on the INGEST JOB (`Job.bytesTransferred`,
-            // src/data/job-repo.ts:105, written at url-pull-worker.ts:139-144),
-            // and the asset document's `administrative.storage.sizeBytes`
-            // (asset-document.ts:312) is always written as `0` (:511 — no caller
-            // supplies `storageSizeBytes`) and is not read back onto the asset
-            // (:654). So there is no recorded size to compare against from here
-            // without a new per-asset query; the size comparison is implemented
-            // and unit-tested in checkTranscodeSourceReadable and becomes live
-            // the moment a recorded size is passed here.
+            // The stack identity #1058's gate just RESOLVED for this request,
+            // not the deployment-wide default: the gate above has already proved
+            // the data plane and the control plane agree, so `controlPlane`
+            // names the one stack this submission concerns. Falling back to
+            // DEPLOYMENT_CONTEXT only where #1058 also does — no resolver wired
+            // or no provisioned stack (transcodeStackIdentity, assets.ts) —
+            // keeps single-stack and env-override deployments byte-identical.
+            stackName: controlPlane.resolved ?? request.connections?.stackName ?? DEPLOYMENT_CONTEXT,
+            // The size recorded when ingest completed (issue #1059): the URL
+            // pull worker's `bytesTransferred` (pipeline/url-pull-worker.ts) or
+            // the upload route's (routes/asset-upload.ts), persisted on the
+            // asset as `Asset.sourceSizeBytes` (data/asset-repo.ts) via the
+            // document's `administrative.storage.sizeBytes`
+            // (data/asset-document.ts). Undefined for assets ingested before
+            // #1059, and for paths that never learn the length (presigned-PUT
+            // completion, external-bucket registration) — the size comparison
+            // is then skipped and presence alone is enforced. The repositories
+            // clear the recorded size whenever `objectKey` is patched without a
+            // new one, so this length always describes `preflightSource.objectKey`.
+            ...(asset.sourceSizeBytes !== undefined
+              ? { expectedSizeBytes: asset.sourceSizeBytes }
+              : {})
           },
           sourceStatReader
         );
@@ -2553,7 +2563,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               bucket: transcodeSourceBucket,
               objectKey: preflightSource.objectKey,
               endpoint: transcodeSourceEndpoint,
-              reason: readiness.reason
+              stack: controlPlane.resolved ?? request.connections?.stackName,
+              reason: readiness.reason,
+              expectedSizeBytes: asset.sourceSizeBytes,
+              observedSizeBytes: readiness.sizeBytes
             },
             'refusing to start a transcode pipeline: the source object is not readable (issue #1059)'
           );

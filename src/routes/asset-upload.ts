@@ -374,7 +374,12 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
 
       // Commit the TRUE transferred size to the running total (issue #579).
       await reservation?.commit(bytesTransferred);
-      await repo.update(asset.id, { objectKey, status: 'processing' });
+      // Record the TRUE stored length alongside the key (issue #1059), exactly
+      // as the URL-pull worker does at pull completion — the streamed upload is
+      // the other path that actually knows how many bytes landed. Gives the
+      // pre-dispatch source readiness check a length to compare against for
+      // uploaded sources too, not just pulled ones.
+      await repo.update(asset.id, { objectKey, status: 'processing', sourceSizeBytes: bytesTransferred });
       opts.onObjectStored?.(asset.id, objectKey, storage);
       return reply.code(200).send({ id: asset.id, status: 'processing' });
     }

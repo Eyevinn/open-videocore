@@ -379,6 +379,14 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    // Recorded ingest size (issue #1059) — same invariant as the in-memory repo
+    // (data/asset-repo.ts): the size describes the key, so a key change with no
+    // new size clears it.
+    if (patch.sourceSizeBytes !== undefined) {
+      next.sourceSizeBytes = patch.sourceSizeBytes;
+    } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
+      next.sourceSizeBytes = undefined;
+    }
     if (patch.technicalMetadata !== undefined) {
       next.technicalMetadata = patch.technicalMetadata;
       if (patch.technicalMetadata !== null) {
