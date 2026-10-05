@@ -44,6 +44,7 @@ process.env['MINIO_ROOT_PASSWORD'] = 'test-minio-password';
 process.env['COUCHDB_ADMIN_PASSWORD'] = 'test-couchdb-password';
 
 import { provisionRouter } from './provision.js';
+import { PACKAGER_SERVICE_ID } from '../services/stack.js';
 import type { ParamStore } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { OperationStore, type Operation } from '../services/operation-store.js';
@@ -280,6 +281,148 @@ describe('DELETE /api/v1/provision/:name (no param store, legacy)', () => {
       url: '/api/v1/provision/Invalid_Name'
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+// Issue #1056: the on-demand packager is torn down OUTSIDE the stored-config
+// teardown (it is normally absent from services[]), and its outcome used to live
+// only in a log line. The stack status was therefore computed without it, so a
+// packager that survived teardown was reported as a clean removal, the stored
+// config — the only record of what was left — was deleted, and the instance kept
+// running and billing with nothing naming it.
+describe('DELETE /api/v1/provision/:name folds the on-demand packager outcome into the result (#1056)', () => {
+  // The normal case since packaging became on-demand (#243/#267): the packager
+  // is NOT in services[], so the route reconciles it against OSC separately.
+  const CONFIG_WITHOUT_PACKAGER = {
+    ...STORED_CONFIG,
+    services: STORED_CONFIG.services.filter(
+      (s) => s.serviceId !== PACKAGER_SERVICE_ID
+    )
+  };
+
+  function servicesOf(result: {
+    services?: unknown[];
+  }): { serviceId: string; role: string; status: string; error?: string }[] {
+    return (result.services ?? []) as never;
+  }
+
+  // Acceptance: static services return removed and the packager returns failed.
+  // The parameter-store entry is kept and the op result names the packager.
+  it('keeps the store entry and names the packager when only the packager fails', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === PACKAGER_SERVICE_ID) {
+        throw new Error('packager removal rejected');
+      }
+      return undefined;
+    });
+    const paramStore = makeParamStore(CONFIG_WITHOUT_PACKAGER);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(app, 'mystack');
+
+    expect(op.status).toBe('done');
+    // Previously 'removed': the packager outcome was not in the aggregate.
+    expect(op.result.status).toBe('failed');
+
+    const services = servicesOf(op.result);
+    const packager = services.find((s) => s.serviceId === PACKAGER_SERVICE_ID);
+    expect(packager).toBeDefined();
+    expect(packager?.status).toBe('failed');
+    expect(packager?.error).toContain('packager removal rejected');
+    // Every stored service still reports its own successful removal.
+    expect(
+      CONFIG_WITHOUT_PACKAGER.services.every(
+        (stored) =>
+          services.find((s) => s.serviceId === stored.serviceId)?.status ===
+          'removed'
+      )
+    ).toBe(true);
+
+    // The record of what still needs removing survives, so a retry can finish.
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+  });
+
+  // Regression guard on the happy path: a stack that never packaged has no
+  // packager, and that must NOT degrade the reported status or strand the entry.
+  it('still reports removed and deletes the entry when no packager was ever provisioned', async () => {
+    getInstance.mockImplementation(async (_c, serviceId: string) =>
+      serviceId === PACKAGER_SERVICE_ID ? undefined : { name: 'mystack' }
+    );
+    // Confirmed absent: the list read succeeds and shows no packager.
+    listInstances.mockResolvedValue([]);
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(CONFIG_WITHOUT_PACKAGER);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(app, 'mystack');
+
+    expect(op.status).toBe('done');
+    expect(op.result.status).toBe('removed');
+    // A confirmed-absent packager contributes no entry, exactly as before.
+    expect(
+      servicesOf(op.result).some((s) => s.serviceId === PACKAGER_SERVICE_ID)
+    ).toBe(false);
+    expect(paramStore.deleteStackConfig).toHaveBeenCalled();
+  });
+
+  // Acceptance: an UNCONFIRMABLE packager probe must not read as "already gone".
+  // This is the #1039 defect in its third copy — the one PR #1047 did not reach.
+  it('keeps the store entry when the packager probe cannot be verified', async () => {
+    // Static services are fine; only the packager's reads fault.
+    getInstance.mockImplementation(async (_c, serviceId: string) =>
+      serviceId === PACKAGER_SERVICE_ID ? undefined : { name: 'mystack' }
+    );
+    listInstances.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === PACKAGER_SERVICE_ID) {
+        throw new TypeError('fetch failed');
+      }
+      return [];
+    });
+    removeInstance.mockResolvedValue(undefined);
+    const paramStore = makeParamStore(CONFIG_WITHOUT_PACKAGER);
+
+    const app = await buildApp(paramStore);
+    const op = await deprovisionAndWait(app, 'mystack');
+
+    expect(op.status).toBe('done');
+    expect(op.result.status).toBe('failed');
+    expect(
+      servicesOf(op.result).find((s) => s.serviceId === PACKAGER_SERVICE_ID)
+        ?.status
+    ).toBe('failed');
+    expect(paramStore.deleteStackConfig).not.toHaveBeenCalled();
+    // Nothing was deleted for the packager on an unverified probe.
+    expect(
+      removeInstance.mock.calls.some((c) => c[1] === PACKAGER_SERVICE_ID)
+    ).toBe(false);
+  });
+
+  // Acceptance: the store-less DELETE path reports the packager outcome too. It
+  // has no config to keep, but the result must not read as clean.
+  it('reports the packager outcome on the store-less path, exactly once', async () => {
+    getInstance.mockResolvedValue({ name: 'mystack' });
+    removeInstance.mockImplementation(async (_c, serviceId: string) => {
+      if (serviceId === PACKAGER_SERVICE_ID) {
+        throw new Error('packager removal rejected');
+      }
+      return undefined;
+    });
+
+    const app = await buildApp();
+    const op = await deprovisionAndWait(app, 'mystack');
+
+    expect(op.status).toBe('done');
+    expect(op.result.status).toBe('failed');
+
+    const services = servicesOf(op.result);
+    // The static TEARDOWN_ORDER also covers the packager, so the two attempts
+    // must merge into ONE reported packager rather than double-counting it.
+    const packagerEntries = services.filter(
+      (s) => s.serviceId === PACKAGER_SERVICE_ID
+    );
+    expect(packagerEntries).toHaveLength(1);
+    expect(packagerEntries[0]?.status).toBe('failed');
   });
 });
 
