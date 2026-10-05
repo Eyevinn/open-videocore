@@ -212,6 +212,12 @@ function toDoc(job: Job): Record<string, unknown> {
     interrupted: job.interrupted,
     interruptionReason: job.interruptionReason,
     droppedByScaler: job.droppedByScaler,
+    // #1023: the durable trace that a drop was reported and later corrected.
+    // Persisted here (not only in the audit trail) so it survives on the record
+    // for every correction path, including the callback poller, which applies
+    // completions with no audit emitter wired.
+    droppedThenRecovered: job.droppedThenRecovered,
+    correctedDropError: job.correctedDropError,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt
   };
@@ -240,6 +246,8 @@ function fromDoc(doc: StoredDoc): Job {
     interrupted: doc['interrupted'] as boolean | undefined,
     interruptionReason: doc['interruptionReason'] as JobInterruptionReason | undefined,
     droppedByScaler: doc['droppedByScaler'] as boolean | undefined,
+    droppedThenRecovered: doc['droppedThenRecovered'] as boolean | undefined,
+    correctedDropError: doc['correctedDropError'] as string | undefined,
     createdAt: String(doc['createdAt'] ?? ''),
     updatedAt: String(doc['updatedAt'] ?? '')
   };

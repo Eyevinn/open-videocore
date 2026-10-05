@@ -45,11 +45,24 @@ import {
   Context,
   createInstance,
   getInstance,
+  listInstances,
   removeInstance,
-  saveSecret,
-  waitForInstanceReady
+  saveSecret
 } from '@osaas/client-core';
-import { PACKAGER_SERVICE_ID } from './stack.js';
+// The readiness wait goes through this bounded helper, NOT @osaas/client-core's
+// waitForInstanceReady (issue #1055, follow-up to #1038). The SDK helper has no
+// deadline and does not wrap its getInstanceHealth probe in a try
+// (lib/core.js:343-353, v0.24.0), so ONE dropped poll failed a stack's first
+// packaging job even though the packager came up moments later.
+import {
+  waitForInstanceReadyBounded,
+  type InstanceReadinessOptions
+} from './instance-readiness.js';
+import { PACKAGER_SERVICE_ID, PACKAGER_TEARDOWN_ROLE } from './stack.js';
+import {
+  confirmInstanceAbsentVia,
+  type ServiceTeardownResult
+} from './deprovision.js';
 
 // Secret purposes (ADR-002 naming: <stackName>.<purpose>), scoped to the
 // PACKAGER_SERVICE_ID. Mirror the purposes the eager path used so a re-provision
@@ -120,8 +133,10 @@ export type EnsurePackagerResult = {
 // OSC. Signatures mirror @osaas/client-core lib/core.d.ts (verified 2026-07-13):
 //   getInstance(ctx, serviceId, name, token)            -> Promise<any | undefined>
 //   createInstance(ctx, serviceId, token, body)         -> Promise<any>
-//   waitForInstanceReady(serviceId, name, ctx)          -> Promise<void>
 //   saveSecret(serviceId, name, value, ctx)             -> Promise<void>
+//   listInstances(ctx, serviceId, token)                -> Promise<any>
+// waitForInstanceReady below is NOT the SDK function of the same name: the
+// adapter below fulfils it with waitForInstanceReadyBounded (#1055).
 export interface PackagerOscApi {
   getServiceAccessToken(serviceId: string): Promise<string>;
   getInstance(
@@ -129,6 +144,13 @@ export interface PackagerOscApi {
     name: string,
     token: string
   ): Promise<{ name?: string } | undefined>;
+  // listInstances(ctx, serviceId, token) -> Promise<any>
+  // (@osaas/client-core lib/core.d.ts:65). UNLIKE getInstance it has no catch
+  // (lib/core.js:160-170), so it rejects instead of reporting an error as an
+  // empty result — which is what makes it usable as the confirming read in
+  // teardownOnDemandPackager. Resolves the raw instances payload; callers go
+  // through confirmInstanceAbsentVia rather than interpreting it here.
+  listInstances(serviceId: string, token: string): Promise<unknown>;
   createInstance(
     serviceId: string,
     token: string,
@@ -147,15 +169,30 @@ export interface PackagerOscApi {
 
 // Adapt an @osaas/client-core Context into the narrow PackagerOscApi. Keeps the
 // SDK's positional-arg calling convention isolated behind one place.
-export function packagerOscApiFromContext(osc: Context): PackagerOscApi {
+//
+// `readiness` bounds the readiness wait (issue #1055). Unset uses the shared
+// defaults in src/services/instance-readiness.ts — the same 5-minute deadline
+// and 1s cadence the provisioning route uses. Tests collapse the cadence.
+export function packagerOscApiFromContext(
+  osc: Context,
+  readiness: InstanceReadinessOptions = {}
+): PackagerOscApi {
   return {
     getServiceAccessToken: (serviceId) => osc.getServiceAccessToken(serviceId),
     getInstance: (serviceId, name, token) =>
       getInstance(osc, serviceId, name, token),
+    listInstances: (serviceId, token) => listInstances(osc, serviceId, token),
     createInstance: (serviceId, token, body) =>
       createInstance(osc, serviceId, token, body),
+    // Bounded (#1055): a transient probe failure is retried until the deadline,
+    // and a timeout throws an error naming the service plus the last probe
+    // error. ensurePackagerProvisioned logs and rethrows that, so the package
+    // step fails loudly instead of hanging.
     waitForInstanceReady: (serviceId, name) =>
-      waitForInstanceReady(serviceId, name, osc),
+      waitForInstanceReadyBounded(osc, serviceId, name, {
+        ...readiness,
+        label: 'packager'
+      }),
     saveSecret: (serviceId, name, value) =>
       saveSecret(serviceId, name, value, osc),
     removeInstance: (serviceId, name, token) =>
@@ -409,13 +446,26 @@ export type PackagerTeardownResult = {
 // idempotent (a retry after removal returns 'not_found') and mirrors the
 // probe-then-remove pattern in services/deprovision.ts:teardownService.
 //
-// Only the getInstance/removeInstance surface of PackagerOscApi is used, so a
-// caller can pass the same packagerOscApiFromContext(osc) adapter used for the
-// ensure path.
+// Only the getInstance/listInstances/removeInstance surface of PackagerOscApi is
+// used, so a caller can pass the same packagerOscApiFromContext(osc) adapter
+// used for the ensure path.
+//
+// An EMPTY probe is not believed on its own (issue #1056, the same defect
+// #1039 fixed in deprovision.ts): osc.getInstance bottoms out in the SDK's
+// getInstance (see packagerOscApiFromContext above), which resolves `undefined`
+// for every error except a 401 — so a network fault, a 5xx or a DNS failure all
+// look exactly like "no packager was ever provisioned". Absence is therefore
+// re-checked through the SHARED confirmInstanceAbsentVia (deprovision.ts); when
+// it cannot establish absence it throws and the catch below reports `failed`,
+// which is retryable, instead of a silent success that leaves the packager
+// running and billing.
 export async function teardownOnDemandPackager(
   osc: Pick<
     PackagerOscApi,
-    'getServiceAccessToken' | 'getInstance' | 'removeInstance'
+    | 'getServiceAccessToken'
+    | 'getInstance'
+    | 'listInstances'
+    | 'removeInstance'
   >,
   stackName: string
 ): Promise<PackagerTeardownResult> {
@@ -423,13 +473,55 @@ export async function teardownOnDemandPackager(
   try {
     const sat = await osc.getServiceAccessToken(serviceId);
     const existing = await osc.getInstance(serviceId, stackName, sat);
-    if (!existing) {
+    if (
+      !existing &&
+      (await confirmInstanceAbsentVia(
+        (sid, token) => osc.listInstances(sid, token),
+        serviceId,
+        stackName,
+        sat
+      ))
+    ) {
       return { serviceId, status: 'not_found' };
     }
+    // Either the probe returned the packager, or it came back empty but the
+    // instance list still shows it (the empty probe was a swallowed error).
+    // Both mean there is something to remove.
     await osc.removeInstance(serviceId, stackName, sat);
     return { serviceId, status: 'removed' };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { serviceId, status: 'failed', error: message };
   }
+}
+
+// Express a packager teardown outcome as per-service teardown results that can
+// be folded into the stack-level DELETE result (issue #1056,
+// deprovision.ts:foldTeardownResults).
+//
+// Returns an EMPTY list for two cases, so folding is a no-op for them:
+//   - `undefined` — teardownOnDemandPackager was not called at all (the
+//     packager was recorded in the stored services[], so the stored-config
+//     teardown already covers it and already reports it).
+//   - `not_found`  — absence was CONFIRMED, so there is no packager and never
+//     was one for this stack. Contributing nothing mirrors how an optional
+//     service that was never activated yields no entry
+//     (deprovision.ts:optionalStoredServices) and keeps a never-packaged stack
+//     reporting `removed` rather than degrading to `partial`.
+//
+// `removed` and `failed` DO produce an entry: the first so a packager that was
+// actually torn down stops being invisible, the second so it lands in the
+// result as a leftover and keeps the stack status retryable.
+export function packagerTeardownAsServiceResults(
+  packager: PackagerTeardownResult | undefined
+): ServiceTeardownResult[] {
+  if (!packager || packager.status === 'not_found') return [];
+  return [
+    {
+      serviceId: packager.serviceId,
+      role: PACKAGER_TEARDOWN_ROLE,
+      status: packager.status,
+      ...(packager.error ? { error: packager.error } : {})
+    }
+  ];
 }

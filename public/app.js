@@ -18,6 +18,11 @@ import { createAssetsTable } from './assets-table.js';
 // (#368/#373) against the verified GET /api/v1/logs/ contract. See
 // public/logs-table.js.
 import { createLogsTable } from './logs-table.js';
+// Shared audit-table wiring (issue #987). Composes the merged shared table
+// primitive (#367/#372) in OFFSET paging mode and the URL-state contract
+// (#368/#373) against the verified GET /api/v1/audit contract (src/routes/
+// audit.ts:62-80). See public/audit-table.js.
+import { createAuditTable } from './audit-table.js';
 // Size-based upload routing (issue #747): stream small files through the proxy,
 // but push medium/large files straight to MinIO via the presigned single-part
 // and multipart routes so they never hit the proxy's request-body limit.
@@ -54,12 +59,23 @@ import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete
 // full contract grounding is in that module's header.
 import { mountReviewState } from './review-state.js';
 
-// Asset rename affordance (issue #956): a control for the `name` field that
-// PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
+// Asset rename affordance (issues #956, #927): a control for the `name` field
+// that PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
 // could trigger. UI only — no route or schema changes. Full contract grounding,
 // including why a rename cannot move the asset's id, slug or stored object keys,
 // is in that module's header.
-import { mountAssetRename } from './asset-rename.js';
+//   mountAssetRename  — the detail view's action-row control (#956).
+//   openRenameDialog  — the dialog behind it, called directly by the assets
+//                       table's per-row Rename control (#927) so both surfaces
+//                       share one interaction and one request shape.
+import { mountAssetRename, openRenameDialog } from './asset-rename.js';
+
+// Clip / trim affordance (issue #793): a control for POST
+// /api/v1/assets/{id}/clip, which the API has served since issue #17 but which
+// nothing in this UI could reach. UI only — no route or schema changes. Full
+// contract grounding, including where the duration bound comes from and why a
+// 502 is reported as an outright failure, is in that module's header.
+import { mountAssetClip } from './asset-clip.js';
 
 // Read-only tracks panel (issue #902, broken out of #794): one section per track
 // kind — video, audio, subtitle — each listing only the attributes the API
@@ -71,6 +87,25 @@ import { mountAssetRename } from './asset-rename.js';
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
 import { AUDIO_EDIT_COPY } from './audio-track-edit.js';
+
+// Comments panel (issue #900): the free-text notes on an asset, plus one control
+// to add another. ADD + READ ONLY — the API exposes exactly `post` and `get` on
+// /api/v1/assets/{id}/comments and no `…/comments/{commentId}` path at all, so
+// an edit or delete control would have nothing to call. Full contract grounding,
+// including the author field the API does not have, is in that module's header.
+import { mountAssetComments } from './comments-panel.js';
+
+// Version-chain navigation on asset detail (issue #907, broken out of #795):
+// the whole lineage an asset belongs to, as the tree the API can describe, with
+// the SERVER-COMPUTED current version badged, the asset being viewed marked
+// separately, every other member navigable, and an explicit state for an asset
+// with no other versions. One call — GET /assets/{id}/versions — which the
+// detail view's own GET /assets/{id} body cannot answer: that body carries the
+// asset's own `versionGroupId` but not the other members of the group. Full
+// contract grounding, and what the API does NOT expose (no promote/set-current
+// operation of any kind), is in that module's header; the interaction design it
+// implements is docs/design/asset-version-chain.md.
+import { mountVersionChain } from './version-chain.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -188,6 +223,31 @@ function canRenameAsset() {
 // tracks panel itself stays fully visible — only the write controls go.
 // Client-side mirror only: the 403 is still handled if it arrives.
 function canEditAudioTracks() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add a comment to an asset (issue #900).
+// Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only, and
+// `methodToAction` (:79-93) maps POST -> write, so POST /assets/{id}/comments is
+// refused to a `viewer` with 403 by `resourceAuthorizationPreHandler('asset')`
+// (:126, registered src/routes/assets.ts:1748). GET on the same sub-resource is
+// `read`, which a viewer DOES hold — so a viewer still sees every comment,
+// read-only. Client-side mirror only: the 403 is still handled if it arrives.
+function canAddComment() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may clip an asset (issue #793). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-93) maps
+// POST -> write, so POST /assets/{id}/clip is refused to a `viewer` with 403 by
+// `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
+// if it arrives.
+function canClipAsset() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -1923,11 +1983,20 @@ function loadingEl() {
 // detached window renders ONLY that one detail view, self-polls, and shares no
 // state with this window. The active stack is passed explicitly so the detached
 // window targets the same stack without depending on the opener's localStorage.
-function openDetailWindow(type, id) {
-  const params = 'type=' + encodeURIComponent(type) +
+// The URL of that standalone view. Broken out (issue #793) so a link to another
+// resource's detail — e.g. the child asset a clip produced — can be a REAL
+// anchor href (openable in a new tab, copyable) rather than a click handler
+// that only works in the window it was built in. `getActiveStack()` already
+// resolves the window-scoped override first, so a link built inside a detached
+// window targets that window's stack.
+function detailWindowUrl(type, id) {
+  return 'detail.html?type=' + encodeURIComponent(type) +
     '&id=' + encodeURIComponent(id) +
     '&stack=' + encodeURIComponent(getActiveStack());
-  window.open('detail.html?' + params, '_blank', 'width=680,height=800,noopener');
+}
+
+function openDetailWindow(type, id) {
+  window.open(detailWindowUrl(type, id), '_blank', 'width=680,height=800,noopener');
 }
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
@@ -1938,7 +2007,7 @@ function openDetailWindow(type, id) {
 // here, so switchTab dropped every click on it (issue #823). The list is kept
 // explicit rather than derived from the DOM so a stray/injected button cannot
 // become routable; auditTabWiring() below is what keeps the three in step.
-const TABS = ['assets', 'jobs', 'logs', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
+const TABS = ['assets', 'jobs', 'logs', 'audit', 'transcoders', 'pipelines', 'profiles', 'collections', 'search', 'webhooks', 'storage', 'provision'];
 const TAB_RENDERERS = {};
 
 const TAB_KEY = 'ovc-active-tab';
@@ -2085,6 +2154,44 @@ async function renderAssetsTab(container) {
     isAssetWedged,
     onRowClick: function (id) {
       showAssetDetail(id, detailPanel);
+    },
+    // ── Rename from the row (issue #927) ──
+    //
+    // The detail view got this action first (#956); this is the same action
+    // reached one click earlier. It is deliberately the SAME dialog
+    // (openRenameDialog) and therefore the same single PATCH /api/v1/assets/{id}
+    // body — `{ name }` and nothing else — rather than a second rename path that
+    // could drift from it. The contract is cited in full in
+    // public/asset-rename.js; nothing about the API changes for this control.
+    //
+    // Passed as the function, not its result: the table calls it while rendering
+    // each page, so changing role in the UI takes effect on the next repaint.
+    canRename: canRenameAsset,
+    onRename: async function (id, name) {
+      const outcome = await openRenameDialog({
+        // `name` is the row's current title, so the field is prefilled without a
+        // second GET. The row carries the ULID in `data-id`, which is what
+        // PATCH /:id requires — that route has no slug fallback.
+        asset: { id: id, name: name },
+        apiFetch: apiFetch,
+        openModal: openModal,
+      });
+      if (outcome.renamed) {
+        // Reload (the table's default) so the new title appears in the Name /
+        // Title column. If the detail pane happens to be showing this asset, it
+        // is re-read too: it renders the same `name` and would otherwise keep
+        // displaying the old one.
+        if (detailPanel.style.display !== 'none' && detailPanel.dataset.assetId === id) {
+          showAssetDetail(id, detailPanel);
+        }
+        return true;
+      }
+      // Not renamed — cancelled, or refused. Every refusal (403, 404, a rejected
+      // name, a transport failure) has already been stated IN the dialog, where
+      // the operator still has what they typed, so nothing is reported a second
+      // time out here. A 404 is the one case that still earns a reload: the row on
+      // screen is stale, and the reload is what removes it.
+      return outcome.gone === true;
     },
     onDelete: async function (id, name, rowState) {
       const label = nameOrFallback(name, 'this asset');
@@ -2366,6 +2473,10 @@ async function renderAssetsTab(container) {
 
 async function showAssetDetail(id, detailPanel) {
   detailPanel.style.display = 'flex';
+  // Which asset this pane is currently showing, so a list-row action that changes
+  // the asset (the row Rename, issue #927) can tell whether the open pane is now
+  // displaying a stale value and needs re-reading.
+  detailPanel.dataset.assetId = id;
   // Static structural HTML only. A "pop out" affordance sits next to the close
   // button so the user can detach this asset detail into its own window.
   detailPanel.innerHTML = [
@@ -2391,7 +2502,13 @@ async function showAssetDetail(id, detailPanel) {
   });
 
   const body = detailPanel.querySelector('#detail-body');
-  await renderAssetDetailBody(id, body);
+  // Navigating the version chain (issue #907) rebuilds the whole pane, not just
+  // the body: the pop-out button above closes over `id`, so re-rendering the
+  // body alone would leave "open in new window" pointing at the version the
+  // operator just navigated away from.
+  await renderAssetDetailBody(id, body, {
+    onNavigate: function (nextId) { return showAssetDetail(nextId, detailPanel); },
+  });
 }
 
 // Fetch and render an asset's downloadable files + streaming file groups into
@@ -2537,7 +2654,18 @@ async function renderAssetFiles(assetId, container) {
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
 // the fetched asset (or throws if the fetch fails / 404s so callers can react).
-async function renderAssetDetailBody(id, bodyEl) {
+//
+// `opts.onNavigate(nextId)` (optional, issue #907) is how the version-chain
+// block hands the view to another member of the same chain. The default —
+// re-render this same body element for the new id — is correct for the embedded
+// side panel; callers whose surface owns more chrome than the body (the asset
+// pane's pop-out button, the detached window's self-poll) override it so their
+// chrome follows the navigation instead of going stale.
+async function renderAssetDetailBody(id, bodyEl, opts) {
+  const options = opts || {};
+  const navigateToVersion = typeof options.onNavigate === 'function'
+    ? options.onNavigate
+    : function (nextId) { return renderAssetDetailBody(nextId, bodyEl, options); };
   const body = bodyEl;
   body.innerHTML = '';
   const loader = loadingEl();
@@ -2814,6 +2942,51 @@ async function renderAssetDetailBody(id, bodyEl) {
       // A viewer keeps the whole panel (they hold `read`) and is told once why
       // the controls are not there, rather than being left to wonder.
       audioEditDenied: canEditAudioTracks() ? null : AUDIO_EDIT_COPY.roleNote,
+    });
+
+    // ── Versions: the asset's whole version chain (issue #907) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/version-chain.js:
+    //   GET /api/v1/assets/{id}/versions — the ONLY operation on that path
+    //        (openapi.json .paths["/api/v1/assets/{id}/versions"]; handler
+    //        src/routes/assets.ts:3446-3484). 200 =
+    //        { assetId, versionGroupId?, currentVersionId, versions[] },
+    //        required ["assetId","currentVersionId","versions"] (:3452-3457);
+    //        items are the full assetSchema, of which this block reads `id`,
+    //        `name`, `status`, `createdAt` and the lineage edge
+    //        `versionOfAssetId` (:882). 404 = flat { error, message? } (:529).
+    //        No query parameters: the chain is not paginated, only capped at
+    //        MAX_LIMIT = 200 (src/data/asset-repo.ts:853).
+    //
+    // Three things this block does NOT do, because the contract does not
+    // support them:
+    //   - It never re-derives the current version. `currentVersionId` is
+    //     computed server-side by a preference ladder over `status`
+    //     (src/data/asset-repo.ts:1275-1294) and is explicitly NOT "the last
+    //     array element" (:1239-1243), so the field is read as sent.
+    //   - It offers no promote / set-current control: no endpoint accepts one,
+    //     and there is no stored marker it could write (ADR-024 D3). Current is
+    //     shown as observed state, never as an operator choice.
+    //   - It never reparents a member whose `versionOfAssetId` is outside the
+    //     returned page; those are grouped as orphans rather than attached to
+    //     the root, which would assert an edge the API did not report.
+    //
+    // The path takes the ULID (`asset.id`): unlike GET /assets/{id}, this route
+    // passes the raw param to repo.listVersions (:3463), which looks up by id
+    // alone — a slug would 404. The detail pane holds the ULID even when it was
+    // opened by slug.
+    //
+    // Mounted with the other read-only information blocks and ABOVE the action
+    // controls, next to Tracks: it reports lineage and originates no mutation.
+    await mountVersionChain({
+      assetId: asset.id,
+      host: body,
+      apiFetch: apiFetch,
+      // Inject the app's own status->class map so one `status` value never
+      // renders two different ways on a single page.
+      badgeClass: badgeClass,
+      onNavigate: navigateToVersion,
     });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
@@ -3129,6 +3302,55 @@ async function renderAssetDetailBody(id, bodyEl) {
       showMsg: showMsg,
     });
 
+    // ── Comments: add + read (issue #900) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/comments-panel.js. Note the real path: the issue
+    // says `/comments`, but the comments collection is a SUB-RESOURCE of one
+    // asset and no top-level `/comments` path exists.
+    //   GET  /api/v1/assets/{id}/comments — 200 is a bare ARRAY of
+    //        { id, assetId, body, createdAt } (all four `required`,
+    //        additionalProperties false), 404 { error }. No query parameters at
+    //        all, so the list is unpaged and the server's order — oldest first
+    //        (listByAsset, src/data/comment-repo.ts:50-58) — is rendered as
+    //        given. (openapi.json .paths["/api/v1/assets/{id}/comments"].get;
+    //        src/routes/assets.ts:4798-4814)
+    //   POST /api/v1/assets/{id}/comments — body REQUIRED and carries EXACTLY
+    //        `body` (string, 1..4096 after trim); 201 = the created comment,
+    //        404 { error }, plus an undeclared-but-real 400 from the body
+    //        schema. (…].post; src/routes/assets.ts:4776-4793,
+    //        commentBodySchema :1174-1176)
+    //
+    // Mounted directly below "Editorial review" and above the action row, with
+    // the other editorial blocks: a comment is editorial commentary on the
+    // asset, not a lifecycle operation.
+    //
+    // ADD + READ ONLY, and not as a scope decision to revisit: the path carries
+    // only `post` and `get`, there is no `…/comments/{commentId}` path, and
+    // `CommentRepository` declares only `create` + `listByAsset`
+    // (src/data/comment-repo.ts:29-33). The panel also attributes no comment to
+    // anyone, because `Comment` has no author field (:17-22) and the API has no
+    // per-user identity to fill one with (src/auth/principal.ts:11-16).
+    //
+    // A successful add re-reads the sub-resource and rebuilds the block in
+    // place — one request, no full detail re-render — because `id` and
+    // `createdAt` are server-minted, so the returned list is the only truthful
+    // one. The panel keeps its own in-memory draft per asset id so the detached
+    // window's 5s self-poll cannot wipe a half-typed comment.
+    //
+    // Sub-resource paths take the ULID (`asset.id`): both handlers resolve the
+    // parent with a plain `repo.get(request.params.id)` and no slug fallback
+    // (src/routes/assets.ts:4786, :4807).
+    await mountAssetComments({
+      assetId: asset.id,
+      anchorEl: actionsDiv,
+      host: body,
+      canAdd: canAddComment(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+      fmtDate: fmtDate,
+    });
+
     // ── Delete protection: lock / unlock (issue #895) ──
     //
     // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
@@ -3224,6 +3446,76 @@ async function renderAssetDetailBody(id, bodyEl) {
         // full asset, and re-rendering from the server is the only way a
         // silently different stored value becomes visible.
         await rerenderThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
+    // ── Clip: cut an in/out window into a child asset (issue #793) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/asset-clip.js:
+    //   POST /api/v1/assets/{id}/clip — body REQUIRED, `startSeconds` +
+    //        `endSeconds` (both numbers, `endSeconds > startSeconds` enforced by
+    //        the schema's own refinement) and optional `outputName` (1..256);
+    //        `additionalProperties: false`. 201 = the FULL child asset
+    //        (`parentId` = this asset); 400 / 404 / 409 `no_object` / 501
+    //        `not_configured` / 502 `clip_failed` are all { error, message? }.
+    //        (openapi.json .paths["/api/v1/assets/{id}/clip"].post — the spec
+    //        declares no operationId; clipBodySchema src/routes/assets.ts:734-746,
+    //        handler app.post('/:id/clip') :5389-5464.)
+    //
+    // The in/out bound comes from the asset's OWN probed duration —
+    // `technicalMetadata.durationSeconds` (technicalMetadataSchema,
+    // src/routes/assets.ts:761-770), the same field the "Duration" row above
+    // renders. The API does NOT bound the window itself, so this is a
+    // client-side guard against asking for a window that cannot exist; when the
+    // asset has no extracted metadata the dialog says the check could not be
+    // made rather than inventing a limit.
+    //
+    // A 502 is reported as an outright failure. The pipeline only advances the
+    // child to `ready` after VERIFYING the written object exists and is
+    // non-empty, and marks it `failed` otherwise (src/pipeline/clip.ts:166-209,
+    // the issue #786 honesty fix) — so a failed clip must never be reported as
+    // a usable one, and even on a 201 the child's own `status` is read back
+    // rather than assumed.
+    //
+    // The path takes the ULID (`asset.id`), which this pane holds even when it
+    // was opened by slug: the handler passes the raw param to `repo.get` with no
+    // slug fallback.
+    mountAssetClip({
+      asset: asset,
+      actionsRow: actionsDiv,
+      // Sits with the other produce-something actions:
+      // [Restore?] [Lock | Unlock] [Rename] [Clip] [Extract Metadata] [Thumbnails].
+      beforeEl: actionsDiv.querySelector('#btn-extract-meta'),
+      canChange: canClipAsset(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      messageHost: function () { return bodyEl.querySelector('#action-msg') || bodyEl; },
+      // Where "Open clip" goes. In the main window it swaps this side panel
+      // over to the child asset (the same move the job → asset link makes); in
+      // the detached detail window there is no panel, so the anchor's own href
+      // — a standalone detail URL for the child — carries the navigation.
+      openAsset: function (childId) {
+        const panel = document.getElementById('asset-detail');
+        if (!panel) {
+          window.location.href = detailWindowUrl('asset', childId);
+          return;
+        }
+        switchTab('assets');
+        showAssetDetail(childId, panel);
+      },
+      assetHref: function (childId) { return detailWindowUrl('asset', childId); },
+      // The standalone detail window (detail.html, `body.detail-standalone`)
+      // re-renders this whole body every DETAIL_POLL_INTERVAL_MS, which would
+      // throw the outcome link away a few seconds after it appeared. There, the
+      // clip is followed as soon as it is ready; in the main window the side
+      // panel is not polled, so the link stays put until the operator uses it.
+      navigateOnSuccess: document.body.classList.contains('detail-standalone'),
+      onClipped: function () {
+        // A successful clip adds an asset to the list; a failed one adds a
+        // `failed` child record. Either way the table is now stale. Harmless in
+        // the detached detail window, which has no table.
+        if (assetsTable) assetsTable.reload();
       },
     });
 
@@ -3637,11 +3929,22 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       ['Type', escHtml(job.type || '—')],
       ['Status', renderBadge(job.status)],
     ];
+    // Asset row (issue #988): GET /api/v1/jobs/:id now resolves `assetName`
+    // (OPTIONAL on the wire — src/routes/jobs.ts:62; absent when the asset has
+    // been deleted), so the link reads as the asset's name when there is one.
+    // The ULID stays on screen either way: it is the value every asset-id
+    // endpoint accepts, and it is what a deleted asset degrades to.
     if (job.assetId) {
-      kvRows.push(['Asset ID',
-        '<a href="#" class="job-asset-link text-mono" data-asset-id="' + escHtml(job.assetId) + '" style="color:var(--accent)">' + escHtml(job.assetId) + '</a>']);
+      const assetLinkHtml =
+        '<a href="#" class="job-asset-link' + (job.assetName ? '' : ' text-mono') +
+        '" data-asset-id="' + escHtml(job.assetId) + '" style="color:var(--accent)">' +
+        escHtml(job.assetName || job.assetId) + '</a>';
+      kvRows.push(['Asset',
+        job.assetName
+          ? assetLinkHtml + ' <span class="text-mono job-asset-id-inline">' + escHtml(job.assetId) + '</span>'
+          : assetLinkHtml]);
     } else {
-      kvRows.push(['Asset ID', '<span class="text-mono">—</span>']);
+      kvRows.push(['Asset', '<span class="text-mono">—</span>']);
     }
     if (job.profile) kvRows.push(['Profile', escHtml(job.profile)]);
     if (job.progress != null) kvRows.push(['Progress', escHtml(job.progress + '%')]);
@@ -3776,18 +4079,69 @@ async function renderJobDetailBody(id, bodyEl, opts) {
 }
 
 // ─── PIPELINE EXECUTION DETAIL ────────────────────────────────────────────────
+
+// Marker class on the collapsed "Raw" disclosure (issue #964). One constant so
+// the open-state preservation below, the CSS, and the DOM test all name the
+// same element instead of restating the string.
+const RAW_DISCLOSURE_CLASS = 'raw-disclosure';
+
+// A collapsed-by-default disclosure holding the pretty-printed raw document.
+// The curated view above it is the primary reading surface; the full object
+// stays one click away rather than being the first thing an operator sees
+// (issue #964).
+//
+// ACCESSIBILITY: native <details>/<summary> — keyboard-operable and exposed as
+// a disclosure to assistive tech with no ARIA of our own, matching the existing
+// disclosure idiom in renderCollectionAssetPicker(). The value is written with
+// textContent, never interpolated into an HTML string.
+//
+// @param {unknown} value   object to serialise
+// @param {boolean} [open]  restore a previously-expanded state (poll re-render)
+// @returns {HTMLElement} detached <details>
+function rawJsonDisclosure(value, open) {
+  const details = document.createElement('details');
+  details.className = RAW_DISCLOSURE_CLASS + ' mt12';
+  if (open) details.open = true;
+
+  const summary = document.createElement('summary');
+  summary.textContent = 'Raw';
+  details.appendChild(summary);
+
+  const pre = document.createElement('pre');
+  pre.className = 'code-block';
+  pre.textContent = JSON.stringify(value, null, 2);
+  details.appendChild(pre);
+
+  return details;
+}
+
 // Fetch and render a single PipelineExecution (issue #193) into `bodyEl`.
 // Contract: GET /api/v1/pipelines/:executionId — response `pipelineExecutionSchema`
-// in src/routes/pipelines.ts (id, assetId, assetName?, pipelineName, status
-// [running|done|failed], steps[], createdAt, updatedAt). Each step (per
-// stepExecutionSchema): name, status [pending|running|done|failed], jobId?,
-// encoreJobId?, error?, startedAt?, completedAt?, progress?.
+// in src/routes/pipelines.ts:32-41 (id, assetId, assetName?, pipelineName,
+// status [running|done|failed], steps[], createdAt, updatedAt), mirrored in
+// openapi.json .paths["/api/v1/pipelines/{executionId}"].get 200. Each step, per
+// `stepExecutionSchema` (src/routes/pipelines.ts:17-30): name, status
+// [pending|running|done|failed|skipped], jobId?, encoreJobId?, error?,
+// skipReason?, startedAt?, completedAt?, progress? — only `name` and `status`
+// are required, so every other cell tolerates an absent value.
+//
+// The steps render as a per-step timeline (issue #964): one row per step with
+// its job id, Encore job id, and start/completion timestamps, each
+// identifier click-to-copy via the shared copy-id control. The full execution
+// document is still here, behind the collapsed "Raw" disclosure at the bottom.
 //
 // All server-provided text is inserted via escHtml before interpolation. Returns
 // the fetched execution so callers (detail.js) can derive the window title and
 // decide whether to keep polling.
 async function renderPipelineDetailBody(id, bodyEl) {
   const body = bodyEl;
+  // detail.js tick() re-renders this body on every poll while the execution is
+  // running. Carry the operator's Raw disclosure state across that refresh so a
+  // poll does not snap an expanded dump shut under them.
+  const prevRaw = typeof body.querySelector === 'function'
+    ? body.querySelector('.' + RAW_DISCLOSURE_CLASS)
+    : null;
+  const rawWasOpen = !!(prevRaw && prevRaw.open);
   body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
@@ -3819,8 +4173,9 @@ async function renderPipelineDetailBody(id, bodyEl) {
     }).join('');
     body.appendChild(kvDiv);
 
-    // Per-step list: status, progress, timestamps, and the FULL error text for
-    // failed steps (inline, not tooltip-only). All fields escaped via escHtml.
+    // Per-step timeline: status, progress, both job identifiers, timestamps, and
+    // the FULL error text for failed steps (inline, not tooltip-only). All
+    // fields escaped via escHtml.
     const stepsTitle = document.createElement('div');
     stepsTitle.className = 'section-title mt12';
     stepsTitle.textContent = 'Steps';
@@ -3836,33 +4191,44 @@ async function renderPipelineDetailBody(id, bodyEl) {
       const rows = steps.map(function(s) {
         const cells = [];
         cells.push('<td>' + escHtml(s.name) + '</td>');
+        // Status is never colour-ALONE: the word itself is the status (WCAG 1.4.1).
         cells.push('<td><span style="color:' + stepColor(s.status) + '">' + escHtml(s.status) + '</span></td>');
         cells.push('<td>' + (s.progress != null ? escHtml(s.progress + '%') : '—') + '</td>');
-        cells.push('<td>' + (s.jobId ? '<span class="text-mono">' + escHtml(s.jobId) + '</span>' : '—') + '</td>');
+        // Both identifiers are click-to-copy via the shared control (copy-id.js):
+        // tracing a run means pasting these into GET /jobs/{id} or the
+        // transcoder's own API, and neither should have to be retyped. Both are
+        // optional in stepExecutionSchema — copyableIdCellHtml() renders the
+        // em-dash placeholder when the step has not reached that stage. The
+        // column label mirrors the contract field name (`encoreJobId`) and the
+        // "Encore Instance" row the job detail already shows.
+        cells.push('<td>' + copyableIdCellHtml(s.jobId, 'Copy job id for step ' + s.name) + '</td>');
+        cells.push('<td>' + copyableIdCellHtml(s.encoreJobId, 'Copy Encore job id for step ' + s.name) + '</td>');
         cells.push('<td>' + escHtml(fmtDate(s.startedAt)) + '</td>');
         cells.push('<td>' + escHtml(fmtDate(s.completedAt)) + '</td>');
-        var row = '<tr>' + cells.join('') + '</tr>';
+        var row = '<tr class="step-row">' + cells.join('') + '</tr>';
         // Full error text on its own spanning row so long strings wrap and are
         // fully visible (acceptance criterion: not tooltip-only).
         if (s.error) {
-          row += '<tr class="step-error-row"><td colspan="6" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
+          row += '<tr class="step-error-row"><td colspan="7" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
         }
         return row;
       }).join('');
 
       const table = document.createElement('table');
       table.className = 'mini-table';
+      table.id = 'pipeline-step-timeline';
       table.innerHTML =
         '<thead><tr>' +
-        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Started</th><th>Completed</th>' +
+        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Encore job</th><th>Started</th><th>Completed</th>' +
         '</tr></thead><tbody>' + rows + '</tbody>';
       body.appendChild(table);
+      // Bind the copy buttons for every identifier cell just rendered.
+      wireCopyIdButtons(table);
     }
 
-    const pre = document.createElement('pre');
-    pre.className = 'code-block mt12';
-    pre.textContent = JSON.stringify(exec, null, 2);
-    body.appendChild(pre);
+    // Raw execution document — present, but collapsed behind a disclosure so the
+    // timeline above is what an operator reads first (issue #964).
+    body.appendChild(rawJsonDisclosure(exec, rawWasOpen));
     return exec;
   } catch (err) {
     body.innerHTML = '';
@@ -3882,6 +4248,53 @@ let pendingCollectionFocusId = null;
 function openCollectionFromSearch(id) {
   pendingCollectionFocusId = id;
   switchTab('collections');
+}
+
+// Selector for every interactive control that may live INSIDE a collection row.
+// A click or key press that lands on one of these is that control's own
+// activation, never a row activation (issue #917) — so View/Delete can never
+// double-trigger the detail panel.
+const COLLECTION_ROW_CONTROL_SELECTOR = 'button, a, input, select, textarea, label, [role="button"]';
+
+// Row activation for the collections list (issue #917). The whole row opens the
+// detail panel, by pointer OR by keyboard, with the View button kept as a
+// redundant explicit control.
+//
+// Accessibility notes:
+//   - `tabindex="0"` on the `<tr>` puts the row in the tab order. We deliberately
+//     do NOT put `role="button"` on the row: that would replace the row/cell
+//     semantics a screen reader needs to read a 5-column table, and the cells
+//     carry the only description of WHICH collection this is. The row keeps
+//     `role="row"` and gains an action; the View button inside it remains the
+//     named, unambiguous affordance for assistive tech.
+//   - Enter and Space both activate, matching the platform convention for an
+//     activatable widget. Space is `preventDefault`ed so activating a row does
+//     not also scroll the page.
+//   - Keydowns are only honoured when the row ITSELF has focus (`e.target === tr`).
+//     Without that check, pressing Enter on the focused View button would bubble
+//     a keydown to the row and open the detail panel twice.
+function wireCollectionRowActivation(root, onOpen) {
+  root.querySelectorAll('tr.coll-row').forEach(function(tr) {
+    const id = tr.dataset.id;
+    function activate() {
+      root.querySelectorAll('tr.coll-row').forEach((r) => r.classList.remove('row-selected'));
+      tr.classList.add('row-selected');
+      onOpen(id);
+    }
+    tr.addEventListener('click', function(e) {
+      if (e.target.closest(COLLECTION_ROW_CONTROL_SELECTOR)) return;
+      activate();
+    });
+    tr.addEventListener('keydown', function(e) {
+      if (e.target !== tr) return;
+      if (e.key === 'Enter') {
+        activate();
+      } else if (e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        activate();
+      }
+    });
+  });
 }
 
 async function renderCollectionsTab(container) {
@@ -3966,7 +4379,9 @@ async function renderCollectionsTab(container) {
       // :90) and is
       // returned by GET /collections (:315-324), so the list already knows.
       const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
-      return '<tr data-id="' + escHtml(c.id) + '">' +
+      // `coll-row` + `tabindex="0"`: the whole row activates the detail panel by
+      // pointer or keyboard (issue #917). See wireCollectionRowActivation().
+      return '<tr class="coll-row" data-id="' + escHtml(c.id) + '" tabindex="0">' +
         '<td class="cell-id">' + escHtml(c.id) + '</td>' +
         '<td>' + escHtml(c.name || '—') + '</td>' +
         '<td>' + escHtml(String(assetCount)) + '</td>' +
@@ -3985,6 +4400,13 @@ async function renderCollectionsTab(container) {
       '<tbody>' + rows + '</tbody>' +
       '</table>';
     wrap.appendChild(tableWrap);
+
+    // Whole-row activation (issue #917). Bound alongside the View button, which
+    // stays as a redundant explicit control; the row handler ignores events that
+    // originate on any inner control, so the two cannot double-trigger.
+    wireCollectionRowActivation(tableWrap, function(id) {
+      showCollectionDetail(id, detailPanel, loadCollections);
+    });
 
     tableWrap.querySelectorAll('.coll-view-btn').forEach(function(btn) {
       btn.addEventListener('click', function() { showCollectionDetail(btn.dataset.id, detailPanel, loadCollections); });
@@ -7151,20 +7573,106 @@ async function renderPipelinesTab(container) {
 
 // ─── TRANSCODERS TAB ───────────────────────────────────────────────────────────
 
-// Human-readable relative time for a lastIdleAt epoch-ms value ("X minutes ago").
-function relativeTime(epochMs) {
-  if (epochMs == null || isNaN(epochMs)) return '—';
-  const diffMs = Date.now() - Number(epochMs);
-  if (diffMs < 0) return 'just now';
-  const sec = Math.floor(diffMs / 1000);
-  if (sec < 5) return 'just now';
-  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's') + ' ago';
+// Coarse humanised duration for an elapsed span in ms ("47 seconds",
+// "9 minutes", "2 hours", "3 days"). Same unit ladder the card's old
+// relativeTime() helper used, minus the "ago" suffix: the row now names the
+// quantity itself ("Running 9 minutes"), and "ago" only makes sense for a point
+// in the past. A negative span (clock skew, or a timestamp written slightly
+// ahead of this browser's clock) clamps to zero rather than reading "-3 seconds".
+function humanDuration(ms) {
+  const sec = Math.max(0, Math.floor(Number(ms) / 1000));
+  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's');
   const min = Math.floor(sec / 60);
-  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's') + ' ago';
+  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's');
   const hr = Math.floor(min / 60);
-  if (hr < 24) return hr + ' hour' + (hr === 1 ? '' : 's') + ' ago';
+  if (hr < 24) return hr + ' hour' + (hr === 1 ? '' : 's');
   const day = Math.floor(hr / 24);
-  return day + ' day' + (day === 1 ? '' : 's') + ' ago';
+  return day + ' day' + (day === 1 ? '' : 's');
+}
+
+// The instance record's idle clock, mirroring the server's resolveIdleSince()
+// (src/encore-scaler/scaler-loop.ts:128): `lastIdleAt` when it is a usable
+// number, otherwise `readyAt`. Same order, same tolerance for a value that
+// round-tripped as a numeric string — so the age this card shows is the age the
+// reaping bound (isIdlePastTimeout, scaler-loop.ts:148) measures. Returns
+// undefined when neither timestamp is usable, which is the case the scale-down
+// path deliberately fails CLOSED on (unknown age => treated as aged).
+function resolveIdleSince(inst) {
+  const candidates = [inst && inst.lastIdleAt, inst && inst.readyAt];
+  for (const candidate of candidates) {
+    const epochMs = toEpochMs(candidate);
+    if (epochMs !== undefined) return epochMs;
+  }
+  return undefined;
+}
+
+// One timestamp candidate as epoch ms, or undefined when it is not usable.
+// Deliberately strict about the input type: a blanket Number() would turn `null`
+// into 0 — the epoch — and render a record with a missing timestamp as an
+// instance that has been busy since 1970 instead of as an unknown.
+function toEpochMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+// The one duration row on a transcoder card, state-aware (issue #982).
+//
+// The row used to read "Last idle <X> ago" unconditionally. `lastIdleAt` is
+// stamped when an instance's activeJobs last reached 0 (src/routes/internal.ts:202,
+// src/pipeline/encore-callback-poller.ts:371) and is frozen while it is busy, so
+// on a working instance that row counted upward away from an already-stale value
+// and reset to zero the moment work finished — i.e. it looked like a countdown to
+// reaping while running the opposite direction, sitting right next to an idle
+// timeout.
+//
+// Busy (activeJobs > 0): "Running <duration>" from `lastIdleAt`. No record field
+// is stamped at dispatch — the loop increments activeJobs without a timestamp
+// (src/encore-scaler/scaler-loop.ts:433) — so this is the closest the payload can
+// get, and it is an UPPER bound: it includes however long the instance sat idle
+// between becoming free and being handed its current job. On a queue-fed pool
+// that gap is at most a tick.
+//
+// Idle (activeJobs === 0): "Idle <duration>" from resolveIdleSince(), the exact
+// quantity the reaping bound compares against idleTimeoutMs. A freshly spawned
+// instance awaiting dispatch has lastIdleAt === readyAt (instance-pool.ts:471),
+// so it reads "Idle 12 seconds" — true, and the same clock that will reap it.
+//
+// Returns { label, value, title }; value is '—' when no timestamp is usable.
+function instanceActivity(inst, nowMs) {
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
+  const active = Number(inst && inst.activeJobs) || 0;
+  if (active > 0) {
+    const since = toEpochMs(inst && inst.lastIdleAt);
+    if (since === undefined) {
+      return {
+        label: 'Running',
+        value: '—',
+        title: 'This instance is working, but its record carries no timestamp to measure from.',
+      };
+    }
+    return {
+      label: 'Running',
+      value: humanDuration(now - since),
+      title: 'Elapsed since this instance last became idle — its current work started within that window.',
+    };
+  }
+  const idleSince = resolveIdleSince(inst);
+  if (idleSince === undefined) {
+    return {
+      label: 'Idle',
+      value: '—',
+      title: 'No usable idle timestamp on this record; the scaler treats an unknown idle age as aged.',
+    };
+  }
+  return {
+    label: 'Idle',
+    value: humanDuration(now - idleSince),
+    title: 'Idle age — the value the scaler compares against the idle timeout before tearing this instance down.',
+  };
 }
 
 // Per-instance job capacity, read from the status payload (issue #979).
@@ -7183,25 +7691,160 @@ function resolveJobsPerInstance(status) {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 }
 
-// Green (idle) / amber (partial) / red (at capacity) load class for an instance.
-function loadClass(activeJobs, capacity) {
-  const a = Number(activeJobs) || 0;
-  if (a <= 0) return 'load-idle';
-  if (a >= capacity) return 'load-full';
-  return 'load-partial';
+// ─── Instance lifecycle health (issue #980) ──────────────────────────────────
+//
+// The pill used to colour UTILISATION — idle `--success`, busy `--danger`. On a
+// pool of on-demand instances that are billed while alive, that inverts the
+// meaning of the colours: transcoding is the state being paid for, idle is the
+// state costing money for nothing. "At capacity" was tautological on top of
+// that — at a capacity of 1 it just means activeJobs >= 1, so every working
+// instance was at capacity by construction and a normal encode rendered red for
+// its whole run.
+//
+// What the pill colours now is lifecycle health: whether the instance is where
+// the scaler's OWN rules say it should be.
+//
+//   transcoding  activeJobs > 0                          green  — paid work
+//   draining     activeJobs === 0 && draining            gray   — deliberate
+//   idle         idle age <= idleTimeoutMs + grace       gray   — warm hold
+//   overdue      idle age >  idleTimeoutMs + grace       amber  — not reaped
+//   stuck        idle age >  idleTimeoutMs * 3           red    — genuinely wrong
+//
+// Every threshold is derived from the `idleTimeoutMs` in the status payload —
+// the bound the scaler is live-enforcing, changeable at runtime via PATCH
+// /api/v1/scaler/config — so none of this goes stale when an operator retunes
+// ENCORE_IDLE_TIMEOUT_MS.
+//
+// Pool-level saturation (work queued, every instance busy, pool at maxInstances)
+// is the condition that IS actionable, but it is a property of the pool, not of
+// any one instance, and is tracked separately in #981.
+
+// Grace added to the idle bound before an idle instance counts as overdue. The
+// scaler loop ticks every 10s, so an instance can legitimately sit a tick or two
+// past its bound waiting to be picked up. 60s absorbs that jitter without
+// masking a real failure to reap.
+const IDLE_OVERDUE_GRACE_MS = 60_000;
+
+// Multiple of the idle bound past which an idle instance is stuck rather than
+// merely late: the bound itself plus two orphan-reap cycles.
+const IDLE_STUCK_FACTOR = 3;
+
+// Client-side mirror of the server's resolveIdleSince()
+// (src/encore-scaler/scaler-loop.ts:128): the epoch ms an idle instance has been
+// idle since. Prefers `lastIdleAt` (a real completion stamp) and falls back to
+// `readyAt` (the moment it entered the pool ready for work), because
+// `lastIdleAt` only advances when a job COMPLETES — a freshly spawned instance
+// that has never been dispatched has no completion to key off, and without the
+// `readyAt` fallback would read as infinitely old and render amber the instant
+// it appeared.
+//
+// Returns undefined when neither field is usable. Callers must NOT guess an age
+// from that: numeric strings are accepted (the record round-trips through JSON
+// and may have been repaired out of band), anything else is not a timestamp.
+//
+// #980 and #982 arrived at this same mirror independently — the health pill
+// needs the idle age to pick a colour, the duration row needs it to print a
+// number — so it is ONE implementation (resolveIdleSince, above) under two
+// names rather than two copies that can drift apart from each other and from
+// scaler-loop.ts:128. The name is kept because both surfaces' tests and
+// comments refer to it, and `instanceIdleSince` reads better at the health
+// call site than the server-side spelling does.
+const instanceIdleSince = resolveIdleSince;
+
+// Coarse duration wording for the pill's explanatory text ("6 minutes").
+//
+// Deliberately NOT humanDuration() (above), which the #982 duration row uses.
+// This one ROUNDS and tops out at hours, because the tooltip is prose comparing
+// an age against a bound ("Idle 6 minutes — past the 5 minute idle bound") where
+// the nearest unit reads better than a truncated one. humanDuration() FLOORS and
+// carries on into days, because the row reports an elapsed clock and must not
+// claim a minute that has not fully passed. Same ladder, different rounding on
+// purpose; neither is a copy of the other's job.
+function fmtDurationApprox(ms) {
+  const sec = Math.max(0, Math.round(Number(ms) / 1000));
+  if (sec < 60) return sec + ' second' + (sec === 1 ? '' : 's');
+  const min = Math.round(sec / 60);
+  if (min < 60) return min + ' minute' + (min === 1 ? '' : 's');
+  const hr = Math.round(min / 60);
+  return hr + ' hour' + (hr === 1 ? '' : 's');
 }
 
-// Operator-facing wording for each load class. Derived from the class rather
-// than re-deciding the same thresholds a second time, so the dot colour and the
-// tooltip can never disagree.
-const LOAD_CLASS_LABELS = {
-  'load-idle': 'idle',
-  'load-partial': 'partially loaded',
-  'load-full': 'at capacity',
-};
+// Lifecycle-health verdict for one instance: { cls, label, detail }.
+//
+// One function decides the colour AND the wording, so the dot and the text can
+// never disagree — the class is not re-derived from the thresholds a second time.
+//
+// Contract (GET /api/v1/scaler/status, `instanceSchema` + `scalerStatusSchema`
+// in src/routes/scaler.ts): instance = { instanceId, url, activeJobs,
+// lastIdleAt?, readyAt?, draining? }; bound = top-level `idleTimeoutMs`.
+function instanceHealth(inst, idleTimeoutMs, now) {
+  const active = Number(inst && inst.activeJobs) || 0;
+  const draining = !!(inst && inst.draining === true);
+  const at = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
 
-function loadLabel(cls) {
-  return LOAD_CLASS_LABELS[cls] || cls;
+  // Transcoding is green at ANY duration. This branch is also what makes the
+  // idle maths below sound: `lastIdleAt` holds the PREVIOUS idle moment and does
+  // not advance during a run, so on a busy instance it is stale by exactly the
+  // length of the encode. Idle age is only ever evaluated at activeJobs === 0.
+  if (active > 0) {
+    return {
+      cls: 'health-transcoding',
+      label: 'transcoding',
+      detail: draining
+        ? 'Transcoding. Draining: finishing its in-flight work and taking no new jobs.'
+        : 'Transcoding — doing the work this instance is billed for.',
+    };
+  }
+
+  // A draining instance (#513, drain-don't-kill) has been selected for teardown
+  // and deliberately held past its idle bound, so "past the bound" is not a
+  // fault for it and must never be flagged amber or red.
+  if (draining) {
+    return {
+      cls: 'health-draining',
+      label: 'draining',
+      detail: 'Selected for teardown and taking no new jobs. Not flagged for being past its idle bound.',
+    };
+  }
+
+  const bound = Number(idleTimeoutMs);
+  const idleSince = instanceIdleSince(inst);
+  if (!Number.isFinite(bound) || bound <= 0 || idleSince === undefined) {
+    // No usable bound, or no usable timestamp on the record: there is no
+    // evidence of a lifecycle fault, so do not invent one. The server's own
+    // scale-down path fails CLOSED on a missing stamp (isIdlePastTimeout,
+    // src/encore-scaler/scaler-loop.ts:148), so such an instance still gets
+    // reaped — its age simply is not diagnosable from this payload.
+    return {
+      cls: 'health-idle',
+      label: 'idle',
+      detail: 'Idle. Age not available from this payload.',
+    };
+  }
+
+  const idleAge = at - idleSince;
+  const boundText = fmtDurationApprox(bound);
+  if (idleAge > bound * IDLE_STUCK_FACTOR) {
+    return {
+      cls: 'health-stuck',
+      label: 'stuck',
+      detail: 'Idle ' + fmtDurationApprox(idleAge) + ' — more than ' + IDLE_STUCK_FACTOR +
+        '× the ' + boundText + ' idle bound. Teardown has failed; this is burning money.',
+    };
+  }
+  if (idleAge > bound + IDLE_OVERDUE_GRACE_MS) {
+    return {
+      cls: 'health-overdue',
+      label: 'overdue',
+      detail: 'Idle ' + fmtDurationApprox(idleAge) + ' — past the ' + boundText +
+        ' idle bound. Should already have been torn down.',
+    };
+  }
+  return {
+    cls: 'health-idle',
+    label: 'idle',
+    detail: 'Idle ' + fmtDurationApprox(idleAge) + ' — within the ' + boundText + ' idle bound.',
+  };
 }
 
 async function renderTranscodersTab(container) {
@@ -7266,20 +7909,42 @@ async function renderTranscodersTab(container) {
     }
 
     const capacity = resolveJobsPerInstance(status);
+    // The live idle bound every health threshold is measured against (#980),
+    // taken from the payload (`idleTimeoutMs`, scalerStatusSchema in
+    // src/routes/scaler.ts) rather than hardcoded here, so the colours follow
+    // ENCORE_IDLE_TIMEOUT_MS / PATCH /scaler/config instead of drifting from it.
+    const idleTimeoutMs = status && typeof status.idleTimeoutMs === 'number'
+      ? status.idleTimeoutMs
+      : undefined;
+    // One clock for the whole grid, so two cards rendered from the same payload
+    // cannot land on different sides of a threshold.
+    const renderedAt = Date.now();
 
     const grid = document.createElement('div');
     grid.className = 'tc-grid';
     grid.innerHTML = flatInstances.map(function(f) {
       const inst = f.inst;
       const active = Number(inst.activeJobs) || 0;
-      const cls = loadClass(active, capacity);
-      const label = loadLabel(cls);
+      const health = instanceHealth(inst, idleTimeoutMs, renderedAt);
+      // One state-aware duration row: running time while busy, idle age while
+      // idle (issue #982). See instanceActivity(). Reads the same `renderedAt`
+      // clock the health pill does, so the pill and the row on one card can
+      // never be measured a few milliseconds apart.
+      const activity = instanceActivity(inst, renderedAt);
       return [
         '<div class="tc-card">',
         '  <div class="tc-card-head">',
         '    <span class="tc-id text-mono">' + escHtml(inst.instanceId) + '</span>',
-        '    <span class="tc-load ' + cls + '" title="' + escHtml(label) + '">',
-        '      <span class="tc-dot"></span>' + escHtml(String(active)) + ' / ' + escHtml(String(capacity)),
+        '    <span class="tc-card-head-right">',
+        // Utilisation is still worth reporting — it is just not a health signal,
+        // so it renders as neutral text instead of a traffic light (#980).
+        '      <span class="tc-load text-mono" title="Active jobs of this instance’s job capacity.">' +
+        escHtml(String(active)) + ' / ' + escHtml(String(capacity)) + '</span>',
+        // The state name is VISIBLE text, not a tooltip: the meaning of the
+        // colour has to be readable without hovering (and without colour vision).
+        '      <span class="tc-health ' + health.cls + '" title="' + escHtml(health.detail) + '">',
+        '        <span class="tc-dot"></span>' + escHtml(health.label),
+        '      </span>',
         '    </span>',
         '  </div>',
         '  <div class="tc-row">',
@@ -7288,8 +7953,8 @@ async function renderTranscodersTab(container) {
         '  <div class="tc-meta">',
         '    <span class="text-muted">Workspace</span> <span class="text-mono">' + escHtml(f.workspaceId) + '</span>',
         '  </div>',
-        '  <div class="tc-meta">',
-        '    <span class="text-muted">Last idle</span> ' + escHtml(relativeTime(inst.lastIdleAt)),
+        '  <div class="tc-meta tc-activity" title="' + escHtml(activity.title) + '">',
+        '    <span class="text-muted">' + escHtml(activity.label) + '</span> ' + escHtml(activity.value),
         '  </div>',
         '</div>',
       ].join('');
@@ -7340,11 +8005,56 @@ async function renderLogsTab(container) {
   });
 }
 
+// ─── Audit tab ───────────────────────────────────────────────────────────────
+// A cross-cutting view over the audit log (issue #987). The per-asset trail on
+// the asset detail panel answers "what happened to THIS asset"; it is left
+// exactly as it was. This tab answers the questions that span resources — what
+// was archived, every failed job, a collection's deletion history, system vs
+// operator activity — by driving the same query endpoint with its real filters.
+//
+// All filtering and paging is server-side (GET /api/v1/audit accepts
+// targetType/targetId/origin/principalId/action/from/to + limit/offset —
+// src/routes/audit.ts:62-72), so the table lives entirely in the shared
+// primitive composed by public/audit-table.js. app.js owns only the chrome
+// (header + Refresh). No auto-poll: the log is append-only and offset-paged, so
+// a background poll would shift the page under the operator.
+
+let auditTableInstance = null;
+
+async function renderAuditTab(container) {
+  const layout = document.createElement('div');
+  layout.className = 'assets-layout';
+  container.appendChild(layout);
+
+  const main = document.createElement('div');
+  main.className = 'assets-main';
+  layout.appendChild(main);
+
+  const header = document.createElement('div');
+  header.className = 'assets-main-header';
+  header.innerHTML = [
+    '<span class="section-title">Audit</span>',
+    '<div class="flex-gap">',
+    '  <button id="audit-refresh" class="btn-ghost" style="font-size:12px;padding:6px 12px;">Refresh</button>',
+    '</div>',
+  ].join('');
+  main.appendChild(header);
+
+  const auditTable = createAuditTable({ apiFetch, fmtDate });
+  auditTableInstance = auditTable;
+  main.appendChild(auditTable.el);
+
+  header.querySelector('#audit-refresh').addEventListener('click', function () {
+    auditTable.reload();
+  });
+}
+
 // ─── Tab renderer registry ───────────────────────────────────────────────────
 
 TAB_RENDERERS['assets'] = renderAssetsTab;
 TAB_RENDERERS['jobs'] = renderJobsTab;
 TAB_RENDERERS['logs'] = renderLogsTab;
+TAB_RENDERERS['audit'] = renderAuditTab;
 TAB_RENDERERS['transcoders'] = renderTranscodersTab;
 TAB_RENDERERS['pipelines'] = renderPipelinesTab;
 TAB_RENDERERS['profiles'] = renderProfilesTab;
@@ -7385,6 +8095,13 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirror of the ADR-018 write gate for POST /assets/{id}/clip
+  // (issue #793). Exported so a DOM/unit test can assert the Clip control is
+  // offered to exactly the roles that hold `write`.
+  canClipAsset,
+  // Standalone detail URL builder (issue #793). Exported so a DOM/unit test can
+  // assert a cross-asset link points at the right resource and stack.
+  detailWindowUrl,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
@@ -7458,6 +8175,13 @@ export {
   assetPickerTotal,
   assetPickerResultNote,
   ASSET_PICKER_PAGE_SIZE,
+  // Whole-row activation on the collections list (issue #917). Exported so a
+  // DOM test can assert a click anywhere on the row opens the detail, that the
+  // View/Delete buttons do not double-trigger it, and that the row is reachable
+  // and activatable by keyboard.
+  wireCollectionRowActivation,
+  COLLECTION_ROW_CONTROL_SELECTOR,
+  renderCollectionsTab,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
@@ -7474,11 +8198,24 @@ export {
   SEARCH_FORMAT_PLACEHOLDER,
   // Per-instance capacity is read from the wire, not inferred (issue #979).
   // Exported so a DOM/unit test can assert the card reports the server's
-  // `jobsPerInstance` and that an instance below it renders as partially loaded —
-  // the state that was unreachable while capacity was derived from observed load.
+  // `jobsPerInstance`.
   resolveJobsPerInstance,
-  loadClass,
-  loadLabel,
+  // The instance pill colours LIFECYCLE HEALTH, not utilisation (issue #980).
+  // Exported so a DOM/unit test can pin the two traps that make the naive
+  // version wrong: `lastIdleAt` is stale while an instance is busy, and a
+  // draining instance is deliberately past its idle bound.
+  instanceHealth,
+  instanceIdleSince,
+  IDLE_OVERDUE_GRACE_MS,
+  IDLE_STUCK_FACTOR,
+  // The transcoder card's one duration row is state-aware (issue #982): running
+  // time while an instance is busy, idle age — the quantity the reaping bound
+  // uses — while it is not. Exported so a unit test can pin both branches, the
+  // shared duration formatting, and the idle-clock fallback that mirrors the
+  // server's resolveIdleSince().
+  humanDuration,
+  resolveIdleSince,
+  instanceActivity,
   renderTranscodersTab,
   // Exported so a DOM/unit test can prove every rendered tab button is
   // routable — i.e. present in the allowlist AND backed by a renderer — and

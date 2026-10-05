@@ -27,6 +27,13 @@
  *   #124/#126):
  *       'pending' | 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
  *
+ *   Asset identification on a job row (issue #988): each item carries
+ *   `assetId` (string, ALWAYS present — `jobSchema` in src/routes/jobs.ts:54)
+ *   and `assetName` (string, OPTIONAL — src/routes/jobs.ts:62-70, resolved at
+ *   read time from the asset repository and ABSENT when the asset has been
+ *   deleted or cannot be read). The name is therefore never assumed: every cell
+ *   that shows it falls back to the ULID.
+ *
  * IMPORTANT CONSEQUENCE: the jobs listing endpoint exposes NO server-side sort,
  * status filter, date-range, or text-search parameter. Per the contract-first
  * rule we must not invent query params the endpoint does not accept. So this
@@ -52,6 +59,7 @@
  */
 
 import { createOpsTable, escHtml, SORT_DESC } from './ops-ui-table.js';
+import { copyableIdCellHtml, wireCopyIdButtons } from './copy-id.js';
 import {
   decodeTableState,
   applyTableState,
@@ -112,7 +120,12 @@ function includesCI(haystack, needle) {
 
 /**
  * Filter jobs by a status set, an inclusive date range on createdAt, and a
- * free-text needle matched against job id OR associated asset id.
+ * free-text needle matched against job id, associated asset id, OR asset name.
+ *
+ * The asset name joined the haystack with issue #988: once the Asset column
+ * shows a name, typing that name and getting nothing back would be a trap. It
+ * is matched tolerantly — `assetName` is OPTIONAL on the wire, so rows without
+ * one simply fail that clause and still match on their ids.
  *
  * @param {Array} jobs
  * @param {{ status?: string[], from?: string|null, to?: string|null, q?: string }} f
@@ -137,7 +150,8 @@ export function filterJobs(jobs, f) {
       if (!Number.isNaN(from) && !(t >= from)) return false;
       if (!Number.isNaN(to) && !(t <= to)) return false;
     }
-    if (q && !(includesCI(j.id, q) || includesCI(j.assetId, q))) return false;
+    if (q && !(includesCI(j.id, q) || includesCI(j.assetId, q) || includesCI(j.assetName, q)))
+      return false;
     return true;
   });
 }
@@ -173,6 +187,45 @@ export function pageJobs(jobs, offset, size) {
   const o = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
   const s = Number.isFinite(size) && size > 0 ? Math.floor(size) : JOBS_PAGE_SIZE;
   return list.slice(o, o + s);
+}
+
+// ─── Asset cell ───────────────────────────────────────────────────────────────
+
+/**
+ * Render the Asset cell for one job row (issue #988).
+ *
+ * The column used to show the bare 26-char ULID, which is unscannable: nothing
+ * in the row said WHICH asset the job was working on. The backend now resolves
+ * `assetName` at read time (src/routes/jobs.ts:62 — OPTIONAL), so the name
+ * leads and the ULID stays with it as a secondary line.
+ *
+ * The ULID is NOT dropped, for two reasons: it is the value every asset-id
+ * endpoint accepts (see the contract-grounding block in public/copy-id.js), and
+ * asset names are not unique, so the id is the only way to tell two like-named
+ * assets apart. It is rendered with the shared click-to-copy affordance rather
+ * than a hover-only tooltip.
+ *
+ * Fallbacks, in order:
+ *   - name + id  — the asset resolved
+ *   - id only    — no `assetName` (asset deleted, or lookup degraded to
+ *                  undefined per the route's `.catch(() => undefined)`)
+ *   - em-dash    — no asset reference at all
+ *
+ * @param {{ assetId?: string, assetName?: string }} job
+ * @returns {string} escaped HTML
+ */
+export function renderAssetCell(job) {
+  const j = job || {};
+  const id = j.assetId == null ? '' : String(j.assetId);
+  const name = j.assetName == null ? '' : String(j.assetName);
+  if (!id && !name) return '<span class="cell-id">—</span>';
+  // No name resolved: the id IS the row's asset label, so it takes the primary
+  // slot (still copyable) instead of being demoted under a blank.
+  if (!name) return copyableIdCellHtml(id, 'Copy asset id');
+  return (
+    '<span class="job-asset-name">' + escHtml(name) + '</span>' +
+    '<span class="job-asset-id">' + copyableIdCellHtml(id, 'Copy asset id') + '</span>'
+  );
 }
 
 // ─── Filter controls (slot factories for the shared primitive) ────────────────
@@ -290,7 +343,8 @@ function searchControl(initial) {
     input.type = 'search';
     input.id = 'jobs-filter-q';
     input.className = 'ops-filter-search';
-    input.placeholder = 'Job id or asset id';
+    // Names the three fields the client-side pass actually searches (#988).
+    input.placeholder = 'Job id, asset id, or asset name';
     if (initial) input.value = initial;
     // Fire on input (debounced lightly) so text search feels live.
     let timer = null;
@@ -400,8 +454,8 @@ export function createJobsTable(deps) {
       },
       {
         key: 'assetId',
-        label: 'Asset ID',
-        render: (j) => '<span class="cell-id">' + escHtml(j.assetId || '—') + '</span>',
+        label: 'Asset',
+        render: (j) => renderAssetCell(j),
       },
       {
         key: 'progress',
@@ -571,6 +625,11 @@ export function createJobsTable(deps) {
   function wireRowInteractions() {
     const tbody = table.el.querySelector('tbody');
     if (!tbody) return;
+    // Click-to-copy for the asset ULID in the Asset cell (issue #988, reusing
+    // the #851 affordance). Idempotent, and the handler stops propagation so
+    // copying an id does not also open that row's detail panel. Bound before
+    // the row handler below, exactly as assets-table.js does it.
+    wireCopyIdButtons(tbody);
     tbody.querySelectorAll('tr[data-row-key]').forEach((tr) => {
       const id = tr.dataset.rowKey;
       if (id === selectedId) tr.classList.add('row-selected');
