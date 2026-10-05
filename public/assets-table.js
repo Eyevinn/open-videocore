@@ -14,7 +14,23 @@
  * Every query param, field, and status value below is verified against the live
  * OpenAPI schema in this repo (openapi.json) and the route source, NOT guessed.
  *
- * Tier 1 — exact/range list (no free-text term), per ADR-005:
+ * TIER SELECTION (issue #947). The table answers from whichever endpoint can
+ * honour the whole filter set, and never from both at once:
+ *   - tags or metadata filter present  -> tier 2, with or without a `q` term.
+ *   - free-text `q` present            -> tier 2.
+ *   - otherwise                        -> tier 1.
+ * Tags and metadata force tier 2 because GET /api/v1/assets/ accepts NO such
+ * params — verified: openapi.json .paths["/api/v1/assets/"].get.parameters is
+ * exactly limit, offset, status, parentId, from, to (`listQuerySchema`,
+ * src/routes/assets.ts). The alternative — fetching a page from tier 1 and
+ * dropping rows whose tags do not match — is exactly the page-scoped narrowing
+ * with an unnarrowed `total` that #825 fixed, which is why this issue was
+ * blocked on it. `q` is optional on tier 2 (`searchQuerySchema.q` is
+ * `.optional()`, src/routes/search.ts:154-164, and the route's own description
+ * says "omit them all to list every asset and collection in the workspace"), so
+ * a tag-only filter is a plain structured query there, not a free-text one.
+ *
+ * Tier 1 — exact/range list (no free-text term, no structured filter), per ADR-005:
  *   Endpoint: GET /api/v1/assets/  (openapi.json path key "/api/v1/assets/").
  *   Verified query params (openapi.json
  *   .paths["/api/v1/assets/"].get.parameters and `listQuerySchema`,
@@ -42,14 +58,19 @@
  *   i.e. ULID `_id` creation order per ADR-005. There is NO server `sort` or `q`
  *   param on this endpoint (confirmed absent from the schema).
  *
- * Tier 2 — free-text FTS (a `q` term is present), per ADR-005:
+ * Tier 2 — search endpoint (a `q` term and/or a tags/metadata filter), per ADR-005:
  *   Endpoint: GET /api/v1/search/  (the CANONICAL free-text path already used by
  *   the Search tab in app.js — we reuse it rather than adding a second search
  *   path, per the issue's explicit constraint).
  *   Verified query params (openapi.json .paths["/api/v1/search/"].get.parameters
- *   and `searchQuerySchema`, src/routes/search.ts:146): q (string 1..512),
- *   status (the SAME status enum as tier 1), from, to, page (int >=1),
- *   pageSize (int 1..100), plus tags/mimeType/tams* (unused here).
+ *   and `searchQuerySchema`, src/routes/search.ts:152): q (string 1..512),
+ *   tags (string | string[], comma-separated accepted), status (the SAME status
+ *   enum as tier 1), from, to, page (int >=1), pageSize (int 1..100), plus
+ *   mimeType/tams* (unused here), plus the dynamic `metadata.<key>=<value>`
+ *   exact-match filters the schema's `.passthrough()` admits
+ *   (src/routes/search.ts:14-16, 219, 223-238). The tags/metadata grammar and
+ *   its match semantics live in public/search-filter-params.js, which carries
+ *   the full citation; this module only decides WHEN to send them.
  *   Response envelope (searchResultSchema, src/routes/search.ts:118-131):
  *     { assets, collections, total, collectionTotal, page }. `total` is the count
  *     of matching ASSETS; `collectionTotal` counts collection hits separately and
@@ -72,8 +93,9 @@
  *
  * TIER-2 PROJECTION GAP (delete-lock, issue #894). The search projection
  * (`assetSchema`, src/routes/search.ts:78 — Fastify serializes against it) has NO
- * `deleteLock` property, so a locked asset carries no lock field while a
- * free-text `q` is active. That is lock state UNKNOWN, not unlocked, and the
+ * `deleteLock` property, so a locked asset carries no lock field whenever tier 2
+ * answers the view — which, since #947, includes a tags/metadata filter with no
+ * free-text term. That is lock state UNKNOWN, not unlocked, and the
  * difference matters: rendering "unlocked" there would be a promise the payload
  * does not support. The table therefore shows no lock flag on tier-2 rows and
  * makes no counter-claim either (there is no "Unlocked" badge to contradict),
@@ -145,6 +167,18 @@ import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.j
 // live in one module so the list, the detail panel (#895) and the protected-
 // delete flow (#896) ship one pattern — see docs/ux/asset-lock-state-spec.md §2.
 import { isAssetLocked, lockBadgeHtml, ROW_LOCKED_CLASS } from './lock-state.js';
+// Tags + free-form metadata filters (issue #947). The request grammar for both,
+// and the typed text grammar the two controls below share with the Search tab,
+// live in one module with the verified contract citation — this module decides
+// only WHICH tier can honour them and renders the controls.
+import {
+  applySearchFilterParams,
+  formatMetadataFilterText,
+  formatTagsFilterText,
+  hasStructuredFilter,
+  parseMetadataFilterText,
+  parseTagsFilterText,
+} from './search-filter-params.js';
 
 // ─── Contract constants (verified above) ─────────────────────────────────────
 
@@ -279,7 +313,33 @@ function applyClientSort(rows, sort) {
   return out;
 }
 
-// ─── Data-source router: choose the FTS tier or the exact/range list tier ─────
+// Read the filter bar's raw control values into the shape the request needs, and
+// decide which tier can answer them (issue #947). One place, so the initial
+// lock-projection flag and the fetch below cannot disagree about the tier.
+//
+// `tags`/`meta` are held in state as the text the operator typed — the controls
+// are text inputs and the URL round-trips through the same grammar — and parsed
+// here, at the boundary where they become query params. Exported so the tier
+// decision is testable on its own.
+export function readFilterState(filters) {
+  const f = filters || {};
+  const q = (f.q || '').trim();
+  const tags = parseTagsFilterText(f.tags || '');
+  const metadata = parseMetadataFilterText(f.meta || '').entries;
+  return {
+    q,
+    tags,
+    metadata,
+    status: f.status || '',
+    from: f.from || '',
+    to: f.to || '',
+    // Tags/metadata have no tier-1 param at all, so they decide the tier exactly
+    // as a free-text term does — see TIER SELECTION in the header block.
+    useSearchTier: !!q || hasStructuredFilter({ tags, metadata }),
+  };
+}
+
+// ─── Data-source router: choose the search tier or the exact/range list tier ──
 //
 // Given the primitive's current interaction state, build and run the correct
 // request. Returns { rows, total } where `total` is the backend's match count
@@ -290,21 +350,26 @@ function applyClientSort(rows, sort) {
 // which also keeps this module unit-testable without a live server.
 async function fetchAssetsPage(snap, deps) {
   const apiFetch = deps.apiFetch;
-  const filters = snap.filters || {};
-  const q = (filters.q || '').trim();
-  const status = filters.status || '';
-  const from = filters.from || '';
-  const to = filters.to || '';
+  const filter = readFilterState(snap.filters);
+  const status = filter.status;
+  const from = filter.from;
+  const to = filter.to;
   const limit = snap.pageSize;
   const offset = snap.offset;
 
-  if (q) {
-    // ── Tier 2: free-text FTS via the canonical GET /api/v1/search/ path. ──
-    // Paged by page/pageSize (page is 1-based). Envelope:
-    // { assets, collections, total, collectionTotal, page }.
+  if (filter.useSearchTier) {
+    // ── Tier 2: the canonical GET /api/v1/search/ path — free-text and/or the
+    // structured tags/metadata filters (issue #947). Paged by page/pageSize
+    // (page is 1-based). Envelope:
+    // { assets, collections, total, collectionTotal, page }. `collections` is
+    // ignored here: this is the assets table, and collection results stay a
+    // Search-tab concern (issue #561).
     const page = Math.floor(offset / limit) + 1;
     const params = new URLSearchParams();
-    params.set('q', q);
+    // `q` is optional on this endpoint, so a tags/metadata-only filter sends no
+    // free-text term rather than an empty one (`q` is a 1..512 string, so `q=`
+    // would be a 400).
+    if (filter.q) params.set('q', filter.q);
     params.set('page', String(page));
     params.set('pageSize', String(limit));
     // status/from/to are real server params here (issue #833) — send them so the
@@ -312,6 +377,8 @@ async function fetchAssetsPage(snap, deps) {
     if (status) params.set('status', status);
     if (from) params.set('from', from);
     if (to) params.set('to', to);
+    // tags + metadata.<key>, in the verified forms (public/search-filter-params.js).
+    applySearchFilterParams(params, { tags: filter.tags, metadata: filter.metadata });
     const res = await apiFetch('/search?' + params.toString());
     const assets = (res && (res.assets || res.items)) || [];
     // `total` is the backend's count of matching assets AFTER every filter, so
@@ -327,6 +394,8 @@ async function fetchAssetsPage(snap, deps) {
   }
 
   // ── Tier 1: exact/range list via GET /api/v1/assets/ (Mango-style). ──
+  // Reached only when the whole filter set is expressible here — no free-text
+  // term, no tags, no metadata (issue #947).
   // Paged by limit/offset. Envelope: { items, limit, offset, total }.
   const params = new URLSearchParams();
   params.set('limit', String(limit));
@@ -547,6 +616,153 @@ function dateFilterControl(name, labelText, initial) {
   };
 }
 
+// ─── Structured text filters: tags + free-form metadata (issue #947) ─────────
+//
+// Both are typed, free-form values, so they get the same control shape: a text
+// input, a permanent grammar hint, and — for the one whose grammar can be typed
+// incompletely — a live notice naming what is NOT being filtered on.
+//
+// INTERACTION. These fire on `change` (blur) and on Enter, like the status and
+// date controls beside them, NOT on every keystroke. A half-typed tag or a
+// metadata key with no value yet is not a filter anyone asked for, and firing
+// mid-word would fan out one tier-2 request per letter. The free-text box's
+// debounce/clear/magnifier behaviour (#946) is deliberately not duplicated here:
+// filter-box interaction is tracked separately from this issue, and `change` is
+// the primitive's own simple descriptor path (see asSlot below), so these
+// controls add no new interaction machinery to the bar.
+//
+// ACCESSIBILITY. The hint and the notice are wired to the input with
+// aria-describedby, so the grammar is announced with the field rather than being
+// a visual-only aside. The notice is a polite live region (role="status"), so a
+// segment that cannot be understood is announced as it becomes typeable rather
+// than silently ignored, and it is never the only channel: the text is visible
+// too (WCAG 1.4.1 — no information by colour or placement alone).
+
+// Unique ids for the describedby targets, so two tables (or a detached pane) can
+// mount this control on one page without colliding.
+let filterHintSeq = 0;
+
+function structuredTextFilterControl(cfg) {
+  return function () {
+    filterHintSeq += 1;
+    const hintId = 'ops-filter-hint-' + filterHintSeq;
+    const noticeId = 'ops-filter-notice-' + filterHintSeq;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'ops-filter-' + cfg.name + ' ops-filter-textfield';
+
+    const label = document.createElement('label');
+    const span = document.createElement('span');
+    span.textContent = cfg.label;
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'ops-filter-text';
+    input.placeholder = cfg.placeholder;
+    input.setAttribute('aria-label', cfg.ariaLabel);
+    // Browser autofill on a live filter box just covers the list it is filtering.
+    input.setAttribute('autocomplete', 'off');
+    if (cfg.initial) input.value = cfg.initial;
+
+    const hint = document.createElement('span');
+    hint.className = 'ops-filter-hint';
+    hint.id = hintId;
+    hint.textContent = cfg.hint;
+
+    let notice = null;
+    if (typeof cfg.describeValue === 'function') {
+      notice = document.createElement('span');
+      notice.className = 'ops-filter-notice';
+      notice.id = noticeId;
+      notice.setAttribute('role', 'status');
+      notice.hidden = true;
+    }
+
+    input.setAttribute('aria-describedby', notice ? hintId + ' ' + noticeId : hintId);
+
+    label.appendChild(span);
+    label.appendChild(input);
+    wrap.appendChild(label);
+    wrap.appendChild(hint);
+    if (notice) wrap.appendChild(notice);
+
+    function syncNotice() {
+      if (!notice) return;
+      const message = cfg.describeValue(input.value) || '';
+      // Only write on a real change: this runs per keystroke, and re-writing the
+      // same text into a live region risks re-announcing it letter by letter.
+      if (notice.textContent === message) return;
+      notice.textContent = message;
+      notice.hidden = message === '';
+    }
+    syncNotice();
+
+    function wire(onChange) {
+      // Last value handed to the table, so Enter followed by the blur it causes
+      // does not issue the same request twice.
+      let dispatched = (cfg.initial || '').trim();
+      function dispatch() {
+        const value = input.value.trim();
+        if (value === dispatched) return;
+        dispatched = value;
+        onChange(value);
+      }
+      input.addEventListener('input', syncNotice);
+      input.addEventListener('change', dispatch);
+      input.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Enter') return;
+        ev.preventDefault();
+        dispatch();
+      });
+    }
+
+    return { el: wrap, input, hint, notice, wire };
+  };
+}
+
+// Tags. Server-side `tags` is ANDed and matched exactly, so the hint says "all
+// must match" rather than leaving it to be inferred: an operator who read it as
+// "any of these" would take an empty table for missing data (contract:
+// public/search-filter-params.js).
+function tagsFilterControl(initial) {
+  return structuredTextFilterControl({
+    name: 'tags',
+    label: 'Tags',
+    ariaLabel: 'Filter by tags',
+    placeholder: 'news, sports',
+    hint: 'Comma-separated; all must match.',
+    initial,
+  });
+}
+
+// Free-form operator metadata. Values are compared with strict equality against
+// the asset's `metadata` bag server-side (src/data/search-repo.ts:392-399) and a
+// query string can only carry text, which is why the hint names the limit
+// instead of leaving a non-string field looking like missing data.
+function metadataFilterControl(initial) {
+  return structuredTextFilterControl({
+    name: 'meta',
+    label: 'Metadata',
+    ariaLabel: 'Filter by metadata',
+    placeholder: 'genre=documentary',
+    hint: 'key=value, comma-separated; exact text match.',
+    initial,
+    describeValue: metadataFilterNotice,
+  });
+}
+
+// "Not filtering on …" for every segment the grammar cannot read. Returns '' when
+// everything typed is a usable pair.
+function metadataFilterNotice(text) {
+  const ignored = parseMetadataFilterText(text).ignored;
+  if (!ignored.length) return '';
+  return (
+    'Not filtering on ' +
+    ignored.map((s) => '“' + s + '”').join(', ') +
+    ' — each filter needs key=value.'
+  );
+}
+
 // Adapt one of the descriptors above into the primitive's slot contract:
 // `control(state, onChange) -> HTMLElement`. The primitive calls onChange(value).
 //
@@ -621,8 +837,9 @@ function buildColumns(renderCtx) {
     // .paths["/api/v1/assets/"].get ... items.properties.slug) but is ABSENT from
     // the tier-2 search projection (`assetSchema` in src/routes/search.ts:67-94
     // has no `slug`, and Fastify serializes against that schema). So this cell
-    // renders an em-dash while a free-text `q` term is active — an honest empty,
-    // not a wrong value. Noted with the other tier-2 contract gaps above; no
+    // renders an em-dash whenever tier 2 answers the view — a free-text `q` term
+    // or, since #947, a tags/metadata filter — an honest empty, not a wrong
+    // value. Noted with the other tier-2 contract gaps above; no
     // issue tracks widening that projection yet, so treat this as a known gap
     // rather than a scheduled fix.
     {
@@ -828,13 +1045,21 @@ export function createAssetsTable(deps) {
   if (urlState.status && urlState.status.length) initialFilters.status = urlState.status[0];
   if (urlState.from) initialFilters.from = urlState.from;
   if (urlState.to) initialFilters.to = urlState.to;
+  // Tags/metadata are held as the control's own text (issue #947), so the URL's
+  // structured form is rendered back through the shared grammar rather than a
+  // second, table-local one.
+  const initialTagsText = formatTagsFilterText(urlState.tags);
+  if (initialTagsText) initialFilters.tags = initialTagsText;
+  const initialMetaText = formatMetadataFilterText(urlState.meta);
+  if (initialMetaText) initialFilters.meta = initialMetaText;
 
   // Whether the rows currently in hand came from a projection that carries
-  // `deleteLock` (issue #894). Tier 1 does; tier 2 (free-text search) does not.
+  // `deleteLock` (issue #894). Tier 1 does; tier 2 (the search endpoint) does not.
   // Written by reload() from the fetch result immediately before setRows(), so
   // the Status renderer always reads the flag belonging to the rows it renders.
-  // Starts true because the first load is tier 1 unless the URL seeds a `q`.
-  const projection = { carriesLock: !initialFilters.q };
+  // Starts true because the first load is tier 1 unless the URL seeds a `q` or a
+  // tags/metadata filter (issue #947) — the same tier decision the fetch makes.
+  const projection = { carriesLock: !readFilterState(initialFilters).useSearchTier };
 
   const columns = buildColumns({
     renderBadge: d.renderBadge,
@@ -855,6 +1080,12 @@ export function createAssetsTable(deps) {
     { name: 'status', control: asSlot(statusFilterControl(initialFilters.status)) },
     { name: 'from', control: asSlot(dateFilterControl('from', 'Created from', initialFilters.from)) },
     { name: 'to', control: asSlot(dateFilterControl('to', 'Created to', initialFilters.to)) },
+    // Tags and metadata (issue #947) sit with the other structured filters, ahead
+    // of the free-text box: they narrow by what an asset IS, which is the same
+    // kind of question as status and created-date, and the box stays last so its
+    // position in the bar is unchanged.
+    { name: 'tags', control: asSlot(tagsFilterControl(initialFilters.tags)) },
+    { name: 'meta', control: asSlot(metadataFilterControl(initialFilters.meta)) },
     { name: 'q', control: asSlot(searchFilterControl(initialFilters.q)) },
   ];
 
@@ -921,11 +1152,17 @@ export function createAssetsTable(deps) {
   // which is what keeps a virgin default view's URL clean.
   function syncUrl(snap) {
     const page = Math.floor((snap.offset || 0) / snap.pageSize) + 1;
+    // The URL carries the PARSED filters, not the raw text: a shared link should
+    // reproduce the query, not someone's spacing, and the decoder on the other
+    // side renders them back into the controls through the same grammar.
+    const filter = readFilterState(snap.filters);
     return applyTableState(
       {
         sort: tableSortToUrlSort(snap.sort),
         status: snap.filters.status ? [snap.filters.status] : [],
         q: snap.filters.q || '',
+        tags: filter.tags,
+        meta: filter.metadata,
         from: snap.filters.from || null,
         to: snap.filters.to || null,
         page,

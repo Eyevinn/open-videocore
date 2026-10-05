@@ -33,6 +33,20 @@
  *   status filter: one status value, or a comma-separated set. e.g. `jobs.status=failed`
  *          or `jobs.status=queued,running`.
  *   q      filter: free-text search string.
+ *   tags   filter: one tag, or a comma-separated set. e.g. `assets.tags=news,sports`.
+ *          Same shape as `status` (a token set); kept as its own key because it is
+ *          a different filter, and the SAME comma-separated form the backend's own
+ *          `tags` query param accepts (see public/search-filter-params.js for the
+ *          verified contract). An empty set means "no tag filter".
+ *   meta   filter: free-form `key=value` pairs (issue #947). UNLIKE every other
+ *          key here this one is DYNAMIC: each pair is its own param, written as
+ *          `<ns>.meta.<key>=<value>` (e.g. `assets.meta.genre=documentary`). One
+ *          param per pair rather than one packed param, because the pair list has
+ *          no fixed vocabulary and packing it would need an escaping scheme of its
+ *          own for keys/values containing the separator — URLSearchParams already
+ *          solves that per param. It also makes the URL read like the request it
+ *          becomes (`metadata.genre=documentary`). Decodes to a plain object; `{}`
+ *          means "no metadata filter".
  *   from   filter: ISO date (inclusive lower bound), YYYY-MM-DD or full ISO.
  *   to     filter: ISO date (inclusive upper bound).
  *   page   1-based page number (offset-style paging).
@@ -62,6 +76,11 @@ const PARAM_KEYS = Object.freeze({
   sort: 'sort',
   status: 'status',
   q: 'q',
+  tags: 'tags',
+  // `meta` is a PREFIX, not a leaf param: pairs are written as
+  // `<ns>.meta.<key>=<value>`. It is listed here so the namespace-clearing pass
+  // in encodeTableState() knows the key belongs to this schema.
+  meta: 'meta',
   from: 'from',
   to: 'to',
   page: 'page',
@@ -81,6 +100,8 @@ const BASE_DEFAULTS = Object.freeze({
   sort: null, // { field: string, dir: 'asc'|'desc' } | null (server default order)
   status: [], // string[]  (empty = no status filter)
   q: '', // string
+  tags: [], // string[]  (empty = no tag filter)
+  meta: {}, // Record<string,string>  (empty = no metadata filter)
   from: null, // string | null (ISO date)
   to: null, // string | null (ISO date)
   page: 1, // 1-based
@@ -98,6 +119,14 @@ const PAGE_MAX = 1_000_000;
 // hostile `cols` with thousands of entries is truncated rather than walked.
 const COLS_MAX = 64;
 const COL_KEY_MAX_LEN = 64;
+// A tag/metadata filter is bounded the same way, for the same reason: a hostile
+// or hand-mangled URL is truncated rather than walked and re-sent verbatim to the
+// backend. The limits are generous against any filter a human types.
+const TAGS_MAX = 32;
+const TAG_MAX_LEN = 128;
+const META_MAX_PAIRS = 32;
+const META_KEY_MAX_LEN = 128;
+const META_VALUE_MAX_LEN = 512;
 
 // ─── Small pure helpers ──────────────────────────────────────────────────────
 
@@ -118,6 +147,8 @@ function resolveDefaults(defaults) {
     sort,
     status: normalizeStatusValue('status' in d ? d.status : BASE_DEFAULTS.status),
     q: typeof d.q === 'string' ? d.q : BASE_DEFAULTS.q,
+    tags: normalizeTagsValue('tags' in d ? d.tags : BASE_DEFAULTS.tags),
+    meta: normalizeMetadataValue('meta' in d ? d.meta : BASE_DEFAULTS.meta),
     from: normalizeDateValue('from' in d ? d.from : BASE_DEFAULTS.from),
     to: normalizeDateValue('to' in d ? d.to : BASE_DEFAULTS.to),
     page: clampInt(d.page, BASE_DEFAULTS.page, PAGE_MIN, PAGE_MAX),
@@ -200,6 +231,58 @@ function normalizeStatusValue(v) {
 }
 
 /**
+ * Normalize a tag filter into a de-duped, order-preserving, length-bounded
+ * string[] (empty = no filter). Same token-set shape as `status`, with the
+ * guardrails a free-form value needs that a fixed enum does not.
+ */
+function normalizeTagsValue(v) {
+  const out = [];
+  const seen = new Set();
+  for (const t of normalizeStatusValue(v)) {
+    if (t.length > TAG_MAX_LEN || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+    if (out.length >= TAGS_MAX) break;
+  }
+  return out;
+}
+
+/**
+ * Normalize a metadata filter into a plain `Record<string,string>` (empty = no
+ * filter). Keys and values are trimmed; a pair missing either half is dropped,
+ * because the request grammar has no way to express it (see
+ * public/search-filter-params.js) and an empty value would silently become a
+ * filter for the empty string.
+ *
+ * Only a plain object is accepted. There is no string form to parse: the pairs
+ * arrive as separate `<ns>.meta.<key>` params, so there is no packed
+ * representation to be tolerant of.
+ */
+function normalizeMetadataValue(v) {
+  if (!isPlainObject(v)) return {};
+  const out = {};
+  let count = 0;
+  for (const rawKey of Object.keys(v)) {
+    if (count >= META_MAX_PAIRS) break;
+    const key = typeof rawKey === 'string' ? rawKey.trim() : '';
+    const raw = v[rawKey];
+    // Numbers/booleans are coerced rather than rejected: the query string can
+    // only carry text, so `{ season: 2 }` is a legitimate way for a caller to
+    // ask for `metadata.season=2`.
+    const value =
+      typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean'
+        ? String(raw).trim()
+        : '';
+    if (!key || !value) continue;
+    if (key.length > META_KEY_MAX_LEN || value.length > META_VALUE_MAX_LEN) continue;
+    if (Object.prototype.hasOwnProperty.call(out, key)) continue;
+    out[key] = value;
+    count += 1;
+  }
+  return out;
+}
+
+/**
  * Normalize a visible-column set into a de-duped, order-preserving string[], or
  * null when nothing usable was supplied.
  *
@@ -262,6 +345,35 @@ function readParam(params, ns, key) {
   return s.length ? s : null;
 }
 
+/** The `<ns>.meta.` prefix every metadata-filter param carries. */
+function metaPrefix(ns) {
+  return (ns ? ns + '.' : '') + PARAM_KEYS.meta + '.';
+}
+
+/**
+ * Collect every `<ns>.meta.<key>=<value>` param into one normalized object, or
+ * null when the URL carries none (so the caller can fall back to its default
+ * rather than treating "absent" as "explicitly empty" — the distinction every
+ * other key here already makes).
+ *
+ * A repeated key keeps its FIRST value, matching the server's own collapse for
+ * a repeated `metadata.<key>` (src/routes/search.ts:235), so the URL and the
+ * request agree on which value is in force.
+ */
+function readMetadataParams(params, ns) {
+  const prefix = metaPrefix(ns);
+  const raw = {};
+  let found = false;
+  for (const [name, value] of params.entries()) {
+    if (!name.startsWith(prefix)) continue;
+    const key = name.slice(prefix.length);
+    if (!key || Object.prototype.hasOwnProperty.call(raw, key)) continue;
+    raw[key] = value;
+    found = true;
+  }
+  return found ? normalizeMetadataValue(raw) : null;
+}
+
 /**
  * Coerce a query-string-ish input into a URLSearchParams. Accepts:
  *   - a URLSearchParams instance (returned as-is)
@@ -305,8 +417,9 @@ function toSearchParams(input) {
  * @param {string} ns                          table namespace (e.g. 'assets').
  * @param {object} [defaults]                  per-table default overrides.
  * @returns {{sort:({field:string,dir:string}|null), status:string[], q:string,
+ *            tags:string[], meta:Record<string,string>,
  *            from:(string|null), to:(string|null), page:number,
- *            cursor:(string|null), size:number}}
+ *            cursor:(string|null), size:number, cols:(string[]|null)}}
  *
  * Tolerant: absent/malformed params degrade to defaults; never throws.
  */
@@ -325,6 +438,14 @@ function decodeTableState(input, ns, defaults) {
   // free text
   const qRaw = readParam(params, ns, PARAM_KEYS.q);
   const q = qRaw != null ? qRaw : def.q;
+
+  // tags (comma-separated set, same form the backend's `tags` param accepts)
+  const tagsRaw = readParam(params, ns, PARAM_KEYS.tags);
+  const tags = tagsRaw != null ? normalizeTagsValue(tagsRaw) : def.tags;
+
+  // metadata pairs (`<ns>.meta.<key>=<value>`, one param each)
+  const metaFromUrl = readMetadataParams(params, ns);
+  const meta = metaFromUrl != null ? metaFromUrl : def.meta;
 
   // date range
   const fromRaw = readParam(params, ns, PARAM_KEYS.from);
@@ -347,7 +468,7 @@ function decodeTableState(input, ns, defaults) {
   const colsRaw = readParam(params, ns, PARAM_KEYS.cols);
   const cols = colsRaw != null ? normalizeColumnsValue(colsRaw) ?? def.cols : def.cols;
 
-  return { sort, status, q, from, to, page, cursor, size, cols };
+  return { sort, status, q, tags, meta, from, to, page, cursor, size, cols };
 }
 
 // ─── Core: encode (state -> URL params) ──────────────────────────────────────
@@ -356,6 +477,16 @@ function shallowEqualStringArray(a, b) {
   if (a === b) return true;
   if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function shallowEqualStringRecord(a, b) {
+  if (a === b) return true;
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka) if (a[k] !== b[k]) return false;
   return true;
 }
 
@@ -389,6 +520,16 @@ function encodeTableState(state, ns, defaults, into) {
   for (const key of Object.values(PARAM_KEYS)) {
     params.delete(ns ? ns + '.' + key : key);
   }
+  // `meta` is a prefix, so clearing the leaf name above is not enough: every
+  // `<ns>.meta.<key>` pair from a previous encode has to go too, or a removed
+  // filter would survive in the URL. Collect first, then delete — mutating a
+  // URLSearchParams while iterating it is not safe.
+  const staleMetaKeys = [];
+  const prefix = metaPrefix(ns);
+  for (const name of params.keys()) {
+    if (name.startsWith(prefix)) staleMetaKeys.push(name);
+  }
+  for (const name of staleMetaKeys) params.delete(name);
 
   const set = (key, value) => params.set(ns ? ns + '.' + key : key, value);
 
@@ -401,6 +542,15 @@ function encodeTableState(state, ns, defaults, into) {
   }
   if (s.q !== def.q && s.q.length) {
     set(PARAM_KEYS.q, s.q);
+  }
+  if (!shallowEqualStringArray(s.tags, def.tags) && s.tags.length) {
+    set(PARAM_KEYS.tags, s.tags.join(','));
+  }
+  if (!shallowEqualStringRecord(s.meta, def.meta)) {
+    // One param per pair (see the `meta` note in the PARAM SCHEMA block).
+    for (const key of Object.keys(s.meta)) {
+      params.set(prefix + key, s.meta[key]);
+    }
   }
   if (s.from !== def.from && s.from) {
     set(PARAM_KEYS.from, s.from);
@@ -441,6 +591,8 @@ function normalizeState(state, def) {
     sort: 'sort' in st ? normalizeSortValue(st.sort) : def.sort,
     status: 'status' in st ? normalizeStatusValue(st.status) : def.status,
     q: typeof st.q === 'string' ? st.q : def.q,
+    tags: 'tags' in st ? normalizeTagsValue(st.tags) : def.tags,
+    meta: 'meta' in st ? normalizeMetadataValue(st.meta) : def.meta,
     from: 'from' in st ? normalizeDateValue(st.from) : def.from,
     to: 'to' in st ? normalizeDateValue(st.to) : def.to,
     page: 'page' in st ? clampInt(st.page, def.page, PAGE_MIN, PAGE_MAX) : def.page,

@@ -2049,6 +2049,46 @@ body.detail-standalone .assets-side {
   padding: 5px 8px;
 }
 
+/* Assets table structured text filters — tags + metadata (issue #947). Each one
+   is a label/input pair with a permanent grammar hint under it, and the metadata
+   control adds a live notice for segments it cannot read. The hint and the notice
+   are referenced by the input's aria-describedby, so they are part of the field
+   rather than decoration beside it. */
+.ops-filter-textfield {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ops-table-filters .ops-filter-text {
+  min-width: 200px;
+}
+
+/* Capped near the input's own width: the hints are written to fit one line, and
+   the cap keeps a translated or wrapped one from stretching the bar's row height
+   for every other control in it. */
+.ops-filter-hint,
+.ops-filter-notice {
+  max-width: 220px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.ops-filter-hint {
+  color: var(--text-muted);
+}
+
+/* Amber, not red: an unreadable segment is a filter NOT being applied, which is
+   an advisory about the query, not a failure. Never the only channel — the text
+   itself says what is ignored (WCAG 1.4.1). */
+.ops-filter-notice {
+  color: var(--warning);
+}
+
+.ops-filter-notice[hidden] {
+  display: none;
+}
+
 /* Assets table free-text filter box (issue #946). The box reads as a filter, so
    it carries a magnifier affordance on the left and a clear control on the right,
    both sitting INSIDE the input's box. The wrapper is the positioning context and
