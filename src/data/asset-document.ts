@@ -56,7 +56,10 @@ export const VideoTrackSchema = z.object({
   bitrateBps: z.number().optional(),
   frameRate: z.number().optional()
 });
-export type VideoTrack = z.infer<typeof VideoTrackSchema>;
+// Named `DocVideoTrack` (not `VideoTrack`) for the same reason as
+// `DocAudioTrack` below: the flat domain model in asset-repo.ts exports a
+// `VideoTrack` of its own (issue #978), and the two names must not clash.
+export type DocVideoTrack = z.infer<typeof VideoTrackSchema>;
 
 export const AudioTrackSchema = z.object({
   index: z.number(),
@@ -396,11 +399,25 @@ export type AssetDocument = z.infer<typeof AssetDocumentSchema>;
 function technicalFromAsset(asset: Asset): AssetDocument['technical'] {
   const tm = asset.technicalMetadata;
   const technical: AssetDocument['technical'] = {};
+  // Per-track video, read back onto the flat Asset by `technicalToAsset` below
+  // (issue #978). `technicalMetadata` stays AUTHORITATIVE for the four
+  // attributes it carries — a re-probe writes them through unchanged — while
+  // the stored track's `index` / `frameRate` and any second-and-later track
+  // survive the round-trip instead of being dropped. With no stored tracks this
+  // produces exactly the single-entry array it always did.
+  const storedVideo = asset.videoTracks ?? [];
   if (tm) {
     technical.container = tm.containerFormat;
     technical.durationMs = Math.round(tm.durationSeconds * 1000);
     technical.video = [
-      { codec: tm.codec, width: tm.width, height: tm.height, bitrateBps: tm.bitrateBps }
+      {
+        ...storedVideo[0],
+        codec: tm.codec,
+        width: tm.width,
+        height: tm.height,
+        bitrateBps: tm.bitrateBps
+      },
+      ...storedVideo.slice(1)
     ];
     technical.audio = tm.audioTracks?.map((a) => ({
       index: a.index,
@@ -409,6 +426,10 @@ function technicalFromAsset(asset: Asset): AssetDocument['technical'] {
       sampleRateHz: a.sampleRateHz
     }));
     technical.probe = { source: 'eyevinn-ffmpeg-s3', probedAt: tm.extractedAt };
+  } else if (storedVideo.length > 0) {
+    // Probed tracks with no probe block (so no flattened `technicalMetadata`)
+    // still round-trip rather than being erased by the next write.
+    technical.video = storedVideo;
   }
   if (asset.technicalMetadataError) {
     technical.error = asset.technicalMetadataError;
@@ -418,7 +439,7 @@ function technicalFromAsset(asset: Asset): AssetDocument['technical'] {
 
 function technicalToAsset(
   technical: AssetDocument['technical']
-): Pick<Asset, 'technicalMetadata' | 'technicalMetadataError'> {
+): Pick<Asset, 'technicalMetadata' | 'technicalMetadataError' | 'videoTracks'> {
   const v = technical.video?.[0];
   let technicalMetadata: Asset['technicalMetadata'] = null;
   if (v && technical.probe) {
@@ -438,7 +459,11 @@ function technicalToAsset(
       extractedAt: technical.probe.probedAt
     };
   }
-  return { technicalMetadata, technicalMetadataError: technical.error };
+  // Every stored video track, projected onto the flat Asset (issue #978).
+  // Undefined (not []) when the document has no `technical.video` block, so an
+  // unprobed asset stays clean and a later write does not invent an array.
+  const videoTracks = technical.video?.map((t) => ({ ...t }));
+  return { technicalMetadata, technicalMetadataError: technical.error, videoTracks };
 }
 
 // Map a flat domain Asset to its persisted four-namespace document body.
@@ -659,6 +684,8 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     })),
     technicalMetadata: technical.technicalMetadata,
     technicalMetadataError: technical.technicalMetadataError,
+    // Per-track video from `technical.video[]` (issue #978).
+    videoTracks: technical.videoTracks,
     manifestUrls,
     packagingError: doc.structural?.packagingError,
     // Durable packaged-output location (issue #502). Absent block maps back to
