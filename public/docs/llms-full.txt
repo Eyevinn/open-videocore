@@ -2048,6 +2048,16 @@ id | path | string | required
   Response
 Response 200 (application/json)
 {
+  "videoTracks": [
+    {
+      "codec": "string",
+      "width": 0,
+      "height": 0,
+      "index": 0,
+      "bitrateBps": 0,
+      "frameRate": 0
+    }
+  ],
   "audioTracks": [
     {
       "id": "string",
