@@ -1990,6 +1990,16 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   probe,
   // External storage-backend registry (issue #548): lets POST /ingest-url
   // reference a registered external backend as the source (ADR-017 D4).
+  //
+  // Also the registry POST /:id/deliver resolves its `destination` reference
+  // through (issue #1131) — the SAME records /api/v1/export-destinations
+  // registers and lists, so an operator-registered destination is deliverable
+  // with no second registration. The delivery route deliberately takes NO
+  // client option here: its copy + landing verification must run against the
+  // store THIS request's bytes live in, so it uses the per-request stack client
+  // and endpoint (`request.connections.storageClient` / `.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:148,152) rather than a process-wide handle
+  // that could belong to a different stack (the issue #1058 class of split).
   storageBackendRegistry,
   encore,
   // Resolve the EFFECTIVE stack identity a transcode request routes to (issue

@@ -267,6 +267,7 @@ The OpenAPI document's `info.version` deliberately stays pinned to
 | `GET` | `/api/v1/assets/:id/thumbnails/:index` | Get a single thumbnail |
 | `POST` | `/api/v1/assets/:id/clip` | Clip a time segment into a new asset |
 | `POST` | `/api/v1/assets/:id/export` | Re-wrap into a different container format |
+| `POST` | `/api/v1/assets/:id/deliver` | Deliver the asset's source object to a registered export destination |
 | `GET` | `/api/v1/assets/:id/delivery` | Get playback URLs (see [ADR-003](docs/architecture/ADR-003-delivery-and-stream-url-contract.md)) |
 | `GET` | `/api/v1/assets/:id/stream/*` | Proxy-stream packaged HLS/DASH manifests and segments (see [ADR-003](docs/architecture/ADR-003-delivery-and-stream-url-contract.md)) |
 | `PUT` | `/api/v1/assets/:id/metadata` | Replace free-form metadata |
