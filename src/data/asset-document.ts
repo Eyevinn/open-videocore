@@ -547,7 +547,12 @@ export function toAssetDocument(
     doc.administrative.storage = {
       bucket: opts.storageBucket ?? '',
       key: asset.objectKey,
-      sizeBytes: opts.storageSizeBytes ?? 0
+      // Issue #1059: the size recorded at ingest completion now actually lands
+      // here (and is read back in fromAssetDocument). Before #1059 nothing ever
+      // supplied a size and this slot was unconditionally 0; `?? 0` keeps that
+      // exact behaviour for assets that carry no recorded size, so the document
+      // shape is unchanged and no schemaVersion bump is required.
+      sizeBytes: asset.sourceSizeBytes ?? opts.storageSizeBytes ?? 0
     };
   }
   if (asset.manifestUrls && (asset.manifestUrls.hls || asset.manifestUrls.dash)) {
@@ -691,6 +696,14 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     versionOfAssetId,
     versionGroupId,
     objectKey: doc.administrative.storage?.key,
+    // Size recorded at ingest completion (issue #1059). `0` is the pre-#1059
+    // "nothing was ever recorded" placeholder, not a real zero-length source, so
+    // it maps back to undefined — a legacy document must not be read as "this
+    // object should be 0 bytes".
+    sourceSizeBytes:
+      doc.administrative.storage?.sizeBytes && doc.administrative.storage.sizeBytes > 0
+        ? doc.administrative.storage.sizeBytes
+        : undefined,
     statusHistory: (doc.administrative.statusHistory ?? []).map((t) => ({
       at: t.at,
       from: t.from as AssetStatus | null,

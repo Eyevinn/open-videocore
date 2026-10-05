@@ -169,7 +169,22 @@ import {
 // SERVER-SIDE; it is never put in the response body.
 import { oscJobLog } from '../pipeline/osc-job-log.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
+// Deliver an existing asset object to a registered export destination (issue
+// #1131). The module owns the byte movement (server-side CopyObject) and the
+// landing verification that makes the endpoint's terminal status truthful.
+import {
+  deliverAssetObject,
+  destinationEndpointRefusal,
+  type DeliveryFailureReason,
+  type DeliveryObjectClient
+} from '../pipeline/asset-delivery.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
+// Pre-dispatch verification that the transcode source object is actually present
+// and readable in the bucket the transcoder will read (issue #1059).
+import {
+  checkTranscodeSourceReadable,
+  type SourceStatReader
+} from '../pipeline/source-readiness.js';
 import {
   backendOutputDestination,
   DEFAULT_BACKEND_ID
@@ -735,6 +750,65 @@ const exportBodySchema = z.object({
   // export is additionally recorded as a version of the source asset.
   asVersion: z.boolean().optional()
 });
+
+// Deliver request (issue #1131): WHICH registered export destination the
+// asset's existing source object is to be delivered to. `destination` is the
+// stable id OR the human name of a registered output-role destination — the
+// SAME reference form the named-destination job path accepts
+// (`resolveJobDestination`, below) and the same records
+// GET /api/v1/export-destinations lists (src/routes/export-destinations.ts:
+// 279-288). Nothing else is accepted: this endpoint delivers bytes that already
+// exist, so there is no format, profile or output-name to choose. The bound
+// mirrors the destination id/name bound on the export-destinations surface
+// (`z.string().min(1).max(256)`, export-destinations.ts:301).
+const deliverBodySchema = z.object({
+  destination: z.string().min(1).max(256)
+});
+
+// Deliver result (issue #1131). Describes the object AS VERIFIED at the
+// destination after the copy: the bucket + key it was re-read at, its byte
+// count and etag. `status` is a single terminal value — the endpoint answers
+// 200 only when the object really landed, so a 200 can never mean "submitted"
+// or "probably".
+const deliverResultSchema = z.object({
+  assetId: z.string(),
+  status: z.literal('delivered'),
+  destination: z.object({
+    id: z.string(),
+    name: z.string(),
+    role: z.enum(['packaged', 'both'])
+  }),
+  bucket: z.string(),
+  objectKey: z.string(),
+  bytes: z.number(),
+  etag: z.string(),
+  deliveredAt: z.string()
+});
+
+// How each delivery failure reason (src/pipeline/asset-delivery.ts) surfaces as
+// HTTP. Exhaustive by type, so a new reason cannot be added without deciding
+// how it is reported — and none of them can be reported as a 200.
+//   - a destination we cannot write to / verify, and an over-size source, are
+//     caller-actionable 422s (the same code the #209 destination pre-flight
+//     uses for an unreachable destination bucket);
+//   - missing source BYTES are a 409: the asset document named an object that
+//     is not in the bucket, so there was nothing to deliver;
+//   - a failed copy, or a copy that did not land, is a 502 — the store is
+//     downstream of us and reported (or silently produced) a failure;
+//   - an unsettled delivery is a 504: we genuinely do not know the outcome, so
+//     it must not be dressed up as either success or a clean failure.
+const DELIVERY_FAILURE_RESPONSE: Record<
+  DeliveryFailureReason,
+  { status: 409 | 422 | 502 | 504; error: string }
+> = {
+  destination_unreachable: { status: 422, error: 'destination_unreachable' },
+  source_missing: { status: 409, error: 'source_missing' },
+  source_too_large: { status: 422, error: 'source_too_large' },
+  copy_failed: { status: 502, error: 'delivery_failed' },
+  not_landed: { status: 502, error: 'delivery_failed' },
+  timeout: { status: 504, error: 'delivery_timeout' }
+};
+
 // Clip / trim request (issue #17): a time window in seconds. `endSeconds` must
 // be strictly greater than `startSeconds`. Optional `outputName` names the new
 // child asset.
@@ -1132,6 +1206,24 @@ type AssetsRouterOptions = {
   // appending log records (no-op), so existing tests are unaffected. Emission
   // never throws, so no route becomes newly failable.
   pipelineLog?: PipelineLogSink;
+  // Asset delivery to a named export destination (issue #1131).
+  //
+  // `deliveryClient` is the object-store client POST /:id/deliver performs the
+  // server-side copy + landing verification with. In PRODUCTION the route uses
+  // the per-request stack client (`request.connections.storageClient`,
+  // src/services/workspace-stack.ts:148) so a delivery always runs against the
+  // same store this request's bytes live in; this option exists so a test can
+  // inject a fake, and when both are present the injected one wins — the same
+  // precedence `opts.subtitleGenerator ?? request.connections?.subtitleGenerator`
+  // uses. When neither is available the route answers 501.
+  deliveryClient?: DeliveryObjectClient;
+  // The object-storage endpoint `deliveryClient` is authenticated against, used
+  // to refuse a destination that declares a DIFFERENT endpoint (whose
+  // credentials this API cannot hold — see destinationEndpointRefusal in
+  // src/pipeline/asset-delivery.ts). Production reads it from the resolved
+  // stack (`request.connections.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:152); injectable here for tests.
+  deliveryEndpoint?: string;
 };
 
 // Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
@@ -2612,6 +2704,163 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     ) {
       if (!requireSourceObject(asset, reply)) {
         return undefined;
+      }
+    }
+
+    // #1059: the resolver above proves the asset RECORDS a source key. It does
+    // NOT prove the BYTES are still in the bucket the transcoder reads — and for
+    // large sources they sometimes are not (#1057 / #1058). Without this check
+    // the execution is accepted, the scaler spawns a transcoder, and the run
+    // fails ~2 minutes later with an opaque probe 404 that names nothing. So HEAD
+    // (stat) the EXACT bucket + key the transcode step is about to put in the
+    // job's `s3://<bucket>/<key>` input (transcode.ts:120) and fail here, before
+    // any execution record exists, with an error naming bucket, key and endpoint.
+    //
+    // Gated on the pipeline CONTAINING a transcode step (`transcode`, `abr-vod`,
+    // `full`), the same condition the profile pre-flights below use — a transcode
+    // reads this object store location whether it is the first step or runs after
+    // the fire-and-forget ones. Pipelines with no transcode step are untouched:
+    // `package` reads the transcoder's OUTPUT, not the source (see above), and the
+    // fire-and-forget steps record their own per-step outcome on the asset.
+    //
+    // The stat goes through the per-request StorageFactory, which is bound to the
+    // SAME per-stack `config.sourceBucket` (workspace-stack.ts:213-214) that the
+    // input URI's bucket is taken from (:248, carried as
+    // WorkspaceConnections.sourceBucket) — so it addresses exactly the object the
+    // transcoder will read. OPT-IN, fail-open: a deployment with no object store
+    // wired cannot verify presence, and must keep submitting exactly as before,
+    // so the guard is skipped with a warning rather than blocking the pipeline.
+    if (steps.includes('transcode')) {
+      const preflightSource = tryResolveSourceObject(asset);
+      const transcodeSourceBucket =
+        request.connections?.sourceBucket ?? opts.sourceBucket;
+      // Same per-stack endpoint the spawned transcoder is configured with
+      // (StackConfig.minioEndpoint -> EncoreS3Config.endpoint, see
+      // services/encore-s3-config.ts); undefined on the env-override path.
+      const transcodeSourceEndpoint = stackResolvedMinioEndpoint(request.connections);
+      let sourceStatReader: SourceStatReader | undefined;
+      try {
+        // Take the stat reader from the SAME resolution the bucket and the
+        // endpoint above come from: this request's already-resolved connections
+        // (`WorkspaceConnections.storageFor`, services/workspace-stack.ts:147,
+        // bound to that stack's `config.sourceBucket` at :274, the same field
+        // the input URI's bucket is read from at :248). The router-level factory
+        // reaches the same stack by a different route — the ambient request stack
+        // name plus a CACHED read (`makeRequestScopedStorageFactory`,
+        // services/request-stack-context.ts:78-92) — which yields nothing and
+        // THROWS once that cache entry goes cold, degrading the check to
+        // "submitting unverified" on a stack whose connections this request
+        // already holds. Resolving the probe, the bucket and the reported
+        // endpoint from one object removes that second resolution entirely, so
+        // the diagnostic can never name an endpoint the probe did not address.
+        // Fall back to the router-level factory only where `connections` carries
+        // no storage (env-override path). The invariant is "same resolved
+        // stack", not "same URL" — the spawned transcoder is legitimately handed
+        // an in-cluster alias of that same object store
+        // (services/internal-minio-endpoint.ts).
+        const connectionsStorageFor = request.connections?.storageFor;
+        sourceStatReader = connectionsStorageFor
+          ? connectionsStorageFor()
+          : storageFor
+            ? storageFor()
+            : undefined;
+      } catch (err) {
+        // storageFor() throws when the resolved stack has no object storage
+        // (main.ts:658-664). Treated as "cannot verify", not as a failure.
+        request.log.warn(
+          { err, bucket: transcodeSourceBucket },
+          'could not open object storage to verify the transcode source object (issue #1059) — submitting unverified'
+        );
+        sourceStatReader = undefined;
+      }
+      // An `s3://<bucket>/<key>` objectKey is an EXTERNAL-bucket registration
+      // (assets.ts:3166/3182 store the full locator, not a workspace-local key),
+      // which lives outside the stack source bucket this stat addresses. Stat'ing
+      // the locator as a local key would 409 against the wrong bucket with a
+      // message that misdescribes the cause, so leave those sources to the
+      // transcode step (pipeline/transcode.ts composes its own URI for them).
+      const externalSourceLocator = preflightSource?.objectKey.startsWith('s3://') ?? false;
+      if (externalSourceLocator) {
+        request.log.info(
+          { assetId: asset.id, objectKey: preflightSource?.objectKey },
+          'source is an external-bucket locator — starting the transcode pipeline WITHOUT verifying the source object (issue #1059)'
+        );
+      }
+      // No bucket resolved at all (no stack connections AND no configured source
+      // bucket): there is nothing to name in a diagnostic and nothing to stat
+      // against, so this is the same "cannot verify" case as having no object
+      // store wired. The 501 guard above only covers `firstStep === 'transcode'`,
+      // so a `full` pipeline can reach here with neither bucket source set.
+      if (preflightSource && sourceStatReader && transcodeSourceBucket && !externalSourceLocator) {
+        const readiness = await checkTranscodeSourceReadable(
+          {
+            bucket: transcodeSourceBucket,
+            objectKey: preflightSource.objectKey,
+            ...(transcodeSourceEndpoint ? { endpoint: transcodeSourceEndpoint } : {}),
+            // The stack identity #1058's gate just RESOLVED for this request,
+            // not the deployment-wide default: the gate above has already proved
+            // the data plane and the control plane agree, so `controlPlane`
+            // names the one stack this submission concerns. Falling back to
+            // DEPLOYMENT_CONTEXT only where #1058 also does — no resolver wired
+            // or no provisioned stack (transcodeStackIdentity, assets.ts) —
+            // keeps single-stack and env-override deployments byte-identical.
+            stackName: controlPlane.resolved ?? request.connections?.stackName ?? DEPLOYMENT_CONTEXT,
+            // The size recorded when ingest completed (issue #1059): the URL
+            // pull worker's `bytesTransferred` (pipeline/url-pull-worker.ts) or
+            // the upload route's (routes/asset-upload.ts), persisted on the
+            // asset as `Asset.sourceSizeBytes` (data/asset-repo.ts) via the
+            // document's `administrative.storage.sizeBytes`
+            // (data/asset-document.ts). Undefined for assets ingested before
+            // #1059, and for paths that never learn the length (external-bucket
+            // registration) — the size comparison is then skipped and presence
+            // alone is enforced. The length always describes
+            // `preflightSource.objectKey`: the repositories clear it when
+            // `objectKey` is patched to a DIFFERENT key with no new size, and
+            // every ingest-completion path that can replace the object under the
+            // same deterministic key writes the object's true length in the same
+            // patch (routes/asset-upload.ts `finalizedSourceSizeBytes`, used by
+            // the presigned single-part and multipart finalizes, plus the
+            // streamed PUT and the URL-pull worker's `bytesTransferred`).
+            ...(asset.sourceSizeBytes !== undefined
+              ? { expectedSizeBytes: asset.sourceSizeBytes }
+              : {})
+          },
+          sourceStatReader
+        );
+        if (!readiness.readable) {
+          request.log.warn(
+            {
+              assetId: asset.id,
+              bucket: transcodeSourceBucket,
+              objectKey: preflightSource.objectKey,
+              endpoint: transcodeSourceEndpoint,
+              stack: controlPlane.resolved ?? request.connections?.stackName,
+              reason: readiness.reason,
+              expectedSizeBytes: asset.sourceSizeBytes,
+              observedSizeBytes: readiness.sizeBytes
+            },
+            'refusing to start a transcode pipeline: the source object is not readable (issue #1059)'
+          );
+          // `probe-failed` means the object store could not be asked at all —
+          // a dependency failure (502), not a conflict with the asset's state.
+          // Everything else is a definite answer ABOUT the asset's source, so it
+          // takes the same 409 shape as the other source-related refusals above.
+          if (readiness.reason === 'probe-failed') {
+            reply
+              .code(502)
+              .send({ error: 'source_verification_failed', message: readiness.message });
+          } else {
+            reply.code(409).send({ error: 'source_unreadable', message: readiness.message });
+          }
+          return undefined;
+        }
+      } else if (!sourceStatReader || !transcodeSourceBucket) {
+        request.log.warn(
+          { assetId: asset.id, bucket: transcodeSourceBucket },
+          !transcodeSourceBucket
+            ? 'no source bucket resolved for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+            : 'no object storage wired for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+        );
       }
     }
 
@@ -5074,9 +5323,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //   409 — pipeline already running / job not found / instance unavailable /
   //         `stack_routing_mismatch` (issue #1058, pipeline mode only — it shares
   //         `startPipelineExecution` with POST /:id/execute, whose abr-vod
-  //         pipeline contains a transcode step)
+  //         pipeline contains a transcode step),
+  //         (pipeline mode, issue #1059) `source_unreadable` — the source object
+  //         is missing from the bucket the transcode step would read. The #1058
+  //         stack-routing gate runs FIRST (is this the right stack at all?), then
+  //         the #1059 readiness gate (are the bytes actually there?).
   //   501 — required service not configured on this deployment
-  //   502 — Encore submission failed
+  //   502 — Encore submission failed, or (pipeline mode, issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
   app.post(
     '/:id/package',
     {
@@ -5192,9 +5446,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         pooled, so the job URL the packager needs cannot be resolved /
   //         `stack_routing_mismatch` (issue #1058) — for any pipeline CONTAINING
   //         a transcode step, the source bytes and the transcoder would resolve
-  //         different stacks; refused before the execution record is created
+  //         different stacks; refused before the execution record is created /
+  //         `source_unreadable` (issue #1059) — the asset records a source key but
+  //         the object is missing / empty / the wrong size in the bucket the
+  //         transcode step would read. The two gates run in that order: #1058
+  //         settles WHICH stack, then #1059 checks the bytes are there on it
   //   501 — pipeline execution or the required OSC service is not configured
-  //   502 — the first step's submission failed
+  //   502 — the first step's submission failed, or (issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
+  //         whether the transcode source exists
   app.post(
     '/:id/execute',
     {
@@ -5570,6 +5830,263 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'rewrap_failed', message });
       }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Deliver an EXISTING asset to a registered export destination (issue #1131).
+  //
+  // Prerequisite for #945 (and the #910/#911 export-from-detail UI): the caller
+  // supplies `(assetId, destination)` and gets back a terminal, truthful answer
+  // about whether the asset's source object is now AT that destination.
+  //
+  // WHY A NEW ENDPOINT AND NOT A `destination` FIELD ON POST /:id/export.
+  // `/:id/export` is a container re-wrap/transmux: it dispatches an OSC ffmpeg
+  // `-c copy` job via `rewrapRunner` and answers 201 with a NEW CHILD ASSET
+  // (`exportBodySchema` = `{ targetFormat, outputName?, asVersion? }`, handler
+  // above). Its output location is the workspace's own bucket, fixed by the
+  // runner's `s3Config` (`requestRunnerS3Config`), and the ffmpeg-s3 job body
+  // carries exactly ONE S3 identity (`ffmpegS3CredentialMapping`,
+  // src/services/external-storage-credentials.ts:155-180) — so that job cannot
+  // be pointed at a separately-credentialed destination, and a `destination`
+  // field there would have to mean "transmux, then relocate", i.e. two
+  // operations with two failure modes behind one 201-with-an-asset contract.
+  // Delivery has a different terminal condition ("the object is present at the
+  // destination"), so it gets its own endpoint and its own 200 body, and
+  // `/:id/export` keeps its current meaning unchanged.
+  //
+  // COMPOSITION (all pre-existing contracts, nothing new invented):
+  //   - the destination reference is resolved by `resolveJobDestination`
+  //     (above) — the SAME #573/#574 path POST /:id/package and
+  //     POST /:id/execute use, so a destination's optional path template
+  //     (`StorageBackendRegistry.resolveDestinationBucket`,
+  //     src/services/storage-backend-registry.ts:982-998) keys a delivered
+  //     object exactly as it keys packaged output;
+  //   - the resolved string is split by `parseDestination`
+  //     (src/pipeline/output-relocation.ts:57-80) into { bucket, prefix };
+  //   - the bytes move by server-side CopyObject and the landing is VERIFIED by
+  //     re-reading the destination object (src/pipeline/asset-delivery.ts).
+  //
+  // TRUTHFUL TERMINAL STATUS. 200 `{ status: 'delivered' }` is sent only after
+  // the object has been re-read at the destination with the source's byte
+  // count. Everything else is an error naming what went wrong:
+  //   400 — the reference names no registered export destination (or names the
+  //         OSC-managed default, which is where the asset already is)
+  //   404 — unknown/foreign asset (existence is not leaked)
+  //   409 — the asset has no stored source object (`no_object`, the shared
+  //         source-resolution contract), or its bytes are gone from the source
+  //         bucket (`source_missing`) so there was nothing to copy
+  //   422 — the destination is registered for a non-output role, or is not
+  //         writable/verifiable with the credentials this API holds
+  //   501 — no storage-backend registry, or no object storage, on this
+  //         deployment
+  //   502 — the copy failed, or the store reported success but the object is
+  //         not actually at the destination
+  //   504 — the delivery did not settle within the bound, so its outcome could
+  //         not be confirmed
+  app.post(
+    '/:id/deliver',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: deliverBodySchema,
+        response: {
+          200: deliverResultSchema,
+          400: errorSchema,
+          404: errorSchema,
+          409: errorSchema,
+          422: errorSchema,
+          501: errorSchema,
+          502: errorSchema,
+          504: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // Unified source-object resolution (issue #612): a source-less asset
+      // fails here the same way it fails for every other source-consuming
+      // operation (409 `no_object`).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
+
+      const registry = opts.storageBackendRegistry;
+      if (!registry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+
+      const ref = request.body.destination;
+      // The implicit OSC-managed default (ADR-017 D3) is the store the asset
+      // already lives in, not somewhere to deliver TO. `resolveForOutput`
+      // answers undefined for it by design
+      // (storage-backend-registry.ts:1040-1042), so name it explicitly rather
+      // than reporting it as an unknown destination.
+      if (ref === DEFAULT_BACKEND_ID) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: `"${DEFAULT_BACKEND_ID}" is the platform-managed default store the asset already lives in, not an export destination; name a destination registered via POST /api/v1/export-destinations`
+        });
+      }
+      // Resolve the destination RECORD first, under the SAME workspace
+      // namespace the export-destinations surface registers records in
+      // (`workspaceId = STACK_CONFIG_NAMESPACE`,
+      // src/routes/export-destinations.ts:187), so this endpoint addresses
+      // exactly the destinations GET /api/v1/export-destinations lists.
+      // Resolving the record up front (rather than going straight to
+      // `resolveJobDestination`) is what lets a registered-but-wrong-role
+      // backend get its own, accurate error: `resolveDestinationBucket` folds
+      // that case into the generic "no destination matches" 400
+      // (storage-backend-registry.ts:988-991), which would misreport a
+      // destination that IS registered.
+      const record = await registry.resolveForOutput(STACK_CONFIG_NAMESPACE, ref);
+      if (!record) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: new UnknownDestinationBackendError(ref).message
+        });
+      }
+      // Only output-role backends are export destinations (ADR-018 D1 —
+      // `isExportDestination`, src/routes/export-destinations.ts:174-176). A
+      // 'source'/'archive' backend is read/cold storage; delivering to it would
+      // silently cross the two surfaces, so it is refused with the same
+      // `backend_role`-style 422 the job path uses (`resolveJobDestination`
+      // above).
+      if (record.role !== 'packaged' && record.role !== 'both') {
+        return reply.code(422).send({
+          error: 'backend_role',
+          message: `storage backend "${ref}" is registered for the "${record.role}" role and cannot receive a delivery; register it with role "packaged" or "both"`
+        });
+      }
+
+      // Resolve the destination to the SAME `<bucket>/<prefix>/` string the
+      // relocation path consumes, through the SAME resolver the package/execute
+      // jobs use — so a #574 path template applies to a delivery identically.
+      // An error (unknown reference, unrenderable template, no registry) has
+      // already been sent by the resolver.
+      const resolved = await resolveJobDestination(
+        { destination: ref, assetId: asset.id },
+        reply
+      );
+      if (!resolved.ok) return reply;
+      const target =
+        resolved.destinationBucket !== undefined
+          ? parseDestination(resolved.destinationBucket)
+          : undefined;
+      if (!target) {
+        // A named destination always resolves to a non-empty bucket string, so
+        // this is defence in depth: refuse rather than copy to an unparseable
+        // location.
+        request.log.error(
+          { assetId: asset.id, destinationId: record.id },
+          'destination reference resolved to no usable bucket path'
+        );
+        return reply.code(422).send({
+          error: 'destination_unresolved',
+          message: `export destination "${ref}" did not resolve to a usable bucket path`
+        });
+      }
+
+      // A destination that declares its OWN endpoint cannot be delivered to
+      // from here: its secret access key lives write-only in OSC per-service
+      // secrets, so this process holds no credential for that endpoint, and
+      // copying to a same-named bucket on our own store would report a success
+      // for bytes that never reached the operator (see
+      // `destinationEndpointRefusal`, src/pipeline/asset-delivery.ts). Refuse
+      // instead of producing a false success.
+      const deploymentEndpoint = opts.deliveryEndpoint ?? request.connections?.s3Config?.endpoint;
+      const endpointRefusal = destinationEndpointRefusal(record.endpointUrl, deploymentEndpoint);
+      if (endpointRefusal) {
+        request.log.warn(
+          { assetId: asset.id, destinationId: record.id },
+          'refusing delivery: the destination is registered at an endpoint this API holds no credentials for (issue #1131)'
+        );
+        return reply.code(422).send({
+          error: 'destination_unreachable',
+          message: endpointRefusal
+        });
+      }
+
+      // The copy client: the per-request stack client in production, an
+      // injected fake in tests (see the option docs).
+      const client = opts.deliveryClient ?? request.connections?.storageClient;
+      if (!client) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured; asset delivery is unavailable'
+        });
+      }
+
+      // Where the source bytes are now. A rendition/external source is stored
+      // as an `s3://bucket/key` URI (`parseS3Uri`, above); a plain key lives in
+      // THIS request's stack source bucket (`WorkspaceConnections.sourceBucket`,
+      // src/services/workspace-stack.ts:150), falling back to the router's
+      // configured bucket and finally the documented default.
+      const s3Source = parseS3Uri(source.objectKey);
+      const sourceLocation = s3Source
+        ? { bucket: s3Source.bucket, key: s3Source.key }
+        : {
+            bucket:
+              request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET,
+            key: source.objectKey
+          };
+
+      const outcome = await deliverAssetObject(client, {
+        source: sourceLocation,
+        target
+      });
+      if (!outcome.ok) {
+        const mapped = DELIVERY_FAILURE_RESPONSE[outcome.reason];
+        request.log.warn(
+          {
+            assetId: asset.id,
+            destinationId: record.id,
+            reason: outcome.reason,
+            bucket: target.bucket
+          },
+          'asset delivery did not land at the destination'
+        );
+        return reply.code(mapped.status).send({
+          error: mapped.error,
+          message: outcome.message
+        });
+      }
+
+      // Audit the delivery (issue #564 emitter): emitted ONLY on a verified
+      // landing, so the audit trail cannot claim a delivery that did not
+      // happen. Fire-and-forget — a failed audit write never fails the request.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.delivered',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: {
+            destinationId: record.id,
+            destinationName: record.name,
+            bucket: outcome.bucket,
+            objectKey: outcome.objectKey,
+            bytes: outcome.bytes
+          }
+        },
+        request.log
+      );
+      return reply.code(200).send({
+        assetId: asset.id,
+        status: 'delivered' as const,
+        destination: { id: record.id, name: record.name, role: record.role },
+        bucket: outcome.bucket,
+        objectKey: outcome.objectKey,
+        bytes: outcome.bytes,
+        etag: outcome.etag,
+        deliveredAt: new Date().toISOString()
+      });
     }
   );
 
