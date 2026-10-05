@@ -200,7 +200,19 @@ delete-lock never blocks a restore (ADR-020 decision 4). Restore has no
 
 ## 4. Retention window: **not exposed — no such field exists**
 
-**Answer to the issue's second scope item: there is NO retention-expiry or
+> **Superseded in part by #891.** The "Preferred" shape this section recommends
+> now exists: `GET /api/v1/assets/{id}` (and `POST /api/v1/assets/{id}/restore`,
+> for contract symmetry) attach an optional, server-derived
+> `retention: { archivedAt, purgeAfter, retentionMs }` — `retentionSchema` +
+> `withRetention()` in `src/routes/assets.ts`. It is present only while the asset
+> is `archived` and only where the deployment wires the live window, it is
+> computed per response (never persisted), and `purgeAfter` is `null` when
+> `retentionMs === 0`. The list endpoint and search still do NOT carry it.
+> Everything below about *why* the value is approximate (sweep cadence,
+> hot-swappable window, deferred parents) still holds and still applies to the
+> new field.
+
+**Answer to the issue's second scope item (as of this finding, pre-#891): there is NO retention-expiry or
 remaining-window value in the asset document, in the restore response, or in any
 per-asset response.** Checked exhaustively: the 200 property list in §2 is the
 complete set (`additionalProperties: false`) and contains no `archivedAt`,

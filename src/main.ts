@@ -2050,7 +2050,13 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   // `transcode` submission. Appends to the SAME store
   // GET /api/v1/logs reads (`logStore` above), which is what makes the Logs tab
   // populate during a normal run.
-  pipelineLog: logStore
+  pipelineLog: logStore,
+  // LIVE archived-asset retention window, so GET /api/v1/assets/{id} can report
+  // the remaining retention window on an archived asset (issue #891). A getter
+  // over the same mutable `archiveRetentionMs` the purge sweep reads
+  // (retentionMs getter below), so a PATCH /api/v1/retention/config hot-swap
+  // moves the advertised deadline and the sweep that enforces it together.
+  retentionMs: () => archiveRetentionMs
 };
 await app.register(assetsRouter, assetRouterOptions);
 
