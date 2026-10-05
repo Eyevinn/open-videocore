@@ -78,7 +78,13 @@ class FakeStackStorage {
   async presignedPut(key: string): Promise<string> {
     return `https://${this.stack}.minio-minio.example/${SOURCE_BUCKET}/${key}?signed=put`;
   }
-  async statObject(): Promise<{ size: number; etag: string }> {
+  // Keys this stack's store does NOT hold. Default is "every key is present"
+  // (what the other cases here need); a test marks a key absent in one stack to
+  // show which stack a probe actually addressed — the pre-dispatch source
+  // readiness check (issue #1059) stats through this method.
+  readonly absentKeys = new Set<string>();
+  async statObject(key: string): Promise<{ size: number; etag: string } | undefined> {
+    if (this.absentKeys.has(key)) return undefined;
     return { size: 1, etag: `etag-${this.stack}` };
   }
 }
@@ -595,6 +601,55 @@ describe('pipeline execute refuses a stack split too (issue #1058)', () => {
     expect(res.statusCode).toBe(202);
     expect(h.submitted).toHaveLength(1);
     expect(h.submitted[0]!.externalId.split('__')[0]).toBe('b');
+  });
+
+  // The pre-dispatch source probe (issue #1059) must address the stack the
+  // REQUEST names — the one the transcoder will read and the one the reported
+  // bucket and endpoint are taken from — not whichever stack a second,
+  // independent resolution happens to land on. Asserting the probe's endpoint
+  // string equals the transcoder's would be wrong (the spawned transcoder is
+  // handed an in-cluster alias of the same store, issue #991); the property that
+  // matters is "same resolved stack", so this pins it by presence: the object
+  // exists in the default stack 'a' and NOT in the named stack 'b'.
+  it('probes the NAMED stack for the source object, not the first-listed one', async () => {
+    const h = await buildApp(['a', 'b']);
+    const id = await readyAsset(h);
+    h.stacks['b']!.storage.absentKeys.add(`ingest/${id}`);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/execute`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: { pipeline: 'abr-vod' }
+    });
+
+    expect(res.statusCode).toBe(409);
+    const body = res.json() as { error: string; message: string };
+    expect(body.error).toBe('source_unreadable');
+    expect(body.message).toContain('does not exist');
+    // The named stack's endpoint is the one reported, and it is the one probed.
+    expect(body.message).toContain('b.minio-minio.example');
+    expect(h.submitted).toHaveLength(0);
+    expect(await h.stacks['b']!.pipelines.listByAsset(id)).toHaveLength(0);
+  });
+
+  it('a source present only in the NAMED stack still submits', async () => {
+    // Mirror image of the above: the object is missing from the default stack
+    // and present in the named one, so a probe that resolved the default stack
+    // would refuse a perfectly good transcode.
+    const h = await buildApp(['a', 'b']);
+    const id = await readyAsset(h);
+    h.stacks['a']!.storage.absentKeys.add(`ingest/${id}`);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/execute`,
+      headers: { ...AUTH, 'x-stack-name': 'b' },
+      payload: { pipeline: 'abr-vod' }
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(h.submitted).toHaveLength(1);
   });
 });
 

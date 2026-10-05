@@ -383,7 +383,10 @@ export class CouchAssetRepository implements AssetRepository {
     // (data/asset-repo.ts): the size describes the key, so a key change with no
     // new size clears it.
     if (patch.sourceSizeBytes !== undefined) {
-      next.sourceSizeBytes = patch.sourceSizeBytes;
+      // Non-positive == "nothing recorded" (same sentinel as the in-memory repo
+      // and as a stored `0` read back by fromAssetDocument), so a finalize that
+      // could not learn the length clears a stale one.
+      next.sourceSizeBytes = patch.sourceSizeBytes > 0 ? patch.sourceSizeBytes : undefined;
     } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
       next.sourceSizeBytes = undefined;
     }

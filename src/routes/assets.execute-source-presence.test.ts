@@ -93,7 +93,14 @@ type Harness = {
   submitted: EncoreSubmitInput[];
 };
 
-async function buildApp(storageFor: StorageFactory | undefined): Promise<Harness> {
+async function buildApp(
+  storageFor: StorageFactory | undefined,
+  // `withSourceBucket: false` leaves the deployment with NO source bucket at all
+  // (neither stack connections nor the boot default) — the check has nothing to
+  // stat against and nothing to name, so it must step aside rather than produce
+  // a diagnostic about a bucket called "undefined".
+  opts: { withSourceBucket?: boolean } = {}
+): Promise<Harness> {
   const app = Fastify();
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
@@ -107,7 +114,7 @@ async function buildApp(storageFor: StorageFactory | undefined): Promise<Harness
     jobRepository: new InMemoryJobRepository(),
     pipelineRepository: pipelines,
     encore: client,
-    sourceBucket: SOURCE_BUCKET,
+    ...(opts.withSourceBucket === false ? {} : { sourceBucket: SOURCE_BUCKET }),
     outputBucket: 'out-bucket',
     ...(storageFor ? { storageFor } : {})
   });
@@ -219,6 +226,36 @@ describe('POST /:id/execute abr-vod source verification (issue #1059)', () => {
     const id = await seedAsset(h.repo);
 
     const res = await execute(h, id, 'ingest');
+
+    expect(res.statusCode).toBe(202);
+  });
+
+  it('an external-bucket `s3://` source locator is left alone => 202, nothing refused', async () => {
+    // External-bucket registration stores the FULL locator as `objectKey`
+    // (POST /assets/external, assets.ts), not a workspace-local key. Stat'ing it
+    // against the stack source bucket would 409 while naming the wrong bucket,
+    // so those sources are skipped: the transcode step composes its own URI for
+    // them (src/pipeline/transcode.ts).
+    const h = await buildApp(fakeStorage({}));
+    const asset = await h.repo.create({
+      name: 'external',
+      objectKey: 's3://partner-bucket/incoming/clip.mp4'
+    });
+
+    const res = await execute(h, asset.id);
+
+    expect(res.statusCode).toBe(202);
+    expect(h.submitted).toHaveLength(1);
+  });
+
+  it('no source bucket resolved at all => 202 (nothing to stat, nothing to name)', async () => {
+    // `full` reaches the check without tripping the transcode-first 501 guard,
+    // so this is the one shape that can arrive with no bucket from either
+    // source. It must not produce a diagnostic about bucket "undefined".
+    const h = await buildApp(fakeStorage({}), { withSourceBucket: false });
+    const id = await seedAsset(h.repo);
+
+    const res = await execute(h, id, 'full');
 
     expect(res.statusCode).toBe(202);
   });

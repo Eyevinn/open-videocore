@@ -148,9 +148,9 @@ export type SourceReadiness =
 
 // `"<key>" in bucket "<bucket>" at storage endpoint <endpoint>` — the three
 // coordinates an operator needs to go and look for the object themselves.
-function describeTarget(target: TranscodeSourceTarget): string {
-  const where = target.endpoint
-    ? `at storage endpoint ${sanitizeEndpoint(target.endpoint)}`
+function describeTarget(target: TranscodeSourceTarget, safeEndpoint?: string): string {
+  const where = safeEndpoint
+    ? `at storage endpoint ${safeEndpoint}`
     : 'at the configured storage endpoint';
   return `"${target.objectKey}" in bucket "${target.bucket}" ${where}`;
 }
@@ -171,6 +171,16 @@ export async function checkTranscodeSourceReadable(
   opts: { timeoutMs?: number } = {}
 ): Promise<SourceReadiness> {
   const timeoutMs = opts.timeoutMs ?? resolveDependencyTimeoutMs();
+  // Sanitize ONCE, up front, and use the result for every outward-facing string:
+  // the messages below (forwarded verbatim into the route's 409/502 body) and the
+  // bounded-deadline detail, whose `DependencyUnreachableDetail.endpoint` is
+  // documented as "the endpoint we were talking to, with any credentials
+  // stripped" (src/encore-scaler/dependency-timeout.ts:46-48) and whose message
+  // is also forwarded. Matches the other two call sites, which sanitize before
+  // handing the endpoint over (src/encore-scaler/index.ts, services/
+  // stack-reachability.ts). No stored endpoint carries credentials today; this
+  // makes the path structurally unable to leak one if that ever changes.
+  const safeEndpoint = target.endpoint ? sanitizeEndpoint(target.endpoint) : undefined;
   let stat: { size: number } | undefined;
   try {
     stat = await withDependencyTimeout(() => storage.statObject(target.objectKey), {
@@ -178,7 +188,7 @@ export async function checkTranscodeSourceReadable(
       // `endpoint` is diagnostic text on the bounded-deadline error only; the
       // env-override path carries no stack endpoint, so name the bucket instead
       // of fabricating a URL.
-      endpoint: target.endpoint ?? `bucket ${target.bucket}`,
+      endpoint: safeEndpoint ?? `bucket ${target.bucket}`,
       ...(target.stackName !== undefined ? { stackName: target.stackName } : {}),
       operation: `statObject ${target.bucket}/${target.objectKey}`,
       timeoutMs
@@ -189,7 +199,7 @@ export async function checkTranscodeSourceReadable(
       readable: false,
       reason: 'probe-failed',
       message:
-        `could not verify that the transcode source object ${describeTarget(target)} is readable: ` +
+        `could not verify that the transcode source object ${describeTarget(target, safeEndpoint)} is readable: ` +
         `${detail} — refusing to start the transcode, because a source the object store cannot ` +
         'confirm would fail the transcode minutes later with an opaque probe error'
     };
@@ -200,7 +210,7 @@ export async function checkTranscodeSourceReadable(
       readable: false,
       reason: 'absent',
       message:
-        `the transcode source object ${describeTarget(target)} does not exist — refusing to start ` +
+        `the transcode source object ${describeTarget(target, safeEndpoint)} does not exist — refusing to start ` +
         'the transcode, which would otherwise fail minutes later with an opaque probe error. The ' +
         'object was deleted or never landed under that key; re-ingest the source and retry'
     };
@@ -211,7 +221,7 @@ export async function checkTranscodeSourceReadable(
       reason: 'empty',
       sizeBytes: stat.size,
       message:
-        `the transcode source object ${describeTarget(target)} exists but is zero-length — ` +
+        `the transcode source object ${describeTarget(target, safeEndpoint)} exists but is zero-length — ` +
         'refusing to start the transcode; re-ingest the source and retry'
     };
   }
@@ -225,7 +235,7 @@ export async function checkTranscodeSourceReadable(
       reason: 'size-mismatch',
       sizeBytes: stat.size,
       message:
-        `the transcode source object ${describeTarget(target)} is ${stat.size} bytes, but ` +
+        `the transcode source object ${describeTarget(target, safeEndpoint)} is ${stat.size} bytes, but ` +
         `${target.expectedSizeBytes} bytes were recorded when ingest completed — the stored source ` +
         'has been truncated or replaced; refusing to start the transcode, re-ingest the source and retry'
     };

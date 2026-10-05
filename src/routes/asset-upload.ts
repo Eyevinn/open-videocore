@@ -100,6 +100,51 @@ export function sourceObjectKey(assetId: string): string {
 // S3/MinIO multipart part numbers are 1..10000.
 const partNumberSchema = z.coerce.number().int().min(1).max(10000);
 
+// The TRUE stored length of a finalized source object, for the two direct-to-store
+// completion paths that never transit this process (issue #1059 review follow-up).
+//
+// WHY this must be recorded, not left absent. Source object keys are deterministic
+// per asset (`sourceObjectKey`, above), so a REPLACEMENT upload writes the SAME
+// key. The recorded-size invariant in both repositories only drops a stale length
+// when the patched key DIFFERS (asset-repo.ts `update()`, couch-asset-repo.ts
+// `applyPatch()`), which a same-key replacement never does. Leaving the length
+// alone here therefore pins the asset to the length of the object it replaced, and
+// the pre-dispatch readiness check refuses every later transcode with
+// `409 source_unreadable` — permanently, because no route exposes
+// `sourceSizeBytes` for the operator to correct.
+//
+// Returns the real size when the store reports one, and `0` — the "nothing
+// recorded" sentinel (`fromAssetDocument`, data/asset-document.ts, maps a stored
+// `0` back to `undefined`; `checkTranscodeSourceReadable` skips the comparison
+// for a non-positive expected size) — when it cannot be determined. Writing the
+// sentinel still CLEARS any stale length, so the readiness check falls back to
+// presence only instead of comparing against a length that no longer applies.
+//
+// Best-effort by construction: the bytes are already committed and the asset must
+// be finalized, so a stat failure (unreachable store, a storage surface without
+// the method) is logged and degraded to the sentinel rather than turned into an
+// error. The quota path keeps its own CLASSIFIED stat (issue #771) and feeds its
+// size in directly, so no extra round trip is made there.
+//
+// Contract: `WorkspaceStorage.statObject(localKey): Promise<{ size: number; etag:
+// string } | undefined>` (src/data/storage.ts:146) — `undefined` is a NotFound.
+async function finalizedSourceSizeBytes(
+  storage: WorkspaceStorage,
+  objectKey: string,
+  log: { warn: (obj: unknown, msg: string) => void }
+): Promise<number> {
+  try {
+    const stat = await storage.statObject(objectKey);
+    return stat && stat.size > 0 ? stat.size : 0;
+  } catch (err) {
+    log.warn(
+      { err, objectKey },
+      'could not stat the finalized source object to record its length (issue #1059) — clearing any recorded length so the pre-transcode check enforces presence only'
+    );
+    return 0;
+  }
+}
+
 const idParams = z.object({ id: z.string().min(1) });
 const multipartParams = z.object({ id: z.string().min(1), uploadId: z.string().min(1) });
 
@@ -515,8 +560,14 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
         storage.completeMultipartUpload(objectKey, request.params.uploadId, parts)
       );
       // Persist the object key on the asset; the explicit upload-complete call
-      // performs the lifecycle transition.
-      await repo.update(asset.id, { objectKey });
+      // performs the lifecycle transition. Record the stitched object's TRUE
+      // length in the SAME patch (issue #1059): this key is deterministic per
+      // asset, so a multipart re-upload replaces the object in place and a
+      // length recorded by an earlier ingest would otherwise survive and fail
+      // the pre-transcode size comparison forever (see
+      // finalizedSourceSizeBytes above).
+      const sourceSizeBytes = await finalizedSourceSizeBytes(storage, objectKey, request.log);
+      await repo.update(asset.id, { objectKey, sourceSizeBytes });
       return reply.code(200).send({ id: asset.id, status: asset.status });
     }
   );
@@ -612,12 +663,21 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
       // would breach the cap we reject 409 quota_exceeded AND delete the
       // over-cap object so it never counts against the deployment, leaving the
       // asset un-finalized (still `uploading`). No cap configured => skip.
+      // TRUE stored length of the finalized object, recorded alongside the key
+      // below (issue #1059). The presigned PUT bypassed this process, so this is
+      // the one point on this path where the length is knowable — and because the
+      // key is deterministic per asset, a replacement upload lands on the same key
+      // and MUST overwrite (or clear) the length recorded by the previous ingest.
+      // When a quota is configured the classified stat below already has the real
+      // size, so it is reused rather than stat'ing twice.
+      let sourceSizeBytes = 0;
       if (quota) {
         // statObject is a storage-boundary read: an unreachable store or an S3
         // error here must surface as network_error / storage_backend_error
         // rather than a bare 500 (#771).
         const stat = await viaStorage('statObject', () => storage.statObject(objectKey));
         const size = stat?.size ?? 0;
+        sourceSizeBytes = size > 0 ? size : 0;
         let reservation;
         try {
           reservation = await quota.admit(size);
@@ -632,11 +692,14 @@ export const assetUploadRouter: FastifyPluginAsync<AssetUploadRouterOptions> = a
         }
         // admit() succeeded; commit the real size to the running total.
         await reservation.commit(size);
+      } else {
+        sourceSizeBytes = await finalizedSourceSizeBytes(storage, objectKey, request.log);
       }
 
       const updated = await repo.update(request.params.id, {
         objectKey,
-        status: 'processing'
+        status: 'processing',
+        sourceSizeBytes
       });
       if (!updated) {
         return reply.code(404).send(notFoundBody);

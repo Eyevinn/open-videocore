@@ -2508,14 +2508,37 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     if (steps.includes('transcode')) {
       const preflightSource = tryResolveSourceObject(asset);
       const transcodeSourceBucket =
-        request.connections?.sourceBucket ?? (opts.sourceBucket as string);
+        request.connections?.sourceBucket ?? opts.sourceBucket;
       // Same per-stack endpoint the spawned transcoder is configured with
       // (StackConfig.minioEndpoint -> EncoreS3Config.endpoint, see
       // services/encore-s3-config.ts); undefined on the env-override path.
       const transcodeSourceEndpoint = stackResolvedMinioEndpoint(request.connections);
       let sourceStatReader: SourceStatReader | undefined;
       try {
-        sourceStatReader = storageFor ? storageFor() : undefined;
+        // Take the stat reader from the SAME resolution the bucket and the
+        // endpoint above come from: this request's already-resolved connections
+        // (`WorkspaceConnections.storageFor`, services/workspace-stack.ts:147,
+        // bound to that stack's `config.sourceBucket` at :274, the same field
+        // the input URI's bucket is read from at :248). The router-level factory
+        // reaches the same stack by a different route — the ambient request stack
+        // name plus a CACHED read (`makeRequestScopedStorageFactory`,
+        // services/request-stack-context.ts:78-92) — which yields nothing and
+        // THROWS once that cache entry goes cold, degrading the check to
+        // "submitting unverified" on a stack whose connections this request
+        // already holds. Resolving the probe, the bucket and the reported
+        // endpoint from one object removes that second resolution entirely, so
+        // the diagnostic can never name an endpoint the probe did not address.
+        // Fall back to the router-level factory only where `connections` carries
+        // no storage (env-override path). The invariant is "same resolved
+        // stack", not "same URL" — the spawned transcoder is legitimately handed
+        // an in-cluster alias of that same object store
+        // (services/internal-minio-endpoint.ts).
+        const connectionsStorageFor = request.connections?.storageFor;
+        sourceStatReader = connectionsStorageFor
+          ? connectionsStorageFor()
+          : storageFor
+            ? storageFor()
+            : undefined;
       } catch (err) {
         // storageFor() throws when the resolved stack has no object storage
         // (main.ts:658-664). Treated as "cannot verify", not as a failure.
@@ -2525,7 +2548,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         );
         sourceStatReader = undefined;
       }
-      if (preflightSource && sourceStatReader) {
+      // An `s3://<bucket>/<key>` objectKey is an EXTERNAL-bucket registration
+      // (assets.ts:3166/3182 store the full locator, not a workspace-local key),
+      // which lives outside the stack source bucket this stat addresses. Stat'ing
+      // the locator as a local key would 409 against the wrong bucket with a
+      // message that misdescribes the cause, so leave those sources to the
+      // transcode step (pipeline/transcode.ts composes its own URI for them).
+      const externalSourceLocator = preflightSource?.objectKey.startsWith('s3://') ?? false;
+      if (externalSourceLocator) {
+        request.log.info(
+          { assetId: asset.id, objectKey: preflightSource?.objectKey },
+          'source is an external-bucket locator — starting the transcode pipeline WITHOUT verifying the source object (issue #1059)'
+        );
+      }
+      // No bucket resolved at all (no stack connections AND no configured source
+      // bucket): there is nothing to name in a diagnostic and nothing to stat
+      // against, so this is the same "cannot verify" case as having no object
+      // store wired. The 501 guard above only covers `firstStep === 'transcode'`,
+      // so a `full` pipeline can reach here with neither bucket source set.
+      if (preflightSource && sourceStatReader && transcodeSourceBucket && !externalSourceLocator) {
         const readiness = await checkTranscodeSourceReadable(
           {
             bucket: transcodeSourceBucket,
@@ -2545,11 +2586,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             // asset as `Asset.sourceSizeBytes` (data/asset-repo.ts) via the
             // document's `administrative.storage.sizeBytes`
             // (data/asset-document.ts). Undefined for assets ingested before
-            // #1059, and for paths that never learn the length (presigned-PUT
-            // completion, external-bucket registration) — the size comparison
-            // is then skipped and presence alone is enforced. The repositories
-            // clear the recorded size whenever `objectKey` is patched without a
-            // new one, so this length always describes `preflightSource.objectKey`.
+            // #1059, and for paths that never learn the length (external-bucket
+            // registration) — the size comparison is then skipped and presence
+            // alone is enforced. The length always describes
+            // `preflightSource.objectKey`: the repositories clear it when
+            // `objectKey` is patched to a DIFFERENT key with no new size, and
+            // every ingest-completion path that can replace the object under the
+            // same deterministic key writes the object's true length in the same
+            // patch (routes/asset-upload.ts `finalizedSourceSizeBytes`, used by
+            // the presigned single-part and multipart finalizes, plus the
+            // streamed PUT and the URL-pull worker's `bytesTransferred`).
             ...(asset.sourceSizeBytes !== undefined
               ? { expectedSizeBytes: asset.sourceSizeBytes }
               : {})
@@ -2583,10 +2629,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           }
           return undefined;
         }
-      } else if (!sourceStatReader) {
+      } else if (!sourceStatReader || !transcodeSourceBucket) {
         request.log.warn(
           { assetId: asset.id, bucket: transcodeSourceBucket },
-          'no object storage wired for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+          !transcodeSourceBucket
+            ? 'no source bucket resolved for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+            : 'no object storage wired for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
         );
       }
     }

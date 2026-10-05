@@ -1661,7 +1661,13 @@ export class InMemoryAssetRepository implements AssetRepository {
     // it rather than let the readiness check compare a fresh object against a
     // stale length and refuse a perfectly good transcode.
     if (patch.sourceSizeBytes !== undefined) {
-      next.sourceSizeBytes = patch.sourceSizeBytes;
+      // A non-positive size is the "nothing recorded" sentinel, not a real
+      // zero-length source — the same meaning the persisted document gives a
+      // stored `0` (fromAssetDocument, data/asset-document.ts). An ingest
+      // finalize that could not learn the length writes it to CLEAR whatever was
+      // recorded for the previous object under this (deterministic) key, so the
+      // readiness check falls back to presence only.
+      next.sourceSizeBytes = patch.sourceSizeBytes > 0 ? patch.sourceSizeBytes : undefined;
     } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
       next.sourceSizeBytes = undefined;
     }
