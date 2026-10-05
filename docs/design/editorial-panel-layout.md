@@ -5,6 +5,12 @@
 **Audience:** whoever implements the asset-detail editorial panel, plus anyone writing operator copy
 about review state or tags.
 
+**Revision 2 — re-verified against `main` at `cdeb83d`.** The first draft was written ~22 commits
+behind and three of its claims had gone stale: comments were recorded as non-durable (they are
+persisted — gap C4 is **resolved**, §0.2.1 and §10), `public/style.css` was recorded as having no
+`details`/`summary` rules (it has them, scoped to `.raw-disclosure` — §6.4), and every line-number
+citation had drifted. Citations are now **anchored to symbols and literals**, not line numbers (§0).
+
 This pins the **information architecture** of one surface: the editorial panel on asset detail.
 It specifies what the panel contains, in what order, what collapses, how the editorial review axis
 is kept visually separate from the lifecycle `status` axis (#134), and exactly where the panel
@@ -18,75 +24,106 @@ design says so (§10) rather than inventing a field.
 ## 0. Contract grounding
 
 Everything below was read from `openapi.json`, the route source, the repository source and the
-existing client source in this tree on branch `issue-898/editorial-panel-layout`. Nothing is taken
-from issue text.
+existing client source **in the merged tree** — this branch merged with `origin/main` at
+`cdeb83d`. Nothing is taken from issue text.
+
+**Citations are anchored to symbols, not to line numbers.** Every row below names the exact
+identifier, literal or source comment to grep for (`const tagSchema`, `['Tags', renderTags(…)]`,
+`REVIEW_COPY.axisNote`). Line numbers are given only where no stable symbol exists, and are marked
+as such. The first draft of this spec cited line numbers throughout and every one of them went
+stale within ~20 commits; symbol anchors survive the churn that broke them.
 
 ### 0.1 Tags
 
 | What | Exact symbol verified |
 |---|---|
-| Wire field on the asset | `assetSchema` → `tags: z.array(z.string()).optional()`, `src/routes/assets.ts:914`. Comment on the line: *"Absent until the first tag is set."* Mirrored in `openapi.json` → `paths["/api/v1/assets/{id}"].get.responses["200"]…properties.tags` = `{"type":"array","items":{"type":"string"}}`, and **not** in that schema's `required` list (`required: ["id","name","status","statusHistory","createdAt","updatedAt"]`) |
-| Empty ⇒ **absent**, not `[]` | `tags: doc.descriptive.tags && doc.descriptive.tags.length > 0 ? doc.descriptive.tags : undefined`, `src/data/asset-document.ts:692` |
-| Persisted location | `descriptive.tags: z.array(z.string()).default([])`, `src/data/asset-document.ts:288`; written from the flat asset at `src/data/asset-document.ts:458` (`tags: asset.tags ?? []`). User-writable `descriptive` namespace, **not** system-owned `administrative` |
-| Per-tag validation | `const tagSchema = z.string().min(1).max(128)`, `src/routes/assets.ts:393`. **No `.trim()`, no charset restriction, no case folding** |
-| List cap | `const tagsSchema = z.array(tagSchema).max(128)`, `src/routes/assets.ts:394` |
-| Append endpoint | `app.post('/:id/tags', …)`, route path `src/routes/assets.ts:5466`. Body `z.object({ tags: z.array(tagSchema).min(1).max(128) })`, `:5471`. `response: { 200: assetSchema, 404: errorSchema }`, `:5472` — **200 returns the FULL asset**, not the tag list |
-| Append is merge + dedupe | `normalizeTags([...(asset.tags ?? []), ...request.body.tags])`, `src/routes/assets.ts:5480` |
-| Dedupe is exact-string, first-seen order | `normalizeTags`, `src/data/asset-repo.ts:1297-1307` — `Set<string>` on the raw value. `"News"` and `"news"` are two tags; `" news"` and `"news"` are two tags |
-| Remove endpoint | `app.delete('/:id/tags/:tag', …)`, route path `src/routes/assets.ts:5493`. `params: z.object({ id: z.string(), tag: z.string().min(1) })`, `:5497`. `response: { 200: assetSchema, 404: errorSchema }`, `:5498`. Filter at `:5506`; removing an absent tag is a no-op that still answers 200 |
-| PATCH replaces wholesale | `updateSchema` → `tags: tagsSchema.optional()`, `src/routes/assets.ts:421`, with the comment *"On PATCH this REPLACES the tag list wholesale"* `:420` |
-| Response `tags` is **unbounded** | `assetSchema` uses `z.array(z.string())` (`:914`), not `tagsSchema` — the 128-item / 128-char caps are write-side only |
+| Wire field on the asset | `assetSchema` → `tags: z.array(z.string()).optional()`, `src/routes/assets.ts`. Comment on the line above it: *"First-class tags (issue #11). Absent until the first tag is set."* Mirrored in `openapi.json` → `paths["/api/v1/assets/{id}"].get.responses["200"]…properties.tags` = `{"type":"array","items":{"type":"string"}}`, and **not** in that schema's `required` list (`required: ["id","name","status","statusHistory","createdAt","updatedAt"]`) |
+| Empty ⇒ **absent**, not `[]` | `tags: doc.descriptive.tags && doc.descriptive.tags.length > 0 ? doc.descriptive.tags : undefined` in `assetFromDocument`, `src/data/asset-document.ts` |
+| Persisted location | `descriptive.tags: z.array(z.string()).default([])` in `AssetDocumentSchema`, `src/data/asset-document.ts`; written from the flat asset as `tags: asset.tags ?? []` inside the `descriptive: { … }` literal of `documentFromAsset`. User-writable `descriptive` namespace, **not** system-owned `administrative` |
+| Per-tag validation | `const tagSchema = z.string().min(1).max(128)`, `src/routes/assets.ts`. **No `.trim()`, no charset restriction, no case folding** |
+| List cap | `const tagsSchema = z.array(tagSchema).max(128)`, `src/routes/assets.ts` (the line directly after `tagSchema`) |
+| Append endpoint | `app.post('/:id/tags', …)`, `src/routes/assets.ts`. Body `z.object({ tags: z.array(tagSchema).min(1).max(128) })`; `response: { 200: assetSchema, 404: errorSchema }` — **200 returns the FULL asset**, not the tag list |
+| Append is merge + dedupe | `normalizeTags([...(asset.tags ?? []), ...request.body.tags])` in the `POST /:id/tags` handler, `src/routes/assets.ts` |
+| Dedupe is exact-string, first-seen order | `export function normalizeTags(tags: readonly string[]): string[]`, `src/data/asset-repo.ts` — `const seen = new Set<string>()` on the raw value. `"News"` and `"news"` are two tags; `" news"` and `"news"` are two tags |
+| Remove endpoint | `app.delete('/:id/tags/:tag', …)`, `src/routes/assets.ts`. `params: z.object({ id: z.string(), tag: z.string().min(1) })`; `response: { 200: assetSchema, 404: errorSchema }`. Handler filters with `(asset.tags ?? []).filter((t) => t !== request.params.tag)`; removing an absent tag is a no-op that still answers 200 |
+| PATCH replaces wholesale | `updateSchema` → `tags: tagsSchema.optional()`, `src/routes/assets.ts`, directly under the comment *"First-class tags (issue #11). On PATCH this REPLACES the tag list wholesale."* |
+| Response `tags` is **unbounded** | `assetSchema` uses `z.array(z.string())`, not `tagsSchema` — the 128-item / 128-char caps are write-side only. (`createSchema` also takes `tags: tagsSchema.optional()`, so the caps apply on create too) |
 
 ### 0.2 Comments
 
 | What | Exact symbol verified |
 |---|---|
-| Endpoints exist | `openapi.json` → `paths["/api/v1/assets/{id}/comments"]` exposes exactly `post` and `get`. Route paths `src/routes/assets.ts:4777` (POST) and `:4799` (GET) |
-| Create body | `const commentBodySchema = z.object({ body: z.string().trim().min(1).max(4096) })`, `src/routes/assets.ts:1174-1176`. **`.trim()` is applied server-side here** — unlike tags |
-| Comment shape | `const commentSchema = z.object({ id, assetId, body, createdAt })`, all `z.string()`, `src/routes/assets.ts:1177-1182`. In `openapi.json`: `required: ["id","assetId","body","createdAt"]`, `additionalProperties: false` |
-| Create responses | `response: { 201: commentSchema, 404: errorSchema }`, `src/routes/assets.ts:4782`. `openapi.json` → `…comments.post.responses` = exactly `["201","404"]` — **the 400 for an empty body is undeclared** (it comes from the zod validator compiler, `src/main.ts` wiring) |
-| List responses | `response: { 200: z.array(commentSchema), 404: errorSchema }`, `src/routes/assets.ts:4803`. `openapi.json` → `…comments.get.responses` = exactly `["200","404"]`; the 200 schema is a bare array — **no envelope, no cursor, no total** |
-| Order on the wire | **oldest first.** `listByAsset` sorts `createdAt` ascending with the ULID `id` as tiebreak, `src/data/comment-repo.ts:50-56`. Interface contract comment: *"Comments for an asset in stable chronological order (oldest -> newest)"*, `src/data/comment-repo.ts:31` |
-| `id` is a ULID, `createdAt` is ISO 8601 | `Comment` type, `src/data/comment-repo.ts:17-22`; minted at `src/data/comment-repo.ts:39-44` (`ulid()`, `new Date().toISOString()`) |
-| **No author field** | `Comment` has exactly `id`/`assetId`/`body`/`createdAt` (`src/data/comment-repo.ts:17-22`); `CreateCommentInput` has exactly `assetId`/`body` (`:24-27`). There is no `author`, `createdBy`, or actor of any kind on the wire |
-| **No update, no delete** | `interface CommentRepository` declares exactly `create` and `listByAsset`, `src/data/comment-repo.ts:29-32`. `openapi.json` exposes no `put`/`patch`/`delete` on `…/comments` and no `…/comments/{commentId}` path at all |
-| Default store is **in-memory** | `const comments = opts.commentRepository ?? new InMemoryCommentRepository()`, `src/routes/assets.ts:1752`. `InMemoryCommentRepository` is a plain `Map`, `src/data/comment-repo.ts:35-58`. Source comment: *"Only an in-memory implementation is provided for this iteration"*, `src/data/comment-repo.ts:10-11` |
-| Behaviour under test | `test/asset-comments.test.ts` |
+| Endpoints exist | `openapi.json` → `paths["/api/v1/assets/{id}/comments"]` exposes exactly `post` and `get`. Routes `app.post('/:id/comments', …)` and `app.get('/:id/comments', …)`, `src/routes/assets.ts` |
+| Create body | `const commentBodySchema = z.object({ body: z.string().trim().min(1).max(4096) })`, `src/routes/assets.ts`. **`.trim()` is applied server-side here** — unlike tags |
+| Comment shape | `const commentSchema = z.object({ id, assetId, body, createdAt })`, all `z.string()`, `src/routes/assets.ts` (immediately after `commentBodySchema`). In `openapi.json`: `required: ["id","assetId","body","createdAt"]`, `additionalProperties: false` |
+| Create responses | `response: { 201: commentSchema, 404: errorSchema }` on `POST /:id/comments`. `openapi.json` → `…comments.post.responses` = exactly `["201","404"]` — **the 400 for an empty body is undeclared** (it comes from the zod validator compiler; the route's own source comment does document it: *"400 — empty / invalid body (rejected by commentBodySchema)"*) |
+| List responses | `response: { 200: z.array(commentSchema), 404: errorSchema }` on `GET /:id/comments`. `openapi.json` → `…comments.get.responses` = exactly `["200","404"]`; the 200 schema is a bare array — **no envelope, no cursor, no total** |
+| Order on the wire | **oldest first.** `InMemoryCommentRepository.listByAsset` sorts `a.createdAt.localeCompare(b.createdAt) \|\| a.id.localeCompare(b.id)`, `src/data/comment-repo.ts`; `CouchCommentRepository.listByAsset` (`src/data/couch-comment-repo.ts`) holds the same order. Interface contract comment: *"Comments for an asset in stable chronological order (oldest -> newest)"* on `CommentRepository.listByAsset`, `src/data/comment-repo.ts`. Covered by `it('keeps oldest-first ordering across the restart and scopes by asset')`, `test/asset-comments-couch.test.ts` |
+| `id` is a ULID, `createdAt` is ISO 8601 | `export type Comment = { id: string; // ULID … createdAt: string; // ISO 8601 }`, `src/data/comment-repo.ts`; minted in `InMemoryCommentRepository.create` with `ulid()` and `new Date().toISOString()` |
+| **No author field** | `Comment` has exactly `id`/`assetId`/`body`/`createdAt`; `CreateCommentInput` has exactly `assetId`/`body` (`src/data/comment-repo.ts`). There is no `author`, `createdBy`, or actor of any kind on the wire |
+| **No update, no delete** | `interface CommentRepository` declares exactly `create` and `listByAsset`, `src/data/comment-repo.ts`. `openapi.json` exposes no `put`/`patch`/`delete` on `…/comments` and no `…/comments/{commentId}` path at all |
+| Store is **durable per resolved stack** | `const commentRepository = new PerWorkspaceCommentRepository(stackResolver, app.log)`, `src/main.ts`, passed to the assets router as `commentRepository`. The facade (`export class PerWorkspaceCommentRepository`, `src/data/per-workspace-repos.ts`) delegates to `(await this.resolver.resolve()).comments`, which `buildConnectionsFromStack` / `buildEnvConnections` set to `new CouchCommentRepository(wc, log)` (`src/services/workspace-stack.ts`). Persisted since issue #1046 — see §0.2.1 |
+| In-memory is the **last-resort fallback only** | `new InMemoryCommentRepository()` is returned by `workspace-stack.ts` only when no stack resolves, or on the env path with `MINIO_URL` but no `COUCHDB_URL`. `src/routes/assets.ts` still has `const comments = opts.commentRepository ?? new InMemoryCommentRepository()` — that default is for **tests**, which inject their own repo; `src/main.ts` always injects |
+| Behaviour under test | `test/asset-comments.test.ts` (endpoint contract), `test/asset-comments-couch.test.ts` (`describe('asset comments survive a restart on CouchDB (issue #1046)')`), `test/comments-stack-wiring.test.ts` (`describe('comment store selection per resolved stack (#1046)')`) |
+
+#### 0.2.1 Durability, exactly
+
+`PerWorkspaceCommentRepository.repo()` (`src/data/per-workspace-repos.ts`) checks
+`comments instanceof InMemoryCommentRepository` on every call and, the first time it is true, logs a
+warning naming the reason:
+
+> asset comments are being served from the IN-MEMORY store because the resolved stack has no
+> CouchDB — comments will be LOST on restart (issue #1046). Provision a stack with CouchDB, or set
+> `COUCHDB_URL`, for a durable comment store.
+
+It re-arms the flag when the store becomes durable again, so a later fall-back is reported rather
+than swallowed (`it('warns once when the resolved comment store is in-memory, and not when it is
+durable')`, `test/comments-stack-wiring.test.ts`).
+
+Two consequences for this panel:
+
+1. On any deployment with a provisioned stack — the deployment shape this panel targets — comments
+   are **as durable as tags and review state**. The comments sub-section is therefore buildable and
+   shippable (see gap C4, §10, now resolved).
+2. The fall-back is a **server-side** condition, surfaced only in the server log. There is still no
+   field on the wire that tells a client which store is live, so the UI must not claim durability it
+   cannot observe — it simply does not mention storage at all. That residual is tracked as C4a (§10).
 
 ### 0.3 Review state
 
 | What | Exact symbol verified |
 |---|---|
-| Vocabulary | `ASSET_REVIEW_STATES = ['draft','in-review','approved','rejected']`, `src/data/asset-repo.ts:62` |
-| Persisted field | `reviewState: z.enum(ASSET_REVIEW_STATES).default('draft')`, `src/data/asset-document.ts:322`, inside the **system-owned `administrative`** namespace. Absent ⇒ `draft` |
-| Wire field on the asset | `assetSchema` → `reviewState: reviewStateSchema.optional()`, `src/routes/assets.ts:863`. `openapi.json` → `…assets/{id}.get…properties.reviewState.enum` = `["draft","in-review","approved","rejected"]`, not in `required` |
-| Transition graph | `ALLOWED_REVIEW_TRANSITIONS`, `src/data/asset-repo.ts:88-93` — `draft→[in-review]`, `in-review→[approved,rejected]`, `approved→[in-review]`, `rejected→[in-review]`. Read by **both** `isValidReviewTransition` (the 422 gate, `:95-100`) and `allowedReviewTransitions` (what the read advertises, `:114-116`), so enforced and advertised graphs cannot drift |
-| No edge targets `draft` | `src/data/asset-repo.ts:79-84` states it explicitly: `draft` is an entry state only |
-| Read sub-resource | `app.get('/:id/review-state', …)`, route path `src/routes/assets.ts:5529`. `response: { 200: reviewStateReadSchema, 404: errorSchema }`, `:5533`. Body built at `:5545-5547` from `asset.reviewState ?? 'draft'` (`:5544`) and `allowedReviewTransitions(current)` |
-| 200 shape | `reviewStateReadSchema = { reviewState, allowedTransitions }`, `src/routes/assets.ts:228-244`; both `required`, `additionalProperties: false` in `openapi.json`. `allowedTransitions` may be empty ⇒ terminal; the current state is never listed |
-| Write sub-resource | `app.post('/:id/review-state', …)`, route path `src/routes/assets.ts:5562`. Body `z.object({ reviewState: reviewStateSchema })`, `:5566`. `response: { 200: assetSchema, 404: errorSchema, 422: errorSchema }`, `:5567` — **200 returns the FULL asset** |
-| 422 body | `{ error: 'invalid_review_transition', message }`, `src/routes/assets.ts:2683` |
-| Two independent axes | `src/data/asset-repo.ts:55-61`: *"The two are INDEPENDENT: a `ready` asset can be `draft`, `in-review`, `approved`, or `rejected`, and moving one never moves the other."* |
+| Vocabulary | `export const ASSET_REVIEW_STATES = ['draft', 'in-review', 'approved', 'rejected'] as const`, `src/data/asset-repo.ts` |
+| Persisted field | `reviewState: z.enum(ASSET_REVIEW_STATES).default('draft')`, `src/data/asset-document.ts`, inside the **system-owned `administrative`** namespace (sibling of `provenance` and `statusHistory`). Absent ⇒ `draft` |
+| Wire field on the asset | `assetSchema` → `reviewState: reviewStateSchema.optional()`, `src/routes/assets.ts`. `openapi.json` → `…assets/{id}.get…properties.reviewState.enum` = `["draft","in-review","approved","rejected"]`, not in `required` |
+| Transition graph | `const ALLOWED_REVIEW_TRANSITIONS: Record<AssetReviewState, readonly AssetReviewState[]>`, `src/data/asset-repo.ts` — `draft→['in-review']`, `in-review→['approved','rejected']`, `approved→['in-review']`, `rejected→['in-review']`. Read by **both** `isValidReviewTransition` (the 422 gate) and `allowedReviewTransitions` (what the read advertises) |
+| Advertised ⊂ accepted, by exactly one value | The two readers of that table do **not** return the same set. `allowedReviewTransitions` returns `[...ALLOWED_REVIEW_TRANSITIONS[from ?? 'draft']]` and deliberately **excludes `from` itself**; `isValidReviewTransition` opens with `if (from === to) { return true; // idempotent no-op transitions are allowed }`. So re-sending the **current** state is accepted and answers **200, not 422**, even though the read never advertises it. The *graph of real moves* cannot drift (one table, two readers); the *accepted set* is the advertised set plus `{current}` — see §5.1 |
+| No edge targets `draft` | The source comment above the table states it: *"`draft` is an ENTRY state only — once an asset has been submitted it can never go back to `draft`, and no edge anywhere in the table targets `draft`."* Also: no direct `approved → rejected` or `rejected → approved`; a verdict changes only by passing through `in-review` again |
+| Read sub-resource | `app.get('/:id/review-state', …)`, `src/routes/assets.ts`. `response: { 200: reviewStateReadSchema, 404: errorSchema }`. Handler: `const current = asset.reviewState ?? 'draft'`, then sends `{ reviewState: current, allowedTransitions: allowedReviewTransitions(current) }` |
+| 200 shape | `const reviewStateReadSchema = z.object({ reviewState, allowedTransitions })`, `src/routes/assets.ts`; both `required`, `additionalProperties: false` in `openapi.json`. `allowedTransitions` may be empty ⇒ terminal; the current state is never listed |
+| Write sub-resource | `app.post('/:id/review-state', …)`, `src/routes/assets.ts`. Body `z.object({ reviewState: reviewStateSchema })`. `response: { 200: assetSchema, 404: errorSchema, 422: errorSchema }` — **200 returns the FULL asset** |
+| 422 body | `return reply.code(422).send({ error: 'invalid_review_transition', message: err.message })`, `src/routes/assets.ts` (the router's error mapping, not the handler) |
+| Two independent axes | Source comment above `ASSET_REVIEW_STATES`, `src/data/asset-repo.ts`: *"The two are INDEPENDENT: a `ready` asset can be `draft`, `in-review`, `approved`, or `rejected`, and moving one never moves the other."* |
 | Existing contract note | `docs/findings/review-state-contract-897.md` — §1 graph, §4 auth, §5 UI notes, §6 gaps G1–G3 |
 
 ### 0.4 Lifecycle `status` (the axis review state must never be confused with)
 
 | What | Exact symbol verified |
 |---|---|
-| Vocabulary | `ASSET_STATUSES = ['uploading','processing','ready','failed','archived']`, `src/data/asset-repo.ts:29`. Confirmed on the wire: `openapi.json` → `…assets/{id}.get…properties.status.enum` |
-| `status` is `required` on the wire | `openapi.json` → `…assets/{id}.get.responses["200"]…required` includes `status` (and `statusHistory`) — unlike `reviewState` and `tags`, which are optional |
-| Has an audited trail | `statusHistory: array of { at, from: <status>\|null, to: <status> }`, `openapi.json` same schema; `src/routes/assets.ts:855` |
-| **Zero vocabulary overlap with review state** | The two enums (`src/data/asset-repo.ts:29` and `:62`) share no member |
+| Vocabulary | `export const ASSET_STATUSES = ['uploading', 'processing', 'ready', 'failed', 'archived'] as const`, `src/data/asset-repo.ts`. Confirmed on the wire: `openapi.json` → `…assets/{id}.get…properties.status.enum` |
+| `status` is `required` on the wire | `openapi.json` → `…assets/{id}.get.responses["200"]…required` = `["id","name","status","statusHistory","createdAt","updatedAt"]`, so `status` and `statusHistory` are both required — unlike `reviewState` and `tags`, which are optional |
+| Has an audited trail | `statusHistory: array of { at, from: <status>\|null, to: <status> }`, `openapi.json` same schema; `statusHistory: z.array(transitionSchema)` on `assetSchema`, `src/routes/assets.ts`. (Note: the comment block above the status-history renderer in `public/app.js` cites this as `src/routes/assets.ts:855`, which is itself stale — the symbol is the anchor, not the line) |
+| **Zero vocabulary overlap with review state** | `ASSET_STATUSES` and `ASSET_REVIEW_STATES` (both `src/data/asset-repo.ts`) share no member |
 
 ### 0.5 Authorization (ADR-018)
 
 | What | Exact symbol verified |
 |---|---|
-| Matrix | `MATRIX`, `src/auth/authorize.ts:54-58` — `viewer { read:true, write:false, delete:false }`; `editor` and `admin` all true |
-| Method ⇒ action | `methodToAction`, `src/auth/authorize.ts:79-93` — `GET/HEAD → read`, `POST/PUT/PATCH → write`, `DELETE → delete` |
-| Enforcement point | `app.addHook('preHandler', resourceAuthorizationPreHandler('asset'))`, `src/routes/assets.ts:1748` (handler `src/auth/authorize.ts:126`). **Router-scoped, so it covers every sub-resource in this panel** |
-| Denial | 403 `AUTHZ_FORBIDDEN_ERROR = 'forbidden_insufficient_role'`, `src/auth/authorize.ts:99`. A `null` (unrecognised) role fails closed, `src/auth/authorize.ts:63-66` |
-| Client-side mirror | `canChangeReviewState()`, `public/app.js:161-164` (`editor`/`admin`) — a mirror only; the 403 is still handled when it arrives |
+| Matrix | `const MATRIX: Record<PrincipalRole, Record<Action, boolean>>`, `src/auth/authorize.ts` — `viewer: { read: true, write: false, delete: false }`; `editor` and `admin` all true |
+| Method ⇒ action | `export function methodToAction(method: string)`, `src/auth/authorize.ts` — `GET`/`HEAD` → `read`, `POST`/`PUT`/`PATCH` → `write`, `DELETE` → `delete`, anything else `undefined` |
+| Enforcement point | `app.addHook('preHandler', resourceAuthorizationPreHandler('asset'))`, `src/routes/assets.ts` (handler `export function resourceAuthorizationPreHandler`, `src/auth/authorize.ts`). **Router-scoped, so it covers every sub-resource in this panel** |
+| Denial | 403 `export const AUTHZ_FORBIDDEN_ERROR = 'forbidden_insufficient_role' as const`, `src/auth/authorize.ts`. A `null` (unrecognised) role fails closed — `if (role === null)` returns false before `MATRIX` is consulted |
+| Client-side mirror | `function canChangeReviewState()`, `public/app.js` — `r === 'editor' \|\| r === 'admin'` off `getClientRole()`. A mirror only; the 403 is still handled when it arrives |
 
 Derived per-control gate for this panel:
 
@@ -102,37 +139,57 @@ Derived per-control gate for this panel:
 
 ### 0.6 Sub-resources take the ULID only — never the slug
 
-`resolveAsset(idOrSlug)` (ULID-or-slug resolution, `src/routes/assets.ts:3371-3378`) has exactly one
-caller: `GET /:id` at `src/routes/assets.ts:3407`. Every sub-resource in this panel calls
-`repo.get(request.params.id)` directly — tags `:5476` and `:5502`, comments `:4786` and `:4807`,
-review state `:5537` — so **all six calls must use `asset.id` (the ULID), even when the detail pane
-was opened by slug.** Passing a slug yields a 404 that looks like a missing asset.
+`async function resolveAsset(idOrSlug)` (`src/routes/assets.ts`) is the only ULID-or-slug resolver:
+`if (isUlid(idOrSlug)) return repo.get(idOrSlug); return repo.getBySlug(idOrSlug);`. Verified by
+grep, it has **exactly one caller** — the `app.get('/:id', …)` detail handler.
+
+Every sub-resource in this panel bypasses it and goes straight to the id:
+
+| Call | How it reads the id |
+|---|---|
+| `POST /:id/tags` | `const asset = await repo.get(request.params.id)` |
+| `DELETE /:id/tags/:tag` | `const asset = await repo.get(request.params.id)` |
+| `POST /:id/comments` | `const asset = await repo.get(request.params.id)` |
+| `GET /:id/comments` | `const asset = await repo.get(request.params.id)` |
+| `GET /:id/review-state` | `const asset = await repo.get(request.params.id)` |
+| `POST /:id/review-state` | `await repo.transitionReviewState(request.params.id, …)` — no `repo.get` at all |
+
+So **all six calls must use `asset.id` (the ULID), even when the detail pane was opened by slug.**
+Passing a slug yields a 404 that looks like a missing asset. (`renderAssetDetailBody` already holds
+`asset.id`, and the existing `mountReviewState` call already passes `assetId: asset.id` for this
+reason.)
 
 ### 0.7 Client primitives already in the tree
 
+All anchored to symbols / literals; grep the quoted string.
+
 | What | Exact symbol verified |
 |---|---|
-| Detail renderer | `renderAssetDetailBody(id, bodyEl)`, `public/app.js:2523` |
-| Summary grid | `kvDiv.className = 'kv-grid'`, `public/app.js:2606-2609`; rows pushed at `:2572-2579` |
-| Lifecycle status cell | `['Status', statusCell]`, `public/app.js:2574`; `statusCell` built from `renderBadge(asset.status)` at `:2559` |
-| **Tags row (today's home for tags)** | `['Tags', renderTags(asset.tags)]`, `public/app.js:2576` |
-| Tag pill renderer | `renderTags(tags)`, `public/app.js:783-787` — **also used by the search-results table (`public/app.js:4609`) and injected into the shared assets table (`public/app.js:2066` → `public/assets-table.js:530,627`)**, so it must not change shape |
-| Lifecycle badge renderer | `renderBadge(status)`, `public/app.js:364-367`; class chosen by `badgeClass`, `:352-361` |
-| Status-history block | `public/app.js:2613-2666`; heading `'Status history'` `:2636`; rendered **newest first** via `.slice().reverse()` `:2641-2642` |
-| Review-state block (exists) | `mountReviewState({ assetId, anchorEl: actionsDiv, host: body, canChange, apiFetch, showMsg })`, `public/app.js:3075-3082`; module `public/review-state.js` |
-| Action row (the anchor) | `const actionsDiv = …; actionsDiv.className = 'mt12 flex-gap'`, `public/app.js:2910-2911`; appended `:2920` |
-| Shared outcome region | `actionMsg.id = 'action-msg'`, `aria-live="polite"`, `public/app.js:2986-2994` |
-| Heading conventions | `.section-title` `public/style.css:183`; sub-group heading precedent `.tracks-group-title` `public/style.css:479-484` |
-| Badge styles | `.badge` (20px pill) `public/style.css:292-300`; `.review-badge` (3px rectangle) `public/style.css:412-421`; per-state review variants `:423-452`; `.review-block` left accent rail `:407-410`; `.tag` pill `public/style.css:520-529` |
-| Disclosure precedent | native `<details>` / `<summary>`, `public/app.js:4208-4221`. **No `details`/`summary` rules exist in `public/style.css`** — the panel's disclosure needs styling added |
-| Date formatter | `fmtDate(val)`, `public/app.js:336` |
-| Escaping | `escHtml(str)`, `public/app.js:76` |
+| Detail renderer | `async function renderAssetDetailBody(id, bodyEl, opts)`, `public/app.js` |
+| Summary grid | `kvDiv.className = 'kv-grid'` inside `renderAssetDetailBody`, built from `kvRows` via the `kvHtml` map directly above it |
+| Lifecycle status cell | `['Status', statusCell]` in the `kvRows.push(…)` block. `statusCell` is an **HTML string**, not an element: `var statusCell = renderBadge(asset.status)` then `statusCell += …` for the wedged "Needs attention" badge (`isAssetWedged(asset)`) and for `asset.sceneDetectionError` |
+| **Tags row (today's home for tags)** | `['Tags', renderTags(asset.tags)]` in the same `kvRows.push(…)` block |
+| Tag pill renderer | `function renderTags(tags)`, `public/app.js` — returns `'<span class="text-muted">—</span>'` when falsy/empty, else `.map(…'<span class="tag">' + escHtml(t) + '</span>').join(' ')`. **Also called by the search-results table (`'<td>' + renderTags(hit.tags) + '</td>'`) and injected into the shared assets table (`renderTags,` in the `createAssetsTable({…})` literal → `const renderTags = renderCtx.renderTags` in `buildColumns`, then `render: (a) => renderTags(a.tags)` on the `key: 'tags'` column, `public/assets-table.js`)**, so it must not change shape |
+| Lifecycle badge renderer | `function renderBadge(status)`, `public/app.js`; class chosen by `function badgeClass(status)` directly above it — four buckets plus `'badge-unknown'` for anything unrecognised (`archived` buckets with `failed` into `badge-failed`) |
+| Status-history block | guarded by `if (lifecycleHistory.length > 0)` in `renderAssetDetailBody`; `histDiv.id = 'status-history'`; heading `histTitle.textContent = 'Status history'`; rendered **newest first** via `.slice().reverse()` on `lifecycleHistory`, with the caption *"Audited status transitions, newest first"* |
+| Review-state block (exists) | `await mountReviewState({ assetId: asset.id, anchorEl: actionsDiv, host: body, canChange: canChangeReviewState(), apiFetch: apiFetch, showMsg: showMsg })`, `public/app.js`; module `public/review-state.js` |
+| Action row (the anchor) | `const actionsDiv = document.createElement('div'); actionsDiv.className = 'mt12 flex-gap';` … `body.appendChild(actionsDiv)` |
+| Shared outcome region | `actionMsg.id = 'action-msg'; actionMsg.className = 'mt8';` + `actionMsg.setAttribute('aria-live', 'polite')`. Re-read on each use as `bodyEl.querySelector('#action-msg') \|\| bodyEl` |
+| Heading conventions | `.section-title` `public/style.css`; sub-group heading precedent `.tracks-group-title` (`font-size: 12px; font-weight: 600; color: var(--text-muted); margin: 12px 0 6px`) |
+| Badge styles | `.badge` (`border-radius: 20px`); `.review-badge` (`border-radius: 3px` + `border: 1px solid transparent`); per-state variants `.review-badge--draft` / `--in-review` / `--approved` / `--rejected` / `--unknown`; `.review-block` left accent rail (`border-left: 3px solid var(--review-accent, #2dd4bf); padding-left: 10px`); `.tag` (`border-radius: 20px`, accent-tinted) — all `public/style.css` |
+| Disclosure precedent, **in JS** | `function rawJsonDisclosure(value, open)`, `public/app.js` — builds a native `<details>` with `className = RAW_DISCLOSURE_CLASS + ' mt12'` and a `<summary>` written via `textContent`. Its own comment names the second precedent (*"matching the existing / disclosure idiom in"* — the sentence wraps across two comment lines) as `renderCollectionAssetPicker()`, which inlines `'<details class="mt8" id="add-asset-fallback">'` + `'<summary>Add by asset ID instead</summary>'` |
+| Disclosure precedent, **in CSS** | **`details`/`summary` rules now EXIST** (added with issue #964): `.raw-disclosure > summary` plus `:hover` and `:focus-visible` variants, `public/style.css`. They are **scoped to `.raw-disclosure`**, not to bare `summary`, so they do not apply to a new disclosure — see §6.4 |
+| Date formatter | `function fmtDate(val)`, `public/app.js` — returns `'—'` for falsy |
+| Escaping | `function escHtml(str)`, `public/app.js` |
+| Comma-separated convention already in the UI | `'<label for="search-tags">Tags (comma-separated)</label>'` with `placeholder="news,sports"`, read as `section.querySelector('#search-tags').value.trim()`, `public/app.js` |
+| Sibling-module convention | `public/review-state.js`, `public/lock-detail.js`, `public/tracks-panel.js`, `public/asset-rename.js`, `public/asset-clip.js` — one concern per file, mounted from `renderAssetDetailBody` |
 
-**Today's scatter, precisely.** Tags are a read-only row in the summary grid (`public/app.js:2576`)
-with *no write control anywhere in `public/`* — nothing in the client calls `POST /:id/tags` or
-`DELETE /:id/tags/:tag`. Review state is its own block wedged above the action row
-(`public/app.js:3075`). Comments have **no UI at all** — no file in `public/` references the
-comments sub-resource. That is the "three scattered controls" this spec replaces.
+**Today's scatter, precisely.** Tags are a read-only row in the summary grid
+(`['Tags', renderTags(asset.tags)]`) with *no write control anywhere in `public/`* — grep confirms
+nothing in the client calls `POST /:id/tags` or `DELETE /:id/tags/:tag`. Review state is its own
+block wedged above the action row (`mountReviewState({ …, anchorEl: actionsDiv, host: body })`).
+Comments have **no UI at all** — no file in `public/` references the comments sub-resource. That is
+the "three scattered controls" this spec replaces.
 
 ---
 
@@ -151,12 +208,14 @@ about an asset — its approval state, its classification, and the notes people 
 ```
 
 **Naming.** The container is "Editorial", not "Metadata" and not "Workflow". "Metadata" already
-means the free-form `metadata` object block (`public/app.js:2669-2680`); "Workflow" would invite
+means the free-form `metadata` object block (`metaTitle.textContent = 'Metadata'`, `public/app.js`);
+"Workflow" would invite
 confusion with the pipeline/job blocks above it. "Editorial" matches the vocabulary the source
 already uses for this axis — `reviewState` sits in the user-facing editorial workflow
-(`src/data/asset-repo.ts:55-57`), the existing block heading is already
+(the `reviewState` comment block in `src/data/asset-repo.ts`), the existing block heading is already
 `REVIEW_COPY.heading = 'Editorial review'` (`public/review-state.js`), and `descriptive` is the
-user-writable namespace tags live in (`src/data/asset-document.ts:282-291`).
+user-writable namespace tags live in (`descriptive: z.object({ … })` in `AssetDocumentSchema`,
+`src/data/asset-document.ts`).
 
 **The panel itself never collapses.** Only sub-sections do (§3). A collapsed panel would hide the
 review axis behind a click, which is the exact failure #134 asks this layout to prevent.
@@ -179,8 +238,8 @@ content, identical on every asset.
    grows, so nothing is placed below it.
 
 The same argument fixes the panel's own position: **immediately before the action row**
-(`public/app.js:2910-2920`) — i.e. exactly the slot `mountReviewState` already occupies via
-`anchorEl: actionsDiv` (`public/app.js:3077`). Read top-down the pane becomes: what the asset *is*
+(`actionsDiv`, `public/app.js`) — i.e. exactly the slot `mountReviewState` already occupies via
+`anchorEl: actionsDiv`. Read top-down the pane becomes: what the asset *is*
 (summary grid, technical, tracks) → what has *happened* to it (status history, pipeline runs) → what
 humans *decide and say* about it (this panel) → what you can *do* to it (action row, delete
 protection, rename).
@@ -194,7 +253,7 @@ protection, rename).
 | `#editorial-panel` | **no** | — | Always rendered, always open, even on an asset with no tags and no comments |
 | `#editorial-review` | **no** | — | Always open. Review state is never behind a click (#134) |
 | `#editorial-tags` | no | — | The group is always open; the *pill list inside it* discloses (below) |
-| tag overflow | yes | first 12 shown | When `tags.length > 12`, render 12 pills then a `<button>` toggle: `Show all 37 tags` / `Show fewer tags`. `aria-expanded` on the button, `aria-controls` pointing at the pill list. 12 ≈ three rows in the side pane at the `.tag` metrics in `public/style.css:520-529` |
+| tag overflow | yes | first 12 shown | When `tags.length > 12`, render 12 pills then a `<button>` toggle: `Show all 37 tags` / `Show fewer tags`. `aria-expanded` on the button, `aria-controls` pointing at the pill list. 12 ≈ three rows in the side pane at the `.tag` metrics in `public/style.css` |
 | `#editorial-comments` | **yes** | open when `count ≤ 5`, else closed | Native `<details>`; `open` set from the fetched count on each render |
 | comment overflow | yes | newest 10 shown | When `count > 10`, render 10 then `Show all 34 comments`. Same toggle pattern as tags |
 
@@ -208,13 +267,14 @@ experience than a deterministic default.
 **Empty sub-sections are shown, not hidden.** A tags group reading "No tags" plus an input is how an
 operator learns tagging exists. Hiding empty groups would make the panel's shape vary per asset and
 make the feature undiscoverable — the same reasoning `.tracks-none`
-(`public/style.css:495-497`) already encodes for empty track sub-groups.
+(`public/style.css`) already encodes for empty track sub-groups.
 
 ---
 
 ## 4. Review state vs lifecycle `status` — seven separations
 
-`status` and `reviewState` are independent axes (`src/data/asset-repo.ts:55-61`) that an operator can
+`status` and `reviewState` are independent axes (the `reviewState` comment block,
+`src/data/asset-repo.ts`) that an operator can
 catastrophically confuse: "archived" and "rejected" are both things you would stop working on, but
 one is a storage fact and the other is an editorial verdict. This design keeps them apart on seven
 axes at once, so no single rendering mode (monochrome, colour-blind, zoomed, screen-reader) can
@@ -222,20 +282,21 @@ collapse the distinction.
 
 | # | Separation | Lifecycle `status` | Review state |
 |---|---|---|---|
-| 1 | **Region** | `Status` row inside `.kv-grid` (`public/app.js:2574`) | `#editorial-review`, inside the editorial panel |
-| 2 | **Shape** | `.badge` — `border-radius: 20px`, a full pill (`public/style.css:292-300`) | `.review-badge` — `border-radius: 3px` + `1px` border, a rectangle (`public/style.css:412-421`) |
-| 3 | **Vocabulary** | `uploading`/`processing`/`ready`/`failed`/`archived` (`src/data/asset-repo.ts:29`) | `draft`/`in-review`/`approved`/`rejected` (`src/data/asset-repo.ts:62`) — **zero overlap, and this design forbids ever introducing an overlapping value on either axis** |
-| 4 | **Always-present word label** | Preceded by the grid key `Status` | Preceded by the literal words `Review state:` (`REVIEW_COPY.stateKey`, `.review-state-key` `public/style.css:454-458`) — never a bare badge |
+| 1 | **Region** | `['Status', statusCell]` inside `.kv-grid` (`public/app.js`) | `#editorial-review`, inside the editorial panel |
+| 2 | **Shape** | `.badge` — `border-radius: 20px`, a full pill (`public/style.css`) | `.review-badge` — `border-radius: 3px` + `border: 1px solid transparent`, a rectangle (`public/style.css`) |
+| 3 | **Vocabulary** | `uploading`/`processing`/`ready`/`failed`/`archived` (`ASSET_STATUSES`) | `draft`/`in-review`/`approved`/`rejected` (`ASSET_REVIEW_STATES`) — both `src/data/asset-repo.ts`, **zero overlap, and this design forbids ever introducing an overlapping value on either axis** |
+| 4 | **Always-present word label** | Preceded by the grid key `Status` | Preceded by the literal words `Review state:` (`REVIEW_COPY.stateKey`, rendered by `el('span', 'review-state-key', REVIEW_COPY.stateKey + ':')` in `public/review-state.js`; `.review-state-key` in `public/style.css`) — never a bare badge |
 | 5 | **Container accent** | none | the panel carries a left accent rail (§4.1) |
 | 6 | **Explicit sentence** | none needed | one sentence in the panel saying the two are different axes (§4.2) |
-| 7 | **Trail** | `Status history` table of transitions (`public/app.js:2613-2666`) | **no trail exists** — the API stores only the current state (§10, gap R1). The panel shows one state and never implies a history |
+| 7 | **Trail** | the `Status history` table of transitions (`histDiv.id = 'status-history'`, `public/app.js`) | **no trail exists** — the API stores only the current state (§10, gap R1). The panel shows one state and never implies a history |
 
 **Hard rule:** the two badges never appear in the same row, the same table cell, or the same grid.
 A "review" chip in the assets *table* (out of scope here) would have to obey the same rule.
 
 ### 4.1 Move the accent rail from the block to the panel
 
-`.review-block` currently owns the teal left rail (`public/style.css:407-410`). With the review block
+`.review-block` currently owns the teal left rail (`border-left: 3px solid var(--review-accent, #2dd4bf)`,
+`public/style.css`). With the review block
 nested inside the editorial panel, that rail should move to `.editorial-panel` and be **removed**
 from `.review-block`. A rail on both draws a rail inside a rail, which reads as two nesting levels
 where there is one, and dilutes the signal that made the rail worth having. The rail then means
@@ -272,19 +333,34 @@ Behaviour is already specified and implemented by `public/review-state.js` (#901
 redesigned here**. This spec changes only its placement and two copy strings:
 
 - It becomes the **first child of the editorial panel** instead of a sibling of the action row:
-  `mountReviewState({ assetId: asset.id, host: editorialPanel })` with **no `anchorEl`** (the
-  existing `place()` in `public/review-state.js` appends to `host` when `anchorEl` is absent, so no
-  signature change is needed).
+  `mountReviewState({ assetId: asset.id, host: editorialPanel })` with **no `anchorEl`**. Its JSDoc
+  already promises this — *"The block is inserted before `anchorEl` when given, else appended to
+  `host`."* — and `place()` implements it (`if (o.anchorEl && o.anchorEl.parentNode) … else if
+  (o.host) { o.host.appendChild(block); }`), so **no signature change is needed**.
 - Its heading drops to the sub-group level: `.editorial-group-title` reading **"Review"**, not
   `.section-title` reading "Editorial review" — "Editorial" is now the panel heading, and repeating
   it inside would read as a section of its own (the exact problem `.tracks-group-title`
-  (`public/style.css:476-484`) was introduced to solve).
+  (`public/style.css`) was introduced to solve).
 - `REVIEW_COPY.axisNote` loses the word "above" (§4.2).
 - `.review-block` loses its left rail (§4.1).
 
 Everything else holds: one transition button per entry of the server's `allowedTransitions` and by no
 other route; empty array ⇒ the terminal sentence; `viewer` ⇒ state visible, no buttons, role note;
 403 ⇒ the action group is removed for the rest of the view; 422 ⇒ re-read and say the state moved.
+
+**The one accepted move the read never advertises.** `isValidReviewTransition` returns `true` when
+`from === to` (*"idempotent no-op transitions are allowed"*), while `allowedReviewTransitions`
+deliberately excludes the current state — its comment says advertising it *"would put a button on the
+screen that changes nothing"* (§0.3). So re-sending the current state answers **200 with an unchanged
+asset**, not 422.
+
+Build-only-from-`allowedTransitions` already makes that unreachable from the UI, and this spec keeps
+it that way — there is no "confirm current state" control. The consequence worth writing down is for
+**error copy**, not for layout: a 200 from `POST …/review-state` does **not** prove a transition
+happened, so the success message must be phrased from the state in the returned asset ("Review state
+is now *approved*") rather than from the state the client asked for ("Moved to *approved*"). The 422
+path is correspondingly narrower than "any state not in `allowedTransitions`": it is every such state
+**except** the current one.
 
 ### 5.2 `#editorial-tags` — Tags
 
@@ -302,25 +378,27 @@ Tags
 ```
 
 **Read.** Tags come from the asset read already in hand (`asset.tags`); **no extra request**. The
-field is **absent when empty** (`src/data/asset-document.ts:692`, `src/routes/assets.ts:914`), so the
+field is **absent when empty** (§0.1), so the
 renderer must treat `undefined` and `[]` identically — the existing `renderTags` guard
-(`public/app.js:784`) already does. Order is the server's first-seen order
-(`normalizeTags`, `src/data/asset-repo.ts:1297-1307`); **do not sort client-side** — re-sorting would
+(`if (!tags || tags.length === 0) return …`) already does. Order is the server's first-seen order
+(`normalizeTags`, `src/data/asset-repo.ts`); **do not sort client-side** — re-sorting would
 make a newly added tag jump to an unpredictable position instead of appearing at the end where the
 operator's eye already is.
 
 **Add.** One `POST …/tags` with the whole array, never one request per tag — the body takes an array
-(`src/routes/assets.ts:5471`), so a comma-separated entry of five tags is one round trip. The
-comma-separated convention matches the existing search filter (`public/app.js:4669-4670`).
-The 200 is the **full asset** (`:5472`), so the write path re-renders from the response rather than
+(`body: z.object({ tags: z.array(tagSchema).min(1).max(128) })`), so a comma-separated entry of five
+tags is one round trip. The comma-separated convention matches the existing search filter, whose
+label is already `Tags (comma-separated)` with placeholder `news,sports` (`#search-tags`,
+`public/app.js`).
+The 200 is the **full asset** (`response: { 200: assetSchema, 404: errorSchema }`), so the write path re-renders from the response rather than
 patching the pill list locally (same rule the lock and review blocks already follow) — that is the
 only way the client observes the server's dedupe and ordering.
 
-**Client-side normalisation, and its limits.** `tagSchema` (`src/routes/assets.ts:393`) has **no
-`.trim()`** — in pointed contrast to `commentBodySchema`, which does (`:1174-1176`). So the input
+**Client-side normalisation, and its limits.** `tagSchema` (`src/routes/assets.ts`) has **no
+`.trim()`** — in pointed contrast to `commentBodySchema`, which does. So the input
 **must** trim each token and drop empties before sending; otherwise `" news"` is accepted as a tag
 permanently distinct from `"news"`, invisible to the operator who typed it and unmatched by a search
-for `news`. Dedupe is exact-string (`src/data/asset-repo.ts:1300`), so:
+for `news`. Dedupe is exact-string (`new Set<string>()` on the raw value in `normalizeTags`), so:
 
 - **Trim** each comma-separated token; drop tokens that are empty after trimming; if every token is
   empty, show the inline error and send nothing.
@@ -333,7 +411,8 @@ for `news`. Dedupe is exact-string (`src/data/asset-repo.ts:1300`), so:
 - Drop a token already present verbatim (the server would dedupe it; sending it is a pointless
   write).
 
-**Caps.** 128 tags per asset, 128 characters per tag (`src/routes/assets.ts:393-394`). Both are
+**Caps.** 128 tags per asset, 128 characters per tag (`tagSchema` / `tagsSchema`,
+`src/routes/assets.ts`). Both are
 enforced pre-submit with a specific message, because the server's rejection is an **undeclared**
 zod 400: `…tags.post.responses` in `openapi.json` is exactly `["200","404"]`. Show the remaining
 budget only when it is nearly gone (`tags.length ≥ 112`): *"16 of 128 tag slots left."*
@@ -341,10 +420,11 @@ budget only when it is nearly gone (`tags.length ≥ 112`): *"16 of 128 tag slot
 **Remove.** An `×` button inside each pill, `aria-label="Remove tag news"`. No confirm dialog — a
 tag is cheap to re-add and `POST …/tags` makes re-adding one click. The 200 again returns the full
 asset, so removal re-renders from the response. Removing an absent tag is a server-side no-op that
-still answers 200 (`src/routes/assets.ts:5506-5509`), so a double click is harmless.
+still answers 200 (the handler's `.filter((t) => t !== request.params.tag)` simply matches nothing),
+so a double click is harmless.
 
 **The un-removable tag.** `tagSchema` restricts no characters, but removal addresses the tag as a
-**path segment** (`DELETE /:id/tags/:tag`, `src/routes/assets.ts:5493`). A tag containing `/`, `?`,
+**path segment** (`app.delete('/:id/tags/:tag', …)`, `src/routes/assets.ts`). A tag containing `/`, `?`,
 `#`, or a literal `%` cannot be addressed reliably even percent-encoded (gap T1, §10). The panel's
 mitigation, in both directions:
 
@@ -355,8 +435,8 @@ mitigation, in both directions:
   carry. Replace the whole tag list with PATCH /assets/{id}."`
 
 **Role gate.** `viewer` gets pills with no `×` and no input, plus the read-only note. `POST` is
-`write` and `DELETE` is **`delete`** (`src/auth/authorize.ts:79-93`) — two different actions. Both
-belong to `editor`/`admin` in today's matrix (`:54-58`) so one client-side mirror covers both, but
+`write` and `DELETE` is **`delete`** (`methodToAction`, `src/auth/authorize.ts`) — two different
+actions. Both belong to `editor`/`admin` in today's `MATRIX` so one client-side mirror covers both, but
 they must be mirrored as two capability checks, not one (gap T2, §10).
 
 ### 5.3 `#editorial-comments` — Comments
@@ -375,12 +455,14 @@ they must be mirrored as two capability checks, not one (gap T2, §10).
 ```
 
 **Fetch.** One `GET …/comments` per render of the panel, using `asset.id` (§0.6). The response is a
-bare array with no envelope and no cursor (`src/routes/assets.ts:4803`).
+bare array with no envelope and no cursor (`response: { 200: z.array(commentSchema), … }`,
+`src/routes/assets.ts`).
 
 **Order: newest first — which means reversing the wire order.** The API returns oldest→newest
-(`src/data/comment-repo.ts:50-56`); the panel renders the reverse. Two reasons: it matches the
+(`listByAsset`, §0.2); the panel renders the reverse. Two reasons: it matches the
 convention the pane already sets for `Status history`, which reverses for exactly this purpose
-(`public/app.js:2641-2642`), and in a side pane with a collapsed, unpaginated thread the operator's
+(`.slice().reverse()` on `lifecycleHistory`, `public/app.js`), and in a side pane with a collapsed,
+unpaginated thread the operator's
 question is "what is the latest note", which must be answerable without scrolling. The cost is that
 a long thread no longer reads as a conversation top-to-bottom; that is the right trade for a notes
 field with no replies, no threading and no attribution.
@@ -389,57 +471,66 @@ field with no replies, no threading and no attribution.
 page as the thread grows.
 
 **Post.** `POST …/comments` with `{ body }`. The 201 returns **the created comment**, not the asset
-(`src/routes/assets.ts:4782`) — so unlike tags and review state, this response cannot re-render the
+(`response: { 201: commentSchema, 404: errorSchema }`) — so unlike tags and review state, this
+response cannot re-render the
 whole panel. Prepend the returned comment to the rendered list, clear the composer, and announce the
 result in the sub-section's `aria-live` region. Do **not** synthesise the comment from the local
-draft: `id` and `createdAt` are server-minted (`src/data/comment-repo.ts:39-44`) and the rendered row
+draft: `id` and `createdAt` are server-minted (`ulid()` / `new Date().toISOString()` in the
+repository's `create`) and the rendered row
 must show the server's values.
 
 **Validation.** `body` is trimmed server-side then `min(1).max(4096)`
-(`src/routes/assets.ts:1174-1176`). Mirror it: `Post` is disabled while the trimmed draft is empty; a
+(`commentBodySchema`, `src/routes/assets.ts`). Mirror it: `Post` is disabled while the trimmed draft
+is empty; a
 character counter appears at ≥ 3800 characters; over 4096 the button disables with
 *"A comment can be at most 4096 characters. This one is 4210."* This matters more than usual because
 the 400 is **undeclared** in the spec (`…comments.post.responses` = `["201","404"]`), so the client
 cannot rely on a documented error shape for it — handle it as a generic failure and prevent it.
 
 **No attribution, and say so.** There is no author field anywhere in the contract
-(`src/data/comment-repo.ts:17-27`). The panel therefore shows **no** avatar, no "you", no name, and
+(`Comment` / `CreateCommentInput`, `src/data/comment-repo.ts`, and `CouchCommentRepository` adds no
+field of its own). The panel therefore shows **no** avatar, no "you", no name, and
 no "added by". It carries one quiet line under the composer — *"Comments are not attributed to a
 user."* — because an operator who assumes a note is signed may write something that only makes sense
 if it is. This is the single most important honesty constraint in the sub-section (gap C1, §10).
 
 **No edit, no delete.** `CommentRepository` declares only `create` and `listByAsset`
-(`src/data/comment-repo.ts:29-32`) and no `…/comments/{commentId}` path exists. So no hover-edit, no
+(`interface CommentRepository`, `src/data/comment-repo.ts`) and no `…/comments/{commentId}` path
+exists. So no hover-edit, no
 `×` on a comment row, and the composer's helper text must not imply a post is revisable. A typo is
 fixed by posting a correction (gap C3, §10).
 
-**Timestamps.** `createdAt` is ISO 8601 UTC (`createdAt: string; // ISO 8601`, `src/data/comment-repo.ts:21`; minted with `new Date().toISOString()`, `:44`). Render through the
-existing `fmtDate` (`public/app.js:336`). If a relative form ("2 hours ago") is ever added it must be
+**Timestamps.** `createdAt` is ISO 8601 UTC (`createdAt: string; // ISO 8601` on `Comment`,
+`src/data/comment-repo.ts`; minted with `new Date().toISOString()`). Render through the existing
+`fmtDate` (`public/app.js`). If a relative form ("2 hours ago") is ever added it must be
 *in addition to* the absolute timestamp, never instead of it.
 
 **Role gate.** `viewer` gets the list with no composer, plus the read-only note.
 
-**Durability.** See gap C4 (§10) — this sub-section must not ship against the default in-memory
-repository.
+**Durability.** Comments are persisted per resolved stack (§0.2.1), so this sub-section is cleared to
+ship — gap C4 is **resolved** (§10). What remains is C4a: the client cannot observe *which* store is
+live, so the panel carries **no durability copy at all** — no "saved", no "stored permanently", no
+sync indicator. The thread is simply shown as read back from the server.
 
 ---
 
 ## 6. Composition with `public/app.js`
 
 Concrete, minimal, and expressed as a diff against `renderAssetDetailBody`
-(`public/app.js:2523`).
+(`public/app.js`).
 
 ### 6.1 One row leaves the summary grid
 
-Delete `['Tags', renderTags(asset.tags)]` (`public/app.js:2576`) from `kvRows`. Tags then live in
+Delete `['Tags', renderTags(asset.tags)]` (the `kvRows.push(…)` block, `public/app.js`) from
+`kvRows`. Tags then live in
 exactly one place on this pane. Leaving the row *and* adding the panel would put two renderings of
 the same field on one screen, one of which silently goes stale after a write.
 
-- `renderTags` (`public/app.js:783-787`) itself **must not be touched** — the search-results table
-  calls it (`public/app.js:4609`), and it is injected into the shared assets table
-  (`renderTags` passed to `createAssetsTable`, `public/app.js:2066`) where it renders the Tags column
-  (`render: (a) => renderTags(a.tags)`, `public/assets-table.js:627`).
-- The `Status` row (`public/app.js:2574`) **stays** in the grid. It belongs there: the grid is the
+- `function renderTags(tags)` (`public/app.js`) itself **must not be touched** — the search-results
+  table calls it (`'<td>' + renderTags(hit.tags) + '</td>'`), and it is injected into the shared
+  assets table (`renderTags,` in the `createAssetsTable({…})` literal) where it renders the Tags
+  column (`render: (a) => renderTags(a.tags)` on the `key: 'tags'` column, `public/assets-table.js`).
+- The `['Status', statusCell]` row **stays** in the grid. It belongs there: the grid is the
   pipeline-owned summary of the asset, and keeping the lifecycle badge there while review state lives
   in the editorial panel is separation #1 in §4.
 - No test asserts the detail pane's `Tags` row label (verified across `test/*.test.ts`), so the
@@ -447,7 +538,8 @@ the same field on one screen, one of which silently goes stale after a write.
 
 ### 6.2 One container replaces one mount
 
-At the current review-state mount site (`public/app.js:3052-3082`):
+At the current review-state mount site (the `await mountReviewState({…})` call in
+`renderAssetDetailBody`, `public/app.js`):
 
 ```
 build #editorial-panel (heading + .editorial-intro)
@@ -459,7 +551,7 @@ insert it before actionsDiv            ← the slot mountReviewState uses today
 
 - `mountReviewState` is called with `host` and **no `anchorEl`**, so it appends into the panel. Its
   existing `place()` already supports this; no signature change.
-- The panel is inserted before `actionsDiv` (`public/app.js:2920`), so **the vertical order of every
+- The panel is inserted before `actionsDiv`, so **the vertical order of every
   other block is unchanged** — the panel occupies precisely the slot the review block occupies today.
 - All three mounts receive `asset.id`, never `id` (the route parameter, which may be a slug) — §0.6.
 - New sibling modules, matching the one-concern-per-file convention of `public/review-state.js`,
@@ -470,8 +562,8 @@ insert it before actionsDiv            ← the slot mountReviewState uses today
 
 - Each sub-section keeps its **own** `aria-live` message host, as `public/review-state.js` already
   does. Sub-section outcomes do **not** go to the shared `#action-msg`
-  (`public/app.js:2986-2994`), which belongs to the action row below and is far enough away that an
-  operator would not connect the two.
+  (`actionMsg.id = 'action-msg'`, `public/app.js`), which belongs to the action row below and is far
+  enough away that an operator would not connect the two.
 - A tag write returns the full asset, so it re-renders the tags group from the response. It must
   **not** call `renderAssetDetailBody`, which would rebuild the whole pane, collapse the comments
   disclosure and destroy the composer draft.
@@ -480,11 +572,28 @@ insert it before actionsDiv            ← the slot mountReviewState uses today
 ### 6.4 CSS to add (`public/style.css`)
 
 `.editorial-panel` (accent rail, moved off `.review-block` — §4.1), `.editorial-group`,
-`.editorial-group-title` (modelled on `.tracks-group-title`, `public/style.css:479-484`),
+`.editorial-group-title` (modelled on `.tracks-group-title`, `public/style.css`),
 `.editorial-intro`, `.tag-remove` (the `×` affordance inside `.tag`), `.tag-input-row`,
-`.comment-row`, `.comment-time`, `.comment-body`, and **`details`/`summary` rules — none exist
-today** (verified: no `details` or `summary` selector in `public/style.css`), so the comments
-disclosure would otherwise render as an unstyled browser default in a styled pane.
+`.comment-row`, `.comment-time`, `.comment-body`.
+
+**Disclosure styling: follow the precedent, don't re-invent it.** An earlier draft said no
+`details`/`summary` rules existed in `public/style.css`. That is no longer true — issue #964 added
+`.raw-disclosure > summary` with `:hover` and `:focus-visible` variants (`cursor: pointer`,
+`color: var(--text-muted)`, `font-size: 12px`, `padding: 2px 0`, `user-select: none`, and a kept
+focus ring: `outline: 2px solid var(--accent, var(--border))` with `outline-offset: 2px`).
+
+Those rules are **class-scoped to `.raw-disclosure`**, so they will not style the comments
+disclosure on their own. Two things follow:
+
+- The comments `<details>` still needs its own rule — but it should **match** the `.raw-disclosure`
+  summary treatment rather than invent a second disclosure look, and it must keep the same
+  `:focus-visible` ring (WCAG 2.1 SC 2.4.7, which that rule's comment already cites).
+- The cheapest honest implementation is to **extract the shared declarations into a selector list**
+  (`.raw-disclosure > summary, .editorial-group > summary { … }`) instead of copying the block. One
+  disclosure look, one place to change it.
+
+`rawJsonDisclosure` (`public/app.js`) is the JS precedent to copy: native `<details>`, no ARIA of its
+own, `<summary>` text set via `textContent`.
 
 ---
 
@@ -492,7 +601,7 @@ disclosure would otherwise render as an unstyled browser default in a styled pan
 
 | Sub-section | Empty | Loading | Request failed | `viewer` |
 |---|---|---|---|---|
-| Review | n/a — always has a state (absent ⇒ `draft`, `src/routes/assets.ts:5544`) | none (single fetch, rendered on arrival) | `REVIEW_COPY.unavailable` + no controls (existing behaviour) | state + badge, no buttons, `REVIEW_COPY.readOnly` |
+| Review | n/a — always has a state (absent ⇒ `draft`: `const current = asset.reviewState ?? 'draft'`, `src/routes/assets.ts`) | none (single fetch, rendered on arrival) | `REVIEW_COPY.unavailable` + no controls (existing behaviour) | state + badge, no buttons, `REVIEW_COPY.readOnly` |
 | Tags | "No tags yet." + input | none — comes from the asset read already in hand | inline error on the write only; the pill list is never blanked by a failed write | pills without `×`, no input, read-only note |
 | Comments | "No comments yet." + composer | one-line "Loading comments…" (separate fetch) | "Could not load comments." + a `Retry` button; the composer is still shown, because posting does not depend on the list | list only, no composer, read-only note |
 
@@ -572,13 +681,15 @@ No commercial product names, and no vocabulary borrowed from any commercial MAM.
 Carried forward from `docs/findings/review-state-contract-897.md` §6:
 
 - **R1 (= G2) — no actor and no history on the review axis.** The asset stores only the current
-  `reviewState` (`src/data/asset-document.ts:322`); there is no `reviewedBy`, no `reviewedAt` and no
+  `reviewState` (`administrative.reviewState`, `src/data/asset-document.ts`); there is no
+  `reviewedBy`, no `reviewedAt` and no
   per-transition trail, unlike lifecycle `statusHistory`. "Who approved this and when" is
   unanswerable. *Routed around:* the panel shows one state, has no "Review history" sub-section, and
   no copy implies a trail. This is the single largest functional asymmetry between the two axes in
   §4 (separation 7) — and the one most likely to be requested first.
 - **R2 (= G1) — a review transition emits no audit entry.** `POST …/review-state`
-  (`src/routes/assets.ts:5562-5577`) calls no `emitAudit`, so editorial approval is absent from
+  (`app.post('/:id/review-state', …)`, whose handler is just `repo.transitionReviewState(…)` + a 404
+  branch + `reply.code(200).send(updated)`) calls no `emitAudit`, so editorial approval is absent from
   `GET /api/v1/audit`. *Routed around:* the panel cannot offer "see this in the audit log".
 - **R3 (= G3) — `reviewState` optional on the asset read, resolved on the sub-resource.** The panel
   reads the sub-resource, so it is unaffected; any other surface reading `asset.reviewState` must
@@ -587,37 +698,52 @@ Carried forward from `docs/findings/review-state-contract-897.md` §6:
 New, found while writing this spec:
 
 - **T1 — a tag can be created that cannot be deleted.** `tagSchema`
-  (`src/routes/assets.ts:393`) restricts no characters, but `DELETE /:id/tags/:tag`
-  (`:5493`) addresses the tag as a single path segment. A tag containing `/`, `?`, `#` or `%` is not
+  (`src/routes/assets.ts`) restricts no characters, but `DELETE /:id/tags/:tag` addresses the tag as
+  a single path segment. A tag containing `/`, `?`, `#` or `%` is not
   reliably addressable. *Routed around* client-side in §5.2, but the real fix is server-side — either
   restrict the charset on write, or accept the tag to remove in a body. **Worth an API issue.**
 - **T2 — add and remove tags are different authorization actions.** `POST …/tags` is `write` and
-  `DELETE …/tags/{tag}` is `delete` (`src/auth/authorize.ts:79-93`). Today `editor`/`admin` hold both
-  (`:54-58`) so nothing is observable, but any future role with `write` and not `delete` could add
+  `DELETE …/tags/{tag}` is `delete` (`methodToAction`, `src/auth/authorize.ts`). Today
+  `editor`/`admin` hold both in `MATRIX` so nothing is observable, but any future role with `write` and not `delete` could add
   tags it cannot remove. The client mirror must be two checks, not one.
 - **C1 — comments have no author.** `Comment` is exactly `{ id, assetId, body, createdAt }`
-  (`src/data/comment-repo.ts:17-22`) and `CreateCommentInput` carries no actor (`:24-27`), even
+  (`src/data/comment-repo.ts`) and `CreateCommentInput` carries no actor, even
   though the request is authenticated and a principal role is resolved
   (`src/auth/authorize.ts`). An unattributed comment thread is of limited value for editorial
   hand-off. *Routed around:* the panel states plainly that comments are unattributed rather than
   implying otherwise. **Worth an API issue** — and it should be resolved before the comments UI is
   built, because adding attribution later changes this sub-section's layout.
 - **C2 — comments are unpaginated.** `GET …/comments` returns a bare array with no cursor and no
-  total (`src/routes/assets.ts:4803`), against the project's cursor-token pagination principle.
+  total (`response: { 200: z.array(commentSchema), … }`, `src/routes/assets.ts`), against the
+  project's cursor-token pagination principle.
   Every render of the panel transfers the entire thread. *Routed around* with client-side truncation
   (§3), which limits rendering cost but not payload. **Worth an API issue.**
 - **C3 — comments cannot be edited or deleted.** `CommentRepository` declares only `create` and
-  `listByAsset` (`src/data/comment-repo.ts:29-32`); no `…/comments/{commentId}` path exists. A
+  `listByAsset` (`src/data/comment-repo.ts`); no `…/comments/{commentId}` path exists. A
   mistaken or sensitive note is permanent. *Routed around:* no such controls, and copy that does not
   imply revisability.
-- **C4 — comments are not durable by default. Blocking.** `opts.commentRepository ?? new
-  InMemoryCommentRepository()` (`src/routes/assets.ts:1752`) means an unconfigured deployment stores
-  comments in a process-local `Map` (`src/data/comment-repo.ts:35-58`) and loses every one on
-  restart. Tags and review state are persisted documents; comments are not. A UI cannot detect which
-  repository is wired, so it cannot warn honestly. **The comments sub-section must not ship until a
-  persistent `CommentRepository` exists** — the interface was left clean for exactly that
-  (`src/data/comment-repo.ts:10-11`). Shipping it against the in-memory default would silently
-  destroy operator-authored text.
+- **C4 — comments are not durable. RESOLVED (issue #1046), no longer blocking.** An earlier draft of
+  this spec recorded C4 as blocking and said the comments sub-section must not ship. **That is false
+  against current `main`.** A persistent `CommentRepository` now exists
+  (`export class CouchCommentRepository implements CommentRepository`,
+  `src/data/couch-comment-repo.ts`), it is wired per resolved stack
+  (`comments: CommentRepository` on `WorkspaceConnections` and `new CouchCommentRepository(wc, log)`
+  in `src/services/workspace-stack.ts`), and `src/main.ts` injects it into the assets router through
+  `new PerWorkspaceCommentRepository(stackResolver, app.log)` under the comment *"Asset comments
+  (issue #135), persisted since issue #1046."* Restart durability is covered by
+  `describe('asset comments survive a restart on CouchDB (issue #1046)')`,
+  `test/asset-comments-couch.test.ts`. **The comments sub-section is cleared to ship**; the merge gate
+  that referenced this gap is withdrawn (§11).
+- **C4a — a client cannot tell which comment store is live.** The residual of C4. In-memory remains
+  the fall-back when no stack resolves, or on the env path with `MINIO_URL` set and `COUCHDB_URL`
+  unset (`src/services/workspace-stack.ts`); `PerWorkspaceCommentRepository.repo()` warns once to the
+  **server log** when that happens, naming the reason (§0.2.1). Nothing on the wire exposes it — no
+  field, no header, no health endpoint. *Routed around:* the panel makes **no durability claim at
+  all**. It never says "saved permanently", never shows a sync/persistence indicator, and its copy
+  reads the same either way, so a non-durable deployment cannot make the UI tell a lie. The honest
+  fix is server-side — surface the resolved store in a readiness/health response so an operator
+  dashboard can warn. **Worth an API issue** (low priority; the warning is already in the log and the
+  default deployment path is durable).
 
 None of these are OSC-platform limitations, so none are logged to `docs/osc-feedback/`; they are all
 gaps in this project's own API surface.
@@ -629,15 +755,17 @@ gaps in this project's own API surface.
 Layout / IA (all tickets):
 
 - [ ] One `#editorial-panel` on asset detail, headed "Editorial", inserted **before** `actionsDiv`
-      (`public/app.js:2920`) so no other block moves.
+      (`actionsDiv`, `public/app.js`) so no other block moves.
 - [ ] Sub-sections in the fixed order Review → Tags → Comments, on every asset, including empty ones.
 - [ ] The panel itself never collapses; the review sub-section never collapses.
 - [ ] Comments `<details>` opens by default when `count ≤ 5`; tag overflow discloses past 12; comment
       overflow past 10. No disclosure state persisted.
-- [ ] `['Tags', renderTags(asset.tags)]` removed from `kvRows` (`public/app.js:2576`); `renderTags`
-      itself unchanged (still used at `public/app.js:4609`).
+- [ ] `['Tags', renderTags(asset.tags)]` removed from `kvRows`; `renderTags` itself unchanged (still
+      called from the search-results table and injected into `public/assets-table.js`).
 - [ ] `Status` row stays in the summary grid.
-- [ ] `details`/`summary` styles added to `public/style.css`.
+- [ ] The comments disclosure is styled by **extending** the existing `.raw-disclosure > summary`
+      rules in `public/style.css` (issue #964) into a shared selector list, not by a second
+      copy-pasted disclosure look — and the `:focus-visible` ring is kept.
 
 Review-vs-`status` distinction (#134):
 
@@ -647,6 +775,9 @@ Review-vs-`status` distinction (#134):
 - [ ] The accent rail is on `.editorial-panel`, removed from `.review-block`.
 - [ ] The panel intro states the two-axis rule; `REVIEW_COPY.axisNote` no longer says "above".
 - [ ] No "Review history" sub-section, and no copy implying a review trail (gap R1).
+- [ ] The success message after `POST …/review-state` is phrased from the `reviewState` in the
+      **returned asset**, not from the state the client requested — a 200 does not prove a move
+      happened, because `from === to` is accepted as an idempotent no-op (§5.1).
 
 Tags:
 
@@ -671,7 +802,8 @@ Comments:
 - [ ] No edit and no delete affordance on a comment (gap C3).
 - [ ] Absolute timestamps via `fmtDate`.
 - [ ] `viewer` sees the list with no composer.
-- [ ] **Not merged until a persistent `CommentRepository` exists (gap C4).**
+- [ ] No durability claim in the copy: nothing says "saved", "stored permanently", or shows a
+      persistence indicator (gap C4a — the client cannot observe which store is live).
 
 Cross-cutting:
 
