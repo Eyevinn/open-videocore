@@ -1083,7 +1083,7 @@ type AssetsRouterOptions = {
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
   // Best-effort operational log emission for pipeline steps (issue #995). Wired
-  // to the in-memory LogStore's `append()` write primitive — the same instance
+  // to the log store's `append()` write primitive — the same instance
   // GET /api/v1/logs reads (src/main.ts, `logStore`; read path
   // src/routes/logs.ts:94). When absent, pipeline execution proceeds without
   // appending log records (no-op), so existing tests are unaffected. Emission
@@ -2145,7 +2145,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // than thrown because this is a fire-and-forget pipeline step: throwing here
   // would fail the whole execution, which an unconfigured optional step must
   // never do.
-  function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+  //
+  // `storage` has exactly the meaning it has on `triggerExtraction` above
+  // (issue #1051 review): a caller that already resolved a WorkspaceStorage
+  // hands it in instead of resolving a fresh one here. Callers running INSIDE
+  // the request may omit it and get the resolver-cache entry the onRequest hook
+  // warmed for this request's stack; a caller that reaches this AFTER the
+  // request's work has settled MUST pass the handle, because `storageFor()` is a
+  // cache read whose entry can age past the resolver TTL (`CACHE_TTL_MS`,
+  // services/workspace-stack.ts) during a long transfer — after which the
+  // factory THROWS rather than returning the wrong stack, and here that throw
+  // would land in a detached continuation. Same shape as
+  // `triggerExtraction(assetId, objectKey, externalSource?, storage?)` and
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts).
+  //
+  // Note this only covers the DATA plane. The runner factory is still built from
+  // `request.connections` (issue #1062), which is request-scoped state captured
+  // synchronously here rather than a TTL'd cache read, so it stays correct for a
+  // non-default `x-stack-name` even when called from a detached continuation.
+  function triggerThumbnail(
+    assetId: string,
+    objectKey: string,
+    request: import('fastify').FastifyRequest,
+    storage?: WorkspaceStorage
+  ): boolean {
     if (!opts.thumbnailExtractor || !storageFor) {
       return false;
     }
@@ -2165,7 +2188,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     void thumbnailRunner(
       { assetId, objectKey, timecodes: [1] },
-      { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
+      {
+        assets: repo,
+        storage: storage ?? storageFor(),
+        extractor: resolvedExtractor,
+        ...opts.thumbnailDeps
+      }
     ).catch(() => {
       /* thumbnail failures are recorded on the asset by the runner */
     });
@@ -3107,8 +3135,41 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           assetId: extAsset.id,
           sourceUrl: extObjectKey
         });
+        // Audit: ingest-url job submitted (issue #1000). One entry, targetId = the
+        // new job id, emitted right after the durable job record exists — the same
+        // moment and the same shape the transcode submission uses
+        // (src/pipeline/transcode.ts:104-114). `system` origin matches every other
+        // `job.*` entry (transcode + package), so the job lifecycle reads as one
+        // consistent origin regardless of which surface triggered it.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.submitted',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         await jobs.update(extJob.id, { status: 'running' });
         await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Audit: this branch settles the job terminally INLINE (the bytes already
+        // live in the external bucket, so no pull worker runs and nothing else can
+        // ever emit the terminal entry for it). Same shape as the pull worker's
+        // success entry (src/pipeline/url-pull-worker.ts) minus `bytesTransferred`,
+        // which is meaningless when no bytes were transferred.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.completed',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         // Fire-and-forget probe against the external source (job reads in place).
         triggerExtraction(extAsset.id, extObjectKey, source);
         return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
@@ -3172,11 +3233,50 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // TTL of its own, so holding it across the pull is safe.
       const pullStorage = storageFor();
 
+      // Audit: ingest-url job submitted (issue #1000). See the external-backend
+      // branch above for the shape rationale. Emitted BEFORE the detached pull
+      // runner starts, so the audit trail records the submission regardless of the
+      // pull outcome — and the asset's history no longer starts mid-pipeline.
+      // `sourceUrl` is deliberately NOT in the detail bag: a pull source may be a
+      // pre-signed URL carrying credentials in its query string.
+      // This submission and the terminal job.completed/job.failed the worker emits
+      // can land in the same millisecond (equal `at`); the audit store mints
+      // monotonic ULID ids so GET /api/v1/audit's equal-`at` tiebreak resolves to
+      // true write order and never renders the lifecycle inverted (issue #1000
+      // review; CONTRACT: monotonic id minting in src/data/audit-repo.ts record()).
+      emitAudit(
+        audit,
+        {
+          actor: originActor('system'),
+          action: 'job.submitted',
+          targetType: 'job',
+          targetId: job.id,
+          detail: { jobType: 'ingest-url', assetId: asset.id }
+        },
+        request.log
+      );
+
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
-      // extraction against the now-stored object (issue #6); we only extract if
-      // the asset actually advanced to `processing` (pull succeeded).
+      // extraction AND poster-frame extraction against the now-stored object
+      // (issues #6, #1050); we only run either if the asset actually advanced to
+      // `processing` (pull succeeded).
+      //
+      // issue #1050: this branch previously ran extraction only, so a
+      // URL-ingested asset never got a `thumbnails` entry while an uploaded one
+      // did (main.ts onObjectStored runs both). The pull lands the bytes in
+      // OSC-managed storage under our own `ingest/<id>` key, so the thumbnail
+      // runner's presignedGet of that key resolves exactly as it does for an
+      // upload — the two paths are now at parity.
+      //
+      // Deliberately NOT applied to the external-backend branch above: there
+      // objectKey is `s3://<foreign-bucket>/<key>`, and the thumbnail runner
+      // resolves its source via deps.storage.presignedGet (thumbnail.ts:119),
+      // which cannot presign a bucket this deployment's storage does not own.
+      // triggerExtraction takes an externalSource for that case; triggerThumbnail
+      // has no equivalent, so calling it there would fail silently. Giving the
+      // thumbnail path the same external-source treatment is a separate change.
       void runner(
         { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
         {
@@ -3191,13 +3291,27 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // the Logs tab gets of a URL-pull ingest, which runs detached and
           // therefore outlives this request.
           pipelineLog,
-          pipelineLogErrors: request.log
+          pipelineLogErrors: request.log,
+          // Terminal `job.completed` / `job.failed` emission for this job happens
+          // inside the worker, where the pull actually settles (issue #1000).
+          // Threaded after the `pullDeps` spread so an injected test dep bag can
+          // never silently drop the emitter.
+          audit,
+          auditLog: request.log
         }
       )
         .then(async () => {
           const settled = await repo.get(asset.id);
           if (settled?.status === 'processing') {
             triggerExtraction(asset.id, objectKey, undefined, pullStorage);
+            // Same `pullStorage` handle, for the same reason (issue #1051
+            // review): this runs AFTER the request's work has settled, so
+            // `storageFor()` can have aged past the resolver TTL and would throw
+            // inside this detached continuation. Passing the handle resolved at
+            // request time keeps the thumbnail path symmetric with the
+            // extraction path immediately above instead of silently depending on
+            // the ambient request-stack context.
+            triggerThumbnail(asset.id, objectKey, request, pullStorage);
           }
         })
         // This continuation outlives the request, so nothing is left to surface
@@ -3209,7 +3323,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         .catch((err: unknown) => {
           request.log.error(
             { err, assetId: asset.id, jobId: job.id },
-            'post-pull metadata extraction could not be started'
+            'post-pull metadata/thumbnail extraction could not be started'
           );
         });
 
