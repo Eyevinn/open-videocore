@@ -2516,18 +2516,34 @@ body.detail-standalone .assets-side {
   display: none;
 }
 
+/* Panel footer actions (issue #962: "Show all" + "Reset to defaults"). A wrapping
+   flex row so the pair stays side by side in a narrow panel and stacks instead of
+   overflowing it. */
 .ops-columns-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   margin-top: 8px;
   padding-top: 8px;
   border-top: 1px solid var(--border, #333);
 }
 
-.ops-columns-showall {
+.ops-columns-showall,
+.ops-columns-reset {
   font-size: 12px;
   padding: 3px 8px;
 }
 
-.ops-columns-showall:disabled {
+/* "Reset to defaults" is the destructive-ish, less-used half of the pair — it
+   throws away a saved preference — so it reads quieter than "Show all" rather
+   than competing with it for the first glance. */
+.ops-columns-reset {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+
+.ops-columns-showall:disabled,
+.ops-columns-reset:disabled {
   opacity: 0.5;
   cursor: default;
 }

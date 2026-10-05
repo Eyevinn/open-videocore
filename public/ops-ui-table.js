@@ -305,13 +305,20 @@ export function createOpsTableState(config) {
 //               column against the chooser; `chooserLabel` names a column whose
 //               header caption is empty (e.g. a thumbnail column) in that list.
 //   columnChooser: optional (issue #959) — { visible?, requireAtLeastOne?, label?,
-//               onChange? }. `visible` is the initial visible key set (null/absent
-//               = every declared column); `requireAtLeastOne` is a list of groups
-//               that must each keep one visible member; `onChange(keys)` fires
-//               after an operator toggle so the consumer can persist it. Present =
-//               a "Columns" control is mounted in the filter bar. Toggling NEVER
-//               touches the interaction store, so paging/sort/filters and the
-//               in-flight request are all unaffected.
+//               onChange?, onReset?, isCustomized? }. `visible` is the initial
+//               visible key set (null/absent = every declared column);
+//               `requireAtLeastOne` is a list of groups that must each keep one
+//               visible member; `onChange(keys)` fires after an operator toggle so
+//               the consumer can persist it. `onReset(keys)` fires when the
+//               operator resets (issue #962) and receives the DECLARED default
+//               set — the consumer's job there is to CLEAR whatever it persisted
+//               in onChange, not to persist again; it falls back to `onChange`
+//               when absent. `isCustomized()` reports whether there is anything
+//               left to reset, which greys the action out when there is not.
+//               Present = a "Columns" control is mounted in the filter bar.
+//               Toggling NEVER touches the interaction store, so paging/sort/
+//               filters and the in-flight request are all unaffected — and
+//               neither does a reset: it is the same repaint-only path.
 //   filters:    [{ name, control(state, onChange) -> HTMLElement }] — slot-based.
 //               Each table populates its own column-appropriate controls (status
 //               select, date-range, free-text). The primitive owns no filter
@@ -518,6 +525,23 @@ export function createOpsTable(config) {
           const applied = setVisibleColumns(keys);
           if (typeof chooserCfg.onChange === 'function') chooserCfg.onChange(applied);
         },
+        // Reset (issue #962) takes the SAME repaint path as a toggle — `null`
+        // normalizes to the declared default set, so "default" is derived here
+        // exactly as it is on a first load with no stored/URL choice. Only the
+        // callback differs: the consumer clears its persistence instead of
+        // writing to it. Falling back to onChange keeps the action live for a
+        // consumer that has not wired onReset, at the cost of re-persisting the
+        // default set rather than forgetting the choice.
+        onReset: function () {
+          const applied = setVisibleColumns(null);
+          const cb =
+            typeof chooserCfg.onReset === 'function'
+              ? chooserCfg.onReset
+              : chooserCfg.onChange;
+          if (typeof cb === 'function') cb(applied);
+        },
+        getIsCustomized:
+          typeof chooserCfg.isCustomized === 'function' ? chooserCfg.isCustomized : undefined,
       })
     : null;
 
@@ -672,6 +696,13 @@ export function createOpsTable(config) {
     // emits, so a consumer can restore a persisted set without provoking a fetch.
     getVisibleColumns: function() { return visibleKeys.slice(); },
     setVisibleColumns,
+    // Reset to the declared default set (issue #962) — the same action the
+    // chooser's own button runs, including the consumer's clear-what-you-stored
+    // callback, so a caller never has to re-implement half of it. No-op without a
+    // chooser configured, where there is no customization to undo.
+    resetVisibleColumns: function() {
+      return columnChooser ? columnChooser.reset() : visibleKeys.slice();
+    },
     // Exposed so a consumer/test can drive the chooser panel directly.
     columnChooser,
   };

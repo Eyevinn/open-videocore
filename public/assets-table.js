@@ -135,7 +135,10 @@
  * createdAt, and hiding Status does not drop the `status` param — so `total` and
  * which rows a page reaches are unchanged by definition, not by convention.
  * Resolution order on load is URL -> stored per-operator default -> all columns;
- * see resolveInitialColumns() below.
+ * see resolveInitialColumns() below. The chooser's "Reset to defaults" (issue
+ * #962) unwinds that same ladder from the top: it clears the `assets.cols` param
+ * AND this browser's stored default, so the table falls back to the declared set
+ * and stays there on refresh and on the next visit alike.
  *
  * ROW RENAME (issue #927). The Actions column carries a Rename control, so an
  * operator renames an asset from the list without opening the detail pane. The
@@ -175,6 +178,7 @@ import {
   normalizeVisibleColumns,
   readStoredColumns,
   writeStoredColumns,
+  clearStoredColumns,
 } from './table-columns.js';
 // Presigned thumbnail loading (issue #801). The thumbnail cell is rendered
 // src-less and filled in after each render — see hydrateThumbnails() below and
@@ -1128,6 +1132,31 @@ export function createAssetsTable(deps) {
         // NOT reload(): the request is identical, so re-issuing it would be a
         // wasted round-trip and a visible loading flash for a repaint.
         syncUrl(table.state.getState());
+      },
+      // Reset to defaults (issue #962) — the exact inverse of onChange above, and
+      // it has to undo BOTH of its writes. Clearing only one is not a partial
+      // reset, it is no reset at all: a surviving `cols` param re-applies on this
+      // refresh, and a surviving stored default re-applies on the next bare visit.
+      // `keys` is the declared default set the primitive has already painted, so
+      // this callback only forgets.
+      onReset: function (keys) {
+        columnChoice.keys = keys;
+        // 1) The URL half. Dropping `explicit` is what removes the param rather
+        //    than rewriting it: syncUrl sends `cols: null`, and encodeTableState
+        //    clears every param in this namespace before writing back only the
+        //    non-default ones — so `assets.cols` simply does not come back.
+        columnChoice.explicit = false;
+        // 2) The stored half. Best-effort like the write it undoes; a blocked
+        //    store had nothing to forget in the first place.
+        clearStoredColumns(ASSETS_NS, win);
+        syncUrl(table.state.getState());
+      },
+      // Whether there is anything left to reset, so the action is greyed out in a
+      // view that is already pristine. `explicit` covers both a choice made in
+      // this session and one the URL arrived with; the stored read covers a
+      // default saved in an earlier one.
+      isCustomized: function () {
+        return columnChoice.explicit || readStoredColumns(ASSETS_NS, win) != null;
       },
     },
   });
