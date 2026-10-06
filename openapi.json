@@ -2392,6 +2392,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -2937,6 +2962,31 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false
                           },
                           "createdAt": {
                             "type": "string"
@@ -3627,6 +3677,31 @@
                               "type": "string"
                             }
                           },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false
+                          },
                           "createdAt": {
                             "type": "string"
                           },
@@ -4138,6 +4213,31 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false
                           },
                           "createdAt": {
                             "type": "string"
@@ -4726,6 +4826,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -5288,6 +5413,31 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
                     },
                     "createdAt": {
                       "type": "string"
@@ -6028,6 +6178,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -6607,6 +6782,31 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
                     },
                     "createdAt": {
                       "type": "string"
@@ -7286,6 +7486,31 @@
                             "items": {
                               "type": "string"
                             }
+                          },
+                          "retention": {
+                            "type": "object",
+                            "properties": {
+                              "archivedAt": {
+                                "type": "string",
+                                "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                              },
+                              "purgeAfter": {
+                                "type": "string",
+                                "nullable": true,
+                                "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                              },
+                              "retentionMs": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                              }
+                            },
+                            "required": [
+                              "archivedAt",
+                              "purgeAfter",
+                              "retentionMs"
+                            ],
+                            "additionalProperties": false
                           },
                           "createdAt": {
                             "type": "string"
@@ -10081,6 +10306,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -10975,6 +11225,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -11739,6 +12014,31 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
                     },
                     "createdAt": {
                       "type": "string"
@@ -12803,6 +13103,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -13321,6 +13646,31 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
                     },
                     "createdAt": {
                       "type": "string"
@@ -13933,6 +14283,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -14487,6 +14862,31 @@
                         "type": "string"
                       }
                     },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
+                    },
                     "createdAt": {
                       "type": "string"
                     },
@@ -14994,6 +15394,31 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
                     },
                     "createdAt": {
                       "type": "string"
@@ -15504,6 +15929,31 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "retention": {
+                      "type": "object",
+                      "properties": {
+                        "archivedAt": {
+                          "type": "string",
+                          "description": "When the asset entered `archived` (ISO 8601 UTC): the `at` of the most recent `-> archived` transition in `statusHistory`, falling back to `updatedAt` when no such transition is recorded."
+                        },
+                        "purgeAfter": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Earliest instant the retention sweep may purge this asset (ISO 8601 UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 (retention disabled \u2014 the asset never expires automatically). APPROXIMATE on purpose: the sweep runs on its own interval, so an asset stays restorable for up to one extra tick after this instant, and a parent with any live child is deferred further."
+                        },
+                        "retentionMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The instance-global archived-asset retention window in ms, as reported by `GET /api/v1/retention/config`. 0 means retention is disabled (never purge), in which case `purgeAfter` is `null`."
+                        }
+                      },
+                      "required": [
+                        "archivedAt",
+                        "purgeAfter",
+                        "retentionMs"
+                      ],
+                      "additionalProperties": false
                     },
                     "createdAt": {
                       "type": "string"

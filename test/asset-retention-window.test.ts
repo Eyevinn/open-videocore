@@ -5,25 +5,28 @@
 //
 // Contract grounding (CLAUDE.md rule 7) — read directly from this tree, not
 // assumed:
-//   - `assetSchema` (src/routes/assets.ts:~792-866, serialised with
+//   - `assetSchema` (src/routes/assets.ts:1096 `retention:
+//     retentionSchema.optional()`, serialised with
 //     `additionalProperties: false`) is the schema BOTH `GET /api/v1/assets/{id}`
-//     and the `200` of `POST /api/v1/assets/{id}/restore` use
-//     (src/routes/assets.ts:5802). Its property list — re-verified on this
-//     branch by grepping the schema body — has NO `retention`, `archivedAt`,
-//     `purgeAfter`, or `retentionMs` field. There is no per-asset
-//     retention-window value on the wire today.
-//   - Exhaustively confirmed, with the same conclusion, by
-//     docs/findings/asset-restore-contract-888.md §4 ("Retention window: not
-//     exposed — no such field exists"), which also records the recommended
-//     additive shape (`retention: { archivedAt, purgeAfter, retentionMs }`,
-//     §4 "Preferred") if the field is ever added.
+//     and the `200` of `POST /api/v1/assets/{id}/restore` use. On THIS branch it
+//     carries an OPTIONAL `retention: { archivedAt, purgeAfter, retentionMs }`
+//     object (`retentionSchema`, src/routes/assets.ts:990-1017), attached by
+//     `withRetention()` (src/routes/assets.ts:2012) and present in the
+//     committed spec (openapi.json, `GET /api/v1/assets/{id}` 200 →
+//     `retention`).
+//   - The shape is the additive one recommended by
+//     docs/findings/asset-restore-contract-888.md §4 ("Preferred"). That
+//     finding recorded the field as NOT exposed when it was written, against
+//     the pre-#891 contract; this branch is what adds it.
+//   - `purgeAfter` is `null` exactly when `retentionMs === 0`
+//     (RETENTION_DISABLED_MS, src/routes/retention.ts:36) — retention disabled,
+//     never purge.
 //
-// Because the field does not exist on the verified contract, these tests
-// lock in the honest behaviour required by #891's acceptance criteria: no
-// countdown is fabricated for any asset the API serves today (the field is
-// simply absent), AND the UI is wired to render one the moment a future,
-// additive `asset.retention` object of that proposed shape actually appears
-// on the wire — so a later server-side change needs no further UI change.
+// The field is OPTIONAL, so these tests pin both directions: no countdown is
+// fabricated for a body that carries no `retention` (non-archived asset, the
+// list endpoint, or a deployment that wires no live retention window), AND the
+// remaining window is rendered near the restore action when the object is
+// present.
 //
 // Target: `formatRetentionRemaining` (pure formatter) and
 // `renderAssetDetailBody` (the real detail renderer), both imported from
@@ -66,7 +69,7 @@ function routedFetch(currentAsset: () => unknown) {
 }
 
 describe('formatRetentionRemaining — pure formatter (issue #891)', () => {
-  it('returns null when no retention object is present (today’s verified contract)', () => {
+  it('returns null when no retention object is present (the field is optional on the wire)', () => {
     expect(formatRetentionRemaining(undefined)).toBeNull();
     expect(formatRetentionRemaining(null)).toBeNull();
   });
@@ -124,15 +127,17 @@ describe('asset detail — retention window near the restore action (issue #891)
     vi.useRealTimers();
   });
 
-  it('omits the retention window for an archived asset on today’s verified contract — no fabricated countdown', async () => {
+  it('omits the retention window when the body carries no retention object — no fabricated countdown', async () => {
     vi.stubGlobal('fetch', routedFetch(() => ARCHIVED_ASSET));
 
     await renderAssetDetailBody(ARCHIVED_ASSET.id, container);
 
     // The restore action is still offered...
     expect(container.querySelector('#btn-restore-asset')).not.toBeNull();
-    // ...but no retention-window element is rendered, because the asset the
-    // server actually sent has no `retention` field.
+    // ...but no retention-window element is rendered, because this fixture
+    // body carries no `retention` field — the case of an older server, or a
+    // deployment that wires no live retention window, where `withRetention()`
+    // omits the object (src/routes/assets.ts:2012).
     expect(container.querySelector('#retention-window')).toBeNull();
     expect(container.textContent).not.toMatch(/remain before/);
   });

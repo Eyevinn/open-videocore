@@ -8262,10 +8262,12 @@ export {
   auditTabWiring,
   reportTabWiring,
   // Remaining-retention-window text for the restore action (issue #891).
-  // Exported so a DOM/unit test can exercise the pure formatter directly,
-  // without needing a live `asset.retention` field (which the verified
-  // contract does not send today — see formatRetentionRemaining's own
-  // comment for the exact citation).
+  // Exported so a DOM/unit test can exercise the pure formatter directly on a
+  // hand-built `retention` object, without standing up a server. The formatter
+  // stays null-safe for the bodies that legitimately carry no `retention`
+  // (non-archived assets, the list endpoint, a deployment with no live
+  // retention window wired) — see formatRetentionRemaining's own comment for
+  // the exact contract citations.
   formatRetentionRemaining,
 };
 
