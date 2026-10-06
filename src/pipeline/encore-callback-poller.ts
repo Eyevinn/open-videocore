@@ -114,6 +114,12 @@ export type PollerDeps = {
   // "packaging-queue". Overridable so a deployment can point at a differently
   // named packager queue without a code change.
   packagingQueueKey?: string;
+  // The Valkey the packagers consume from. A poller draining a per-stack Valkey
+  // (one per distinct stack connection, alongside the activation poller) still
+  // hands packaging off on the activation Valkey, which is the one every on-demand
+  // packager is wired to (src/main.ts ensurePackaging). Optional: unset enqueues
+  // on `redis`, which is the activation Valkey for the activation poller.
+  packagingRedis?: Redis;
   // #464: bounds for the independent reconciliation sweep. All optional; when
   // unset the poller applies the defaults below so behaviour is identical to
   // before these knobs existed. Threaded the same way queueKey/packagingQueueKey
@@ -265,9 +271,10 @@ async function enqueuePackagingJob(
   // an ancient job whose no-jobId failure callback would be misattributed to THIS
   // fresh, healthy run. Best-effort — purgeStalePackagingJobs never throws, so a
   // purge hiccup cannot block the enqueue below.
-  await purgeStalePackagingJobs(deps.redis, queueKey, { logger: deps.logger });
+  const packagingRedis = deps.packagingRedis ?? deps.redis;
+  await purgeStalePackagingJobs(packagingRedis, queueKey, { logger: deps.logger });
   try {
-    await deps.redis.zadd(queueKey, Date.now(), message);
+    await packagingRedis.zadd(queueKey, Date.now(), message);
     deps.logger.info({ msg: 'encore-callback-poller: enqueued packaging job', queueKey, assetId, url: encoreJobUrl });
   } catch (err) {
     const emsg = err instanceof Error ? err.message : String(err);

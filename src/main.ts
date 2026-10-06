@@ -152,7 +152,7 @@ import {
 } from './pipeline/watch-folder.js';
 import { healthRouter } from './routes/health.js';
 import { resolveBuildInfo } from './build-info.js';
-import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
+import { startEncoreCallbackPoller, type PollerDeps } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
   settleFailedTranscode
@@ -1054,6 +1054,13 @@ let sharedRedis: IORedis | undefined;
 let packaging: PackagingService | undefined;
 let scalerRegistry: WorkspaceEncoreScalerRegistry | undefined;
 let stopEncoreCallbackPoller: (() => void) | undefined;
+// Everything the callback poller needs except the Valkey it drains, captured at
+// activation so a poller can be started per stack Valkey later.
+let callbackPollerOptions: Omit<PollerDeps, 'redis'> | undefined;
+let activationConnectionId: string | undefined;
+// Callback pollers for every stack Valkey other than the activation one, keyed
+// by connectionId. See syncStackCallbackPollers.
+const stackCallbackPollers = new Map<string, () => void>();
 
 // Bucket names are stack-invariant (created at provision time, see provision.ts)
 // so a static default is correct for every workspace.
@@ -1793,8 +1800,7 @@ function activateScaler(redisUrl: string): void {
   // Encore completion callback poller (background). Drains the Valkey sorted set
   // the callback listener writes to and applies transcode completions even when
   // the public callback route is unreachable (e.g. local runs).
-  stopEncoreCallbackPoller = startEncoreCallbackPoller({
-    redis,
+  callbackPollerOptions = {
     jobRepository,
     assetRepository,
     pipelineRepository,
@@ -1847,7 +1853,9 @@ function activateScaler(redisUrl: string): void {
     // that settles through this poller shows up in the Logs tab.
     pipelineLog: logStore,
     logger: app.log
-  });
+  };
+  stopEncoreCallbackPoller = startEncoreCallbackPoller({ redis, ...callbackPollerOptions });
+  activationConnectionId = valkeyConnectionId(redisUrl);
 
   // Publish the freshly-live connections into the router option objects so every
   // already-registered plugin picks them up on its next request/tick (#103).
@@ -1890,6 +1898,10 @@ async function deactivateScaler(): Promise<void> {
 
   stopEncoreCallbackPoller?.();
   stopEncoreCallbackPoller = undefined;
+  for (const stop of stackCallbackPollers.values()) stop();
+  stackCallbackPollers.clear();
+  callbackPollerOptions = undefined;
+  activationConnectionId = undefined;
 
   // Destroy all pooled OSC Encore instances before stopping loops.
   // Without this, instances accumulate across restarts because the Valkey pool
@@ -1938,11 +1950,50 @@ async function deactivateScaler(): Promise<void> {
 // against the first stack's Valkey when one exists and we are not yet active;
 // deactivate when the last stack is gone. Invoked at startup and after every
 // provision/teardown via onStackChange.
+// Run a callback poller on every stack's Valkey, not just the activation one.
+//
+// Since #615 each stack's scaler loop dispatches on its own stack's Valkey, and
+// the callback listener paired with each Encore instance writes completions to
+// that same Valkey. The poller was only ever started on the activation Valkey,
+// so a completion on any other stack was never drained: the reconcile then saw
+// the job leave Encore's active set with no completion recorded and failed it
+// as "dropped by Encore: gone from active set with no completion", although
+// Encore had finished it successfully.
+//
+// One poller per DISTINCT connection (the registry's connectionId, #1074), so a
+// stack that shares the activation Valkey is not drained twice. Packaging is
+// still handed off on the activation Valkey, where the packagers listen. Called
+// on every reconcile (startup and each provision/deprovision), so a stack
+// provisioned later gets its poller without a restart; a connection no longer
+// listed has its poller stopped.
+async function syncStackCallbackPollers(): Promise<void> {
+  if (!scalerRegistry || !sharedRedis || !callbackPollerOptions) return;
+  const live = new Set<string>();
+  for (const connection of await scalerRegistry.listStackConnections()) {
+    const { connectionId, redis, stackKey } = connection;
+    if (!connectionId || !redis || connectionId === activationConnectionId) continue;
+    live.add(connectionId);
+    if (stackCallbackPollers.has(connectionId)) continue;
+    stackCallbackPollers.set(
+      connectionId,
+      startEncoreCallbackPoller({ ...callbackPollerOptions, redis, packagingRedis: sharedRedis })
+    );
+    app.log.info({ stackKey, connectionId }, 'encore-callback-poller: started for stack Valkey');
+  }
+  for (const [connectionId, stop] of stackCallbackPollers) {
+    if (live.has(connectionId)) continue;
+    stop();
+    stackCallbackPollers.delete(connectionId);
+    app.log.info({ connectionId }, 'encore-callback-poller: stopped for stack Valkey');
+  }
+}
+
 async function reconcileScaler(): Promise<void> {
   if (!storageAvailable) return;
   const resolution = await resolveStackRedis();
   if (resolution.outcome === 'resolved') {
     if (!sharedRedis) activateScaler(resolution.redisUrl);
+    await syncStackCallbackPollers();
     return;
   }
   if (sharedRedis) {

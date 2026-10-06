@@ -814,6 +814,31 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
   });
 
+  // A poller draining a per-stack Valkey (one per stack connection, beside the
+  // activation poller) applies the completion from its own Valkey but hands
+  // packaging off on the activation Valkey, where the packagers listen.
+  it('enqueues packaging on packagingRedis when draining a stack Valkey', async () => {
+    const encoreUuid = 'uuid-handoff-stack-valkey';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+    const activationRedis = new FakeRedis();
+    const d = {
+      ...baseDeps(successFetch(externalId, encoreUuid), undefined),
+      packagingRedis: activationRedis as unknown as import('ioredis').Redis
+    };
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => activationRedis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    const execution = await pipelines.get(pipelineId);
+    expect(execution?.steps.find((s) => s.name === 'transcode')?.status).toBe('done');
+    expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
   // #976: the transcode->package handoff is the OSC-native enqueue path (it
   // ZADDs the packager's input queue directly rather than going through
   // PackagingService), so it must leave the SAME observable `package` Job
