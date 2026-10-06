@@ -9,7 +9,17 @@
 // still receive a single repository object — while the actual backing service is
 // selected lazily at call time rather than wired as a global singleton at
 // startup. OSC provides structural tenant isolation (ADR-003), so there is no
-// workspace parameter to thread; the resolver returns the deployment's stack.
+// workspace parameter to thread.
+//
+// There IS a stack to thread (issue #1058). Each call resolves the stack the
+// in-flight request named via `X-Stack-Name`, read from the ambient
+// request-scoped context (services/request-stack-context.ts) rather than passed
+// through every router option. Previously every call here resolved with NO name
+// — the first listed stack — while the transcode control plane resolved from the
+// header (issue #615), so on a multi-stack installation asset documents and the
+// object bytes they describe could be written to two different stacks. Outside a
+// request (sweeps, boot wiring) the context is empty and resolution falls back
+// to the workspace default, unchanged.
 
 import type {
   AssetReadState,
@@ -57,9 +67,23 @@ import type {
   Profile
 } from './profile-repo.js';
 import type {
+  AppendLogInput,
+  ListLogsOptions,
+  ListLogsResult,
+  LogReader,
+  LogRecord,
+  LogSink
+} from '../services/log-store.js';
+import type {
   PipelineRepository,
   PipelineExecution
 } from './pipeline-repo.js';
+import {
+  InMemoryCommentRepository,
+  type Comment,
+  type CommentRepository,
+  type CreateCommentInput
+} from './comment-repo.js';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
 import type {
   EncoreClient,
@@ -68,13 +92,14 @@ import type {
 } from '../pipeline/encore-client.js';
 import { decodeEncoreJobId } from './job-repo.js';
 import type { WorkspaceStackResolver } from '../services/workspace-stack.js';
+import { currentRequestStackName } from '../services/request-stack-context.js';
 import type { AuditEmitter } from './audit-emit.js';
 import type { RecordAuditInput } from './audit-repo.js';
 
 export class PerWorkspaceAssetRepository implements AssetRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<AssetRepository> {
-    return (await this.resolver.resolve()).assets;
+    return (await this.resolver.resolve(currentRequestStackName())).assets;
   }
   async create(input: CreateAssetInput): Promise<Asset> {
     return (await this.repo()).create(input);
@@ -145,7 +170,7 @@ export class PerWorkspaceAssetRepository implements AssetRepository {
 export class PerWorkspaceJobRepository implements JobRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<JobRepository> {
-    return (await this.resolver.resolve()).jobs;
+    return (await this.resolver.resolve(currentRequestStackName())).jobs;
   }
   async create(input: CreateJobInput): Promise<Job> {
     return (await this.repo()).create(input);
@@ -185,7 +210,7 @@ export class PerWorkspaceJobRepository implements JobRepository {
 export class PerWorkspacePipelineRepository implements PipelineRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<PipelineRepository> {
-    return (await this.resolver.resolve()).pipelines;
+    return (await this.resolver.resolve(currentRequestStackName())).pipelines;
   }
   async create(input: {
     assetId: string;
@@ -226,25 +251,84 @@ export class PerWorkspacePipelineRepository implements PipelineRepository {
   }
 }
 
+// Minimal logger surface (structurally satisfied by Fastify's logger) for the
+// durability warning below. Optional so callers/tests that don't wire a logger
+// keep working.
+export type PerWorkspaceCommentLogger = {
+  warn: (obj: unknown, msg?: string) => void;
+};
+
+// Asset comments resolved per stack (issue #1046).
+//
+// Comments used to be a process-global InMemoryCommentRepository, so every
+// review comment was lost on restart. They are now a field on
+// WorkspaceConnections (src/services/workspace-stack.ts `comments`) backed by
+// CouchCommentRepository for any stack that has a CouchDB — including a stack
+// provisioned through POST /api/v1/provision, whose CouchDB URL arrives from the
+// parameter store and NOT from COUCHDB_URL. This facade resolves that field at
+// call time, exactly like PerWorkspacePipelineRepository above, so a stack
+// provisioned after boot is picked up with no restart.
+//
+// DURABILITY WARNING. The resolved field is in-memory only when the resolved
+// stack has no CouchDB at all, in which case comments are lost on restart. That
+// has to be audible, so it is logged the first time a resolution lands on the
+// in-memory implementation (and again after any return to a durable store, so a
+// later relapse is not swallowed). It is logged here rather than once at boot
+// because the resolution is deliberately lazy: at boot there may be no stack
+// yet, and a boot-time verdict would be stale the moment one is provisioned.
+export class PerWorkspaceCommentRepository implements CommentRepository {
+  private warnedInMemory = false;
+  constructor(
+    private readonly resolver: WorkspaceStackResolver,
+    private readonly log?: PerWorkspaceCommentLogger
+  ) {}
+  private async repo(): Promise<CommentRepository> {
+    const comments = (await this.resolver.resolve()).comments;
+    if (comments instanceof InMemoryCommentRepository) {
+      if (!this.warnedInMemory) {
+        this.warnedInMemory = true;
+        this.log?.warn(
+          { store: 'in-memory', reason: 'no CouchDB in the resolved stack' },
+          'asset comments are being served from the IN-MEMORY store because the ' +
+            'resolved stack has no CouchDB — comments will be LOST on restart ' +
+            '(issue #1046). Provision a stack with CouchDB, or set COUCHDB_URL, ' +
+            'for a durable comment store.'
+        );
+      }
+    } else {
+      // Durable again (e.g. a stack was provisioned after boot): re-arm so a
+      // later fall back to in-memory is reported rather than silently ignored.
+      this.warnedInMemory = false;
+    }
+    return comments;
+  }
+  async create(input: CreateCommentInput): Promise<Comment> {
+    return (await this.repo()).create(input);
+  }
+  async listByAsset(assetId: string): Promise<Comment[]> {
+    return (await this.repo()).listByAsset(assetId);
+  }
+}
+
 export class PerWorkspaceEncoreClient implements EncoreClient {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   async submit(input: EncoreSubmitInput): Promise<EncoreSubmitResult> {
     if (!decodeEncoreJobId(input.externalId)) {
       throw new Error('cannot decode encore externalId');
     }
-    const conns = await this.resolver.resolve();
+    const conns = await this.resolver.resolve(currentRequestStackName());
     if (!conns.encore) {
       throw new Error('transcoding (Encore) is not configured for this stack');
     }
     return conns.encore.submit(input);
   }
   async getJobStatus(encoreJobId: string): Promise<string | undefined> {
-    const conns = await this.resolver.resolve();
+    const conns = await this.resolver.resolve(currentRequestStackName());
     if (!conns.encore) return undefined;
     return conns.encore.getJobStatus(encoreJobId);
   }
   async cancel(encoreJobId: string): Promise<void> {
-    const conns = await this.resolver.resolve();
+    const conns = await this.resolver.resolve(currentRequestStackName());
     // No Encore configured: nothing to cancel — idempotent no-op, matching
     // getJobStatus above.
     if (!conns.encore) return;
@@ -255,14 +339,14 @@ export class PerWorkspaceEncoreClient implements EncoreClient {
 export class PerWorkspaceSearchRepository implements SearchRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   async search(query: SearchQuery): Promise<SearchResult> {
-    return (await this.resolver.resolve()).search.search(query);
+    return (await this.resolver.resolve(currentRequestStackName())).search.search(query);
   }
 }
 
 export class PerWorkspaceWebhookRepository implements WebhookRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<WebhookRepository> {
-    return (await this.resolver.resolve()).webhooks;
+    return (await this.resolver.resolve(currentRequestStackName())).webhooks;
   }
   async create(input: CreateWebhookInput): Promise<WebhookRegistration> {
     return (await this.repo()).create(input);
@@ -278,7 +362,7 @@ export class PerWorkspaceWebhookRepository implements WebhookRepository {
 export class PerWorkspaceProfileRepository implements ProfileRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<ProfileRepository> {
-    return (await this.resolver.resolve()).profiles;
+    return (await this.resolver.resolve(currentRequestStackName())).profiles;
   }
   async create(input: CreateProfileInput): Promise<Profile> {
     return (await this.repo()).create(input);
@@ -303,7 +387,7 @@ export class PerWorkspaceProfileRepository implements ProfileRepository {
 export class PerWorkspaceCollectionRepository implements CollectionRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<CollectionRepository> {
-    return (await this.resolver.resolve()).collections;
+    return (await this.resolver.resolve(currentRequestStackName())).collections;
   }
   async create(input: CreateCollectionInput): Promise<Collection> {
     return (await this.repo()).create(input);
@@ -339,7 +423,7 @@ export class PerWorkspaceCollectionRepository implements CollectionRepository {
 export class PerWorkspaceAuditRepository implements AuditRepository {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   private async repo(): Promise<AuditRepository> {
-    return (await this.resolver.resolve()).audit;
+    return (await this.resolver.resolve(currentRequestStackName())).audit;
   }
   async query(query: AuditQuery): Promise<AuditQueryResult> {
     return (await this.repo()).query(query);
@@ -358,12 +442,39 @@ export class PerWorkspaceAuditRepository implements AuditRepository {
 export class PerWorkspaceAuditEmitter implements AuditEmitter {
   constructor(private readonly resolver: WorkspaceStackResolver) {}
   async record(input: RecordAuditInput): Promise<unknown> {
-    const audit = (await this.resolver.resolve()).audit;
+    const audit = (await this.resolver.resolve(currentRequestStackName())).audit;
     if (!audit) {
       // No durable audit store on this stack (in-memory fallback): silently
       // skip. The entry is intentionally not persisted rather than erroring.
       return undefined;
     }
     return audit.record(input);
+  }
+}
+
+// Stack-delegating operational log store (issue #996). Holds no connection of
+// its own: on every call it resolves the active stack and delegates to that
+// stack's log store — CouchLogStore on a Couch-backed stack (durable, survives a
+// restart), the process-local LogStore on the no-Couch dev/test paths. Mirrors
+// PerWorkspaceAuditRepository / PerWorkspaceAuditEmitter above, so the logs
+// router and the pipeline producer each receive ONE object regardless of
+// backend.
+//
+// Satisfies both halves of the store contract (src/services/log-store.ts):
+//   - `LogReader.list(opts) -> ListLogsResult` for GET /api/v1/logs
+//     (src/routes/logs.ts:110-113) — the response contract is unchanged, this
+//     wrapper only moves WHERE the records come from.
+//   - `LogSink.append(input) -> LogRecord` for the pipeline producer
+//     (src/services/pipeline-log.ts), which calls it fire-and-forget.
+export class PerWorkspaceLogStore implements LogReader, LogSink {
+  constructor(private readonly resolver: WorkspaceStackResolver) {}
+  private async store(): Promise<LogSink & LogReader> {
+    return (await this.resolver.resolve(currentRequestStackName())).logs;
+  }
+  async append(input: AppendLogInput): Promise<LogRecord> {
+    return (await this.store()).append(input);
+  }
+  async list(opts: ListLogsOptions = {}): Promise<ListLogsResult> {
+    return (await this.store()).list(opts);
   }
 }
