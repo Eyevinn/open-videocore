@@ -7,6 +7,13 @@
 **Audience:** whoever implements the export button/panel on asset detail, plus anyone
 writing operator copy about export.
 
+**Revised after review:** the first draft routed each state's whole payload through `showMsg`,
+which renders `textContent` and removes itself after 6s — so the markup it prescribed would have
+shipped as visible asterisks and the success link would have vanished. Every state now names the
+plain string that goes through `showMsg` and, separately, the persistent sibling DOM that carries
+anything else (§0.4). The 502 `message` is no longer specified for verbatim display: one of the
+two paths that produce it is not bounded by this repo (§0.1), so § "Export failed" sanitises it.
+
 This pins **copy and visual treatment** for five states. Four belong to one action — `POST
 /api/v1/assets/{id}/export` (the "re-wrap" action — copies a source into a new container
 format without re-encoding). The fifth, the issue's "zero destinations configured"
@@ -42,11 +49,12 @@ names a symbol, selector, or `openapi.json` path you can grep for.
 | Default child name | `outputName`, else `<source name> [<format>]` — the `name:` property of the child-asset literal in `rewrap()`, `src/pipeline/rewrap.ts`, which reads `outputName ?? \`${baseName} [${targetFormat}]\``. `baseName` is the `const baseName = source?.name ?? sourceAssetId` binding in the same function (it is **not** the `isRewrapFormat` guard a few lines above it — grep the identifier, not a line) |
 | Output object key | `exports/<newAssetId>.<format>` — `rewrapObjectKey`, `src/pipeline/rewrap.ts` |
 | **201 is falsifiable** | Three layers agree before it is sent: job-status allow-list (`SUCCESS_STATUSES`, `src/pipeline/osc-rewrap.ts`), the `deps.storage.statObject(outputKey)` HEAD + non-empty check in `rewrap()` (`src/pipeline/rewrap.ts`), only then the `ready` transition. Documented contract note: `docs/findings/export-truthful-status-944.md` |
-| 400 | Unsupported `targetFormat` — the Zod enum built from `REWRAP_FORMATS` at the edge; `UnsupportedFormatError` thrown defensively behind the `isRewrapFormat` guard in `rewrap()` (`src/pipeline/rewrap.ts`). Body: `errorSchema` (`error`, `message?`), `src/routes/assets.ts` |
+| 400 | Unsupported `targetFormat` — the Zod enum built from `REWRAP_FORMATS` at the edge; `UnsupportedFormatError` thrown defensively behind the `isRewrapFormat` guard in `rewrap()` (`src/pipeline/rewrap.ts`). **Two different bodies, depending on which layer rejects** — the *defensive* path throws `UnsupportedFormatError`, which the router's `setErrorHandler` maps to `errorSchema`-shaped `{ error: 'unsupported_format', message }` (`src/routes/assets.ts`); the *edge* path (Zod enum rejection) fails in Fastify's own schema validation, and since there is **no `schemaErrorFormatter` anywhere in `src/`** and the router's error handler ends in `throw err`, the client gets Fastify's default validation envelope instead (`error: 'Bad Request'`, `message` = the raw validation string). This divergence is precisely why § "Export failed" overrides the 400 with its own fixed copy rather than echoing `message` |
 | 404 | Unknown/foreign asset — `reply.code(404).send({ error: 'not_found' })` in the export handler. Existence is not leaked |
 | 409 | `{ error: 'no_object', message: 'asset has no stored source object to process' }` — `NO_SOURCE_OBJECT_ERROR` / `NO_SOURCE_OBJECT_MESSAGE`, `src/pipeline/source-object.ts`, sent by the shared `requireSourceObject` helper, which the export handler calls before anything else |
 | **501** | `{ error: 'not_configured', message: 'export / re-wrap is not configured' }` — the `if (!opts.rewrapRunner \|\| !storageFor)` guard in the export handler (deployment never wired a re-wrap runner or workspace storage). This is the only "nowhere for an export to go" condition **this endpoint** can produce — see § "Export is not available on this deployment" |
-| 502 | `{ error: 'rewrap_failed', message: <single status-bearing sentence> }` — the `reply.code(502).send({ error: 'rewrap_failed', message })` in the export handler's catch. The ffmpeg log is captured server-side only (`oscJobLog(err)`, logged at `warn` in the same catch) and is **never** in `message` — a deliberate security position (the log is third-party output and can carry storage endpoints/bucket names), not an oversight. `message` is what the UI has to show; it is real, not generic ("Export failed") |
+| 502 | `{ error: 'rewrap_failed', message: string }` — the `reply.code(502).send({ error: 'rewrap_failed', message })` in the export handler's catch, where `message` is `err instanceof Error ? err.message : String(err)`. The ffmpeg log is captured server-side only (`oscJobLog(err)`, logged at `warn` in the same catch) and is **never** in `message` — a deliberate security position (the log is third-party output and can carry storage endpoints/bucket names), not an oversight. `message` is what the UI has to show; it is real, not generic ("Export failed") |
+| **502 `message` is a bounded sentence on one path, unbounded on the other** | For the **poll/status** path it is composed by this repo: `makeOscRewrapRunner` builds `failure` as `OSC export/re-wrap job "<name>" ended with non-success status "<status>"` or `… did not complete: <err.message>` and throws `OscRewrapJobError(failure, logs)` — log as data, never in the message (`src/pipeline/osc-rewrap.ts`). For the **job-submission** path it is **not**: the `api.createJob(...)` call in the same function sits **outside** that `try`, so an error from the external OSC job client propagates unchanged through `rewrap()` into the route catch above and becomes the 502 `message` verbatim. The request in flight there carries `cmdLineArgs` from `rewrapCmdLine` (presigned source URL **with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`. This repo does not bound that client's error text, so **the UI must not render a 502 `message` unbounded** — see the bounding rules in § "Export failed" |
 | Failed export leaves no file to serve | `rewrap()` sets `objectKey` only **after** verification passes (the `update` calls follow the `statObject` guard, `src/pipeline/rewrap.ts`) — a `502` child is `status: 'failed'` with **no** `objectKey`, so it can never 200 a `/files` entry for bytes that don't exist |
 | Synchronous, no polling | The handler `await`s the resolved runner inline; there is no `processing`-then-poll contract for this action. The only "in progress" state is the one request in flight |
 | Source unchanged | Export is a pure read of the source asset — never mutated |
@@ -133,12 +141,14 @@ primitives:
 
 | Primitive | Where (greppable symbol / selector) | Reused for |
 |---|---|---|
-| `showMsg(container, text, type)` → `<div class="msg msg-{info\|success\|error}">`, auto-dismiss after 6s | `function showMsg` in `public/app.js`; CSS rules `.msg`, `.msg-info`, `.msg-success`, `.msg-error` in `public/style.css` | § "Export in progress" (`info`), § "Export succeeded" (`success`), § "Export failed" (`error`) |
+| **`showMsg(container, text, type)` — plain text only, and self-destructing.** It builds `<div class="msg msg-{info\|success\|error}">`, assigns **`el.textContent = text`**, appends that to `container`, then schedules `el.remove()` after **6000 ms**. Two consequences constrain every state below, and they are the reason this spec's copy is shaped the way it is: **(a)** `text` is a plain string rendered *as text* — it cannot carry an anchor, a `data-asset-id` attribute, a `<span class="text-mono">`, or bold/emphasis of any kind. Markup or markdown written into it is shown to the operator verbatim, characters and all. **(b)** the element it creates is **gone six seconds later**, so nothing the operator still needs may live inside it. | `function showMsg` in `public/app.js`; CSS rules `.msg`, `.msg-info`, `.msg-success`, `.msg-error` in `public/style.css` | the **one plain sentence** of status in § "Export in progress" (`info`), § "Export succeeded" (`success`), § "Export failed" (`error`) — and nothing beyond a sentence |
+| **Sibling-append, for anything `showMsg` cannot carry.** Construct the richer node yourself and `appendChild` it to the **same container**, as a *sibling* of the message box — never inside it. A sibling is not on `showMsg`'s timer, so it survives after the message box removes itself. | the `#btn-extract-meta` handler in `public/app.js`: immediately after its `showMsg(actionMsg, …)` call it does `const pre = document.createElement('pre'); pre.className = 'code-block mt8'; pre.textContent = JSON.stringify(r, null, 2);` then `actionMsg.appendChild(pre);` — the `<pre>` is a sibling of the `.msg` div and outlives it. The same handler opens with `actionMsg.innerHTML = ''`, which is how a previous run's persistent sibling is retired before a new one is posted | § "Export succeeded"'s result row (link + id), § "Export failed"'s persistent diagnostic |
+| Click-to-copy identifier — **do not hand-roll a second clipboard path** | `copyableIdCellHtml(value, label)` and `wireCopyIdButtons(root)`, exported from `public/copy-id.js` (button class constant `COPY_ID_BTN_CLASS`). `copyableIdCellHtml` returns **already-escaped HTML**: a `.cell-id.cell-id-value` span holding the full value as selectable text, plus an `aria-live="polite"` button carrying `data-copy-id`. `wireCopyIdButtons` binds the behaviour for every such button under `root` and is **idempotent** (it marks `dataset.copyIdWired`), so calling it after each render is safe. Live consumers to copy the call pattern from: `public/assets-table.js` (`wireCopyIdButtons(tbody)` after building rows) and `public/app.js`'s asset-detail key/value block (`wireCopyIdButtons(kvDiv)`) | § "Export succeeded"'s child-asset id |
 | Disable + relabel the triggering button while a request is in flight | the `#btn-extract-meta` handler in `public/app.js`: `var prevLabel = extractBtn.textContent; extractBtn.disabled = true; …` restored as `extractBtn.disabled = false; extractBtn.textContent = prevLabel;` in a `finally` | § "Export in progress" |
-| `err.status` / `err.body` / `err.message` surfaced by `apiFetch` (`async function apiFetch` in `public/app.js`, whose error path assigns `msg = body.message \|\| body.error \|\| msg` over a `'HTTP ' + res.status` default) | `public/app.js` | § "Export failed" reads `err.message`, which **is** the 502 `message` field verbatim per §0.1 |
+| `err.status` / `err.body` / `err.message` surfaced by `apiFetch` (`async function apiFetch` in `public/app.js`, whose error path assigns `msg = body.message \|\| body.error \|\| msg` over a `'HTTP ' + res.status` default) | `public/app.js` | § "Export failed" reads `err.status`, `err.body.error` **and** `err.message` — it branches on `err.body.error` first and renders `err.message` only for `rewrap_failed`, bounded, because the 502 `message` is not a trusted string on every path (§0.1) |
 | "…is not configured for this stack" / disabled-with-reason convention (pipeline picker) rather than a generic failure | `function notConfiguredText` and `function optionalServiceNames` in `public/app.js` | § "Export is not available on this deployment", § "No export destinations are configured" |
 | A distinct, non-`.msg-error` terminal-state block for a condition a retry can't fix, with an uppercase label row and a machine-readable outcome | `function renderPurgedUnrecoverable` in `public/app.js` (sets `className = 'msg msg-unrecoverable'`, `role="alert"`, `data-outcome="unrecoverable"`); CSS `.msg-unrecoverable` and its `.unrecoverable-label` / `.unrecoverable-body` / `.unrecoverable-detail` children in `public/style.css` | Pattern reused (not the component itself — that one is 410-specific) for the distinct visual identity of the two unavailable states |
-| `data-asset-id` link → `showAssetDetail(id, panel)`, monospace id convention | the `.job-asset-link` anchor built in `renderJobDetailBody` (`public/app.js`), whose click handler calls `opts.onAssetLink(assetLink.dataset.assetId)`; the embedded caller supplies that `onAssetLink` as `switchTab('assets'); showAssetDetail(assetId, panel)` in `showJobDetail`. The id is rendered with `.text-mono` (`public/style.css`) — as the link text only when `job.assetName` is absent, otherwise as a separate `.job-asset-id-inline` span | § "Export succeeded"'s "open the export" link |
+| `data-asset-id` link → `showAssetDetail(id, panel)`, monospace id convention | the `.job-asset-link` anchor built in `renderJobDetailBody` (`public/app.js`), whose click handler calls `opts.onAssetLink(assetLink.dataset.assetId)`; the embedded caller supplies that `onAssetLink` as `switchTab('assets'); showAssetDetail(assetId, panel)` in `showJobDetail`. The id is rendered with `.text-mono` (`public/style.css`) — as the link text only when `job.assetName` is absent, otherwise as a separate `.job-asset-id-inline` span. Because this is an element with an attribute and a click listener, it **must** be built as sibling DOM (row above) — it cannot be passed through `showMsg` | § "Export succeeded"'s "open the export" link |
 
 ---
 
@@ -171,13 +181,20 @@ request.
 - Relabel the submit control to a busy state (reuse the `extractBtn`/`prevLabel` pattern
   from the `#btn-extract-meta` handler, §0.4): button text becomes **"Exporting…"**,
   restored to its prior label in a `finally` regardless of outcome.
-- Post an `info` message via `showMsg`:
+- Post an `info` message via `showMsg`. The string, exactly — **no markup, no emphasis**,
+  because `showMsg` renders it as `textContent` (§0.4):
 
-  > Exporting to **{FORMAT}**…
+  ```js
+  showMsg(actionMsg, 'Exporting to ' + FORMAT + '…', 'info');
+  ```
+
+  which reads: `Exporting to MP4…`
 
   `{FORMAT}` is the exact `targetFormat` value the operator picked (`mp4`/`mkv`/`mov`/`mxf`/`ts`),
   uppercased for the message only — never invent a longer format name the contract doesn't
-  carry.
+  carry. This state needs no sibling DOM and no persistence: it is replaced within one request
+  by either outcome, and its 6s self-destruct is harmless here because it carries nothing the
+  operator has to keep.
 
 **Do not** show a progress bar or percentage — the contract exposes no job id, no poll
 endpoint and no partial-progress signal for this action (§0.1). A determinate progress UI
@@ -190,29 +207,55 @@ failure mode #944 fixed on the other end of this same request.
 
 **Trigger:** `201` with the new child asset body.
 
-**Visual treatment:** replace the in-progress message with a `success` `showMsg` block. Copy:
+**Visual treatment — two pieces, because one primitive cannot do both.** `showMsg` renders
+`textContent` and deletes itself after 6s (§0.4), so the *sentence* goes through `showMsg` and
+the *result* — the link and the id, which are this state's entire answer to "where did the
+export land" — is built as **persistent sibling DOM** next to it, following the
+`#btn-extract-meta` `actionMsg.appendChild(pre)` precedent (§0.4). Clear the host first, the
+way that handler does, so a previous run's result row is retired rather than stacked.
 
-> Exported to **{FORMAT}**. → [**{NAME}**](#)
+**(a) The status sentence** — a plain string, no markup, no emphasis:
 
-- `{FORMAT}` — the submitted `targetFormat`, same rendering as § "Export in progress".
-- `{NAME}` — the response body's `name` field, verbatim (already resolved server-side to
-  either the operator's `outputName` or the `<source name> [<format>]` default — §0.1). The
-  link uses the existing `data-asset-id="{id}"` / `showAssetDetail` convention (the
-  `.job-asset-link` + `onAssetLink` pattern, §0.4) so activating it opens the new child
-  asset's detail panel — reusing navigation already built for the exact same "jump to a
-  just-created/related asset" need, not a new route.
-- The link text is **not** a raw id. `public/app.js`'s existing `.job-asset-link` convention
-  only falls back to the id as link text when no human name exists (`job.assetName ||
-  job.assetId`, §0.4); an export's child **does** have a name (`assetSchema.name` is always
-  present, §0.1), so prefer it — and follow that handler's own
-  name-present branch, which renders the id separately in a `.text-mono` span rather than as
-  the link text:
+```js
+actionMsg.innerHTML = '';                                  // retire the previous run's row
+showMsg(actionMsg, 'Exported to ' + FORMAT + '.', 'success');
+```
 
-  > Exported to **MP4**. → [**clip-master [mp4]**](#)
-  > `01JQ7K9…` (click to copy)
+which reads: `Exported to MP4.`
 
-  reusing the click-to-copy id convention already cited in `docs/design/asset-version-chain.md`
-  ("the `id` as click-to-copy monospace text following the existing asset-id convention").
+- `{FORMAT}` — the submitted `targetFormat`, rendered as in § "Export in progress".
+- The sentence deliberately does **not** name the output. It is allowed to vanish at 6s
+  because the result row below it does not.
+
+**(b) The result row** — appended to the same container, *after* the `showMsg` call, and
+**not** on its timer. It must still be on screen minutes later, so an operator who looked away
+can still find what was produced. It carries two things:
+
+1. **A link whose text is the output's name**, opening the new child asset. Build an anchor
+   with `data-asset-id="{id}"` and a click handler that calls `showAssetDetail(id, panel)`,
+   reusing the `.job-asset-link` + `onAssetLink` convention (§0.4) — navigation already built
+   for this exact "jump to a just-created, related asset" need, not a new route. The link text
+   is the response body's `name` field, verbatim: already resolved server-side to either the
+   operator's `outputName` or the `<source name> [<format>]` default (§0.1). Set it with
+   `textContent`, never `innerHTML` — the name can contain `<`, `&` or quotes the operator
+   typed into `outputName`.
+2. **The child's id, as a click-to-copy control** — not as the link text. The existing
+   `.job-asset-link` convention falls back to an id as link text only when no human name
+   exists (`job.assetName || job.assetId`, §0.4), and an export's child always has a name
+   (`assetSchema.name`, §0.1). So follow that handler's name-present branch and render the id
+   separately. Use the module that already implements this — `copyableIdCellHtml(asset.id,
+   'Copy asset id')` into the row's markup, then `wireCopyIdButtons(row)` (`public/copy-id.js`,
+   §0.4). Do not hand-roll a clipboard call, do not invent a "(click to copy)" hint in prose:
+   the component ships its own visible `Copy` button and its own `aria-live` feedback.
+
+Rendered, the two pieces read as:
+
+> Exported to MP4.
+> → clip-master [mp4]   `01JQ7K9…` [Copy]
+
+where `Exported to MP4.` is the `.msg-success` box that disappears, and the second line is the
+row that stays. Any emphasis in this state is **CSS on the sibling row**, never asterisks in a
+`showMsg` string.
 
 **"Where it landed" — be precise about what is actually knowable:**
 The response's `objectKey` (`exports/{childId}.{format}`) is the storage key, not a byte
@@ -222,11 +265,18 @@ UI must **not** attempt to resolve a download URL by filtering `/:id/files` for 
 download affordance, it must fetch `GET /:id/files` for the new child and use the entry whose
 `objectKey` equals the one just returned (the handler always reports it as `type: 'source'`,
 §0.3) — not a `type` filter. That is an optional enhancement; the minimum state this ticket
-requires is satisfied by the name + link above, which needs no second request.
+requires is satisfied by the persistent result row above, which needs no second request.
 
-**Do not** say "export complete" without the output's name — #944's entire point is that
-`201` is a verified claim about a specific object; the copy should let the operator see which
-one.
+**Do not** ship this state as a bare "export complete" with nothing that names the output.
+#944's entire point is that a `201` is a verified claim about a *specific* object, so the state
+has to show which one. The split above satisfies that between the two pieces, not within the
+sentence — which is exactly why piece (b) is mandatory and not an enhancement. A `success`
+`showMsg` on its own is **not** an implementation of this state.
+
+**Accessibility:** the result row appears without a page change, as the outcome of an action the
+operator just took, so give it `role="status"` (WCAG 2.1 AA, SC 4.1.3) — `renderPurgedUnrecoverable`
+sets `role="alert"` for its terminal condition (§0.4); a successful export is not an alert.
+Append the row *after* the `showMsg` call so the reading order matches the visual order.
 
 ---
 
@@ -235,19 +285,73 @@ one.
 **Trigger:** the request resolves with HTTP `502`, body `{ error: 'rewrap_failed', message:
 string }` (§0.1).
 
-**Visual treatment:** replace the in-progress message with an `error` `showMsg` block. Copy:
+**Visual treatment — same two-piece split as § "Export succeeded", and for the same reason.**
+The server's sentence is the *only* diagnostic the operator will ever get for this failure (the
+ffmpeg log is server-side only, below), so it must not be put somewhere that deletes itself
+after six seconds. The short failure headline goes through `showMsg`; the server's sentence is
+appended as **persistent sibling DOM**:
 
-> Export to **{FORMAT}** failed: {MESSAGE}
+**(a) The headline** — plain string, no markup:
 
-- `{MESSAGE}` is `err.message` as surfaced by `apiFetch` (`msg = body.message || body.error
-  || msg`, §0.4), which for a 502 **is** the server's `message` field verbatim (§0.1) — never
-  replace it with a generic "Something went wrong." The acceptance criterion ("surfaces the
-  actual error returned by the verified `/export` contract") is met by printing this field,
-  not by summarizing it.
-- Do **not** attempt to show more than `message`. The ffmpeg log that would explain *why* is
-  deliberately server-side only (§0.1) — there is no safe additional detail to fetch or
-  display for this failure, and the UI must not imply there is one (no "see details"
-  affordance that leads nowhere).
+```js
+actionMsg.innerHTML = '';
+showMsg(actionMsg, 'Export to ' + FORMAT + ' failed.', 'error');
+```
+
+**(b) The diagnostic line** — a sibling node that stays, built with `textContent` (the server's
+sentence is not markup and must never be parsed as any):
+
+```js
+const detail = document.createElement('div');
+detail.className = 'text-mono mt8';
+detail.textContent = serverDetail;          // see the bounding rule below
+actionMsg.appendChild(detail);
+```
+
+**Bounding rule for `serverDetail` — required, not optional.** `err.message` comes from
+`apiFetch`'s `msg = body.message || body.error || msg` (§0.4). For the poll/status path the
+server composes that sentence itself and it is safe to show (§0.1). But **not every 502
+`message` is composed by this repo**: `api.createJob` in `src/pipeline/osc-rewrap.ts` is called
+*before* the `try` block that wraps the poll, so an error raised by that external client
+propagates unchanged into the route's catch (`const message = err instanceof Error ?
+err.message : String(err)`, the `rewrap_failed` 502 in `src/routes/assets.ts`) — and the request
+in flight at that moment carries `cmdLineArgs` built by `rewrapCmdLine` (the **presigned source
+URL with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`. Whether that client's
+error text echoes its request body is **not something this repo bounds**. So the UI must treat
+the string as untrusted:
+
+- Render it **only** when `err.body.error === 'rewrap_failed'`. Any other `error` value gets
+  this state's own fixed copy (the table below) and the server string is dropped.
+- **Truncate to 300 characters** with a trailing `…`. A composed status sentence is well under
+  that; an echoed request body is not, so the bound is also the tell.
+- **Drop the line entirely** if the string matches credential- or URL-shaped content —
+  `X-Amz-Signature`, `X-Amz-Credential`, `awsSecretAccessKey`, `awsAccessKeyId`, or any
+  `http://` / `https://` substring. In that case show only the headline plus: *"The export
+  service reported an error that could not be displayed safely. The full detail is in the
+  server log."* A dropped line is a worse diagnostic; a leaked presigned URL plus access key is
+  a worse incident.
+- Collapse whitespace to single spaces before measuring and rendering, so a multi-line dump
+  cannot stretch the panel or hide its tail below the fold.
+
+The earlier draft of this spec said to print `message` verbatim and "never replace it with a
+generic message." That was wrong for the `createJob` path and is superseded by the rules above:
+the *intent* — the acceptance criterion's "surfaces the actual error returned by the verified
+`/export` contract" — is met by showing the server's own sentence when the server composed it,
+which the rules preserve. What they forbid is rendering an unbounded upstream string.
+
+**The real fix belongs on the API surface, not here.** Wrapping `createJob` failures in a
+known sentence the way the poll path already does would make the 502 `message` uniformly safe
+and let the UI drop the sanitiser. File that against `src/pipeline/osc-rewrap.ts` as a
+follow-up; until it lands, the bounding rules above are load-bearing.
+
+**Nothing beyond that one sentence.** The ffmpeg log that would explain *why* is deliberately
+server-side only (§0.1) — there is no safe additional detail to fetch or display for this
+failure, and the UI must not imply there is one (no "see details" affordance that leads
+nowhere). Give the diagnostic line `role="status"` so it is announced with the headline rather
+than silently (§ "Export succeeded" carries the same note); `role="alert"` is reserved for the
+terminal, unrecoverable treatment (§0.4), and an export failure is retryable.
+
+Further constraints on this state:
 - The failed child asset itself (`status: 'failed'`, no `objectKey`, §0.1) is not linked to
   from this message — it is not a result the operator can act on (no file exists for it), so
   surfacing it would invite the exact "plausible-looking broken link" #786/#944 eliminated on
@@ -263,9 +367,13 @@ string }` (§0.1).
 single out 502 by name, but an implementer reusing this error path needs to know these don't
 collide with it):
 
-| Status | `error` | Shown via the same `error` `showMsg`, copy |
+Each of these is a **fixed plain-string headline through `showMsg`** and nothing else — no
+sibling diagnostic, no server string. The bounding rule in this section applies only to
+`rewrap_failed`; for every row below the server's `message` is dropped in favour of this copy.
+
+| Status | `error` | Fixed `showMsg` string (`error`) |
 |---|---|---|
-| `400` | Zod-enum rejection body | **"Unsupported export format."** — should not occur through the UI's own format picker (it would only enumerate `REWRAP_FORMATS`), so this is a defensive message, not a primary design target |
+| `400` | Fastify validation envelope (`error: 'Bad Request'`) at the edge, or `unsupported_format` from the defensive guard (§0.1) | **"Unsupported export format."** — should not occur through the UI's own format picker (it would only enumerate `REWRAP_FORMATS`), so this is a defensive message, not a primary design target |
 | `404` | `not_found` | **"This asset no longer exists."** — existence is deliberately not distinguished from "not yours" (§0.1); do not say "not found or access denied" or any phrasing that narrows which |
 | `409` | `no_object` | **"{SOURCE NAME} has no stored file to export."** — `message` is the shared, generic sentence (§0.1) used by every other source-consuming operation; prefer naming the asset over echoing `message` verbatim here, since the generic sentence reads oddly attached to a specific asset in a UI |
 
@@ -356,7 +464,7 @@ the position the destination picker and Deliver button would occupy. Copy:
 > Register a destination with the role **"packaged"** or **"both"**, then come back.
 
 - Title line names the condition in the issue's own terms, and in the contract's noun
-  ("destinations", §1).
+  ("destinations", § "Vocabulary").
 - The second line answers the first question a first-time operator has — *what is a
   destination for?* — before telling them they don't have one. One sentence, no jargon; it
   does not mention buckets, roles, endpoints, or credentials.
@@ -404,15 +512,19 @@ and that is what this section pins.
 
 ## 7. Summary table (for the implementer)
 
-| State | Action | Trigger | `showMsg` type / block | Inputs | Retry semantics |
-|---|---|---|---|---|---|
-| In progress | export | request in flight (client-side only, §0.1: no server poll state) | `info`, "Exporting to {FORMAT}…" | disabled | n/a |
-| Exported | export | `201` | `success`, "Exported to {FORMAT}. → {NAME}" + id | re-enabled, cleared | n/a — action is done |
-| Export failed | export | `502 rewrap_failed` | `error`, "Export to {FORMAT} failed: {message}" | re-enabled, **preserved** | retryable, same inputs likely to work later |
-| Unsupported format / unknown asset / no source object | export | `400`/`404`/`409` | `error`, per-status copy (§ "Export failed" table) | re-enabled (400: cleared format; 404/409: n/a, asset-level) | 400/409 need different operator input or asset state; 404 is not retryable |
-| Export not available | export | `501 not_configured` | dedicated disabled block, `data-outcome="not-configured"` | not rendered | not retryable by the operator — deployment-level |
-| No destinations | deliver | `GET /export-destinations` `200` with no entry whose `id !== 'default'` | dedicated disabled block, `data-outcome="no-destinations"` | picker + button not rendered | fixable by the reader — register a destination |
-| Delivery not available | deliver | `GET /export-destinations` `501 not_configured` | dedicated disabled block, `data-outcome="not-configured"` | not rendered | not retryable by the operator — deployment-level |
+Reminder for every `showMsg` cell below: the string is **plain text**, no markup, and the box
+**self-removes after 6s** (§0.4). Anything in the "persists" column is separate sibling DOM that
+is *not* on that timer.
+
+| State | Action | Trigger | `showMsg` type / plain string / block | Persists (sibling DOM) | Inputs | Retry semantics |
+|---|---|---|---|---|---|---|
+| In progress | export | request in flight (client-side only, §0.1: no server poll state) | `info`, `"Exporting to {FORMAT}…"` | nothing — replaced within the request | disabled | n/a |
+| Exported | export | `201` | `success`, `"Exported to {FORMAT}."` | **yes** — result row: name link (`data-asset-id` → `showAssetDetail`) + `copyableIdCellHtml` id | re-enabled, cleared | n/a — action is done |
+| Export failed | export | `502 rewrap_failed` | `error`, `"Export to {FORMAT} failed."` | **yes** — one `.text-mono` diagnostic line carrying the server sentence, **bounded/sanitised** per § "Export failed" | re-enabled, **preserved** | retryable, same inputs likely to work later |
+| Unsupported format / unknown asset / no source object | export | `400`/`404`/`409` | `error`, fixed per-status copy (§ "Export failed" table) | nothing — server string is dropped | re-enabled (400: cleared format; 404/409: n/a, asset-level) | 400/409 need different operator input or asset state; 404 is not retryable |
+| Export not available | export | `501 not_configured` | dedicated disabled block, `data-outcome="not-configured"` | **the block itself** — not a `showMsg`, so no timer | not rendered | not retryable by the operator — deployment-level |
+| No destinations | deliver | `GET /export-destinations` `200` with no entry whose `id !== 'default'` | dedicated disabled block, `data-outcome="no-destinations"` | **the block itself** — not a `showMsg`, so no timer | picker + button not rendered | fixable by the reader — register a destination |
+| Delivery not available | deliver | `GET /export-destinations` `501 not_configured` | dedicated disabled block, `data-outcome="not-configured"` | **the block itself** — not a `showMsg`, so no timer | not rendered | not retryable by the operator — deployment-level |
 
 ---
 
@@ -436,6 +548,13 @@ and that is what this section pins.
    on the list view, or omitting the default from the destinations projection) so the rule
    lives in the contract instead of in each UI. Until then, § "No export destinations are
    configured" specifies the filter so at least this UI applies it once.
-4. **The 502 `message` is a single sentence, not structured.** There's no machine-readable
-   failure reason field, so copy cannot branch on failure cause (e.g. "the source was
-   corrupt" vs. "the container doesn't support this codec") — only the one sentence, verbatim.
+4. **The 502 `message` is one unstructured string, and only sometimes one this repo wrote.**
+   There's no machine-readable failure-reason field, so copy cannot branch on failure cause
+   (e.g. "the source was corrupt" vs. "the container doesn't support this codec") — there is only
+   the string. And because the `createJob` submission path returns that string unbounded (§0.1),
+   the UI has to sanitise what should have arrived safe: § "Export failed" spends four rules on
+   defending against a leak that a server-side wrap in `src/pipeline/osc-rewrap.ts` would remove
+   outright. Both are worth a follow-up on the API surface: wrap the submission failure in a
+   composed sentence, and add a stable `reason` field so copy can branch on cause instead of
+   printing prose. Logged as OSC friction (`docs/osc-feedback/`, `@osaas/client-core`
+   `createJob` error shape) in the agents repo.
