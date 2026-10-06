@@ -57,15 +57,15 @@
  *         `additionalProperties: false`.
  *     Source of truth: `assetSchema` —
  *       `audioTracks: z.array(audioTrackOutSchema).optional()`
- *       (src/routes/assets.ts:907) and
- *       `subtitleTracks: z.array(subtitleTrackOutSchema).optional()` (:908),
- *       `audioTrackOutSchema` :795-802, `subtitleTrackOutSchema` :806-813; the
+ *       (src/routes/assets.ts:1037) and
+ *       `subtitleTracks: z.array(subtitleTrackOutSchema).optional()` (:1038),
+ *       `audioTrackOutSchema` :885-892, `subtitleTrackOutSchema` :896-903; the
  *       subtitle vocabulary is `SUBTITLE_FORMATS = ['vtt','srt','ttml']`,
- *       src/data/asset-repo.ts:449, reached via `subtitleFormatSchema`
- *       (src/routes/assets.ts:804).
+ *       src/data/asset-repo.ts:466, reached via `subtitleFormatSchema`
+ *       (src/routes/assets.ts:894).
  *     ABSENT MEANS "NONE", NOT "UNKNOWN". The field is optional because the
  *       arrays are "absent until the first track of the respective kind is
- *       added" (src/routes/assets.ts:905-906); persistence only writes the
+ *       added" (src/routes/assets.ts:1035-1036); persistence only writes the
  *       block when the array is non-empty (`doc.structural.editorialAudio` /
  *       `editorialSubtitles`, src/data/asset-document.ts:553-557) and reads it
  *       straight back (:693-694). So an omitted array is an empty one, and this
@@ -118,7 +118,7 @@
  * WHAT THE API DOES NOT EXPOSE (checked, not assumed):
  *   - There is no GET on `/api/v1/assets/{id}/audio-tracks` or
  *     `…/subtitle-tracks`. In `openapi.json` those paths carry only `post`, and
- *     `…/{trackId}` only `delete` (src/routes/assets.ts:5279, 5314, 5344, 5392).
+ *     `…/{trackId}` only `delete` (src/routes/assets.ts:6429, 6464, 6494, 6542).
  *   - There is no UPDATE of any kind on a track: no PUT and no PATCH on either
  *     track path. A track's language, codec, channels, label or default flag
  *     cannot be edited in place, so this panel offers add and remove only —
@@ -127,18 +127,22 @@
  *   - There is no add/remove route for VIDEO tracks at all (no path in
  *     `openapi.json` contains "video"), so the video section stays read-only.
  *   - `GET /api/v1/assets/{id}/tracks` DOES exist and is the only *dedicated*
- *     read for the two editorial kinds — but it is not a second source of truth:
- *     its handler sends `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []`
- *     from the very same document (src/routes/assets.ts:5268-5271, via
- *     `repo.get(request.params.id)` at :5264). A caller that already holds the
- *     asset — which the detail view always does — would be paying a round-trip
- *     for bytes it has, so this panel does not call it.
- *   - There is no video-track endpoint and no video-track ARRAY in any response:
- *     no path in `openapi.json` contains "video", and `technicalMetadata` carries
- *     one flattened set of video attributes. So this panel can list at most one
- *     video track for an asset, however many the source file holds. That ceiling
- *     is the API's, not this module's, and the section says so on screen rather
- *     than implying the file has exactly one video stream.
+ *     read of the two editorial kinds — but it is not a second source of truth
+ *     for them: its handler sends `asset.audioTracks ?? []` /
+ *     `asset.subtitleTracks ?? []` from the very same document
+ *     (src/routes/assets.ts:6420-6421, via `repo.get(request.params.id)` at
+ *     :6414). A caller that already holds the asset — which the detail view
+ *     always does — would be paying a round-trip for bytes it has, so this panel
+ *     does not call it on the render path. It IS called after a write; see the
+ *     refresh grounding below.
+ *   - No endpoint writes video tracks, and the only response that carries a
+ *     video-track ARRAY is that same `GET …/tracks` (`videoTracks`, issue #978,
+ *     read-only). `GET /api/v1/assets/{id}` — the body this panel renders from —
+ *     does NOT carry one: it exposes `technicalMetadata`, one flattened set of
+ *     video attributes. So this panel can list at most one video track for an
+ *     asset, however many the source file holds. That ceiling is the asset
+ *     body's, not this module's, and the section says so on screen rather than
+ *     implying the file has exactly one video stream.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * SUBTITLE CONTROLS — CONTRACT GROUNDING (issue #904, CLAUDE.md rule 7)
@@ -147,70 +151,82 @@
  * either call below was written. Nothing is taken from the issue text.
  *
  *   ADD — `POST /api/v1/assets/{id}/subtitle-tracks`
- *     openapi.json .paths["/api/v1/assets/{id}/subtitle-tracks"].post;
- *     handler src/routes/assets.ts:5390-5432.
- *     Path param: `id` only (`z.object({ id: z.string() })`, :5395). It is the
- *       ULID — the handler passes the raw param to `repo.get` (:5404) with NO
+ *     openapi.json .paths["/api/v1/assets/{id}/subtitle-tracks"] carries `post`
+ *     and nothing else; handler src/routes/assets.ts:6494-6536.
+ *     Path param: `id` only (`z.object({ id: z.string() })`, :6499). It is the
+ *       ULID — the handler passes the raw param to `repo.get` (:6508) with NO
  *       slug fallback, so a slug would 404.
- *     Body REQUIRED, `addSubtitleTrackSchema` (src/routes/assets.ts:829-834),
+ *     Body REQUIRED, `addSubtitleTrackSchema` (src/routes/assets.ts:915-920),
  *       `additionalProperties: false`:
  *         language  string, min 1, max 64   — REQUIRED
  *         format    "vtt" | "srt" | "ttml"  — REQUIRED
- *                   (`subtitleFormatSchema` :808 over
- *                    `SUBTITLE_FORMATS` src/data/asset-repo.ts:449)
+ *                   (`subtitleFormatSchema` :894 over
+ *                    `SUBTITLE_FORMATS` src/data/asset-repo.ts:466)
  *         label     string, min 1, max 128  — optional
  *         default   boolean                 — optional
  *       Four fields, and no fifth: `objectKey` and `id` are NOT accepted —
- *       the id is server-generated (`randomUUID()`, :5408) and the object key is
- *       derived by the route (:5411). So this panel sends no id and no key.
- *     201 → `{ track, uploadUrl? }` (:5398). `track` is `subtitleTrackOutSchema`
- *       (:810-817) — the ONE new track, NOT the full list, which is why a
+ *       the id is server-generated (`randomUUID()`, :6512) and the object key is
+ *       derived by the route (:6515). So this panel sends no id and no key.
+ *     201 → `{ track, uploadUrl? }` (:6502). `track` is `subtitleTrackOutSchema`
+ *       (:896-903) — the ONE new track, NOT the full list, which is why a
  *       successful add is followed by a re-read (below) rather than an
  *       append-in-place. `uploadUrl` is a presigned PUT, present only when
- *       object storage is configured (:5413-5416); it is NEVER rendered — it is
+ *       object storage is configured (:6517-6519); it is NEVER rendered — it is
  *       a credential-bearing URL — and uploading subtitle BYTES is not part of
  *       this panel (#904 is add/remove of the track record).
  *     404 → `{ error, message? }` (`errorSchema`) for an unknown/foreign asset.
  *     APPEND-ONLY, verified: the handler spreads the existing array and pushes
- *       (`[...(asset.subtitleTracks ?? []), track]`, :5428). It does NOT clear
+ *       (`[...(asset.subtitleTracks ?? []), track]`, :6532). It does NOT clear
  *       `default` on the other tracks, so an asset CAN end up with two tracks
  *       flagged default. The form says so instead of implying otherwise.
  *
  *   REMOVE — `DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId}`
  *     openapi.json .paths["/api/v1/assets/{id}/subtitle-tracks/{trackId}"]
- *       .delete; handler src/routes/assets.ts:5438-5460.
- *     Path params `{ id, trackId }` (:5443). No body, no query parameter: the
+ *       carries `delete` and nothing else; handler
+ *       src/routes/assets.ts:6542-6564.
+ *     Path params `{ id, trackId }` (:6547). No body, no query parameter: the
  *       operation declares `parameters` for the two path params and nothing else.
- *     204 → empty (`z.null()`, :5444), so a successful remove returns NO list
+ *     204 → empty (`z.null()`, :6548), so a successful remove returns NO list
  *       and the fresh list must be re-read.
  *     404 → `{ error, message }` for an unknown asset AND for a track id that is
- *       not on it (`message: 'subtitle track not found'`, :5455). The two are not
+ *       not on it (`message: 'subtitle track not found'`, :6559). The two are not
  *       machine-distinguishable, so the inline error does not claim to tell them
  *       apart.
  *     The STORED FILE SURVIVES: "Leaves the subtitle object (if any) in storage"
- *       (:5434-5435) — the handler only filters the list (:5453) and patches
- *       `subtitleTracks` (:5457, applied as the single key by
- *       src/data/couch-asset-repo.ts:416-417). The confirmation step says this in
+ *       (:6538-6539) — the handler only filters the list (:6557) and patches
+ *       `subtitleTracks` (:6561, applied as the single key by
+ *       src/data/couch-asset-repo.ts:433-434). The confirmation step says this in
  *       words rather than letting the operator assume a file was deleted.
  *
  *   REFRESH AFTER A WRITE — `GET /api/v1/assets/{id}/tracks`
  *     openapi.json .paths["/api/v1/assets/{id}/tracks"].get → 200
- *     `{ audioTracks, subtitleTracks }`, BOTH `required` (`tracksSchema`,
- *     src/routes/assets.ts:836-839; handler :5301-5320 sends
- *     `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []`, read through
- *     `repo.get(request.params.id)` at :5311).
+ *     `{ videoTracks, audioTracks, subtitleTracks }` — THREE arrays, ALL THREE
+ *     `required` (`tracksSchema`, src/routes/assets.ts:958-965; `videoTracks`
+ *     added by issue #978). Handler :6404-6424 sends `videoTracksOf(asset)` /
+ *     `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []` (:6418-6422),
+ *     read through `repo.get(request.params.id)` at :6414.
  *     This is the read the panel refuses at RENDER time (it already holds those
  *     bytes) and needs after a WRITE, when it no longer does: neither write
  *     returns the resulting list. It is the smallest authoritative read of the
  *     two editorial arrays — the alternative is the whole asset body — and it
  *     cannot drift from the asset, since the handler projects the same document.
- *     Only the subtitle section is re-rendered from it; the video and probed-audio
- *     attributes come from `technicalMetadata`, which neither write touches.
+ *     Only the subtitle and editorial-audio sections are re-rendered from it.
+ *     `videoTracks` IS present on this response and is deliberately NOT adopted:
+ *     the video section is projected from `technicalMetadata` by
+ *     `videoTracksFromAsset`, because `GET /api/v1/assets/{id}` does NOT expose
+ *     a `videoTracks` array (verified: its 200 schema has `technicalMetadata` /
+ *     `technicalMetadataError` and no `videoTracks`), so the derived path is the
+ *     only source available on the initial render. Adopting the array here would
+ *     switch the video section to a second, differently-shaped source part-way
+ *     through a session — `videoTrackOutSchema` (:930) can report MANY streams
+ *     while the derived projection is capped at one — for data that neither
+ *     subtitle write can change. Video stays read-only and single-sourced; see
+ *     `refreshSubtitles`.
  *
  *   AUTHORISATION — `editor` and `admin` only, mirrored client-side.
  *     Both routes sit under the assets router's two preHandlers: `authGate(app)`
- *     (src/routes/assets.ts:1738) and `resourceAuthorizationPreHandler('asset')`
- *     (:1748). `methodToAction` maps POST → `write` and DELETE → `delete`
+ *     (src/routes/assets.ts:1902) and `resourceAuthorizationPreHandler('asset')`
+ *     (:1912). `methodToAction` maps POST → `write` and DELETE → `delete`
  *     (src/auth/authorize.ts:79-93) and `MATRIX` (:54-58) grants both to `editor`
  *     and `admin` and neither to `viewer`. Refusal is 403
  *     `forbidden_insufficient_role` (`AUTHZ_FORBIDDEN_ERROR`, :99). The
@@ -366,8 +382,8 @@ export const TRACKS_COPY = Object.freeze({
  * The subtitle `format` vocabulary, as an ordered list for the add form.
  *
  * Copied from the contract, not invented: `subtitleFormatSchema =
- * z.enum(SUBTITLE_FORMATS)` (src/routes/assets.ts:808) over
- * `SUBTITLE_FORMATS = ['vtt','srt','ttml']` (src/data/asset-repo.ts:449), which
+ * z.enum(SUBTITLE_FORMATS)` (src/routes/assets.ts:894) over
+ * `SUBTITLE_FORMATS = ['vtt','srt','ttml']` (src/data/asset-repo.ts:466), which
  * is also what `openapi.json` publishes as the `format` enum on both the request
  * and the response schema. A format outside this list is rejected by the route,
  * so the form offers exactly these three and no free-text alternative.
@@ -502,7 +518,7 @@ export function sampleRateLabel(sampleRateHz) {
  *
  * NEVER the opaque track id: the house confirmation primitive requires the
  * subject to be a name an operator recognises (public/app.js, confirmModal's
- * `spec.subject` rule), and a `randomUUID()` (src/routes/assets.ts:5408) is not
+ * `spec.subject` rule), and a `randomUUID()` (src/routes/assets.ts:6512) is not
  * one. `label` is the editorial display name when the server has one, `language`
  * is the only other field required on every track, and the fallback is a phrase
  * rather than an id.
@@ -522,7 +538,7 @@ export function subtitleTrackName(track) {
 /**
  * Validate the add form and build the POST body.
  *
- * Mirrors `addSubtitleTrackSchema` (src/routes/assets.ts:829-834) EXACTLY, and
+ * Mirrors `addSubtitleTrackSchema` (src/routes/assets.ts:915-920) EXACTLY, and
  * sends only the four keys it declares — the body is
  * `additionalProperties: false`, so a fifth key would be a 400 rather than a
  * silently ignored field.
@@ -572,7 +588,7 @@ export function subtitleAddBody(values) {
  *   403 — `forbidden_insufficient_role` (src/auth/authorize.ts:99), the role
  *         mirror having been bypassed or the server disagreeing with it.
  *   404 — `errorSchema`. On remove this covers BOTH an unknown asset and an
- *         unknown track id (src/routes/assets.ts:5450, :5455); nothing in the
+ *         unknown track id (src/routes/assets.ts:6554, :6559); nothing in the
  *         response separates them, so the copy does not pretend to.
  * Everything else (network failure, 5xx, a 400 from a body this build built
  * wrongly) is reported with the message the failure carried, never swallowed.
@@ -604,9 +620,9 @@ export function classifySubtitleTrackError(err, op) {
  *
  * Both impact lists are required by the house primitive and every entry here was
  * read off the handler, not assumed: the list entry is filtered out
- * (src/routes/assets.ts:5453) and `subtitleTracks` is the only patched key
- * (:5457, src/data/couch-asset-repo.ts:416-417), while the stored object is
- * explicitly left alone (:5434-5435). The burn-in consequence is equally
+ * (src/routes/assets.ts:6557) and `subtitleTracks` is the only patched key
+ * (:6561, src/data/couch-asset-repo.ts:433-434), while the stored object is
+ * explicitly left alone (:6538-6539). The burn-in consequence is equally
  * verified: a referenced track id is resolved against the asset's own list and
  * refused when absent (src/pipeline/burn-in.ts:259-265).
  *
@@ -1305,11 +1321,26 @@ export function mountAssetTracks(opts) {
   /**
    * Re-read the editorial track lists and re-render in place.
    *
-   * `GET /assets/{id}/tracks` → `{ audioTracks, subtitleTracks }`, both
-   * `required` (tracksSchema, src/routes/assets.ts:836-839). Both are adopted,
-   * not just the subtitle one: the response is authoritative for the pair and
-   * dropping the audio half would leave two lists on screen read at different
-   * times.
+   * `GET /assets/{id}/tracks` → `{ videoTracks, audioTracks, subtitleTracks }` —
+   * THREE arrays, ALL THREE `required` (tracksSchema,
+   * src/routes/assets.ts:958-965; `videoTracks` added by issue #978).
+   *
+   * Both EDITORIAL arrays are adopted, not just the subtitle one: the response
+   * is authoritative for the pair and dropping the audio half would leave two
+   * lists on screen read at different times.
+   *
+   * `videoTracks` is read and KNOWINGLY IGNORED — this is deliberate, not an
+   * oversight. The video section is projected from `technicalMetadata` by
+   * `videoTracksFromAsset`, because `GET /api/v1/assets/{id}` exposes no
+   * `videoTracks` array (its 200 schema carries `technicalMetadata` /
+   * `technicalMetadataError`), so the derived projection is the only source the
+   * INITIAL render has. Adopting the array only here would swap the video
+   * section onto a second, differently-shaped source part-way through a session
+   * — `videoTrackOutSchema` (src/routes/assets.ts:930) can report many streams,
+   * the derived projection is capped at one — and would contradict the
+   * single-video-row ceiling this panel states on screen. Neither subtitle write
+   * can change video anyway: the POST/DELETE handlers patch `subtitleTracks`
+   * only. Video stays read-only and single-sourced.
    */
   async function refreshSubtitles() {
     const tracks = await o.apiFetch(tracksPath);
@@ -1320,6 +1351,10 @@ export function mountAssetTracks(opts) {
     if (tracks && Array.isArray(tracks.audioTracks)) {
       next.audioTracks = tracks.audioTracks;
     }
+    // `tracks.videoTracks` is the third required array on this response and is
+    // intentionally not copied onto `next` — see the note above. The video
+    // section keeps its single source, `technicalMetadata`, which no subtitle
+    // write touches.
     render(next);
   }
 

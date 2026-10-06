@@ -258,7 +258,7 @@ function canClipAsset() {
 // `admin` and neither to `viewer`, and `methodToAction` (:79-93) maps POST ->
 // write and DELETE -> delete. Both subtitle-track routes sit under the assets
 // router's `resourceAuthorizationPreHandler('asset')`
-// (src/routes/assets.ts:1748, after `authGate` at :1738), so a viewer is
+// (src/routes/assets.ts:1912, after `authGate` at :1902), so a viewer is
 // refused 403 `forbidden_insufficient_role` (src/auth/authorize.ts:99) on
 // either one. ONE flag covers both because the two actions resolve to the same
 // pair of roles. Client-side mirror only: a 403 that arrives anyway is still
@@ -2918,7 +2918,7 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // GET /api/v1/assets/{id}/tracks exists but is NOT called on the render
     // path: its handler sends `asset.audioTracks ?? []` /
     // `asset.subtitleTracks ?? []` off the same document
-    // (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would cost a
+    // (src/routes/assets.ts:6420-6421, repo.get at :6414), so it would cost a
     // round-trip for bytes this renderer is holding. The audio editor DOES call
     // it, but only after a 204 from a remove, which carries no body — see
     // public/audio-track-edit.js.
@@ -2936,23 +2936,29 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //   POST /api/v1/assets/{id}/subtitle-tracks — body REQUIRED, exactly
     //        { language (1..64), format: "vtt"|"srt"|"ttml", label? (1..128),
     //        default? } and `additionalProperties: false`
-    //        (`addSubtitleTrackSchema`, src/routes/assets.ts:829-834, wired at
-    //        :5390-5401); 201 = { track, uploadUrl? } — the ONE new track, not
-    //        the list (:5398) — 404 = { error }.
+    //        (`addSubtitleTrackSchema`, src/routes/assets.ts:915-920, wired at
+    //        :6494-6503); 201 = { track, uploadUrl? } — the ONE new track, not
+    //        the list (:6502) — 404 = { error }.
     //   DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId} — params
-    //        { id, trackId }, no body, no query parameter (:5443); 204 = empty
-    //        (:5444), 404 = { error, message } for an unknown asset AND for an
-    //        unknown track id (:5450, :5455), which are not distinguishable.
-    //   GET /api/v1/assets/{id}/tracks — 200 { audioTracks, subtitleTracks },
-    //        both `required` (`tracksSchema` :836-839, handler :5301-5320). The
-    //        panel calls this ONLY after a write: neither write returns the
-    //        resulting list, and this is the smallest authoritative read of it.
+    //        { id, trackId }, no body, no query parameter (:6547); 204 = empty
+    //        (:6548), 404 = { error, message } for an unknown asset AND for an
+    //        unknown track id (:6554, :6559), which are not distinguishable.
+    //   GET /api/v1/assets/{id}/tracks — 200 { videoTracks, audioTracks,
+    //        subtitleTracks } — THREE arrays, ALL THREE `required`
+    //        (`tracksSchema` :958-965, handler :6404-6424; `videoTracks` added
+    //        by issue #978). The panel calls this ONLY after a write: neither
+    //        write returns the resulting list, and this is the smallest
+    //        authoritative read of it. It adopts the two editorial arrays and
+    //        deliberately ignores `videoTracks` — the video section is
+    //        projected from `technicalMetadata`, which is the only source the
+    //        initial render has (`GET /api/v1/assets/{id}` exposes no
+    //        `videoTracks` array) and which no subtitle write touches.
     //        The initial render still calls nothing — the arrays are already on
     //        the asset body awaited above.
     //
     // The sub-resource paths take the ULID (`asset.id`), which this pane holds
     // even when it was opened by slug: neither handler resolves a slug (both
-    // pass the raw param to `repo.get`, :5404 / :5448).
+    // pass the raw param to `repo.get`, :6508 / :6552).
     //
     // `confirmModal` is handed in so Remove goes through the house confirmation
     // primitive (issue #919) rather than a second, divergent dialog — and the
