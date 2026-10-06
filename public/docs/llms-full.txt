@@ -137,9 +137,8 @@ Response 200 (application/json)
   Get a single provisioning operation's status.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -158,9 +157,8 @@ Response 200 (application/json)
   Get a provisioned stack by name.
 
   Parameters
-NameInTypeRequired
-namepathstringrequired
-
+Name | In | Type | Required
+name | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -210,9 +208,8 @@ Response 200 (application/json)
   Deprovision (tear down) a stack and its backing OSC service instances.
 
   Parameters
-NameInTypeRequired
-namepathstringrequired
-
+Name | In | Type | Required
+name | path | string | required
   Response
 Response 202 (application/json)
 {
@@ -224,9 +221,8 @@ Response 202 (application/json)
   GET /api/v1/provision/{name}/reachability
 
   Parameters
-NameInTypeRequired
-namepathstringrequired
-
+Name | In | Type | Required
+name | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -276,9 +272,8 @@ Response 200 (application/json)
   Get a single optional service's provisioning state.
 
   Parameters
-NameInTypeRequired
-keypathstringrequired
-
+Name | In | Type | Required
+key | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -296,9 +291,8 @@ Response 200 (application/json)
   Deprovision an optional service.
 
   Parameters
-NameInTypeRequired
-keypathstringrequired
-
+Name | In | Type | Required
+key | path | string | required
   Response
 Response 202 (application/json)
 {
@@ -313,9 +307,8 @@ Response 202 (application/json)
   Provision an optional service on demand.
 
   Parameters
-NameInTypeRequired
-keypathstringrequired
-
+Name | In | Type | Required
+key | path | string | required
   Request
 Request body (application/json)
 {
@@ -388,9 +381,8 @@ Response 201 (application/json)
   Seed the profile store from the default transcoder test-profiles index. Pass `?force=true` to re-seed over existing profiles.
 
   Parameters
-NameInTypeRequired
-forcequerybooleanoptional
-
+Name | In | Type | Required
+force | query | boolean | optional
   Response
 Response 200 (application/json)
 {
@@ -403,6 +395,8 @@ Response 200 (application/json)
 
   Public, unauthenticated profile index consumed by transcoder instances at transcode time.
 
+  Public Encore-format profile index (name -> :name/yaml). Served without auth. Response header x-profile-count carries the number of runnable profiles in the emitted index so monitoring consumers can distinguish an empty store (x-profile-count: 0, body {}) from a failure WITHOUT parsing the YAML body. The body and 200 status are unchanged by this header (issue #460).
+
   Response
 Response 200 (application/json)
 "string"
@@ -412,9 +406,8 @@ Response 200 (application/json)
   Get a single profile.
 
   Parameters
-NameInTypeRequired
-namepathstringrequired
-
+Name | In | Type | Required
+name | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -430,9 +423,8 @@ Response 200 (application/json)
   Replace a profile's YAML.
 
   Parameters
-NameInTypeRequired
-namepathstringrequired
-
+Name | In | Type | Required
+name | path | string | required
   Request
 Request body (application/json)
 {
@@ -454,9 +446,8 @@ Response 200 (application/json)
   Delete a profile.
 
   Parameters
-NameInTypeRequired
-namepathstringrequired
-
+Name | In | Type | Required
+name | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -466,9 +457,8 @@ Response 204 (application/json)
   Get a profile's raw YAML body.
 
   Parameters
-NameInTypeRequired
-namepathstringrequired
-
+Name | In | Type | Required
+name | path | string | required
   Response
 Response 200 (application/json)
 "string"
@@ -488,14 +478,13 @@ Assets
   List workspace assets.
 
   Parameters
-NameInTypeRequired
-limitqueryintegeroptional
-offsetqueryintegeroptional
-statusquerystring (uploading, processing, ready, failed, archived)optional
-parentIdquerystringoptional
-fromquerystringoptional
-toquerystringoptional
-
+Name | In | Type | Required | Description
+limit | query | integer | optional |
+offset | query | integer | optional |
+status | query | string (uploading, processing, ready, failed, archived) | optional |
+parentId | query | string | optional |
+from | query | string | optional | Inclusive lower bound on the asset creation timestamp (createdAt). Accepts a calendar date (YYYY-MM-DD, interpreted as the first instant of that UTC day) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page.
+to | query | string | optional | Inclusive upper bound on the asset creation timestamp (createdAt). Accepts a calendar date (YYYY-MM-DD, interpreted as the LAST instant of that UTC day, so the named day is included) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page.
   Response
 Response 200 (application/json)
 {
@@ -599,15 +588,18 @@ Response 201 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   GET /api/v1/assets/by-external-id/{namespace}/{id}
 
-  Parameters
-NameInTypeRequired
-namespacepathstringrequired
-idpathstringrequired
+  Resolve an asset by an upstream external identifier
 
+  Resolve a single asset by the { namespace, id } external identifier correlated to it (ADR-019). namespace labels the upstream system of record; id is the opaque foreign key in that system. Returns the asset when exactly one carries the pair, or 404 when none does.
+
+  Parameters
+Name | In | Type | Required | Description
+namespace | path | string | required | Upstream system-of-record label the external id belongs to (e.g. ingest-mam, rights-registry). Required, non-empty.
+id | path | string | required | Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.
   Response
 Response 200 (application/json)
 {
@@ -649,17 +641,16 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   GET /api/v1/assets/by-tams-address
 
   Look up an asset by its TAMS flow/timerange address.
 
   Parameters
-NameInTypeRequired
-tamsFlowIdquerystringrequired
-tamsTimerangequerystringoptional
-
+Name | In | Type | Required | Description
+tamsFlowId | query | string | required | TAMS flow id (UUID) to resolve. Addressing mode (1): supplying only tamsFlowId resolves the ready asset carrying this flow. Required.
+tamsTimerange | query | string | optional | TAMS TAI timerange (ADR-008 grammar, e.g. [0:0_10:0)). Addressing mode (2): supplying tamsFlowId + tamsTimerange additionally requires an exact stored-timerange match. Optional.
   Response
 Response 200 (application/json)
 {
@@ -720,9 +711,9 @@ Request body (application/json)
   ],
   "sourceBackend": "string"
 }
-Field notes- name — Legacy alias for `title` (issue #347). The editorial title of the asset. `title` and `name` are two input spellings of the SAME canonical field: both persist to `descriptive.title` and are read back as the `name` property on GET /assets/:id, list, and search responses. Prefer `title`; `title` wins when both are supplied.
-- title — The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to `descriptive.title` and is read back as the `name` property on GET /assets/:id, list, and search responses (there is NO separate top-level `title` field on responses). Accepted as an alias of `name`; `title` wins when both are supplied.
-- sourceBackend — Reference (id or name) to a registered external storage backend (issue #548, ADR-017) to source the asset bytes from, instead of the OSC-managed default storage. The backend must be registered (POST /storage/backends) and serve the `source` (or `both`) role. When set, `sourceUrl` addresses the object WITHIN that backend as `s3://<bucket>/<key>` (bucket may be omitted to use the registered backend's bucket, i.e. `s3:///<key>` or a bare `<key>`). No external credentials are ever supplied inline: the registered endpoint + credentials are reused server-side. Omit for the default source.
+Field notes- name — Legacy alias for title (issue #347). The editorial title of the asset. title and name are two input spellings of the SAME canonical field: both persist to descriptive.title and are read back as the name property on GET /assets/:id, list, and search responses. Prefer title; title wins when both are supplied.
+- title — The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to descriptive.title and is read back as the name property on GET /assets/:id, list, and search responses (there is NO separate top-level title field on responses). Accepted as an alias of name; title wins when both are supplied.
+- sourceBackend — Reference (id or name) to a registered external storage backend (issue #548, ADR-017) to source the asset bytes from, instead of the OSC-managed default storage. The backend must be registered (POST /storage/backends) and serve the source (or both) role. When set, sourceUrl addresses the object WITHIN that backend as s3://<bucket>/<key> (bucket may be omitted to use the registered backend's bucket, i.e. s3:///<key> or a bare <key>). No external credentials are ever supplied inline: the registered endpoint + credentials are reused server-side. Omit for the default source.
 
   Response
 Response 202 (application/json)
@@ -735,10 +726,11 @@ Response 202 (application/json)
 
   Deprecated legacy free-text-only search alias. Use the canonical Search endpoint instead.
 
-  Parameters
-NameInTypeRequired
-qquerystringrequired
+  Deprecated free-text alias. Use the canonical GET /api/v1/search/?q=<term> endpoint instead, which serves the same free-text results plus tag, mimeType, metadata, and TAMS filters with total/page pagination. This alias only accepts q and returns { items }; it is retained for backward compatibility and will be removed in a future major version.
 
+  Parameters
+Name | In | Type | Required | Description
+q | query | string | required | Case-insensitive free-text query matched against the asset title (the canonical name field, persisted at descriptive.title) and description — regardless of whether the client set the title through the ingest title field or the legacy name alias (issue #347).
   Response
 Response 200 (application/json)
 {
@@ -785,9 +777,8 @@ Response 200 (application/json)
   Get a single asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -829,16 +820,15 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   PATCH /api/v1/assets/{id}
 
   Update asset fields.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -893,17 +883,16 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   DELETE /api/v1/assets/{id}
 
   Delete an asset.
 
   Parameters
-NameInTypeRequired
-forcequerybooleanoptional
-idpathstringrequired
-
+Name | In | Type | Required
+force | query | boolean | optional
+id | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -913,9 +902,8 @@ Response 204 (application/json)
   Add an audio track to an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -946,10 +934,9 @@ Response 201 (application/json)
   Remove an audio track.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-trackIdpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+trackId | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -959,9 +946,8 @@ Response 204 (application/json)
   Clip a time segment of the asset into a new child asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1012,16 +998,15 @@ Response 201 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   GET /api/v1/assets/{id}/comments
 
   List review comments on an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 [
@@ -1038,9 +1023,8 @@ Response 200 (application/json)
   Add a review comment to an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1056,14 +1040,41 @@ Response 201 (application/json)
   "createdAt": "string"
 }
 
+  POST /api/v1/assets/{id}/deliver
+
+  Parameters
+Name | In | Type | Required
+id | path | string | required
+  Request
+Request body (application/json)
+{
+  "destination": "string"
+}
+
+  Response
+Response 200 (application/json)
+{
+  "assetId": "string",
+  "status": "delivered",
+  "destination": {
+    "id": "string",
+    "name": "string",
+    "role": "packaged"
+  },
+  "bucket": "string",
+  "objectKey": "string",
+  "bytes": 0,
+  "etag": "string",
+  "deliveredAt": "string"
+}
+
   GET /api/v1/assets/{id}/delivery
 
   Get playback URLs for an asset (HLS/DASH manifests and/or presigned source download).
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1092,9 +1103,8 @@ Response 200 (application/json)
   Run a multi-step pipeline execution (e.g. transcode + package) against the asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1149,9 +1159,8 @@ Response 202 (application/json)
   List pipeline executions for an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 [
@@ -1184,10 +1193,9 @@ Response 200 (application/json)
   Get a single pipeline execution.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-execIdpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+execId | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1218,9 +1226,8 @@ Response 200 (application/json)
   Re-wrap the asset into a different container format without re-encoding.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1270,15 +1277,19 @@ Response 201 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   GET /api/v1/assets/{id}/external-ids
 
-  Parameters
-NameInTypeRequired
-idpathstringrequired
+  List an asset's upstream external identifiers
 
+  List the { namespace, id } external identifiers attached to the asset (ADR-019), exactly as stored. namespace labels the upstream system of record; id is the opaque foreign key in that system. Returns an empty array when the asset carries none, and 404 when the asset id is unknown.
+
+  Parameters
+Name | In | Type | Required
+id | path | string | required
   Response
+External identifiers attached to the asset, in persisted order. Empty when none are attached.
 Response 200 (application/json)
 [
   {
@@ -1289,17 +1300,20 @@ Response 200 (application/json)
 
   POST /api/v1/assets/{id}/external-ids
 
-  Parameters
-NameInTypeRequired
-idpathstringrequired
+  Attach an upstream external identifier to an asset
 
+  Attach (or change) an upstream { namespace, id } external identifier on the asset (ADR-019). When per-namespace uniqueness enforcement is enabled by the operator (EXTERNAL_ID_UNIQUENESS=enforced) and the pair already resolves to a different asset, the request is rejected with a 409 external_id_conflict naming the conflicting asset id. Attaching a pair the asset already carries is a no-op.
+
+  Parameters
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
   "namespace": "string",
   "id": "string"
 }
-Field notes- namespace — Upstream system-of-record label the external id belongs to (e.g. `ingest-mam`, `rights-registry`). Required, non-empty.
+Field notes- namespace — Upstream system-of-record label the external id belongs to (e.g. ingest-mam, rights-registry). Required, non-empty.
 - id — Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.
 
   Response
@@ -1343,16 +1357,19 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId}
 
-  Parameters
-NameInTypeRequired
-idpathstringrequired
-namespacepathstringrequired
-externalIdpathstringrequired
+  Detach an upstream external identifier from an asset
 
+  Remove the { namespace, id } external identifier from the asset (ADR-019) — the inverse of POST /assets/{id}/external-ids, for correcting a mistyped or stale correlation. Idempotent: returns 204 whether or not the asset carried the pair, so a repeated call is never an error. 404 is returned only when the asset itself does not exist.
+
+  Parameters
+Name | In | Type | Required | Description
+id | path | string | required | Asset id.
+namespace | path | string | required | Upstream system-of-record label the external id belongs to (e.g. ingest-mam, rights-registry). Required, non-empty.
+externalId | path | string | required | Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.
   Response
 Response 204 (application/json)
 "null"
@@ -1362,9 +1379,8 @@ Response 204 (application/json)
   Extract technical metadata (codec, resolution, duration, bitrate) from the asset's source file.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1377,9 +1393,8 @@ Response 200 (application/json)
   List the source and derived media files stored for an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1414,9 +1429,8 @@ Response 200 (application/json)
   PUT /api/v1/assets/{id}/lock
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1465,14 +1479,13 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   DELETE /api/v1/assets/{id}/lock
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1514,16 +1527,15 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   PUT /api/v1/assets/{id}/metadata
 
   Replace an asset's free-form metadata.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {}
@@ -1569,16 +1581,15 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   POST /api/v1/assets/{id}/multipart/initiate
 
   Initiate a multipart upload for large source media.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1592,10 +1603,9 @@ Response 200 (application/json)
   Abort a multipart upload.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-uploadIdpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+uploadId | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -1605,10 +1615,9 @@ Response 204 (application/json)
   Complete a multipart upload.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-uploadIdpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+uploadId | path | string | required
   Request
 Request body (application/json)
 {
@@ -1632,11 +1641,10 @@ Response 200 (application/json)
   Get a presigned URL for one multipart upload part.
 
   Parameters
-NameInTypeRequired
-partNumberqueryintegerrequired
-idpathstringrequired
-uploadIdpathstringrequired
-
+Name | In | Type | Required
+partNumber | query | integer | required
+id | path | string | required
+uploadId | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1650,9 +1658,8 @@ Response 200 (application/json)
   Submit an HLS/DASH packaging job for the asset's transcoded renditions.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1674,9 +1681,8 @@ Response 202 (application/json)
   List pipeline definitions available to run against the asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 [
@@ -1709,9 +1715,8 @@ Response 200 (application/json)
   Restore a soft-deleted asset within its retention window.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1753,16 +1758,15 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   GET /api/v1/assets/{id}/review-state
 
   Get an asset's editorial review state and the transitions that are legal from it.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1771,17 +1775,16 @@ Response 200 (application/json)
     "draft"
   ]
 }
-Field notes- reviewState — The current editorial review state. `draft` for assets that have never been submitted (including ones stored before the field existed). INDEPENDENT of the lifecycle `status`.
-- allowedTransitions — The review states this asset may move to next, from its current `reviewState`. Every value listed here is accepted by POST /assets/{id}/review-state; every state NOT listed (other than `reviewState` itself) is refused with 422. The current state is never listed — re-sending it succeeds as an idempotent no-op but is not a move. May be empty, which means the state is terminal.
+Field notes- reviewState — The current editorial review state. draft for assets that have never been submitted (including ones stored before the field existed). INDEPENDENT of the lifecycle status.
+- allowedTransitions — The review states this asset may move to next, from its current reviewState. Every value listed here is accepted by POST /assets/{id}/review-state; every state NOT listed (other than reviewState itself) is refused with 422. The current state is never listed — re-sending it succeeds as an idempotent no-op but is not a move. May be empty, which means the state is terminal.
 
   POST /api/v1/assets/{id}/review-state
 
   Transition an asset's editorial review state (draft / in-review / approved / rejected).
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1829,17 +1832,16 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   GET /api/v1/assets/{id}/stream/{*}
 
   Proxy-stream a packaged HLS/DASH manifest or media segment.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-*pathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+* | path | string | required
   Response
 Response 200
 (no body)
@@ -1849,9 +1851,8 @@ Response 200
   Add a subtitle track to an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1880,10 +1881,9 @@ Response 201 (application/json)
   Remove a subtitle track.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-trackIdpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+trackId | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -1893,9 +1893,8 @@ Response 204 (application/json)
   Add a tag to an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -1945,17 +1944,16 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   DELETE /api/v1/assets/{id}/tags/{tag}
 
   Remove a tag from an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-tagpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+tag | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -1997,16 +1995,15 @@ Response 200 (application/json)
   },
   "parentId": "string"
 }
-Field notes- name — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.
+Field notes- name — Canonical editorial title of the asset. Set on ingest via title (or the legacy name alias) and persisted to descriptive.title; this is the single documented location for title across GET, list, and search responses. There is no separate top-level title field.
 
   GET /api/v1/assets/{id}/thumbnails
 
   List extracted thumbnails.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2021,9 +2018,8 @@ Response 200 (application/json)
   Extract poster frame thumbnails at one or more timecodes.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -2046,10 +2042,9 @@ Response 200 (application/json)
   Get a single extracted thumbnail.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-indexpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+index | path | string | required
   Response
 Response 200
 (no body)
@@ -2057,10 +2052,9 @@ Response 200
   GET /api/v1/assets/{id}/thumbnails/{index}/url
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-indexpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+index | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2077,12 +2071,21 @@ Response 200 (application/json)
   List an asset's audio and subtitle tracks.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
+  "videoTracks": [
+    {
+      "codec": "string",
+      "width": 0,
+      "height": 0,
+      "index": 0,
+      "bitrateBps": 0,
+      "frameRate": 0
+    }
+  ],
   "audioTracks": [
     {
       "id": "string",
@@ -2110,9 +2113,8 @@ Response 200 (application/json)
   Submit an ABR transcoding job for the asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -2158,9 +2160,8 @@ Field notes- warning — Present only when profileParams validation could not be
   Direct upload of source media for an asset.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2173,9 +2174,8 @@ Response 200 (application/json)
   Finalize a completed direct or presigned upload.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2188,9 +2188,8 @@ Response 200 (application/json)
   Get a presigned single-part upload URL for an asset's source media.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2205,9 +2204,8 @@ Response 200 (application/json)
   List an asset's version history.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2267,10 +2265,9 @@ Jobs
   List background jobs.
 
   Parameters
-NameInTypeRequired
-limitquerynumberoptional
-offsetquerynumberoptional
-
+Name | In | Type | Required
+limit | query | number | optional
+offset | query | number | optional
   Response
 Response 200 (application/json)
 {
@@ -2286,8 +2283,8 @@ Response 200 (application/json)
       "attempts": 0,
       "createdAt": "string",
       "updatedAt": "string",
-      "totalBytes": 0,
-      "error": "string"
+      "assetName": "string",
+      "totalBytes": 0
     }
   ],
   "total": 0
@@ -2297,10 +2294,11 @@ Response 200 (application/json)
 
   Get a job.
 
-  Parameters
-NameInTypeRequired
-idpathstringrequired
+  Read a single job. For transcode jobs, encodeAttempts is the number of Encore dispatches and encodeAttemptLog records each dispatch in order (index, startedAt, endedAt?, classification?). This is DISTINCT from attempts, which counts ingest/URL-pull attempts. To obtain the elapsed time of the successful encode alone (excluding retries), read the LAST entry of encodeAttemptLog and compute endedAt − startedAt.
 
+  Parameters
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2314,22 +2312,22 @@ Response 200 (application/json)
   "attempts": 0,
   "createdAt": "string",
   "updatedAt": "string",
-  "totalBytes": 0,
-  "error": "string"
+  "assetName": "string",
+  "totalBytes": 0
 }
-Field notes- packagingId — Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of `encoreJobId`.
+Field notes- assetName — Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to assetId, which is always present.
+- packagingId — Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of encoreJobId.
 - outputPrefix — Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH objects under.
-- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
-- interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
+- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays running — it is NOT reported as failed. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
+- interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when interrupted is true. interrupted_by_scaledown: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
 
   DELETE /api/v1/jobs/{id}
 
   Cancel or delete a job.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2343,13 +2341,14 @@ Response 200 (application/json)
   "attempts": 0,
   "createdAt": "string",
   "updatedAt": "string",
-  "totalBytes": 0,
-  "error": "string"
+  "assetName": "string",
+  "totalBytes": 0
 }
-Field notes- packagingId — Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of `encoreJobId`.
+Field notes- assetName — Human-readable name of the job's asset, resolved at read time. Absent when the asset has been deleted or cannot be read; fall back to assetId, which is always present.
+- packagingId — Correlation id carried through the packager queue message and echoed on the packager completion callback. The package-job counterpart of encoreJobId.
 - outputPrefix — Deterministic packaged-output prefix this job writes its CMAF/HLS/DASH objects under.
-- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays `running` — it is NOT reported as `failed`. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
-- interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when `interrupted` is true. `interrupted_by_scaledown`: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
+- interrupted — True when the job was interrupted by an infrastructure/topology event (not a media failure) and is being auto-retried. The job stays running — it is NOT reported as failed. Absent on jobs that were never interrupted. Additive and backward compatible with the existing status enum.
+- interruptionReason — Distinguishable, clearly-recoverable reason the job was interrupted, present only when interrupted is true. interrupted_by_scaledown: the shared worker pool scaled a worker away mid-job, so the work was lost to a topology event (not a media failure). This is RECOVERABLE and typically AUTO-RETRIED by the service with no operator intervention; callers may also retry safely.
 
 ---
 
@@ -2366,11 +2365,10 @@ Pipelines
   List pipeline executions across all assets.
 
   Parameters
-NameInTypeRequired
-statusquerystring (running, done, failed)optional
-limitqueryintegeroptional
-offsetqueryintegeroptional
-
+Name | In | Type | Required
+status | query | string (running, done, failed) | optional
+limit | query | integer | optional
+offset | query | integer | optional
   Response
 Response 200 (application/json)
 {
@@ -2406,9 +2404,8 @@ Response 200 (application/json)
   Get a pipeline execution.
 
   Parameters
-NameInTypeRequired
-executionIdpathstringrequired
-
+Name | In | Type | Required
+executionId | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2439,9 +2436,8 @@ Response 200 (application/json)
   Delete a pipeline execution record.
 
   Parameters
-NameInTypeRequired
-executionIdpathstringrequired
-
+Name | In | Type | Required
+executionId | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2513,9 +2509,8 @@ Response 200 (application/json)
   Get a transcoder job's status directly from the transcoder.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2577,8 +2572,7 @@ Response 200 (application/json)
   "workspaces": [
     {
       "workspaceId": "string",
-      "queueDepth": 0,
-      "inflightDepth": 0,
+      "observed": true,
       "instances": [
         {
           "instanceId": null,
@@ -2588,7 +2582,27 @@ Response 200 (application/json)
           "readyAt": null,
           "draining": null
         }
-      ]
+      ],
+      "connectionId": "string",
+      "unobservedReason": "string",
+      "queueDepth": 0,
+      "inflightDepth": 0,
+      "spawnFailure": {
+        "at": 0,
+        "attempts": 0,
+        "consecutiveFailures": 0,
+        "message": "string"
+      }
+    }
+  ],
+  "connections": [
+    {
+      "stacks": [
+        "string"
+      ],
+      "observed": true,
+      "connectionId": "string",
+      "unobservedReason": "string"
     }
   ],
   "maxInstances": 0,
@@ -2650,15 +2664,16 @@ Logs
 
   Query structured application logs.
 
-  Parameters
-NameInTypeRequired
-limitqueryintegeroptional
-cursorquerystringoptional
-fromquerystringoptional
-toquerystringoptional
-qquerystringoptional
-orderquerystring (asc, desc)optional
+  List operational log records as a cursor-paged, newest-first stream. Pass cursor (from a prior response nextCursor) to page forward; a null nextCursor marks the last page. Filter server-side with from/to (ISO-8601 time range on timestamp) and q (case-insensitive message substring). Set order=asc to reverse the default newest-first sort. This endpoint is cursor-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473). Response header x-log-window-degraded: true means the durable store could not scan its whole retained window for this read and the page covers the newest records only; the body and 200 status are unchanged by this header (#996).
 
+  Parameters
+Name | In | Type | Required
+limit | query | integer | optional
+cursor | query | string | optional
+from | query | string | optional
+to | query | string | optional
+q | query | string | optional
+order | query | string (asc, desc) | optional
   Response
 Response 200 (application/json)
 {
@@ -2688,19 +2703,20 @@ Search
 
   Full-text and metadata search across assets (canonical). Combines exact filters (`tags`, `mimeType`, `metadata.<key>`, `tamsFlowId`, `tamsTimerange`) with free-text `q`, all ANDed, paginated.
 
-  Parameters
-NameInTypeRequired
-qquerystringoptional
-tagsquerystringoptional
-mimeTypequerystringoptional
-statusquerystring (uploading, processing, ready, failed, archived)optional
-fromquerystringoptional
-toquerystringoptional
-tamsFlowIdquerystringoptional
-tamsTimerangequerystringoptional
-pagequeryintegeroptional
-pageSizequeryintegeroptional
+  The single canonical search endpoint. Combines an exact-filter tier (tags, mimeType, metadata.<key>, tamsFlowId, tamsTimerange) with a free-text tier (q, matched case-insensitively over name and description). All filters are ANDed; omit them all to list every asset and collection in the workspace. Both assets AND collections are searched (issue #561): a collection matches on its name/description/tags and its open custom bag (via metadata.<key>). Asset-only filters (mimeType, tamsFlowId, tamsTimerange) never match a collection. Asset hits and collection hits are returned in separate arrays and each carries a type discriminator ('asset' | 'collection') so they are unambiguously distinguishable. mimeType filters on the extracted container format and accepts either a container token (mp4) or a common media MIME type (video/mp4), which is resolved onto the container family it names (issue #822). Results are paginated via page/pageSize and returned as { assets, collections, total, collectionTotal, page }. The exact-filter tier also carries status (exact lifecycle match, asset-only) and an inclusive created-at range from/to (issue #833); both are applied to the whole matched set before pagination, so they narrow total and every page rather than the page in hand. Results are ALWAYS CURRENT and there is no reindex step (issue #929): this endpoint reads the stored assets and collections per request rather than consulting a separately maintained index, so an edit made through PATCH /api/v1/assets/{id} or PATCH /api/v1/collections/{id} — a rename included — is reflected by the next search with nothing called in between.
 
+  Parameters
+Name | In | Type | Required | Description
+q | query | string | optional | Case-insensitive free-text query matched against the asset title (the canonical name field, persisted at descriptive.title) and description. Matches title whether the client set it through the ingest title field or the legacy name alias (issue #347).
+tags | query | string | optional |
+mimeType | query | string | optional | Container-format filter, matched against the probe-extracted technicalMetadata.containerFormat. Accepts either a bare container token (mp4, mov, webm, matroska) or a common media MIME type (video/mp4), which is resolved onto the ffprobe container family it names — so video/mp4 matches an asset stored as mov,mp4,m4a (issue #822). Matching is case-insensitive and per family token. A MIME-shaped value that neither maps to a container family nor names a content type this API accepts on upload can never match any asset, and is rejected with 400 unsupported_mime_type rather than silently returning an empty result set.
+status | query | string (uploading, processing, ready, failed, archived) | optional | Exact-match lifecycle status filter, identical in accepted values and match semantics to GET /api/v1/assets/?status=. Applied independently of q, so the same status answers the same asset set with or without a free-text term. Asset-only: supplying it excludes all collection hits, since a collection has no lifecycle status.
+from | query | string | optional | Inclusive lower bound on the asset creation timestamp (createdAt). Accepts a calendar date (YYYY-MM-DD, interpreted as the first instant of that UTC day) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page.
+to | query | string | optional | Inclusive upper bound on the asset creation timestamp (createdAt). Accepts a calendar date (YYYY-MM-DD, interpreted as the LAST instant of that UTC day, so the named day is included) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page.
+tamsFlowId | query | string | optional |
+tamsTimerange | query | string | optional |
+page | query | integer | optional |
+pageSize | query | integer | optional |
   Response
 Response 200 (application/json)
 {
@@ -2816,9 +2832,8 @@ Response 201 (application/json)
   Delete a webhook.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -2907,9 +2922,8 @@ Response 201 (application/json)
   Get a collection.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -2939,9 +2953,8 @@ Response 200 (application/json)
   PATCH /api/v1/collections/{id}
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -2978,27 +2991,83 @@ Response 200 (application/json)
 
   DELETE /api/v1/collections/{id}
 
-  Delete a collection.
+  Delete a collection. Empty ones delete outright; a non-empty one is refused with 409 until you confirm its member count.
+
+  Delete a collection. Member assets are never touched: membership lives inside the collection document, so deleting it unlinks the members and nothing more.
+Deleting an EMPTY collection needs no extra parameter and answers 204. An unknown or foreign collection id is also a silent 204 (existence is never leaked), so 404 is not emitted on this route.
+Deleting a NON-EMPTY collection is refused by default with 409 delete_blocked, reason: "member_of_collection", carrying memberCount — the number of member assets the collection currently holds. The confirm-then-delete flow is:
+- DELETE /api/v1/collections/{id} → 409 with reason: "member_of_collection" and e.g. memberCount: 7.
+- Show the caller what they are about to unlink, then re-issue DELETE /api/v1/collections/{id}?confirmMemberCount=7 → 204.
+The confirmation must match the CURRENT member count. If someone added or removed members in between, the retry is refused with the same 409 member_of_collection carrying the new authoritative memberCount — never a silent delete. Re-confirm with that value and retry. ?force=true is the blind alternative: it skips the count check entirely.
+A 409 with reason: "delete_protected" is a DIFFERENT and unrelated condition: the collection carries an explicit delete lock. It is a hard block — neither ?confirmMemberCount= nor ?force=true bypasses it, it carries NO memberCount, and both blockedBy arrays are empty. The only way forward is to clear the lock with DELETE /api/v1/collections/{id}/lock (then delete as normal). Branch on reason, not on the status code or message.
 
   Parameters
-NameInTypeRequired
-forcequerybooleanoptional
-confirmMemberCountqueryintegeroptional
-idpathstringrequired
-
+Name | In | Type | Required | Description
+force | query | boolean | optional | Blind override of the soft member_of_collection block: delete a non-empty collection without asserting its member count. Prefer confirmMemberCount — force deletes whatever is there, including members added since you last read the collection. Never bypasses a delete_protected lock.
+confirmMemberCount | query | integer | optional | Assert how many member assets the collection currently holds, to delete a non-empty collection safely. Use the memberCount from the 409 member_of_collection response (or the length of assetIds from GET /api/v1/collections/{id}). Matches the current count -> the delete proceeds (204). Does not match -> 409 member_of_collection with the real memberCount; never a silent delete. Omit it to keep the safe default (non-empty collections are refused).
+id | path | string | required |
   Response
+Deleted. Also returned for an unknown or foreign collection id (delete is idempotent and never leaks existence).
 Response 204 (application/json)
 "null"
+
+  Response 400
+Malformed query parameter — e.g. a confirmMemberCount that is not a non-negative integer.
+Response 404
+Not emitted on this route; an unknown or foreign collection id answers 204.
+Response 409
+Delete refused. Branch on reason: member_of_collection means the collection still holds memberCount member assets — retry with ?confirmMemberCount=<memberCount>. delete_protected means an explicit delete lock is set — clear it with DELETE /api/v1/collections/{id}/lock; no confirmation or ?force=true can bypass it.
+Field notes- error — Always delete_blocked. The single error code for every refused delete.
+- message — Human-readable explanation. Do not branch on it — branch on reason.
+- reason — Machine-readable cause, and the only field a client should branch on. delete_protected — an explicit delete lock is set on the collection; a HARD block that neither ?force=true nor ?confirmMemberCount= can bypass, and is lifted only by DELETE /api/v1/collections/{id}/lock. member_of_collection — the collection still holds member assets; a SOFT block, resolved by re-issuing the delete with ?confirmMemberCount=<memberCount> (or ?force=true). referenced_by_job is part of the shared envelope and is not emitted on this route.
+- blockedBy — The references that blocked the delete. Both arrays are empty on delete_protected.
+- memberCount — Present ONLY on member_of_collection: the number of member assets the collection currently holds. Echo this value back as ?confirmMemberCount=<memberCount> to delete the collection in one follow-up call. Absent on delete_protected.
+
+reason: member_of_collection — retry with ?confirmMemberCount=7
+{
+  "error": "delete_blocked",
+  "message": "collection 01J8ZK9F4Q is in use (7 member asset(s))",
+  "reason": "member_of_collection",
+  "blockedBy": {
+    "jobIds": [],
+    "collectionIds": [
+      "01J8ZK9F4Q"
+    ]
+  },
+  "memberCount": 7
+}
+reason: member_of_collection — stale confirmation, re-confirm with 8
+{
+  "error": "delete_blocked",
+  "message": "collection 01J8ZK9F4Q has 8 member asset(s), not the confirmed 7",
+  "reason": "member_of_collection",
+  "blockedBy": {
+    "jobIds": [],
+    "collectionIds": [
+      "01J8ZK9F4Q"
+    ]
+  },
+  "memberCount": 8
+}
+reason: delete_protected — clear the lock first (no memberCount)
+{
+  "error": "delete_blocked",
+  "message": "collection 01J8ZK9F4Q is protected from deletion by an explicit lock",
+  "reason": "delete_protected",
+  "blockedBy": {
+    "jobIds": [],
+    "collectionIds": []
+  }
+}
 
   PUT /api/v1/collections/{id}/assets/{assetId}
 
   Add an asset to a collection.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-assetIdpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+assetId | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -3027,10 +3096,9 @@ Response 200 (application/json)
   Remove an asset from a collection.
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-assetIdpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
+assetId | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -3057,9 +3125,8 @@ Response 200 (application/json)
   PUT /api/v1/collections/{id}/lock
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -3093,9 +3160,8 @@ Response 200 (application/json)
   DELETE /api/v1/collections/{id}/lock
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -3196,9 +3262,8 @@ Response 201 (application/json)
   GET /api/v1/storage/backends/{id}
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -3223,9 +3288,8 @@ Response 200 (application/json)
   PATCH /api/v1/storage/backends/{id}
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -3265,9 +3329,8 @@ Response 200 (application/json)
   DELETE /api/v1/storage/backends/{id}
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -3275,9 +3338,8 @@ Response 204 (application/json)
   POST /api/v1/storage/backends/{id}/test-connection
 
   Parameters
-NameInTypeRequired
-idpathstringrequired
-
+Name | In | Type | Required
+id | path | string | required
   Request
 Request body (application/json)
 {
@@ -3327,11 +3389,10 @@ Response 201 (application/json)
   List objects in a bucket.
 
   Parameters
-NameInTypeRequired
-prefixquerystringoptional
-limitqueryintegeroptional
-bucketpathstringrequired
-
+Name | In | Type | Required
+prefix | query | string | optional
+limit | query | integer | optional
+bucket | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -3352,10 +3413,9 @@ Response 200 (application/json)
   Delete an object from a bucket.
 
   Parameters
-NameInTypeRequired
-bucketpathstringrequired
-*pathstringrequired
-
+Name | In | Type | Required
+bucket | path | string | required
+* | path | string | required
   Response
 Response 204 (application/json)
 "null"
@@ -3365,9 +3425,8 @@ Response 204 (application/json)
   Get watch-folder status for a bucket.
 
   Parameters
-NameInTypeRequired
-bucketpathstringrequired
-
+Name | In | Type | Required
+bucket | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -3381,9 +3440,8 @@ Response 200 (application/json)
   Toggle watch-folder ingest for a bucket.
 
   Parameters
-NameInTypeRequired
-bucketpathstringrequired
-
+Name | In | Type | Required
+bucket | path | string | required
   Response
 Response 200 (application/json)
 {
@@ -3540,7 +3598,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (118 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (119 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3550,7 +3608,7 @@ Optional services4
 Discover and provision add-on OSC services for a workspace.
 Profiles8
 Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
-Assets51
+Assets52
 Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
 Jobs3
 Background job status for asynchronous asset operations.
@@ -3869,6 +3927,53 @@ curl -X POST https://<your-instance>/api/v1/collections \
 
 Add and remove assets with PUT /api/v1/collections/{id}/assets/{assetId} / DELETE /api/v1/collections/{id}/assets/{assetId}. Full shape in the Collections reference.
 
+Deleting a collection
+
+Deleting a collection never deletes its member assets — membership lives on the collection, so the delete just unlinks them.
+
+An empty collection deletes outright. A non-empty one is refused, so you can't tear down a grouping you haven't looked at:
+
+Request
+curl -i -X DELETE https://<your-instance>/api/v1/collections/<id>
+
+Response 409
+{
+  "error": "delete_blocked",
+  "message": "collection 01J8ZK9F4Q is in use (7 member asset(s))",
+  "reason": "member_of_collection",
+  "blockedBy": {
+    "jobIds": [],
+    "collectionIds": [
+      "01J8ZK9F4Q"
+    ]
+  },
+  "memberCount": 7
+}
+
+Branch on reason, never on the status code alone. member_of_collection means the collection still holds memberCount assets. Show the user what they're about to unlink, then echo that number back to confirm:
+
+Request
+curl -i -X DELETE "https://<your-instance>/api/v1/collections/<id>?confirmMemberCount=7"
+
+That answers 204. The count must match the collection's current membership: if someone added or removed an asset in between, you get the same 409 member_of_collection back carrying the new authoritative memberCount — re-confirm with that value and retry. The delete is never silent, so you can't destroy a set that changed under you. ?force=true is the blind alternative; it skips the count check entirely.
+
+A 409 with reason: "delete_protected" is a different condition and needs a different fix. It means the collection carries an explicit delete lock. There is no memberCount, both blockedBy arrays are empty, and neither ?confirmMemberCount= nor ?force=true gets past it:
+
+Response 409
+{
+  "error": "delete_blocked",
+  "message": "collection 01J8ZK9F4Q is protected from deletion by an explicit lock",
+  "reason": "delete_protected",
+  "blockedBy": {
+    "jobIds": [],
+    "collectionIds": []
+  }
+}
+
+Clear the lock with DELETE /api/v1/collections/{id}/lock first, then delete as normal. Treating delete_protected as a retryable confirmation prompt is the usual integration bug here — no number of retries will ever succeed.
+
+Every parameter and the full 409 shape are in the Collections reference.
+
 Webhooks
 
 Register an HTTP endpoint to be notified as assets and jobs change state, instead of polling:
@@ -4085,156 +4190,100 @@ Workspace (provisioned Stack)
 
   The central entity. Represents one piece of media through its whole lifecycle — from an empty record through upload, processing, and (optionally) packaging.
 
-    FieldTypeNotes
-
-      idstringOpaque identifier.
-
-      namestringCanonical editorial title. Set on ingest via title (or the legacy name alias); persisted at descriptive.title.
-
-      statusenumuploading · processing · ready · failed · archived
-
-      reviewStateenumdraft · in-review · approved · rejected
-
-      parentId / versionOfAssetId / versionGroupIdstringLinks a clip, rendition, or version back to its source asset.
-
-      statusHistoryarrayEvery status transition, with a timestamp.
-
-      technicalMetadataobjectCodec, resolution, duration, bitrate — populated by extract-metadata.
-
-      manifestUrlsobjectPopulated once packaging completes.
-
-      renditionsarrayReferences to child assets produced by transcoding.
-
-      thumbnails, audioTracks, subtitleTracks, tagsarraySee the thumbnails and metadata guides.
-
-      metadataobjectFree-form, application-defined key-value data.
-
-      createdAt / updatedAtstring (date-time)
-
+    Field | Type | Notes
+      id | string | Opaque identifier.
+      name | string | Canonical editorial title. Set on ingest via title (or the legacy name alias); persisted at descriptive.title.
+      status | enum | uploading · processing · ready · failed · archived
+      reviewState | enum | draft · in-review · approved · rejected
+      parentId / versionOfAssetId / versionGroupId | string | Links a clip, rendition, or version back to its source asset.
+      statusHistory | array | Every status transition, with a timestamp.
+      technicalMetadata | object | Codec, resolution, duration, bitrate — populated by extract-metadata.
+      manifestUrls | object | Populated once packaging completes.
+      renditions | array | References to child assets produced by transcoding.
+      thumbnails, audioTracks, subtitleTracks, tags | array | See the thumbnails and metadata guides.
+      metadata | object | Free-form, application-defined key-value data.
+      createdAt / updatedAt | string (date-time) |
   Full request/response shapes: Assets reference.
 
   Job
 
   One unit of asynchronous work against an asset — ingest or transcode. Created by the endpoint that starts the work; polled until it settles.
 
-    FieldTypeNotes
-
-      idstring
-
-      typeenumingest-url · transcode
-
-      statusenumpending · queued · running · done · failed · cancelled
-
-      assetIdstringThe asset this job is working on.
-
-      progressnumber
-
-      bytesTransferred / totalBytesnumberIngest download progress.
-
-      renditionAssetIdsarrayChild assets created by a completed transcode job.
-
-      interrupted / interruptionReasonboolean / enumSet when the job was interrupted by an infrastructure event (e.g. auto-scaler scale-down) rather than a media failure, and is being retried.
-
-      createdAt / updatedAtstring (date-time)
-
+    Field | Type | Notes
+      id | string |
+      type | enum | ingest-url · transcode
+      status | enum | pending · queued · running · done · failed · cancelled
+      assetId | string | The asset this job is working on.
+      progress | number |
+      bytesTransferred / totalBytes | number | Ingest download progress.
+      renditionAssetIds | array | Child assets created by a completed transcode job.
+      interrupted / interruptionReason | boolean / enum | Set when the job was interrupted by an infrastructure event (e.g. auto-scaler scale-down) rather than a media failure, and is being retried.
+      createdAt / updatedAt | string (date-time) |
   Full shape: Jobs reference.
 
   Pipeline Execution
 
   Tracks a multi-step run (for example, transcode then package) against one asset as a single unit, rather than making the caller sequence and poll individual jobs.
 
-    FieldTypeNotes
-
-      idstring
-
-      assetId / assetNamestring
-
-      pipelineNamestringWhich pipeline definition was run.
-
-      statusenumrunning · done · failed
-
-      stepsarrayPer-step status within the execution.
-
+    Field | Type | Notes
+      id | string |
+      assetId / assetName | string |
+      pipelineName | string | Which pipeline definition was run.
+      status | enum | running · done · failed
+      steps | array | Per-step status within the execution.
   Full shape: Pipelines reference.
 
   Profile
 
   A named transcoding rendition ladder, stored as raw YAML and served to the transcoder via the public index.yml endpoint. Seeded from a default set on bootstrap; extendable per workspace.
 
-    FieldTypeNotes
-
-      namestringPrimary key.
-
-      yamlstringRaw transcoder-format profile definition.
-
-      runnableboolean
-
+    Field | Type | Notes
+      name | string | Primary key.
+      yaml | string | Raw transcoder-format profile definition.
+      runnable | boolean |
   Full shape: Profiles reference.
 
   Collection
 
-    FieldTypeNotes
-
-      id / namestring
-
-      assetIdsarrayMember asset ids.
-
-      assetsarrayExpanded member asset summaries (on GET).
-
+    Field | Type | Notes
+      id / name | string |
+      assetIds | array | Member asset ids.
+      assets | array | Expanded member asset summaries (on GET).
   Full shape: Collections reference.
 
   Webhook
 
-    FieldTypeNotes
-
-      idstring
-
-      urlstring (uri)Delivery target.
-
-      eventsarrayasset.ready · asset.failed · transcode.complete · transcode.failed · package.complete · package.failed
-
-      secretstringUsed to sign deliveries, if set.
-
+    Field | Type | Notes
+      id | string |
+      url | string (uri) | Delivery target.
+      events | array | asset.ready · asset.failed · transcode.complete · transcode.failed · package.complete · package.failed
+      secret | string | Used to sign deliveries, if set.
   Full shape: Webhooks reference.
 
   Stack (provisioned workspace)
 
-    FieldTypeNotes
-
-      statusenumprovisioning · ready · failed · degraded
-
-      minioEndpoint / couchdbUrl / redisUrlstringBacking service endpoints for this workspace.
-
-      sourceBucket / packagedBucketstring
-
-      servicesarrayBacking OSC service instances that make up this stack.
-
+    Field | Type | Notes
+      status | enum | provisioning · ready · failed · degraded
+      minioEndpoint / couchdbUrl / redisUrl | string | Backing service endpoints for this workspace.
+      sourceBucket / packagedBucket | string |
+      services | array | Backing OSC service instances that make up this stack.
   Full shape: Provisioning reference.
 
   Provisioning Operation
 
-    FieldTypeNotes
-
-      idstring
-
-      typeenumprovision · deprovision
-
-      statusenumpending · running · done · failed
-
-      startedAt / completedAtnumberUnix epoch milliseconds — not ISO date-time, unlike most other timestamps.
-
+    Field | Type | Notes
+      id | string |
+      type | enum | provision · deprovision
+      status | enum | pending · running · done · failed
+      startedAt / completedAt | number | Unix epoch milliseconds — not ISO date-time, unlike most other timestamps.
   Full shape: Provisioning reference.
 
   Optional Service
 
-    FieldTypeNotes
-
-      key / serviceId / displayNamestring
-
-      stateenumnot-configured · configured · active
-
-      instanceName / urlstringPresent once provisioned.
-
+    Field | Type | Notes
+      key / serviceId / displayName | string |
+      state | enum | not-configured · configured · active
+      instanceName / url | string | Present once provisioned.
   Full shape: Optional services reference.
 
 ---
@@ -4315,27 +4364,17 @@ Environment variables
 
 On Open Source Cloud only the settings exposed by the service's deploy form are configurable — the required credentials above plus the optional ENCORE_* tuning knobs. The others are injected automatically by the deploy step or fixed by the platform, and can only be set directly when you run open-videocore yourself (self-hosted). The OSC-configurable column below marks which is which.
 
-  VariableRequiredOSC-configurableDescription
-
-    OSC_ACCESS_TOKENYesInjectedPersonal Access Token. Injected automatically at deploy time on OSC.
-
-    PARAMETER_STORE_API_KEYYesYesConfig API key of the connected parameter store.
-
-    PARAMETER_STORE_INSTANCE_NAMEYesYesName of the parameter store (default ovcconfig). On OSC this is the ParameterStore deploy-form field.
-
-    MINIO_ROOT_PASSWORDYesYesAdmin password used when provisioning object storage instances.
-
-    COUCHDB_ADMIN_PASSWORDYesYesAdmin password used when provisioning the metadata store.
-
-    PORTNoNoHTTP port (default 3000). Fixed by the platform on OSC; self-hosted only.
-
-    ENCORE_MAX_INSTANCESNoYesMax transcoder instances the auto-scaler may run per workspace (default 3).
-
-    ENCORE_MIN_INSTANCESNoYesWarm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
-
-    ENCORE_IDLE_TIMEOUT_MSNoYesIdle time before a transcoder instance is torn down (default 300000).
-
-    PUBLIC_BASE_URLNoNoPublicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
+  Variable | Required | OSC-configurable | Description
+    OSC_ACCESS_TOKEN | Yes | Injected | Personal Access Token. Injected automatically at deploy time on OSC.
+    PARAMETER_STORE_API_KEY | Yes | Yes | Config API key of the connected parameter store.
+    PARAMETER_STORE_INSTANCE_NAME | Yes | Yes | Name of the parameter store (default ovcconfig). On OSC this is the ParameterStore deploy-form field.
+    MINIO_ROOT_PASSWORD | Yes | Yes | Admin password used when provisioning object storage instances.
+    COUCHDB_ADMIN_PASSWORD | Yes | Yes | Admin password used when provisioning the metadata store.
+    PORT | No | No | HTTP port (default 3000). Fixed by the platform on OSC; self-hosted only.
+    ENCORE_MAX_INSTANCES | No | Yes | Max transcoder instances the auto-scaler may run per workspace (default 3).
+    ENCORE_MIN_INSTANCES | No | Yes | Warm floor of transcoder instances kept running even when idle (default 0 — scale to zero). See Operating a workspace.
+    ENCORE_IDLE_TIMEOUT_MS | No | Yes | Idle time before a transcoder instance is torn down (default 300000).
+    PUBLIC_BASE_URL | No | No | Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. Self-hosted only — not configurable on Open Source Cloud (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.
 
 ---
 
@@ -4401,7 +4440,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 118 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 119 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.

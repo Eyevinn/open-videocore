@@ -41,7 +41,14 @@ const A = { authorization: 'Bearer token-a' };
 // MinIO.
 class FakeStorage {
   stored: { key: string; bytes: number } | undefined;
+  // Keys the worker asked to clear of orphaned multipart uploads (issue #1088),
+  // in call order.
+  readonly multipartCleanups: string[] = [];
   constructor(private readonly fail?: Error) {}
+  async abortIncompleteMultipartUploads(key: string): Promise<number> {
+    this.multipartCleanups.push(key);
+    return 0;
+  }
   async putStream(
     key: string,
     source: Readable,
@@ -291,7 +298,7 @@ describe('URL-pull ingest (issue #5)', () => {
         });
       }) as unknown as typeof globalThis.fetch;
 
-      const { app } = await buildApp({ pullDeps: { fetch } });
+      const { app, storage } = await buildApp({ pullDeps: { fetch } });
       const res = await app.inject({
         method: 'POST',
         url: '/api/v1/assets/ingest-url',
@@ -302,13 +309,18 @@ describe('URL-pull ingest (issue #5)', () => {
       expect(job.status).toBe('done');
       expect(calls).toBe(3);
       expect(job.attempts).toBe(3);
+      // The write that finally succeeded started from a clean slate: the worker
+      // discards any multipart upload left open for the object key before it
+      // streams, so a retry can never resume a half-finished one (issue #1088).
+      const { assetId } = res.json();
+      expect(storage.multipartCleanups).toEqual([`ingest/${assetId}`]);
     });
 
     it('records the error after exhausting all attempts', async () => {
       const fetch = vi.fn(async () => {
         throw new Error('persistent network failure');
       }) as unknown as typeof globalThis.fetch;
-      const { app, assets } = await buildApp({ pullDeps: { fetch } });
+      const { app, assets, storage } = await buildApp({ pullDeps: { fetch } });
       const res = await app.inject({
         method: 'POST',
         url: '/api/v1/assets/ingest-url',
@@ -321,6 +333,9 @@ describe('URL-pull ingest (issue #5)', () => {
       expect(job.attempts).toBe(3);
       const asset = await assets.get(res.json().assetId);
       expect(asset?.status).toBe('failed');
+      // A pull that gives up leaves nothing staged behind for a later write to
+      // resume into (issue #1088).
+      expect(storage.multipartCleanups).toEqual([`ingest/${res.json().assetId}`]);
     });
   });
 

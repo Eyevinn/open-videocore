@@ -1,6 +1,7 @@
 import {
   Context,
   getInstance,
+  listInstances,
   removeInstance
 } from '@osaas/client-core';
 import {
@@ -19,9 +20,10 @@ export type StoredService = { serviceId: string; instanceName: string };
 
 // Per-service outcome of a teardown attempt.
 //   removed    — instance existed and was removed this call
-//   not_found  — instance did not exist (already gone / never created) — this
-//                is a success from an idempotency standpoint
-//   failed     — the OSC call errored; the operation should be retried
+//   not_found  — instance was CONFIRMED absent (already gone / never created) —
+//                this is a success from an idempotency standpoint
+//   failed     — the OSC call errored, OR absence could not be confirmed; the
+//                operation should be retried (issue #1039)
 export type TeardownStatus = 'removed' | 'not_found' | 'failed';
 
 export type ServiceTeardownResult = {
@@ -49,9 +51,85 @@ export type StackTeardownResult = {
   services: ServiceTeardownResult[];
 };
 
+// Confirm an instance really is gone, rather than inferring it from a probe
+// that cannot tell "absent" from "could not check" (issue #1039).
+//
+// CONTRACT (verified in node_modules/@osaas/client-core/lib/core.js, SDK
+// 0.24.0):
+//   - `getInstance(context, serviceId, name, token)` (core.js:127-150) catches
+//     the instance GET and rethrows ONLY when the error is a `FetchError` with
+//     `httpCode === 401`; it returns `undefined` on 404 and then FALLS THROUGH
+//     to a bare `return undefined` for every other error. `createFetch`
+//     (lib/fetch.js:38-44) turns a rejected `fetch` — network fault, DNS
+//     failure, timeout — into `new FetchError({ message })` with NO httpCode,
+//     and a 5xx into a `FetchError` with that httpCode. All of those reach the
+//     caller as `undefined`, indistinguishable from a genuine 404.
+//   - `listInstances(context, serviceId, token)` (core.js:160-170) has NO catch
+//     at all: any transport or HTTP error rejects, and on success it resolves
+//     the raw JSON array from the instances endpoint whose elements carry
+//     `name`. That makes it a probe that can FAIL, which is exactly what is
+//     needed to tell absence from an unreachable control plane.
+//
+// Resolves true only when the instance list was read successfully and does not
+// contain `name`. Throws when the absence could not be established — the caller
+// turns that into `failed` so the config is kept and the teardown is retried.
+export async function confirmInstanceAbsent(
+  osc: Context,
+  serviceId: string,
+  name: string,
+  sat: string
+): Promise<boolean> {
+  return confirmInstanceAbsentVia(
+    (sid, token) => listInstances(osc, sid, token),
+    serviceId,
+    name,
+    sat
+  );
+}
+
+// The confirming read, as a function of (serviceId, token). Mirrors
+// `listInstances(context, serviceId, token)` from @osaas/client-core
+// (lib/core.d.ts:65) with the Context already bound, so a caller that only
+// holds a NARROW injectable OSC surface — rather than a full SDK `Context` —
+// can still use the one shared confirmation below. Resolves whatever the
+// instances endpoint returned; it must reject (not resolve empty) on error,
+// which is exactly what the SDK's listInstances does.
+export type InstanceListReader = (
+  serviceId: string,
+  token: string
+) => Promise<unknown>;
+
+// The single implementation of the confirmation described above, over an
+// injectable instance-list read. `confirmInstanceAbsent` binds the SDK's
+// listInstances to a Context; teardownOnDemandPackager binds the equivalent
+// method on its narrow PackagerOscApi. Deliberately ONE body with two entry
+// points: issue #1056 called out that each independently written copy of this
+// probe reacquired the #1039 defect, so there is no second copy to drift.
+export async function confirmInstanceAbsentVia(
+  listInstancesFor: InstanceListReader,
+  serviceId: string,
+  name: string,
+  sat: string
+): Promise<boolean> {
+  const instances = await listInstancesFor(serviceId, sat);
+  if (!Array.isArray(instances)) {
+    throw new Error(
+      `could not confirm instance "${name}" of ${serviceId} is gone: ` +
+        'unexpected instance list payload'
+    );
+  }
+  return !instances.some(
+    (entry) => (entry as { name?: unknown } | null)?.name === name
+  );
+}
+
 // Tear down a single OSC service instance, tolerating the already-removed case.
-// We probe with getInstance first (returns undefined on 404) so a retry of a
-// partially-completed teardown reports not_found rather than re-erroring.
+// We probe with getInstance first; because that probe reports EVERY error as
+// `undefined` (see confirmInstanceAbsent), an empty probe result is re-checked
+// against the instance list before it is believed. Only a confirmed absence is
+// not_found, so a retry of a partially-completed teardown still converges while
+// a teardown attempted during a network fault or a 5xx reports failed — keeping
+// the stored config and surfacing the instance as a leftover (issue #1039).
 async function teardownService(
   osc: Context,
   service: StackService,
@@ -62,10 +140,13 @@ async function teardownService(
     const sat = await osc.getServiceAccessToken(serviceId);
 
     const existing = await getInstance(osc, serviceId, name, sat);
-    if (!existing) {
+    if (!existing && (await confirmInstanceAbsent(osc, serviceId, name, sat))) {
       return { serviceId, role, status: 'not_found' };
     }
 
+    // Either the probe returned the instance, or the probe came back empty but
+    // the list says the instance is still there (the empty probe was a swallowed
+    // error). Both mean there is something to remove.
     await removeInstance(osc, serviceId, name, sat);
     return { serviceId, role, status: 'removed' };
   } catch (err) {
@@ -127,11 +208,64 @@ function aggregate(
   return { name, status, services };
 }
 
+// How much a per-service status matters when two results describe the SAME
+// instance. `failed` dominates (something may still be running, so the whole
+// result must stay retryable), then `removed` (a removal definitely happened),
+// then `not_found` (the weakest claim — nothing was there).
+const TEARDOWN_STATUS_RANK: Record<TeardownStatus, number> = {
+  failed: 2,
+  removed: 1,
+  not_found: 0
+};
+
+// Fold extra per-service teardown outcomes into a StackTeardownResult and
+// RE-AGGREGATE the stack status from the combined list (issue #1056).
+//
+// The on-demand packager is torn down outside deprovisionStack(FromConfig) —
+// it is not in the stored services[] — so its outcome used to live only in a
+// log line while the stack-level status was computed without it. A `failed`
+// packager therefore reported a clean teardown, the stored config was deleted,
+// and the surviving instance was never named. Folding it through the SAME
+// `aggregate` gives it the same retry semantics as any stored service.
+//
+// `extra` entries are PREPENDED (teardown-only consumers are removed before the
+// producers they consume — the head of TEARDOWN_ORDER, stack.ts). An entry whose
+// serviceId is already present is MERGED into that entry rather than duplicated,
+// keeping the highest-ranking status: the store-less path tears the packager
+// down twice (once via TEARDOWN_ORDER, once via the ground-truth reconciliation)
+// and must still report one packager, not two.
+export function foldTeardownResults(
+  result: StackTeardownResult,
+  extra: readonly ServiceTeardownResult[]
+): StackTeardownResult {
+  if (extra.length === 0) return result;
+
+  const prepended: ServiceTeardownResult[] = [];
+  const merged = [...result.services];
+
+  for (const entry of extra) {
+    const atIndex = merged.findIndex((s) => s.serviceId === entry.serviceId);
+    if (atIndex === -1) {
+      prepended.push(entry);
+      continue;
+    }
+    const current = merged[atIndex] as ServiceTeardownResult;
+    if (
+      TEARDOWN_STATUS_RANK[entry.status] > TEARDOWN_STATUS_RANK[current.status]
+    ) {
+      merged[atIndex] = entry;
+    }
+  }
+
+  return aggregate(result.name, [...prepended, ...merged]);
+}
+
 // Tear down an entire stack in dependency-safe order using the hardcoded
 // STACK_SERVICES list (legacy / fallback path). Failures do not abort the run:
 // every service is attempted so a single transient error does not strand the
 // rest of the stack. The whole operation is safe to retry (idempotent) because
-// each step probes for existence first and treats a missing instance as success.
+// each step probes for existence first and treats a CONFIRMED-missing instance
+// as success (an unconfirmable probe is a failure, not a success — issue #1039).
 export async function deprovisionStack(
   osc: Context,
   name: string

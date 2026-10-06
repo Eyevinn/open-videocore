@@ -288,6 +288,34 @@ tbody td {
   border-color: var(--accent, var(--border));
 }
 
+/* Jobs table Asset cell (issue #988): the asset's human-readable name leads,
+   with its ULID — the value the API accepts — on a second line beneath it, in
+   the same monospace/muted treatment other identifier cells use. The name is
+   full-strength text so the column is scannable; the id stays subordinate but
+   readable in full (`.cell-id-value` lifts the 140px ellipsis cap) and keeps
+   its click-to-copy button. Not colour-coded: the two values are distinguished
+   by position, size and typeface, never by hue alone (WCAG 1.4.1). */
+.job-asset-name {
+  display: block;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.job-asset-id {
+  display: block;
+  margin-top: 2px;
+}
+
+/* Same pairing in the job detail panel, where the kv row is a single line: the
+   ULID trails the named link rather than sitting under it. */
+.job-asset-id-inline {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 /* Status badges */
 .badge {
   display: inline-block;
@@ -540,6 +568,56 @@ tr.row-locked td:first-child {
   margin-top: 6px;
 }
 
+/* Audio track add/remove controls (issue #903). They belong to the editorial
+   audio group, so they are inset against the group's left edge rather than
+   floating free in the Audio section. */
+.audio-track-controls {
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+
+/* The add form. Boxed so an open form reads as one unit against the tables
+   above and below it. */
+.audio-track-form {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+/* Field help sits directly under its input, so it loses the .tracks-note gap. */
+.audio-track-form .form-field .tracks-note {
+  margin-top: 2px;
+  max-width: 260px;
+}
+
+/* The row of per-track controls. Shrink-to-fit so the button does not stretch
+   across a column sized for the Track ID beside it. */
+td.cell-actions {
+  white-space: nowrap;
+  width: 1%;
+}
+
+/* The inline error and the success line are block-level inside the controls,
+   and keep .msg's own spacing. */
+.audio-track-error,
+.audio-track-status {
+  margin-top: 10px;
+}
+
+/* ── Comments (issue #900) ──────────────────────────────────────────────────
+   Add + read only: the API exposes POST and GET on
+   /api/v1/assets/{id}/comments and nothing else, so there is no row-hover
+   affordance, no per-item action area and no edit/delete styling here — the
+   list is text, deliberately. */
+.comments-note,
+.comments-role-note,
+.comments-counter {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
 .external-id-role-note {
   margin-top: 10px;
 }
@@ -611,6 +689,218 @@ tr.row-locked td:first-child {
   display: none;
 }
 
+/* Inside the centred .empty box the detail line is secondary to the headline
+   (same rule the tracks panel applies). */
+.empty .comments-note {
+  margin-top: 4px;
+}
+
+.comment-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.comment-item {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+
+.comment-meta {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+/* An operator's line breaks are part of what they wrote, so they survive —
+   while the text itself is always set via textContent, never innerHTML. */
+.comment-body {
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.comment-form {
+  max-width: 640px;
+}
+
+.comment-input {
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+}
+
+/* Over the API's 4096-character ceiling. Colour is the secondary cue — the
+   counter text says "remove N characters" and the submit button is disabled,
+   so the state survives monochrome rendering (WCAG 1.4.1). */
+.comments-counter--over {
+  color: var(--danger);
+}
+
+/* ── Version chain on asset detail (issue #907) ────────────────────────────
+   The chain is a TREE: `versionOfAssetId` names each member's immediate source
+   and two versions can be cut from one master, so depth is drawn with an indent
+   plus a connector rule. The indent is decorative only — the same relationship
+   is stated in a visually-hidden "Source version: …" line on every indented
+   row, so the structure survives without the layout (WCAG 1.3.1). */
+.version-chain-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.version-group-id {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.version-group-key {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.version-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+
+/* "No version is ready yet" — advisory, not an error: the API still names a
+   head of the lineage. Amber matches the house "needs attention" signal, and
+   the sentence says it in words so colour is never the only carrier. */
+.version-note--attention {
+  color: var(--warning);
+}
+
+.version-truncated {
+  font-size: 12px;
+  color: var(--warning);
+  border-left: 3px solid var(--warning);
+  padding-left: 10px;
+  margin: 8px 0;
+}
+
+/* Rows are not clickable as a whole — the version NAME is the link — so the
+   shared `tbody tr:hover { cursor: pointer }` would promise a target the row
+   does not have. */
+.version-chain-table tbody tr:hover {
+  cursor: default;
+}
+
+.version-name-cell {
+  white-space: nowrap;
+}
+
+.version-indent {
+  display: inline-block;
+}
+
+.version-connector {
+  color: var(--text-muted);
+  font-family: 'Courier New', monospace;
+  margin-right: 4px;
+}
+
+.version-link,
+.version-name {
+  font-weight: 500;
+}
+
+.version-link {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.version-link:hover,
+.version-link:focus {
+  color: var(--text);
+}
+
+/* Archived members stay in the list and stay navigable — this is lineage
+   history, not a live listing — but sit at reduced emphasis. Never below the
+   AA contrast floor: --text-muted on --surface is the same pairing used for
+   every secondary line in the panel. */
+.version-row--archived .version-link,
+.version-row--archived .version-name,
+.version-row--archived .version-created {
+  color: var(--text-muted);
+}
+
+/* The Current badge. A deliberate-state variant in the .badge family, like
+   .badge-locked — NOT a status colour, because Current is orthogonal to
+   `status` and both badges share a row. Cyan keeps it distinct from the ready /
+   pending / failed palette above and from the lock's indigo. The badge carries
+   the word "Current" plus a visually-hidden consequence clause, so the state is
+   never carried by colour alone (WCAG 1.4.1). */
+.badge-current {
+  background: rgba(34, 211, 238, 0.18);
+  color: #67e8f9;
+  border: 1px solid rgba(34, 211, 238, 0.5);
+  margin-left: 8px;
+}
+
+/* "You are here" is a DIFFERENT fact from Current and frequently lands on a
+   different row, so it is a different shape as well as a different word: plain
+   bracketed text, not a pill. The two must be able to coexist on one row. */
+.version-here {
+  margin-left: 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border-bottom: 1px dotted var(--text-muted);
+}
+
+.version-orphans {
+  margin-top: 12px;
+}
+
+.version-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 12px 0 6px;
+}
+
+/* Previous / Next step through the server's array order (oldest -> newest). */
+.version-steps {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.version-step-position {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.version-step[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.empty .version-note {
+  margin-top: 4px;
+  margin-bottom: 0;
+}
+
 /* "Needs attention" filter toggle in the assets header. */
 .wedged-filter {
   display: inline-flex;
@@ -662,6 +952,10 @@ tr.row-locked td:first-child {
 input[type="text"],
 input[type="url"],
 input[type="password"],
+/* Numeric fields (the autoscaler bounds, and the clip in/out points added in
+   issue #793) were the one input type the house rules never covered, so they
+   rendered as raw browser controls inside otherwise-styled forms. */
+input[type="number"],
 select,
 textarea {
   background: var(--bg);
@@ -678,6 +972,7 @@ textarea {
 input[type="text"]:focus,
 input[type="url"]:focus,
 input[type="password"]:focus,
+input[type="number"]:focus,
 select:focus,
 textarea:focus {
   border-color: var(--accent);
@@ -1017,6 +1312,29 @@ pre.code-block {
   word-break: break-all;
   color: var(--text);
   margin-top: 8px;
+}
+
+/* Collapsed "Raw" disclosure holding a full API document (issue #964). The
+   curated view above it is the primary reading surface; this keeps the raw JSON
+   available without it dominating the panel. Native <details>/<summary>, so the
+   expand/collapse is keyboard-operable and announced as a disclosure with no
+   ARIA of our own. The focus ring is kept (never `outline: none`) so keyboard
+   users can see where they are — WCAG 2.1 SC 2.4.7. */
+.raw-disclosure > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 2px 0;
+  user-select: none;
+}
+
+.raw-disclosure > summary:hover {
+  color: var(--text);
+}
+
+.raw-disclosure > summary:focus-visible {
+  outline: 2px solid var(--accent, var(--border));
+  outline-offset: 2px;
 }
 
 /* Inline thumbnail in asset list */
@@ -1445,6 +1763,28 @@ pre.code-block {
   background: rgba(99, 102, 241, 0.14);
 }
 
+/* Clickable collection row (issue #917). The whole row opens the detail panel,
+   so it must LOOK activatable and must show where keyboard focus is. The focus
+   ring uses :focus-visible, so it appears for keyboard users without drawing an
+   outline on every mouse click; `outline-offset: -2px` keeps the ring inside the
+   row so it is not clipped by the surrounding .table-wrap scroll container. */
+tbody tr.coll-row {
+  cursor: pointer;
+}
+
+tbody tr.coll-row:hover {
+  background: rgba(99, 102, 241, 0.08);
+}
+
+tbody tr.coll-row:focus-visible {
+  outline: 2px solid var(--accent, #6366f1);
+  outline-offset: -2px;
+}
+
+tbody tr.coll-row.row-selected {
+  background: rgba(99, 102, 241, 0.14);
+}
+
 /* Pagination bar */
 .pagination {
   display: flex;
@@ -1694,6 +2034,46 @@ pre.code-block {
   gap: 8px;
   justify-content: flex-end;
   margin-top: 16px;
+}
+
+/* Clip-asset dialog (issue #793). Same furniture again — .form-row/.form-field
+   for the in/out pair, .msg.msg-error for the inline refusal. */
+.clip-dialog .clip-dialog-intro,
+.clip-dialog .clip-dialog-sync,
+.clip-dialog .clip-dialog-duration,
+.clip-dialog .clip-dialog-duration-unknown {
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+.clip-dialog .clip-dialog-sync,
+.clip-dialog .clip-dialog-duration,
+.clip-dialog .clip-dialog-duration-unknown {
+  color: var(--text-muted);
+}
+.clip-dialog .clip-field-help {
+  font-size: 11px;
+}
+.clip-dialog .clip-dialog-error-detail {
+  margin-top: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+}
+.clip-dialog .modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* Clip outcome block. Persistent (it carries the link to the produced clip),
+   unlike showMsg's six-second notices. */
+.clip-result .clip-result-link {
+  color: var(--accent);
+}
+.clip-result .clip-result-detail {
+  margin-top: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
 }
 
 /* Utility */
@@ -1992,6 +2372,18 @@ body.detail-standalone .assets-side {
   display: none;
 }
 
+/* Secondary line under an empty-state headline (issue #997), for a table whose
+ * empty row has to explain WHY it is empty. Mirrors `.empty .tracks-note`: the
+ * headline stays the primary line and this reads as its body text. */
+.ops-table-empty-detail {
+  max-width: 56ch;
+  margin: 6px auto 0;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
+  color: var(--text-muted);
+}
+
 .ops-table-filters {
   display: flex;
   flex-wrap: wrap;
@@ -2147,6 +2539,26 @@ body.detail-standalone .assets-side {
   min-width: 220px;
 }
 
+/* Assets table tag + metadata filter boxes (issue #914). Same box as the
+   free-text filter, minus the magnifier: a tag list is not a search term, and a
+   second magnifier in the same bar would say the three boxes do the same thing.
+   Only the left padding changes — the clear control still needs its 26px. */
+.ops-table-filters .ops-search-input-plain {
+  padding-left: 8px;
+  min-width: 180px;
+}
+
+/* The accepted shape (comma-separated tags, key=value pairs) stated under the
+   box rather than hidden in a placeholder the value overwrites. Bounded to the
+   control's width so a filter bar of three boxes does not reflow. */
+.ops-table-filters .ops-filter-hint {
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.3;
+  max-width: 220px;
+  color: var(--text-muted);
+}
+
 /* The native type="search" affordance is suppressed so there is never a second,
    unstyled, keyboard-invisible x next to ours. */
 .ops-search-input::-webkit-search-cancel-button,
@@ -2225,6 +2637,168 @@ body.detail-standalone .assets-side {
   display: none;
 }
 
+/* Column chooser (issue #959). A disclosure button in the shared
+   .ops-table-filters bar, opening a non-modal checkbox list. Non-modal on purpose:
+   choosing columns is an adjustment made WHILE reading the table, so the rows being
+   adjusted for must stay on screen. It sits last in the bar and is marked as a view
+   control, not a filter — it changes what you see, never what is requested. */
+.ops-columns-slot {
+  /* Push it to the end of the bar, away from the controls that DO change the
+     query, so the two kinds of control do not read as one group. */
+  margin-left: auto;
+  align-self: flex-end;
+}
+
+.ops-columns {
+  position: relative;
+}
+
+.ops-columns-btn {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  font-size: 13px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+/* "6 of 8" — so "am I hiding anything?" is answerable without opening the panel,
+   and is part of the button's accessible name. */
+.ops-columns-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ops-columns-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  /* Anchored to the right edge: the control sits at the right of the filter bar,
+     so a left-anchored panel would hang off the viewport on a narrow window. */
+  right: 0;
+  min-width: 220px;
+  padding: 10px 12px;
+  background: var(--surface, #1a1a1a);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.ops-columns-panel[hidden] {
+  display: none;
+}
+
+.ops-columns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Each row is a <label>, and the chooser mounts inside the filter bar
+   (public/ops-ui-table.js appends it to `.ops-table-filters`), so every row is
+   also matched by `.ops-table-filters label` above — a (0,1,1) rule that stacks a
+   caption over an input and mutes it. A bare `.ops-columns-item` is only (0,1,0),
+   so it loses and the rows collapse into checkbox-over-caption stacks. Qualify
+   with the ancestor to reach (0,2,0), the same way the checkbox and the row label
+   below already do. */
+.ops-table-filters .ops-columns-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  color: var(--text, #eee);
+  cursor: pointer;
+}
+
+.ops-table-filters .ops-columns-item:hover {
+  background: var(--border);
+}
+
+/* Selector-qualified to outrank `.ops-table-filters input { padding: 5px 8px }`
+   above, which is written for text/date inputs and would otherwise inflate every
+   checkbox in this list. */
+.ops-table-filters .ops-columns-item input {
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* A column that has to stay visible. Muted and not-allowed rather than absent:
+   an entry that vanished would read as "this column does not exist". Qualified the
+   same way as the row rule above, so "muted" beats the row's `color: var(--text)`
+   on specificity (0,3,0 vs 0,2,0) rather than on source order — a locked row has
+   to stay visibly distinct from an unlocked one wherever this block ends up. */
+.ops-table-filters .ops-columns-item.is-locked,
+.ops-table-filters .ops-columns-item.is-locked input {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+/* Outranks `.ops-table-filters label > span { font-weight: 500 }`: those are
+   filter captions, these are pickable column names and read as body text. */
+.ops-table-filters .ops-columns-item-label {
+  font-weight: 400;
+}
+
+/* A column can be hidden while the table is still sorted by it — sort is not
+   coupled to visibility. This flag is the only place that fact is visible, and
+   this list is where the column can be brought back. */
+.ops-columns-note {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 20px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent, #6366f1);
+  border: 1px solid var(--accent, #6366f1);
+}
+
+.ops-columns-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.ops-columns-hint[hidden] {
+  display: none;
+}
+
+/* Panel footer actions (issue #962: "Show all" + "Reset to defaults"). A wrapping
+   flex row so the pair stays side by side in a narrow panel and stacks instead of
+   overflowing it. */
+.ops-columns-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border, #333);
+}
+
+.ops-columns-showall,
+.ops-columns-reset {
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+/* "Reset to defaults" is the destructive-ish, less-used half of the pair — it
+   throws away a saved preference — so it reads quieter than "Show all" rather
+   than competing with it for the first glance. */
+.ops-columns-reset {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+
+.ops-columns-showall:disabled,
+.ops-columns-reset:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Logs table — level badges (issue #371). `level` is an OPTIONAL log field; the
    cell shows a coloured pill per severity when present, else a dash. */
 .log-level {
@@ -2256,5 +2830,82 @@ body.detail-standalone .assets-side {
 /* The message column carries the free-text search target; let it breathe. */
 .log-message {
   white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* The two Logs empty states (issue #997) must not look alike. The ordinary
+   filtered-to-nothing row keeps the plain muted `.empty` look; the
+   never-been-written-to row is boxed and left-ruled so it reads as an
+   explanation of the store's state rather than as a filter result. Colour is not
+   the only cue — the headline wording and the detail line differ too. */
+td[data-empty='logs-never-written'] {
+  padding: 24px 16px;
+  border-left: 3px solid var(--accent, #6366f1);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+}
+
+td[data-empty='logs-never-written'] .ops-table-empty-detail {
+  margin-left: 0;
+}
+
+/* ─── Audit table (issue #987) ──────────────────────────────────────────────
+   The Audit tab reuses the Jobs filter-bar controls verbatim (.ops-filter-*
+   above), so nothing below restyles the bar — these rules cover only the
+   audit-specific cells and the identity note. */
+
+/* Identity note above the filter bar: `actor.principalId` is a nullable
+   placeholder until read-auth lands, so the Actor column is empty on every
+   entry and the reason is stated once rather than left to be guessed. */
+.audit-note {
+  margin: 0 0 4px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* The action string is the primary "what happened" value — monospace so
+   dotted action names line up and scan vertically. */
+.audit-action {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* Coarse actor origin (user | system | ai). Three visually distinct pills so
+   "who caused this" is answerable at a glance; contrast against --surface is
+   kept above 4.5:1 for WCAG 2.1 AA body text. */
+.audit-origin {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.audit-origin-user {
+  background: rgba(99, 102, 241, 0.18);
+  color: #a5b4fc;
+}
+.audit-origin-system {
+  background: rgba(148, 163, 184, 0.18);
+  color: #cbd5e1;
+}
+.audit-origin-ai {
+  background: rgba(34, 197, 94, 0.16);
+  color: #6ee7a8;
+}
+
+/* The free-form detail bag is summarised to one line; let it wrap rather than
+   stretch the table, and keep it visually secondary to the action. */
+.audit-detail {
+  font-size: 12px;
+  color: var(--text-muted);
   word-break: break-word;
 }
