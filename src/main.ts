@@ -179,6 +179,7 @@ import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
+import { DEPLOYMENT_CONTEXT } from './auth/workspace.js';
 import {
   createJob,
   getJob,
@@ -1314,17 +1315,18 @@ function activateScaler(redisUrl: string): void {
     // Job record queued->running and the source asset to `processing`. The
     // scaler has no repositories of its own, so we resolve the job here by the
     // encoreJobId (our externalId) it was submitted with.
-    onDispatched: async (encoreJobId: string) => {
-      const found = await jobRepository.findByEncoreJobId(encoreJobId);
-      if (!found) return;
-      const { job } = found;
-      if (job.status === 'queued' || job.status === 'pending') {
-        await jobRepository.update(job.id, { status: 'running' });
-      }
-      if (job.assetId) {
-        await assetRepository.update(job.assetId, { status: 'processing' });
-      }
-    },
+    onDispatched: (encoreJobId: string) =>
+      inEncoreJobStack(encoreJobId, async () => {
+        const found = await jobRepository.findByEncoreJobId(encoreJobId);
+        if (!found) return;
+        const { job } = found;
+        if (job.status === 'queued' || job.status === 'pending') {
+          await jobRepository.update(job.id, { status: 'running' });
+        }
+        if (job.assetId) {
+          await assetRepository.update(job.assetId, { status: 'processing' });
+        }
+      }),
     // Durably capture each Encore dispatch on the Job record (ADR-012, #380).
     // The scaler already records the attempt count in the TTL'd Valkey key and
     // clears it on re-dispatch/settle; this appends the same attempt to the
@@ -1333,11 +1335,12 @@ function activateScaler(redisUrl: string): void {
     // no repositories, so we resolve the job here by its encoreJobId. Best-
     // effort: the scaler swallows failures so a durable-write hiccup never
     // re-queues an already-dispatched job.
-    onEncodeDispatched: async (encoreJobId: string, attempt: number) => {
-      const found = await jobRepository.findByEncoreJobId(encoreJobId);
-      if (!found) return;
-      await jobRepository.appendEncodeAttempt(found.job.id, { index: attempt });
-    },
+    onEncodeDispatched: (encoreJobId: string, attempt: number) =>
+      inEncoreJobStack(encoreJobId, async () => {
+        const found = await jobRepository.findByEncoreJobId(encoreJobId);
+        if (!found) return;
+        await jobRepository.appendEncodeAttempt(found.job.id, { index: attempt });
+      }),
     // Once per tick, reconcile transcode jobs stuck non-terminal against Encore's
     // terminal FAILED / garbage-collected (404) outcomes (issue #273). A failed
     // Encore job never produces a completion message (the callback listener only
@@ -1431,180 +1434,183 @@ function activateScaler(redisUrl: string): void {
     // the job here by its encoreJobId (externalId), exactly as onDispatched does.
     // Best-effort: the scaler swallows a thrown hook so a repo hiccup never
     // blocks the re-enqueue that already succeeded.
-    onJobInterrupted: async (encoreJobId: string, reason: 'interrupted_by_scaledown') => {
-      const found = await jobRepository.findByEncoreJobId(encoreJobId);
-      if (!found) return;
-      await jobRepository.update(found.job.id, {
-        interrupted: true,
-        interruptionReason: reason
-      });
-    },
+    onJobInterrupted: (encoreJobId: string, reason: 'interrupted_by_scaledown') =>
+      inEncoreJobStack(encoreJobId, async () => {
+        const found = await jobRepository.findByEncoreJobId(encoreJobId);
+        if (!found) return;
+        await jobRepository.update(found.job.id, {
+          interrupted: true,
+          interruptionReason: reason
+        });
+      }),
     onJobsDropped: async (drops) => {
       for (const { encoreJobId, reason } of drops) {
-        try {
-          const found = await jobRepository.findByEncoreJobId(encoreJobId);
-          if (!found) continue;
-          // #704: when reconcile() recovered Encore's OWN terminal failure text
-          // (the FAILED encoreJob document's `message`, e.g. "Job execution
-          // failed: Could not find location for profile program! Profiles: {}"),
-          // surface THAT as the caller-facing failure so a user can tell a
-          // configuration problem from a platform one. The generic
-          // gone-from-active-set wording is reserved for the genuine
-          // no-reported-cause case (Encore stopped reporting the job without
-          // ever telling us why) — `reason` undefined.
-          const failureText =
-            reason && reason.trim().length > 0
-              ? `dropped by Encore: ${reason}`
-              : 'dropped by Encore: gone from active set with no completion';
+        await inEncoreJobStack(encoreJobId, async () => {
+          try {
+            const found = await jobRepository.findByEncoreJobId(encoreJobId);
+            if (!found) return;
+            // #704: when reconcile() recovered Encore's OWN terminal failure text
+            // (the FAILED encoreJob document's `message`, e.g. "Job execution
+            // failed: Could not find location for profile program! Profiles: {}"),
+            // surface THAT as the caller-facing failure so a user can tell a
+            // configuration problem from a platform one. The generic
+            // gone-from-active-set wording is reserved for the genuine
+            // no-reported-cause case (Encore stopped reporting the job without
+            // ever telling us why) — `reason` undefined.
+            const failureText =
+              reason && reason.trim().length > 0
+                ? `dropped by Encore: ${reason}`
+                : 'dropped by Encore: gone from active set with no completion';
 
-          // #727: route reconcile-detected drops through the SAME retry gate as
-          // callback-detected failures (encore-callback-poller.ts:481). #295 made
-          // transport- and IO-class encode failures retriable, but a read severed
-          // mid-encode produces no FAILED callback — Encore never signals FAILED,
-          // the job simply leaves QUEUED/IN_PROGRESS and reconcile() observes it as
-          // a drop. That was the ONE class #295 was built to retry that could never
-          // structurally reach the gate. So before settling terminal, ask
-          // decideRetry whether the recovered Encore message (carried on `reason`,
-          // #704) is a transport/IO-retryable signature that should be
-          // re-dispatched, honouring its contract exactly as the callback poller
-          // does:
-          //   - action:'retry' — the job has already been re-queued with backoff
-          //     and pinned back to RUNNING; do NOT settle (that would fail the
-          //     caller-facing job while the retry is pending).
-          //   - action:'settle' — settle terminal exactly as today.
-          // Classification is on `failureText`: a case-insensitive substring match
-          // (retry-policy.ts classifyEncoreFailure), so the `dropped by Encore: `
-          // prefix does not interfere with matching a signature carried in `reason`.
-          // When `reason` is undefined the text is the generic gone-from-active-set
-          // wording — no signature matches, so it classifies `deterministic` and
-          // settles exactly as before (no behaviour change; composes safely with
-          // #728). interrupted_by_scaledown (#514) never reaches here: it is
-          // classified structurally at the drain boundary
-          // (scaler-loop.requeueScaleDownInterruptions -> onJobInterrupted) and
-          // re-enqueued before reconcile()'s drop diff, so it is never raised as a
-          // drop while its payload is available.
-          //
-          // Only route jobs that are still non-terminal through the gate. A job
-          // already settled terminal must NOT be re-dispatched (its Valkey attempts
-          // could otherwise re-queue a completed job); fall straight through to the
-          // idempotent settle, which no-ops via completeTranscode. This preserves
-          // #709's conditional settle for the still-`running` case below.
-          const decoded = decodeEncoreJobId(encoreJobId);
-          const isTerminal =
-            found.job.status === 'done' ||
-            found.job.status === 'failed' ||
-            found.job.status === 'cancelled';
-          if (decoded && !isTerminal) {
-            let decision;
-            try {
-              decision = await decideRetry(
-                redis,
-                decoded.workspaceId,
-                encoreJobId,
-                failureText,
-                // #745: a reconcile-detected "drop" can be a FALSE POSITIVE (the
-                // job is still IN_PROGRESS on its instance). Cancel that prior
-                // attempt before re-dispatching so the same externalId is never
-                // active on two instances at once. Encore's serviceId is 'encore'
-                // (src/encore-scaler/types.ts:16).
-                makePriorAttemptCanceler(() => oscContext.getServiceAccessToken('encore'))
-              );
-            } catch (err) {
-              // If the retry gate itself errors, fall through to the normal
-              // terminal settle rather than leaving the job hung — mirrors
-              // encore-callback-poller.ts:487.
-              app.log.warn(
-                { err, encoreJobId },
-                'encore-scaler: onJobsDropped retry gate error — settling terminal'
-              );
-              decision = undefined;
-            }
-            if (decision?.action === 'retry') {
-              // decideRetry has already re-queued the job (with backoff) and pinned
-              // the caller-facing status back to RUNNING, so the job stays
-              // non-terminal until the retry succeeds or the bound is exhausted. Do
-              // NOT settle.
-              app.log.warn(
-                {
+            // #727: route reconcile-detected drops through the SAME retry gate as
+            // callback-detected failures (encore-callback-poller.ts:481). #295 made
+            // transport- and IO-class encode failures retriable, but a read severed
+            // mid-encode produces no FAILED callback — Encore never signals FAILED,
+            // the job simply leaves QUEUED/IN_PROGRESS and reconcile() observes it as
+            // a drop. That was the ONE class #295 was built to retry that could never
+            // structurally reach the gate. So before settling terminal, ask
+            // decideRetry whether the recovered Encore message (carried on `reason`,
+            // #704) is a transport/IO-retryable signature that should be
+            // re-dispatched, honouring its contract exactly as the callback poller
+            // does:
+            //   - action:'retry' — the job has already been re-queued with backoff
+            //     and pinned back to RUNNING; do NOT settle (that would fail the
+            //     caller-facing job while the retry is pending).
+            //   - action:'settle' — settle terminal exactly as today.
+            // Classification is on `failureText`: a case-insensitive substring match
+            // (retry-policy.ts classifyEncoreFailure), so the `dropped by Encore: `
+            // prefix does not interfere with matching a signature carried in `reason`.
+            // When `reason` is undefined the text is the generic gone-from-active-set
+            // wording — no signature matches, so it classifies `deterministic` and
+            // settles exactly as before (no behaviour change; composes safely with
+            // #728). interrupted_by_scaledown (#514) never reaches here: it is
+            // classified structurally at the drain boundary
+            // (scaler-loop.requeueScaleDownInterruptions -> onJobInterrupted) and
+            // re-enqueued before reconcile()'s drop diff, so it is never raised as a
+            // drop while its payload is available.
+            //
+            // Only route jobs that are still non-terminal through the gate. A job
+            // already settled terminal must NOT be re-dispatched (its Valkey attempts
+            // could otherwise re-queue a completed job); fall straight through to the
+            // idempotent settle, which no-ops via completeTranscode. This preserves
+            // #709's conditional settle for the still-`running` case below.
+            const decoded = decodeEncoreJobId(encoreJobId);
+            const isTerminal =
+              found.job.status === 'done' ||
+              found.job.status === 'failed' ||
+              found.job.status === 'cancelled';
+            if (decoded && !isTerminal) {
+              let decision;
+              try {
+                decision = await decideRetry(
+                  redis,
+                  decoded.workspaceId,
                   encoreJobId,
-                  attempt: decision.attempt,
-                  failureClass: decision.failureClass,
-                  backoffMs: decision.backoffMs,
-                  failureText
-                },
-                'encore-scaler: reconcile-detected drop — transport-class failure, re-dispatching'
-              );
-              continue; // retry pending; do not settle this drop.
-            }
-            if (decision?.action === 'skip') {
-              // #743: a retry entry for this job is already queued/inflight, so
-              // decideRetry did NOT enqueue a duplicate. The pending retry keeps
-              // the job non-terminal, so do NOT settle this drop.
-              app.log.info(
-                {
-                  encoreJobId,
-                  failureClass: decision.failureClass,
-                  failureText
-                },
-                'encore-scaler: reconcile-detected drop — retry already queued/inflight, skipping duplicate re-dispatch'
-              );
-              continue; // retry already pending; do not settle this drop.
-            }
-            if (decision?.action === 'settle') {
-              app.log.info(
-                {
-                  encoreJobId,
-                  reason: decision.reason,
-                  failureClass: decision.failureClass
-                },
-                'encore-scaler: reconcile-detected drop settling terminal'
-              );
-              // Retries exhausted / non-retryable: fall through to the terminal
-              // settle below, then clear the #295 retry bookkeeping.
-            }
-          }
-
-          await settleFailedTranscode(
-            {
-              jobs: jobRepository,
-              assets: assetRepository,
-              pipeline: pipelineRepository,
-              // #829: the scaler's dropped-job settle is the third path that
-              // applies a transcode terminal state, and it is invisible to both
-              // the poller's sweep and the #273 sweep (the job is gone from the
-              // instance's active set, so Encore no longer reports it). Without a
-              // dispatcher here the job goes `failed`, the asset goes `failed`,
-              // and the subscriber is told nothing. This settle is CONDITIONAL
-              // (#709) — see the documented failed -> complete correction
-              // sequence at the dispatch site in failed-transcode-reconciler.ts.
-              webhookDispatcher,
-              logger: {
-                info: (...a: unknown[]) => app.log.info(a),
-                warn: (...a: unknown[]) => app.log.warn(a)
+                  failureText,
+                  // #745: a reconcile-detected "drop" can be a FALSE POSITIVE (the
+                  // job is still IN_PROGRESS on its instance). Cancel that prior
+                  // attempt before re-dispatching so the same externalId is never
+                  // active on two instances at once. Encore's serviceId is 'encore'
+                  // (src/encore-scaler/types.ts:16).
+                  makePriorAttemptCanceler(() => oscContext.getServiceAccessToken('encore'))
+                );
+              } catch (err) {
+                // If the retry gate itself errors, fall through to the normal
+                // terminal settle rather than leaving the job hung — mirrors
+                // encore-callback-poller.ts:487.
+                app.log.warn(
+                  { err, encoreJobId },
+                  'encore-scaler: onJobsDropped retry gate error — settling terminal'
+                );
+                decision = undefined;
               }
-            },
-            found.job,
-            // #704: surface Encore's OWN recovered failure text when reconcile()
-            // captured one, else the generic gone-from-active-set wording.
-            failureText,
-            // #709: a gone-from-active-set drop is an INFERENCE (the job vanished
-            // from Encore's live set with no callback, ADR-016), not proof of
-            // failure. Settle it CONDITIONALLY so a genuine SUCCESSFUL callback
-            // arriving out of order can still correct the job to `done` and resume
-            // the pipeline (package / playback URL), rather than being frozen out
-            // by first-terminal-write-wins.
-            'gone-from-active-set'
-          );
-          // #727/#295: the job has now settled terminal (exhausted / non-retryable
-          // / no recovered reason). Drop the retry bookkeeping so it does not linger
-          // for the full TTL — matches the callback poller's terminal path
-          // (encore-callback-poller.ts:633). Best-effort: a stray key self-expires.
-          if (decoded) {
-            await clearRetryState(redis, encoreJobId).catch(() => {});
+              if (decision?.action === 'retry') {
+                // decideRetry has already re-queued the job (with backoff) and pinned
+                // the caller-facing status back to RUNNING, so the job stays
+                // non-terminal until the retry succeeds or the bound is exhausted. Do
+                // NOT settle.
+                app.log.warn(
+                  {
+                    encoreJobId,
+                    attempt: decision.attempt,
+                    failureClass: decision.failureClass,
+                    backoffMs: decision.backoffMs,
+                    failureText
+                  },
+                  'encore-scaler: reconcile-detected drop — transport-class failure, re-dispatching'
+                );
+                return; // retry pending; do not settle this drop.
+              }
+              if (decision?.action === 'skip') {
+                // #743: a retry entry for this job is already queued/inflight, so
+                // decideRetry did NOT enqueue a duplicate. The pending retry keeps
+                // the job non-terminal, so do NOT settle this drop.
+                app.log.info(
+                  {
+                    encoreJobId,
+                    failureClass: decision.failureClass,
+                    failureText
+                  },
+                  'encore-scaler: reconcile-detected drop — retry already queued/inflight, skipping duplicate re-dispatch'
+                );
+                return; // retry already pending; do not settle this drop.
+              }
+              if (decision?.action === 'settle') {
+                app.log.info(
+                  {
+                    encoreJobId,
+                    reason: decision.reason,
+                    failureClass: decision.failureClass
+                  },
+                  'encore-scaler: reconcile-detected drop settling terminal'
+                );
+                // Retries exhausted / non-retryable: fall through to the terminal
+                // settle below, then clear the #295 retry bookkeeping.
+              }
+            }
+
+            await settleFailedTranscode(
+              {
+                jobs: jobRepository,
+                assets: assetRepository,
+                pipeline: pipelineRepository,
+                // #829: the scaler's dropped-job settle is the third path that
+                // applies a transcode terminal state, and it is invisible to both
+                // the poller's sweep and the #273 sweep (the job is gone from the
+                // instance's active set, so Encore no longer reports it). Without a
+                // dispatcher here the job goes `failed`, the asset goes `failed`,
+                // and the subscriber is told nothing. This settle is CONDITIONAL
+                // (#709) — see the documented failed -> complete correction
+                // sequence at the dispatch site in failed-transcode-reconciler.ts.
+                webhookDispatcher,
+                logger: {
+                  info: (...a: unknown[]) => app.log.info(a),
+                  warn: (...a: unknown[]) => app.log.warn(a)
+                }
+              },
+              found.job,
+              // #704: surface Encore's OWN recovered failure text when reconcile()
+              // captured one, else the generic gone-from-active-set wording.
+              failureText,
+              // #709: a gone-from-active-set drop is an INFERENCE (the job vanished
+              // from Encore's live set with no callback, ADR-016), not proof of
+              // failure. Settle it CONDITIONALLY so a genuine SUCCESSFUL callback
+              // arriving out of order can still correct the job to `done` and resume
+              // the pipeline (package / playback URL), rather than being frozen out
+              // by first-terminal-write-wins.
+              'gone-from-active-set'
+            );
+            // #727/#295: the job has now settled terminal (exhausted / non-retryable
+            // / no recovered reason). Drop the retry bookkeeping so it does not linger
+            // for the full TTL — matches the callback poller's terminal path
+            // (encore-callback-poller.ts:633). Best-effort: a stray key self-expires.
+            if (decoded) {
+              await clearRetryState(redis, encoreJobId).catch(() => {});
+            }
+          } catch (err) {
+            app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');
           }
-        } catch (err) {
-          app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');
-        }
+        });
       }
     }
   });
@@ -1950,6 +1956,22 @@ async function deactivateScaler(): Promise<void> {
 // against the first stack's Valkey when one exists and we are not yet active;
 // deactivate when the last stack is gone. Invoked at startup and after every
 // provision/teardown via onStackChange.
+// Run a scaler hook inside the stack its job was dispatched on. The scaler loops
+// run outside any request — a loop resumed at boot carries no ambient stack —
+// so a hook's job lookup resolved the first-listed stack's repositories and
+// missed every job on any other stack: onDispatched never advanced the job to
+// `running`, and its completion was then rejected as `queued -> done`. The
+// encoreJobId's prefix is the scaler's stack key; DEPLOYMENT_CONTEXT (a
+// single-stack env-override deployment) is not a stack name and keeps the
+// default resolution.
+function inEncoreJobStack<T>(encoreJobId: string, fn: () => Promise<T>): Promise<T> {
+  const stackKey = decodeEncoreJobId(encoreJobId)?.workspaceId;
+  return runWithRequestStack(
+    stackKey && stackKey !== DEPLOYMENT_CONTEXT ? stackKey : undefined,
+    fn
+  );
+}
+
 // Run a callback poller on every stack's Valkey, not just the activation one.
 //
 // Since #615 each stack's scaler loop dispatches on its own stack's Valkey, and
