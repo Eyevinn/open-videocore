@@ -15,9 +15,14 @@
 //     still the issue that migrates them.
 
 import { describe, it, expect } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import {
   LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+  MAXIMUM_ESTIMATED_ENTROPY_AT_MINIMUM_SEED_LENGTH,
+  MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+  MINIMUM_OBJECT_STORE_SEED_LENGTH,
   OBJECT_STORE_ACCESS_KEY_ID_PREFIX,
+  assessObjectStoreCredentialSeed,
   deriveObjectStoreAccessKeyId,
   deriveObjectStoreCredential,
   deriveObjectStoreSecretAccessKey,
@@ -210,5 +215,204 @@ describe('planObjectStoreCredential (provision-time decision, issue #1094)', () 
     const plan = planObjectStoreCredential({ ...base, seed: '' });
     expect(plan.perStack).toBe(false);
     expect(plan.credential.accessKeyId).toBe(LEGACY_OBJECT_STORE_ACCESS_KEY_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ISSUE-TIME SEED STRENGTH GATE (issue #1094 review).
+//
+// The gate shipped as 24 characters / 112 bits, a pair no seed of the
+// documented length could satisfy (24 * log2(24) = 110 bits is the ceiling),
+// so every new stack silently fell back to the shared deployment-wide
+// credential and #1089 stayed unfixed. These cases pin the estimator, the
+// mutual satisfiability of the two floors, and the fallback branch.
+// ---------------------------------------------------------------------------
+
+// A seed of exactly the documented minimum length, generated the way the docs
+// say to generate one (`openssl rand -base64 32` shape, trimmed to the floor).
+const DOCUMENTED_MINIMUM_SEED = randomBytes(64)
+  .toString('base64url')
+  .slice(0, MINIMUM_OBJECT_STORE_SEED_LENGTH);
+
+describe('assessObjectStoreCredentialSeed (issue #1094 review)', () => {
+  it('keeps the length and entropy floors mutually satisfiable', () => {
+    // The regression this test exists for: the floors must be reachable
+    // TOGETHER. The estimate is bounded by length * log2(distinct), so no seed
+    // of the minimum length can exceed length * log2(length) bits.
+    expect(MAXIMUM_ESTIMATED_ENTROPY_AT_MINIMUM_SEED_LENGTH).toBeGreaterThanOrEqual(
+      MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS
+    );
+  });
+
+  it('accepts a generated seed of exactly the documented minimum length', () => {
+    // Follow README.md / public/docs/installation.html to the letter and the
+    // gate MUST pass — otherwise the docs lead operators into the fallback.
+    const assessment = assessObjectStoreCredentialSeed(DOCUMENTED_MINIMUM_SEED);
+    expect(assessment).toEqual({
+      acceptable: true,
+      estimatedEntropyBits: assessment.estimatedEntropyBits
+    });
+    expect(assessment.estimatedEntropyBits).toBeGreaterThanOrEqual(
+      MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS
+    );
+  });
+
+  it('accepts a randomly generated seed at the documented length every time', () => {
+    // Not a flake-by-design gate: a random base64url seed of the documented
+    // length has headroom over the entropy floor, not a coin flip at it.
+    for (let i = 0; i < 200; i++) {
+      const seed = randomBytes(64)
+        .toString('base64url')
+        .slice(0, MINIMUM_OBJECT_STORE_SEED_LENGTH);
+      expect(assessObjectStoreCredentialSeed(seed).acceptable).toBe(true);
+    }
+  });
+
+  it('rejects an absent, empty or too-short seed with a seed-free reason', () => {
+    expect(assessObjectStoreCredentialSeed(undefined)).toEqual({
+      acceptable: false,
+      estimatedEntropyBits: 0,
+      reason: 'no seed'
+    });
+    expect(assessObjectStoreCredentialSeed('').acceptable).toBe(false);
+
+    const short = DOCUMENTED_MINIMUM_SEED.slice(
+      0,
+      MINIMUM_OBJECT_STORE_SEED_LENGTH - 1
+    );
+    const assessment = assessObjectStoreCredentialSeed(short);
+    expect(assessment.acceptable).toBe(false);
+    expect(assessment.reason).toContain(
+      `${MINIMUM_OBJECT_STORE_SEED_LENGTH}-character minimum`
+    );
+    // Nothing the assessment reports may echo the seed itself — it is logged.
+    expect(JSON.stringify(assessment)).not.toContain(short);
+  });
+
+  it('rejects a long but repetitive seed on the distinct-character bound', () => {
+    // 'aaaa...' clears the length floor and the class bound alone would score
+    // it as a strong 26-symbol password; the distinct bound is what refuses it.
+    const repetitive = 'a'.repeat(MINIMUM_OBJECT_STORE_SEED_LENGTH * 4);
+    const assessment = assessObjectStoreCredentialSeed(repetitive);
+    expect(assessment.acceptable).toBe(false);
+    expect(assessment.estimatedEntropyBits).toBe(0);
+    expect(assessment.reason).toContain(
+      `${MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS}-bit minimum`
+    );
+  });
+
+  it('is monotone around the entropy floor for same-alphabet seeds', () => {
+    // Two distinct hex characters: log2(2) = 1 bit per char, so the boundary is
+    // exactly the entropy floor in characters. One below rejects, one at it (if
+    // it also clears the length floor) accepts on entropy.
+    const pattern = (length: number): string => {
+      let out = '';
+      for (let i = 0; i < length; i++) out += i % 2 === 0 ? '0' : '1';
+      return out;
+    };
+    const below = assessObjectStoreCredentialSeed(
+      pattern(MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS - 1)
+    );
+    expect(below.acceptable).toBe(false);
+    expect(below.estimatedEntropyBits).toBe(
+      MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS - 1
+    );
+
+    const at = assessObjectStoreCredentialSeed(
+      pattern(MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS)
+    );
+    expect(at.acceptable).toBe(true);
+    expect(at.estimatedEntropyBits).toBe(
+      MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS
+    );
+  });
+});
+
+describe('weak-seed fallback in planObjectStoreCredential (issue #1094 review)', () => {
+  const base = {
+    stackName: 'stack-a',
+    legacySecretAccessKey: 'legacy-password',
+    storedAccessKeyId: undefined as string | undefined,
+    storedConfigExists: false,
+    objectStoreInstanceExists: false,
+    paramStoreAvailable: true
+  };
+  // Clears the length floor by a wide margin, fails the entropy floor.
+  const WEAK_SEED = 'ab'.repeat(MINIMUM_OBJECT_STORE_SEED_LENGTH);
+
+  it('issues a per-stack credential for a seed that meets the documented guidance', () => {
+    const plan = planObjectStoreCredential({
+      ...base,
+      seed: DOCUMENTED_MINIMUM_SEED
+    });
+    expect(plan.perStack).toBe(true);
+    expect(plan.downgradeReason).toBeUndefined();
+    expect(plan.credential.accessKeyId).not.toBe(
+      LEGACY_OBJECT_STORE_ACCESS_KEY_ID
+    );
+  });
+
+  it('falls back to the shared credential for a weak seed, with a reason', () => {
+    const plan = planObjectStoreCredential({ ...base, seed: WEAK_SEED });
+    expect(plan.perStack).toBe(false);
+    expect(plan.credential).toEqual({
+      accessKeyId: LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+      secretAccessKey: 'legacy-password'
+    });
+    // The downgrade must be reportable — this is what makes it loud rather
+    // than a silent disabling of per-stack isolation.
+    expect(plan.downgradeReason).toBeTruthy();
+    expect(plan.downgradeReason).toContain(
+      String(MINIMUM_OBJECT_STORE_SEED_LENGTH)
+    );
+    // ... and must never carry the seed, since it is logged.
+    expect(plan.downgradeReason).not.toContain(WEAK_SEED);
+  });
+
+  it('marks ONLY the weak-seed downgrade, not the expected fallbacks', () => {
+    // An adopted instance and a pre-#1094 stored config are correct outcomes,
+    // not misconfiguration, so they carry no downgradeReason to shout about.
+    for (const args of [
+      { objectStoreInstanceExists: true },
+      { storedConfigExists: true },
+      { paramStoreAvailable: false },
+      { seed: '' }
+    ]) {
+      const plan = planObjectStoreCredential({
+        ...base,
+        seed: DOCUMENTED_MINIMUM_SEED,
+        ...args
+      });
+      expect(plan.perStack).toBe(false);
+      expect(plan.downgradeReason).toBeUndefined();
+    }
+  });
+
+  it('still re-derives an already-issued credential under a weak seed', () => {
+    // The gate is ISSUE-time only. A live instance was created with a derived
+    // id; refusing to re-derive its secret would lock the API out of a working
+    // stack instead of protecting anything.
+    const issued = deriveObjectStoreCredential(WEAK_SEED, 'stack-a', 'gen01');
+    const plan = planObjectStoreCredential({
+      ...base,
+      seed: WEAK_SEED,
+      storedAccessKeyId: issued.accessKeyId,
+      storedConfigExists: true,
+      objectStoreInstanceExists: true
+    });
+    expect(plan.perStack).toBe(true);
+    expect(plan.credential).toEqual(issued);
+    expect(plan.downgradeReason).toBeUndefined();
+  });
+
+  it('leaves the READ path ungated, so a weak-seed stack stays readable', () => {
+    const issued = deriveObjectStoreCredential(WEAK_SEED, 'stack-a', 'gen01');
+    expect(
+      resolveObjectStoreCredential({
+        storedAccessKeyId: issued.accessKeyId,
+        seed: WEAK_SEED,
+        legacySecretAccessKey: 'legacy-password'
+      })
+    ).toEqual(issued);
   });
 });

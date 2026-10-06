@@ -118,6 +118,8 @@ import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { OBJECT_STORE_SERVICE_ID } from '../services/stack.js';
 import {
   LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+  MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+  MINIMUM_OBJECT_STORE_SEED_LENGTH,
   deriveObjectStoreSecretAccessKey,
   resolveObjectStoreCredential
 } from '../services/object-store-credentials.js';
@@ -588,5 +590,118 @@ describe('object-store credential lifecycle (issue #1094)', () => {
       savedSecret(OBJECT_STORE_SERVICE_ID, 'legacystack.rootpassword')
     ).toBe(DEPLOYMENT_SEED);
     expect(current('legacystack')?.objectStoreAccessKeyId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Weak-seed reporting and the unpersistable-id downgrade (issue #1094 review).
+//
+// Both branches turn per-stack isolation OFF, which is exactly the state that
+// must never be reached quietly: one shipped as a warn-only downgrade behind an
+// unsatisfiable gate, the other created an object store with a credential that
+// was never recorded anywhere (an unrecoverable root credential on a stack that
+// reports ready while every object-store call 403s).
+// ---------------------------------------------------------------------------
+describe('provisioning without a per-stack credential is reported loudly (issue #1094)', () => {
+  // Clears the length floor, fails the entropy floor (2 distinct characters).
+  const WEAK_SEED = 'ab'.repeat(MINIMUM_OBJECT_STORE_SEED_LENGTH);
+
+  function errorLines(): Record<string, unknown>[] {
+    return logOutput
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry['level'] === 50);
+  }
+
+  it('reports a weak seed at ERROR at startup AND per provisioned stack', async () => {
+    process.env['MINIO_ROOT_PASSWORD'] = WEAK_SEED;
+    try {
+      const { store, current } = makeParamStore();
+      const app = await buildApp(store);
+      await provisionAndWait(app, 'weakseedstack');
+
+      const errors = errorLines();
+      // Startup: the deployment-level report, with the remediation.
+      const startup = errors.find((e) =>
+        String(e['msg']).includes(
+          'PER-STACK OBJECT-STORE CREDENTIALS ARE DISABLED'
+        )
+      );
+      expect(startup).toBeDefined();
+      expect(startup?.['minimumLength']).toBe(MINIMUM_OBJECT_STORE_SEED_LENGTH);
+      expect(startup?.['minimumEntropyBits']).toBe(
+        MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS
+      );
+
+      // Per stack: which stacks actually lost isolation.
+      const perStack = errors.find((e) => e['name'] === 'weakseedstack');
+      expect(perStack).toBeDefined();
+      expect(perStack?.['perStackObjectStoreCredential']).toBe('disabled');
+
+      // And the fallback is the pre-#1094 shared credential, with no per-stack
+      // id recorded for a stack that does not have one.
+      expect(
+        createBodyFor(OBJECT_STORE_SERVICE_ID, 'weakseedstack')['RootUser']
+      ).toBe(LEGACY_OBJECT_STORE_ACCESS_KEY_ID);
+      expect(current('weakseedstack')?.objectStoreAccessKeyId).toBeUndefined();
+
+      // No part of the seed may reach the log, loud or not.
+      expect(logOutput.join('\n')).not.toContain(WEAK_SEED);
+    } finally {
+      process.env['MINIO_ROOT_PASSWORD'] = DEPLOYMENT_SEED;
+    }
+  });
+
+  it('abandons the per-stack credential when the provisioning marker cannot be written', async () => {
+    // The access key id on the marker is the ONLY record of the credential at
+    // create time (the secret is derived from a per-run random generation that
+    // lives in the provision closure). If the marker write fails and the
+    // object store is created with the per-stack credential anyway, nothing can
+    // ever re-derive it: the next attempt sees no id, adopts the instance under
+    // the legacy root user and reports a ready stack whose every object-store
+    // call fails authorization.
+    const { store, current } = makeParamStore();
+    const writes = store.storeStackConfig as ReturnType<typeof vi.fn>;
+    const realWrite = writes.getMockImplementation() as (
+      ...args: unknown[]
+    ) => Promise<void>;
+    let first = true;
+    writes.mockImplementation(async (...args: unknown[]) => {
+      if (first) {
+        first = false;
+        throw new Error('parameter store unavailable');
+      }
+      return realWrite(...args);
+    });
+
+    const app = await buildApp(store);
+    const op = await provisionAndWait(app, 'markerfailstack');
+    expect(op.status).toBe('done');
+
+    // The object store was created with the recoverable shared credential...
+    expect(
+      createBodyFor(OBJECT_STORE_SERVICE_ID, 'markerfailstack')['RootUser']
+    ).toBe(LEGACY_OBJECT_STORE_ACCESS_KEY_ID);
+    expect(
+      savedSecret(OBJECT_STORE_SERVICE_ID, 'markerfailstack.rootpassword')
+    ).toBe(DEPLOYMENT_SEED);
+    // ... the stack carries no per-stack id it cannot honour ...
+    expect(current('markerfailstack')?.objectStoreAccessKeyId).toBeUndefined();
+    // ... every read path resolves the same credential the instance has ...
+    expect(
+      resolveObjectStoreCredential({
+        storedAccessKeyId: current('markerfailstack')?.objectStoreAccessKeyId,
+        seed: DEPLOYMENT_SEED,
+        legacySecretAccessKey: DEPLOYMENT_SEED
+      })
+    ).toEqual({
+      accessKeyId: LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+      secretAccessKey: DEPLOYMENT_SEED
+    });
+    // ... and the abandonment is on the record at ERROR.
+    const abandoned = errorLines().find(
+      (e) => e['perStackObjectStoreCredential'] === 'abandoned'
+    );
+    expect(abandoned).toBeDefined();
+    expect(abandoned?.['name']).toBe('markerfailstack');
   });
 });

@@ -356,6 +356,24 @@ export async function resolveEncoreS3Config(
       legacySecretAccessKey: secretAccessKey
     });
 
+    // Refuse on an EMPTY resolved secret (issue #1094 review, non-blocking
+    // finding). The guard at the top of this function accepts a deployment that
+    // has a seed but no legacy secret; a pre-#1094 stack read under that
+    // configuration resolves to the legacy `admin` id with an empty secret
+    // (object-store-credentials.ts returns `legacySecretAccessKey ?? ''`), and
+    // spawning a transcoder with it fails every S3 call with a 403 that looks
+    // like a missing object. Fail here, where the cause is still visible,
+    // instead of relying on the main.ts env fallback chain to keep this
+    // unreachable.
+    if (!credential.secretAccessKey) {
+      if (staticFallbackConfigured) return undefined;
+      throw new Error(
+        `encore-scaler: resolved an EMPTY object-store secret for stack "${resolvedStackName}" — ` +
+          'the stack carries no per-stack object-store access key id and no ENCORE_S3_SECRET_KEY, MINIO_SECRET_KEY or MINIO_ROOT_PASSWORD is set as the legacy credential. ' +
+          'Refusing to spawn a transcoder whose every object-store call would fail authorization.'
+      );
+    }
+
     const endpoint = await mapEndpointForTranscoder(
       config.minioEndpoint,
       resolveEndpoint,

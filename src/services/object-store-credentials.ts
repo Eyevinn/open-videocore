@@ -257,16 +257,55 @@ function deriveStretchedSeedKey(seed: string): Buffer {
   return key;
 }
 
-// Minimum seed strength for ISSUING a per-stack credential. 24 characters is
-// the floor on length; the entropy floor is what actually decides, and is
-// estimated conservatively below. 112 bits is far beyond any feasible offline
-// search even without the stretching above, and is comfortably met by any
-// generated password that also clears the length floor (e.g. 32 random
-// base64url characters, which the estimator below scores at ~155 bits —
-// measured, not assumed) while rejecting
-// the short human-chosen passwords this check exists to catch.
-export const MINIMUM_OBJECT_STORE_SEED_LENGTH = 24;
+// Minimum seed strength for ISSUING a per-stack credential. BOTH floors must be
+// clearable by the value the docs tell operators to generate, or the gate is a
+// disguised off-switch: a seed that can never pass silently keeps every new
+// stack on the shared deployment-wide credential, which is the very thing
+// #1089/#1094 exist to remove.
+//
+// The length floor is therefore derived from the entropy floor, not chosen
+// independently of it. Because the estimate below is bounded by
+// `length * log2(distinct characters)`, a seed of length L can never score more
+// than `L * log2(L)` bits, and a RANDOM seed scores well under that because
+// characters repeat. Measured over 5000 random base64url seeds per length with
+// the estimator below (`node -e` sampling, not assumed):
+//
+//   length 24 -> absolute ceiling 110 bits; observed 91..110  (112 IMPOSSIBLE)
+//   length 26 -> ceiling 122; observed 104..122, ~10% below 112 (flaky)
+//   length 32 -> ceiling 160; observed 133..158, none below 112 (reliable)
+//
+// So 32 characters is the documented length floor: it clears 112 bits with
+// ~20 bits of headroom for a random base64url seed and still clears it for a
+// 32-character hex seed (16 distinct symbols, 121 bits). 112 bits is far beyond
+// any feasible offline search even without the stretching above, while still
+// rejecting the short human-chosen passwords this check exists to catch.
+// README.md, public/docs/installation.html and scripts/generate-docs.ts all
+// quote these same two numbers; keep them in step.
+export const MINIMUM_OBJECT_STORE_SEED_LENGTH = 32;
 export const MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS = 112;
+
+// Ceiling on what the estimator below can ever score at the length floor, i.e.
+// `MINIMUM_OBJECT_STORE_SEED_LENGTH * log2(distinct)` with every character
+// distinct. Exported so a test can assert the two floors stay mutually
+// satisfiable (the 24/112 pair shipped in review did not, and no seed of the
+// documented length could pass).
+export const MAXIMUM_ESTIMATED_ENTROPY_AT_MINIMUM_SEED_LENGTH = Math.floor(
+  MINIMUM_OBJECT_STORE_SEED_LENGTH * Math.log2(MINIMUM_OBJECT_STORE_SEED_LENGTH)
+);
+
+// Load-time invariant, so an inconsistent edit to the pair above fails at
+// import rather than degrading silently to "shared credential for everyone".
+if (
+  MAXIMUM_ESTIMATED_ENTROPY_AT_MINIMUM_SEED_LENGTH <
+  MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS
+) {
+  throw new Error(
+    'object-store seed gate is unsatisfiable: a ' +
+      `${MINIMUM_OBJECT_STORE_SEED_LENGTH}-character seed cannot exceed ` +
+      `${MAXIMUM_ESTIMATED_ENTROPY_AT_MINIMUM_SEED_LENGTH} estimated bits, ` +
+      `below the ${MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS}-bit floor`
+  );
+}
 
 export type ObjectStoreCredentialSeedAssessment = {
   // True when the seed may be used to ISSUE new per-stack credentials.
@@ -434,6 +473,13 @@ export function resolveObjectStoreCredential(args: {
 export type ObjectStoreCredentialPlan = {
   credential: ObjectStoreCredential;
   perStack: boolean;
+  // Why a per-stack credential was NOT issued, when the deployment is otherwise
+  // configured for one (a seed is set and a parameter store is available). Set
+  // ONLY for the weak-seed downgrade — the adoption/pre-#1094 fallbacks are
+  // expected, correct outcomes rather than a misconfiguration. Never contains
+  // any part of the seed, so it is safe to log; the provision path logs it at
+  // ERROR so the downgrade cannot pass unnoticed.
+  downgradeReason?: string;
 };
 
 // Decide the credential for one provision run. PURE, so the decision table is
@@ -518,7 +564,24 @@ export function planObjectStoreCredential(args: {
   // than the deployment has today. Only the ISSUE branch is gated: the reuse
   // branch above must still re-derive the credential a live instance was
   // actually created with, whatever the seed's strength.
-  if (!assessObjectStoreCredentialSeed(args.seed).acceptable) return legacy;
+  //
+  // The downgrade is NOT silent: `downgradeReason` is carried back so the
+  // provision path can log it at ERROR per stack, on top of the startup-time
+  // report. A deployment that quietly stops isolating stacks is the failure
+  // mode this gate must not introduce.
+  const assessment = assessObjectStoreCredentialSeed(args.seed);
+  if (!assessment.acceptable) {
+    return {
+      ...legacy,
+      downgradeReason:
+        `the configured object-store credential seed is too weak to issue a ` +
+        `per-stack credential from (${assessment.reason}; estimated ` +
+        `${assessment.estimatedEntropyBits} bits, minimum ` +
+        `${MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS} bits at ` +
+        `${MINIMUM_OBJECT_STORE_SEED_LENGTH}+ characters), so this stack ` +
+        `keeps the shared deployment-wide credential`
+    };
+  }
 
   // Issue a NEW credential, under the caller-supplied generation.
   return {

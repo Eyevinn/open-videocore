@@ -622,24 +622,45 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // A weak seed is NOT fatal: planObjectStoreCredential keeps such a deployment
   // on the legacy deployment-wide credential, which is byte-identically the
   // pre-#1094 behaviour. Failing startup would break working deployments for a
-  // property they never had. So this warns, loudly, and the feature stays off
-  // until the seed is strong enough. The log line carries only the assessment,
-  // never the seed or any part of it.
+  // property they never had. But it is not a WARNING either: it means stack
+  // isolation (#1089) is OFF for every stack provisioned from here, so it is
+  // reported at ERROR, with the remediation and the exact floors, and repeated
+  // per affected provision below. Unless the operator has explicitly
+  // acknowledged running without per-stack credentials via
+  // ALLOW_SHARED_OBJECT_STORE_CREDENTIAL, in which case the same facts are
+  // reported once at WARN — the state is deliberate, not a surprise.
+  //
+  // The log line carries only the assessment, never the seed or any part of it.
+  const sharedObjectStoreCredentialAcknowledged =
+    (process.env['ALLOW_SHARED_OBJECT_STORE_CREDENTIAL'] ?? '')
+      .trim()
+      .toLowerCase() === 'true';
   const objectStoreSeedAssessment =
     assessObjectStoreCredentialSeed(minioRootPassword);
   if (!objectStoreSeedAssessment.acceptable) {
-    app.log.warn(
-      {
-        reason: objectStoreSeedAssessment.reason,
-        estimatedEntropyBits: objectStoreSeedAssessment.estimatedEntropyBits,
-        minimumLength: MINIMUM_OBJECT_STORE_SEED_LENGTH,
-        minimumEntropyBits: MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS
-      },
+    const report = {
+      reason: objectStoreSeedAssessment.reason,
+      estimatedEntropyBits: objectStoreSeedAssessment.estimatedEntropyBits,
+      minimumLength: MINIMUM_OBJECT_STORE_SEED_LENGTH,
+      minimumEntropyBits: MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+      acknowledged: sharedObjectStoreCredentialAcknowledged,
+      perStackObjectStoreCredentials: 'disabled'
+    };
+    const message =
       'MINIO_ROOT_PASSWORD is too weak to derive per-stack object-store ' +
-        'credentials from (issue #1094); newly provisioned stacks will keep ' +
-        'the deployment-wide object-store credential until it is replaced ' +
-        'with a high-entropy value'
-    );
+      'credentials from (issue #1094): PER-STACK OBJECT-STORE CREDENTIALS ARE ' +
+      'DISABLED and every newly provisioned stack will share the ' +
+      'deployment-wide object-store credential. Replace it with a generated ' +
+      `value of at least ${MINIMUM_OBJECT_STORE_SEED_LENGTH} characters ` +
+      `(>= ${MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS} estimated bits), e.g. ` +
+      "`openssl rand -base64 32`, or set " +
+      'ALLOW_SHARED_OBJECT_STORE_CREDENTIAL=true to acknowledge the shared ' +
+      'credential deliberately';
+    if (sharedObjectStoreCredentialAcknowledged) {
+      app.log.warn(report, message);
+    } else {
+      app.log.error(report, message);
+    }
   }
 
   // OpenAI API key for eyevinn-auto-subtitles' Whisper transcription (issue
@@ -809,12 +830,46 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // have. Defaults to the legacy process-global credential and is upgraded
         // to the per-stack one by planObjectStoreCredential below; the secret
         // lives only in this closure and in saveSecret.
-        let objectStorePlan: ObjectStoreCredentialPlan = {
+        const legacyObjectStorePlan: ObjectStoreCredentialPlan = {
           credential: {
             accessKeyId: LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
             secretAccessKey: minioRootPassword
           },
           perStack: false
+        };
+        let objectStorePlan: ObjectStoreCredentialPlan = legacyObjectStorePlan;
+
+        // Reset the plan to the legacy credential when the per-stack access key
+        // id could NOT be persisted (issue #1094 review, blocking finding 3).
+        //
+        // The per-stack secret is derived from (seed, stackName, generation) and
+        // the generation is a fresh random value for this run that exists ONLY
+        // in this closure — the stored access key id is the sole record of it.
+        // If the 'provisioning' marker write fails and we create the object
+        // store with the per-stack credential anyway, nothing can ever
+        // re-derive that credential: the live instance's ROOT user becomes
+        // unrecoverable, and the next provision attempt sees no stored id,
+        // adopts the instance under `admin` and reports a ready stack whose
+        // every object-store call 403s. The legacy credential has no such
+        // failure mode (it is deployment-global and always recoverable), and
+        // the downgrade is safe precisely because `perStack` is only ever true
+        // when the instance does not exist yet. Logged at ERROR, never silent.
+        const downgradeObjectStorePlanOnUnpersistableId = (
+          err: unknown,
+          stage: string
+        ): void => {
+          if (!objectStorePlan.perStack) return;
+          objectStorePlan = legacyObjectStorePlan;
+          app.log.error(
+            { err, name, stage, perStackObjectStoreCredential: 'abandoned' },
+            'could not persist this stack\'s per-stack object-store access ' +
+              'key id, so the per-stack credential has been abandoned for ' +
+              'this run and the stack will be created with the ' +
+              'deployment-wide credential (issue #1094). Creating it with an ' +
+              'unrecorded per-stack credential would leave an ' +
+              'unrecoverable root credential on a stack that reports ready ' +
+              'while every object-store call fails authorization'
+          );
         };
 
         try {
@@ -885,35 +940,78 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 paramStoreAvailable: true
               });
 
+              // A downgrade caused by a weak seed is a SECURITY-relevant state
+              // change, not a detail: report it per stack at ERROR, with the
+              // seed-free reason the planner produced (issue #1094 review,
+              // blocking finding 1). The startup report above covers the
+              // deployment; this covers "which stacks actually lost isolation".
+              if (objectStorePlan.downgradeReason) {
+                app.log.error(
+                  {
+                    name,
+                    reason: objectStorePlan.downgradeReason,
+                    minimumLength: MINIMUM_OBJECT_STORE_SEED_LENGTH,
+                    minimumEntropyBits: MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+                    acknowledged: sharedObjectStoreCredentialAcknowledged,
+                    perStackObjectStoreCredential: 'disabled'
+                  },
+                  'provisioning this stack WITHOUT a per-stack object-store ' +
+                    'credential; it will share the deployment-wide credential ' +
+                    'with every other stack (issue #1094)'
+                );
+              }
+
               // No completed config yet: record a 'provisioning' marker BEFORE
               // creating any companion so a repeated call (this process or a
               // fresh one after a restart) sees an attempt is in flight and
               // converges instead of starting a new companion set. This is
-              // best-effort — a marker-write failure must not block the live
-              // provision, so it is logged and provisioning continues.
-              await paramStore.storeStackConfig(wsId, name, {
-                status: 'provisioning',
-                minioEndpoint: '',
-                couchdbUrl: '',
-                redisUrl: '',
-                sourceBucket: SOURCE_BUCKET,
-                packagedBucket: PACKAGED_BUCKET,
-                // Non-secret per-stack access key id (issue #1094). Recorded on
-                // the marker too, so the mode survives a retry.
-                ...(objectStorePlan.perStack
-                  ? {
-                      objectStoreAccessKeyId:
-                        objectStorePlan.credential.accessKeyId
-                    }
-                  : {}),
-                storage: storageMetadata,
-                services: []
-              });
+              // best-effort for the IDEMPOTENCY guard — a marker-write failure
+              // must not block the live provision, so it is logged and
+              // provisioning continues. It is NOT best-effort for the
+              // per-stack credential: the marker is the only record of the
+              // access key id at this point, so a failed write forces the plan
+              // back to the legacy credential (see
+              // downgradeObjectStorePlanOnUnpersistableId above).
+              try {
+                await paramStore.storeStackConfig(wsId, name, {
+                  status: 'provisioning',
+                  minioEndpoint: '',
+                  couchdbUrl: '',
+                  redisUrl: '',
+                  sourceBucket: SOURCE_BUCKET,
+                  packagedBucket: PACKAGED_BUCKET,
+                  // Non-secret per-stack access key id (issue #1094). Recorded
+                  // on the marker too, so the mode survives a retry.
+                  ...(objectStorePlan.perStack
+                    ? {
+                        objectStoreAccessKeyId:
+                          objectStorePlan.credential.accessKeyId
+                      }
+                    : {}),
+                  storage: storageMetadata,
+                  services: []
+                });
+              } catch (markerErr) {
+                app.log.warn(
+                  { err: markerErr, name },
+                  "'provisioning' marker write failed; continuing provision"
+                );
+                downgradeObjectStorePlanOnUnpersistableId(
+                  markerErr,
+                  'provisioning-marker'
+                );
+              }
             } catch (err) {
               app.log.warn(
                 { err, name },
                 'idempotency pre-flight (param store) failed; continuing provision'
               );
+              // The pre-flight can also fail BEFORE/AROUND the marker write
+              // (e.g. the stored-config read, or the plan itself). Any such
+              // failure leaves the id unpersisted too, so apply the same
+              // downgrade rather than creating an instance under a credential
+              // nothing can re-derive.
+              downgradeObjectStorePlanOnUnpersistableId(err, 'pre-flight');
             }
           }
 
