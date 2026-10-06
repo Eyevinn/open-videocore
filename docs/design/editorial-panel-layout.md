@@ -11,6 +11,15 @@ persisted — gap C4 is **resolved**, §0.2.1 and §10), `public/style.css` was 
 `details`/`summary` rules (it has them, scoped to `.raw-disclosure` — §6.4), and every line-number
 citation had drifted. Citations are now **anchored to symbols and literals**, not line numbers (§0).
 
+**Revision 3 — reconciled with in-flight client work.** Revision 2 still described both the tags and
+the comments sub-sections as greenfield. They are not. Tags are being implemented by **PR #1036**
+(`public/editorial-tags.js`, symbol `mountEditorialTags`), which matches this spec; comments are
+already implemented by **PR #1040** (`public/comments-panel.js`, symbol `mountAssetComments`), which
+differs from this spec on three decisions. The comments sub-section is therefore no longer a
+build-from-scratch brief — it is a **re-parent-and-amend** brief against #1040, and every divergence
+is written up as an explicit, reversible change rather than left to be discovered as a merge
+conflict. See §5.3.0 (reconciliation), §6.2, §6.4 and §11.
+
 This pins the **information architecture** of one surface: the editorial panel on asset detail.
 It specifies what the panel contains, in what order, what collapses, how the editorial review axis
 is kept visually separate from the lifecycle `status` axis (#134), and exactly where the panel
@@ -32,6 +41,13 @@ identifier, literal or source comment to grep for (`const tagSchema`, `['Tags', 
 `REVIEW_COPY.axisNote`). Line numbers are given only where no stable symbol exists, and are marked
 as such. The first draft of this spec cited line numbers throughout and every one of them went
 stale within ~20 commits; symbol anchors survive the churn that broke them.
+
+**Citations to unmerged branches are marked as such.** §5.3.0 and §6.2 cite `public/comments-panel.js`
+(PR #1040) and `public/editorial-tags.js` (PR #1036). Neither file exists in this branch's tree, so
+those rows could not be grepped here — they carry the symbol plus the line number **as verified in
+review against that PR's branch head**, and are labelled *(unmerged — #1040)* / *(unmerged — #1036)*.
+Treat the symbol as the anchor and the line number as a hint that will drift; re-grep the symbol
+before implementing. Everything not so labelled was read in this branch's own merged tree.
 
 ### 0.1 Tags
 
@@ -188,8 +204,16 @@ All anchored to symbols / literals; grep the quoted string.
 (`['Tags', renderTags(asset.tags)]`) with *no write control anywhere in `public/`* — grep confirms
 nothing in the client calls `POST /:id/tags` or `DELETE /:id/tags/:tag`. Review state is its own
 block wedged above the action row (`mountReviewState({ …, anchorEl: actionsDiv, host: body })`).
-Comments have **no UI at all** — no file in `public/` references the comments sub-resource. That is
-the "three scattered controls" this spec replaces.
+Comments have **no UI at all in this branch's merged tree** — no file in `public/` references the
+comments sub-resource — **but a comments UI is in flight on PR #1040** (branch
+`issue-900/comments-panel`, open and clean at time of review), which adds
+`public/comments-panel.js` (`mountAssetComments`) and mounts it from `renderAssetDetailBody` with
+`anchorEl: actionsDiv, host: body` *(unmerged — #1040; `public/app.js:3296` on that branch head)*.
+Tags likewise have a write UI in flight on **PR #1036** (`public/editorial-tags.js`,
+`mountEditorialTags`). So the scatter this spec replaces is now partly *two new scattered blocks*
+rather than two absences: whichever of #898, #1036 and #1040 lands second is re-parenting the other's
+block into the panel, not writing it. §5.3.0 states the comments half of that precisely; the tags
+half needs nothing beyond the symbol name, because #1036 already matches this spec.
 
 ---
 
@@ -441,6 +465,57 @@ they must be mirrored as two capability checks, not one (gap T2, §10).
 
 ### 5.3 `#editorial-comments` — Comments
 
+#### 5.3.0 Reconciliation with PR #1040 — this is an amendment, not a greenfield build
+
+**The comments UI already exists.** Issue #900 — the implementation ticket this sub-section feeds —
+is already implemented on **PR #1040** (branch `issue-900/comments-panel`, open and clean at time of
+review). Revision 2 of this spec described the sub-section as if nothing existed, and proposed a new
+module `public/editorial-comments.js`. **That module must not be created.** There would then be two
+comment UIs on one pane, both reading the same sub-resource, and the panel would be assembled from
+the wrong one.
+
+What #1040 ships *(all rows unmerged — #1040, verified in review against that branch head)*:
+
+| What | On #1040 |
+|---|---|
+| Module | `public/comments-panel.js` — **not** `public/editorial-comments.js` |
+| Mount symbol | `mountAssetComments`, called from `renderAssetDetailBody` at `public/app.js:3296` with `anchorEl: actionsDiv, host: body` |
+| Render order | **oldest first** — `public/comments-panel.js:122`, `:49`, `:397` |
+| Behaviour after a successful add | **re-reads the sub-resource and rebuilds the block in place** |
+| CSS classes | `.comment-item`, `.comment-meta`, `.comment-body` — `public/style.css:560`, `:567`, `:578` |
+| Durability copy | `COMMENTS_COPY.durabilityNote`, `public/comments-panel.js:129-131` — says comments *"do not survive an API restart"* |
+
+**So the comments work under #898 is: re-parent `mountAssetComments` into the editorial panel, then
+apply the amendments below.** Concretely:
+
+1. **Re-parent.** Change the existing call site from `{ anchorEl: actionsDiv, host: body }` to
+   `{ host: editorialPanel }` (§6.2). This is the same re-parenting `mountReviewState` gets, and for
+   the same reason. Whether `mountAssetComments` already supports a `host`-only call the way
+   `mountReviewState.place()` does **must be grepped on #1040's branch before estimating** — this
+   spec does not claim it does, because that file is not in this tree.
+2. **Re-house the heading** under `.editorial-group-title` reading `Comments ({n})` inside the
+   `<details>`/`<summary>` (§3), rather than whatever heading level #1040 uses standalone.
+3. **Apply amendments A1–A3** below, each of which reverses a decision #1040 has already shipped.
+4. **Delete `COMMENTS_COPY.durabilityNote`** (§5.3 *Durability*, §10 gap C4, §11).
+
+**Three amendments that reverse shipped #1040 behaviour.** These are written as explicit changes so
+that reversing them later — or deciding during implementation that #1040 was right — is a visible,
+deliberate decision recorded against this spec, not a silent merge conflict resolved by whoever
+rebases last.
+
+| # | #1040 ships | This spec specifies | Reversible? |
+|---|---|---|---|
+| **A1** | oldest first (`public/comments-panel.js:122`, `:49`, `:397`) | **newest first** (reverse the wire order) | Yes — see the rationale in *Order* below. If the operator research behind #1040 said otherwise, keep oldest-first and amend §3 (comment overflow becomes "oldest 10 hidden") and §11. Record the reversal here. |
+| **A2** | re-read the sub-resource and rebuild the block in place after a successful add | **prepend the 201 body** to the rendered list | Yes, and **A2 is the weaker of the two positions.** #1040's re-read is strictly more correct: it cannot drift from the server, and it costs one extra `GET` on an already-unpaginated resource (gap C2). A2's only advantages are one fewer round trip and not losing scroll position. **If the implementer keeps #1040's re-read, that is an accepted outcome** — the binding requirement is only that `id`/`createdAt` are never synthesised client-side. |
+| **A3** | heading/block rendered standalone (no disclosure) | wrapped in a native `<details>`, open when `count ≤ 5` (§3) | Yes — but A3 is load-bearing for the panel's shape: without it an unbounded thread pushes everything below it off-screen (§2). |
+
+**Class names: adopt #1040's, supersede this spec's.** Revision 2 proposed `.comment-row` and
+`.comment-time`. #1040 has already defined `.comment-item` (`public/style.css:560`),
+`.comment-meta` (`:567`) and `.comment-body` (`:578`) *(unmerged — #1040)*. **`.comment-item` and
+`.comment-meta` are hereby adopted and `.comment-row` / `.comment-time` are withdrawn** — renaming
+shipped classes to satisfy a design doc buys nothing, and `.comment-body` was already the same name
+in both. §6.4 carries the corrected list. Only genuinely new classes are added.
+
 ```
 ▾ Comments (3)
 ┌──────────────────────────────────────────────────────────┐
@@ -458,26 +533,36 @@ they must be mirrored as two capability checks, not one (gap T2, §10).
 bare array with no envelope and no cursor (`response: { 200: z.array(commentSchema), … }`,
 `src/routes/assets.ts`).
 
-**Order: newest first — which means reversing the wire order.** The API returns oldest→newest
-(`listByAsset`, §0.2); the panel renders the reverse. Two reasons: it matches the
+**Order: newest first — which means reversing the wire order, and reversing #1040 (amendment A1).**
+The API returns oldest→newest (`listByAsset`, §0.2) and **#1040 renders that order through**
+(`public/comments-panel.js:122`, `:49`, `:397` — *unmerged — #1040*); this spec renders the reverse,
+so adopting it is an edit to shipped behaviour, not a new build. Two reasons: it matches the
 convention the pane already sets for `Status history`, which reverses for exactly this purpose
 (`.slice().reverse()` on `lifecycleHistory`, `public/app.js`), and in a side pane with a collapsed,
 unpaginated thread the operator's
 question is "what is the latest note", which must be answerable without scrolling. The cost is that
 a long thread no longer reads as a conversation top-to-bottom; that is the right trade for a notes
-field with no replies, no threading and no attribution.
+field with no replies, no threading and no attribution. If that trade is rejected during
+implementation, keep #1040's oldest-first and record the reversal in the A1 row of §5.3.0 — do not
+leave the two orders to be settled by a rebase.
 
 **Composer at the top**, above the list, for the same reason: the control must not move down the
 page as the thread grows.
 
-**Post.** `POST …/comments` with `{ body }`. The 201 returns **the created comment**, not the asset
+**Post (amendment A2 — the one place this spec is the weaker position).** `POST …/comments` with
+`{ body }`. The 201 returns **the created comment**, not the asset
 (`response: { 201: commentSchema, 404: errorSchema }`) — so unlike tags and review state, this
 response cannot re-render the
-whole panel. Prepend the returned comment to the rendered list, clear the composer, and announce the
-result in the sub-section's `aria-live` region. Do **not** synthesise the comment from the local
-draft: `id` and `createdAt` are server-minted (`ulid()` / `new Date().toISOString()` in the
-repository's `create`) and the rendered row
-must show the server's values.
+whole panel. This spec's preference is to prepend the returned comment to the rendered list, clear
+the composer, and announce the result in the sub-section's `aria-live` region.
+
+**#1040 instead re-reads the sub-resource and rebuilds the block in place** *(unmerged — #1040)*.
+That is strictly more correct — the rendered list cannot drift from the server — at the cost of one
+extra unpaginated `GET` (gap C2) and the scroll position. **Either is acceptable; #1040's re-read may
+be kept as-is.** What is *not* negotiable either way: do **not** synthesise the comment from the
+local draft. `id` and `createdAt` are server-minted (`ulid()` / `new Date().toISOString()` in the
+repository's `create`) and the rendered row must show the server's values — which both approaches
+satisfy, since both render only what the server returned.
 
 **Validation.** `body` is trimmed server-side then `min(1).max(4096)`
 (`commentBodySchema`, `src/routes/assets.ts`). Mirror it: `Post` is disabled while the trimmed draft
@@ -512,6 +597,15 @@ ship — gap C4 is **resolved** (§10). What remains is C4a: the client cannot o
 live, so the panel carries **no durability copy at all** — no "saved", no "stored permanently", no
 sync indicator. The thread is simply shown as read back from the server.
 
+**One required deletion.** #1040 carries `COMMENTS_COPY.durabilityNote`
+(`public/comments-panel.js:129-131`, *unmerged — #1040*), which tells the operator that comments
+*"do not survive an API restart"*. **That string is now factually wrong and must be deleted, not
+reworded.** Comments are persisted — `src/main.ts:1064` in this branch's tree reads *"Asset comments
+(issue #135), persisted since issue #1046"* (verified here by grep; this is one of the few line
+numbers cited from the merged tree, and it will drift). Rewording it into a positive claim would be
+just as wrong, because of C4a: the client cannot observe which store is live, so it can honestly say
+neither "lost on restart" nor "saved permanently". The correct copy is **none**.
+
 ---
 
 ## 6. Composition with `public/app.js`
@@ -544,9 +638,9 @@ At the current review-state mount site (the `await mountReviewState({…})` call
 ```
 build #editorial-panel (heading + .editorial-intro)
 insert it before actionsDiv            ← the slot mountReviewState uses today
-  await mountReviewState({ assetId: asset.id, host: editorialPanel, canChange, apiFetch, showMsg })
-  await mountTags({     assetId: asset.id, host: editorialPanel, tags: asset.tags, canChange, apiFetch, … })
-  await mountComments({ assetId: asset.id, host: editorialPanel, canChange, apiFetch, … })
+  await mountReviewState({    assetId: asset.id, host: editorialPanel, canChange, apiFetch, showMsg })
+  await mountEditorialTags({  assetId: asset.id, host: editorialPanel, tags: asset.tags, canChange, apiFetch, … })
+  await mountAssetComments({  assetId: asset.id, host: editorialPanel, canChange, apiFetch, … })
 ```
 
 - `mountReviewState` is called with `host` and **no `anchorEl`**, so it appends into the panel. Its
@@ -554,9 +648,25 @@ insert it before actionsDiv            ← the slot mountReviewState uses today
 - The panel is inserted before `actionsDiv`, so **the vertical order of every
   other block is unchanged** — the panel occupies precisely the slot the review block occupies today.
 - All three mounts receive `asset.id`, never `id` (the route parameter, which may be a slug) — §0.6.
-- New sibling modules, matching the one-concern-per-file convention of `public/review-state.js`,
-  `public/lock-detail.js`, `public/tracks-panel.js`: `public/editorial-tags.js` and
-  `public/editorial-comments.js`.
+
+**All three mount symbols already exist or are in flight — none is invented here.** The pseudo-code
+above names the *real landing symbols*, not placeholders:
+
+| Mount | Module | Status |
+|---|---|---|
+| `mountReviewState` | `public/review-state.js` | merged — called at `public/app.js:3228` in this tree, with `anchorEl: actionsDiv, host: body`; this spec drops the `anchorEl` |
+| `mountEditorialTags` | `public/editorial-tags.js` | **in flight on PR #1036** *(unmerged — #1036; `public/editorial-tags.js:614` on that branch head)*. #1036 matches this spec; nothing in §5.2 changes |
+| `mountAssetComments` | `public/comments-panel.js` | **in flight on PR #1040** *(unmerged — #1040; mounted at `public/app.js:3296` on that branch head with `anchorEl: actionsDiv, host: body`)*. Re-parent to `host: editorialPanel`, then apply amendments A1–A3 — §5.3.0 |
+
+- **No new module is created for comments.** Revision 2 proposed `public/editorial-comments.js`;
+  that is withdrawn in favour of amending `public/comments-panel.js` (§5.3.0). Creating it would put
+  two comment UIs on one pane.
+- The sibling-module convention (`public/review-state.js`, `public/lock-detail.js`,
+  `public/tracks-panel.js` — one concern per file, mounted from `renderAssetDetailBody`) is satisfied
+  by both in-flight modules as they stand, so the convention argument no longer implies new files.
+- The naming inconsistency between `editorial-tags.js` and `comments-panel.js` is **accepted, not
+  fixed.** Renaming a shipped module to match a doc's prefix is churn with no operator-visible
+  effect; the panel is identified by `#editorial-panel`, not by its modules' filenames.
 
 ### 6.3 Messages and re-render
 
@@ -567,14 +677,22 @@ insert it before actionsDiv            ← the slot mountReviewState uses today
 - A tag write returns the full asset, so it re-renders the tags group from the response. It must
   **not** call `renderAssetDetailBody`, which would rebuild the whole pane, collapse the comments
   disclosure and destroy the composer draft.
-- For the same reason a comment post prepends one row rather than re-rendering.
+- For the same reason a comment post updates only its own sub-section — by prepending one row
+  (amendment A2) or by #1040's in-place re-read of `GET …/comments` (§5.3). Both are acceptable; what
+  neither may do is call `renderAssetDetailBody`.
 
 ### 6.4 CSS to add (`public/style.css`)
 
 `.editorial-panel` (accent rail, moved off `.review-block` — §4.1), `.editorial-group`,
 `.editorial-group-title` (modelled on `.tracks-group-title`, `public/style.css`),
-`.editorial-intro`, `.tag-remove` (the `×` affordance inside `.tag`), `.tag-input-row`,
-`.comment-row`, `.comment-time`, `.comment-body`.
+`.editorial-intro`, `.tag-remove` (the `×` affordance inside `.tag`), `.tag-input-row`.
+
+**No comment-row classes are added — #1040's are adopted.** Revision 2 listed `.comment-row`,
+`.comment-time` and `.comment-body` as new. #1040 has already defined `.comment-item`
+(`public/style.css:560`), `.comment-meta` (`:567`) and `.comment-body` (`:578`) *(unmerged — #1040)*,
+which cover the same three roles. **Use those three names; `.comment-row` and `.comment-time` are
+withdrawn** (§5.3.0). The only CSS the comments sub-section needs beyond #1040 is whatever the
+`<details>` wrapper requires (amendment A3), covered immediately below.
 
 **Disclosure styling: follow the precedent, don't re-invent it.** An earlier draft said no
 `details`/`summary` rules existed in `public/style.css`. That is no longer true — issue #964 added
@@ -732,8 +850,14 @@ New, found while writing this spec:
   `new PerWorkspaceCommentRepository(stackResolver, app.log)` under the comment *"Asset comments
   (issue #135), persisted since issue #1046."* Restart durability is covered by
   `describe('asset comments survive a restart on CouchDB (issue #1046)')`,
-  `test/asset-comments-couch.test.ts`. **The comments sub-section is cleared to ship**; the merge gate
-  that referenced this gap is withdrawn (§11).
+  `test/asset-comments-couch.test.ts` (that comment is at `src/main.ts:1064` in this branch's tree —
+  grepped here; the line number will drift, the quoted text will not).
+  **The comments sub-section is cleared to ship**; the merge gate that referenced this gap is
+  withdrawn (§11). **One shipped string still asserts the resolved gap:** `COMMENTS_COPY.durabilityNote`
+  on PR #1040 (`public/comments-panel.js:129-131`, *unmerged — #1040*) tells the operator that
+  comments *"do not survive an API restart"*. That is now factually wrong and must be **deleted** as
+  part of this work — not reworded, because C4a means no positive claim is observable either. See
+  §5.3 *Durability* and the §11 checklist.
 - **C4a — a client cannot tell which comment store is live.** The residual of C4. In-memory remains
   the fall-back when no stack resolves, or on the env path with `MINIO_URL` set and `COUCHDB_URL`
   unset (`src/services/workspace-stack.ts`); `PerWorkspaceCommentRepository.repo()` warns once to the
@@ -792,18 +916,35 @@ Tags:
 - [ ] Both writes re-render the group from the returned **full asset**, not from local state.
 - [ ] `viewer` sees pills without `×`, no input, and the read-only note.
 
-Comments:
+Comments — **amendments to PR #1040, not a new build** (§5.3.0):
 
-- [ ] Rendered **newest first** (the wire order is oldest first — reverse it).
+- [ ] `public/editorial-comments.js` is **not** created. The sub-section is `mountAssetComments` in
+      `public/comments-panel.js` (#1040), re-parented — exactly one comment UI exists on the pane.
+- [ ] `mountAssetComments` is called with `host: editorialPanel` and **no `anchorEl`** (it uses
+      `anchorEl: actionsDiv, host: body` on #1040).
+- [ ] **A1:** rendered **newest first** — this *reverses* #1040's oldest-first render. If oldest-first
+      is kept instead, the reversal is recorded in the A1 row of §5.3.0 and §3's comment-overflow rule
+      is amended to match. Not left to a rebase.
+- [ ] **A2:** after a successful add, the list shows only server-returned values — either the
+      prepended 201 body (this spec) or #1040's in-place re-read of `GET …/comments`. **Either
+      passes.** `id`/`createdAt` are never synthesised client-side.
+- [ ] **A3:** the sub-section is wrapped in a native `<details>` (open when `count ≤ 5`), which #1040
+      does not do today.
+- [ ] `COMMENTS_COPY.durabilityNote` (`public/comments-panel.js:129-131` on #1040) is **deleted**.
+      Its "do not survive an API restart" copy is factually wrong: `src/main.ts:1064` reads *"Asset
+      comments (issue #135), persisted since issue #1046"*. It is deleted rather than reworded,
+      because C4a means the client cannot observe a positive durability claim either.
+- [ ] `.comment-item` / `.comment-meta` / `.comment-body` (#1040, `public/style.css:560`, `:567`,
+      `:578`) are reused; no `.comment-row` / `.comment-time` is introduced (§6.4).
 - [ ] Composer above the list.
-- [ ] `POST` returns the created comment (not the asset): prepend it; never synthesise `id`/`createdAt`.
 - [ ] Trimmed-empty draft disables `Post`; over-4096 disables with the character count.
 - [ ] The "not attributed to a user" line is present (gap C1).
 - [ ] No edit and no delete affordance on a comment (gap C3).
 - [ ] Absolute timestamps via `fmtDate`.
 - [ ] `viewer` sees the list with no composer.
-- [ ] No durability claim in the copy: nothing says "saved", "stored permanently", or shows a
-      persistence indicator (gap C4a — the client cannot observe which store is live).
+- [ ] No durability claim in the copy at all: nothing says "saved", "stored permanently", "lost on
+      restart", or shows a persistence indicator (gap C4a — the client cannot observe which store is
+      live).
 
 Cross-cutting:
 
