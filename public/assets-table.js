@@ -55,6 +55,31 @@
  *     of matching ASSETS; `collectionTotal` counts collection hits separately and
  *     this table (assets only) ignores it.
  *
+ * TAG + METADATA FILTERS (issue #914). The filter bar also narrows by tag and by
+ * free-form operator metadata. Both are filters ONLY `GET /api/v1/search/` has —
+ * `GET /api/v1/assets/` declares neither (verified: openapi.json
+ * .paths["/api/v1/assets/"].get.parameters is limit/offset/status/parentId/from/to
+ * only, and `listQuerySchema`, src/routes/assets.ts:373) — so setting either one
+ * routes the request to the tier-2 search endpoint even with NO free-text term.
+ * That is sound, not a workaround: `q` is `.optional()` on `searchQuerySchema`
+ * (src/routes/search.ts:155-166), so a tags-only or metadata-only search is a
+ * first-class query, and every filter is applied to the whole matched set before
+ * the page slice, so the reported `total` stays exact (#834) on this tier too.
+ *   tags      — `?tags=` accepts a repeated param OR one comma-separated list and
+ *               normalises to a trimmed, non-empty array (`tagsSchema`,
+ *               src/routes/search.ts:139-150). The control therefore sends the
+ *               operator's comma-separated text as a single `tags` param, which is
+ *               the SAME shape the Search tab sends (app.js renderSearchTab:
+ *               `params.set('tags', tags)`).
+ *   metadata  — one `metadata.<key>=<value>` param per pair (issue #12;
+ *               `extractMetadataFilter`, src/routes/search.ts:221-240, which pulls
+ *               the dynamic keys out of the `.passthrough()` querystring at
+ *               src/routes/search.ts:218). Because the key names are dynamic they
+ *               appear in no OpenAPI `parameters` list — the route source IS the
+ *               contract for them.
+ * Container/MIME (`mimeType`) is deliberately NOT offered here (issue #822 owns
+ * that vocabulary; explicitly out of scope for #914), even though the param exists.
+ *
  * `status` / `from` / `to` ARE SERVER-SIDE ON BOTH TIERS (issue #833, merged).
  * Both endpoints share ONE definition of the created-at range grammar and match
  * semantics — `CreatedFromSchema`/`CreatedToSchema`/`resolveCreatedRange` in
@@ -110,7 +135,25 @@
  * createdAt, and hiding Status does not drop the `status` param — so `total` and
  * which rows a page reaches are unchanged by definition, not by convention.
  * Resolution order on load is URL -> stored per-operator default -> all columns;
- * see resolveInitialColumns() below.
+ * see resolveInitialColumns() below. The chooser's "Reset to defaults" (issue
+ * #962) unwinds that same ladder from the top: it clears the `assets.cols` param
+ * AND this browser's stored default, so the table falls back to the declared set
+ * and stays there on refresh and on the next visit alike.
+ *
+ * ROW RENAME (issue #927). The Actions column carries a Rename control, so an
+ * operator renames an asset from the list without opening the detail pane. The
+ * only write it can make is the one the detail view already made:
+ *   PATCH /api/v1/assets/{id} — path param `id` only; request body properties
+ *   `name` (string, minLength 1, maxLength 256), `description`, `objectKey`,
+ *   `status`, `metadata`, `tags`, all optional, `additionalProperties: false`;
+ *   responses 200 (the full asset) / 404 / 422. Verified in openapi.json
+ *   .paths["/api/v1/assets/{id}"].patch and in `updateSchema`
+ *   (src/routes/assets.ts:418, `name` at :420) wired at `app.patch('/:id', …)`
+ *   (src/routes/assets.ts:5682). NO schema change was needed for this control.
+ * The dialog, the validation and the body construction are NOT reimplemented
+ * here: the row hands off to openRenameDialog (public/asset-rename.js), the same
+ * entry point the detail view uses, which sends exactly `{ name }`. This module
+ * contributes the button and the reload; see the Actions column renderer.
  *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
@@ -135,6 +178,7 @@ import {
   normalizeVisibleColumns,
   readStoredColumns,
   writeStoredColumns,
+  clearStoredColumns,
 } from './table-columns.js';
 // Presigned thumbnail loading (issue #801). The thumbnail cell is rendered
 // src-less and filled in after each render — see hydrateThumbnails() below and
@@ -192,6 +236,16 @@ const URL_DEFAULTS = Object.freeze({
   sort: { field: SORT_KEY_CREATED, dir: SORT_DIR.desc },
   size: ASSETS_PAGE_SIZE,
 });
+
+// ─── Bulk selection (issue #916) ─────────────────────────────────────────────
+//
+// The leading tick-box column that turns the Assets tab from a read-only list
+// into a place bulk actions can start from. It is opt-in (`selectable: true`)
+// so every other consumer of this module is unchanged, and it is declared
+// `hideable: false` so the column chooser cannot hide the control an active
+// selection depends on (normalizeVisibleColumns keeps a non-hideable column
+// visible whatever the URL/stored set asks for — public/table-columns.js:205-207).
+export const ASSETS_SELECT_COLUMN_KEY = 'select';
 
 // ─── Column visibility contract (issue #959) ─────────────────────────────────
 
@@ -279,6 +333,52 @@ function applyClientSort(rows, sort) {
   return out;
 }
 
+// ─── Structured filter parsing (issue #914) ───────────────────────────────────
+//
+// Both controls below hold their value as the raw text the operator typed, so the
+// box always shows exactly what they wrote. These two functions are the single
+// place that text becomes request shape — used by the fetch layer AND by the URL
+// sync, so a shared link and the request it reproduces can never disagree.
+
+// Comma-separated tag text -> trimmed, non-empty, de-duped tag list. Mirrors the
+// server's own normalisation (`tagsSchema`, src/routes/search.ts:139-150) so the
+// client never sends a blank tag the server would only drop.
+function parseTagsFilter(raw) {
+  if (typeof raw !== 'string') return [];
+  const out = [];
+  const seen = new Set();
+  raw.split(',').forEach(function (part) {
+    const t = part.trim();
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
+  });
+  return out;
+}
+
+// Comma-separated `key=value` text -> [{ key, value }]. Only the first `=` splits
+// a pair, so a value may contain `=`. A token with no `=` or a blank key is NOT a
+// filter the `metadata.<key>=<value>` grammar can carry, so it is dropped rather
+// than sent as something the server would ignore — the operator sees the full set
+// of rows their partially-typed filter still matches, and the control's hint says
+// what the shape is. A blank VALUE is kept: `metadata.genre=` is a real filter.
+// One pair per key, because the server keeps only the first value for a repeated
+// key (`extractMetadataFilter`, src/routes/search.ts:221-240).
+function parseMetadataFilter(raw) {
+  if (typeof raw !== 'string') return [];
+  const out = [];
+  const seen = new Set();
+  raw.split(',').forEach(function (part) {
+    const eq = part.indexOf('=');
+    if (eq < 0) return;
+    const key = part.slice(0, eq).trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ key, value: part.slice(eq + 1).trim() });
+  });
+  return out;
+}
+
 // ─── Data-source router: choose the FTS tier or the exact/range list tier ─────
 //
 // Given the primitive's current interaction state, build and run the correct
@@ -295,18 +395,31 @@ async function fetchAssetsPage(snap, deps) {
   const status = filters.status || '';
   const from = filters.from || '';
   const to = filters.to || '';
+  // Structured filters only the search tier can express (issue #914).
+  const tags = parseTagsFilter(filters.tags);
+  const metadata = parseMetadataFilter(filters.meta);
   const limit = snap.pageSize;
   const offset = snap.offset;
 
-  if (q) {
+  if (q || tags.length || metadata.length) {
     // ── Tier 2: free-text FTS via the canonical GET /api/v1/search/ path. ──
     // Paged by page/pageSize (page is 1-based). Envelope:
     // { assets, collections, total, collectionTotal, page }.
     const page = Math.floor(offset / limit) + 1;
     const params = new URLSearchParams();
-    params.set('q', q);
+    // `q` is optional on this endpoint, so a tags-only / metadata-only filter
+    // reaches the search tier WITHOUT an empty `q` (which would be a 400: the
+    // schema is `.min(1)`).
+    if (q) params.set('q', q);
     params.set('page', String(page));
     params.set('pageSize', String(limit));
+    // One comma-separated `tags` param — the shape `tagsSchema` normalises and
+    // the shape the Search tab already sends.
+    if (tags.length) params.set('tags', tags.join(','));
+    // One `metadata.<key>=<value>` param per pair (issue #12 query grammar).
+    metadata.forEach(function (pair) {
+      params.set('metadata.' + pair.key, pair.value);
+    });
     // status/from/to are real server params here (issue #833) — send them so the
     // filter narrows the whole matched set, not the page in hand.
     if (status) params.set('status', status);
@@ -457,8 +570,16 @@ function searchFilterControl(initial) {
     wrap.appendChild(span);
     wrap.appendChild(field);
 
-    // Wire the three rhythms onto the primitive's single onChange(value).
-    function wire(onChange) {
+    return { el: wrap, input, clear, wire: debouncedTextWiring(input, clear, initial) };
+  };
+}
+
+// The three typing rhythms a live text filter needs — debounce, flush, clear —
+// factored out of searchFilterControl so the tag and metadata boxes (issue #914)
+// behave identically to the free-text box instead of re-deriving the behaviour.
+// Returns the `wire(onChange)` function asSlot() expects.
+function debouncedTextWiring(input, clear, initial) {
+  return function wire(onChange) {
       let timer = null;
       // The value most recently handed to the table. Lets the flush paths (Enter,
       // blur) skip a second, identical request when the debounce already landed.
@@ -471,11 +592,11 @@ function searchFilterControl(initial) {
         }
       }
 
-      // Hand the box's current value to the table now. Trimmed, because the
+      // Hand the box's current value to the table now, trimmed: a whitespace-only
+      // value is not a filter. For the free-text box that matters because the
       // verified `q` param is a 1..512 string (openapi.json
-      // .paths["/api/v1/search/"].get.parameters) and a whitespace-only term is
-      // not a term — trimming it to '' is exactly what drops back to the tier-1
-      // list call.
+      // .paths["/api/v1/search/"].get.parameters), and trimming it to '' is
+      // exactly what drops back to the tier-1 list call.
       function dispatch() {
         cancel();
         dispatched = input.value.trim();
@@ -525,10 +646,88 @@ function searchFilterControl(initial) {
         // the search, not an exit from it.
         input.focus();
       });
-    }
-
-    return { el: wrap, input, clear, wire };
   };
+}
+
+// The tag and metadata filter boxes (issue #914). Both are plain text boxes with
+// the same debounce/flush/clear rhythms as the free-text box, because they are
+// the same KIND of control — a filter you narrow by typing — and the operator
+// should not have to learn two interaction models in one bar.
+//
+// Accessibility: each box carries a visible <label> (the wrapper IS a <label>, as
+// with the sibling controls) plus an `aria-describedby` hint naming the accepted
+// shape, so the grammar is announced rather than discovered by trial and error.
+// The clear button is a real focusable button with its own accessible name.
+function structuredTextFilterControl(opts) {
+  return function () {
+    const initial = opts.initial;
+    const wrap = document.createElement('label');
+    wrap.className = 'ops-filter-' + opts.name;
+    const span = document.createElement('span');
+    span.textContent = opts.label;
+
+    const field = document.createElement('div');
+    field.className = 'ops-search-field';
+
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.className = 'ops-search-input ops-search-input-plain';
+    input.placeholder = opts.placeholder;
+    input.setAttribute('aria-label', opts.label);
+    input.setAttribute('autocomplete', 'off');
+    const hintId = 'assets-filter-' + opts.name + '-hint';
+    input.setAttribute('aria-describedby', hintId);
+    if (initial) input.value = initial;
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'ops-search-clear';
+    clear.setAttribute('aria-label', opts.clearLabel);
+    clear.title = opts.clearLabel;
+    clear.textContent = '×'; // MULTIPLICATION SIGN — a glyph, not an icon font
+    clear.hidden = !(initial && initial.length);
+
+    field.appendChild(input);
+    field.appendChild(clear);
+
+    const hint = document.createElement('span');
+    hint.className = 'form-hint ops-filter-hint';
+    hint.id = hintId;
+    hint.textContent = opts.hint;
+
+    wrap.appendChild(span);
+    wrap.appendChild(field);
+    wrap.appendChild(hint);
+
+    return { el: wrap, input, clear, wire: debouncedTextWiring(input, clear, initial) };
+  };
+}
+
+function tagsFilterControl(initial) {
+  return structuredTextFilterControl({
+    name: 'tags',
+    label: 'Tags',
+    placeholder: 'news,sports',
+    // Says what the server actually does: `tags` is an AND across the listed
+    // tags in the repo matcher, and the comma is the separator the route's
+    // `tagsSchema` splits on.
+    hint: 'Comma-separated. An asset must carry every tag listed.',
+    clearLabel: 'Clear tag filter',
+    initial,
+  });
+}
+
+function metadataFilterControl(initial) {
+  return structuredTextFilterControl({
+    name: 'meta',
+    label: 'Metadata',
+    placeholder: 'genre=documentary',
+    // Exact-value match on the asset's free-form metadata bag, every listed pair
+    // required (src/data/search-repo.ts:392-400).
+    hint: 'key=value pairs, comma-separated. Exact match on every pair given.',
+    clearLabel: 'Clear metadata filter',
+    initial,
+  });
 }
 
 function dateFilterControl(name, labelText, initial) {
@@ -583,8 +782,42 @@ function buildColumns(renderCtx) {
   // the Status renderer below. It cannot go stale: the only writer is the fetch
   // that produced the very rows being rendered.
   const projection = renderCtx.projection;
+  // Bulk selection (issue #916). `selection` is the live Map the factory owns
+  // (id -> label); read at render time so a row that is already selected comes
+  // back ticked after a sort/page/filter repaint.
+  const selection = renderCtx.selection;
+  // Client-side mirror of the ADR-018 write gate for PATCH /api/v1/assets/{id}
+  // (issue #927). Read as a FUNCTION at render time, not captured as a boolean at
+  // construction time, so a role changed in the UI after the table was built is
+  // honoured by the next repaint instead of showing a control that is certain to
+  // earn a 403.
+  const canRename = typeof renderCtx.canRename === 'function' ? renderCtx.canRename : null;
 
-  return [
+  const selectColumn = {
+    key: ASSETS_SELECT_COLUMN_KEY,
+    label: '',
+    // Named for the chooser list even though it never appears there, so a future
+    // change that makes it hideable does not ship an unlabelled entry.
+    chooserLabel: 'Select',
+    width: '32px',
+    hideable: false,
+    render: (a) => {
+      const label = a.name || a.slug || a.id;
+      return (
+        '<input type="checkbox" class="asset-select-box" value="' +
+        escHtml(a.id) +
+        '"' +
+        (selection && selection.has(a.id) ? ' checked' : '') +
+        ' data-asset-label="' +
+        escHtml(label) +
+        '" aria-label="Select ' +
+        escHtml(label) +
+        '" />'
+      );
+    },
+  };
+
+  const dataColumns = [
     {
       key: 'thumb',
       label: '',
@@ -697,6 +930,36 @@ function buildColumns(renderCtx) {
               escHtml(a.id) +
               '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
             : '') +
+          // Rename, straight from the row (issue #927 — the "inline-in-list"
+          // affordance for the detail view's existing control). It opens the SAME
+          // dialog the detail view opens (openRenameDialog, public/asset-rename.js),
+          // so there is one rename interaction in this UI, not two: the row saves
+          // the operator a detail-pane round trip, it does not get its own rules.
+          //
+          // `data-name` carries the row's current title so the dialog can prefill
+          // without a second GET. `name` is REQUIRED on both tiers (it is in the
+          // `required` list of the tier-1 list item and non-optional on the tier-2
+          // `assetSchema`), so the `|| a.slug || ''` tail is defence against a
+          // malformed payload, not an expected case: it keeps the attribute
+          // well-formed, and the dialog's own `min(1)` rule then makes the operator
+          // supply a name rather than sending an empty one.
+          //
+          // Offered on BOTH tiers. Unlike the delete lock, nothing here depends on
+          // a field the free-text search projection omits: `id` and `name` are
+          // both present on the tier-2 asset schema (src/routes/search.ts:77-90),
+          // so a search-tier row can be renamed as safely as a list-tier one.
+          //
+          // A viewer gets NO button rather than a disabled one: the role cannot
+          // hold `write`, so the control could only ever produce a 403. The server
+          // remains the authority — the dialog still handles the 403 if the
+          // client-side mirror is wrong.
+          (canRename && canRename()
+            ? '<button class="btn-ghost asset-rename-btn" data-id="' +
+              escHtml(a.id) +
+              '" data-name="' +
+              escHtml(a.name || a.slug || '') +
+              '" title="Rename this asset" style="font-size:12px;padding:3px 8px;">Rename</button> '
+            : '') +
           // `data-name` carries the SAME human-readable label the "Name / Title"
           // column renders (a.name || a.slug) so the archive confirmation can
           // name its subject without a second lookup (issue #919). Empty when the
@@ -725,6 +988,8 @@ function buildColumns(renderCtx) {
       },
     },
   ];
+
+  return renderCtx.selectable ? [selectColumn, ...dataColumns] : dataColumns;
 }
 
 // ─── Column visibility resolution (issue #959) ────────────────────────────────
@@ -809,6 +1074,20 @@ function hydrateThumbnails(tbodyEl, apiFetch) {
 //                                         derive, so the handler can explain a
 //                                         guaranteed refusal pre-flight.
 //   onRedrive(id) -> Promise            — re-drive action; table reloads after.
+//   canRename() -> boolean (optional)   — client-side mirror of the ADR-018 write
+//                                         gate (issue #927). Called at render
+//                                         time; when it is absent or answers
+//                                         false, no row carries a Rename control.
+//   onRename(id, name) -> Promise       — rename action; `name` is the row's
+//                                         current title, for the dialog's
+//                                         prefill. The table reloads unless the
+//                                         handler resolves `false`.
+//   selectable (optional, issue #916)   — when true, prepend a tick-box column
+//                                         and track a selection that survives
+//                                         sort/filter/page repaints.
+//   onSelectionChange(selection)        — fires on every selection change with
+//                                         `[{ id, label }]`; only meaningful
+//                                         alongside `selectable: true`.
 //   win (optional)                      — injectable window for URL sync (tests).
 //
 // The table reads its initial sort/filter/page from the URL (shared contract),
@@ -825,6 +1104,11 @@ export function createAssetsTable(deps) {
   // 2) Initial filter values for the controls come from the decoded URL.
   const initialFilters = {};
   if (urlState.q) initialFilters.q = urlState.q;
+  // Structured filters (issue #914). The shared decoder hands these back as
+  // normalised arrays; the controls hold text, so they are re-joined with the
+  // same comma separator the decoder split on — a round trip, not a reformat.
+  if (urlState.tags && urlState.tags.length) initialFilters.tags = urlState.tags.join(',');
+  if (urlState.meta && urlState.meta.length) initialFilters.meta = urlState.meta.join(',');
   if (urlState.status && urlState.status.length) initialFilters.status = urlState.status[0];
   if (urlState.from) initialFilters.from = urlState.from;
   if (urlState.to) initialFilters.to = urlState.to;
@@ -834,7 +1118,19 @@ export function createAssetsTable(deps) {
   // Written by reload() from the fetch result immediately before setRows(), so
   // the Status renderer always reads the flag belonging to the rows it renders.
   // Starts true because the first load is tier 1 unless the URL seeds a `q`.
-  const projection = { carriesLock: !initialFilters.q };
+  // A tags/metadata-only filter also routes to tier 2 (#914), so it is just as
+  // lock-blind as a free-text term — the flag has to account for all three.
+  const projection = {
+    carriesLock: !(initialFilters.q || initialFilters.tags || initialFilters.meta),
+  };
+
+  // Bulk selection (issue #916). id -> human-readable label, so a bulk-action
+  // bar can name what it is about to act on without re-reading the rows. Lives
+  // outside the row data on purpose: it must SURVIVE a repaint (sort, filter,
+  // page) so an operator can gather assets from more than one page before
+  // acting. Only `clearSelection()` and an explicit untick remove entries.
+  const selection = new Map();
+  const selectable = d.selectable === true;
 
   const columns = buildColumns({
     renderBadge: d.renderBadge,
@@ -842,7 +1138,26 @@ export function createAssetsTable(deps) {
     fmtDate: d.fmtDate,
     isAssetWedged: d.isAssetWedged,
     projection,
+    canRename: d.canRename,
+    selectable,
+    selection,
   });
+
+  function selectedIds() {
+    return [...selection.keys()];
+  }
+
+  // One place the consumer is told the selection moved, so the bulk bar never
+  // has to poll or re-derive it from the DOM.
+  function emitSelection() {
+    if (typeof d.onSelectionChange === 'function') {
+      d.onSelectionChange(
+        selectedIds().map(function (id) {
+          return { id: id, label: selection.get(id) || id };
+        })
+      );
+    }
+  }
 
   // Initial visible column set (issue #959): URL -> stored default -> all.
   const columnChoice = resolveInitialColumns(
@@ -856,6 +1171,10 @@ export function createAssetsTable(deps) {
     { name: 'from', control: asSlot(dateFilterControl('from', 'Created from', initialFilters.from)) },
     { name: 'to', control: asSlot(dateFilterControl('to', 'Created to', initialFilters.to)) },
     { name: 'q', control: asSlot(searchFilterControl(initialFilters.q)) },
+    // Structured filters (issue #914), after the free-text box: they REFINE a
+    // list, so they read left-to-right as "search, then narrow".
+    { name: 'tags', control: asSlot(tagsFilterControl(initialFilters.tags)) },
+    { name: 'meta', control: asSlot(metadataFilterControl(initialFilters.meta)) },
   ];
 
   const table = createOpsTable({
@@ -885,6 +1204,31 @@ export function createAssetsTable(deps) {
         // NOT reload(): the request is identical, so re-issuing it would be a
         // wasted round-trip and a visible loading flash for a repaint.
         syncUrl(table.state.getState());
+      },
+      // Reset to defaults (issue #962) — the exact inverse of onChange above, and
+      // it has to undo BOTH of its writes. Clearing only one is not a partial
+      // reset, it is no reset at all: a surviving `cols` param re-applies on this
+      // refresh, and a surviving stored default re-applies on the next bare visit.
+      // `keys` is the declared default set the primitive has already painted, so
+      // this callback only forgets.
+      onReset: function (keys) {
+        columnChoice.keys = keys;
+        // 1) The URL half. Dropping `explicit` is what removes the param rather
+        //    than rewriting it: syncUrl sends `cols: null`, and encodeTableState
+        //    clears every param in this namespace before writing back only the
+        //    non-default ones — so `assets.cols` simply does not come back.
+        columnChoice.explicit = false;
+        // 2) The stored half. Best-effort like the write it undoes; a blocked
+        //    store had nothing to forget in the first place.
+        clearStoredColumns(ASSETS_NS, win);
+        syncUrl(table.state.getState());
+      },
+      // Whether there is anything left to reset, so the action is greyed out in a
+      // view that is already pristine. `explicit` covers both a choice made in
+      // this session and one the URL arrived with; the stored read covers a
+      // default saved in an earlier one.
+      isCustomized: function () {
+        return columnChoice.explicit || readStoredColumns(ASSETS_NS, win) != null;
       },
     },
   });
@@ -926,6 +1270,12 @@ export function createAssetsTable(deps) {
         sort: tableSortToUrlSort(snap.sort),
         status: snap.filters.status ? [snap.filters.status] : [],
         q: snap.filters.q || '',
+        // Normalised through the SAME parsers the request uses, so the URL can
+        // only ever describe filters that were actually sent (issue #914).
+        tags: parseTagsFilter(snap.filters.tags),
+        meta: parseMetadataFilter(snap.filters.meta).map(function (p) {
+          return p.key + '=' + p.value;
+        }),
         from: snap.filters.from || null,
         to: snap.filters.to || null,
         page,
@@ -987,6 +1337,24 @@ export function createAssetsTable(deps) {
     // not also open that row's detail panel.
     wireCopyIdButtons(tbody);
 
+    // Bulk-selection tick boxes (issue #916). `click` stops propagation so
+    // ticking a row does not ALSO open that row's detail panel — selecting and
+    // inspecting are different intents. `change` is what records the choice, so
+    // keyboard operation (focus the box, press Space) works identically.
+    tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+      box.addEventListener('click', function (e) {
+        e.stopPropagation();
+      });
+      box.addEventListener('change', function () {
+        if (box.checked) {
+          selection.set(box.value, box.dataset.assetLabel || box.value);
+        } else {
+          selection.delete(box.value);
+        }
+        emitSelection();
+      });
+    });
+
     tbody.querySelectorAll('tr[data-row-key]').forEach(function (tr) {
       const id = tr.getAttribute('data-row-key');
       // Row accent for a delete-locked row (issue #894, spec §3.1). Derived from
@@ -1020,6 +1388,25 @@ export function createAssetsTable(deps) {
       });
     });
 
+    // Rename from the row (issue #927). The handler owns the dialog and the
+    // request; this only keeps the row click from also opening the detail pane,
+    // and reloads so the renamed row shows its new title in whichever tier is on
+    // screen — both the list and the free-text search projection read `name` from
+    // the live asset document, so one reload is enough and no reindex step
+    // exists to wait for.
+    //
+    // `false` means "nothing changed" (cancelled, or a refusal the handler has
+    // already explained), and skips the reload for the same reason the archive
+    // handler does: a request that changed nothing has nothing to repaint.
+    tbody.querySelectorAll('.asset-rename-btn').forEach(function (btn) {
+      btn.addEventListener('click', async function (e) {
+        e.stopPropagation();
+        if (typeof d.onRename !== 'function') return;
+        const ok = await d.onRename(btn.dataset.id, btn.dataset.name || '');
+        if (ok !== false) reload();
+      });
+    });
+
     tbody.querySelectorAll('.asset-redrive-btn').forEach(function (btn) {
       btn.addEventListener('click', async function (e) {
         e.stopPropagation();
@@ -1047,10 +1434,80 @@ export function createAssetsTable(deps) {
   // Kick off the first load.
   reload();
 
+  // ── Bulk selection, for the consumer's action bar (issue #916) ──
+
+  // Tick every row currently on screen. Additive: rows selected on other pages
+  // stay selected.
+  function selectAllOnPage() {
+    const tbody = table.el.querySelector('tbody');
+    if (tbody) {
+      tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+        box.checked = true;
+        selection.set(box.value, box.dataset.assetLabel || box.value);
+      });
+    }
+    emitSelection();
+    return selectedIds();
+  }
+
+  // Untick a specific set of ids, leaving the rest of the selection alone.
+  // The counterpart `clearSelection()` is all-or-nothing, which is wrong after a
+  // PARTIAL bulk run: the ids that landed must leave the selection while the
+  // ones that failed stay ticked for retry. Because this Map is the
+  // AUTHORITATIVE selection (a consumer's own copy is only a mirror fed by
+  // `onSelectionChange`), narrowing has to happen here or the next tick anywhere
+  // in the table re-emits the ids that already landed. Ids not currently on
+  // screen have no box to untick — dropping them from the Map is enough, the
+  // next repaint renders them unticked.
+  function deselect(ids) {
+    const drop = new Set(
+      (Array.isArray(ids) ? ids : [ids]).map(function (entry) {
+        return entry && typeof entry === 'object' ? entry.id : entry;
+      })
+    );
+    if (drop.size === 0) return selectedIds();
+    let changed = false;
+    drop.forEach(function (id) {
+      if (selection.delete(id)) changed = true;
+    });
+    const tbody = table.el.querySelector('tbody');
+    if (tbody) {
+      tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+        if (drop.has(box.value)) box.checked = false;
+      });
+    }
+    if (changed) emitSelection();
+    return selectedIds();
+  }
+
+  function clearSelection() {
+    selection.clear();
+    const tbody = table.el.querySelector('tbody');
+    if (tbody) {
+      tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+        box.checked = false;
+      });
+    }
+    emitSelection();
+    return [];
+  }
+
   return {
     el: table.el,
     reload,
     destroy: table.destroy,
+    // Bulk selection (issue #916). `getSelection()` returns `{ id, label }`
+    // entries in tick order so a caller can both act on the ids and name them.
+    getSelection: function () {
+      return selectedIds().map(function (id) {
+        return { id: id, label: selection.get(id) || id };
+      });
+    },
+    getSelectedIds: selectedIds,
+    selectAllOnPage,
+    // Per-id untick, for a consumer that consumed only part of its selection.
+    deselect,
+    clearSelection,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
     // Column visibility (issue #959), for consumers/tests that want to read or
