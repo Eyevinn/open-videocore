@@ -2,14 +2,18 @@
 
 **Issues:** extends the spec landed for #941 (closed, COMPLETED 2026-09-30), itself broken out
 of #795 (closed, COMPLETED 2026-09-28); the PR carrying this file closes #906. #906 asks for
-the chain view, current-version indicator and empty state; §2, §3 and §5 answer it, and §7-§9
+the chain view, current-version indicator and empty state; §2, §3 and §5 answer it, and §8-§10
 add the state wireframes, narrow-panel layout and accessibility contract it needs.
 This file is the single spec for the surface; do not open a second one.
-**Implementation:** the surface is being built under #942 (PR #1117, branch
-`issue-942/version-chain-view` — `public/version-chain.js`, `public/detail.js`,
-`public/style.css`). Where this spec and that branch disagree, §8 records the divergence
-explicitly rather than leaving the implementer to guess.
-**Status:** design spec. No production code accompanies it.
+**Implementation (shipped baseline):** the surface is **already implemented on `main`** —
+`public/version-chain.js`, merged 2026-10-05 in PR #1049 (closes #907) and mounted from
+`public/app.js` (`import { mountVersionChain } from './version-chain.js'`). Read that module
+first: it is the baseline any further work edits. #942 / PR #1117 is still open against the
+same surface, so treat it as a follow-up on top of #1049, not as where the surface is built —
+anything it adds has to land on the merged module rather than alongside it. §9 records, by
+grep, which parts of this spec the merged code does **not** yet satisfy.
+**Status:** design spec. The PR carrying this file changes only this file; the code it
+specifies is the already-merged module named above.
 **Audience:** whoever implements the asset-detail versions view, plus anyone writing operator copy about versions.
 
 This pins the **layout, current-version indicator, navigation and empty state** for one
@@ -42,12 +46,12 @@ To check any row, grep the symbol in the file named next to it.
 | `status` enum | `…versions.items.properties.status.enum` = `uploading`, `processing`, `ready`, `failed`, `archived` |
 | Ordering | **oldest first**: `createdAt` ascending, ties broken by `id` ascending. **Duplicated, not shared** — `export function compareVersionOrder` (`src/data/asset-repo.ts`) is called only from `currentVersionId`; both `listVersions` implementations inline the same expression literally (`a.createdAt.localeCompare(b.createdAt) \|\| a.id.localeCompare(b.id)` in `InMemoryAssetRepository.listVersions`, `src/data/asset-repo.ts`, and in `CouchAssetRepository.listVersions`, `src/data/couch-asset-repo.ts`). Editing `compareVersionOrder` does **not** change the order the endpoint returns; that is the drift risk worth recording. ULIDs make the `id` tiebreak total and time-ordered |
 | Current version | `currentVersionId` — **server-computed**, `const current = currentVersionId(versions) ?? request.params.id` in the `'/:id/versions'` handler (`src/routes/assets.ts`), defined as `export function currentVersionId` in `src/data/asset-repo.ts`. Preference ladder over `status`: `ready` → (`uploading`\|`processing`) → `failed` → `archived`, newest-first within the highest non-empty tier |
-| Current version is **not** the last array element | the doc comment on `currentVersionId` (`src/data/asset-repo.ts`) states it explicitly — "'last element of the array' is NOT the rule"; the ladder skips archived / failed / in-flight members while a usable one exists |
+| Current version is **not** the last array element | the doc comment on `currentVersionId` (`src/data/asset-repo.ts`) states it explicitly, in double quotes exactly as written there — `"last element of the array" is NOT the rule` (the phrase wraps across two comment lines, so grep `last element of the array`); the ladder skips archived / failed / in-flight members while a usable one exists |
 | Current version does **not** promise playability | same `currentVersionId` doc comment — "it names the head of the lineage, it does not promise `ready`"; the member's own `status` must be checked |
 | Membership | group-scoped, **always includes the target**, **includes `archived` members** (lineage history, not a live listing). `listVersions` — declared on the `AssetRepository` interface (`src/data/asset-repo.ts`), implemented as `InMemoryAssetRepository.listVersions` (same file) and `CouchAssetRepository.listVersions` (`src/data/couch-asset-repo.ts`) |
 | Never-versioned asset | returns a **single-member chain** containing only itself, with `versionGroupId` absent. Both implementations early-return the asset alone when it has no `versionGroupId`, before any group lookup: `InMemoryAssetRepository.listVersions` (`src/data/asset-repo.ts`) and `CouchAssetRepository.listVersions` (`src/data/couch-asset-repo.ts`). Each guard is introduced by the same one-line comment, which greps in both files: `No lineage yet: the asset is its own (single-member) chain.` |
 | 404 body | `openapi.json` → `…get.responses["404"]` — `{ error: string, message?: string }`, `required: ["error"]`, `additionalProperties: false`. Source: `const errorSchema = z.object({ error: z.string(), message: z.string().optional() })`, `src/routes/assets.ts`, wired as `404: errorSchema` on the `'/:id/versions'` route; that handler sends `{ error: 'not_found' }` |
-| Only two responses | `openapi.json` → `…get.responses` has exactly `200` and `404`. There is no documented 4xx/5xx body beyond those, so anything else is handled as a fetch failure — §5 for the rule, §7 for the wireframe |
+| Only two responses | `openapi.json` → `…get.responses` has exactly `200` and `404`. There is no documented 4xx/5xx body beyond those, so anything else is handled as a fetch failure — §5 for the rule, §8 for the wireframe |
 | No pagination | `…get.parameters` contains **only** `id`. Chain returned whole, bounded by `export const MAX_LIMIT = 200` (`src/data/asset-repo.ts`) applied inside `CouchAssetRepository.listVersions` (`src/data/couch-asset-repo.ts`) — and **only** there. `InMemoryAssetRepository.listVersions` passes no limit, so the cap is Couch-only |
 | How versions are created | `resolveVersionLinkage(source)`, `src/data/asset-repo.ts` — returns `versionOfAssetId: source.id` and `versionGroupId: source.versionGroupId ?? source.id`, plus `seedSourceGroup` to backfill the root |
 | Opt-in only | `asVersion: z.boolean().optional()` on `exportBodySchema` and on `clipBodySchema` (`src/routes/assets.ts`); threaded as `asVersion: request.body.asVersion` from the `'/:id/export'` and `'/:id/clip'` handlers in the same file; consumed at `if (asVersion && source)` in `src/pipeline/clip.ts` and `src/pipeline/rewrap.ts` |
@@ -283,7 +287,47 @@ gets there.
 
 ---
 
-## 7. State wireframes
+## 7. What the implementation ticket inherits {#inherits}
+
+The handoff checklist. It sits here, ahead of the detail sections it points at, because
+**this section's number is load-bearing**: the shipped module cites it by number. Items below
+forward-reference §8-§10, which follow immediately.
+
+> **Do not renumber this section.** `public/version-chain.js` (merged to `main`) opens with
+> `Implements docs/design/asset-version-chain.md (issue #941) §7, "What the`
+> `implementation ticket inherits", point by point.` — a greppable, verbatim citation from
+> production code into this heading. Sections added later go **after** this one, so §7 stays
+> where that comment expects it. New citations should name the title and the `{#inherits}`
+> anchor rather than the bare number — a section number is a line number with extra steps.
+
+1. Reconstruct the tree from `versionOfAssetId`; render orphans under
+   "Source version not in this list"; never reparent.
+2. Badge exactly the `currentVersionId` member as **Current**. Never re-derive it.
+3. Mark the `assetId` member as **you are here**, separately from Current.
+4. Row links reuse the `data-asset-id` → `showAssetDetail` pattern; re-fetch on navigation.
+5. Previous / Next step through `versions` in array order.
+6. Empty state is `versions.length === 1 && !versionGroupId`, not length 0.
+7. Do not add a promote / set-current control — the contract has no such endpoint.
+8. Read errors as flat `{ error, message? }`.
+9. Four non-populated states, all drawn in §8: loading (`loadingEl`), empty, fetch failure,
+   truncated. None of them is the same copy as another.
+10. **The two-line row is the base layout** (§9). The single-line row of §2 is an
+    enhancement applied only inside `@container (min-width: 560px)`, which requires adding
+    `container-type: inline-size` to `.assets-side` (`public/style.css`) — the first size
+    container in that stylesheet, and neither is on `main` yet (the merged module ships the
+    single-line row only), see the divergence note in §9.
+    Do **not** key the wrap to `@media (max-width: 900px)`:
+    that query widens the panel rather than narrowing it, so it is backwards for this
+    purpose (§9 has the arithmetic). Current badge, `status` badge and the indent survive
+    the wrap; nothing is truncated.
+11. Nested `ul`/`li`, connector glyphs `aria-hidden`, `aria-current` on the you-are-here row,
+    focus moved to it after navigation (§10). Not `role="tree"`. Of these, only the
+    `aria-hidden` glyph treatment is on `main` today — items 10 and 11 are the outstanding
+    work against the merged module; §9's divergence table says which greps fail.
+
+---
+
+## 8. State wireframes
 
 §2 draws the populated branching chain. The other four states the view can be in are drawn
 here so none of them gets improvised at implementation time. The section heading **Versions**
@@ -356,7 +400,7 @@ duplicates the badge and never appears without it. The greppable line of that co
 
 ---
 
-## 8. Narrow-panel layout
+## 9. Narrow-panel layout
 
 The versions view lives inside the asset detail panel. The row has six cells — indent,
 Current badge slot, `name`, `status`, `createdAt`, `id` — and they do not all fit on one line
@@ -414,12 +458,22 @@ threshold for this view, and it is stated in the unit it is actually about. `inl
 containment constrains only the inline axis; the panel's own width already comes from its
 flex basis rather than its content, so nothing above it moves.
 
-> **Divergence from the in-flight implementation.** PR #1117 (#942) builds this surface and
-> adds neither `container-type` nor `@container` (grepped over its diff: no match for either),
-> so the rule above is **not yet implemented** there. That branch does carry `aria-current`, so
-> §9 lines up. Treat §8 as the target state for the narrow-panel layout, not as a description of
-> `public/style.css` on that branch — an implementer following it is adding the container query,
-> not verifying one that is already present.
+> **Divergence from the shipped code.** Scoped to what `main` does **not** satisfy, each row
+> checked by grep against the merged tree (`public/version-chain.js` from #1049, plus
+> `public/style.css`). Everything not listed here the merged module already does.
+>
+> | Spec requirement | Shipped state on `main` | Grep |
+> |---|---|---|
+> | §9 container query: `container-type: inline-size` on `.assets-side` + `@container (min-width: 560px)` | **absent** — the row is a single-line table row at every panel width | `grep -E "container-type\|@container" public/style.css` → no match |
+> | §10 `aria-current` on the you-are-here row | **absent** — the row is marked visually and with a visually-hidden string, but not with `aria-current` | `grep -rn "aria-current" public/ src/` → no match |
+> | §10 nested `ul`/`li` semantics | **not as specified** — the chain renders as `table`/`thead`/`tbody`/`tr`/`td`, so depth is conveyed by indent markup rather than by list nesting | `grep -oE "createElement\('[a-z]+'\)" public/version-chain.js` → `table`, `thead`, `tbody`, `tr`, `td` only |
+> | §10 timestamps inside `time` with `datetime` | **absent** — no `time` element is created | `grep -nE "datetime\|'time'" public/version-chain.js` → no match |
+> | §8 state copy — loading reuses `loadingEl`'s `Loading…`, failure headline `Couldn't load versions.` | **copy diverges** — the module ships its own strings; the states themselves are all present | `grep -nE "loading:\|errorPrefix:" public/version-chain.js` → `loading: 'Loading versions…'`, `errorPrefix: 'Could not load versions: '` |
+>
+> So §9 and §10 are the open work on this surface, not settled description. An implementer
+> picking it up is **adding** the container query, `aria-current`, the list semantics and the
+> `time` elements to a module that already ships the tree, the Current badge, you-are-here,
+> Previous / Next, and the empty / failure / truncated states.
 
 The ~560px figure is the width at which all six cells fit without truncation. For a sense of
 scale, and *not* as a number to key CSS on: in the side-by-side regime with
@@ -447,7 +501,7 @@ width shrinks before anything else gives.
 
 ---
 
-## 9. Accessibility and keyboard
+## 10. Accessibility and keyboard
 
 - **Semantics follow the topology, not the drawing.** Render the chain as a nested list
   (`ul`/`li`), not a flat list with padding, so the nesting a sighted reader sees in the
@@ -478,29 +532,3 @@ width shrinks before anything else gives.
   makes the two states look identical.
 - **ISO 8601 UTC timestamps** (§2) render inside `time` with a machine-readable `datetime`,
   so assistive tech and copy-paste both get the exact value the API returned.
-
----
-
-## 10. What the implementation ticket inherits
-
-1. Reconstruct the tree from `versionOfAssetId`; render orphans under
-   "Source version not in this list"; never reparent.
-2. Badge exactly the `currentVersionId` member as **Current**. Never re-derive it.
-3. Mark the `assetId` member as **you are here**, separately from Current.
-4. Row links reuse the `data-asset-id` → `showAssetDetail` pattern; re-fetch on navigation.
-5. Previous / Next step through `versions` in array order.
-6. Empty state is `versions.length === 1 && !versionGroupId`, not length 0.
-7. Do not add a promote / set-current control — the contract has no such endpoint.
-8. Read errors as flat `{ error, message? }`.
-9. Four non-populated states, all drawn in §7: loading (`loadingEl`), empty, fetch failure,
-   truncated. None of them is the same copy as another.
-10. **The two-line row is the base layout** (§8). The single-line row of §2 is an
-    enhancement applied only inside `@container (min-width: 560px)`, which requires adding
-    `container-type: inline-size` to `.assets-side` (`public/style.css`) — the first size
-    container in that stylesheet — neither is on PR #1117 yet, see the divergence note in §8.
-    Do **not** key the wrap to `@media (max-width: 900px)`:
-    that query widens the panel rather than narrowing it, so it is backwards for this
-    purpose (§8 has the arithmetic). Current badge, `status` badge and the indent survive
-    the wrap; nothing is truncated.
-11. Nested `ul`/`li`, connector glyphs `aria-hidden`, `aria-current` on the you-are-here row,
-    focus moved to it after navigation (§9). Not `role="tree"`.
