@@ -408,18 +408,18 @@ overflow, and no fallback query is needed.
 - **Enhancement, `@container (min-width: 560px)`:** collapse to the single-line row of §2.
 
 `container-type` and `@container` do **not** appear anywhere in `public/style.css` today
-(grepped: no match), so this adds the first size container in the stylesheet.
-
-> **Divergence from the in-flight implementation.** PR #1117 (#942) builds this surface and
-> adds neither `container-type` nor `@container` (grepped over its diff: no match for either),
-> so the responsive rule below is **not yet implemented**. It does carry `aria-current`, so §9
-> lines up. Treat §8 as the target state for the narrow-panel layout, not as a description of
-> `public/style.css` on that branch; an implementer following it is adding the container query,
-> not verifying it. That is a new
+(grepped: no match), so this adds the first size container in the stylesheet. That is a new
 declaration on an existing selector, not a new breakpoint — there is still exactly one
 threshold for this view, and it is stated in the unit it is actually about. `inline-size`
 containment constrains only the inline axis; the panel's own width already comes from its
 flex basis rather than its content, so nothing above it moves.
+
+> **Divergence from the in-flight implementation.** PR #1117 (#942) builds this surface and
+> adds neither `container-type` nor `@container` (grepped over its diff: no match for either),
+> so the rule above is **not yet implemented** there. That branch does carry `aria-current`, so
+> §9 lines up. Treat §8 as the target state for the narrow-panel layout, not as a description of
+> `public/style.css` on that branch — an implementer following it is adding the container query,
+> not verifying one that is already present.
 
 The ~560px figure is the width at which all six cells fit without truncation. For a sense of
 scale, and *not* as a number to key CSS on: in the side-by-side regime with
