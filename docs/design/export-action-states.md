@@ -11,8 +11,10 @@ writing operator copy about export.
 which renders `textContent` and removes itself after 6s — so the markup it prescribed would have
 shipped as visible asterisks and the success link would have vanished. Every state now names the
 plain string that goes through `showMsg` and, separately, the persistent sibling DOM that carries
-anything else (§0.4). The 502 `message` is no longer specified for verbatim display: one of the
-two paths that produce it is not bounded by this repo (§0.1), so § "Export failed" sanitises it.
+anything else (§0.4). The 502 `message` is no longer specified for verbatim display: three of
+the paths that produce it carry upstream-controlled text this repo does not bound — including
+one *inside* the bounded `try`, whose raw cause is interpolated into an otherwise repo-written
+sentence (§0.1) — so § "Export failed" sanitises it.
 
 This pins **copy and visual treatment** for five states. Four belong to one action — `POST
 /api/v1/assets/{id}/export` (the "re-wrap" action — copies a source into a new container
@@ -51,10 +53,10 @@ names a symbol, selector, or `openapi.json` path you can grep for.
 | **201 is falsifiable** | Three layers agree before it is sent: job-status allow-list (`SUCCESS_STATUSES`, `src/pipeline/osc-rewrap.ts`), the `deps.storage.statObject(outputKey)` HEAD + non-empty check in `rewrap()` (`src/pipeline/rewrap.ts`), only then the `ready` transition. Documented contract note: `docs/findings/export-truthful-status-944.md` |
 | 400 | Unsupported `targetFormat` — the Zod enum built from `REWRAP_FORMATS` at the edge; `UnsupportedFormatError` thrown defensively behind the `isRewrapFormat` guard in `rewrap()` (`src/pipeline/rewrap.ts`). **Two different bodies, depending on which layer rejects.** The *defensive* path is fully verified: `UnsupportedFormatError` → the router's `setErrorHandler` → `errorSchema`-shaped `{ error: 'unsupported_format', message }` (`src/routes/assets.ts:3330`). The *edge* path (Zod enum rejection) is **not verified in this tree, and this spec does not assert its envelope.** What *is* verified: schema validation is done by `fastify-type-provider-zod` ^4.0.2's compilers, not Fastify's built-in ajv (`app.setValidatorCompiler(validatorCompiler)` / `setSerializerCompiler`, `src/main.ts:225-226`, imported at `src/main.ts:17-21`); there is **no `schemaErrorFormatter` anywhere in `src/`** (grepped); the router's error handler has no branch for a validation error and ends in `throw err` (`src/routes/assets.ts:3332`); and the only test covering this path asserts the status code alone, no body (`test/rewrap.test.ts:341-350`, `expect(res.statusCode).toBe(400)`). So the provable claim — and the only one the UI needs — is that an **edge 400 carries some `error` value that is not `unsupported_format`**; the exact field set is unconfirmed. That is sufficient, because the UI's rule is to render a server string only for `rewrap_failed` (§ "Export failed") and to use its own fixed copy for every other `error` value. If the edge envelope ever needs to be relied on, assert it in `test/rewrap.test.ts` first and cite the assertion here |
 | 404 | Unknown/foreign asset — `reply.code(404).send({ error: 'not_found' })` in the export handler. Existence is not leaked |
-| 409 | `{ error: 'no_object', message: 'asset has no stored source object to process' }` — `NO_SOURCE_OBJECT_ERROR` / `NO_SOURCE_OBJECT_MESSAGE`, `src/pipeline/source-object.ts`, sent by the shared `requireSourceObject` helper, which the export handler calls before anything else |
+| 409 | `{ error: 'no_object', message: 'asset has no stored source object to process' }` — `NO_SOURCE_OBJECT_ERROR` / `NO_SOURCE_OBJECT_MESSAGE`, `src/pipeline/source-object.ts`, sent by the shared `requireSourceObject` helper, which the export handler calls before the 501 configuration guard. It is **not** the handler's first check: `const asset = await repo.get(request.params.id)` and its `404 not_found` run first (`src/routes/assets.ts:5776-5778`), then `requireSourceObject` (`:5781`), then the 501 guard. So an unknown id 404s before this 409 can be reached |
 | **501** | `{ error: 'not_configured', message: 'export / re-wrap is not configured' }` — the `if (!opts.rewrapRunner \|\| !storageFor)` guard in the export handler (deployment never wired a re-wrap runner or workspace storage). This is the only "nowhere for an export to go" condition **this endpoint** can produce — see § "Export is not available on this deployment" |
 | 502 | `{ error: 'rewrap_failed', message: string }` — the `reply.code(502).send({ error: 'rewrap_failed', message })` in the export handler's catch, where `message` is `err instanceof Error ? err.message : String(err)`. The ffmpeg log is captured server-side only (`oscJobLog(err)`, logged at `warn` in the same catch) and is **never** in `message` — a deliberate security position (the log is third-party output and can carry storage endpoints/bucket names), not an oversight. `message` is what the UI has to show; it is real, not generic ("Export failed") |
-| **502 `message` is a bounded sentence on one path, unbounded on the others** | Only the **poll/status** path is composed by this repo: inside the `try` at `src/pipeline/osc-rewrap.ts:141-153`, `makeOscRewrapRunner` builds `failure` as `OSC export/re-wrap job "<name>" ended with non-success status "<status>"` (`:149`) or `… did not complete: <err.message>` (`:152`) and throws `OscRewrapJobError(failure, logs)` (`:166`) — log as data, never in the message. **Two awaits sit *outside* that `try`, and both are unbounded:** `await api.context.getServiceAccessToken(FFPROBE_SERVICE_ID)` (`src/pipeline/osc-rewrap.ts:126`) and `await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {…})` (`:128`). An error from either propagates unchanged through `rewrap()` into the route catch above and becomes the 502 `message` verbatim. Both come from the same SDK error contract: `@osaas/client-core` 0.24.0 (`package.json:27`) raises a `FetchError` whose `message` is the upstream response body verbatim (`lib/fetch.js:16`) or, for a JSON error body lacking `message`/`reason`, that whole body `JSON.stringify`-ed (`lib/fetch.js:9`) — no length bound, no structured cause. The `:128` call is the sharper of the two because the request in flight there carries `cmdLineArgs` from `rewrapCmdLine` (presigned source URL **with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`; `:126` posts only `{ serviceId }` (`lib/context.js:37-39`), so it is unbounded prose but not a credential-leak vector. This repo bounds neither, so **the UI must not render a 502 `message` unbounded** — see the bounding rules in § "Export failed". Logged as OSC friction: `docs/osc-feedback/incoming-client-core-job-submission-unbounded-error-text.md` in the agents repo |
+| **Exactly one 502 `message` shape is fully composed by this repo; THREE paths can carry upstream text** | Only the **non-success-status** sentence is wholly this repo's words: inside the `try` at `src/pipeline/osc-rewrap.ts:141-153`, `makeOscRewrapRunner` sets `failure = OSC export/re-wrap job "<name>" ended with non-success status "<status>"` (`:149`) from a `SUCCESS_STATUSES` allow-list miss, then throws `OscRewrapJobError(failure, logs)` (`:166`) — ffmpeg log as data, never in the message. **Three paths put upstream-controlled text in `message`, and being inside that `try` does not make a path safe:** (1) `await api.context.getServiceAccessToken(FFPROBE_SERVICE_ID)` (`src/pipeline/osc-rewrap.ts:126`), **outside** the `try`; (2) `await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {…})` (`:128`), **outside** the `try`; (3) `const job = await api.getJob(api.context, serviceId, name, sat)` (`src/pipeline/osc-job-poll.ts:123`) — a bare `await` in the poll loop, **inside** the `try`, whose `FetchError` is caught at `src/pipeline/osc-rewrap.ts:151-153` and **interpolated raw** into `` failure = `OSC export/re-wrap job "<name>" did not complete: ${err.message}` `` (`:152`). Paths 1 and 2 reach the route catch verbatim; path 3 arrives prefixed by a repo-written clause but with the unbounded `err.message` intact after `did not complete: `. A prefix is not a bound. All three share one SDK error contract: `@osaas/client-core` 0.24.0 (`package.json:27`) raises a `FetchError` whose `message` is the upstream response body verbatim (`lib/fetch.js:16`) or, for a JSON error body lacking `message`/`reason`, that whole body `JSON.stringify`-ed (`lib/fetch.js:9`) — no length bound, no structured cause. The `:128` call is the sharpest because the request in flight carries `cmdLineArgs` from `rewrapCmdLine` (presigned source URL **with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`; `:126` posts only `{ serviceId }` (`lib/context.js:37-39`) and `osc-job-poll.ts:123` is a `GET` with no body, so those two are unbounded prose rather than credential-leak vectors. This repo bounds none of the three, so **the UI must not render a 502 `message` unbounded** — see the bounding rules in § "Export failed". Logged as OSC friction: `docs/osc-feedback/incoming-client-core-job-submission-unbounded-error-text.md` in the agents repo |
 | Failed export leaves no file to serve | `rewrap()` sets `objectKey` only **after** verification passes (the `update` calls follow the `statObject` guard, `src/pipeline/rewrap.ts`) — a `502` child is `status: 'failed'` with **no** `objectKey`, so it can never 200 a `/files` entry for bytes that don't exist |
 | Synchronous, no polling | The handler `await`s the resolved runner inline; there is no `processing`-then-poll contract for this action. The only "in progress" state is the one request in flight |
 | Source unchanged | Export is a pure read of the source asset — never mutated |
@@ -309,19 +311,35 @@ actionMsg.appendChild(detail);
 ```
 
 **Bounding rule for `serverDetail` — required, not optional.** `err.message` comes from
-`apiFetch`'s `msg = body.message || body.error || msg` (§0.4). For the poll/status path the
-server composes that sentence itself and it is safe to show (§0.1). But **not every 502
-`message` is composed by this repo**: *two* awaits in `makeOscRewrapRunner` sit **before** the
-`try` block that wraps the poll — `api.context.getServiceAccessToken(…)`
-(`src/pipeline/osc-rewrap.ts:126`) and `api.createJob(…)` (`:128`), with the `try` only
-beginning at `:141`. An error raised by either propagates unchanged into the route's catch
-(`const message = err instanceof Error ? err.message : String(err)`, the `rewrap_failed` 502 in
-`src/routes/assets.ts`). The SDK makes that text upstream-controlled and unbounded in both
-cases (`@osaas/client-core` `lib/fetch.js:9,16` — response body verbatim, or the whole JSON
-error body stringified; §0.1), and the request in flight at `:128` carries `cmdLineArgs` built
-by `rewrapCmdLine` (the **presigned source URL with its signature**) plus `awsAccessKeyId` /
-`awsSecretAccessKey`. Whether an upstream error echoes its request body is **not something this
-repo bounds**. So the UI must treat the string as untrusted:
+`apiFetch`'s `msg = body.message || body.error || msg` (§0.4). Exactly one 502 `message` shape
+is wholly composed by this repo and safe to show: the non-success-status sentence
+(`… ended with non-success status "<status>"`, `src/pipeline/osc-rewrap.ts:149`), whose only
+variable part is a status string from the job API. **Three other paths carry upstream-controlled
+text, and the UI cannot tell which shape it received** (there is no `reason` field to branch on
+— §8 item 4):
+
+1. `api.context.getServiceAccessToken(…)` (`src/pipeline/osc-rewrap.ts:126`) — **outside** the
+   `try` (which opens at `:141`); its error propagates unchanged into the route's catch.
+2. `api.createJob(…)` (`:128`) — also outside the `try`; same verbatim propagation. The
+   request in flight here carries `cmdLineArgs` built by `rewrapCmdLine` (the **presigned
+   source URL with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`.
+3. `api.getJob(…)` (`src/pipeline/osc-job-poll.ts:123`) — a bare `await` in the poll loop,
+   **inside** the `try`. Its `FetchError` is caught at `src/pipeline/osc-rewrap.ts:151-153`
+   and the handler **interpolates the raw message**:
+   `` failure = `OSC export/re-wrap job "${name}" did not complete: ${err.message}` `` (`:152`).
+
+Path 3 is the one an earlier draft of this spec missed, and it is the instructive one: it sits
+*inside* the bounded `try` and the sentence that reaches the client *is* partly repo-written —
+yet everything after `did not complete: ` is unbounded upstream text. **A repo-written prefix is
+not a bound.** The relevant property is never "where the `await` sits" but "can this `message`
+contain upstream text anywhere in it".
+
+In all three cases the route's catch does
+`const message = err instanceof Error ? err.message : String(err)` and sends it as the
+`rewrap_failed` 502 (`src/routes/assets.ts`). The SDK makes that text upstream-controlled and
+unbounded (`@osaas/client-core` `lib/fetch.js:9,16` — response body verbatim, or the whole JSON
+error body stringified; §0.1). Whether an upstream error echoes its request body is **not
+something this repo bounds**. So the UI must treat the string as untrusted:
 
 **Apply these four steps in this order** — the order is load-bearing, because scanning after
 truncating would only scan the first 300 characters and let a credential in the tail through:
@@ -343,23 +361,46 @@ truncating would only scan the first 300 characters and let a credential in the 
    well under that; an echoed request body is not, so the bound is also the tell.
 
 The earlier draft of this spec said to print `message` verbatim and "never replace it with a
-generic message." That was wrong for the job-submission awaits (`:126`, `:128`) and is
-superseded by the rules above:
+generic message." That was wrong for all three paths above — the two job-submission awaits
+(`osc-rewrap.ts:126`, `:128`) and the poll read (`osc-job-poll.ts:123`, surfaced through the
+`did not complete:` interpolation at `osc-rewrap.ts:152`) — and is superseded by the rules
+above:
 the *intent* — the acceptance criterion's "surfaces the actual error returned by the verified
 `/export` contract" — is met by showing the server's own sentence when the server composed it,
 which the rules preserve. What they forbid is rendering an unbounded upstream string.
 
-**The real fix belongs on the API surface, not here.** Wrapping the submission failures in a
-known sentence the way the poll path already does would make the 502 `message` uniformly safe.
-Note the precondition precisely: the sanitiser above may be dropped **only once EVERY `await`
-outside the bounded `try` is wrapped** — today that is both
-`api.context.getServiceAccessToken(…)` (`src/pipeline/osc-rewrap.ts:126`) **and**
-`api.createJob(…)` (`:128`), and the test is positional, not name-based: any future await added
-above the `try` at `:141` re-opens the hole. Wrapping `createJob` alone is **not** sufficient —
-`getServiceAccessToken` is subject to the identical unbounded SDK error contract
-(`lib/fetch.js:9,16`). File that against `src/pipeline/osc-rewrap.ts` as a follow-up; until
-every one of those awaits throws a repo-composed error, the bounding rules above are
-load-bearing.
+**The real fix belongs on the API surface, not here.** Composing a known sentence for every
+failure — the way the non-success-status path at `osc-rewrap.ts:149` already does — would make
+the 502 `message` uniformly safe.
+
+**State the precondition as a property of the message, not as a position in the code.** The
+sanitiser above may be dropped **only when no `rewrap_failed` 502 `message` can contain upstream
+text at all** — i.e. every reachable `message` is drawn from a closed set of repo-authored
+sentences whose variable parts are repo-controlled values (a job name, a status from a known
+allow-list), with **no interpolation of any `Error.message` originating in the SDK**, directly
+or via a prefix.
+
+An earlier draft stated this positionally — "every `await` outside the bounded `try` is
+wrapped" — and that test is wrong twice over. It passes `osc-job-poll.ts:123`, which is
+*inside* the `try` and still unbounded, because the `catch` at `osc-rewrap.ts:151-153`
+interpolates `err.message` into the `did not complete:` sentence at `:152`. And it would pass
+any future `catch` that wraps an await in repo prose while still interpolating the raw cause —
+wrapping is not bounding. Three concrete consequences of the property-based test:
+
+- Wrapping `createJob` alone is **not** sufficient; `getServiceAccessToken` is subject to the
+  identical unbounded SDK error contract (`lib/fetch.js:9,16`).
+- Wrapping both submission awaits is **still not** sufficient while `osc-rewrap.ts:152`
+  interpolates the poll error. That interpolation must be replaced by a repo-composed sentence
+  that carries the upstream text as *data* on the error (the way `OscRewrapJobError` already
+  carries the ffmpeg log, §0.1) rather than in `message`.
+- Any new `await` anywhere in this runner or its poller — inside or outside the `try` — re-opens
+  the hole unless its error is classified into a repo-authored sentence.
+
+File that against `src/pipeline/osc-rewrap.ts` and `src/pipeline/osc-job-poll.ts` as a
+follow-up (§8 item 4). Until the property above holds, the bounding rules are load-bearing. The
+honest verification for dropping the sanitiser is a server-side test asserting that the 502
+`message` for each induced failure mode matches one of the allowed sentence templates — not a
+reading of where the `try` begins.
 
 **Nothing beyond that one sentence.** The ffmpeg log that would explain *why* is deliberately
 server-side only (§0.1) — there is no safe additional detail to fetch or display for this
@@ -568,13 +609,20 @@ is *not* on that timer.
 4. **The 502 `message` is one unstructured string, and only sometimes one this repo wrote.**
    There's no machine-readable failure-reason field, so copy cannot branch on failure cause
    (e.g. "the source was corrupt" vs. "the container doesn't support this codec") — there is only
-   the string. And because **both** job-submission awaits — `getServiceAccessToken`
-   (`src/pipeline/osc-rewrap.ts:126`) and `createJob` (`:128`) — return that string unbounded
-   (§0.1), the UI has to sanitise what should have arrived safe: § "Export failed" spends four
-   ordered steps on defending against a leak that a server-side wrap of *every* await above the
-   `try` at `:141` would remove outright. Both are worth a follow-up on the API surface: wrap
-   the submission failures in a composed sentence, and add a stable `reason` field so copy can
-   branch on cause instead of printing prose. The underlying SDK limitation is logged as OSC
+   the string. And **three** paths return that string unbounded (§0.1): the two job-submission
+   awaits `getServiceAccessToken` (`src/pipeline/osc-rewrap.ts:126`) and `createJob` (`:128`),
+   plus the poll read `getJob` (`src/pipeline/osc-job-poll.ts:123`), whose `FetchError` is
+   caught at `osc-rewrap.ts:151-153` and interpolated raw into the `did not complete:` sentence
+   at `:152`. So the UI has to sanitise what should have arrived safe: § "Export failed" spends
+   four ordered steps on defending against a leak that server-side composition would remove
+   outright. The follow-up on the API surface has three parts: (a) wrap the two submission
+   failures in composed sentences; (b) stop interpolating `err.message` at `osc-rewrap.ts:152`
+   — classify the poll failure into a repo-authored sentence and carry the upstream text as
+   data on the error, as `OscRewrapJobError` already does for the ffmpeg log; (c) add a stable
+   `reason` field so copy can branch on cause instead of printing prose. Note (b) explicitly:
+   it is easy to "fix" (a) alone and believe the sanitiser can go, because `:123` sits *inside*
+   the bounded `try` — it is unbounded anyway. The removal test is the message-property one in
+   § "Export failed", not a positional one. The underlying SDK limitation is logged as OSC
    friction in the agents repo:
    `docs/osc-feedback/incoming-client-core-job-submission-unbounded-error-text.md` (`@osaas/client-core`
    0.24.0 — `defaultErrorFactory`, `lib/fetch.js:5-20`, puts the upstream response body verbatim
