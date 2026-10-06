@@ -18,9 +18,13 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * CONTRACT GROUNDING (CLAUDE.md rule 7 — read in the live tree, not assumed)
  *
- * The shared refusal envelope. Both routers declare the SAME closed enum:
- *     src/routes/assets.ts:572       deleteBlockedSchema
- *     src/routes/collections.ts:73   deleteBlockedSchema
+ * Cited by SYMBOL, not by line number: these routers move under unrelated
+ * merges, and a stale coordinate reads as a verified fact when it is not. Every
+ * name below was re-read in the live tree.
+ *
+ * The shared refusal envelope. Both routers declare the SAME closed enum, each
+ * as their own module-level `deleteBlockedSchema` (src/routes/assets.ts and
+ * src/routes/collections.ts):
  *         { error: 'delete_blocked', message?: string,
  *           reason: z.enum(['referenced_by_job', 'member_of_collection',
  *                           'delete_protected']),
@@ -32,34 +36,38 @@
  *     an enum of exactly those three values, required alongside `error` and
  *     `blockedBy`; `memberCount` is optional.
  *
- * `reason` is OPTIONAL on the generic envelope (`reason: z.string().optional()`,
- * src/routes/collections.ts:46-50), so a body may carry none, or one this client
- * does not know. Every lookup below is guarded and returns null in that case, so
- * the caller falls back to the server's own `message`.
+ * `reason` is OPTIONAL on the generic envelope (`reason: z.string().optional()`
+ * on `errorSchema` in src/routes/collections.ts), so a body may carry none, or
+ * one this client does not know. Every lookup below is guarded and returns null
+ * in that case, so the caller falls back to the server's own `message`.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THE COPY IS SUBJECT-AWARE
  *
  * `member_of_collection` is emitted by BOTH routers, and it does not mean the
  * same thing on each:
- *     src/routes/assets.ts:2722-2728  — this ASSET is a member of collections
- *                                       (AssetMemberOfCollectionError)
- *     src/routes/collections.ts:298-306 — this COLLECTION still HOLDS members
- *                                       (CollectionInUseError)
+ *     `AssetMemberOfCollectionError` (src/routes/assets.ts: thrown in the
+ *         DELETE /:id handler, mapped in that router's `setErrorHandler`)
+ *         — this ASSET is a member of collections
+ *     `CollectionInUseError` (src/routes/collections.ts: thrown in the
+ *         DELETE /:id handler, mapped in that router's `setErrorHandler`)
+ *         — this COLLECTION still HOLDS members
  * One sentence cannot be true of both, so the default deck keeps the
  * item-centric wording issue #920 shipped and the `collection` subject overrides
  * the two reasons that router can actually emit. `delete_protected` is likewise
  * resolved differently per subject: an asset has an Unlock control on its detail
  * view (issue #895, public/lock-detail.js), a collection has none in this UI —
- * the only route that lifts its lock is DELETE /collections/{id}/lock
- * (src/routes/collections.ts:572-584), so the collection copy names that and
- * does not point at a control that is not there.
+ * the only route that lifts its lock is DELETE /collections/{id}/lock (the
+ * `app.delete('/:id/lock', …)` route in src/routes/collections.ts, which calls
+ * `repo.setDeleteLock(id, { locked: false })`), so the collection copy names
+ * that and does not point at a control that is not there.
  *
  * Copy rules: sentence case, no promise the API has not made, no product names,
  * and never a "force"/"delete anyway" affordance — `?force=true` and
- * `?confirmMemberCount=` exist on the collection delete route
- * (src/routes/collections.ts:431-434) but this UI deliberately sends neither, so
- * the copy must not imply an override the client will not perform.
+ * `?confirmMemberCount=` exist on the collection delete route (the `querystring`
+ * schema of `app.delete('/:id', …)` in src/routes/collections.ts) but this UI
+ * deliberately sends neither, so the copy must not imply an override the client
+ * will not perform.
  */
 
 // ─── The deck ────────────────────────────────────────────────────────────────
@@ -182,8 +190,9 @@ export const BLOCKED_FLAG_PREFIX = 'Delete blocked:';
  * an empty one).
  *
  * `memberCount` is the collection's current member count — `assetIds.length`
- * from the list payload pre-flight (collectionSchema, src/routes/collections.ts:
- * 95) and the 409's own `memberCount` post-flight (collections.ts:81, :306) —
+ * from the list payload pre-flight (`collectionSchema.assetIds`) and the 409's
+ * own `memberCount` post-flight (`deleteBlockedSchema.memberCount`, sent as
+ * `err.assetIds.length` by the `CollectionInUseError` branch) —
  * folded into the label when it is known, because "still holds 2 assets" tells
  * the operator how much work the resolution is.
  *

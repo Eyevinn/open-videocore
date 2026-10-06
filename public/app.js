@@ -1526,9 +1526,10 @@ function errorToast(message, opts) {
 // errorToast() shows whatever text it is handed, and apiFetch (app.js:260-269)
 // hands it `body.message` — which for a refusal is written for a developer, not
 // an operator: `collection 01J8… is in use (2 member asset(s))`
-// (CollectionInUseError, src/data/collection-repo.ts:184) or `asset 01J8… is
-// protected from deletion by an explicit lock` (DeleteProtectedError,
-// src/data/asset-repo.ts:830). Those internal sentences are what this issue
+// (the `CollectionInUseError` message in src/data/collection-repo.ts) or
+// `asset 01J8… is protected from deletion by an explicit lock` (the
+// `DeleteProtectedError` message in src/data/asset-repo.ts). Those internal
+// sentences are what this issue
 // exists to stop showing.
 //
 // CONTRACT GROUNDING (CLAUDE.md rule 7 — read in the live tree, not assumed)
@@ -1573,10 +1574,10 @@ function errorToast(message, opts) {
 //
 // `opts.subject` (issue #921) selects the subject-specific wording where one
 // reason means different things per router: `member_of_collection` is "this
-// asset is in a collection" from the assets router (src/routes/assets.ts:2722-2728)
-// and "this collection still holds members" from the collections router
-// (src/routes/collections.ts:298-306). A call site that knows which it is says
-// so; omitting it keeps the item-centric default.
+// asset is in a collection" from the assets router (`AssetMemberOfCollectionError`,
+// thrown in its DELETE /:id handler) and "this collection still holds members"
+// from the collections router (`CollectionInUseError`). A call site that knows
+// which it is says so; omitting it keeps the item-centric default.
 function humanizeErrorReason(err, opts) {
   const body = err && err.body;
   if (!body || typeof body !== 'object') return null;
@@ -4465,9 +4466,9 @@ async function renderCollectionsTab(container) {
     const rows = collections.map(function(c, rowIndex) {
       const assetCount = c.assets ? c.assets.length : (c.assetCount != null ? c.assetCount : '—');
       // Authoritative member count for the delete confirmation (issue #919):
-      // GET /api/v1/collections returns `assetIds` (collectionSchema,
-      // src/routes/collections.ts:92-103, field at :95) — `assets` is only
-      // present on GET /collections/{id} (collectionWithAssetsSchema, :108-110).
+      // GET /api/v1/collections returns `assetIds` (`collectionSchema.assetIds`
+      // in src/routes/collections.ts) — `assets` is only present on
+      // GET /collections/{id} (`collectionWithAssetsSchema.assets`).
       // Empty string when neither is present, so the dialog degrades to
       // count-free wording rather than asserting a number it cannot know.
       const memberCount = Array.isArray(c.assetIds)
@@ -4475,12 +4476,13 @@ async function renderCollectionsTab(container) {
         : (Array.isArray(c.assets) ? c.assets.length : '');
       // Explicit delete-lock, carried alongside the member count because the
       // lock decides the delete outcome BEFORE emptiness does: DELETE
-      // /api/v1/collections/{id} throws CollectionDeleteProtectedError on a
-      // locked collection (src/routes/collections.ts:453-455) ahead of the
-      // member check (:490-492), and `?force=true` is never consulted for it.
-      // `deleteLock` is part of collectionSchema (collections.ts:92-103, field
-      // at :102) and is returned by GET /collections (:343-353), so the list
-      // already knows.
+      // /api/v1/collections/{id} throws `CollectionDeleteProtectedError` on a
+      // locked collection ahead of the `assetIds.length` member check (both
+      // guards sit in the `app.delete('/:id', …)` handler in
+      // src/routes/collections.ts, in that order), and `?force=true` is never
+      // consulted for the lock. `deleteLock` is part of `collectionSchema`
+      // (`deleteLock: deleteLockSchema.optional()`) and so is returned by
+      // GET /collections, so the list already knows.
       const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
       // ── Pre-flight (issue #921) ──
       // The list payload already carries everything the two delete guards read
@@ -4558,31 +4560,35 @@ async function renderCollectionsTab(container) {
     tableWrap.querySelectorAll('.coll-delete-btn').forEach(function(btn) {
       btn.addEventListener('click', async function() {
         // Collection delete (issue #919; pre-flight short-circuit added by
-        // #921). Wording verified against DELETE /api/v1/collections/{id}
-        // (src/routes/collections.ts:412-530), NOT assumed — line numbers
-        // re-read on this branch, after issue #922 moved them:
-        //   - The handler calls `repo.delete(id)` only (:502). There is NO
-        //     cascade into assets: a collection stores a flat list of member ids
-        //     (`assetIds`, src/data/collection-repo.ts:28-31), so deleting it
-        //     removes the grouping, never the media.
-        //   - It is audited as `collection.deleted` (collections.ts:506-527),
-        //     emitted AFTER the delete, so a refusal writes no entry.
+        // #921). Wording verified against DELETE /api/v1/collections/{id} — the
+        // `app.delete('/:id', …)` route in src/routes/collections.ts — NOT
+        // assumed. Cited by symbol rather than by line: this handler has already
+        // moved twice under unrelated merges, and a stale line number reads as a
+        // verified fact when it is not.
+        //   - The handler calls `repo.delete(request.params.id)` only. There is
+        //     NO cascade into assets: a collection stores a flat list of member
+        //     ids (`assetIds` on the `Collection` type in
+        //     src/data/collection-repo.ts), so deleting it removes the grouping,
+        //     never the media.
+        //   - It is audited as `collection.deleted` via `emitAudit`, called
+        //     AFTER the delete, so a refusal writes no entry.
         //   - A delete-locked collection is REFUSED with 409 `delete_blocked` /
-        //     reason `delete_protected` (collections.ts:453-455,
-        //     CollectionDeleteProtectedError; envelope deleteBlockedSchema
-        //     :73-82; handler mapping :278-285). This guard is HARD and runs
-        //     FIRST — before the member check — and `?force=true` is never
-        //     consulted for it, so a locked collection can never be deleted from
-        //     here. The only way out is DELETE /collections/{id}/lock
-        //     (collections.ts:572-584, "the only way to lift protection").
+        //     reason `delete_protected` (`CollectionDeleteProtectedError`,
+        //     thrown on `existing?.deleteLock?.locked`; envelope
+        //     `deleteBlockedSchema`; mapped in the router's `setErrorHandler`).
+        //     This guard is HARD and runs FIRST — before the member check — and
+        //     `?force=true` is never consulted for it, so a locked collection
+        //     can never be deleted from here. The only way out is
+        //     DELETE /collections/{id}/lock ("the only way to lift protection").
         //   - A collection that still holds member ids is REFUSED with 409
         //     `delete_blocked` / reason `member_of_collection` + `memberCount`
-        //     (collections.ts:490-492, CollectionInUseError; mapping :298-307)
-        //     unless `?force=true` or a matching `?confirmMemberCount=`
-        //     (:431-434; ADR-020 decision 2 marks this block SOFT/overridable).
-        //     This UI sends NEITHER, so a non-empty collection is a certain
-        //     refusal — which is exactly what makes the pre-flight check below
-        //     sound rather than a guess.
+        //     (`CollectionInUseError`, thrown on `existing.assetIds.length > 0`;
+        //     mapped in the same `setErrorHandler`) unless `?force=true` or a
+        //     matching `?confirmMemberCount=` is sent (both declared on the
+        //     route's `querystring` schema; ADR-020 decision 2 marks this block
+        //     SOFT/overridable). This UI sends NEITHER, so a non-empty
+        //     collection is a certain refusal — which is exactly what makes the
+        //     pre-flight check below sound rather than a guess.
         //   - There is no restore path for a deleted collection (the router
         //     exposes no equivalent of the asset `/restore` route).
         const label = nameOrFallback(btn.dataset.name, 'this collection');
@@ -4614,7 +4620,8 @@ async function renderCollectionsTab(container) {
             // collection that is its own view, which lists the members with a
             // Remove control per row. A delete-locked collection has NO control
             // in this UI — the only route that lifts the lock is DELETE
-            // /collections/{id}/lock (src/routes/collections.ts:572-584) — so no
+            // /collections/{id}/lock (the `app.delete('/:id/lock', …)` route in
+            // src/routes/collections.ts) — so no
             // secondary button is offered there rather than one that leads
             // nowhere. Never a "force"/"delete anyway" affordance.
             secondary:
@@ -4638,9 +4645,9 @@ async function renderCollectionsTab(container) {
         const hasCount = members !== '' && members != null && !Number.isNaN(Number(members));
         const count = hasCount ? Number(members) : null;
         // The outcome is NOT promised unconditionally: an unknown member count
-        // can still be refused, and the `collection.deleted` audit emit sits
-        // AFTER the delete inside `if (existing)` (collections.ts:506-527), so a
-        // refused delete writes no audit entry either. Same construction as the
+        // can still be refused, and the `collection.deleted` `emitAudit` call
+        // sits AFTER `repo.delete(...)` and inside `if (existing)`, so a refused
+        // delete writes no audit entry either. Same construction as the
         // asset archive dialog above: state the refusal first, and promise the
         // outcome only where the delete can actually land.
         const affected = [];
@@ -4675,18 +4682,20 @@ async function renderCollectionsTab(container) {
           // DELETE /api/v1/collections/{id} (openapi.json) answers 204 | 400 |
           // 404 | 409. The 409 body is { error: 'delete_blocked', message,
           // reason: 'referenced_by_job'|'member_of_collection'|
-          // 'delete_protected', blockedBy, memberCount? } (deleteBlockedSchema,
-          // src/routes/collections.ts:73-82; emitted at :278-285 and :298-307).
-          // apiFetch reduces that body to the server's
-          // `message`, which for the in-use case is the internal sentence
-          // `collection <id> is in use (N member asset(s))`
-          // (src/data/collection-repo.ts:184) — so the reason is humanized here
-          // and only falls back to that message when no reason is recognised.
+          // 'delete_protected', blockedBy, memberCount? } (`deleteBlockedSchema`
+          // in src/routes/collections.ts; sent from that router's
+          // `setErrorHandler`, in its `CollectionDeleteProtectedError` and
+          // `CollectionInUseError` branches). apiFetch reduces that body to the
+          // server's `message`, which for the in-use case is the internal
+          // sentence `collection <id> is in use (N member asset(s))` (the
+          // `CollectionInUseError` message in src/data/collection-repo.ts) — so
+          // the reason is humanized here and only falls back to that message
+          // when no reason is recognised.
           //
           // `subject: 'collection'` (issue #921) picks the collections-router
           // meaning of the shared enum: `member_of_collection` from THIS route
-          // means the collection still holds members (CollectionInUseError,
-          // collections.ts:298-306), not that the subject sits inside some other
+          // means the collection still holds members (`CollectionInUseError`
+          // from the collections router), not that the subject sits inside some other
           // collection. Reaching this path at all means the block appeared
           // between the list read and the click, so the list is reloaded
           // afterwards and the row then carries the flag the pre-flight check

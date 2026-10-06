@@ -23,8 +23,13 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * CONTRACT GROUNDING (CLAUDE.md rule 7 — read in the live tree, not assumed)
  *
+ * Cited by SYMBOL, not by line number: these coordinates have already been
+ * invalidated twice by unrelated merges into src/routes/collections.ts, and a
+ * stale line number reads as a verified fact when it is not. Every name below
+ * was re-read in the live tree.
+ *
  * Operation: `DELETE /api/v1/collections/{id}`
- *   Handler: src/routes/collections.ts:412-530 (`app.delete('/:id', …)`).
+ *   Handler: the `app.delete('/:id', …)` route in src/routes/collections.ts.
  *   openapi.json .paths["/api/v1/collections/{id}"].delete
  *     .parameters => exactly three:
  *         { in: 'query', name: 'force',              required: false, boolean }
@@ -38,19 +43,18 @@
  *         required: ['error', 'reason', 'blockedBy'].
  *
  *   The two guards that run BEFORE the delete, in this fixed order:
- *     1. `existing?.deleteLock?.locked` -> CollectionDeleteProtectedError
- *        (src/routes/collections.ts:453-455). HARD: the guard is unconditional
- *        and `request.query.force` is never consulted for it. Mapped to 409
- *        `delete_blocked` / reason `delete_protected`, blockedBy both-empty
- *        (collections.ts:278-285).
- *     2. `existing.assetIds.length > 0` -> CollectionInUseError
- *        (collections.ts:490-492), unless `?force=true` or a matching
- *        `?confirmMemberCount=`. Mapped to 409 `delete_blocked` / reason
- *        `member_of_collection`, `blockedBy.collectionIds = [collection id]`
- *        and `memberCount` = the real member count (collections.ts:298-307).
- *   `repo.delete(id)` is only reached after both (collections.ts:502), so a
- *   refusal changes nothing: no document is touched and no `collection.deleted`
- *   audit entry is written (the emit sits after the delete, :506-527).
+ *     1. `existing?.deleteLock?.locked` -> `CollectionDeleteProtectedError`.
+ *        HARD: the guard is unconditional and `request.query.force` is never
+ *        consulted for it. Mapped by the router's `setErrorHandler` to 409
+ *        `delete_blocked` / reason `delete_protected`, blockedBy both-empty.
+ *     2. `existing.assetIds.length > 0` -> `CollectionInUseError`, unless
+ *        `?force=true` or a matching `?confirmMemberCount=`. Mapped to 409
+ *        `delete_blocked` / reason `member_of_collection`,
+ *        `blockedBy.collectionIds = [collection id]` and `memberCount` =
+ *        `err.assetIds.length`, the real member count.
+ *   `repo.delete(request.params.id)` is only reached after both, so a refusal
+ *   changes nothing: no document is touched and no `collection.deleted` audit
+ *   entry is written (the `emitAudit` call sits after the delete).
  *
  *   THIS UI SENDS NEITHER OVERRIDE. The call site issues a bare
  *   `DELETE /collections/{id}` (public/app.js), so for a locked or a non-empty
@@ -58,9 +62,10 @@
  *   what makes the pre-flight check sound rather than a guess.
  *
  *   The state the prediction reads comes from the list payload itself:
- *     `GET /api/v1/collections` -> { collections: collectionSchema[] }
- *     (src/routes/collections.ts:343-353), and collectionSchema carries both
- *     `assetIds: string[]` (:95, required) and `deleteLock?` (:102) — confirmed
+ *     `GET /api/v1/collections` -> `{ collections: z.array(collectionSchema) }`
+ *     (the `app.get('/', …)` route in src/routes/collections.ts), and
+ *     `collectionSchema` carries both `assetIds: z.array(z.string())`
+ *     (required) and `deleteLock: deleteLockSchema.optional()` — confirmed
  *     in openapi.json .paths["/api/v1/collections/"].get.responses["200"],
  *     whose item properties are id, name, assetIds, description, tags, custom,
  *     createdAt, updatedAt, deleteLock (deleteLock requires `locked` +
