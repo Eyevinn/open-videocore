@@ -285,14 +285,31 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
   // decode. Probe the default resolution FIRST — on a single-stack install (and
   // for every asset on the first-listed stack) that is one lookup and the
   // behaviour is exactly as before — and only then try the other provisioned
-  // stacks. Returns undefined when the default stack owns the asset, when no
-  // stack does (the handler then 404s as before), or when there is no asset repo
-  // wired at all.
+  // stacks. Returns undefined when no stack owns the asset (the handler then
+  // 404s as before), or when there is no asset repo wired at all.
+  //
+  // WHERE THE DOCUMENT WAS FOUND IS AUTHORITATIVE (issue #1097 review, BLOCKING
+  // 1). The probe PROVES ownership: the asset was read out of that stack's
+  // CouchDB. `Asset.stackName` (issue #1097) is a label stamped at create time,
+  // and this function must never prefer the label over the location — if the two
+  // ever disagreed, preferring the label would resolve a stack that does not
+  // hold the bytes, which is exactly the #1058 symptom this line of work exists
+  // to remove. So the default probe returns undefined (keep the default
+  // resolution, and with it the `''` resolver cache key the callback path has
+  // always used — no second client set is built) and a named probe returns the
+  // name it probed under.
+  //
+  // `Asset.stackName` therefore deliberately plays no part in this function. It
+  // could legitimately be used to SEED the probe order (try the labelled stack
+  // first, saving a scan on a multi-stack install), but not to decide the
+  // answer; that optimisation is not built here because the label is only
+  // readable once the asset has already been found.
   async function stackOwningAsset(assetId: string): Promise<string | undefined> {
     const assets = opts.repository;
     if (!assets) return undefined;
     try {
-      if (await assets.get(assetId)) return undefined;
+      const onDefaultStack = await assets.get(assetId);
+      if (onDefaultStack) return undefined;
       for (const name of await listStackNamesSafely(opts)) {
         const found = await runWithRequestStack(name, async () => assets.get(assetId));
         if (found) return name;

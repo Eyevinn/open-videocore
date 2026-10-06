@@ -64,7 +64,11 @@ import {
   makeRequestScopedStorageFactory,
   requestStackNameFromHeaders,
   runWithRequestStack,
-  currentRequestStackName
+  runWithRequestedStack,
+  runWithPersistedStack,
+  adoptResolvedStackName,
+  currentRequestStackName,
+  PERSISTED_STACK_FALLBACK_MESSAGE
 } from './services/request-stack-context.js';
 import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
@@ -484,8 +488,13 @@ registerAuth(app);
 // the AsyncLocalStorage scope keeps the store attached for every later hook, the
 // handler, and any work the handler detaches (the URL-pull worker and its
 // follow-on metadata extraction).
+//
+// The header is UNTRUSTED, so it enters through `runWithRequestedStack`: it
+// ROUTES this request (unchanged), but it is not eligible to be persisted on a
+// document until the resolver below confirms it names a provisioned stack
+// (issue #1097 review, BLOCKING 2).
 app.addHook('onRequest', (request, _reply, done) => {
-  runWithRequestStack(requestStackNameFromHeaders(request.headers), done);
+  runWithRequestedStack(requestStackNameFromHeaders(request.headers), done);
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
@@ -495,6 +504,14 @@ app.addHook('preHandler', async (request) => {
   const stackName = currentRequestStackName();
   try {
     request.connections = await stackResolver.resolve(stackName);
+    // The identity the connections were ACTUALLY built from
+    // (WorkspaceConnections.stackName, services/workspace-stack.ts:188) becomes
+    // the value documents created later in this request are stamped with (issue
+    // #1097). Taken from the resolution we already awaited, so it costs no extra
+    // parameter-store read, and it is by construction a provisioned stack name —
+    // never the raw header — so a persisted stackName can never name a different
+    // stack than the one the document was written into.
+    adoptResolvedStackName(request.connections.stackName);
   } catch (err) {
     // A bad or partially-provisioned stack config (e.g. empty couchdbUrl) must
     // not take down every route including health probes. Degrade to no connections
@@ -2156,19 +2173,58 @@ const triggerPostUploadThumbnail = thumbnailExtractor
 // the upload route and the watch-folder service. The upload route resolves the
 // caller's workspace before invoking this, so the sync storageFor() can be read
 // synchronously.
+// `stackName` is the asset's persisted stack identity (`Asset.stackName`, issue
+// #1097). An upload/watch-folder asset is created OUTSIDE any job, so this is
+// the only durable record of where it lives; the whole detached continuation
+// below runs inside it so the extraction and the thumbnail trigger's own
+// `resolve(currentRequestStackName())` (services/post-upload-thumbnail.ts) see
+// that stack rather than the first-listed one. This is precisely the follow-up
+// the #1100 fix left open in that file's header comment. Absent (pre-#1097
+// asset, or a path with no ambient stack) keeps today's behaviour and is
+// reported at debug level.
 const onObjectStored =
   storageAvailable
-    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) => {
-        const effectiveStorage = storage ?? storageFor();
-        if (probe) {
-          void extractTechnicalMetadata(
-            { assetId, objectKey },
-            { assets: assetRepository, storage: effectiveStorage, probe }
-          );
-        }
-        triggerPostUploadThumbnail?.(assetId, objectKey, effectiveStorage);
-      }
+    ? (
+        assetId: string,
+        objectKey: string,
+        storage?: WorkspaceStorage,
+        stackName?: string
+      ) =>
+        runWithPersistedStack(
+          stackName,
+          () => onObjectStoredInStack(assetId, objectKey, storage),
+          () =>
+            app.log.debug(
+              { assetId, objectKey },
+              `post-object-stored pipeline: ${PERSISTED_STACK_FALLBACK_MESSAGE}`
+            )
+        )
     : undefined;
+
+function onObjectStoredInStack(
+  assetId: string,
+  objectKey: string,
+  storage?: WorkspaceStorage
+): void {
+  const effectiveStorage = storage ?? storageFor();
+  // The stack this work is running in: the request's (issue #1058) or the
+  // asset's persisted one, re-entered by the wrapper above (issue #1097).
+  const stackName = currentRequestStackName();
+  if (probe) {
+    void extractTechnicalMetadata(
+      // Passed explicitly as well, so the extractor re-enters the stack on its
+      // own and stays correct however it is invoked.
+      { assetId, objectKey, ...(stackName ? { stackName } : {}) },
+      { assets: assetRepository, storage: effectiveStorage, probe, stackLog: app.log }
+    );
+  }
+  // Poster frame (issue #7). The trigger captures the AMBIENT stack name
+  // synchronously and then does a REAL resolve() from inside its own detached
+  // continuation (issue #1100, services/post-upload-thumbnail.ts) — so because
+  // the wrapper above has already re-entered the asset's persisted stack, the
+  // name it captures is that stack, with no cache-timing dependency.
+  triggerPostUploadThumbnail?.(assetId, objectKey, effectiveStorage);
+}
 
 // Registered UNCONDITIONALLY (mirroring assetsRouter above, main.ts:1184) so
 // the upload/multipart routes always enter the route tree and therefore the
