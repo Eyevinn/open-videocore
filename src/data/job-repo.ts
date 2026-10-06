@@ -8,6 +8,7 @@
 // status, progress, and any terminal error.
 
 import type { MessageFailureClass } from '../encore-scaler/retry-policy.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 // ---------------------------------------------------------------------------
 // Job model + lifecycle
@@ -175,6 +176,51 @@ export type Job = {
   // unconditional and must never be overridden. Cleared once a job settles to a
   // real terminal outcome (done, or a re-affirmed failure).
   droppedByScaler?: boolean;
+  // --- Durable stack identity (#1097) ---
+  // The provisioned stack this job was created against, captured from the
+  // request's ambient stack context at create time
+  // (`currentDocumentStackName()`, src/services/request-stack-context.ts). It is
+  // the DURABLE copy of an identity that otherwise lives only in
+  // AsyncLocalStorage, so work that outlives the request — the URL-pull worker,
+  // metadata extraction, a queue message drained after a process restart — can
+  // re-enter the same stack (`runWithPersistedStack`) and resolve the same
+  // repositories and object storage the request wrote to.
+  //
+  // Optional and immutable: absent on every job created before #1097 and on
+  // jobs created outside a request (boot wiring, sweeps, watch-folder), where
+  // there is no ambient stack to record. An absent value keeps TODAY's
+  // behaviour — the first-listed stack (`workspace-stack.ts resolve()`,
+  // no-stackName branch) — and the fallback is logged at debug level by the
+  // worker that takes it. Not present on UpdateJobInput: a job's stack never
+  // changes, so there is nothing to patch.
+  stackName?: string;
+  // --- Durable trace of a CORRECTED drop (#1023) ---
+  // True when this job was reported dropped by drop detection (#709) and a later
+  // genuine SUCCESSFUL completion corrected it to `done`. In other words: the
+  // drop was spurious. Set by completeTranscode's success write at the same
+  // moment `error` is cleared and `droppedByScaler` is reset, so the fact that a
+  // drop happened survives on the RECORD rather than only in an audit entry —
+  // the audit emitter is optional (`deps.audit`) and the callback poller does not
+  // pass one, so an audit-only trace would exist on some correction paths and not
+  // others. Modelled exactly like `interrupted`/`interruptionReason` above: an
+  // additive, OPTIONAL annotation that does NOT drive status (the job really is
+  // `done`), is absent (not false) on jobs that were never dropped, and is NOT
+  // cleared afterwards — a completed job that WAS once dropped still reflects
+  // that it recovered. This is what keeps a too-short reconcile grace period
+  // detectable after #1023 stopped a recovered job from carrying failure text.
+  droppedThenRecovered?: boolean;
+  // The drop-detection failure text that was cleared off `error` by the
+  // correction (#1023), present only when `droppedThenRecovered` is true. The
+  // reason half of the pair: `droppedThenRecovered` says a drop was corrected,
+  // this says what the drop claimed (e.g. the generic gone-from-active-set
+  // wording, or a cause Encore reported), which is the part that tells an
+  // operator WHY the job was inferred dropped.
+  correctedDropError?: string;
+  // Both fields are INTERNAL to the record for now, exactly like
+  // `droppedByScaler` above: the response contract (jobSchema, src/routes/
+  // jobs.ts) deliberately does not carry the #709 drop-detection vocabulary, and
+  // what goes on the wire is the API design owner's call. Putting them on the
+  // wire is a separate, additive step; nothing here depends on it.
   createdAt: string;
   updatedAt: string;
 };
@@ -195,6 +241,12 @@ export type CreateJobInput = {
   // external correlation id at creation time.
   packagingId?: string;
   outputPrefix?: string;
+  // Explicit stack identity override (#1097). Normally omitted: the repository
+  // stamps `currentDocumentStackName()` so every caller records the stack it is
+  // actually serving without having to pass anything. Supplied only by a caller
+  // that already KNOWS the stack and is not running inside its context (tests,
+  // and any future re-driver that recreates a job on a named stack).
+  stackName?: string;
 };
 
 // Fields the worker may patch as it makes progress. id/workspace/createdAt are
@@ -232,6 +284,25 @@ export type UpdateJobInput = {
   // SUCCESSFUL callback corrects that conditional failure. Additive/optional so
   // existing callers are unaffected; carried through applyJobPatch unchanged.
   droppedByScaler?: boolean;
+  // Durable trace of a corrected drop (#1023). Written by completeTranscode's
+  // success write, in the SAME patch that clears `error` and `droppedByScaler`,
+  // so every correction path (the internal callback route, the callback poller)
+  // and both repository backends record it without needing an audit emitter.
+  droppedThenRecovered?: boolean;
+  correctedDropError?: string;
+  // Explicit REMOVAL of `error` (#1023). Every other field here is patched by
+  // presence (`!== undefined`), which by construction cannot express "unset this
+  // field": passing `error: undefined` is indistinguishable from not patching
+  // `error` at all, so a failure string written earlier in a job's life could
+  // never be taken back off the record. That is exactly the residue #709 left —
+  // a job corrected from a conditional drop-detection `failed` to `done` kept
+  // the drop's failure text forever (see completeTranscode's success write in
+  // src/pipeline/transcode.ts). This flag is the explicit clear: when true,
+  // applyJobPatch DELETES `error` from the resulting record, so the job reads
+  // exactly as one that never failed. Takes precedence over `error` in the same
+  // patch (a caller asking to clear and set at once is a bug; clearing wins so
+  // the record can never end up terminal-successful WITH a failure string).
+  clearError?: boolean;
 };
 
 // A conditional-drop `failed` state (#709) is reversible ONLY by a SUCCESSFUL
@@ -367,6 +438,15 @@ export function applyJobPatch(existing: IngestJob, patch: UpdateJobInput, now: s
   if (patch.interrupted !== undefined) next.interrupted = patch.interrupted;
   if (patch.interruptionReason !== undefined) next.interruptionReason = patch.interruptionReason;
   if (patch.droppedByScaler !== undefined) next.droppedByScaler = patch.droppedByScaler;
+  if (patch.droppedThenRecovered !== undefined) next.droppedThenRecovered = patch.droppedThenRecovered;
+  if (patch.correctedDropError !== undefined) next.correctedDropError = patch.correctedDropError;
+  // #1023: explicit clear, applied LAST so it beats a same-patch `error` write.
+  // `delete` (not `= undefined`) so the field is genuinely absent: the CouchDB
+  // backend serialises the whole record (couch-job-repo.ts toDoc), where an
+  // absent key is dropped by JSON serialisation, and the in-memory backend hands
+  // the object straight back — both then read as a job with no `error` at all,
+  // which is what "filtering jobs by has-an-error" needs.
+  if (patch.clearError === true) delete next.error;
   return next;
 }
 
@@ -465,6 +545,10 @@ export class InMemoryJobRepository implements JobRepository {
       profile: input.profile,
       packagingId: input.packagingId,
       outputPrefix: input.outputPrefix,
+      // Durable stack identity (#1097): the stack this job is being created
+      // against. Undefined outside a request, which preserves the previous
+      // default-stack behaviour on boot/sweep paths.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };
