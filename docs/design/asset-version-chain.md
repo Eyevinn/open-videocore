@@ -4,8 +4,11 @@
 the chain view, current-version indicator and empty state; §2, §3 and §5 answer it, and §7-§9
 add the state wireframes, narrow-panel layout and accessibility contract it needs.
 This file is the single spec for the surface; do not open a second one.
-**Canonical issue:** not recorded. #941 is still open alongside #906, and this file does not
-decide which of the two is canonical — a maintainer must record that on the issues themselves.
+**Canonical issue:** pending a maintainer decision. The PR carrying this file closes #906;
+#941 is still open against the same surface, and which of the two survives as the canonical
+issue is a human call this file cannot make. One spec, two issues — a maintainer needs to
+record the duplicate resolution on the issues themselves. Do not open a second spec file
+either way.
 **Status:** design spec. No production code accompanies it.
 **Audience:** whoever implements the asset-detail versions view, plus anyone writing operator copy about versions.
 
@@ -42,7 +45,7 @@ To check any row, grep the symbol in the file named next to it.
 | Current version is **not** the last array element | the doc comment on `currentVersionId` (`src/data/asset-repo.ts`) states it explicitly — "'last element of the array' is NOT the rule"; the ladder skips archived / failed / in-flight members while a usable one exists |
 | Current version does **not** promise playability | same `currentVersionId` doc comment — "it names the head of the lineage, it does not promise `ready`"; the member's own `status` must be checked |
 | Membership | group-scoped, **always includes the target**, **includes `archived` members** (lineage history, not a live listing). `listVersions` — declared on the `AssetRepository` interface (`src/data/asset-repo.ts`), implemented as `InMemoryAssetRepository.listVersions` (same file) and `CouchAssetRepository.listVersions` (`src/data/couch-asset-repo.ts`) |
-| Never-versioned asset | returns a **single-member chain** containing only itself, with `versionGroupId` absent — `if (!asset.versionGroupId) return [{ ...asset }]` in `InMemoryAssetRepository.listVersions` and `if (!asset.versionGroupId) return [asset]` in `CouchAssetRepository.listVersions` |
+| Never-versioned asset | returns a **single-member chain** containing only itself, with `versionGroupId` absent. Both implementations early-return the asset alone when it has no `versionGroupId`, before any group lookup: `InMemoryAssetRepository.listVersions` (`src/data/asset-repo.ts`) and `CouchAssetRepository.listVersions` (`src/data/couch-asset-repo.ts`). Each guard is introduced by the same one-line comment, which greps in both files: `No lineage yet: the asset is its own (single-member) chain.` |
 | 404 body | `openapi.json` → `…get.responses["404"]` — `{ error: string, message?: string }`, `required: ["error"]`, `additionalProperties: false`. Source: `const errorSchema = z.object({ error: z.string(), message: z.string().optional() })`, `src/routes/assets.ts`, wired as `404: errorSchema` on the `'/:id/versions'` route; that handler sends `{ error: 'not_found' }` |
 | Only two responses | `openapi.json` → `…get.responses` has exactly `200` and `404`. There is no documented 4xx/5xx body beyond those, so anything else is handled as a fetch failure — §5 for the rule, §7 for the wireframe |
 | No pagination | `…get.parameters` contains **only** `id`. Chain returned whole, bounded by `export const MAX_LIMIT = 200` (`src/data/asset-repo.ts`) applied inside `CouchAssetRepository.listVersions` (`src/data/couch-asset-repo.ts`) |
@@ -342,33 +345,84 @@ Versions                                        versionGroupId 01JQ…A7
 
 The warning triangle in the failure and truncation states is decorative only — it duplicates
 text that is already present, following the `.badge-locked` precedent's rule that an icon
-never carries meaning alone — see the comment on `tr.row-locked td:first-child`
-(`public/style.css`), which states the row accent is "purely decorative" because it
-duplicates the badge.
+never carries meaning alone — see the comment block above `tr.row-locked td:first-child`
+(`public/style.css`), which justifies that row accent as decorative on the grounds that it
+duplicates the badge and never appears without it. The greppable line of that comment is
+`decorative: it duplicates the .badge-locked flag and never appears without it`.
 
 ---
 
 ## 8. Narrow-panel layout
 
-The versions view lives inside the asset detail panel, which is **38% of the viewport width,
-floor 320px** (`.assets-side` — `flex: 0 0 38%` / `min-width: 320px`, `public/style.css`), and
-collapses to full width under the existing `@media (max-width: 900px)` breakpoint, which
-re-declares `.assets-side` (`public/style.css`).
-A five-column row — indent, badge slot, `name`, `status`, `createdAt`, `id` — does not fit in
-320px. Do not introduce a new breakpoint; reuse that one.
+The versions view lives inside the asset detail panel. The row has six cells — indent,
+Current badge slot, `name`, `status`, `createdAt`, `id` — and they do not all fit on one line
+in a narrow panel. **The threshold is a property of the panel, not of the viewport**, so it
+has to be expressed against the panel.
 
-**Wide (panel ≥ ~560px):** the single-line row of §2.
+### Why not a viewport media query
 
-**Narrow (below that):** the row wraps to two lines. Line one keeps the facts that identify
-the version and its state — indent, Current badge slot, `name`, `status` badge. Line two
-carries the metadata, indented to line one's text origin — `createdAt` then `id`.
+The panel is `.assets-side` — `flex: 0 0 38%` with `max-width: 38%` and `min-width: 320px`
+(`public/style.css`). Its percentage resolves against `.assets-layout` (`public/style.css`),
+which sits inside `#content`, and the panel renders in **three** different width regimes:
+
+| Regime | Panel width | How it arises |
+|---|---|---|
+| Side-by-side | ≈38% of `#content` | the default `.assets-side` rule |
+| Stacked | full `#content` width | `@media (max-width: 900px)` re-declares `.assets-side` with `flex-basis: auto` / `max-width: none`, and `.assets-layout` to `flex-direction: column` (`public/style.css`) |
+| Detached window | full width | `body.detail-standalone .assets-side` — `flex: 1` / `max-width: none` (`public/style.css`) |
+
+No single viewport number separates "panel narrow" from "panel wide" across those three, and
+reusing `@media (max-width: 900px)` gets it **backwards**. That block widens the panel: below
+900px the panel goes full width, so it is *wider* there than it is at 1000px. The band that
+actually needs the wrap — side-by-side, panel under ~560px — starts at 900px and runs upward,
+which is precisely where the 900px query has not fired. An implementation keyed to it ships a
+single-line six-cell row into a ~380px panel at 1024px and a two-line row into an ~860px panel
+at 900px. It is also not a panel-width breakpoint by construction: it never resets
+`min-width: 320px`, only `flex-basis` / `max-width` / `min-height`.
+
+The viewport crossover is not a usable constant either. `#content` carries
+`max-width: 1200px`, but the assets tab adds `content-fullbleed`, whose only declaration is
+`max-width: none` (`#content.content-fullbleed`, `public/style.css`), toggled by
+`function switchTab` (`public/app.js`). So the viewport width at which the panel reaches
+560px depends on which class `#content` currently has, on `main`'s `padding: 24px 20px`
+(`public/style.css`), and on the scrollbar. Hard-coding one number bakes all three in.
+
+### The rule: container query, two-line as the base
+
+Query the panel directly. `.assets-side` becomes a size container
+(`container-type: inline-size`) and the row layout keys off `@container`.
+
+**Author the two-line row as the base and the single-line row as the enhancement**, not the
+other way round. The two-line row is correct at every width — it only leaves whitespace in a
+wide panel — whereas a single-line base overflows in a narrow one. Basing on the safe layout
+means a browser that does not evaluate `@container` degrades to two lines rather than to
+overflow, and no fallback query is needed.
+
+- **Base (any panel width):** the row wraps to two lines. Line one keeps the facts that
+  identify the version and its state — indent, Current badge slot, `name`, `status` badge.
+  Line two carries the metadata, indented to line one's text origin — `createdAt` then `id`.
+- **Enhancement, `@container (min-width: 560px)`:** collapse to the single-line row of §2.
+
+`container-type` and `@container` do **not** appear anywhere in `public/style.css` today
+(grepped: no match), so this adds the first size container in the stylesheet. That is a new
+declaration on an existing selector, not a new breakpoint — there is still exactly one
+threshold for this view, and it is stated in the unit it is actually about. `inline-size`
+containment constrains only the inline axis; the panel's own width already comes from its
+flex basis rather than its content, so nothing above it moves.
+
+The ~560px figure is the width at which all six cells fit without truncation. For a sense of
+scale, and *not* as a number to key CSS on: in the side-by-side regime with
+`content-fullbleed` active, 38% of (viewport − 40px of `main` padding) reaches 560px only
+somewhere around a 1510px viewport, so most laptop widths sit in the two-line base. The
+stacked and detached regimes clear 560px almost immediately. One `@container` rule gets all
+three right; no viewport number does.
 
 ```
   └─ ●  master-rewrap-v2  Current [ready]
         2026-03-04T11:02:00Z   01JQ…C5
 ```
 
-What must **not** be dropped at narrow width:
+What must **not** be dropped from the two-line base, at any panel width:
 
 - the **Current** badge — it is the whole point of the section;
 - the `status` badge — Current does not imply `ready` (§3), so hiding `status` next to
@@ -429,7 +483,12 @@ width shrinks before anything else gives.
 8. Read errors as flat `{ error, message? }`.
 9. Four non-populated states, all drawn in §7: loading (`loadingEl`), empty, fetch failure,
    truncated. None of them is the same copy as another.
-10. Rows wrap to two lines under the existing `max-width: 900px` breakpoint (§8). Current
-    badge, `status` badge and the indent survive the wrap; nothing is truncated.
+10. **The two-line row is the base layout** (§8). The single-line row of §2 is an
+    enhancement applied only inside `@container (min-width: 560px)`, which requires adding
+    `container-type: inline-size` to `.assets-side` (`public/style.css`) — the first size
+    container in that stylesheet. Do **not** key the wrap to `@media (max-width: 900px)`:
+    that query widens the panel rather than narrowing it, so it is backwards for this
+    purpose (§8 has the arithmetic). Current badge, `status` badge and the indent survive
+    the wrap; nothing is truncated.
 11. Nested `ul`/`li`, connector glyphs `aria-hidden`, `aria-current` on the you-are-here row,
     focus moved to it after navigation (§9). Not `role="tree"`.
