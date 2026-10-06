@@ -8,14 +8,24 @@ import {
   createInstance,
   getInstance,
   getPortsForInstance,
-  saveSecret,
-  waitForInstanceReady
+  saveSecret
 } from '@osaas/client-core';
+// Readiness waits go through this bounded helper, NOT @osaas/client-core's
+// waitForInstanceReady (issue #1038). The SDK helper has no deadline and does
+// not wrap its getInstanceHealth call in a try (lib/core.js:343-353, v0.24.0),
+// so one transient `fetch failed` mid-wait aborted the entire stack provision.
+import {
+  DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS,
+  DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+  waitForInstanceReadyBounded
+} from '../services/instance-readiness.js';
 import { Client as MinioClient } from 'minio';
 import nano from 'nano';
 import {
   deprovisionStack,
   deprovisionStackFromConfig,
+  foldTeardownResults,
+  type ServiceTeardownResult,
   type StackTeardownResult
 } from '../services/deprovision.js';
 import {
@@ -29,13 +39,25 @@ import {
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import {
   AUTO_SUBTITLES_SERVICE_ID,
+  OBJECT_STORE_SERVICE_ID,
   PACKAGER_SERVICE_ID,
   SCENE_DETECT_SERVICE_ID,
   STACK_SERVICES
 } from '../services/stack.js';
 import {
+  LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+  MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+  MINIMUM_OBJECT_STORE_SEED_LENGTH,
+  assessObjectStoreCredentialSeed,
+  newObjectStoreCredentialGeneration,
+  planObjectStoreCredential,
+  type ObjectStoreCredentialPlan
+} from '../services/object-store-credentials.js';
+import {
   packagerOscApiFromContext,
-  teardownOnDemandPackager
+  packagerTeardownAsServiceResults,
+  teardownOnDemandPackager,
+  type PackagerTeardownResult
 } from '../services/packager-provisioning.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
@@ -282,6 +304,14 @@ type ProvisionRouterOptions = {
   // operator can retry via POST /api/v1/profiles/bootstrap. Optional: when
   // omitted (e.g. no profile repository wired) seeding is skipped.
   seedProfiles?: () => Promise<void>;
+  // Bound (ms) on how long each backing instance's readiness wait polls before
+  // the provision gives up and rolls back (issue #1038). Unset uses
+  // DEFAULT_INSTANCE_READY_TIMEOUT_MS (5 min). main.ts wires
+  // PROVISION_READY_TIMEOUT_MS; tests inject a few milliseconds.
+  readyTimeoutMs?: number;
+  // Cadence (ms) between health probes inside that wait. Unset uses
+  // DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
+  readyPollIntervalMs?: number;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -533,8 +563,33 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     getScalerRegistry,
     operationStore: ops,
     publicBaseUrl,
-    seedProfiles
+    seedProfiles,
+    readyTimeoutMs,
+    readyPollIntervalMs
   } = opts;
+
+  // Readiness-wait budget shared by every backing instance this route creates
+  // (issue #1038). Resolved once here so all five waits use one bound, and so
+  // tests can drive the deadline without touching the environment.
+  const readinessOptions = {
+    timeoutMs: readyTimeoutMs ?? DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+    pollIntervalMs: readyPollIntervalMs ?? DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS
+  } as const;
+
+  // Wait for one backing instance to report `running`, bounded. Every readiness
+  // wait in this route goes through here: @osaas/client-core's
+  // waitForInstanceReady polls getInstanceHealth in a `while (!instanceOk)` loop
+  // with no deadline AND no try (lib/core.js:343-353, v0.24.0), so a single
+  // dropped poll (`fetch failed`) rejected the wait and aborted the whole stack
+  // even when the instance came up moments later. The shared helper retries a
+  // failed probe until the deadline and, on timeout, throws an error naming the
+  // service plus the last probe error — which lands in the catch below and runs
+  // the existing rollback instead of surfacing a bare `fetch failed`.
+  const awaitReady = (serviceId: string, instanceName: string, label: string) =>
+    waitForInstanceReadyBounded(osc, serviceId, instanceName, {
+      ...readinessOptions,
+      label
+    });
 
   // The parameter-store namespace this route WRITES under (issue #804): the
   // deployment-wide CONSTANT, identical to the one the runtime resolver reads
@@ -554,6 +609,58 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   }
   if (!couchdbAdminPassword) {
     throw new Error('COUCHDB_ADMIN_PASSWORD environment variable is required');
+  }
+
+  // MINIO_ROOT_PASSWORD is also the per-stack credential derivation SEED
+  // (issue #1094). Presence alone is not enough for that second role: the
+  // derived secret is handed to spawned transcoders and per-job instances as a
+  // plaintext field, so a WEAK seed would let one leaked stack credential be
+  // turned back into the seed offline — and with it, every other stack's
+  // credential. Checked ONCE here, at registration time, so the operator sees
+  // it in the startup log rather than discovering it per provision.
+  //
+  // A weak seed is NOT fatal: planObjectStoreCredential keeps such a deployment
+  // on the legacy deployment-wide credential, which is byte-identically the
+  // pre-#1094 behaviour. Failing startup would break working deployments for a
+  // property they never had. But it is not a WARNING either: it means stack
+  // isolation (#1089) is OFF for every stack provisioned from here, so it is
+  // reported at ERROR, with the remediation and the exact floors, and repeated
+  // per affected provision below. Unless the operator has explicitly
+  // acknowledged running without per-stack credentials via
+  // ALLOW_SHARED_OBJECT_STORE_CREDENTIAL, in which case the same facts are
+  // reported once at WARN — the state is deliberate, not a surprise.
+  //
+  // The log line carries only the assessment, never the seed or any part of it.
+  const sharedObjectStoreCredentialAcknowledged =
+    (process.env['ALLOW_SHARED_OBJECT_STORE_CREDENTIAL'] ?? '')
+      .trim()
+      .toLowerCase() === 'true';
+  const objectStoreSeedAssessment =
+    assessObjectStoreCredentialSeed(minioRootPassword);
+  if (!objectStoreSeedAssessment.acceptable) {
+    const report = {
+      reason: objectStoreSeedAssessment.reason,
+      estimatedEntropyBits: objectStoreSeedAssessment.estimatedEntropyBits,
+      minimumLength: MINIMUM_OBJECT_STORE_SEED_LENGTH,
+      minimumEntropyBits: MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+      acknowledged: sharedObjectStoreCredentialAcknowledged,
+      perStackObjectStoreCredentials: 'disabled'
+    };
+    const message =
+      'MINIO_ROOT_PASSWORD is too weak to derive per-stack object-store ' +
+      'credentials from (issue #1094): PER-STACK OBJECT-STORE CREDENTIALS ARE ' +
+      'DISABLED and every newly provisioned stack will share the ' +
+      'deployment-wide object-store credential. Replace it with a generated ' +
+      `value of at least ${MINIMUM_OBJECT_STORE_SEED_LENGTH} characters ` +
+      `(>= ${MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS} estimated bits), e.g. ` +
+      "`openssl rand -base64 32`, or set " +
+      'ALLOW_SHARED_OBJECT_STORE_CREDENTIAL=true to acknowledge the shared ' +
+      'credential deliberately';
+    if (sharedObjectStoreCredentialAcknowledged) {
+      app.log.warn(report, message);
+    } else {
+      app.log.error(report, message);
+    }
   }
 
   // OpenAI API key for eyevinn-auto-subtitles' Whisper transcription (issue
@@ -580,6 +687,13 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   // the same serviceId. (The PACKAGED-role secrets are minted by the on-demand
   // packager ensure step now, not here — epic #226 / issue #243.)
   const EXT_SOURCE = 'extsource';
+  // Role-qualified secret purpose for the stack's OWN per-stack object-store
+  // credential (issue #1094), kept distinct from EXT_SOURCE so an operator who
+  // ALSO supplied an external source bucket gets two separate secrets under the
+  // same consuming serviceId instead of one overwriting the other. The
+  // credential-mapping layer appends the field-specific suffix (e.g.
+  // `.s3secretaccesskey`), exactly as it does for the #212 external credentials.
+  const OBJECT_STORE = 'objectstore';
 
   // Provision/deprovision/lookup are stack-lifecycle operations performed by
   // the deployment itself. They are NOT caller-authenticated: the OSC SDK
@@ -706,6 +820,58 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         }
         inFlightProvisions.add(name);
 
+        // The object-store credential THIS stack's instance is created with
+        // (issue #1094). Decided ONCE here, before anything is created or
+        // written, and then used by every write below — the 'provisioning'
+        // marker, the create body, our own S3 client, the OSC secrets, the final
+        // 'ready' config and the partial 'failed' config — so a retry of this
+        // stack can never flip between the per-stack and the legacy credential
+        // and leave the API authenticating with a key the live instance does not
+        // have. Defaults to the legacy process-global credential and is upgraded
+        // to the per-stack one by planObjectStoreCredential below; the secret
+        // lives only in this closure and in saveSecret.
+        const legacyObjectStorePlan: ObjectStoreCredentialPlan = {
+          credential: {
+            accessKeyId: LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+            secretAccessKey: minioRootPassword
+          },
+          perStack: false
+        };
+        let objectStorePlan: ObjectStoreCredentialPlan = legacyObjectStorePlan;
+
+        // Reset the plan to the legacy credential when the per-stack access key
+        // id could NOT be persisted (issue #1094 review, blocking finding 3).
+        //
+        // The per-stack secret is derived from (seed, stackName, generation) and
+        // the generation is a fresh random value for this run that exists ONLY
+        // in this closure — the stored access key id is the sole record of it.
+        // If the 'provisioning' marker write fails and we create the object
+        // store with the per-stack credential anyway, nothing can ever
+        // re-derive that credential: the live instance's ROOT user becomes
+        // unrecoverable, and the next provision attempt sees no stored id,
+        // adopts the instance under `admin` and reports a ready stack whose
+        // every object-store call 403s. The legacy credential has no such
+        // failure mode (it is deployment-global and always recoverable), and
+        // the downgrade is safe precisely because `perStack` is only ever true
+        // when the instance does not exist yet. Logged at ERROR, never silent.
+        const downgradeObjectStorePlanOnUnpersistableId = (
+          err: unknown,
+          stage: string
+        ): void => {
+          if (!objectStorePlan.perStack) return;
+          objectStorePlan = legacyObjectStorePlan;
+          app.log.error(
+            { err, name, stage, perStackObjectStoreCredential: 'abandoned' },
+            'could not persist this stack\'s per-stack object-store access ' +
+              'key id, so the per-stack credential has been abandoned for ' +
+              'this run and the stack will be created with the ' +
+              'deployment-wide credential (issue #1094). Creating it with an ' +
+              'unrecorded per-stack credential would leave an ' +
+              'unrecoverable root credential on a stack that reports ready ' +
+              'while every object-store call fails authorization'
+          );
+        };
+
         try {
           if (paramStore) {
             try {
@@ -727,27 +893,125 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 });
                 return;
               }
+              // Decide this stack's object-store credential (issue #1094)
+              // BEFORE the marker is written, so the marker already carries the
+              // per-stack access key id and a later retry reads it back instead
+              // of concluding "no id recorded" and falling back.
+              //
+              // The existence probe is the safety input: provisioning ADOPTS an
+              // object store that already exists (#417) and adoption does NOT
+              // rewrite its root user, so an already-live instance with no
+              // recorded per-stack id must keep the legacy credential (#1096
+              // migrates it). A probe that cannot answer is reported as
+              // "exists", which is the non-breaking answer.
+              let objectStoreInstanceExists = true;
+              try {
+                const sat = await osc.getServiceAccessToken(
+                  OBJECT_STORE_SERVICE_ID
+                );
+                objectStoreInstanceExists = Boolean(
+                  await getInstance(osc, OBJECT_STORE_SERVICE_ID, name, sat)
+                );
+              } catch (probeErr) {
+                app.log.warn(
+                  { err: probeErr, name, serviceId: OBJECT_STORE_SERVICE_ID },
+                  'object-store existence probe failed; keeping the legacy ' +
+                    'object-store credential for this stack'
+                );
+              }
+              objectStorePlan = planObjectStoreCredential({
+                stackName: name,
+                seed: minioRootPassword,
+                legacySecretAccessKey: minioRootPassword,
+                // A FRESH generation for this provision run (issue #1094
+                // review follow-up). Without it the credential would be a pure
+                // function of (seed, stackName), so tearing a stack down and
+                // provisioning the same name again would replay the retired
+                // credential — which teardown cannot revoke, because the OSC
+                // secrets API is write-only (saveSecret only, no delete:
+                // @osaas/client-core lib/core.d.ts:154 / lib/index.d.ts:6).
+                // Only used on the ISSUE branch: a stack that already has a
+                // recorded access key id keeps it verbatim, so this does not
+                // disturb the idempotent retry path (#417).
+                generation: newObjectStoreCredentialGeneration(),
+                storedAccessKeyId: existing?.objectStoreAccessKeyId,
+                storedConfigExists: Boolean(existing),
+                objectStoreInstanceExists,
+                paramStoreAvailable: true
+              });
+
+              // A downgrade caused by a weak seed is a SECURITY-relevant state
+              // change, not a detail: report it per stack at ERROR, with the
+              // seed-free reason the planner produced (issue #1094 review,
+              // blocking finding 1). The startup report above covers the
+              // deployment; this covers "which stacks actually lost isolation".
+              if (objectStorePlan.downgradeReason) {
+                app.log.error(
+                  {
+                    name,
+                    reason: objectStorePlan.downgradeReason,
+                    minimumLength: MINIMUM_OBJECT_STORE_SEED_LENGTH,
+                    minimumEntropyBits: MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+                    acknowledged: sharedObjectStoreCredentialAcknowledged,
+                    perStackObjectStoreCredential: 'disabled'
+                  },
+                  'provisioning this stack WITHOUT a per-stack object-store ' +
+                    'credential; it will share the deployment-wide credential ' +
+                    'with every other stack (issue #1094)'
+                );
+              }
+
               // No completed config yet: record a 'provisioning' marker BEFORE
               // creating any companion so a repeated call (this process or a
               // fresh one after a restart) sees an attempt is in flight and
               // converges instead of starting a new companion set. This is
-              // best-effort — a marker-write failure must not block the live
-              // provision, so it is logged and provisioning continues.
-              await paramStore.storeStackConfig(wsId, name, {
-                status: 'provisioning',
-                minioEndpoint: '',
-                couchdbUrl: '',
-                redisUrl: '',
-                sourceBucket: SOURCE_BUCKET,
-                packagedBucket: PACKAGED_BUCKET,
-                storage: storageMetadata,
-                services: []
-              });
+              // best-effort for the IDEMPOTENCY guard — a marker-write failure
+              // must not block the live provision, so it is logged and
+              // provisioning continues. It is NOT best-effort for the
+              // per-stack credential: the marker is the only record of the
+              // access key id at this point, so a failed write forces the plan
+              // back to the legacy credential (see
+              // downgradeObjectStorePlanOnUnpersistableId above).
+              try {
+                await paramStore.storeStackConfig(wsId, name, {
+                  status: 'provisioning',
+                  minioEndpoint: '',
+                  couchdbUrl: '',
+                  redisUrl: '',
+                  sourceBucket: SOURCE_BUCKET,
+                  packagedBucket: PACKAGED_BUCKET,
+                  // Non-secret per-stack access key id (issue #1094). Recorded
+                  // on the marker too, so the mode survives a retry.
+                  ...(objectStorePlan.perStack
+                    ? {
+                        objectStoreAccessKeyId:
+                          objectStorePlan.credential.accessKeyId
+                      }
+                    : {}),
+                  storage: storageMetadata,
+                  services: []
+                });
+              } catch (markerErr) {
+                app.log.warn(
+                  { err: markerErr, name },
+                  "'provisioning' marker write failed; continuing provision"
+                );
+                downgradeObjectStorePlanOnUnpersistableId(
+                  markerErr,
+                  'provisioning-marker'
+                );
+              }
             } catch (err) {
               app.log.warn(
                 { err, name },
                 'idempotency pre-flight (param store) failed; continuing provision'
               );
+              // The pre-flight can also fail BEFORE/AROUND the marker write
+              // (e.g. the stored-config read, or the plan itself). Any such
+              // failure leaves the id unpersisted too, so apply the same
+              // downgrade rather than creating an instance under a credential
+              // nothing can re-derive.
+              downgradeObjectStorePlanOnUnpersistableId(err, 'pre-flight');
             }
           }
 
@@ -859,21 +1123,26 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
       let currentService = '';
       try {
         // 1. MinIO — S3-compatible object storage.
-        currentService = 'minio-minio';
+        currentService = OBJECT_STORE_SERVICE_ID;
+        // Per-stack object-store credential (issue #1094). The SECRET only ever
+        // reaches saveSecret (via secretRef) and the S3 client below — the
+        // create body carries the {{secrets.*}} reference, never the literal,
+        // and nothing here is logged. The access key id is non-secret.
+        const objectStoreCredential = objectStorePlan.credential;
         const minioRootPasswordRef = await secretRef(
-          'minio-minio',
+          OBJECT_STORE_SERVICE_ID,
           ROOTPASSWORD,
-          minioRootPassword
+          objectStoreCredential.secretAccessKey
         );
-        const minio = await provision('minio-minio', {
-          RootUser: 'admin',
+        const minio = await provision(OBJECT_STORE_SERVICE_ID, {
+          RootUser: objectStoreCredential.accessKeyId,
           RootPassword: minioRootPasswordRef
         });
-        await waitForInstanceReady('minio-minio', name, osc);
+        await awaitReady('minio-minio', name, 'object storage');
         const minioEndpoint = instanceUrl(minio);
 
         // 1b. Create the source and packaged buckets on the live MinIO instance.
-        // waitForInstanceReady passes when the container health check is green,
+        // The readiness wait passes when the container health check is green,
         // but the MinIO S3 API may still be initialising. Retry with backoff
         // until S3 is actually accepting connections.
         const minioUrl = new URL(minioEndpoint);
@@ -885,11 +1154,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               ? 443
               : 80,
           useSSL: minioUrl.protocol === 'https:',
-          accessKey: 'admin',
-          // The admin S3 client connects with the real credential — OSC resolves
+          accessKey: objectStoreCredential.accessKeyId,
+          // The root S3 client connects with the real credential — OSC resolves
           // the {{secrets.*}} reference on its side, but our client speaks S3
-          // directly to the live instance and needs the literal password.
-          secretKey: minioRootPassword
+          // directly to the live instance and needs the literal secret. This is
+          // THIS STACK's credential (issue #1094), not a deployment-wide one.
+          secretKey: objectStoreCredential.secretAccessKey
         });
         const delay = (ms: number) =>
           new Promise((resolve) => setTimeout(resolve, ms));
@@ -997,11 +1267,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         const couchdb = await provision('apache-couchdb', {
           AdminPassword: couchdbAdminPasswordRef
         });
-        await waitForInstanceReady('apache-couchdb', name, osc);
+        await awaitReady('apache-couchdb', name, 'document store');
         const couchdbUrl = instanceUrl(couchdb);
 
-        // 2b. Create the required CouchDB databases. waitForInstanceReady
-        // passes when the container is healthy but the HTTP API may still be
+        // 2b. Create the required CouchDB databases. The readiness wait passes
+        // when the container is healthy but the HTTP API may still be
         // starting up — retry with backoff the same way we do for MinIO.
         const couchAdminUrl = couchdbUrl
           .replace(/\/$/, '')
@@ -1033,7 +1303,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // 3. Valkey — queue / coordination backbone.
         currentService = 'valkey-io-valkey';
         await provision('valkey-io-valkey', {});
-        await waitForInstanceReady('valkey-io-valkey', name, osc);
+        await awaitReady('valkey-io-valkey', name, 'queue');
         const redisUrl = await redisUrlFrom(osc, 'valkey-io-valkey', name);
 
         // Encore and its paired callback listener are NOT provisioned here: the
@@ -1052,7 +1322,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // Each is created ONLY when the request opted in — opted-out means zero
         // cost (nothing is provisioned). Both flow through the same provision()
         // helper (so they land in provisioned[] and are covered by the
-        // partial-failure cleanup below) and waitForInstanceReady, and their
+        // partial-failure cleanup below) and the same bounded readiness wait as
+        // the core stack (awaitReady, #1038), and their
         // instance names are recorded into the StackConfig persisted below.
 
         // 5a. eyevinn-auto-subtitles ("Subtitle Generator") — Whisper transcription.
@@ -1080,7 +1351,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           await provision(AUTO_SUBTITLES_SERVICE_ID, {
             openaikey: openaiKeyRef
           });
-          await waitForInstanceReady(AUTO_SUBTITLES_SERVICE_ID, name, osc);
+          await awaitReady(
+            AUTO_SUBTITLES_SERVICE_ID,
+            name,
+            'subtitle generation'
+          );
           autoSubtitlesInstanceName = name;
         }
 
@@ -1090,7 +1365,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         if (wantSceneDetect) {
           currentService = SCENE_DETECT_SERVICE_ID;
           await provision(SCENE_DETECT_SERVICE_ID, {});
-          await waitForInstanceReady(SCENE_DETECT_SERVICE_ID, name, osc);
+          await awaitReady(SCENE_DETECT_SERVICE_ID, name, 'scene detection');
           sceneDetectInstanceName = name;
         }
 
@@ -1127,6 +1402,77 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           );
         }
 
+        // The stack's OWN per-stack object-store credential, persisted as OSC
+        // secrets for the same two source-reading services (issue #1094),
+        // through the SAME mapping layer the #212 external credentials use
+        // above. The per-stack object store is an S3-compatible store like any
+        // other, so it is mapped by exactly the same code rather than a parallel
+        // one: `encoreCredentialMapping`/`ffmpegS3CredentialMapping` place the
+        // non-secret accessKeyId/endpoint in config fields and hand the secret
+        // to saveSecret, scoped per serviceId, under the `objectstore.*`
+        // purposes. As with the block above the returned references are not used
+        // here — these services are created in a different lifecycle (scaler
+        // spawn / per-job) — the point is that the secret exists under each
+        // consuming serviceId and the literal never leaves saveSecret.
+        //
+        // Only for a stack that actually HAS a per-stack credential: a stack
+        // still on the legacy deployment-wide password keeps its pre-#1094
+        // behaviour (no object-store secret is minted for it) until #1096
+        // migrates it.
+        //
+        // BEST-EFFORT, by review (issue #1094). These two writes are NOT
+        // load-bearing for the stack that is being provisioned: nothing resolves
+        // `{{secrets.<stack>.objectstore.*}}` yet — the scaler passes the
+        // literal secret in the encore create body
+        // (encore-scaler/instance-pool.ts) and the per-job ffmpeg bodies take
+        // theirs from `s3Config` (pipeline/osc-rewrap.ts,
+        // pipeline/osc-thumbnail.ts) — they pre-establish the secret NAMES under
+        // each consuming serviceId for the follow-up that switches those paths
+        // to references. Unlike the #212 block above, which only runs when the
+        // operator supplied an external bucket, this runs on EVERY per-stack
+        // provision, so leaving it as a bare `await` in the main try block made
+        // a single `saveSecret` hiccup roll back an otherwise fully provisioned
+        // stack. saveSecret POSTs /mysecrets/<serviceId> and rejects on a
+        // non-2xx (@osaas/client-core lib/core.js:355-369, lib/core.d.ts:154),
+        // and OSC exposes no delete, so a half-written pair cannot be cleaned up
+        // either (docs/osc-feedback/incoming-no-osc-secret-deletion-for-stack-
+        // teardown.md). Catching here keeps the failure proportional: the stack
+        // stays up, the operator gets a warning, and a retried provision
+        // re-attempts the same (deterministic) secret names and values.
+        if (objectStorePlan.perStack) {
+          const objectStoreCreds: ExternalStorageCredentials = {
+            bucket: SOURCE_BUCKET,
+            accessKeyId: objectStorePlan.credential.accessKeyId,
+            secretAccessKey: objectStorePlan.credential.secretAccessKey,
+            endpointUrl: minioEndpoint
+          };
+          for (const [serviceId, mapping] of [
+            [
+              EXTERNAL_STORAGE_SERVICE_IDS.encore,
+              encoreCredentialMapping(objectStoreCreds, OBJECT_STORE)
+            ],
+            [
+              EXTERNAL_STORAGE_SERVICE_IDS.ffmpegS3,
+              ffmpegS3CredentialMapping(objectStoreCreds, OBJECT_STORE)
+            ]
+          ] as const) {
+            try {
+              await applyCredentialMapping(serviceId, mapping);
+            } catch (secretErr) {
+              // The error object can carry the response body, so it is logged
+              // under `err` only — never the credential, which is not part of
+              // the message the SDK throws.
+              app.log.warn(
+                { err: secretErr, name, serviceId },
+                'could not persist the per-stack object-store credential as ' +
+                  'an OSC secret; the stack is unaffected because no runtime ' +
+                  'path resolves this secret reference yet, and a retried ' +
+                  'provision re-attempts the write'
+              );
+            }
+          }
+        }
+
         // Persist the stack's non-secret connection coordinates to the OSC
         // parameter store (issue #31, ADR-002) so the API — and deprovision
         // (#29) — can rediscover this stack at runtime without the caller
@@ -1157,6 +1503,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
               ? { autoSubtitlesInstanceName }
               : {}),
             ...(sceneDetectInstanceName ? { sceneDetectInstanceName } : {}),
+            // The object store's per-stack access key id (issue #1094).
+            // NON-SECRET — an identifier. Its matching secret is NOT stored
+            // (here or anywhere at rest): readers re-derive it from this id plus
+            // the deployment seed (services/object-store-credentials.ts). Absent
+            // for a stack still on the legacy deployment-wide credential, which
+            // is exactly how the fallback is detected until #1096.
+            ...(objectStorePlan.perStack
+              ? { objectStoreAccessKeyId: objectStorePlan.credential.accessKeyId }
+              : {}),
             // Non-secret storage backend metadata (issue #211). Secrets are
             // never included — only bucket/endpointUrl/region + backend type.
             storage: storageMetadata,
@@ -1246,13 +1601,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // call the tenant was never told to make. Tear them down best-effort
           // here, in dependency-safe order, reusing the SAME idempotent
           // teardown the DELETE route uses (deprovisionStackFromConfig ->
-          // teardownService: probes getInstance first, tolerates already-gone).
+          // teardownService: probes getInstance, CONFIRMS an empty probe against
+          // the instance list, and tolerates a confirmed already-gone instance).
           //
           // CRITICAL (issue #736 trap): only `created` is rolled back. provision()
           // is idempotent (#417) and ADOPTS a pre-existing instance on "already
           // taken"; those live in `provisioned` but NOT `created`, so a rollback
           // never deletes an instance the tenant already had.
           let rollback: StackTeardownResult | undefined;
+          let rollbackThrew: string | undefined;
           if (created.length > 0) {
             try {
               rollback = await deprovisionStackFromConfig(
@@ -1270,6 +1627,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             } catch (rollbackErr) {
+              rollbackThrew =
+                rollbackErr instanceof Error
+                  ? rollbackErr.message
+                  : String(rollbackErr);
               app.log.error(
                 { rollbackErr, name, created },
                 'rollback of created instances threw; some may still be running'
@@ -1277,10 +1638,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             }
           }
 
+          // A rollback that threw tore down NOTHING we can account for, so every
+          // created instance is unaccounted-for rather than gone (issue #1039:
+          // an unverifiable teardown must never read as "nothing left"). Report
+          // each one as a failed teardown so it lands in `leftovers`, in
+          // `stillRunning`, and in the persisted services[] a retry reads.
+          const rollbackServices: ServiceTeardownResult[] =
+            rollback?.services ??
+            created.map((c) => ({
+              serviceId: c.serviceId,
+              role: 'unknown',
+              status: 'failed' as const,
+              error: rollbackThrew ?? 'rollback did not run'
+            }));
+
           // Created instances that could NOT be torn down are still running and
           // still billing — surfaced in the operation result with the exact
           // deprovision call so the tenant can finish removing them.
-          const leftovers = (rollback?.services ?? []).filter(
+          const leftovers = rollbackServices.filter(
             (s) => s.status === 'failed'
           );
 
@@ -1310,6 +1685,17 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 redisUrl: '',
                 sourceBucket: SOURCE_BUCKET,
                 packagedBucket: PACKAGED_BUCKET,
+                // Preserve the per-stack access key id on the partial write
+                // (issue #1094). The instances that survived this failure were
+                // created with it, so dropping it here would make a retry (or
+                // the resolver) fall back to the legacy credential against an
+                // object store that only accepts the per-stack one.
+                ...(objectStorePlan.perStack
+                  ? {
+                      objectStoreAccessKeyId:
+                        objectStorePlan.credential.accessKeyId
+                    }
+                  : {}),
                 // Preserve the requested storage backend metadata on the partial
                 // write so deprovision/downstream can still resolve it (#211).
                 storage: storageMetadata,
@@ -1330,20 +1716,43 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // Report the rollback outcome so the caller knows the created
             // instances were torn down (or, if teardown itself failed, exactly
             // which leftovers remain and how to remove them) — issue #736.
+            //
+            // When this operation created nothing there was nothing to roll
+            // back, which is NOT the same as "nothing is left": any instance the
+            // run ADOPTED is still running. That case reports `not_attempted`
+            // rather than the old `not_found`, which read as an empty stack
+            // (issue #1039). `stillRunning` lists everything that survives —
+            // adopted instances included — with the call that removes them.
             result: {
               name,
               failedService: currentService,
-              rollback: rollback
-                ? { status: rollback.status, services: rollback.services }
-                : { status: 'not_found', services: [] },
+              rollback:
+                created.length === 0
+                  ? {
+                      status: 'not_attempted',
+                      services: [],
+                      reason: 'this operation created no instances'
+                    }
+                  : {
+                      status: rollback?.status ?? 'failed',
+                      services: rollbackServices
+                    },
+              ...(stillRunning.length > 0
+                ? {
+                    stillRunning: stillRunning.map((p) => ({
+                      serviceId: p.serviceId,
+                      instanceName: p.name
+                    })),
+                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                  }
+                : {}),
               ...(leftovers.length > 0
                 ? {
                     leftovers: leftovers.map((s) => ({
                       serviceId: s.serviceId,
                       instanceName: name,
                       error: s.error
-                    })),
-                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                    }))
                   }
                 : {})
             }
@@ -1617,7 +2026,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 'on-demand packager teardown failed; continuing static teardown'
               );
             }
-            const result = await deprovisionStack(osc, name);
+            // Fold the packager outcome into the reported result (issue #1056).
+            // There is no stored config to keep on this path, but the result
+            // must not read as clean while the packager is still running. The
+            // static TEARDOWN_ORDER also covers PACKAGER_SERVICE_ID, so the
+            // fold MERGES onto that entry instead of reporting two packagers.
+            const result = foldTeardownResults(
+              await deprovisionStack(osc, name),
+              packagerTeardownAsServiceResults(packagerTeardown)
+            );
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
@@ -1636,7 +2053,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const config = await paramStore.loadStackConfig(workspaceId, name);
           if (!config) {
             // Idempotent: a retry after a successful teardown (entry already
-            // gone) lands here. Report not_found rather than erroring.
+            // gone) lands here. Report not_found rather than erroring — but
+            // still sweep any scaler state left under this name: a stack torn
+            // down while the scaler teardown was a no-op (it was keyed by the
+            // namespace, not the stack) left its pool keys and possibly its
+            // Encore instances behind, and re-issuing the DELETE is the
+            // operator's way to clean that up. teardown() is a clean no-op
+            // when there is nothing under the name.
+            const staleRegistry = getScalerRegistry?.();
+            if (staleRegistry) {
+              try {
+                await staleRegistry.teardown(name);
+              } catch (err) {
+                app.log.warn(
+                  { err, name },
+                  'scaler teardown for an already-removed stack failed; continuing'
+                );
+              }
+            }
             ops.update(op.id, {
               status: 'done',
               completedAt: Date.now(),
@@ -1653,13 +2087,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // absent or the pool is empty. Guard failures the same way the
           // parameter-store cleanup below does: a teardown error is logged but
           // must not abort the static-service deprovision that follows.
+          //
+          // Keyed by the STACK NAME: since #615 the registry's loop key is the
+          // stack the transcode resolved to (the encoreJobId prefix), and since
+          // #804 `workspaceId` here is the constant config namespace, which is
+          // not a stack. Passing the namespace made this a silent no-op, so a
+          // deprovisioned stack left its Encore instances, their callback
+          // listeners and its pool keys behind, billing until removed by hand.
           const scalerRegistry = getScalerRegistry?.();
           if (scalerRegistry) {
             try {
-              await scalerRegistry.teardown(workspaceId);
+              await scalerRegistry.teardown(name);
             } catch (err) {
               app.log.error(
-                { err, name, workspaceId },
+                { err, name },
                 'scaler teardown failed before static-service deprovision; continuing'
               );
             }
@@ -1674,7 +2115,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // (consumer-before-producer, mirroring TEARDOWN_ORDER). Safe whether
           // or not packaging ever ran: not_found when no packager exists. A
           // failure is logged but must not abort the static-service teardown
-          // that follows (same policy as the scaler teardown above).
+          // that follows (same policy as the scaler teardown above) — though,
+          // unlike before issue #1056, the outcome is now folded into the
+          // reported result below rather than only logged, so a packager that
+          // survives teardown keeps the stored config and is named.
           //
           // SKIP this reconciliation when the packager IS already recorded in
           // config.services[] (e.g. a stack persisted by an older eager path):
@@ -1685,8 +2129,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const packagerInStoredServices = config.services.some(
             (s) => s.serviceId === PACKAGER_SERVICE_ID
           );
+          // Left undefined when the packager IS in the stored services[]: the
+          // stored-config teardown below reports it, so folding it again would
+          // double-count it (see packagerTeardownAsServiceResults).
+          let packagerTeardown: PackagerTeardownResult | undefined;
           if (!packagerInStoredServices) {
-            const packagerTeardown = await teardownOnDemandPackager(
+            packagerTeardown = await teardownOnDemandPackager(
               packagerOscApiFromContext(osc),
               name
             );
@@ -1704,18 +2152,31 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // torn down too: their instance names are passed alongside services[]
           // and deprovisionStackFromConfig merges (and dedupes) them so a stack
           // that activated auto-subtitles or scene-detect is fully removed.
-          const result = await deprovisionStackFromConfig(
-            osc,
-            name,
-            config.services,
-            {
-              ...(config.autoSubtitlesInstanceName
-                ? { autoSubtitlesInstanceName: config.autoSubtitlesInstanceName }
-                : {}),
-              ...(config.sceneDetectInstanceName
-                ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
-                : {})
-            }
+          //
+          // The on-demand packager torn down above is NOT in that stored list,
+          // so its outcome is folded in here (issue #1056) and the stack status
+          // is re-aggregated over the combined list. That gives the packager the
+          // same retry semantics as any stored service: a `failed` packager
+          // makes the whole result `failed`, which keeps the parameter-store
+          // entry below and names the still-running instance in result.services.
+          const result = foldTeardownResults(
+            await deprovisionStackFromConfig(
+              osc,
+              name,
+              config.services,
+              {
+                ...(config.autoSubtitlesInstanceName
+                  ? {
+                      autoSubtitlesInstanceName:
+                        config.autoSubtitlesInstanceName
+                    }
+                  : {}),
+                ...(config.sceneDetectInstanceName
+                  ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
+                  : {})
+              }
+            ),
+            packagerTeardownAsServiceResults(packagerTeardown)
           );
 
           if (result.status === 'failed') {
@@ -1732,6 +2193,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // re-finds a stale entry still converges. A delete failure is logged
           // but does not fail the call: the OSC instances are already removed
           // and a stale config entry is a recoverable inconsistency.
+          //
+          // OBJECT-STORE CREDENTIAL LIFECYCLE (issue #1094). This delete is
+          // also the credential's teardown step: `objectStoreAccessKeyId` is
+          // the ONLY persisted part of the per-stack credential, and the secret
+          // is derived from it (services/object-store-credentials.ts), so
+          // removing the entry makes the credential unresolvable by every read
+          // path — and the object store that honoured it has just been removed
+          // above. What CANNOT be torn down from here is the OSC secret ENTRY
+          // itself: @osaas/client-core exposes `saveSecret` only — there is no
+          // delete (nor read-back) for `/mysecrets/<serviceId>` in the SDK
+          // (lib/index.d.ts, lib/core.js:355-369), so the write-once secret
+          // names outlive the stack with nothing referencing them. Logged as
+          // OSC friction in
+          // docs/osc-feedback/incoming-no-osc-secret-deletion-for-stack-teardown.md.
           try {
             await paramStore.deleteStackConfig(workspaceId, name);
           } catch (err) {

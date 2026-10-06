@@ -1,9 +1,17 @@
 /**
  * open-videocore ops dashboard — asset-rename.js
  *
- * The asset DETAIL view's "Rename" action (issue #956): an operator-facing
- * affordance for the `name` field that PATCH /api/v1/assets/{id} has always
- * accepted but that no control in this UI could ever trigger.
+ * The "Rename" action (issues #956, #927): an operator-facing affordance for the
+ * `name` field that PATCH /api/v1/assets/{id} has always accepted but that no
+ * control in this UI could ever trigger.
+ *
+ * TWO surfaces offer it, ONE implementation behind them:
+ *   - the asset DETAIL view's action row — `mountAssetRename` (issue #956);
+ *   - a per-row control in the assets LIST — the "inline-in-list" affordance from
+ *     issue #927, which calls `openRenameDialog` straight from the table's
+ *     Actions cell (wired in public/app.js, rendered by public/assets-table.js).
+ * Both go through `openRenameDialog`, so validation, the wire body, the copy and
+ * the error handling cannot drift between where an operator happens to start.
  *
  * This module is now an ADAPTER over the shared rename affordance in
  * `public/rename-dialog.js` (extracted for issue #928, when collections needed
@@ -97,6 +105,7 @@ import {
   classifyRenameFailure,
   mountRenameControl,
   normaliseName,
+  openRenameDialog as openSharedRenameDialog,
   renameRequestBody,
   renameResultMessage,
 } from './rename-dialog.js';
@@ -188,8 +197,76 @@ export function buildRenameForm(body, opts) {
   return buildRenameDialogBody(body, { currentName: o.currentName, copy: RENAME_COPY });
 }
 
+// ─── Dialog ──────────────────────────────────────────────────────────────────
+
+/**
+ * Open the rename dialog for one asset and resolve with what happened.
+ *
+ * An ASSET-BOUND adapter over the shared `openRenameDialog`
+ * (public/rename-dialog.js), which is the one implementation of the rename
+ * interaction. Both asset surfaces that offer the action use this wrapper — the
+ * detail view (via `mountAssetRename` below, issue #956) and the per-row control
+ * in the assets list (issue #927) — and collections reach the same shared dialog
+ * through public/collection-rename.js, so none of them can drift on validation,
+ * wire shape, copy or error handling. Adding a surface adds no second request
+ * path.
+ *
+ * The returned promise settles from `openModal`'s own `onClose`, so EVERY close
+ * route settles it exactly once: Save, Cancel, the header ×, Escape and a
+ * backdrop click. A caller that awaits it to decide whether to refresh (the list
+ * row does) can never be left hanging on a dismissed dialog.
+ *
+ * @param {object} opts
+ * @param {object}   opts.asset      asset (or list row) carrying `id` and `name`
+ * @param {Function} opts.apiFetch
+ * @param {Function} opts.openModal  `(title, buildBody, { onClose }) => close`
+ * @param {(asset: object|null, message: string) => any} [opts.onRenamed]
+ *        notified on a successful rename (with the FULL asset the 200 carries)
+ *        and on a 404 (with `null`), for callers that re-render from it. Callers
+ *        that only need the outcome can read the resolved value instead.
+ * @param {(message: string) => any} [opts.onForbidden]
+ *        notified when the server refuses the write with a 403, so the caller can
+ *        retire a control that is now known not to work.
+ * @returns {Promise<{renamed: boolean, asset: object|null, message: string|null,
+ *                    forbidden?: boolean, gone?: boolean}>}
+ */
+export async function openRenameDialog(opts) {
+  const o = opts || {};
+  const asset = o.asset || {};
+
+  const outcome = await openSharedRenameDialog({
+    copy: RENAME_COPY,
+    // The ULID, never the slug: PATCH /:id does not resolve slugs (see CONTRACT
+    // GROUNDING).
+    path: '/assets/' + encodeURIComponent(String(asset.id)),
+    currentName: asset.name,
+    apiFetch: o.apiFetch,
+    openModal: o.openModal,
+    onRenamed: o.onRenamed,
+    onForbidden: o.onForbidden,
+  });
+
+  // The shared dialog is resource-neutral and reports `resource`; this module's
+  // callers (public/app.js) read `asset`. Keep that name stable for them rather
+  // than making every caller learn the generic one.
+  return {
+    renamed: outcome.renamed,
+    asset: outcome.resource,
+    message: outcome.message,
+    forbidden: outcome.forbidden,
+    gone: outcome.gone,
+  };
+}
+
+// ─── Mount ───────────────────────────────────────────────────────────────────
+
 /**
  * Add the "Rename" control to the asset detail action row and wire its dialog.
+ *
+ * The button, the 403 retirement rule and the dialog all come from
+ * `mountRenameControl` (public/rename-dialog.js), which opens the same shared
+ * dialog `openRenameDialog` above wraps — so the detail view and the list row
+ * stay one interaction.
  *
  * @param {object} opts
  * @param {object}      opts.asset       asset from GET /api/v1/assets/{id}

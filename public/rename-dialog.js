@@ -270,6 +270,141 @@ export function buildRenameDialogBody(body, opts) {
   return { input, errorEl, submitBtn, cancelBtn };
 }
 
+// ─── Dialog ──────────────────────────────────────────────────────────────────
+
+/**
+ * Open the rename dialog for one resource and resolve with what happened.
+ *
+ * This is the ONE implementation of the rename INTERACTION, as
+ * `buildRenameDialogBody` is the one implementation of its markup. Every surface
+ * that offers a rename goes through here — the asset detail action row and the
+ * assets list's per-row control (issue #927, via `openRenameDialog` in
+ * public/asset-rename.js) and the collection detail action row (issue #928, via
+ * public/collection-rename.js) — so none of them can drift on validation, wire
+ * shape, copy or error handling. A new surface adds no second request path.
+ *
+ * The returned promise settles from `openModal`'s own `onClose`, so EVERY close
+ * route settles it exactly once: Save, Cancel, the header ×, Escape and a
+ * backdrop click. A caller that awaits it to decide whether to refresh (the list
+ * row does) can never be left hanging on a dismissed dialog.
+ *
+ * @param {object} opts
+ * @param {RenameCopy} opts.copy       resource-specific sentences
+ * @param {string}   opts.path         apiFetch path of the PATCH, e.g. '/collections/01J8…'
+ * @param {string}   [opts.currentName]  current `name` (prefill + no-op check)
+ * @param {Function} opts.apiFetch
+ * @param {Function} opts.openModal    `(title, buildBody, { onClose }) => close`
+ * @param {(resource: object|null, message: string) => any} [opts.onRenamed]
+ *        notified on a successful rename (with the FULL resource the 200 carries)
+ *        and on a 404 (with `null`), for callers that re-render from it. Callers
+ *        that only need the outcome can read the resolved value instead.
+ * @param {(message: string) => any} [opts.onForbidden]
+ *        notified when the server refuses the write with a 403, so the caller can
+ *        retire a control that is now known not to work. Which control that is
+ *        belongs to the caller, so it is told rather than guessed.
+ * @returns {Promise<{renamed: boolean, resource: object|null, message: string|null,
+ *                    forbidden?: boolean, gone?: boolean}>}
+ */
+export function openRenameDialog(opts) {
+  const o = opts || {};
+  const copy = o.copy;
+
+  return new Promise(function (resolve) {
+    // Recorded before the dialog is closed and resolved from onClose, so the
+    // outcome of a dismissal and the outcome of a save travel the same route.
+    let outcome = { renamed: false, resource: null, message: null };
+    let settled = false;
+    function settle() {
+      if (settled) return;
+      settled = true;
+      resolve(outcome);
+    }
+
+    // Held so the field can be focused AFTER openModal attaches the backdrop —
+    // the body builder runs while the dialog is still detached, and focus() on a
+    // detached element is a no-op (the lock dialog's rule).
+    let firstField = null;
+
+    o.openModal(
+      copy.dialogTitle,
+      function (body, closeDialog) {
+        const form = buildRenameDialogBody(body, { currentName: o.currentName, copy: copy });
+        firstField = form.input;
+
+        function showError(message) {
+          form.errorEl.textContent = message;
+          form.errorEl.style.display = '';
+          form.input.focus();
+        }
+
+        form.cancelBtn.addEventListener('click', function () {
+          closeDialog();
+        });
+
+        form.submitBtn.addEventListener('click', async function () {
+          form.errorEl.style.display = 'none';
+          form.errorEl.textContent = '';
+
+          // Client-side gate first, against the SERVER's bounds. A refusal here
+          // sends no request at all.
+          const check = normaliseName(form.input.value, o.currentName, copy);
+          if (!check.ok) {
+            showError(check.message);
+            return;
+          }
+
+          const prev = form.submitBtn.textContent;
+          form.submitBtn.disabled = true;
+          form.cancelBtn.disabled = true;
+          form.submitBtn.textContent = copy.busyLabel;
+          try {
+            const updated = await o.apiFetch(o.path, {
+              method: 'PATCH',
+              // Exactly `{ name }` — see renameRequestBody.
+              body: JSON.stringify(renameRequestBody(check.value)),
+            });
+            // Report the name the SERVER returned, not the one that was typed.
+            const stored =
+              updated && typeof updated.name === 'string' ? updated.name : check.value;
+            outcome = {
+              renamed: true,
+              resource: updated,
+              message: renameResultMessage(stored),
+            };
+            closeDialog();
+            if (typeof o.onRenamed === 'function') await o.onRenamed(updated, outcome.message);
+            return;
+          } catch (err) {
+            const c = classifyRenameFailure(err, copy);
+            if (c.dismiss) {
+              outcome = { renamed: false, resource: null, message: c.message, gone: true };
+              closeDialog();
+              if (typeof o.onRenamed === 'function') await o.onRenamed(null, c.message);
+              return;
+            }
+            if (c.kind === 'forbidden') {
+              outcome = { renamed: false, resource: null, message: c.message, forbidden: true };
+              if (typeof o.onForbidden === 'function') o.onForbidden(c.message);
+            }
+            showError(c.message);
+          } finally {
+            // Never leave the dialog stuck in its pending state.
+            form.submitBtn.disabled = false;
+            form.cancelBtn.disabled = false;
+            form.submitBtn.textContent = prev;
+          }
+        });
+      },
+      { onClose: settle }
+    );
+
+    if (firstField) {
+      firstField.focus();
+      firstField.select();
+    }
+  });
+}
+
 // ─── Mount ───────────────────────────────────────────────────────────────────
 
 /**
@@ -328,78 +463,25 @@ export function mountRenameControl(opts) {
     if (host) o.showMsg(host, text, kind || 'error');
   }
 
+  // The dialog itself lives in openRenameDialog, shared with every other surface
+  // that offers a rename. All this mount adds is its own button and what a 403
+  // should do to it.
   function open() {
-    // Held so the field can be focused AFTER openModal attaches the backdrop —
-    // the body builder runs while the dialog is still detached, and focus() on a
-    // detached element is a no-op (the lock dialog's rule).
-    let firstField = null;
-    o.openModal(copy.dialogTitle, function (body, closeDialog) {
-      const form = buildRenameDialogBody(body, { currentName: o.currentName, copy: copy });
-      firstField = form.input;
-
-      function showError(message) {
-        form.errorEl.textContent = message;
-        form.errorEl.style.display = '';
-        form.input.focus();
-      }
-
-      form.cancelBtn.addEventListener('click', function () {
-        closeDialog();
-      });
-
-      form.submitBtn.addEventListener('click', async function () {
-        form.errorEl.style.display = 'none';
-        form.errorEl.textContent = '';
-
-        // Client-side gate first, against the SERVER's bounds. A refusal here
-        // sends no request at all.
-        const check = normaliseName(form.input.value, o.currentName, copy);
-        if (!check.ok) {
-          showError(check.message);
-          return;
-        }
-
-        const prev = form.submitBtn.textContent;
-        form.submitBtn.disabled = true;
-        form.cancelBtn.disabled = true;
-        form.submitBtn.textContent = copy.busyLabel;
-        try {
-          const updated = await o.apiFetch(o.path, {
-            method: 'PATCH',
-            // Exactly `{ name }` — see renameRequestBody.
-            body: JSON.stringify(renameRequestBody(check.value)),
-          });
-          closeDialog();
-          // Report the name the SERVER returned, not the one that was typed.
-          const stored = updated && typeof updated.name === 'string' ? updated.name : check.value;
-          await o.onRenamed(updated, renameResultMessage(stored));
-          return;
-        } catch (err) {
-          const c = classifyRenameFailure(err, copy);
-          if (c.dismiss) {
-            closeDialog();
-            await o.onRenamed(null, c.message);
-            return;
-          }
-          if (c.kind === 'forbidden' && btn.parentNode) {
-            // A control known to fail stops being offered for the rest of this
-            // view of the resource (the lock module's 403 rule).
-            btn.parentNode.removeChild(btn);
-            reportToActionArea(c.message, 'error');
-          }
-          showError(c.message);
-        } finally {
-          // Never leave the dialog stuck in its pending state.
-          form.submitBtn.disabled = false;
-          form.cancelBtn.disabled = false;
-          form.submitBtn.textContent = prev;
-        }
-      });
+    return openRenameDialog({
+      copy: copy,
+      path: o.path,
+      currentName: o.currentName,
+      apiFetch: o.apiFetch,
+      openModal: o.openModal,
+      onRenamed: o.onRenamed,
+      onForbidden: function (message) {
+        // A control known to fail stops being offered for the rest of this view
+        // of the resource (the lock module's 403 rule).
+        if (!btn.parentNode) return;
+        btn.parentNode.removeChild(btn);
+        reportToActionArea(message, 'error');
+      },
     });
-    if (firstField) {
-      firstField.focus();
-      firstField.select();
-    }
   }
 
   btn.addEventListener('click', open);

@@ -20,6 +20,11 @@
 
 import type { AssetRepository, AudioTrack, TechnicalMetadata } from '../data/asset-repo.js';
 import type { WorkspaceStorage } from '../data/storage.js';
+import {
+  PERSISTED_STACK_FALLBACK_MESSAGE,
+  runWithPersistedStack,
+  type StackContextLogger
+} from '../services/request-stack-context.js';
 
 // TTL for the presigned GET URL handed to the ffprobe runner. Short by design:
 // the probe job reads the object once, immediately. Configurable via env.
@@ -137,6 +142,13 @@ export type ExtractParams = {
   // minting a presigned GET URL against WorkspaceStorage. The credentials are
   // `{{secrets.<name>}}` references — never literals.
   externalSource?: ExternalProbeSource;
+  // The stack the asset (or the job that produced it) was created against —
+  // `Asset.stackName` / `Job.stackName` (issue #1097). Extraction is
+  // fire-and-forget and can run long after the request that triggered it has
+  // ended, so the extractor re-enters this stack itself rather than relying on
+  // the ambient AsyncLocalStorage context still being there. Undefined on
+  // documents written before #1097, which keeps today's behaviour.
+  stackName?: string;
 };
 
 export type ExtractDeps = {
@@ -147,6 +159,9 @@ export type ExtractDeps = {
   ttlSeconds?: number;
   // Test observability hook fired on a recorded failure.
   onError?: (err: unknown) => void;
+  // Debug sink for the issue #1097 legacy-document fallback notice. Optional:
+  // absent => the fallback is silent and behaviour is unchanged.
+  stackLog?: StackContextLogger;
 };
 
 // Run one extraction to completion. NEVER throws: on any failure it records
@@ -155,7 +170,28 @@ export type ExtractDeps = {
 //
 // On success: writes `technicalMetadata` (which clears any prior error).
 // On failure: writes `technicalMetadata: null` + `technicalMetadataError`.
+//
+// The whole run executes inside the asset's PERSISTED stack context (issue
+// #1097, `params.stackName`), so the `deps.assets` read-back and write resolve
+// the stack the asset actually lives on even when the ambient request context is
+// gone (extraction kicked off after a detached pull, or re-driven after a
+// process restart).
 export async function extractTechnicalMetadata(
+  params: ExtractParams,
+  deps: ExtractDeps
+): Promise<void> {
+  return runWithPersistedStack(
+    params.stackName,
+    () => extractTechnicalMetadataInStack(params, deps),
+    () =>
+      deps.stackLog?.debug(
+        { assetId: params.assetId },
+        `metadata extraction: ${PERSISTED_STACK_FALLBACK_MESSAGE}`
+      )
+  );
+}
+
+async function extractTechnicalMetadataInStack(
   params: ExtractParams,
   deps: ExtractDeps
 ): Promise<void> {

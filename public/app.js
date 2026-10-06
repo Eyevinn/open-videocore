@@ -59,12 +59,23 @@ import { classifyDeleteBlock, protectedBlock, showDeleteBlocked } from './delete
 // full contract grounding is in that module's header.
 import { mountReviewState } from './review-state.js';
 
-// Asset rename affordance (issue #956): a control for the `name` field that
-// PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
+// Asset rename affordance (issues #956, #927): a control for the `name` field
+// that PATCH /api/v1/assets/{id} has always accepted but that nothing in this UI
 // could trigger. UI only — no route or schema changes. Full contract grounding,
 // including why a rename cannot move the asset's id, slug or stored object keys,
 // is in that module's header.
-import { mountAssetRename } from './asset-rename.js';
+//   mountAssetRename  — the detail view's action-row control (#956).
+//   openRenameDialog  — the dialog behind it, called directly by the assets
+//                       table's per-row Rename control (#927) so both surfaces
+//                       share one interaction and one request shape.
+import { mountAssetRename, openRenameDialog } from './asset-rename.js';
+
+// Clip / trim affordance (issue #793): a control for POST
+// /api/v1/assets/{id}/clip, which the API has served since issue #17 but which
+// nothing in this UI could reach. UI only — no route or schema changes. Full
+// contract grounding, including where the duration bound comes from and why a
+// 502 is reported as an outright failure, is in that module's header.
+import { mountAssetClip } from './asset-clip.js';
 
 // Collection rename affordance (issue #928): the same control, for the `name`
 // field that PATCH /api/v1/collections/{id} accepts since issue #926 but that
@@ -84,6 +95,41 @@ import { mountCollectionRename } from './collection-rename.js';
 // own. Full contract grounding, including what the API does NOT expose, is in
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
+import { AUDIO_EDIT_COPY } from './audio-track-edit.js';
+
+// Comments panel (issue #900): the free-text notes on an asset, plus one control
+// to add another. ADD + READ ONLY — the API exposes exactly `post` and `get` on
+// /api/v1/assets/{id}/comments and no `…/comments/{commentId}` path at all, so
+// an edit or delete control would have nothing to call. Full contract grounding,
+// including the author field the API does not have, is in that module's header.
+import { mountAssetComments } from './comments-panel.js';
+
+// Version-chain navigation on asset detail (issue #907, broken out of #795):
+// the whole lineage an asset belongs to, as the tree the API can describe, with
+// the SERVER-COMPUTED current version badged, the asset being viewed marked
+// separately, every other member navigable, and an explicit state for an asset
+// with no other versions. One call — GET /assets/{id}/versions — which the
+// detail view's own GET /assets/{id} body cannot answer: that body carries the
+// asset's own `versionGroupId` but not the other members of the group. Full
+// contract grounding, and what the API does NOT expose (no promote/set-current
+// operation of any kind), is in that module's header; the interaction design it
+// implements is docs/design/asset-version-chain.md.
+import { mountVersionChain } from './version-chain.js';
+
+// External identifiers panel (issue #908, broken out of #796): the
+// `{ namespace, id }` correlations to upstream systems of record, which until now
+// were reachable only by whatever integration wrote them. The sub-resource is the
+// ONLY surface that exposes them — `assetSchema` declares no
+// `externalIdentifiers` property, so the GET /assets/{id} body this renderer
+// already holds cannot supply them.
+//
+// The panel offers exactly the affordances the verified contract can perform:
+// `GET` + `POST` on /assets/{id}/external-ids and `DELETE` on
+// /{namespace}/{externalId}. There is NO PUT and NO PATCH, so "edit" is POST +
+// DELETE, two requests, and the form says so. Full contract grounding — including
+// why POST appends rather than replaces, and why a 409 can only be handled
+// reactively — is in that module's header.
+import { mountAssetExternalIds } from './external-ids.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -203,6 +249,64 @@ function canRenameAsset() {
 // resources, there is already a seam to change. Client-side mirror only: the 403
 // is still handled if it arrives.
 function canRenameCollection() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add/edit/remove an asset's external
+// identifiers (issue #908). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` AND `delete` to `editor` and `admin`
+// only, and `methodToAction` (:79-93) maps POST -> write and DELETE -> delete, so
+// BOTH mutating operations on this sub-resource — POST /assets/{id}/external-ids
+// and DELETE /assets/{id}/external-ids/{namespace}/{externalId} — are refused to a
+// `viewer` with 403 by `resourceAuthorizationPreHandler('asset')`
+// (src/auth/authorize.ts:126, registered src/routes/assets.ts:1748). One predicate
+// covers both because the matrix grants the two actions to exactly the same roles.
+// GET on the same sub-resource is `read`, which a viewer DOES hold — hence a
+// viewer still sees every namespace and value, read-only. Client-side mirror
+// only: the 403 is still handled if it arrives.
+function canChangeExternalIds() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add or remove an asset's editorial audio
+// tracks (issue #903). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only and
+// `delete` to the same two, and `methodToAction` (:79-93) maps POST -> write and
+// DELETE -> delete. Both track routes sit under
+// `resourceAuthorizationPreHandler('asset')`, registered plugin-scoped on EVERY
+// asset route (src/routes/assets.ts:1748), so POST /assets/{id}/audio-tracks and
+// DELETE /assets/{id}/audio-tracks/{trackId} are both refused to a `viewer` with
+// 403 `forbidden_insufficient_role` (:99). A viewer still holds `read`, so the
+// tracks panel itself stays fully visible — only the write controls go.
+// Client-side mirror only: the 403 is still handled if it arrives.
+function canEditAudioTracks() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add a comment to an asset (issue #900).
+// Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only, and
+// `methodToAction` (:79-93) maps POST -> write, so POST /assets/{id}/comments is
+// refused to a `viewer` with 403 by `resourceAuthorizationPreHandler('asset')`
+// (:126, registered src/routes/assets.ts:1748). GET on the same sub-resource is
+// `read`, which a viewer DOES hold — so a viewer still sees every comment,
+// read-only. Client-side mirror only: the 403 is still handled if it arrives.
+function canAddComment() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may clip an asset (issue #793). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-93) maps
+// POST -> write, so POST /assets/{id}/clip is refused to a `viewer` with 403 by
+// `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
+// if it arrives.
+function canClipAsset() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -1938,11 +2042,20 @@ function loadingEl() {
 // detached window renders ONLY that one detail view, self-polls, and shares no
 // state with this window. The active stack is passed explicitly so the detached
 // window targets the same stack without depending on the opener's localStorage.
-function openDetailWindow(type, id) {
-  const params = 'type=' + encodeURIComponent(type) +
+// The URL of that standalone view. Broken out (issue #793) so a link to another
+// resource's detail — e.g. the child asset a clip produced — can be a REAL
+// anchor href (openable in a new tab, copyable) rather than a click handler
+// that only works in the window it was built in. `getActiveStack()` already
+// resolves the window-scoped override first, so a link built inside a detached
+// window targets that window's stack.
+function detailWindowUrl(type, id) {
+  return 'detail.html?type=' + encodeURIComponent(type) +
     '&id=' + encodeURIComponent(id) +
     '&stack=' + encodeURIComponent(getActiveStack());
-  window.open('detail.html?' + params, '_blank', 'width=680,height=800,noopener');
+}
+
+function openDetailWindow(type, id) {
+  window.open(detailWindowUrl(type, id), '_blank', 'width=680,height=800,noopener');
 }
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
@@ -2092,14 +2205,65 @@ async function renderAssetsTab(container) {
   // "Needs attention" checkbox: operators isolate `processing` via the status
   // filter; the per-row "Needs attention" badge + inline Re-drive action are
   // preserved by the table's Status/Actions column renderers.
+  // ── Bulk-action bar (issue #916) ──
+  // Mounted above the table and declared before it so the table's
+  // `onSelectionChange` can hand it every change. It starts with an empty
+  // selection, which is the state its controls render as disabled.
+  let bulkBar = null;
+
   assetsTable = createAssetsTable({
     apiFetch,
     renderBadge,
     renderTags,
     fmtDate,
     isAssetWedged,
+    // Opt in to the leading tick-box column (issue #916). Without this the
+    // table renders exactly as before, which is what every other consumer of
+    // createAssetsTable still gets.
+    selectable: true,
+    onSelectionChange: function (selection) {
+      if (bulkBar) bulkBar.setSelection(selection);
+    },
     onRowClick: function (id) {
       showAssetDetail(id, detailPanel);
+    },
+    // ── Rename from the row (issue #927) ──
+    //
+    // The detail view got this action first (#956); this is the same action
+    // reached one click earlier. It is deliberately the SAME dialog
+    // (openRenameDialog) and therefore the same single PATCH /api/v1/assets/{id}
+    // body — `{ name }` and nothing else — rather than a second rename path that
+    // could drift from it. The contract is cited in full in
+    // public/asset-rename.js; nothing about the API changes for this control.
+    //
+    // Passed as the function, not its result: the table calls it while rendering
+    // each page, so changing role in the UI takes effect on the next repaint.
+    canRename: canRenameAsset,
+    onRename: async function (id, name) {
+      const outcome = await openRenameDialog({
+        // `name` is the row's current title, so the field is prefilled without a
+        // second GET. The row carries the ULID in `data-id`, which is what
+        // PATCH /:id requires — that route has no slug fallback.
+        asset: { id: id, name: name },
+        apiFetch: apiFetch,
+        openModal: openModal,
+      });
+      if (outcome.renamed) {
+        // Reload (the table's default) so the new title appears in the Name /
+        // Title column. If the detail pane happens to be showing this asset, it
+        // is re-read too: it renders the same `name` and would otherwise keep
+        // displaying the old one.
+        if (detailPanel.style.display !== 'none' && detailPanel.dataset.assetId === id) {
+          showAssetDetail(id, detailPanel);
+        }
+        return true;
+      }
+      // Not renamed — cancelled, or refused. Every refusal (403, 404, a rejected
+      // name, a transport failure) has already been stated IN the dialog, where
+      // the operator still has what they typed, so nothing is reported a second
+      // time out here. A 404 is the one case that still earns a reload: the row on
+      // screen is stale, and the reload is what removes it.
+      return outcome.gone === true;
     },
     onDelete: async function (id, name, rowState) {
       const label = nameOrFallback(name, 'this asset');
@@ -2241,6 +2405,23 @@ async function renderAssetsTab(container) {
       }
     },
   });
+
+  // Bulk bar between the header and the table: the controls sit next to the
+  // rows they act on, and the DOM order matches the reading order (tick rows ->
+  // choose a target -> add), not the other way round.
+  bulkBar = renderAssetsBulkBar({
+    apiFetch,
+    getSelection: function () { return assetsTable.getSelection(); },
+    // Per-id untick, so a partial run narrows the table's authoritative
+    // selection instead of leaving already-added assets ticked (issue #916).
+    deselect: function (ids) { assetsTable.deselect(ids); },
+    clearSelection: function () { assetsTable.clearSelection(); },
+    onAdded: function () {
+      // Membership lives on the collection, not on the asset row, so the asset
+      // list itself has nothing new to show — deliberately no reload() here.
+    },
+  });
+  main.appendChild(bulkBar.el);
   main.appendChild(assetsTable.el);
 
   // ── Upload modal ──
@@ -2381,6 +2562,10 @@ async function renderAssetsTab(container) {
 
 async function showAssetDetail(id, detailPanel) {
   detailPanel.style.display = 'flex';
+  // Which asset this pane is currently showing, so a list-row action that changes
+  // the asset (the row Rename, issue #927) can tell whether the open pane is now
+  // displaying a stale value and needs re-reading.
+  detailPanel.dataset.assetId = id;
   // Static structural HTML only. A "pop out" affordance sits next to the close
   // button so the user can detach this asset detail into its own window.
   detailPanel.innerHTML = [
@@ -2406,7 +2591,13 @@ async function showAssetDetail(id, detailPanel) {
   });
 
   const body = detailPanel.querySelector('#detail-body');
-  await renderAssetDetailBody(id, body);
+  // Navigating the version chain (issue #907) rebuilds the whole pane, not just
+  // the body: the pop-out button above closes over `id`, so re-rendering the
+  // body alone would leave "open in new window" pointing at the version the
+  // operator just navigated away from.
+  await renderAssetDetailBody(id, body, {
+    onNavigate: function (nextId) { return showAssetDetail(nextId, detailPanel); },
+  });
 }
 
 // Fetch and render an asset's downloadable files + streaming file groups into
@@ -2552,7 +2743,18 @@ async function renderAssetFiles(assetId, container) {
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
 // the fetched asset (or throws if the fetch fails / 404s so callers can react).
-async function renderAssetDetailBody(id, bodyEl) {
+//
+// `opts.onNavigate(nextId)` (optional, issue #907) is how the version-chain
+// block hands the view to another member of the same chain. The default —
+// re-render this same body element for the new id — is correct for the embedded
+// side panel; callers whose surface owns more chrome than the body (the asset
+// pane's pop-out button, the detached window's self-poll) override it so their
+// chrome follows the navigation instead of going stale.
+async function renderAssetDetailBody(id, bodyEl, opts) {
+  const options = opts || {};
+  const navigateToVersion = typeof options.onNavigate === 'function'
+    ? options.onNavigate
+    : function (nextId) { return renderAssetDetailBody(nextId, bodyEl, options); };
   const body = bodyEl;
   body.innerHTML = '';
   const loader = loadingEl();
@@ -2786,18 +2988,94 @@ async function renderAssetDetailBody(id, bodyEl) {
     //        `technical.video = [{ codec, width, height, bitrateBps }]`
     //        (src/data/asset-document.ts:402-404).
     //
-    // GET /api/v1/assets/{id}/tracks exists but is NOT called: its handler sends
-    // `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []` off the same
-    // document (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would
-    // cost a round-trip for bytes this renderer is holding.
+    // GET /api/v1/assets/{id}/tracks exists but is NOT called on the render
+    // path: its handler sends `asset.audioTracks ?? []` /
+    // `asset.subtitleTracks ?? []` off the same document
+    // (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would cost a
+    // round-trip for bytes this renderer is holding. The audio editor DOES call
+    // it, but only after a 204 from a remove, which carries no body — see
+    // public/audio-track-edit.js.
     //
-    // Mounted here, with the other read-only information blocks (status history,
-    // metadata, scenes) and ABOVE the action controls, because it is reporting
-    // only: #902 is explicitly read-only, so the panel creates no add/remove
-    // affordance for the POST/DELETE track routes that do exist.
+    // Mounted here, with the other information blocks (status history, metadata,
+    // scenes) and ABOVE the action controls, because it is predominantly
+    // reporting: the only writes it offers are the two scoped to its own audio
+    // section.
+    //
+    // ── Audio track add/remove (issue #903, broken out of #794) ──
+    // Contract fetched before these calls were written and cited in full in
+    // public/audio-track-edit.js:
+    //   POST /api/v1/assets/{id}/audio-tracks — body
+    //        { language (required, 1-64), codec? (1-64), channels? (int 1-64),
+    //        label? (1-128), default? } `additionalProperties: false`
+    //        (addAudioTrackSchema, src/routes/assets.ts:821-827, wired :5325-5355);
+    //        201 returns the asset's FULL updated `{ audioTracks }` (:5333,
+    //        :5351-5353), so a successful add needs no follow-up read. 404 is the
+    //        only other declared response.
+    //   DELETE /api/v1/assets/{id}/audio-tracks/{trackId} — no body; 204 (empty,
+    //        no content-type on the wire) or 404 (src/routes/assets.ts:5360-5382).
+    //        The handler filters the list and patches ONE key (:5375, :5379), so
+    //        it deletes no media and touches nothing else.
+    // `asset.id` is the ULID even when this pane was opened by slug, which is
+    // what both routes need: each hands its raw path param to `repo.get` with no
+    // slug fallback (:5339, :5370).
     mountAssetTracks({
       asset: asset,
       host: body,
+      audioEdit: canEditAudioTracks()
+        ? {
+            assetId: asset.id,
+            apiFetch: apiFetch,
+            confirmModal: confirmModal,
+          }
+        : null,
+      // A viewer keeps the whole panel (they hold `read`) and is told once why
+      // the controls are not there, rather than being left to wonder.
+      audioEditDenied: canEditAudioTracks() ? null : AUDIO_EDIT_COPY.roleNote,
+    });
+
+    // ── Versions: the asset's whole version chain (issue #907) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/version-chain.js:
+    //   GET /api/v1/assets/{id}/versions — the ONLY operation on that path
+    //        (openapi.json .paths["/api/v1/assets/{id}/versions"]; handler
+    //        src/routes/assets.ts:3446-3484). 200 =
+    //        { assetId, versionGroupId?, currentVersionId, versions[] },
+    //        required ["assetId","currentVersionId","versions"] (:3452-3457);
+    //        items are the full assetSchema, of which this block reads `id`,
+    //        `name`, `status`, `createdAt` and the lineage edge
+    //        `versionOfAssetId` (:882). 404 = flat { error, message? } (:529).
+    //        No query parameters: the chain is not paginated, only capped at
+    //        MAX_LIMIT = 200 (src/data/asset-repo.ts:853).
+    //
+    // Three things this block does NOT do, because the contract does not
+    // support them:
+    //   - It never re-derives the current version. `currentVersionId` is
+    //     computed server-side by a preference ladder over `status`
+    //     (src/data/asset-repo.ts:1275-1294) and is explicitly NOT "the last
+    //     array element" (:1239-1243), so the field is read as sent.
+    //   - It offers no promote / set-current control: no endpoint accepts one,
+    //     and there is no stored marker it could write (ADR-024 D3). Current is
+    //     shown as observed state, never as an operator choice.
+    //   - It never reparents a member whose `versionOfAssetId` is outside the
+    //     returned page; those are grouped as orphans rather than attached to
+    //     the root, which would assert an edge the API did not report.
+    //
+    // The path takes the ULID (`asset.id`): unlike GET /assets/{id}, this route
+    // passes the raw param to repo.listVersions (:3463), which looks up by id
+    // alone — a slug would 404. The detail pane holds the ULID even when it was
+    // opened by slug.
+    //
+    // Mounted with the other read-only information blocks and ABOVE the action
+    // controls, next to Tracks: it reports lineage and originates no mutation.
+    await mountVersionChain({
+      assetId: asset.id,
+      host: body,
+      apiFetch: apiFetch,
+      // Inject the app's own status->class map so one `status` value never
+      // renders two different ways on a single page.
+      badgeClass: badgeClass,
+      onNavigate: navigateToVersion,
     });
 
     // Pipeline executions (PipelineExecution feature). Rendered as a small table
@@ -3113,6 +3391,103 @@ async function renderAssetDetailBody(id, bodyEl) {
       showMsg: showMsg,
     });
 
+    // ── External identifiers: upstream { namespace, id } correlations (issue #908) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/external-ids.js. `openapi.json .paths` carries
+    // EXACTLY three operations for this sub-resource — checked key by key:
+    //   GET  /api/v1/assets/{id}/external-ids — 200 is a bare ARRAY of
+    //        { namespace, id } (both `required`, additionalProperties: false),
+    //        "in persisted order … no dedup, sort, or reformatting"; 404 { error }
+    //        only when the ASSET is unknown (an asset with none is 200 []).
+    //        (…].get; src/routes/assets.ts:3315-3362)
+    //   POST /api/v1/assets/{id}/external-ids — body REQUIRED
+    //        { namespace (1..256), id (1..1024) }; 200 = the full asset,
+    //        400 { error }, 404 { error }, 409 { error, reason:
+    //        'external_id_conflict', namespace, externalId, conflictingAssetId }.
+    //        (…].post; src/routes/assets.ts:3173-3209, schema :501-518, 409
+    //        envelope :524-531 sent at :2696-2704)
+    //   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId} — no
+    //        body; 204 idempotently whether or not the pair was attached,
+    //        400/404 { error }. (…].delete; src/routes/assets.ts:3247-3294)
+    //
+    // THERE IS NO PUT AND NO PATCH on either path, and POST cannot substitute for
+    // one: it APPENDS to the set (src/data/asset-repo.ts:1546-1551) rather than
+    // replacing within a namespace. So the panel's "edit" is POST-then-DELETE —
+    // two requests, not atomic, add first so a failure between them leaves both
+    // pairs rather than neither — and the edit form says so on screen. The remove
+    // affordance exists only because DELETE does; nothing here is offered for a
+    // method the spec does not declare.
+    //
+    // The panel must issue its own GET: `assetSchema` declares no
+    // `externalIdentifiers` property (openapi.json .paths["/api/v1/assets/{id}"]
+    // .get 200 schema, additionalProperties: false), which is precisely why the
+    // sub-resource exists (src/routes/assets.ts:3293-3299). For the same reason the
+    // POST's 200 asset body is NOT a read-back — the serializer strips the field —
+    // so every write re-reads the sub-resource.
+    //
+    // Mounted between the review block and the action controls, and the
+    // sub-resource path takes the ULID (`asset.id`) — GET/POST resolve with a
+    // plain `repo.get` and no slug fallback (:3353, :3195).
+    await mountAssetExternalIds({
+      assetId: asset.id,
+      anchorEl: actionsDiv,
+      host: body,
+      canChange: canChangeExternalIds(),
+      apiFetch: apiFetch,
+      confirmModal: confirmModal,
+      showMsg: showMsg,
+    });
+
+    // ── Comments: add + read (issue #900) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/comments-panel.js. Note the real path: the issue
+    // says `/comments`, but the comments collection is a SUB-RESOURCE of one
+    // asset and no top-level `/comments` path exists.
+    //   GET  /api/v1/assets/{id}/comments — 200 is a bare ARRAY of
+    //        { id, assetId, body, createdAt } (all four `required`,
+    //        additionalProperties false), 404 { error }. No query parameters at
+    //        all, so the list is unpaged and the server's order — oldest first
+    //        (listByAsset, src/data/comment-repo.ts:50-58) — is rendered as
+    //        given. (openapi.json .paths["/api/v1/assets/{id}/comments"].get;
+    //        src/routes/assets.ts:4798-4814)
+    //   POST /api/v1/assets/{id}/comments — body REQUIRED and carries EXACTLY
+    //        `body` (string, 1..4096 after trim); 201 = the created comment,
+    //        404 { error }, plus an undeclared-but-real 400 from the body
+    //        schema. (…].post; src/routes/assets.ts:4776-4793,
+    //        commentBodySchema :1174-1176)
+    //
+    // Mounted directly below "Editorial review" and above the action row, with
+    // the other editorial blocks: a comment is editorial commentary on the
+    // asset, not a lifecycle operation.
+    //
+    // ADD + READ ONLY, and not as a scope decision to revisit: the path carries
+    // only `post` and `get`, there is no `…/comments/{commentId}` path, and
+    // `CommentRepository` declares only `create` + `listByAsset`
+    // (src/data/comment-repo.ts:29-33). The panel also attributes no comment to
+    // anyone, because `Comment` has no author field (:17-22) and the API has no
+    // per-user identity to fill one with (src/auth/principal.ts:11-16).
+    //
+    // A successful add re-reads the sub-resource and rebuilds the block in
+    // place — one request, no full detail re-render — because `id` and
+    // `createdAt` are server-minted, so the returned list is the only truthful
+    // one. The panel keeps its own in-memory draft per asset id so the detached
+    // window's 5s self-poll cannot wipe a half-typed comment.
+    //
+    // Sub-resource paths take the ULID (`asset.id`): both handlers resolve the
+    // parent with a plain `repo.get(request.params.id)` and no slug fallback
+    // (src/routes/assets.ts:4786, :4807).
+    await mountAssetComments({
+      assetId: asset.id,
+      anchorEl: actionsDiv,
+      host: body,
+      canAdd: canAddComment(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+      fmtDate: fmtDate,
+    });
+
     // ── Delete protection: lock / unlock (issue #895) ──
     //
     // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
@@ -3208,6 +3583,76 @@ async function renderAssetDetailBody(id, bodyEl) {
         // full asset, and re-rendering from the server is the only way a
         // silently different stored value becomes visible.
         await rerenderThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
+    // ── Clip: cut an in/out window into a child asset (issue #793) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/asset-clip.js:
+    //   POST /api/v1/assets/{id}/clip — body REQUIRED, `startSeconds` +
+    //        `endSeconds` (both numbers, `endSeconds > startSeconds` enforced by
+    //        the schema's own refinement) and optional `outputName` (1..256);
+    //        `additionalProperties: false`. 201 = the FULL child asset
+    //        (`parentId` = this asset); 400 / 404 / 409 `no_object` / 501
+    //        `not_configured` / 502 `clip_failed` are all { error, message? }.
+    //        (openapi.json .paths["/api/v1/assets/{id}/clip"].post — the spec
+    //        declares no operationId; clipBodySchema src/routes/assets.ts:734-746,
+    //        handler app.post('/:id/clip') :5389-5464.)
+    //
+    // The in/out bound comes from the asset's OWN probed duration —
+    // `technicalMetadata.durationSeconds` (technicalMetadataSchema,
+    // src/routes/assets.ts:761-770), the same field the "Duration" row above
+    // renders. The API does NOT bound the window itself, so this is a
+    // client-side guard against asking for a window that cannot exist; when the
+    // asset has no extracted metadata the dialog says the check could not be
+    // made rather than inventing a limit.
+    //
+    // A 502 is reported as an outright failure. The pipeline only advances the
+    // child to `ready` after VERIFYING the written object exists and is
+    // non-empty, and marks it `failed` otherwise (src/pipeline/clip.ts:166-209,
+    // the issue #786 honesty fix) — so a failed clip must never be reported as
+    // a usable one, and even on a 201 the child's own `status` is read back
+    // rather than assumed.
+    //
+    // The path takes the ULID (`asset.id`), which this pane holds even when it
+    // was opened by slug: the handler passes the raw param to `repo.get` with no
+    // slug fallback.
+    mountAssetClip({
+      asset: asset,
+      actionsRow: actionsDiv,
+      // Sits with the other produce-something actions:
+      // [Restore?] [Lock | Unlock] [Rename] [Clip] [Extract Metadata] [Thumbnails].
+      beforeEl: actionsDiv.querySelector('#btn-extract-meta'),
+      canChange: canClipAsset(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      messageHost: function () { return bodyEl.querySelector('#action-msg') || bodyEl; },
+      // Where "Open clip" goes. In the main window it swaps this side panel
+      // over to the child asset (the same move the job → asset link makes); in
+      // the detached detail window there is no panel, so the anchor's own href
+      // — a standalone detail URL for the child — carries the navigation.
+      openAsset: function (childId) {
+        const panel = document.getElementById('asset-detail');
+        if (!panel) {
+          window.location.href = detailWindowUrl('asset', childId);
+          return;
+        }
+        switchTab('assets');
+        showAssetDetail(childId, panel);
+      },
+      assetHref: function (childId) { return detailWindowUrl('asset', childId); },
+      // The standalone detail window (detail.html, `body.detail-standalone`)
+      // re-renders this whole body every DETAIL_POLL_INTERVAL_MS, which would
+      // throw the outcome link away a few seconds after it appeared. There, the
+      // clip is followed as soon as it is ready; in the main window the side
+      // panel is not polled, so the link stays put until the operator uses it.
+      navigateOnSuccess: document.body.classList.contains('detail-standalone'),
+      onClipped: function () {
+        // A successful clip adds an asset to the list; a failed one adds a
+        // `failed` child record. Either way the table is now stale. Harmless in
+        // the detached detail window, which has no table.
+        if (assetsTable) assetsTable.reload();
       },
     });
 
@@ -3771,18 +4216,69 @@ async function renderJobDetailBody(id, bodyEl, opts) {
 }
 
 // ─── PIPELINE EXECUTION DETAIL ────────────────────────────────────────────────
+
+// Marker class on the collapsed "Raw" disclosure (issue #964). One constant so
+// the open-state preservation below, the CSS, and the DOM test all name the
+// same element instead of restating the string.
+const RAW_DISCLOSURE_CLASS = 'raw-disclosure';
+
+// A collapsed-by-default disclosure holding the pretty-printed raw document.
+// The curated view above it is the primary reading surface; the full object
+// stays one click away rather than being the first thing an operator sees
+// (issue #964).
+//
+// ACCESSIBILITY: native <details>/<summary> — keyboard-operable and exposed as
+// a disclosure to assistive tech with no ARIA of our own, matching the existing
+// disclosure idiom in renderCollectionAssetPicker(). The value is written with
+// textContent, never interpolated into an HTML string.
+//
+// @param {unknown} value   object to serialise
+// @param {boolean} [open]  restore a previously-expanded state (poll re-render)
+// @returns {HTMLElement} detached <details>
+function rawJsonDisclosure(value, open) {
+  const details = document.createElement('details');
+  details.className = RAW_DISCLOSURE_CLASS + ' mt12';
+  if (open) details.open = true;
+
+  const summary = document.createElement('summary');
+  summary.textContent = 'Raw';
+  details.appendChild(summary);
+
+  const pre = document.createElement('pre');
+  pre.className = 'code-block';
+  pre.textContent = JSON.stringify(value, null, 2);
+  details.appendChild(pre);
+
+  return details;
+}
+
 // Fetch and render a single PipelineExecution (issue #193) into `bodyEl`.
 // Contract: GET /api/v1/pipelines/:executionId — response `pipelineExecutionSchema`
-// in src/routes/pipelines.ts (id, assetId, assetName?, pipelineName, status
-// [running|done|failed], steps[], createdAt, updatedAt). Each step (per
-// stepExecutionSchema): name, status [pending|running|done|failed], jobId?,
-// encoreJobId?, error?, startedAt?, completedAt?, progress?.
+// in src/routes/pipelines.ts:32-41 (id, assetId, assetName?, pipelineName,
+// status [running|done|failed], steps[], createdAt, updatedAt), mirrored in
+// openapi.json .paths["/api/v1/pipelines/{executionId}"].get 200. Each step, per
+// `stepExecutionSchema` (src/routes/pipelines.ts:17-30): name, status
+// [pending|running|done|failed|skipped], jobId?, encoreJobId?, error?,
+// skipReason?, startedAt?, completedAt?, progress? — only `name` and `status`
+// are required, so every other cell tolerates an absent value.
+//
+// The steps render as a per-step timeline (issue #964): one row per step with
+// its job id, Encore job id, and start/completion timestamps, each
+// identifier click-to-copy via the shared copy-id control. The full execution
+// document is still here, behind the collapsed "Raw" disclosure at the bottom.
 //
 // All server-provided text is inserted via escHtml before interpolation. Returns
 // the fetched execution so callers (detail.js) can derive the window title and
 // decide whether to keep polling.
 async function renderPipelineDetailBody(id, bodyEl) {
   const body = bodyEl;
+  // detail.js tick() re-renders this body on every poll while the execution is
+  // running. Carry the operator's Raw disclosure state across that refresh so a
+  // poll does not snap an expanded dump shut under them.
+  const prevRaw = typeof body.querySelector === 'function'
+    ? body.querySelector('.' + RAW_DISCLOSURE_CLASS)
+    : null;
+  const rawWasOpen = !!(prevRaw && prevRaw.open);
   body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
@@ -3814,8 +4310,9 @@ async function renderPipelineDetailBody(id, bodyEl) {
     }).join('');
     body.appendChild(kvDiv);
 
-    // Per-step list: status, progress, timestamps, and the FULL error text for
-    // failed steps (inline, not tooltip-only). All fields escaped via escHtml.
+    // Per-step timeline: status, progress, both job identifiers, timestamps, and
+    // the FULL error text for failed steps (inline, not tooltip-only). All
+    // fields escaped via escHtml.
     const stepsTitle = document.createElement('div');
     stepsTitle.className = 'section-title mt12';
     stepsTitle.textContent = 'Steps';
@@ -3831,33 +4328,44 @@ async function renderPipelineDetailBody(id, bodyEl) {
       const rows = steps.map(function(s) {
         const cells = [];
         cells.push('<td>' + escHtml(s.name) + '</td>');
+        // Status is never colour-ALONE: the word itself is the status (WCAG 1.4.1).
         cells.push('<td><span style="color:' + stepColor(s.status) + '">' + escHtml(s.status) + '</span></td>');
         cells.push('<td>' + (s.progress != null ? escHtml(s.progress + '%') : '—') + '</td>');
-        cells.push('<td>' + (s.jobId ? '<span class="text-mono">' + escHtml(s.jobId) + '</span>' : '—') + '</td>');
+        // Both identifiers are click-to-copy via the shared control (copy-id.js):
+        // tracing a run means pasting these into GET /jobs/{id} or the
+        // transcoder's own API, and neither should have to be retyped. Both are
+        // optional in stepExecutionSchema — copyableIdCellHtml() renders the
+        // em-dash placeholder when the step has not reached that stage. The
+        // column label mirrors the contract field name (`encoreJobId`) and the
+        // "Encore Instance" row the job detail already shows.
+        cells.push('<td>' + copyableIdCellHtml(s.jobId, 'Copy job id for step ' + s.name) + '</td>');
+        cells.push('<td>' + copyableIdCellHtml(s.encoreJobId, 'Copy Encore job id for step ' + s.name) + '</td>');
         cells.push('<td>' + escHtml(fmtDate(s.startedAt)) + '</td>');
         cells.push('<td>' + escHtml(fmtDate(s.completedAt)) + '</td>');
-        var row = '<tr>' + cells.join('') + '</tr>';
+        var row = '<tr class="step-row">' + cells.join('') + '</tr>';
         // Full error text on its own spanning row so long strings wrap and are
         // fully visible (acceptance criterion: not tooltip-only).
         if (s.error) {
-          row += '<tr class="step-error-row"><td colspan="6" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
+          row += '<tr class="step-error-row"><td colspan="7" style="color:var(--error,#f87171);white-space:pre-wrap;word-break:break-word;">' + escHtml(s.error) + '</td></tr>';
         }
         return row;
       }).join('');
 
       const table = document.createElement('table');
       table.className = 'mini-table';
+      table.id = 'pipeline-step-timeline';
       table.innerHTML =
         '<thead><tr>' +
-        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Started</th><th>Completed</th>' +
+        '<th>Step</th><th>Status</th><th>Progress</th><th>Job</th><th>Encore job</th><th>Started</th><th>Completed</th>' +
         '</tr></thead><tbody>' + rows + '</tbody>';
       body.appendChild(table);
+      // Bind the copy buttons for every identifier cell just rendered.
+      wireCopyIdButtons(table);
     }
 
-    const pre = document.createElement('pre');
-    pre.className = 'code-block mt12';
-    pre.textContent = JSON.stringify(exec, null, 2);
-    body.appendChild(pre);
+    // Raw execution document — present, but collapsed behind a disclosure so the
+    // timeline above is what an operator reads first (issue #964).
+    body.appendChild(rawJsonDisclosure(exec, rawWasOpen));
     return exec;
   } catch (err) {
     body.innerHTML = '';
@@ -3877,6 +4385,53 @@ let pendingCollectionFocusId = null;
 function openCollectionFromSearch(id) {
   pendingCollectionFocusId = id;
   switchTab('collections');
+}
+
+// Selector for every interactive control that may live INSIDE a collection row.
+// A click or key press that lands on one of these is that control's own
+// activation, never a row activation (issue #917) — so View/Delete can never
+// double-trigger the detail panel.
+const COLLECTION_ROW_CONTROL_SELECTOR = 'button, a, input, select, textarea, label, [role="button"]';
+
+// Row activation for the collections list (issue #917). The whole row opens the
+// detail panel, by pointer OR by keyboard, with the View button kept as a
+// redundant explicit control.
+//
+// Accessibility notes:
+//   - `tabindex="0"` on the `<tr>` puts the row in the tab order. We deliberately
+//     do NOT put `role="button"` on the row: that would replace the row/cell
+//     semantics a screen reader needs to read a 5-column table, and the cells
+//     carry the only description of WHICH collection this is. The row keeps
+//     `role="row"` and gains an action; the View button inside it remains the
+//     named, unambiguous affordance for assistive tech.
+//   - Enter and Space both activate, matching the platform convention for an
+//     activatable widget. Space is `preventDefault`ed so activating a row does
+//     not also scroll the page.
+//   - Keydowns are only honoured when the row ITSELF has focus (`e.target === tr`).
+//     Without that check, pressing Enter on the focused View button would bubble
+//     a keydown to the row and open the detail panel twice.
+function wireCollectionRowActivation(root, onOpen) {
+  root.querySelectorAll('tr.coll-row').forEach(function(tr) {
+    const id = tr.dataset.id;
+    function activate() {
+      root.querySelectorAll('tr.coll-row').forEach((r) => r.classList.remove('row-selected'));
+      tr.classList.add('row-selected');
+      onOpen(id);
+    }
+    tr.addEventListener('click', function(e) {
+      if (e.target.closest(COLLECTION_ROW_CONTROL_SELECTOR)) return;
+      activate();
+    });
+    tr.addEventListener('keydown', function(e) {
+      if (e.target !== tr) return;
+      if (e.key === 'Enter') {
+        activate();
+      } else if (e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        activate();
+      }
+    });
+  });
 }
 
 async function renderCollectionsTab(container) {
@@ -3961,7 +4516,9 @@ async function renderCollectionsTab(container) {
       // :90) and is
       // returned by GET /collections (:315-324), so the list already knows.
       const deleteLocked = !!(c.deleteLock && c.deleteLock.locked);
-      return '<tr data-id="' + escHtml(c.id) + '">' +
+      // `coll-row` + `tabindex="0"`: the whole row activates the detail panel by
+      // pointer or keyboard (issue #917). See wireCollectionRowActivation().
+      return '<tr class="coll-row" data-id="' + escHtml(c.id) + '" tabindex="0">' +
         '<td class="cell-id">' + escHtml(c.id) + '</td>' +
         '<td>' + escHtml(c.name || '—') + '</td>' +
         '<td>' + escHtml(String(assetCount)) + '</td>' +
@@ -3980,6 +4537,13 @@ async function renderCollectionsTab(container) {
       '<tbody>' + rows + '</tbody>' +
       '</table>';
     wrap.appendChild(tableWrap);
+
+    // Whole-row activation (issue #917). Bound alongside the View button, which
+    // stays as a redundant explicit control; the row handler ignores events that
+    // originate on any inner control, so the two cannot double-trigger.
+    wireCollectionRowActivation(tableWrap, function(id) {
+      showCollectionDetail(id, detailPanel, loadCollections);
+    });
 
     tableWrap.querySelectorAll('.coll-view-btn').forEach(function(btn) {
       btn.addEventListener('click', function() { showCollectionDetail(btn.dataset.id, detailPanel, loadCollections); });
@@ -4222,6 +4786,220 @@ function addAssetsSummary(result) {
   }
   const detail = result.failed.map(function(f) { return f.id + ' (' + f.message + ')'; }).join('; ');
   return 'Added ' + result.added.length + ' of ' + total + ' assets. Failed: ' + detail;
+}
+
+// ─── Assets-tab bulk "add to collection" (issue #916) ────────────────────────
+//
+// CONTRACT GROUNDING. This view issues NO new call of its own. The only write it
+// performs is `addAssetsToCollection()` above (app.js — the one PUT-per-asset
+// loop over `/collections/:id/assets/:assetId`), which is the exact function the
+// collection-detail picker's "Add selected" button calls
+// (`renderCollectionAssetPicker` -> `addAssetsToCollection`, app.js:4203+).
+// Reusing that function — rather than re-issuing the PUT here — is what keeps the
+// two entry points on one add-membership path, so the 404/422 handling and the
+// partial-failure summary (`addAssetsSummary`) cannot drift between them.
+//
+// The verified backend contract behind that shared function:
+//   - PUT /api/v1/collections/{id}/assets/{assetId} — src/routes/collections.ts:586-620
+//     (`app.put('/:id/assets/:assetId', ...)`, declared at :587). Schema:
+//     `params: z.object({ id: z.string(), assetId: z.string() })`, NO body schema,
+//     `response: { 200: collectionSchema, 404: errorSchema, 422: errorSchema }`
+//     (:589-592). Route header comment src/routes/collections.ts:18. Mirrored in
+//     openapi.json at `.paths["/api/v1/collections/{id}/assets/{assetId}"].put`
+//     (no operationId is emitted by the generator — the path+method IS the
+//     identifier in this spec). 422 is `asset_not_found` for an asset that does
+//     not resolve (:598-603); 404 is an unknown collection (:609-611).
+//   - There is still NO batch/multi-member route on that router: its only other
+//     membership route is DELETE `/:id/assets/:assetId`
+//     (src/routes/collections.ts:625). So "add N assets" is N PUTs issued from
+//     one user interaction, exactly as the detail picker does it.
+//   - Collection list for the target picker: GET /api/v1/collections/ returns
+//     `{ collections: [...] }` with each item requiring `id`, `name`, `assetIds`,
+//     `createdAt`, `updatedAt` (openapi.json
+//     `.paths["/api/v1/collections/"].get.responses["200"]`). Only `id` and `name`
+//     are read here.
+
+// Normalise whatever the collections list endpoint returned into `{ id, name }`
+// options. Tolerant of the three envelope shapes the Collections tab already
+// accepts (app.js:3901-3902) so the two readers cannot disagree about the wire.
+function bulkCollectionOptions(res) {
+  const list = Array.isArray(res)
+    ? res
+    : res && Array.isArray(res.collections)
+      ? res.collections
+      : res && Array.isArray(res.items)
+        ? res.items
+        : [];
+  return list
+    .map(function(c) {
+      return { id: c && c.id != null ? String(c.id) : '', name: (c && c.name) || '' };
+    })
+    .filter(function(c) { return c.id !== ''; });
+}
+
+// The label on the bulk bar's primary button, and the bar's own live-region text.
+// Kept pure so the wording is testable without a DOM round-trip.
+function bulkAddButtonLabel(count) {
+  if (count === 0) return 'Add to collection';
+  return 'Add ' + count + ' asset' + (count === 1 ? '' : 's') + ' to collection';
+}
+
+function bulkSelectionSummary(selection) {
+  const n = selection.length;
+  if (n === 0) return 'No assets selected.';
+  if (n === 1) return '1 asset selected: ' + selection[0].label + '.';
+  return n + ' assets selected.';
+}
+
+// The bulk-action bar for the Assets tab. Returns
+// `{ el, setSelection }` — a detached element plus the one function the table's
+// `onSelectionChange` calls, which is the ONLY way this bar learns about the
+// selection. `opts.onAdded()` fires after a run that added at least one
+// membership; `opts.deselect(ids)` unticks just the ids a run consumed and
+// `opts.clearSelection()` drops the whole selection.
+//
+// The bar submits the ids from the same local mirror it LABELS, so the button
+// text and the requests can never disagree. The table's Map stays
+// authoritative: whatever the run consumed is handed back to `opts.deselect()`
+// so the mirror and the Map narrow together. Submitting `opts.getSelection()`
+// directly would reintroduce exactly that split — after a partial failure the
+// label would name the remaining assets while the click re-sent every id the
+// table still held.
+function renderAssetsBulkBar(opts) {
+  opts = opts || {};
+  const fetchFn = opts.apiFetch || apiFetch;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'assets-bulk-bar';
+  wrap.id = 'assets-bulk-bar';
+  // The bar is a named region rather than a floating strip of controls, so a
+  // screen-reader user can reach it directly and knows what it governs
+  // (WCAG 2.1 AA — 1.3.1, 4.1.2).
+  wrap.setAttribute('role', 'group');
+  wrap.setAttribute('aria-label', 'Bulk actions for selected assets');
+  wrap.innerHTML = [
+    '<div class="form-row">',
+    '  <div class="grow" id="assets-bulk-count" aria-live="polite">No assets selected.</div>',
+    '  <div class="form-field">',
+    '    <label for="assets-bulk-collection">Target collection</label>',
+    '    <select id="assets-bulk-collection" aria-describedby="assets-bulk-hint"></select>',
+    '  </div>',
+    '  <button id="assets-bulk-add-btn" disabled>Add to collection</button>',
+    '  <button id="assets-bulk-clear-btn" class="btn-ghost" disabled>Clear selection</button>',
+    '</div>',
+    '<div class="form-hint" id="assets-bulk-hint">Tick assets in the table, pick an existing collection, then add them. Selection survives paging and filtering, so assets from more than one page can be added together.</div>',
+    '<div id="assets-bulk-msg" aria-live="polite"></div>',
+  ].join('');
+
+  const countEl = wrap.querySelector('#assets-bulk-count');
+  const selectEl = wrap.querySelector('#assets-bulk-collection');
+  const addBtn = wrap.querySelector('#assets-bulk-add-btn');
+  const clearBtn = wrap.querySelector('#assets-bulk-clear-btn');
+  const msgEl = wrap.querySelector('#assets-bulk-msg');
+
+  // The bar's mirror of the table's selection: fed by `setSelection()` from
+  // `onSelectionChange`, seeded once from `opts.getSelection()` in case the bar
+  // is mounted after rows were already ticked. Everything this bar renders AND
+  // everything it submits reads from here, so the two cannot drift apart.
+  let selection =
+    typeof opts.getSelection === 'function' ? opts.getSelection() || [] : [];
+  // Null until the list has been read; distinguishes "no collections exist" from
+  // "not asked yet", which decide different disabled states.
+  let collections = null;
+
+  function refreshControls() {
+    countEl.textContent = bulkSelectionSummary(selection);
+    addBtn.textContent = bulkAddButtonLabel(selection.length);
+    clearBtn.disabled = selection.length === 0;
+    addBtn.disabled = selection.length === 0 || !selectEl.value;
+  }
+
+  function setSelection(next) {
+    selection = Array.isArray(next) ? next : [];
+    refreshControls();
+  }
+
+  // Populate the target picker. A failure is reported in the bar rather than
+  // thrown: the table behind it is still usable, only this action is not.
+  async function loadCollections() {
+    try {
+      collections = bulkCollectionOptions(await fetchFn('/collections'));
+    } catch (err) {
+      collections = [];
+      showMsg(msgEl, 'Failed to load collections: ' + err.message, 'error');
+    }
+    selectEl.innerHTML =
+      collections.length === 0
+        ? '<option value="">No collections — create one in the Collections tab</option>'
+        : '<option value="">Choose a collection…</option>' +
+          collections
+            .map(function(c) {
+              return '<option value="' + escHtml(c.id) + '">' + escHtml(c.name || c.id) + '</option>';
+            })
+            .join('');
+    refreshControls();
+  }
+
+  selectEl.addEventListener('change', refreshControls);
+
+  clearBtn.addEventListener('click', function() {
+    msgEl.innerHTML = '';
+    if (typeof opts.clearSelection === 'function') opts.clearSelection();
+    setSelection([]);
+  });
+
+  addBtn.addEventListener('click', async function() {
+    const collectionId = selectEl.value;
+    if (!collectionId) return;
+    // Submit exactly what the bar is showing. `selection` is the mirror the
+    // count and the button label are rendered from, so reading the ids from it
+    // keeps the action and its own description in step — including on the retry
+    // click after a partial failure, when the table may still hold ids this bar
+    // has already reported as added.
+    const ids = selection.map(function(s) { return typeof s === 'string' ? s : s.id; });
+    if (ids.length === 0) return;
+
+    const prev = addBtn.textContent;
+    addBtn.disabled = true;
+    addBtn.textContent = 'Adding…';
+    msgEl.innerHTML = '';
+    try {
+      // THE shared add-membership path — identical call to the one the
+      // collection-detail picker makes. No second implementation exists.
+      const result = await addAssetsToCollection(collectionId, ids);
+      const summary = addAssetsSummary(result);
+      showMsg(msgEl, summary, result.failed.length === 0 ? 'success' : 'error');
+      if (result.added.length > 0) {
+        // Only the ids that landed leave the selection: a failed add stays
+        // ticked so the operator can retry it without re-finding the row.
+        // Narrow the OWNER of the selection first — the table's tick-boxes and
+        // its Map — so the rows on screen stop showing assets this run already
+        // consumed, and so the next tick anywhere in the table re-emits only
+        // what is genuinely still outstanding. Falling back to
+        // `clearSelection()` when every id landed keeps a consumer that offers
+        // no per-id untick working as before.
+        const landed = new Set(result.added);
+        const remaining = selection.filter(function(s) { return !landed.has(s.id); });
+        if (typeof opts.deselect === 'function') {
+          opts.deselect(result.added);
+        } else if (remaining.length === 0 && typeof opts.clearSelection === 'function') {
+          opts.clearSelection();
+        }
+        setSelection(remaining);
+        if (typeof opts.onAdded === 'function') opts.onAdded(collectionId, result);
+      }
+    } catch (err) {
+      showMsg(msgEl, 'Failed to add to collection: ' + err.message, 'error');
+    } finally {
+      addBtn.textContent = selection.length === 0 ? bulkAddButtonLabel(0) : prev;
+      refreshControls();
+    }
+  });
+
+  refreshControls();
+  void loadCollections();
+
+  return { el: wrap, setSelection: setSelection, reloadCollections: loadCollections };
 }
 
 // The add-to-collection control: name search + multi-select, with the raw-id
@@ -7757,6 +8535,18 @@ export {
   // REAL panel — the same code path the Collections tab opens — against the real
   // collections router, and assert the rename affordance end to end.
   showCollectionDetail,
+  // Client-side mirror of the ADR-018 write+delete gate for the external-ids
+  // sub-resource (issue #908). Exported so a DOM/unit test can assert the
+  // add/edit/remove controls are offered to exactly the roles that hold both
+  // `write` and `delete`, and that a viewer still sees the list.
+  canChangeExternalIds,
+  // Client-side mirror of the ADR-018 write gate for POST /assets/{id}/clip
+  // (issue #793). Exported so a DOM/unit test can assert the Clip control is
+  // offered to exactly the roles that hold `write`.
+  canClipAsset,
+  // Standalone detail URL builder (issue #793). Exported so a DOM/unit test can
+  // assert a cross-asset link points at the right resource and stack.
+  detailWindowUrl,
   // Add/edit storage-backend form (issue #681). Exported so a DOM/unit test can
   // exercise the pure render + validation without a network call.
   renderStorageBackendForm,
@@ -7824,12 +8614,28 @@ export {
   addAssetsToCollection,
   addAssetsSummary,
   ASSET_PICKER_DEBOUNCE_MS,
+  // Assets-tab bulk add-to-collection (issue #916). Exported so a DOM test can
+  // drive the real bar and assert it goes through the SAME addAssetsToCollection
+  // path as the collection-detail picker — one PUT per selected asset against
+  // PUT /api/v1/collections/{id}/assets/{assetId} — plus the pure label/summary
+  // wording and the collection-envelope normaliser.
+  renderAssetsBulkBar,
+  bulkCollectionOptions,
+  bulkAddButtonLabel,
+  bulkSelectionSummary,
   // Truncation disclosure on the hit list (issue #949). Exported so a unit test
   // can pin the "showing N of M" wording and the no-note case without going
   // through a search round trip.
   assetPickerTotal,
   assetPickerResultNote,
   ASSET_PICKER_PAGE_SIZE,
+  // Whole-row activation on the collections list (issue #917). Exported so a
+  // DOM test can assert a click anywhere on the row opens the detail, that the
+  // View/Delete buttons do not double-trigger it, and that the row is reachable
+  // and activatable by keyboard.
+  wireCollectionRowActivation,
+  COLLECTION_ROW_CONTROL_SELECTOR,
+  renderCollectionsTab,
   // Exported so a DOM/unit test can drive the real Assets-tab upload flow —
   // including the raw streaming PUT at app.js:1298 that bypasses apiFetch — and
   // assert it presents the UI-scoped Authorization header (issue #740).
