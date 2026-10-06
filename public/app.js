@@ -2385,6 +2385,9 @@ async function renderAssetsTab(container) {
   bulkBar = renderAssetsBulkBar({
     apiFetch,
     getSelection: function () { return assetsTable.getSelection(); },
+    // Per-id untick, so a partial run narrows the table's authoritative
+    // selection instead of leaving already-added assets ticked (issue #916).
+    deselect: function (ids) { assetsTable.deselect(ids); },
     clearSelection: function () { assetsTable.clearSelection(); },
     onAdded: function () {
       // Membership lives on the collection, not on the asset row, so the asset
@@ -4823,10 +4826,18 @@ function bulkSelectionSummary(selection) {
 
 // The bulk-action bar for the Assets tab. Returns
 // `{ el, setSelection }` — a detached element plus the one function the table's
-// `onSelectionChange` calls. `opts.getSelection()` supplies the ids at submit
-// time (never a stale copy), `opts.onAdded()` fires after a run that added at
-// least one membership, and `opts.clearSelection()` drops the selection the run
-// consumed.
+// `onSelectionChange` calls, which is the ONLY way this bar learns about the
+// selection. `opts.onAdded()` fires after a run that added at least one
+// membership; `opts.deselect(ids)` unticks just the ids a run consumed and
+// `opts.clearSelection()` drops the whole selection.
+//
+// The bar submits the ids from the same local mirror it LABELS, so the button
+// text and the requests can never disagree. The table's Map stays
+// authoritative: whatever the run consumed is handed back to `opts.deselect()`
+// so the mirror and the Map narrow together. Submitting `opts.getSelection()`
+// directly would reintroduce exactly that split — after a partial failure the
+// label would name the remaining assets while the click re-sent every id the
+// table still held.
 function renderAssetsBulkBar(opts) {
   opts = opts || {};
   const fetchFn = opts.apiFetch || apiFetch;
@@ -4859,7 +4870,12 @@ function renderAssetsBulkBar(opts) {
   const clearBtn = wrap.querySelector('#assets-bulk-clear-btn');
   const msgEl = wrap.querySelector('#assets-bulk-msg');
 
-  let selection = [];
+  // The bar's mirror of the table's selection: fed by `setSelection()` from
+  // `onSelectionChange`, seeded once from `opts.getSelection()` in case the bar
+  // is mounted after rows were already ticked. Everything this bar renders AND
+  // everything it submits reads from here, so the two cannot drift apart.
+  let selection =
+    typeof opts.getSelection === 'function' ? opts.getSelection() || [] : [];
   // Null until the list has been read; distinguishes "no collections exist" from
   // "not asked yet", which decide different disabled states.
   let collections = null;
@@ -4908,9 +4924,12 @@ function renderAssetsBulkBar(opts) {
   addBtn.addEventListener('click', async function() {
     const collectionId = selectEl.value;
     if (!collectionId) return;
-    const ids = (typeof opts.getSelection === 'function' ? opts.getSelection() : selection).map(
-      function(s) { return typeof s === 'string' ? s : s.id; }
-    );
+    // Submit exactly what the bar is showing. `selection` is the mirror the
+    // count and the button label are rendered from, so reading the ids from it
+    // keeps the action and its own description in step — including on the retry
+    // click after a partial failure, when the table may still hold ids this bar
+    // has already reported as added.
+    const ids = selection.map(function(s) { return typeof s === 'string' ? s : s.id; });
     if (ids.length === 0) return;
 
     const prev = addBtn.textContent;
@@ -4926,9 +4945,17 @@ function renderAssetsBulkBar(opts) {
       if (result.added.length > 0) {
         // Only the ids that landed leave the selection: a failed add stays
         // ticked so the operator can retry it without re-finding the row.
+        // Narrow the OWNER of the selection first — the table's tick-boxes and
+        // its Map — so the rows on screen stop showing assets this run already
+        // consumed, and so the next tick anywhere in the table re-emits only
+        // what is genuinely still outstanding. Falling back to
+        // `clearSelection()` when every id landed keeps a consumer that offers
+        // no per-id untick working as before.
         const landed = new Set(result.added);
         const remaining = selection.filter(function(s) { return !landed.has(s.id); });
-        if (remaining.length === 0 && typeof opts.clearSelection === 'function') {
+        if (typeof opts.deselect === 'function') {
+          opts.deselect(result.added);
+        } else if (remaining.length === 0 && typeof opts.clearSelection === 'function') {
           opts.clearSelection();
         }
         setSelection(remaining);

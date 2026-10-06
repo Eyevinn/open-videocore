@@ -1450,6 +1450,36 @@ export function createAssetsTable(deps) {
     return selectedIds();
   }
 
+  // Untick a specific set of ids, leaving the rest of the selection alone.
+  // The counterpart `clearSelection()` is all-or-nothing, which is wrong after a
+  // PARTIAL bulk run: the ids that landed must leave the selection while the
+  // ones that failed stay ticked for retry. Because this Map is the
+  // AUTHORITATIVE selection (a consumer's own copy is only a mirror fed by
+  // `onSelectionChange`), narrowing has to happen here or the next tick anywhere
+  // in the table re-emits the ids that already landed. Ids not currently on
+  // screen have no box to untick — dropping them from the Map is enough, the
+  // next repaint renders them unticked.
+  function deselect(ids) {
+    const drop = new Set(
+      (Array.isArray(ids) ? ids : [ids]).map(function (entry) {
+        return entry && typeof entry === 'object' ? entry.id : entry;
+      })
+    );
+    if (drop.size === 0) return selectedIds();
+    let changed = false;
+    drop.forEach(function (id) {
+      if (selection.delete(id)) changed = true;
+    });
+    const tbody = table.el.querySelector('tbody');
+    if (tbody) {
+      tbody.querySelectorAll('.asset-select-box').forEach(function (box) {
+        if (drop.has(box.value)) box.checked = false;
+      });
+    }
+    if (changed) emitSelection();
+    return selectedIds();
+  }
+
   function clearSelection() {
     selection.clear();
     const tbody = table.el.querySelector('tbody');
@@ -1475,6 +1505,8 @@ export function createAssetsTable(deps) {
     },
     getSelectedIds: selectedIds,
     selectAllOnPage,
+    // Per-id untick, for a consumer that consumed only part of its selection.
+    deselect,
     clearSelection,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
