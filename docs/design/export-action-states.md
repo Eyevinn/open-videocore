@@ -49,12 +49,12 @@ names a symbol, selector, or `openapi.json` path you can grep for.
 | Default child name | `outputName`, else `<source name> [<format>]` — the `name:` property of the child-asset literal in `rewrap()`, `src/pipeline/rewrap.ts`, which reads `outputName ?? \`${baseName} [${targetFormat}]\``. `baseName` is the `const baseName = source?.name ?? sourceAssetId` binding in the same function (it is **not** the `isRewrapFormat` guard a few lines above it — grep the identifier, not a line) |
 | Output object key | `exports/<newAssetId>.<format>` — `rewrapObjectKey`, `src/pipeline/rewrap.ts` |
 | **201 is falsifiable** | Three layers agree before it is sent: job-status allow-list (`SUCCESS_STATUSES`, `src/pipeline/osc-rewrap.ts`), the `deps.storage.statObject(outputKey)` HEAD + non-empty check in `rewrap()` (`src/pipeline/rewrap.ts`), only then the `ready` transition. Documented contract note: `docs/findings/export-truthful-status-944.md` |
-| 400 | Unsupported `targetFormat` — the Zod enum built from `REWRAP_FORMATS` at the edge; `UnsupportedFormatError` thrown defensively behind the `isRewrapFormat` guard in `rewrap()` (`src/pipeline/rewrap.ts`). **Two different bodies, depending on which layer rejects** — the *defensive* path throws `UnsupportedFormatError`, which the router's `setErrorHandler` maps to `errorSchema`-shaped `{ error: 'unsupported_format', message }` (`src/routes/assets.ts`); the *edge* path (Zod enum rejection) fails in Fastify's own schema validation, and since there is **no `schemaErrorFormatter` anywhere in `src/`** and the router's error handler ends in `throw err`, the client gets Fastify's default validation envelope instead (`error: 'Bad Request'`, `message` = the raw validation string). This divergence is precisely why § "Export failed" overrides the 400 with its own fixed copy rather than echoing `message` |
+| 400 | Unsupported `targetFormat` — the Zod enum built from `REWRAP_FORMATS` at the edge; `UnsupportedFormatError` thrown defensively behind the `isRewrapFormat` guard in `rewrap()` (`src/pipeline/rewrap.ts`). **Two different bodies, depending on which layer rejects.** The *defensive* path is fully verified: `UnsupportedFormatError` → the router's `setErrorHandler` → `errorSchema`-shaped `{ error: 'unsupported_format', message }` (`src/routes/assets.ts:3330`). The *edge* path (Zod enum rejection) is **not verified in this tree, and this spec does not assert its envelope.** What *is* verified: schema validation is done by `fastify-type-provider-zod` ^4.0.2's compilers, not Fastify's built-in ajv (`app.setValidatorCompiler(validatorCompiler)` / `setSerializerCompiler`, `src/main.ts:225-226`, imported at `src/main.ts:17-21`); there is **no `schemaErrorFormatter` anywhere in `src/`** (grepped); the router's error handler has no branch for a validation error and ends in `throw err` (`src/routes/assets.ts:3332`); and the only test covering this path asserts the status code alone, no body (`test/rewrap.test.ts:341-350`, `expect(res.statusCode).toBe(400)`). So the provable claim — and the only one the UI needs — is that an **edge 400 carries some `error` value that is not `unsupported_format`**; the exact field set is unconfirmed. That is sufficient, because the UI's rule is to render a server string only for `rewrap_failed` (§ "Export failed") and to use its own fixed copy for every other `error` value. If the edge envelope ever needs to be relied on, assert it in `test/rewrap.test.ts` first and cite the assertion here |
 | 404 | Unknown/foreign asset — `reply.code(404).send({ error: 'not_found' })` in the export handler. Existence is not leaked |
 | 409 | `{ error: 'no_object', message: 'asset has no stored source object to process' }` — `NO_SOURCE_OBJECT_ERROR` / `NO_SOURCE_OBJECT_MESSAGE`, `src/pipeline/source-object.ts`, sent by the shared `requireSourceObject` helper, which the export handler calls before anything else |
 | **501** | `{ error: 'not_configured', message: 'export / re-wrap is not configured' }` — the `if (!opts.rewrapRunner \|\| !storageFor)` guard in the export handler (deployment never wired a re-wrap runner or workspace storage). This is the only "nowhere for an export to go" condition **this endpoint** can produce — see § "Export is not available on this deployment" |
 | 502 | `{ error: 'rewrap_failed', message: string }` — the `reply.code(502).send({ error: 'rewrap_failed', message })` in the export handler's catch, where `message` is `err instanceof Error ? err.message : String(err)`. The ffmpeg log is captured server-side only (`oscJobLog(err)`, logged at `warn` in the same catch) and is **never** in `message` — a deliberate security position (the log is third-party output and can carry storage endpoints/bucket names), not an oversight. `message` is what the UI has to show; it is real, not generic ("Export failed") |
-| **502 `message` is a bounded sentence on one path, unbounded on the other** | For the **poll/status** path it is composed by this repo: `makeOscRewrapRunner` builds `failure` as `OSC export/re-wrap job "<name>" ended with non-success status "<status>"` or `… did not complete: <err.message>` and throws `OscRewrapJobError(failure, logs)` — log as data, never in the message (`src/pipeline/osc-rewrap.ts`). For the **job-submission** path it is **not**: the `api.createJob(...)` call in the same function sits **outside** that `try`, so an error from the external OSC job client propagates unchanged through `rewrap()` into the route catch above and becomes the 502 `message` verbatim. The request in flight there carries `cmdLineArgs` from `rewrapCmdLine` (presigned source URL **with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`. This repo does not bound that client's error text, so **the UI must not render a 502 `message` unbounded** — see the bounding rules in § "Export failed" |
+| **502 `message` is a bounded sentence on one path, unbounded on the others** | Only the **poll/status** path is composed by this repo: inside the `try` at `src/pipeline/osc-rewrap.ts:141-153`, `makeOscRewrapRunner` builds `failure` as `OSC export/re-wrap job "<name>" ended with non-success status "<status>"` (`:149`) or `… did not complete: <err.message>` (`:152`) and throws `OscRewrapJobError(failure, logs)` (`:166`) — log as data, never in the message. **Two awaits sit *outside* that `try`, and both are unbounded:** `await api.context.getServiceAccessToken(FFPROBE_SERVICE_ID)` (`src/pipeline/osc-rewrap.ts:126`) and `await api.createJob(api.context, FFPROBE_SERVICE_ID, sat, {…})` (`:128`). An error from either propagates unchanged through `rewrap()` into the route catch above and becomes the 502 `message` verbatim. Both come from the same SDK error contract: `@osaas/client-core` 0.24.0 (`package.json:27`) raises a `FetchError` whose `message` is the upstream response body verbatim (`lib/fetch.js:16`) or, for a JSON error body lacking `message`/`reason`, that whole body `JSON.stringify`-ed (`lib/fetch.js:9`) — no length bound, no structured cause. The `:128` call is the sharper of the two because the request in flight there carries `cmdLineArgs` from `rewrapCmdLine` (presigned source URL **with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`; `:126` posts only `{ serviceId }` (`lib/context.js:37-39`), so it is unbounded prose but not a credential-leak vector. This repo bounds neither, so **the UI must not render a 502 `message` unbounded** — see the bounding rules in § "Export failed". Logged as OSC friction: `docs/osc-feedback/incoming-client-core-job-submission-unbounded-error-text.md` in the agents repo |
 | Failed export leaves no file to serve | `rewrap()` sets `objectKey` only **after** verification passes (the `update` calls follow the `statObject` guard, `src/pipeline/rewrap.ts`) — a `502` child is `status: 'failed'` with **no** `objectKey`, so it can never 200 a `/files` entry for bytes that don't exist |
 | Synchronous, no polling | The handler `await`s the resolved runner inline; there is no `processing`-then-poll contract for this action. The only "in progress" state is the one request in flight |
 | Source unchanged | Export is a pure read of the source asset — never mutated |
@@ -311,38 +311,55 @@ actionMsg.appendChild(detail);
 **Bounding rule for `serverDetail` — required, not optional.** `err.message` comes from
 `apiFetch`'s `msg = body.message || body.error || msg` (§0.4). For the poll/status path the
 server composes that sentence itself and it is safe to show (§0.1). But **not every 502
-`message` is composed by this repo**: `api.createJob` in `src/pipeline/osc-rewrap.ts` is called
-*before* the `try` block that wraps the poll, so an error raised by that external client
-propagates unchanged into the route's catch (`const message = err instanceof Error ?
-err.message : String(err)`, the `rewrap_failed` 502 in `src/routes/assets.ts`) — and the request
-in flight at that moment carries `cmdLineArgs` built by `rewrapCmdLine` (the **presigned source
-URL with its signature**) plus `awsAccessKeyId` / `awsSecretAccessKey`. Whether that client's
-error text echoes its request body is **not something this repo bounds**. So the UI must treat
-the string as untrusted:
+`message` is composed by this repo**: *two* awaits in `makeOscRewrapRunner` sit **before** the
+`try` block that wraps the poll — `api.context.getServiceAccessToken(…)`
+(`src/pipeline/osc-rewrap.ts:126`) and `api.createJob(…)` (`:128`), with the `try` only
+beginning at `:141`. An error raised by either propagates unchanged into the route's catch
+(`const message = err instanceof Error ? err.message : String(err)`, the `rewrap_failed` 502 in
+`src/routes/assets.ts`). The SDK makes that text upstream-controlled and unbounded in both
+cases (`@osaas/client-core` `lib/fetch.js:9,16` — response body verbatim, or the whole JSON
+error body stringified; §0.1), and the request in flight at `:128` carries `cmdLineArgs` built
+by `rewrapCmdLine` (the **presigned source URL with its signature**) plus `awsAccessKeyId` /
+`awsSecretAccessKey`. Whether an upstream error echoes its request body is **not something this
+repo bounds**. So the UI must treat the string as untrusted:
 
-- Render it **only** when `err.body.error === 'rewrap_failed'`. Any other `error` value gets
-  this state's own fixed copy (the table below) and the server string is dropped.
-- **Truncate to 300 characters** with a trailing `…`. A composed status sentence is well under
-  that; an echoed request body is not, so the bound is also the tell.
-- **Drop the line entirely** if the string matches credential- or URL-shaped content —
-  `X-Amz-Signature`, `X-Amz-Credential`, `awsSecretAccessKey`, `awsAccessKeyId`, or any
-  `http://` / `https://` substring. In that case show only the headline plus: *"The export
-  service reported an error that could not be displayed safely. The full detail is in the
-  server log."* A dropped line is a worse diagnostic; a leaked presigned URL plus access key is
-  a worse incident.
-- Collapse whitespace to single spaces before measuring and rendering, so a multi-line dump
-  cannot stretch the panel or hide its tail below the fold.
+**Apply these four steps in this order** — the order is load-bearing, because scanning after
+truncating would only scan the first 300 characters and let a credential in the tail through:
+
+1. **Gate on the error code.** Render the string **only** when
+   `err.body.error === 'rewrap_failed'`. Any other `error` value gets this state's own fixed
+   copy (the table below) and the server string is dropped unexamined.
+2. **Collapse whitespace** (all runs of whitespace, including newlines and tabs, to a single
+   space; trim the ends). Do this before anything measures or scans the string, so a multi-line
+   dump cannot stretch the panel, hide its tail below the fold, or split a credential across a
+   line break and slip past step 3.
+3. **Scan the WHOLE collapsed string** and **drop the line entirely** if it matches credential-
+   or URL-shaped content — `X-Amz-Signature`, `X-Amz-Credential`, `awsSecretAccessKey`,
+   `awsAccessKeyId`, or any `http://` / `https://` substring. In that case show only the
+   headline plus: *"The export service reported an error that could not be displayed safely.
+   The full detail is in the server log."* A dropped line is a worse diagnostic; a leaked
+   presigned URL plus access key is a worse incident.
+4. **Only then truncate to 300 characters**, with a trailing `…`. A composed status sentence is
+   well under that; an echoed request body is not, so the bound is also the tell.
 
 The earlier draft of this spec said to print `message` verbatim and "never replace it with a
-generic message." That was wrong for the `createJob` path and is superseded by the rules above:
+generic message." That was wrong for the job-submission awaits (`:126`, `:128`) and is
+superseded by the rules above:
 the *intent* — the acceptance criterion's "surfaces the actual error returned by the verified
 `/export` contract" — is met by showing the server's own sentence when the server composed it,
 which the rules preserve. What they forbid is rendering an unbounded upstream string.
 
-**The real fix belongs on the API surface, not here.** Wrapping `createJob` failures in a
-known sentence the way the poll path already does would make the 502 `message` uniformly safe
-and let the UI drop the sanitiser. File that against `src/pipeline/osc-rewrap.ts` as a
-follow-up; until it lands, the bounding rules above are load-bearing.
+**The real fix belongs on the API surface, not here.** Wrapping the submission failures in a
+known sentence the way the poll path already does would make the 502 `message` uniformly safe.
+Note the precondition precisely: the sanitiser above may be dropped **only once EVERY `await`
+outside the bounded `try` is wrapped** — today that is both
+`api.context.getServiceAccessToken(…)` (`src/pipeline/osc-rewrap.ts:126`) **and**
+`api.createJob(…)` (`:128`), and the test is positional, not name-based: any future await added
+above the `try` at `:141` re-opens the hole. Wrapping `createJob` alone is **not** sufficient —
+`getServiceAccessToken` is subject to the identical unbounded SDK error contract
+(`lib/fetch.js:9,16`). File that against `src/pipeline/osc-rewrap.ts` as a follow-up; until
+every one of those awaits throws a repo-composed error, the bounding rules above are
+load-bearing.
 
 **Nothing beyond that one sentence.** The ffmpeg log that would explain *why* is deliberately
 server-side only (§0.1) — there is no safe additional detail to fetch or display for this
@@ -373,7 +390,7 @@ sibling diagnostic, no server string. The bounding rule in this section applies 
 
 | Status | `error` | Fixed `showMsg` string (`error`) |
 |---|---|---|
-| `400` | Fastify validation envelope (`error: 'Bad Request'`) at the edge, or `unsupported_format` from the defensive guard (§0.1) | **"Unsupported export format."** — should not occur through the UI's own format picker (it would only enumerate `REWRAP_FORMATS`), so this is a defensive message, not a primary design target |
+| `400` | `unsupported_format` from the defensive guard, or — at the edge — some other `error` value whose exact envelope is unverified (§0.1); either way the UI matches on `error !== 'rewrap_failed'` and never echoes `message` | **"Unsupported export format."** — should not occur through the UI's own format picker (it would only enumerate `REWRAP_FORMATS`), so this is a defensive message, not a primary design target |
 | `404` | `not_found` | **"This asset no longer exists."** — existence is deliberately not distinguished from "not yours" (§0.1); do not say "not found or access denied" or any phrasing that narrows which |
 | `409` | `no_object` | **"{SOURCE NAME} has no stored file to export."** — `message` is the shared, generic sentence (§0.1) used by every other source-consuming operation; prefer naming the asset over echoing `message` verbatim here, since the generic sentence reads oddly attached to a specific asset in a UI |
 
@@ -551,10 +568,16 @@ is *not* on that timer.
 4. **The 502 `message` is one unstructured string, and only sometimes one this repo wrote.**
    There's no machine-readable failure-reason field, so copy cannot branch on failure cause
    (e.g. "the source was corrupt" vs. "the container doesn't support this codec") — there is only
-   the string. And because the `createJob` submission path returns that string unbounded (§0.1),
-   the UI has to sanitise what should have arrived safe: § "Export failed" spends four rules on
-   defending against a leak that a server-side wrap in `src/pipeline/osc-rewrap.ts` would remove
-   outright. Both are worth a follow-up on the API surface: wrap the submission failure in a
-   composed sentence, and add a stable `reason` field so copy can branch on cause instead of
-   printing prose. Logged as OSC friction (`docs/osc-feedback/`, `@osaas/client-core`
-   `createJob` error shape) in the agents repo.
+   the string. And because **both** job-submission awaits — `getServiceAccessToken`
+   (`src/pipeline/osc-rewrap.ts:126`) and `createJob` (`:128`) — return that string unbounded
+   (§0.1), the UI has to sanitise what should have arrived safe: § "Export failed" spends four
+   ordered steps on defending against a leak that a server-side wrap of *every* await above the
+   `try` at `:141` would remove outright. Both are worth a follow-up on the API surface: wrap
+   the submission failures in a composed sentence, and add a stable `reason` field so copy can
+   branch on cause instead of printing prose. The underlying SDK limitation is logged as OSC
+   friction in the agents repo:
+   `docs/osc-feedback/incoming-client-core-job-submission-unbounded-error-text.md` (`@osaas/client-core`
+   0.24.0 — `defaultErrorFactory`, `lib/fetch.js:5-20`, puts the upstream response body verbatim
+   in `Error.message` with no length bound and no structured cause; `createInstance`,
+   `lib/core.js:76-91`, does not forward `createFetch`'s `errorFactory` parameter, so a caller
+   cannot bound it at the source either).
