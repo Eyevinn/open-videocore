@@ -507,6 +507,12 @@ async function createOrAdoptCallbackListener(
   callbackSat: string
 ): Promise<{ instance: OscInstance; adopted: boolean }> {
   try {
+    console.info(
+      '[encore-scaler] spawn: creating callback listener %s for Encore instance %s (workspace=%s)',
+      instanceId,
+      encoreUrl,
+      config.workspaceId
+    );
     const created = (await createInstance(
       config.oscContext,
       ENCORE_CALLBACK_LISTENER_SERVICE_ID,
@@ -520,6 +526,12 @@ async function createOrAdoptCallbackListener(
     )) as OscInstance;
     return { instance: created, adopted: false };
   } catch (err) {
+    console.warn(
+      '[encore-scaler] spawn: create of callback listener %s failed (workspace=%s): %s',
+      instanceId,
+      config.workspaceId,
+      err instanceof Error ? err.message : String(err)
+    );
     // Adopt-on-"already taken": the listener is named after its Encore
     // instance, so a create that landed behind a 504 makes the retry collide
     // with itself.
@@ -594,15 +606,38 @@ async function spawnPooledInstance(
       if (config.profilesUrl) {
         instanceBody['profilesUrl'] = config.profilesUrl;
       }
+      // Say what is being created before the call: a create that hangs or
+      // fails at the gateway otherwise leaves no record of having been tried.
+      console.info(
+        '[encore-scaler] spawn: creating Encore instance %s (workspace=%s attempt=%d/%d)',
+        name,
+        config.workspaceId,
+        attempt,
+        maxAttempts
+      );
       instance = (await createInstance(
         config.oscContext,
         ENCORE_SERVICE_ID,
         sat,
         instanceBody
       )) as OscInstance;
+      console.info(
+        '[encore-scaler] spawn: created Encore instance %s (workspace=%s attempt=%d)',
+        name,
+        config.workspaceId,
+        attempt
+      );
       break;
     } catch (err) {
       lastErr = err;
+      console.warn(
+        '[encore-scaler] spawn: create of Encore instance %s failed (workspace=%s attempt=%d/%d): %s',
+        name,
+        config.workspaceId,
+        attempt,
+        maxAttempts,
+        err instanceof Error ? err.message : String(err)
+      );
       // #1071 ADOPT-ON-"ALREADY TAKEN". `name` is computed ONCE, outside this
       // loop, so every attempt sends the same name. That is deliberate: when a
       // previous attempt timed out at the gateway (504) but completed behind it,
