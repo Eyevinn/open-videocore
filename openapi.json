@@ -10214,6 +10214,268 @@
         }
       }
     },
+    "/api/v1/assets/{id}/deliver": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "destination": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  }
+                },
+                "required": [
+                  "destination"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "assetId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "delivered"
+                      ]
+                    },
+                    "destination": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "role": {
+                          "type": "string",
+                          "enum": [
+                            "packaged",
+                            "both"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "role"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "bucket": {
+                      "type": "string"
+                    },
+                    "objectKey": {
+                      "type": "string"
+                    },
+                    "bytes": {
+                      "type": "number"
+                    },
+                    "etag": {
+                      "type": "string"
+                    },
+                    "deliveredAt": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "assetId",
+                    "status",
+                    "destination",
+                    "bucket",
+                    "objectKey",
+                    "bytes",
+                    "etag",
+                    "deliveredAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/assets/{id}/clip": {
       "post": {
         "requestBody": {
@@ -11543,6 +11805,38 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "videoTracks": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "number"
+                          },
+                          "codec": {
+                            "type": "string"
+                          },
+                          "width": {
+                            "type": "number"
+                          },
+                          "height": {
+                            "type": "number"
+                          },
+                          "bitrateBps": {
+                            "type": "number"
+                          },
+                          "frameRate": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "codec",
+                          "width",
+                          "height"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
                     "audioTracks": {
                       "type": "array",
                       "items": {
@@ -11613,6 +11907,7 @@
                     }
                   },
                   "required": [
+                    "videoTracks",
                     "audioTracks",
                     "subtitleTracks"
                   ],
@@ -19817,6 +20112,16 @@
                           "workspaceId": {
                             "type": "string"
                           },
+                          "connectionId": {
+                            "type": "string"
+                          },
+                          "observed": {
+                            "type": "boolean"
+                          },
+                          "unobservedReason": {
+                            "type": "string",
+                            "description": "Why this workspace could not be queried. Carries the shape of the fault only \u2014 connection strings and error text stay in the server log, since this endpoint is unauthenticated."
+                          },
                           "queueDepth": {
                             "type": "number"
                           },
@@ -19854,13 +20159,71 @@
                               ],
                               "additionalProperties": false
                             }
+                          },
+                          "spawnFailure": {
+                            "type": "object",
+                            "properties": {
+                              "at": {
+                                "type": "number",
+                                "description": "Epoch milliseconds at which the failed scale-up was recorded."
+                              },
+                              "attempts": {
+                                "type": "number",
+                                "description": "Total instance-create calls the failed spawn made, across both the transcoder instance and its paired callback listener. Not the attempt number of a single retry loop: it can exceed the per-loop retry limit."
+                              },
+                              "consecutiveFailures": {
+                                "type": "number",
+                                "description": "How many scale-ups have failed in a row for this workspace. Reset to 0 by a successful spawn, so 1 is a fresh blip while a climbing number means the scaler has been unable to grow for a while."
+                              },
+                              "message": {
+                                "type": "string",
+                                "description": "Error text from the failed spawn, redacted at write time: credentials, tokens, URLs and bare network locations (host, host:port, IP:port) are stripped, as is any HTML markup, because upstream error text can echo the request the spawn sent. This endpoint is unauthenticated, so the field carries the SHAPE of the failure, not its details."
+                              }
+                            },
+                            "required": [
+                              "at",
+                              "attempts",
+                              "consecutiveFailures",
+                              "message"
+                            ],
+                            "additionalProperties": false,
+                            "description": "The last scale-up for this workspace that could not create an instance. Absent when the most recent spawn succeeded, or when none has failed recently. This is what distinguishes \"the pool is at maxInstances\" from \"the pool cannot grow\", which are otherwise identical on the wire."
                           }
                         },
                         "required": [
                           "workspaceId",
-                          "queueDepth",
-                          "inflightDepth",
+                          "observed",
                           "instances"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "connections": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "connectionId": {
+                            "type": "string",
+                            "description": "Stable non-secret identifier for a physical Valkey. Equal for every stack sharing a store, different for different stores. Absent when the connection could not be resolved at all."
+                          },
+                          "stacks": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "Provisioned stacks whose scaler loop uses this connection. Empty for the process-global connection when no stack resolved to it."
+                          },
+                          "observed": {
+                            "type": "boolean"
+                          },
+                          "unobservedReason": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "stacks",
+                          "observed"
                         ],
                         "additionalProperties": false
                       }
@@ -19880,6 +20243,7 @@
                   },
                   "required": [
                     "workspaces",
+                    "connections",
                     "maxInstances",
                     "jobsPerInstance",
                     "idleTimeoutMs",
@@ -20178,7 +20542,7 @@
         "tags": [
           "logs"
         ],
-        "description": "List operational log records as a cursor-paged, newest-first stream. Pass `cursor` (from a prior response `nextCursor`) to page forward; a null `nextCursor` marks the last page. Filter server-side with `from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-insensitive message substring). Set `order=asc` to reverse the default newest-first sort. This endpoint is cursor/sequence-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473).",
+        "description": "List operational log records as a cursor-paged, newest-first stream. Pass `cursor` (from a prior response `nextCursor`) to page forward; a null `nextCursor` marks the last page. Filter server-side with `from`/`to` (ISO-8601 time range on `timestamp`) and `q` (case-insensitive message substring). Set `order=asc` to reverse the default newest-first sort. This endpoint is cursor-only: there is no offset or page-number param, so newly appended entries never shift an in-flight page (#371, #473). Response header `x-log-window-degraded: true` means the durable store could not scan its whole retained window for this read and the page covers the newest records only; the body and 200 status are unchanged by this header (#996).",
         "parameters": [
           {
             "schema": {
@@ -21454,6 +21818,8 @@
         }
       },
       "delete": {
+        "summary": "Delete a collection",
+        "description": "Delete a collection. Member assets are never touched: membership lives inside the collection document, so deleting it unlinks the members and nothing more.\n\nDeleting an EMPTY collection needs no extra parameter and answers `204`. An unknown or foreign collection id is also a silent `204` (existence is never leaked), so `404` is not emitted on this route.\n\nDeleting a NON-EMPTY collection is refused by default with `409 delete_blocked`, `reason: \"member_of_collection\"`, carrying `memberCount` \u2014 the number of member assets the collection currently holds. The confirm-then-delete flow is:\n\n1. `DELETE /api/v1/collections/{id}` \u2192 `409` with `reason: \"member_of_collection\"` and e.g. `memberCount: 7`.\n2. Show the caller what they are about to unlink, then re-issue `DELETE /api/v1/collections/{id}?confirmMemberCount=7` \u2192 `204`.\n\nThe confirmation must match the CURRENT member count. If someone added or removed members in between, the retry is refused with the same `409 member_of_collection` carrying the new authoritative `memberCount` \u2014 never a silent delete. Re-confirm with that value and retry. `?force=true` is the blind alternative: it skips the count check entirely.\n\nA `409` with `reason: \"delete_protected\"` is a DIFFERENT and unrelated condition: the collection carries an explicit delete lock. It is a hard block \u2014 neither `?confirmMemberCount=` nor `?force=true` bypasses it, it carries NO `memberCount`, and both `blockedBy` arrays are empty. The only way forward is to clear the lock with `DELETE /api/v1/collections/{id}/lock` (then delete as normal). Branch on `reason`, not on the status code or `message`.",
         "parameters": [
           {
             "schema": {
@@ -21461,7 +21827,8 @@
             },
             "in": "query",
             "name": "force",
-            "required": false
+            "required": false,
+            "description": "Blind override of the soft `member_of_collection` block: delete a non-empty collection without asserting its member count. Prefer `confirmMemberCount` \u2014 `force` deletes whatever is there, including members added since you last read the collection. Never bypasses a `delete_protected` lock."
           },
           {
             "schema": {
@@ -21470,7 +21837,8 @@
             },
             "in": "query",
             "name": "confirmMemberCount",
-            "required": false
+            "required": false,
+            "description": "Assert how many member assets the collection currently holds, to delete a non-empty collection safely. Use the `memberCount` from the `409 member_of_collection` response (or the length of `assetIds` from GET /api/v1/collections/{id}). Matches the current count -> the delete proceeds (`204`). Does not match -> `409 member_of_collection` with the real `memberCount`; never a silent delete. Omit it to keep the safe default (non-empty collections are refused)."
           },
           {
             "schema": {
@@ -21483,20 +21851,21 @@
         ],
         "responses": {
           "204": {
-            "description": "Default Response",
+            "description": "Deleted. Also returned for an unknown or foreign collection id (delete is idempotent and never leaks existence).",
             "content": {
               "application/json": {
                 "schema": {
                   "enum": [
                     "null"
                   ],
-                  "nullable": true
+                  "nullable": true,
+                  "description": "Deleted. Also returned for an unknown or foreign collection id (delete is idempotent and never leaks existence)."
                 }
               }
             }
           },
           "400": {
-            "description": "Default Response",
+            "description": "Malformed query parameter \u2014 e.g. a `confirmMemberCount` that is not a non-negative integer.",
             "content": {
               "application/json": {
                 "schema": {
@@ -21515,13 +21884,14 @@
                   "required": [
                     "error"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "description": "Malformed query parameter \u2014 e.g. a `confirmMemberCount` that is not a non-negative integer."
                 }
               }
             }
           },
           "404": {
-            "description": "Default Response",
+            "description": "Not emitted on this route; an unknown or foreign collection id answers 204.",
             "content": {
               "application/json": {
                 "schema": {
@@ -21540,13 +21910,14 @@
                   "required": [
                     "error"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "description": "Not emitted on this route; an unknown or foreign collection id answers 204."
                 }
               }
             }
           },
           "409": {
-            "description": "Default Response",
+            "description": "Delete refused. Branch on `reason`: `member_of_collection` means the collection still holds `memberCount` member assets \u2014 retry with `?confirmMemberCount=<memberCount>`. `delete_protected` means an explicit delete lock is set \u2014 clear it with DELETE /api/v1/collections/{id}/lock; no confirmation or `?force=true` can bypass it.",
             "content": {
               "application/json": {
                 "schema": {
@@ -21556,10 +21927,12 @@
                       "type": "string",
                       "enum": [
                         "delete_blocked"
-                      ]
+                      ],
+                      "description": "Always `delete_blocked`. The single error code for every refused delete."
                     },
                     "message": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Human-readable explanation. Do not branch on it \u2014 branch on `reason`."
                     },
                     "reason": {
                       "type": "string",
@@ -21567,7 +21940,8 @@
                         "referenced_by_job",
                         "member_of_collection",
                         "delete_protected"
-                      ]
+                      ],
+                      "description": "Machine-readable cause, and the only field a client should branch on. `delete_protected` \u2014 an explicit delete lock is set on the collection; a HARD block that neither `?force=true` nor `?confirmMemberCount=` can bypass, and is lifted only by DELETE /api/v1/collections/{id}/lock. `member_of_collection` \u2014 the collection still holds member assets; a SOFT block, resolved by re-issuing the delete with `?confirmMemberCount=<memberCount>` (or `?force=true`). `referenced_by_job` is part of the shared envelope and is not emitted on this route."
                     },
                     "blockedBy": {
                       "type": "object",
@@ -21576,24 +21950,28 @@
                           "type": "array",
                           "items": {
                             "type": "string"
-                          }
+                          },
+                          "description": "Always empty on this route."
                         },
                         "collectionIds": {
                           "type": "array",
                           "items": {
                             "type": "string"
-                          }
+                          },
+                          "description": "On `member_of_collection`, the collection\u2019s own id (the reference that blocks). Empty on `delete_protected`."
                         }
                       },
                       "required": [
                         "jobIds",
                         "collectionIds"
                       ],
-                      "additionalProperties": false
+                      "additionalProperties": false,
+                      "description": "The references that blocked the delete. Both arrays are empty on `delete_protected`."
                     },
                     "memberCount": {
                       "type": "integer",
-                      "minimum": 0
+                      "minimum": 0,
+                      "description": "Present ONLY on `member_of_collection`: the number of member assets the collection currently holds. Echo this value back as `?confirmMemberCount=<memberCount>` to delete the collection in one follow-up call. Absent on `delete_protected`."
                     }
                   },
                   "required": [
@@ -21601,7 +21979,8 @@
                     "reason",
                     "blockedBy"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "description": "Delete refused. Branch on `reason`: `member_of_collection` means the collection still holds `memberCount` member assets \u2014 retry with `?confirmMemberCount=<memberCount>`. `delete_protected` means an explicit delete lock is set \u2014 clear it with DELETE /api/v1/collections/{id}/lock; no confirmation or `?force=true` can bypass it."
                 }
               }
             }

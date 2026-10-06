@@ -27,8 +27,10 @@ import {
 } from './types.js';
 import {
   destroyInstance,
+  evictVanishedInstances,
   listInstances,
   reapOrphanedInstances,
+  resolvePendingSpawns,
   spawnInstance,
   updateInstance
 } from './instance-pool.js';
@@ -236,20 +238,75 @@ export class EncoreScalerLoop {
     // 1. Pending work.
     const pending = await redis.llen(keys.queue(workspaceId));
 
+    // 1b. Resolve any PENDING spawn (#1071): an instance a previous tick's spawn
+    //     left running because it had not reported `running` within the readiness
+    //     budget — normal while OSC provisions a new worker node. Promote it into
+    //     the pool proper the moment OSC reports it healthy, or destroy it once it
+    //     has had a second full budget and OSC still does not. This runs BEFORE
+    //     the pool is read so the scale-up gate below sees the result: a promoted
+    //     instance is capacity we already have (no sibling spawned for the node
+    //     already being provisioned), and a destroyed one frees its slot under
+    //     maxInstances. Never fatal to the tick.
+    try {
+      await resolvePendingSpawns(this.config);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] pending-spawn resolve error (workspace=%s):',
+        workspaceId,
+        err
+      );
+    }
+
     // 2. Current pool.
     let instances = await listInstances(redis, workspaceId);
 
     // 3. Scale up (one instance per tick). Pre-warm to minInstances regardless
     //    of pending work; otherwise scale up only when every instance is busy
     //    and there is pending work.
-    const allBusy = instances.every((i) => i.activeJobs >= JOBS_PER_INSTANCE);
+    //
+    //    #1071: `allBusy` asks "is all the capacity I HAVE already working?", so
+    //    it must only consider instances that can take work. A PENDING entry
+    //    cannot: it has never reported healthy and dispatch skips it, so its
+    //    activeJobs is permanently 0. Counting it made `allBusy` false for as
+    //    long as any instance was coming up, which froze scale-up for the WHOLE
+    //    workspace — 2 busy instances, 20 queued jobs and a cap of 5 would spawn
+    //    nothing. Pending entries are still counted in `instances.length` below:
+    //    they hold ONE slot each against maxInstances, because each is a real
+    //    instance OSC is really provisioning, but they never speak for the
+    //    busyness of the pool.
+    const usable = instances.filter((i) => i.pendingReadySince === undefined);
+    const allBusy = usable.every((i) => i.activeJobs >= JOBS_PER_INSTANCE);
     const belowMin = instances.length < minInstances;
     if (
       instances.length < maxInstances &&
       (belowMin || (pending > 0 && allBusy))
     ) {
-      const spawned = await spawnInstance(this.config);
-      instances = [...instances, spawned];
+      // #1071: a spawn that cannot create an instance must NOT abort the tick.
+      // spawnInstance retries transient OSC errors and then throws; letting that
+      // throw escape took out everything after this gate — scale-down (step 4),
+      // the orphan sweep (4b) and dispatch (5) — for as long as spawning kept
+      // failing. That is worst exactly where it hurts most: on the belowMin
+      // pre-warm path the gate fires on EVERY tick regardless of pending work,
+      // so a workspace that cannot spawn stopped reaping and stopped dispatching
+      // to the capacity it already had. The failure itself is recorded on the
+      // pool's own state by spawnInstance (keys.spawnFailure) and reported per
+      // workspace by GET /scaler/status, so swallowing it here loses no signal:
+      // it is precisely what makes "at cap" distinguishable from "cannot spawn"
+      // without pod logs.
+      try {
+        const spawned = await spawnInstance(this.config);
+        instances = [...instances, spawned];
+      } catch (err) {
+        console.error(
+          '[encore-scaler] scale-up: spawn failed (workspace=%s pending=%d instances=%d max=%d); ' +
+            'continuing the tick with the existing pool:',
+          workspaceId,
+          pending,
+          instances.length,
+          maxInstances,
+          err
+        );
+      }
     }
 
     // 4. Scale down idle instances, but never below minInstances — and NEVER an
@@ -276,6 +333,14 @@ export class EncoreScalerLoop {
       // A record with neither usable timestamp fails closed (eligible), never
       // "hold forever"; the real-work + packaging-pin checks below still decide
       // whether it is destroyed or drained.
+      // #1071: a PENDING spawn is owned end to end by resolvePendingSpawns
+      // (step 1b) — it has never reported healthy, so neither the idle clock nor
+      // the real-work query says anything useful about it, and it has its own
+      // deadline. Never a scale-down candidate.
+      if (inst.pendingReadySince !== undefined) {
+        survivors.push(inst);
+        continue;
+      }
       const idlePastTimeout = isIdlePastTimeout(inst, now, idleTimeoutMs);
       if (inst.activeJobs === 0 && resolveIdleSince(inst) === undefined) {
         this.warnMissingIdleStampThrottled(inst, now);
@@ -380,6 +445,14 @@ export class EncoreScalerLoop {
       // new job dispatches. Skip it so its real active-job count can reach zero
       // and a later tick can safely remove it.
       if (inst.draining === true) {
+        continue;
+      }
+      // #1071: a PENDING spawn is in the pool so it counts against maxInstances
+      // and cannot be lost, but OSC has never reported it `running`. Dispatching
+      // to it would post a job to an instance that is still being placed on a
+      // node. It becomes eligible the tick after resolvePendingSpawns promotes
+      // it, which is also when its callback-trust probe starts.
+      if (inst.pendingReadySince !== undefined) {
         continue;
       }
       // Gate first-job dispatch on confirmed outbound TLS trust to the paired
@@ -944,6 +1017,44 @@ export class EncoreScalerLoop {
         poolUncheckedInstances.push(`${instanceId}(unreachable)`);
       }
       poolPass.push({ instanceId, record, real });
+    }
+
+    // An unreachable instance is kept (an outage mid-job must never cost the
+    // job) UNLESS OSC confirms it no longer exists: then its pool record is a
+    // leftover of a teardown or an external removal, and keeping it blocks
+    // the workspace — it counts as idle capacity so nothing scales up, and every
+    // dispatch to it fails and re-queues the job. Evict such records, and
+    // re-queue the jobs still mapped to them exactly as a scale-down
+    // interruption (the work on them is lost the same way). An evicted
+    // instance no longer makes the pool view partial, so it is dropped from
+    // the unchecked list too. Never fatal to the pass.
+    const unreachableIds = poolPass
+      .filter(({ real }) => real === undefined)
+      .map(({ instanceId }) => instanceId);
+    if (unreachableIds.length > 0) {
+      let evicted: string[] = [];
+      try {
+        evicted = await evictVanishedInstances(this.config, unreachableIds);
+      } catch (err) {
+        console.error(
+          '[encore-scaler] reconcile: vanished-instance check failed (workspace=%s):',
+          workspaceId,
+          err
+        );
+      }
+      if (evicted.length > 0) {
+        const gone = new Set(evicted);
+        for (const instanceId of evicted) {
+          await this.requeueScaleDownInterruptions(instanceId, new Set());
+        }
+        for (let i = poolPass.length - 1; i >= 0; i--) {
+          if (gone.has(poolPass[i]!.instanceId)) poolPass.splice(i, 1);
+        }
+        for (let i = poolUncheckedInstances.length - 1; i >= 0; i--) {
+          const entry = poolUncheckedInstances[i]!;
+          if (gone.has(entry.replace(/\(unreachable\)$/, ''))) poolUncheckedInstances.splice(i, 1);
+        }
+      }
     }
 
     // Every pool instance on which Encore currently reports `externalId` active.
