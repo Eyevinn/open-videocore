@@ -577,3 +577,29 @@ describe('DELETE /api/v1/provision/:name tears down the stack’s scaler pool', 
     expect(order[0]).toBe('scaler:mystack');
   });
 });
+
+describe('DELETE /api/v1/provision/:name for a stack the store no longer has', () => {
+  // A stack deprovisioned while the scaler teardown was a no-op left its pool
+  // keys (and possibly its instances) behind. Re-issuing the DELETE must still
+  // sweep that scaler state, while the response stays not_found.
+  it('still tears down scaler state under that name', async () => {
+    const paramStore = makeParamStore(undefined);
+    const teardown = vi.fn(async () => {});
+    const app = Fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    await app.register(provisionRouter, {
+      prefix: '/api/v1/provision',
+      osc,
+      paramStore,
+      operationStore: new OperationStore(),
+      getScalerRegistry: () => ({ teardown }) as never
+    });
+    await app.ready();
+
+    const op = await deprovisionAndWait(app, 'ghoststack');
+    expect(op.result.status).toBe('not_found');
+    expect(teardown).toHaveBeenCalledWith('ghoststack');
+    expect(removeInstance).not.toHaveBeenCalled();
+  });
+});

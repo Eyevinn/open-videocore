@@ -1737,7 +1737,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const config = await paramStore.loadStackConfig(workspaceId, name);
           if (!config) {
             // Idempotent: a retry after a successful teardown (entry already
-            // gone) lands here. Report not_found rather than erroring.
+            // gone) lands here. Report not_found rather than erroring — but
+            // still sweep any scaler state left under this name: a stack torn
+            // down while the scaler teardown was a no-op (it was keyed by the
+            // namespace, not the stack) left its pool keys and possibly its
+            // Encore instances behind, and re-issuing the DELETE is the
+            // operator's way to clean that up. teardown() is a clean no-op
+            // when there is nothing under the name.
+            const staleRegistry = getScalerRegistry?.();
+            if (staleRegistry) {
+              try {
+                await staleRegistry.teardown(name);
+              } catch (err) {
+                app.log.warn(
+                  { err, name },
+                  'scaler teardown for an already-removed stack failed; continuing'
+                );
+              }
+            }
             ops.update(op.id, {
               status: 'done',
               completedAt: Date.now(),
