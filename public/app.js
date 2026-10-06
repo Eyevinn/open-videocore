@@ -252,6 +252,22 @@ function canClipAsset() {
   return r === 'editor' || r === 'admin';
 }
 
+// Whether the current client role may add or remove a subtitle track (issue
+// #904). Same matrix, read before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` AND `delete` to `editor` and
+// `admin` and neither to `viewer`, and `methodToAction` (:79-93) maps POST ->
+// write and DELETE -> delete. Both subtitle-track routes sit under the assets
+// router's `resourceAuthorizationPreHandler('asset')`
+// (src/routes/assets.ts:1748, after `authGate` at :1738), so a viewer is
+// refused 403 `forbidden_insufficient_role` (src/auth/authorize.ts:99) on
+// either one. ONE flag covers both because the two actions resolve to the same
+// pair of roles. Client-side mirror only: a 403 that arrives anyway is still
+// reported inline by the panel.
+function canChangeSubtitleTracks() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
 // Window-scoped stack override for detached windows (e.g. detail.html). Unlike
 // setActiveStack, this does NOT touch the shared localStorage key, so popping
 // out a detail for a different stack cannot switch the opener window's active
@@ -2908,10 +2924,40 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // public/audio-track-edit.js.
     //
     // Mounted here, with the other information blocks (status history, metadata,
-    // scenes) and ABOVE the action controls, because it is predominantly
-    // reporting: the only writes it offers are the two scoped to its own audio
-    // section.
+    // scenes) and ABOVE the action controls: the panel is still predominantly
+    // reporting, and its write surfaces (audio #903, subtitles #904) act on
+    // sub-resources of the asset rather than on the asset's lifecycle, so they
+    // belong with the thing they edit and not in the asset-level action row.
     //
+    // ── Subtitle add/remove controls (issue #904) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/tracks-panel.js:
+    //   POST /api/v1/assets/{id}/subtitle-tracks — body REQUIRED, exactly
+    //        { language (1..64), format: "vtt"|"srt"|"ttml", label? (1..128),
+    //        default? } and `additionalProperties: false`
+    //        (`addSubtitleTrackSchema`, src/routes/assets.ts:829-834, wired at
+    //        :5390-5401); 201 = { track, uploadUrl? } — the ONE new track, not
+    //        the list (:5398) — 404 = { error }.
+    //   DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId} — params
+    //        { id, trackId }, no body, no query parameter (:5443); 204 = empty
+    //        (:5444), 404 = { error, message } for an unknown asset AND for an
+    //        unknown track id (:5450, :5455), which are not distinguishable.
+    //   GET /api/v1/assets/{id}/tracks — 200 { audioTracks, subtitleTracks },
+    //        both `required` (`tracksSchema` :836-839, handler :5301-5320). The
+    //        panel calls this ONLY after a write: neither write returns the
+    //        resulting list, and this is the smallest authoritative read of it.
+    //        The initial render still calls nothing — the arrays are already on
+    //        the asset body awaited above.
+    //
+    // The sub-resource paths take the ULID (`asset.id`), which this pane holds
+    // even when it was opened by slug: neither handler resolves a slug (both
+    // pass the raw param to `repo.get`, :5404 / :5448).
+    //
+    // `confirmModal` is handed in so Remove goes through the house confirmation
+    // primitive (issue #919) rather than a second, divergent dialog — and the
+    // panel renders NO Remove control without it, so there is no path to an
+    // unconfirmed DELETE.
     // ── Audio track add/remove (issue #903, broken out of #794) ──
     // Contract fetched before these calls were written and cited in full in
     // public/audio-track-edit.js:
@@ -2929,9 +2975,26 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // `asset.id` is the ULID even when this pane was opened by slug, which is
     // what both routes need: each hands its raw path param to `repo.get` with no
     // slug fallback (:5339, :5370).
+    //
+    // ONE mount carries both opt-ins: the subtitle controls this pane owns
+    // (`assetId` + `canChange` + `apiFetch` + `confirmModal`) and the audio
+    // editor (`audioEdit`). They are independent — a role that may write gets
+    // both, a viewer gets neither and is told why — and the panel keeps each
+    // one scoped to its own section.
     mountAssetTracks({
       asset: asset,
       host: body,
+      assetId: asset.id,
+      canChange: canChangeSubtitleTracks(),
+      apiFetch: apiFetch,
+      confirmModal: confirmModal,
+      onChanged: function () {
+        // Nothing else on this page projects the subtitle list — the assets
+        // table shows no track columns — so there is deliberately no table
+        // reload and no re-render of the pane here: the panel has already
+        // re-read the list and swapped its own subtitle section in place, which
+        // is the whole point of refreshing without a reload.
+      },
       audioEdit: canEditAudioTracks()
         ? {
             assetId: asset.id,

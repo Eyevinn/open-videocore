@@ -529,6 +529,58 @@ tr.row-locked td:first-child {
   margin-top: 4px;
 }
 
+/* Subtitle add/remove controls (issue #904). A write surface scoped to the
+   subtitle section — the video section stays read-only and audio has its own
+   controls below — so the editable section is set apart by its own heading and
+   form row rather than by restyling the whole block. */
+
+/* Same step as .tracks-group-title but without a count: "Add a subtitle track"
+   heads a form, and there is nothing to count. */
+.tracks-group-title-plain {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin: 14px 0 6px;
+}
+
+.subtitle-add {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 4px;
+}
+
+/* Wraps on a narrow pane rather than overflowing: the four fields plus the
+   button are a single logical row, not a fixed-width one. */
+.subtitle-add-row {
+  align-items: flex-end;
+}
+
+.subtitle-add-row input[type="text"] {
+  min-width: 140px;
+}
+
+/* Field help sits under its input, quieter than the value it explains. */
+.tracks-field-help {
+  font-size: 11px;
+  max-width: 260px;
+}
+
+/* The default-track checkbox: label and box on one line, so the box is not
+   stranded above its own text. */
+.subtitle-default-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.subtitle-default-label input {
+  cursor: pointer;
+}
+
 /* Audio track add/remove controls (issue #903). They belong to the editorial
    audio group, so they are inset against the group's left edge rather than
    floating free in the Audio section. */
@@ -552,15 +604,20 @@ tr.row-locked td:first-child {
   max-width: 260px;
 }
 
-/* The row of per-track controls. Shrink-to-fit so the button does not stretch
-   across a column sized for the Track ID beside it. */
-td.cell-actions {
+/* The per-row Remove cell, audio (#903) and subtitle (#904) alike: keep the
+   control tight against its row and shrink-to-fit, so the button does not
+   stretch across a column sized for the Track ID beside it. */
+td.cell-actions,
+.tracks-row-actions {
   white-space: nowrap;
   width: 1%;
 }
 
-/* The inline error and the success line are block-level inside the controls,
-   and keep .msg's own spacing. */
+/* Inline outcome regions: one per subtitle section (#904), and the audio
+   editor's error and success lines (#903). All reuse .msg/.msg-error etc. for
+   colour and keep .msg's own spacing, so a failure here looks like a failure
+   anywhere else in the UI. */
+.subtitle-notice,
 .audio-track-error,
 .audio-track-status {
   margin-top: 10px;
