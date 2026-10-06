@@ -1742,6 +1742,28 @@ pre.code-block {
   margin-bottom: 0;
 }
 
+/* Bulk-action bar above the assets table (issue #916). Visually a continuation
+   of the header strip rather than a floating overlay, so it never covers rows
+   and needs no dismissal affordance. */
+.assets-bulk-bar {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.assets-bulk-bar .form-row {
+  align-items: flex-end;
+}
+
+/* The tick-box column is a 32px gutter; the box itself keeps a target large
+   enough to hit without zooming (WCAG 2.1 AA 2.5.5 target size, AAA-sized here
+   because the column is narrow). */
+.asset-select-box {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
 .assets-table-scroll {
   flex: 1;
   min-height: 0;
