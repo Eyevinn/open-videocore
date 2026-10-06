@@ -44,6 +44,13 @@ const getInstance = vi.fn();
 const removeInstance = vi.fn();
 const saveSecret = vi.fn();
 const waitForInstanceReady = vi.fn(async () => undefined);
+// Readiness waits poll getInstanceHealth through the bounded shared helper
+// (src/services/instance-readiness.ts, issue #1038) rather than the SDK's
+// unbounded waitForInstanceReady, so the mock MUST provide it or every
+// provision in this file stalls on the readiness poll. 'running' is the ready
+// state (@osaas/client-core@0.24.0 lib/core.d.ts, exported from
+// lib/index.d.ts:6). Same shape as provision.idempotency.test.ts:31.
+const getInstanceHealth = vi.fn(async (..._args: unknown[]) => 'running');
 const getPortsForInstance = vi.fn(async () => []);
 
 vi.mock('@osaas/client-core', () => ({
@@ -54,6 +61,8 @@ vi.mock('@osaas/client-core', () => ({
     getPortsForInstance(...(args as [])),
   waitForInstanceReady: (...args: unknown[]) =>
     waitForInstanceReady(...(args as [])),
+  getInstanceHealth: (...args: unknown[]) =>
+    getInstanceHealth(...(args as [])),
   saveSecret: (...args: unknown[]) => saveSecret(...(args as [])),
   Context: class {}
 }));
@@ -109,7 +118,7 @@ import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
 import { OBJECT_STORE_SERVICE_ID } from '../services/stack.js';
 import {
   LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
-  deriveObjectStoreCredential,
+  deriveObjectStoreSecretAccessKey,
   resolveObjectStoreCredential
 } from '../services/object-store-credentials.js';
 import { OperationStore, type Operation } from '../services/operation-store.js';
@@ -175,7 +184,13 @@ async function buildApp(paramStore: ParamStore) {
     prefix: '/api/v1/provision',
     osc,
     paramStore,
-    operationStore
+    operationStore,
+    // The bounded readiness wait sleeps BEFORE its first getInstanceHealth
+    // probe (provision.ts:311/565, default
+    // DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS). Collapse that cadence, as
+    // provision.idempotency.test.ts does, or waitForOperation below exhausts
+    // its setImmediate budget while the flow is still sleeping between probes.
+    readyPollIntervalMs: 1
   });
   await app.ready();
   return app;
@@ -232,6 +247,29 @@ function createBodyFor(serviceId: string, name: string): Record<string, unknown>
   return call[3] as Record<string, unknown>;
 }
 
+// The credential a provision run ISSUED for `stack`, read back from the
+// object-store create body. A newly issued id carries a random per-issue
+// GENERATION, so it is deliberately NOT recomputable from (seed, stackName) —
+// that is what stops a reused stack name replaying a retired credential. The
+// id on the create body is the ground truth of what the live instance was
+// created with, and the secret is the derivation keyed on that id, which is
+// exactly what every read path recomputes.
+function issuedCredential(stack: string): {
+  accessKeyId: string;
+  secretAccessKey: string;
+} {
+  const accessKeyId = createBodyFor(OBJECT_STORE_SERVICE_ID, stack)[
+    'RootUser'
+  ] as string;
+  return {
+    accessKeyId,
+    secretAccessKey: deriveObjectStoreSecretAccessKey(
+      DEPLOYMENT_SEED,
+      accessKeyId
+    )
+  };
+}
+
 // The value saved for one (serviceId, secretName) pair.
 function savedSecret(serviceId: string, secretName: string): string | undefined {
   const call = saveSecret.mock.calls.find(
@@ -278,15 +316,34 @@ describe('POST /api/v1/provision issues a per-stack object-store credential (iss
     await provisionAndWait(app, 'stacka');
     await provisionAndWait(app, 'stackb');
 
-    const expectedA = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stacka');
-    const expectedB = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stackb');
-
     // 1. The created object stores have different root users — neither is the
     //    former process-global one.
     const rootUserA = createBodyFor(OBJECT_STORE_SERVICE_ID, 'stacka')['RootUser'];
     const rootUserB = createBodyFor(OBJECT_STORE_SERVICE_ID, 'stackb')['RootUser'];
-    expect(rootUserA).toBe(expectedA.accessKeyId);
-    expect(rootUserB).toBe(expectedB.accessKeyId);
+
+    // A newly ISSUED id is minted under a random per-issue generation, so it
+    // is deliberately NOT recomputable from (seed, stackName) — that is what
+    // stops a reused stack name replaying a retired credential. The oracle is
+    // therefore the id's SHAPE plus the derivation keyed on the OBSERVED id
+    // (which is what every read path uses); the generation's own property —
+    // a re-provisioned stack name gets a different id — is asserted in
+    // 'mints a NEW credential ...' below.
+    expect(rootUserA).toMatch(/^ovc[a-z0-9]{17}$/);
+    expect(rootUserB).toMatch(/^ovc[a-z0-9]{17}$/);
+    const expectedA = {
+      accessKeyId: rootUserA as string,
+      secretAccessKey: deriveObjectStoreSecretAccessKey(
+        DEPLOYMENT_SEED,
+        rootUserA as string
+      )
+    };
+    const expectedB = {
+      accessKeyId: rootUserB as string,
+      secretAccessKey: deriveObjectStoreSecretAccessKey(
+        DEPLOYMENT_SEED,
+        rootUserB as string
+      )
+    };
     expect(rootUserA).not.toBe(rootUserB);
     expect(rootUserA).not.toBe(LEGACY_OBJECT_STORE_ACCESS_KEY_ID);
     expect(rootUserB).not.toBe(LEGACY_OBJECT_STORE_ACCESS_KEY_ID);
@@ -329,7 +386,7 @@ describe('POST /api/v1/provision issues a per-stack object-store credential (iss
 
     await provisionAndWait(app, 'stacka');
 
-    const expected = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stacka');
+    const expected = issuedCredential('stacka');
     expect(s3ClientCredentials).toContainEqual({
       accessKey: expected.accessKeyId,
       secretKey: expected.secretAccessKey
@@ -345,7 +402,7 @@ describe('POST /api/v1/provision issues a per-stack object-store credential (iss
 
     await provisionAndWait(app, 'stacka');
 
-    const expected = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stacka');
+    const expected = issuedCredential('stacka');
     const body = createBodyFor(OBJECT_STORE_SERVICE_ID, 'stacka');
     expect(body['RootPassword']).toBe('{{secrets.stacka.rootpassword}}');
     expect(JSON.stringify(body)).not.toContain(expected.secretAccessKey);
@@ -357,7 +414,7 @@ describe('POST /api/v1/provision issues a per-stack object-store credential (iss
 
     await provisionAndWait(app, 'stacka');
 
-    const expected = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stacka');
+    const expected = issuedCredential('stacka');
     // Same mechanism as the #212 external-backend credentials: one secret per
     // consuming serviceId, named <stackName>.<purpose>, value handed straight
     // to saveSecret.
@@ -383,7 +440,7 @@ describe('no object-store secret is logged, returned or stored (issue #1094)', (
     const op = await provisionAndWait(app, 'stacka');
     expect(op.status).toBe('done');
 
-    const expected = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stacka');
+    const expected = issuedCredential('stacka');
 
     // Logs: nothing the route emitted carries the secret (or the seed).
     const logs = logOutput.join('\n');
@@ -424,7 +481,7 @@ describe('object-store credential lifecycle (issue #1094)', () => {
 
     // CREATE on provision.
     await provisionAndWait(app, 'stacka');
-    const expected = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stacka');
+    const expected = issuedCredential('stacka');
     expect(savedSecret(OBJECT_STORE_SERVICE_ID, 'stacka.rootpassword')).toBe(
       expected.secretAccessKey
     );
@@ -466,7 +523,7 @@ describe('object-store credential lifecycle (issue #1094)', () => {
     const app = await buildApp(store);
 
     await provisionAndWait(app, 'stacka');
-    const expected = deriveObjectStoreCredential(DEPLOYMENT_SEED, 'stacka');
+    const expected = issuedCredential('stacka');
 
     // The object store now exists (adopted on the retry) and the stored config
     // records the per-stack id: the retry must stay on that exact credential.
@@ -480,6 +537,37 @@ describe('object-store credential lifecycle (issue #1094)', () => {
     for (const rootUser of rootUsers) {
       expect(rootUser).toBe(expected.accessKeyId);
     }
+  });
+
+  it('mints a NEW credential when a torn-down stack name is provisioned again', async () => {
+    // The credential cannot be a pure function of (seed, stackName): OSC
+    // secrets are write-only (saveSecret only — @osaas/client-core
+    // lib/core.d.ts:154, lib/index.d.ts:6), so teardown cannot REVOKE the
+    // secret it wrote. If re-provisioning a reused name reproduced the same
+    // pair, whoever held the old stack's secret would hold the new stack's
+    // secret. The per-issue generation is what makes the reissue distinct.
+    const { store } = makeParamStore();
+    const app = await buildApp(store);
+
+    await provisionAndWait(app, 'stacka');
+    const first = issuedCredential('stacka');
+
+    // Tear the stack down: the stored access key id goes with the config, so
+    // the next provision of this name has no recorded id and must ISSUE one.
+    setObjectStoreExists(true);
+    expect((await deprovisionAndWait(app, 'stacka')).status).toBe('done');
+    setObjectStoreExists(false);
+
+    createInstance.mock.calls.length = 0;
+    await provisionAndWait(app, 'stacka');
+    const second = issuedCredential('stacka');
+
+    expect(second.accessKeyId).not.toBe(first.accessKeyId);
+    expect(second.secretAccessKey).not.toBe(first.secretAccessKey);
+    // Still a well-formed per-stack credential, not a degraded fallback.
+    expect(second.accessKeyId).toMatch(/^ovc[a-z0-9]{17}$/);
+    expect(second.accessKeyId).not.toBe(LEGACY_OBJECT_STORE_ACCESS_KEY_ID);
+    expect(second.secretAccessKey).not.toBe(DEPLOYMENT_SEED);
   });
 
   it('keeps the legacy credential for a stack whose object store already exists without one', async () => {

@@ -143,15 +143,19 @@ describe("the API's per-stack client uses the stack's own credential (issue #109
     const a = await resolver.resolve('stacka');
     const b = await resolver.resolve('stackb');
 
+    // s3Config has carried stackName since #1093, so these are full-shape
+    // assertions, not just the credential pair.
     expect(a.s3Config).toEqual({
       endpoint: 'https://stacka-objectstore.example.test',
       accessKey: CRED_A.accessKeyId,
-      secretKey: CRED_A.secretAccessKey
+      secretKey: CRED_A.secretAccessKey,
+      stackName: 'stacka'
     });
     expect(b.s3Config).toEqual({
       endpoint: 'https://stackb-objectstore.example.test',
       accessKey: CRED_B.accessKeyId,
-      secretKey: CRED_B.secretAccessKey
+      secretKey: CRED_B.secretAccessKey,
+      stackName: 'stackb'
     });
 
     // Different stacks, different credentials — and neither is the former
@@ -173,7 +177,9 @@ describe("the API's per-stack client uses the stack's own credential (issue #109
     expect(connections.s3Config).toEqual({
       endpoint: 'https://oldstack-objectstore.example.test',
       accessKey: LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
-      secretKey: SEED
+      secretKey: SEED,
+      // s3Config has carried stackName since #1093.
+      stackName: 'oldstack'
     });
   });
 });
