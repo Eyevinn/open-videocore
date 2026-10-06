@@ -46,6 +46,7 @@ import {
 } from '../services/stack.js';
 import {
   LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+  newObjectStoreCredentialGeneration,
   planObjectStoreCredential,
   type ObjectStoreCredentialPlan
 } from '../services/object-store-credentials.js';
@@ -833,6 +834,17 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 stackName: name,
                 seed: minioRootPassword,
                 legacySecretAccessKey: minioRootPassword,
+                // A FRESH generation for this provision run (issue #1094
+                // review follow-up). Without it the credential would be a pure
+                // function of (seed, stackName), so tearing a stack down and
+                // provisioning the same name again would replay the retired
+                // credential — which teardown cannot revoke, because the OSC
+                // secrets API is write-only (saveSecret only, no delete:
+                // @osaas/client-core lib/core.d.ts:154 / lib/index.d.ts:6).
+                // Only used on the ISSUE branch: a stack that already has a
+                // recorded access key id keeps it verbatim, so this does not
+                // disturb the idempotent retry path (#417).
+                generation: newObjectStoreCredentialGeneration(),
                 storedAccessKeyId: existing?.objectStoreAccessKeyId,
                 storedConfigExists: Boolean(existing),
                 objectStoreInstanceExists,

@@ -8,8 +8,11 @@
 // credential could not be rotated for one stack without breaking all of them.
 //
 // AFTER: each stack's object store is created with its OWN access key id and
-// secret access key. The credential is DERIVED, not randomly generated and
-// stored, for three reasons that matter on this platform:
+// secret access key, minted under a per-issue GENERATION nonce so that a
+// re-provision of a torn-down stack name gets a genuinely new credential
+// rather than a replay of the retired one (see GENERATION below). The
+// credential is DERIVED, not randomly generated and stored in full, for three
+// reasons that matter on this platform:
 //
 //   1. OSC secrets are WRITE-ONLY. `saveSecret(serviceId, name, value, ctx)`
 //      POSTs to `/mysecrets/<serviceId>` (@osaas/client-core
@@ -26,8 +29,30 @@
 //      A derivation keyed on the stack is stable across retries by construction.
 //
 // Derivation (HMAC-SHA256, domain-separated):
-//   accessKeyId     = 'ovc' + HMAC(seed, '<access-key-id ctx>/<stackName>')  (hex, 20 chars)
-//   secretAccessKey = HMAC(seed, '<secret ctx>/<accessKeyId>')               (base64url, 40 chars)
+//   accessKeyId     = 'ovc' + HMAC(seed, '<id ctx>/<stackName>[/g=<gen>]')  (hex, 20 chars)
+//   secretAccessKey = HMAC(seed, '<secret ctx>/<accessKeyId>')              (base64url, 40 chars)
+//
+// GENERATION (issue #1094, review follow-up). The derivation above is a pure
+// function of its inputs, so with only (seed, stackName) as inputs a stack name
+// that is torn down and provisioned again would be handed back the IDENTICAL
+// credential — and teardown cannot retire the old one, because the OSC secrets
+// API is write-only (no delete, see reason 1 below). Anyone who held the old
+// stack's secret would therefore hold the new stack's secret. The `generation`
+// input closes that: it is a 64-bit random nonce minted ONCE, by the caller, at
+// the moment a credential is ISSUED for a stack that has none
+// (`newObjectStoreCredentialGeneration()` + provision's call to
+// `planObjectStoreCredential`). Randomness lives in the CALLER so every
+// function here stays pure and the decision table stays unit-testable.
+//
+// The generation never needs to be persisted: it only shapes the accessKeyId,
+// and the accessKeyId IS persisted (`StackConfig.objectStoreAccessKeyId`) and
+// is the ground truth of what the live instance was created with. Every read
+// path re-derives the secret from the STORED id, so a retried/idempotent
+// provision (#417) and every later read stay stable within a generation while
+// a fresh issue starts a new one. `generation` omitted / empty means
+// GENERATION ZERO — the pre-generation derivation, byte-identical to the
+// credentials already issued by earlier builds of this module, so already-live
+// stacks keep working.
 //
 // The accessKeyId is NON-SECRET (it is an identifier, like a username — the
 // same classification the #212 external-credential mapping uses, see the
@@ -46,18 +71,36 @@
 // as rotating MINIO_ROOT_PASSWORD already does today, since the live instances
 // keep the password they were created with. No new operational constraint.
 //
+// WHAT "ROTATABLE PER STACK" MEANS HERE, PRECISELY. One stack's credential can
+// be reissued without touching any other stack's: minting a new generation
+// yields a new (id, secret) pair for that stack alone, and the pair a different
+// stack resolves is unchanged because it is keyed on that stack's own stored
+// id. What this module does NOT do is push the new pair onto a LIVE object
+// store: the credential is the OSC instance's root user, and an adopted
+// instance keeps the root user it was created with (see
+// planObjectStoreCredential). So reissue takes effect for a stack that is
+// (re-)created, which is why a reused stack name must not replay the retired
+// credential — the generation nonce is what prevents that.
+//
 // NO SECRET IS LOGGED OR RETURNED. Every function here is pure and returns the
 // credential to its caller; nothing in this module logs. Callers put the secret
 // only into (a) `saveSecret`, (b) an OSC create-instance body as a
 // `{{secrets.*}}` REFERENCE, or (c) an S3 client constructor.
 //
-// OUT OF SCOPE (deliberately, per the issue split): scoping a key to a single
-// bucket (#1095) and migrating already-provisioned stacks / removing the legacy
-// fallback (#1096). Until #1096 runs, a stack whose stored config carries no
-// `objectStoreAccessKeyId` keeps using the legacy `admin` + seed credential,
-// byte-identically to the pre-#1094 behaviour.
+// STILL OPEN (tracked, NOT claimed as done by this module):
+//   - #1095, scoping a key to only this stack's source + packaged buckets. The
+//     credential here is the object store's ROOT user, which is an admin
+//     identity on its own instance, so it is confined to one stack's buckets
+//     only in the sense that the instance holds nothing else. A genuinely
+//     bucket-scoped, non-admin key needs a policy-bound object-store user,
+//     which the object-store JS SDK cannot create — see
+//     OBJECT_STORE_BUCKET_SCOPE_LIMITATION below.
+//   - #1096, migrating already-provisioned stacks and REMOVING the legacy
+//     fallback. Until that lands, a stack whose stored config carries no
+//     `objectStoreAccessKeyId` keeps using the legacy `admin` + seed
+//     credential, byte-identically to the pre-#1094 behaviour.
 
-import { createHmac } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 
 // The legacy, process-global object-store root user every pre-#1094 stack was
 // created with (`RootUser: 'admin'` in routes/provision.ts). Kept as the single
@@ -83,6 +126,29 @@ const ACCESS_KEY_ID_LENGTH = 20;
 // 240 bits of the HMAC retained.
 const SECRET_ACCESS_KEY_LENGTH = 40;
 
+// A credential GENERATION: the random, per-issue component that makes a newly
+// issued credential unpredictable instead of a pure function of the stack name
+// (see GENERATION in the header). 64 bits as 16 lowercase hex chars — enough
+// that a reused stack name never collides with its own retired credential, and
+// over a charset that is safe inside the HMAC message and in any log line (the
+// generation is NOT secret; it only has to be unguessable-by-replay).
+export type ObjectStoreCredentialGeneration = string;
+
+// Generation ZERO: the pre-generation derivation. Reserved for credentials
+// issued before the generation component existed, so they keep resolving.
+// NEVER pass this when ISSUING a new credential — use
+// newObjectStoreCredentialGeneration().
+export const LEGACY_CREDENTIAL_GENERATION: ObjectStoreCredentialGeneration = '';
+
+const CREDENTIAL_GENERATION_BYTES = 8;
+
+// Mint a fresh generation. The ONLY impure function in this module; kept here,
+// rather than inside the derivation, so the derivation stays a pure function of
+// explicit inputs and the provision decision table stays testable.
+export function newObjectStoreCredentialGeneration(): ObjectStoreCredentialGeneration {
+  return randomBytes(CREDENTIAL_GENERATION_BYTES).toString('hex');
+}
+
 export type ObjectStoreCredential = {
   // NON-SECRET identifier. Safe to persist in the parameter store.
   accessKeyId: string;
@@ -92,16 +158,22 @@ export type ObjectStoreCredential = {
   secretAccessKey: string;
 };
 
-// Derive the stack's access key id. Stable for a given (seed, stackName) pair,
-// so a retried/idempotent provision computes the same id the live instance was
-// created with.
+// Derive the stack's access key id. Stable for a given
+// (seed, stackName, generation) triple, so a retried/idempotent provision
+// within one generation computes the same id the live instance was created
+// with, while a NEW generation yields a different id for the same stack name.
+// `generation` defaults to generation zero (the pre-generation derivation) so
+// credentials issued before the generation component still resolve.
 export function deriveObjectStoreAccessKeyId(
   seed: string,
-  stackName: string
+  stackName: string,
+  generation: ObjectStoreCredentialGeneration = LEGACY_CREDENTIAL_GENERATION
 ): string {
-  const digest = createHmac('sha256', seed)
-    .update(`${ACCESS_KEY_ID_CONTEXT}/${stackName}`)
-    .digest('hex');
+  const message =
+    generation.length > 0
+      ? `${ACCESS_KEY_ID_CONTEXT}/${stackName}/g=${generation}`
+      : `${ACCESS_KEY_ID_CONTEXT}/${stackName}`;
+  const digest = createHmac('sha256', seed).update(message).digest('hex');
   return `${OBJECT_STORE_ACCESS_KEY_ID_PREFIX}${digest}`.slice(
     0,
     ACCESS_KEY_ID_LENGTH
@@ -121,13 +193,18 @@ export function deriveObjectStoreSecretAccessKey(
     .slice(0, SECRET_ACCESS_KEY_LENGTH);
 }
 
-// The full per-stack credential for a stack name. Used at PROVISION time, where
-// the stack name is authoritative and the id has not been stored yet.
+// The full per-stack credential for a stack name and generation. Used at
+// PROVISION time, where the stack name is authoritative and the id has not been
+// stored yet. Pass a FRESH generation from
+// newObjectStoreCredentialGeneration() when issuing; the default (generation
+// zero) reproduces the pre-generation derivation and must only be used to
+// resolve credentials issued before the generation component existed.
 export function deriveObjectStoreCredential(
   seed: string,
-  stackName: string
+  stackName: string,
+  generation: ObjectStoreCredentialGeneration = LEGACY_CREDENTIAL_GENERATION
 ): ObjectStoreCredential {
-  const accessKeyId = deriveObjectStoreAccessKeyId(seed, stackName);
+  const accessKeyId = deriveObjectStoreAccessKeyId(seed, stackName, generation);
   return {
     accessKeyId,
     secretAccessKey: deriveObjectStoreSecretAccessKey(seed, accessKeyId)
@@ -204,6 +281,13 @@ export function planObjectStoreCredential(args: {
   // `true` when the existence probe could not answer: that is the conservative
   // answer (fallback), never the breaking one.
   objectStoreInstanceExists: boolean;
+  // The generation to mint a NEW credential under (see GENERATION in the
+  // header). Supply `newObjectStoreCredentialGeneration()` from the provision
+  // path so a reused stack name cannot be handed back a retired credential.
+  // Only read on the ISSUE branch: a stack that already has a recorded access
+  // key id keeps that id verbatim, whatever generation it was issued under.
+  // Omitted/empty means generation zero, i.e. the pre-generation derivation.
+  generation?: ObjectStoreCredentialGeneration;
   // False when this deployment has no parameter store. Without one the
   // per-stack access key id cannot be persisted, so nothing could ever resolve
   // it again — the only correct choice is the fallback.
@@ -242,8 +326,43 @@ export function planObjectStoreCredential(args: {
   // situation — a pre-#1094 record.
   if (args.objectStoreInstanceExists || args.storedConfigExists) return legacy;
 
+  // Issue a NEW credential, under the caller-supplied generation.
   return {
-    credential: deriveObjectStoreCredential(args.seed, args.stackName),
+    credential: deriveObjectStoreCredential(
+      args.seed,
+      args.stackName,
+      args.generation ?? LEGACY_CREDENTIAL_GENERATION
+    ),
     perStack: true
   };
 }
+
+// WHY #1095 (bucket-scoped keys) CANNOT BE SATISFIED BY THIS MODULE ALONE.
+// Verified against the contracts, not assumed:
+//   - the only credential fields this repo's object-store create body carries
+//     are `RootUser` + `RootPassword` (routes/provision.ts:1006-1007). NOTE:
+//     this is the repo's usage, NOT the upstream OSC service schema, which
+//     could not be fetched here — whether the service exposes any additional
+//     user/policy field MUST be confirmed against the OSC service schema
+//     before #1095 is designed. On the usage as it stands, the key a stack is
+//     provisioned with is that instance's ROOT user.
+//   - creating a non-root user restricted to `arn:aws:s3:::<source>/*` and
+//     `arn:aws:s3:::<packaged>/*` therefore needs the object store's ADMIN API
+//     (add-canned-policy + add-user / add-service-account). The object-store JS
+//     client (`minio@^8`) exposes no admin surface: `makeRequestAsync` is its
+//     only signed escape hatch (node_modules/minio/dist/main/internal/
+//     client.d.ts:156, options type `RequestOption = Partial<IRequest> & ...`
+//     with `path` from IRequest), and while that can reach an admin path, the
+//     add-user and add-service-account bodies must be encrypted with the admin
+//     secret, which the client does not implement.
+//   - bucket POLICIES (the SDK's setBucketPolicy, already used for the public
+//     packaged-read policy in routes/provision.ts) cannot substitute: they bind
+//     a principal, and a root/admin identity is not constrained by them.
+// So #1095 needs either an OSC object-store option for a scoped user, or an
+// admin-API-capable client. Logged as OSC friction; the constant below exists
+// so call sites can reference the limitation instead of restating it.
+export const OBJECT_STORE_BUCKET_SCOPE_LIMITATION =
+  'per-stack object-store keys are the instance root user: the create body ' +
+  'carries only RootUser/RootPassword and the object-store client exposes no ' +
+  'admin API, so a bucket-scoped non-admin user cannot be created at ' +
+  'provision time (#1095)';
