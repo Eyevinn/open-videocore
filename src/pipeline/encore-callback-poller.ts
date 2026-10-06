@@ -34,6 +34,7 @@
 import type { Redis } from 'ioredis';
 import type { Context } from '@osaas/client-core';
 import type { JobRepository } from '../data/job-repo.js';
+import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import { isStepComplete } from '../data/pipeline-repo.js';
 import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js';
@@ -42,6 +43,11 @@ import type { PipelineLogSink } from '../services/pipeline-log.js';
 import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
+import {
+  PERSISTED_STACK_FALLBACK_MESSAGE,
+  runWithPersistedStack,
+  runWithRequestStack
+} from '../services/request-stack-context.js';
 import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
 import { DEFAULT_RECONCILE_GRACE_MS } from '../encore-scaler/scaler-loop.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from '../encore-scaler/retry-store.js';
@@ -92,9 +98,12 @@ type Logger = {
   info(...a: any[]): void;
   warn(...a: any[]): void;
   error(...a: any[]): void;
+  // Optional (issue #1097): used only for the legacy-document fallback notice,
+  // so a logger without a debug level (several test fakes) still satisfies this.
+  debug?(...a: any[]): void;
 };
 
-type PollerDeps = {
+export type PollerDeps = {
   redis: Redis;
   jobRepository: JobRepository;
   assetRepository: AssetRepository;
@@ -383,14 +392,85 @@ async function decrementActiveJobs(
   }
 }
 
-// Process one queue message: fetch the Encore job, resolve our job, complete the
-// transcode, and advance the matching PipelineExecution.
+// The stack a queue message's transcode job belongs to (issue #1097).
+//
+// This loop is the restart/resume path for transcode completions: messages left
+// in the processing set by a killed process are returned to the queue on startup
+// (recoverProcessingQueue below) and drained here with NO ambient stack context
+// at all. Every repository call in handleMessage therefore resolved the
+// FIRST-LISTED stack, so a completion for a job on any other stack found no
+// local job and was dropped ("no local job for externalId"), leaving the job
+// `running` and its asset `processing` forever.
+//
+// Two identity sources, in priority order:
+//   1. `Job.stackName` (src/data/job-repo.ts) — the stack the job was created
+//      against, persisted at create time. Authoritative.
+//   2. the contextId embedded in the externalId we issued
+//      (`encodeEncoreJobId(contextId, jobLocalId)`, src/data/job-repo.ts), which
+//      is the resolved stack name for a provisioned stack and the fixed
+//      DEPLOYMENT_CONTEXT otherwise. This is the #1058 identity source and it is
+//      what makes the lookup in (1) land on the right stack in the first place.
+// The externalId is read from the dispatch-time UUID mapping
+// (`keys.uuidToExternalId`, src/encore-scaler/types.ts) so no Encore round-trip
+// is needed. Returns undefined when neither source answers (no mapping, no
+// decodable context) — the documented legacy case, which keeps today's
+// first-listed-stack behaviour.
+//
+// Exported for tests only.
+export async function stackForQueueMessage(
+  deps: PollerDeps,
+  raw: string
+): Promise<string | undefined> {
+  try {
+    const { jobId: encoreUuid } = JSON.parse(raw) as { jobId?: string };
+    if (!encoreUuid) return undefined;
+    const externalId = await deps.redis.get(keys.uuidToExternalId(encoreUuid));
+    if (!externalId) return undefined;
+    const decoded = decodeEncoreJobId(externalId)?.workspaceId;
+    const found = await runWithRequestStack(decoded, () =>
+      deps.jobRepository.findByEncoreJobId(externalId)
+    );
+    if (found?.job.stackName) return found.job.stackName;
+    // The decoded contextId is the fixed DEPLOYMENT_CONTEXT ('default',
+    // src/auth/workspace.ts:46) — not a stack name — for a single-stack
+    // env-override deployment and for every job dispatched before stacks were
+    // provisioned. Returning it as if it WERE a stack name degrades safely (an
+    // unknown name resolves first-listed), but it suppresses the documented
+    // legacy-document debug notice on this path, so an operator grepping for
+    // pre-#1097 jobs would not see them. Report it as "no persisted identity"
+    // instead, which is what it is.
+    return decoded === DEPLOYMENT_CONTEXT ? undefined : decoded;
+  } catch {
+    // Best-effort: a corrupt message, a Valkey hiccup or a repository error here
+    // must never stop the message from being processed. It degrades to the
+    // ambient (first-listed) resolution, exactly as before this resolution
+    // existed.
+    return undefined;
+  }
+}
+
+// Process one queue message in the stack its job belongs to (issue #1097), then
+// fetch the Encore job, resolve our job, complete the transcode, and advance the
+// matching PipelineExecution.
 //
 // Throws on retryable failures (network errors, non-2xx Encore fetch, DB write
 // errors) so the outer loop can re-queue the message and retry. Non-retryable
 // cases (unparseable message, unknown externalId) log and return cleanly so the
 // message is dropped rather than looped forever.
 async function handleMessage(deps: PollerDeps, raw: string): Promise<void> {
+  const stackName = await stackForQueueMessage(deps, raw);
+  return runWithPersistedStack(
+    stackName,
+    () => handleMessageInStack(deps, raw),
+    () =>
+      deps.logger.debug?.({
+        msg: `encore-callback-poller: ${PERSISTED_STACK_FALLBACK_MESSAGE}`,
+        raw
+      })
+  );
+}
+
+async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void> {
   let message: { jobId?: string; url?: string };
   try {
     message = JSON.parse(raw);

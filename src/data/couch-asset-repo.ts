@@ -67,6 +67,7 @@ import {
   toTombstoneDocument
 } from './asset-tombstone.js';
 import { updateWithRetry, type StoredDoc, type StackCouch } from './couchdb.js';
+import { currentDocumentStackName } from '../services/request-stack-context.js';
 
 const RESOURCE_TYPE = 'asset';
 
@@ -112,6 +113,11 @@ export class CouchAssetRepository implements AssetRepository {
       sourceMethod: method,
       originUri: input.originUri,
       provenance: initialProvenance(now, method),
+      // Durable stack identity (issue #1097): the stack this asset is being
+      // created against, so post-upload work (metadata extraction, thumbnails)
+      // can re-enter it even with no ambient context. Undefined outside a
+      // request, which preserves the previous default-stack behaviour.
+      stackName: input.stackName ?? currentDocumentStackName(),
       createdAt: now,
       updatedAt: now
     };
@@ -379,6 +385,17 @@ export class CouchAssetRepository implements AssetRepository {
     if (patch.name !== undefined) next.name = patch.name;
     if (patch.description !== undefined) next.description = patch.description;
     if (patch.objectKey !== undefined) next.objectKey = patch.objectKey;
+    // Recorded ingest size (issue #1059) — same invariant as the in-memory repo
+    // (data/asset-repo.ts): the size describes the key, so a key change with no
+    // new size clears it.
+    if (patch.sourceSizeBytes !== undefined) {
+      // Non-positive == "nothing recorded" (same sentinel as the in-memory repo
+      // and as a stored `0` read back by fromAssetDocument), so a finalize that
+      // could not learn the length clears a stale one.
+      next.sourceSizeBytes = patch.sourceSizeBytes > 0 ? patch.sourceSizeBytes : undefined;
+    } else if (patch.objectKey !== undefined && patch.objectKey !== existing.objectKey) {
+      next.sourceSizeBytes = undefined;
+    }
     if (patch.technicalMetadata !== undefined) {
       next.technicalMetadata = patch.technicalMetadata;
       if (patch.technicalMetadata !== null) {
