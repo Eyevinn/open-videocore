@@ -73,6 +73,29 @@ export const PACKAGER_PAT_PURPOSE = 'pat';
 // RedisQueue value — must match packagerQueueKey() in osc-packager-queue.ts.
 export const PACKAGER_REDIS_QUEUE = 'encore-packager:jobs';
 
+// The queue key a newly provisioned packager for `stackName` consumes. Scoped
+// per stack because every packager listens on the same shared Valkey: with one
+// common key, a second stack's packager would pop the first stack's jobs (and
+// vice versa) and read renditions from the wrong object store. The key is
+// recorded on the stack config (StackConfig.packagerQueue) so producers enqueue
+// onto exactly the key the packager was created with.
+export function packagerQueueForStack(stackName: string): string {
+  return `${PACKAGER_REDIS_QUEUE}:${stackName}`;
+}
+
+// The stack packaging work targets, out of the provisioned `names`: the ambient
+// stack — a request's X-Stack-Name, or a background worker re-entering a job's
+// persisted stackName (#1097) — when it names a provisioned stack, else the
+// first provisioned stack, which is the single-stack default.
+export function packagingStackName(
+  names: readonly string[],
+  ambientStackName: string | undefined
+): string | undefined {
+  return ambientStackName && names.includes(ambientStackName)
+    ? ambientStackName
+    : names[0];
+}
+
 // The non-secret + secret-reference inputs needed to build the packager create
 // body. Secrets themselves are passed as their raw values and turned into
 // {{secrets.*}} references by ensurePackagerProvisioned via saveSecret; the
@@ -84,6 +107,9 @@ export type PackagerStackCoordinates = {
   stackName: string;
   // Valkey connection string for the shared stack queue.
   redisUrl: string;
+  // The queue key the packager consumes. Optional: unset keeps the shared
+  // PACKAGER_REDIS_QUEUE, the pre-per-stack behaviour.
+  redisQueue?: string;
   // The stack's MinIO S3 endpoint URL.
   minioEndpoint: string;
   // The packaged-output bucket name (no scheme/prefix).
@@ -107,7 +133,7 @@ export function buildPackagerCreateBody(
   return {
     name: coords.stackName,
     RedisUrl: coords.redisUrl,
-    RedisQueue: PACKAGER_REDIS_QUEUE,
+    RedisQueue: coords.redisQueue ?? PACKAGER_REDIS_QUEUE,
     OutputFolder: `s3://${coords.packagedBucket.replace(/\/+$/, '')}/`,
     PersonalAccessToken: refs.patRef,
     AwsAccessKeyId: 'admin',

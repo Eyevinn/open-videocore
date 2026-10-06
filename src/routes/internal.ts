@@ -132,6 +132,16 @@ const encoreAckSchema = z.object({
   renditionCount: z.number()
 });
 
+// The scaler-state Valkey for a job: the per-stack resolver when wired, else the
+// injected connection.
+async function redisForJob(
+  opts: Pick<InternalRouterOptions, 'redis' | 'redisForJob'>,
+  encoreJobId: string
+): Promise<Redis | undefined> {
+  if (!opts.redisForJob) return opts.redis;
+  return opts.redisForJob(encoreJobId);
+}
+
 type InternalRouterOptions = {
   // The packaging service that resolves the callback to an asset and records
   // manifestUrls / packagingError. When absent (packaging not configured) the
@@ -148,6 +158,13 @@ type InternalRouterOptions = {
   webhookDispatcher?: WebhookDispatcher;
   // Redis client for looking up Encore instance URL at packaging trigger time.
   redis?: Redis;
+  // Resolves the Valkey holding the scaler state of the stack a job was
+  // dispatched on (every scaler key lives on the job's own stack's Valkey,
+  // #615). Preferred over `redis`, which is the first stack's connection: the
+  // job-instance, job-url and packaging-pin keys of a job on any other stack
+  // are not there, so a pin taken for it was never released and the packaging
+  // URL never resolved.
+  redisForJob?: (encoreJobId: string) => Promise<Redis | undefined>;
   // PipelineExecution tracking (PipelineExecution feature). When set, transcode/
   // package completion callbacks advance the matching running execution.
   pipelineRepository?: PipelineRepository;
@@ -367,7 +384,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
             // pending. Best-effort: a release failure must never fail the
             // packager's callback (it would just retry); the pin's own TTL is
             // the safety net if this never runs.
-            if (opts.redis) {
+            if (opts.redis || opts.redisForJob) {
               try {
                 // Correlate via the `transcode` step, falling back to the
                 // `package` step (issue #739). A package-only execution has NO
@@ -382,7 +399,8 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                 const encoreJobId =
                   execution.steps.find((s) => s.name === 'transcode')?.encoreJobId ??
                   execution.steps.find((s) => s.name === 'package')?.encoreJobId;
-                if (encoreJobId) {
+                const pinRedis = encoreJobId ? await redisForJob(opts, encoreJobId) : undefined;
+                if (encoreJobId && pinRedis) {
                   // Resolve the pinned instance through the shared resolver
                   // (CONTRACT: `resolvePackagingInstanceId(redis, encoreJobId)`,
                   // src/encore-scaler/packaging-target.ts) rather than reading
@@ -394,9 +412,9 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
                   // idle instance out of scale-down for the pin's full TTL. The
                   // resolver reads keys.jobTerminalInstance, which is retained
                   // past terminal for precisely this.
-                  const instanceId = await resolvePackagingInstanceId(opts.redis, encoreJobId);
+                  const instanceId = await resolvePackagingInstanceId(pinRedis, encoreJobId);
                   if (instanceId) {
-                    await unpinInstanceForPackaging(opts.redis, instanceId, encoreJobId);
+                    await unpinInstanceForPackaging(pinRedis, instanceId, encoreJobId);
                   }
                 }
               } catch (err) {
@@ -623,6 +641,8 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         if (!found) {
           return reply.code(404).send({ error: 'not_found' });
         }
+        // The Valkey this job's scaler state lives on: its own stack's.
+        const redis = await redisForJob(opts, externalId);
 
         const upper = status.toUpperCase();
         const success = upper === 'SUCCESSFUL' || upper === 'SUCCESS';
@@ -659,13 +679,13 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         // enqueued packaging job, by the packager's success callback once
         // packaging completes, or by the pin's own TTL otherwise.
         let pinnedInstanceId: string | undefined;
-        if (result.applied && success && opts.redis) {
+        if (result.applied && success && redis) {
           const decoded = decodeEncoreJobId(externalId);
           if (decoded) {
             try {
-              const instanceId = await opts.redis.hget(keys.jobInstance(decoded.workspaceId), externalId);
+              const instanceId = await redis.hget(keys.jobInstance(decoded.workspaceId), externalId);
               if (instanceId) {
-                await pinInstanceForPackaging(opts.redis, instanceId, externalId);
+                await pinInstanceForPackaging(redis, instanceId, externalId);
                 pinnedInstanceId = instanceId;
               }
             } catch (err) {
@@ -674,9 +694,9 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
           }
         }
         const releasePendingPackagingPin = async (): Promise<void> => {
-          if (!pinnedInstanceId || !opts.redis) return;
+          if (!pinnedInstanceId || !redis) return;
           try {
-            await unpinInstanceForPackaging(opts.redis, pinnedInstanceId, externalId);
+            await unpinInstanceForPackaging(redis, pinnedInstanceId, externalId);
           } catch (err) {
             fastify.log.warn({ err, externalId, instanceId: pinnedInstanceId }, 'failed to release packaging pin');
           }
@@ -686,7 +706,7 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
         // Free the slot on the Encore instance that ran this job so the scaler
         // can reuse its capacity. Only on a terminal completion that applied.
         if (result.applied) {
-          await decrementActiveJobs(externalId, opts.redis);
+          await decrementActiveJobs(externalId, redis);
         }
 
         // Advance the matching PipelineExecution. If this transcode was part of a
@@ -716,8 +736,8 @@ export const internalRouter: FastifyPluginAsync<InternalRouterOptions> = async (
               steps[tIdx] = { ...steps[tIdx], status: 'done', completedAt: now };
               // Find the next pending step. When it is `package`, trigger packaging.
               const nextIdx = steps.findIndex((s) => s.status === 'pending');
-              if (nextIdx >= 0 && steps[nextIdx].name === 'package' && opts.packaging && opts.redis) {
-                const encoreJobUrl = await resolveEncoreJobUrl(externalId, opts.redis);
+              if (nextIdx >= 0 && steps[nextIdx].name === 'package' && opts.packaging && redis) {
+                const encoreJobUrl = await resolveEncoreJobUrl(externalId, redis);
                 if (encoreJobUrl) {
                   steps[nextIdx] = { ...steps[nextIdx], status: 'running', startedAt: now };
                   await opts.pipelineRepository.update(execution.id, { steps, status: 'running' });
