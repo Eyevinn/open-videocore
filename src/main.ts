@@ -68,6 +68,7 @@ import {
   runWithPersistedStack,
   adoptResolvedStackName,
   currentRequestStackName,
+  currentDocumentStackName,
   PERSISTED_STACK_FALLBACK_MESSAGE
 } from './services/request-stack-context.js';
 import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
@@ -1065,6 +1066,30 @@ let activationConnectionId: string | undefined;
 // by connectionId. See syncStackCallbackPollers.
 const stackCallbackPollers = new Map<string, () => void>();
 
+// The Valkey a stack's scaler state lives on. Since #615 each provisioned stack
+// has its own Valkey and its scaler loop, the callback listeners paired with its
+// Encore instances, its packaging pins and its retry bookkeeping all live there;
+// the "activation" connection (`sharedRedis`) is merely the first-listed stack's
+// Valkey plus the fallback for the fixed single-stack deployment context. Every
+// consumer outside a scaler loop — routes, hooks, the packaging queue — resolves
+// its connection through these two accessors, which go through the registry so
+// they hand out the identical connection object the stack's loop uses.
+//
+// `stackRedisForEncoreJob`: by the stack encoded in the job id (the loop key).
+// `stackRedisForAmbientStack`: by the stack the current request or background
+// worker runs in (the resolver-confirmed identity, never the raw header). With
+// no ambient stack, the first-listed stack's connection.
+async function stackRedisForEncoreJob(encoreJobId: string): Promise<IORedis | undefined> {
+  if (!scalerRegistry) return undefined;
+  return scalerRegistry.redisForEncoreJob(encoreJobId);
+}
+async function stackRedisForAmbientStack(): Promise<IORedis | undefined> {
+  if (!scalerRegistry) return undefined;
+  const stackName = currentDocumentStackName();
+  if (!stackName) return sharedRedis;
+  return (await scalerRegistry.resolveStackRedis(stackName)).redis;
+}
+
 // Bucket names are stack-invariant (created at provision time, see provision.ts)
 // so a static default is correct for every workspace.
 const sourceBucket = process.env['MINIO_SOURCE_BUCKET'] ?? 'openvideocore-source';
@@ -1191,10 +1216,12 @@ function activateScaler(redisUrl: string): void {
       throw new Error('parameter store unavailable; cannot resolve stack name');
     }
     const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-    if (names.length === 0) {
+    // The ambient stack's packager: the stalled-package sweep runs once inside
+    // each provisioned stack, and each stack has its own packager.
+    const stackName = packagingStackName(names, currentRequestStackName());
+    if (!stackName) {
       throw new Error('no provisioned stack; cannot resolve packager instance');
     }
-    const stackName = names[0]!;
     const packagerApi = packagerOscApiFromContext(oscContext);
     const sat = await packagerApi.getServiceAccessToken(PACKAGER_SERVICE_ID);
     const instance = await packagerApi.getInstance(
@@ -1514,11 +1541,17 @@ function activateScaler(redisUrl: string): void {
               found.job.status === 'done' ||
               found.job.status === 'failed' ||
               found.job.status === 'cancelled';
+            // The retry bookkeeping (job payload / attempts, written by the
+            // loop at dispatch) and the queue the retry is pushed back onto are
+            // on THIS job's stack's Valkey, not the activation one: on any other
+            // stack the gate found no payload there and settled terminal
+            // without ever retrying.
+            const stackRedis = await scalerRegistry!.redisForEncoreJob(encoreJobId);
             if (decoded && !isTerminal) {
               let decision;
               try {
                 decision = await decideRetry(
-                  redis,
+                  stackRedis,
                   decoded.workspaceId,
                   encoreJobId,
                   failureText,
@@ -1620,7 +1653,7 @@ function activateScaler(redisUrl: string): void {
             // for the full TTL — matches the callback poller's terminal path
             // (encore-callback-poller.ts:633). Best-effort: a stray key self-expires.
             if (decoded) {
-              await clearRetryState(redis, encoreJobId).catch(() => {});
+              await clearRetryState(stackRedis, encoreJobId).catch(() => {});
             }
           } catch (err) {
             app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');
@@ -1636,7 +1669,15 @@ function activateScaler(redisUrl: string): void {
   // and receive a completion callback.
   packaging = new PackagingService({
     assets: assetRepository,
-    queue: makeOscPackagerQueue(redis, undefined, app.log, packagingQueueKey),
+    // Enqueue on the ambient stack's Valkey (its packager consumes its own
+    // stack's Valkey — see ensurePackaging below) and onto the key recorded for
+    // that stack's packager.
+    queue: makeOscPackagerQueue(
+      async () => (await stackRedisForAmbientStack()) ?? redis,
+      undefined,
+      app.log,
+      packagingQueueKey
+    ),
     publicBaseUrl: packagingPublicBaseUrl(),
     // Observable `package` Job records (issue #976): created at enqueue time,
     // stamped onto the execution's `package` step as `steps[].jobId`, and
@@ -1753,7 +1794,13 @@ function activateScaler(redisUrl: string): void {
         osc: packagerApi,
         coords: {
           stackName: resolvedStackName,
-          redisUrl,
+          // The stack's OWN Valkey (StackConfig.redisUrl), where its scaler
+          // loop, its completion poller and the producers of its packaging
+          // queue all are — never the activation connection, which is another
+          // stack's Valkey for every stack but the first. A packager created
+          // before per-stack packaging was the first stack's, on that same
+          // Valkey, so it keeps working unchanged.
+          redisUrl: stackCfg?.redisUrl && stackCfg.redisUrl.length > 0 ? stackCfg.redisUrl : redisUrl,
           // Only used when the packager is created; an already-running packager
           // keeps the key it was built with (StackConfig.packagerQueue).
           redisQueue: packagerQueueForStack(resolvedStackName),
@@ -2012,22 +2059,24 @@ function inEncoreJobStack<T>(encoreJobId: string, fn: () => Promise<T>): Promise
 // Encore had finished it successfully.
 //
 // One poller per DISTINCT connection (the registry's connectionId, #1074), so a
-// stack that shares the activation Valkey is not drained twice. Packaging is
-// still handed off on the activation Valkey, where the packagers listen. Called
-// on every reconcile (startup and each provision/deprovision), so a stack
-// provisioned later gets its poller without a restart; a connection no longer
-// listed has its poller stopped.
+// stack that shares the activation Valkey is not drained twice. Each poller
+// hands packaging off on the Valkey it drains, which is where that stack's
+// packager listens (ensurePackaging). Called on every reconcile (startup and
+// each provision/deprovision), so a stack provisioned later gets its poller
+// without a restart; a connection no longer listed has its poller stopped. The
+// enumeration is read fresh, bypassing the registry's status-poll cache, so the
+// stack that was just provisioned is not missed for its lifetime.
 async function syncStackCallbackPollers(): Promise<void> {
   if (!scalerRegistry || !sharedRedis || !callbackPollerOptions) return;
   const live = new Set<string>();
-  for (const connection of await scalerRegistry.listStackConnections()) {
+  for (const connection of await scalerRegistry.listStackConnections({ fresh: true })) {
     const { connectionId, redis, stackKey } = connection;
     if (!connectionId || !redis || connectionId === activationConnectionId) continue;
     live.add(connectionId);
     if (stackCallbackPollers.has(connectionId)) continue;
     stackCallbackPollers.set(
       connectionId,
-      startEncoreCallbackPoller({ ...callbackPollerOptions, redis, packagingRedis: sharedRedis })
+      startEncoreCallbackPoller({ ...callbackPollerOptions, redis })
     );
     app.log.info({ stackKey, connectionId }, 'encore-callback-poller: started for stack Valkey');
   }
@@ -2149,6 +2198,8 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   clipRunner,
   packaging,
   packagingRedis: sharedRedis,
+  packagingRedisForJob: stackRedisForEncoreJob,
+  packagingRedisForStack: stackRedisForAmbientStack,
   pipelineRepository,
   commentRepository,
   // Profile store for per-profile profileParams key validation (issue #290)
@@ -2177,6 +2228,7 @@ const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } =
   prefix: '/api/v1/jobs',
   repository: jobRepository,
   redis: sharedRedis,
+  redisForJob: stackRedisForEncoreJob,
   pipelineRepository,
   // Read-time `assetName` enrichment on the jobs listing + detail (issue #988).
   // The SAME repository instance the pipelines router below resolves its own
@@ -2228,6 +2280,7 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
   repository: assetRepository,
   webhookDispatcher,
   redis: sharedRedis,
+  redisForJob: stackRedisForEncoreJob,
   pipelineRepository,
   // Post-package relocation (issue #208, ADR-011). Resolve the stack's MinIO
   // client + packaged/staging bucket at callback time so a packaging success can

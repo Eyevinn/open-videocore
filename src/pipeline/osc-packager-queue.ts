@@ -36,16 +36,20 @@ export function packagerQueueKey(): string {
 
 // Construct the production PackageQueue. Each enqueue serialises the job to JSON
 // and ZADDs it onto the sorted set (FIFO with the packager's BZPOPMIN consumer).
-// `resolveQueueKey`, when given, picks the key per enqueue (per-stack packager
-// queues, resolved from the ambient stack) with `defaultQueueKey` as fallback.
+// `client` is either one connection or a resolver called per enqueue: each
+// stack's packager consumes its OWN stack's Valkey, so the producer must enqueue
+// on the Valkey of the stack the job belongs to (the ambient stack at enqueue
+// time), not on one fixed connection. `resolveQueueKey`, when given, picks the
+// key per enqueue (per-stack packager queues) with `defaultQueueKey` as fallback.
 export function makeOscPackagerQueue(
-  client: RedisLike,
+  client: RedisLike | (() => Promise<RedisLike>),
   defaultQueueKey: string = packagerQueueKey(),
   logger: QueueLogger = NOOP_QUEUE_LOGGER,
   resolveQueueKey?: (defaultKey: string) => Promise<string>
 ): PackageQueue {
   return {
     async enqueue(job: PackagingJob): Promise<void> {
+      const target = typeof client === 'function' ? await client() : client;
       const queueKey = resolveQueueKey
         ? await resolveQueueKey(defaultQueueKey)
         : defaultQueueKey;
@@ -55,8 +59,8 @@ export function makeOscPackagerQueue(
       // (src/routes/assets.ts) also targets this queue and provisions a packager
       // on-demand, so it shares the ghost-drain exposure. Best-effort: never throws
       // into the enqueue below.
-      await purgeStalePackagingJobs(client, queueKey, { logger });
-      await client.zadd(queueKey, Date.now(), JSON.stringify(job));
+      await purgeStalePackagingJobs(target, queueKey, { logger });
+      await target.zadd(queueKey, Date.now(), JSON.stringify(job));
     }
   };
 }

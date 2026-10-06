@@ -182,6 +182,11 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   constructor(private readonly config: WorkspaceEncoreScalerConfig) {}
 
   // Resolve (and cache) the Valkey connection + URL for a stack key (issue #615).
+  // Public: main.ts hands the per-stack connection to everything that reads
+  // scaler state for one stack outside a loop — the per-stack callback pollers,
+  // the packaging queue, the routes' job-instance / pin lookups and the
+  // reconcile drop hook's retry gate — so no consumer is left on the
+  // process-global connection by default.
   //
   // Mirrors how resolveS3Config resolves the MinIO endpoint per stack: the
   // resolveRedisUrl hook loads the stack's own StackConfig.redisUrl, and makeRedis
@@ -194,7 +199,7 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // no resolver/factory is wired, or the stack has no stored redisUrl, it falls
   // back to the injected process-global `redis`/`redisUrl` — the unchanged
   // single-Valkey behaviour used by env-override deployments and tests.
-  private async resolveStackRedis(
+  async resolveStackRedis(
     stackKey: string
   ): Promise<{ redis: Redis; redisUrl: string }> {
     const cached = this.redisConnections.get(stackKey);
@@ -207,16 +212,15 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
 
     const perStackUrl = await this.config.resolveRedisUrl(stackKey);
     if (!perStackUrl) {
-      // The stack has no stored Valkey URL (e.g. the fixed deployment context of
-      // a single-stack env-override run, which is not itself a provisioned stack).
-      // Fall back to the injected connection rather than fabricating one.
-      const fallback = {
-        redis: this.config.redis,
-        redisUrl: this.config.redisUrl,
-        owned: false
-      };
-      this.redisConnections.set(stackKey, fallback);
-      return { redis: fallback.redis, redisUrl: fallback.redisUrl };
+      // The stack has no stored Valkey URL: the fixed deployment context of a
+      // single-stack env-override run (not itself a provisioned stack), or a
+      // stack still being provisioned whose config carries no redisUrl yet.
+      // Fall back to the injected connection rather than fabricating one, but
+      // do NOT cache it: a stack resolved mid-provision (a status read, a
+      // poller sync) would otherwise stay bound to the first stack's Valkey
+      // until the process restarted, with its loop, completions and packaging
+      // all on the wrong store.
+      return { redis: this.config.redis, redisUrl: this.config.redisUrl };
     }
 
     // If this stack's URL is identical to the process-global one, reuse the
@@ -241,14 +245,27 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     return { redis, redisUrl: perStackUrl };
   }
 
+  // The Valkey holding the scaler state of the stack an Encore job was
+  // dispatched on. Every scaler key is namespaced by the job's stack — the
+  // encoreJobId prefix (keys in types.ts) — and lives on THAT stack's Valkey
+  // (issue #615), so a reader of the job-instance / job-url / packaging-pin /
+  // retry keys must use this connection, never the process-global one, or it
+  // reads an empty namespace for every stack but the first. An undecodable id
+  // falls back to the injected connection.
+  async redisForEncoreJob(encoreJobId: string): Promise<Redis> {
+    const decoded = decodeEncoreJobId(encoreJobId);
+    if (!decoded) return this.config.redis;
+    return (await this.resolveStackRedis(decoded.workspaceId)).redis;
+  }
+
   // Provisioned stack keys, cached for STACK_KEYS_CACHE_MS (issue #1074). Never
   // throws: an enumeration failure yields the last known list, or an empty one,
   // so listStackConnections() still reports the stacks this registry already
   // holds connections for.
-  private async enumerateStackKeys(): Promise<string[]> {
+  private async enumerateStackKeys(fresh = false): Promise<string[]> {
     if (!this.config.listStackKeys) return [];
     const cached = this.stackKeysCache;
-    if (cached && Date.now() - cached.at < STACK_KEYS_CACHE_MS) return cached.keys;
+    if (!fresh && cached && Date.now() - cached.at < STACK_KEYS_CACHE_MS) return cached.keys;
     try {
       const keys = (await this.config.listStackKeys()).filter((key) => key.length > 0);
       this.stackKeysCache = { keys, at: Date.now() };
@@ -284,9 +301,18 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // are lazyConnect, and stopAll()/teardown() dispose the ones this registry owns.
   // Resolved sequentially rather than in parallel so two concurrent observations
   // cannot race the per-stack connection cache into opening duplicate sockets.
-  async listStackConnections(): Promise<ScalerStackConnection[]> {
+  //
+  // `fresh` bypasses the enumeration cache. The unauthenticated status read
+  // keeps the cache; a caller reacting to a provision or deprovision (the
+  // per-stack callback-poller sync in main.ts) must see the stack that was just
+  // added or removed, not a list cached by a status poll seconds earlier.
+  async listStackConnections(
+    options: { fresh?: boolean } = {}
+  ): Promise<ScalerStackConnection[]> {
     const stackKeys = new Set<string>();
-    for (const key of await this.enumerateStackKeys()) stackKeys.add(key);
+    for (const key of await this.enumerateStackKeys(options.fresh === true)) {
+      stackKeys.add(key);
+    }
     for (const key of this.loops.keys()) stackKeys.add(key);
     for (const key of this.redisConnections.keys()) stackKeys.add(key);
 
@@ -435,28 +461,40 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   async resumeExistingWorkspaces(
     log?: (msg: string, err?: unknown) => void
   ): Promise<void> {
-    // The restart discovery scan runs against the injected process-global
-    // connection (`this.config.redis` — the first-provisioned stack's Valkey).
-    // Once a workspaceId is discovered, resolveStackRedis() below re-binds it to
-    // its OWN per-stack Valkey for reconcile + the live loop (issue #615), so job
-    // routing is per-stack. A stack whose pool/queue keys live ONLY on a
-    // different physical Valkey is not discovered by this scan on restart, but is
-    // resumed lazily the moment a request/submit for it arrives (getOrCreate ->
-    // resolveStackRedis). Documented in
-    // docs/osc-feedback/incoming-issue615-per-stack-valkey-connection.md.
-    const [poolKeys, queueKeys] = await Promise.all([
-      this.config.redis.keys('encore:pool:*'),
-      this.config.redis.keys('encore:queue:*')
-    ]);
+    // The restart discovery scan covers EVERY stack's Valkey, not only the
+    // injected process-global connection (the first-provisioned stack's). Each
+    // stack's pool/queue keys live on its own Valkey (issue #615), so a scan of
+    // the first stack's store alone never found another stack's running pool:
+    // that stack came back with no loop — no reconcile, no idle scale-down, no
+    // dispatch of its queued jobs — until a request for it happened to arrive.
+    // Once a workspaceId is discovered, resolveStackRedis() below binds it to
+    // its own per-stack Valkey for reconcile + the live loop.
     const workspaceIdsWithPool = new Set<string>();
     const workspaceIds = new Set<string>();
-    for (const key of poolKeys) {
-      const id = key.slice('encore:pool:'.length);
-      if (id) { workspaceIds.add(id); workspaceIdsWithPool.add(id); }
-    }
-    for (const key of queueKeys) {
-      const id = key.slice('encore:queue:'.length);
-      if (id) workspaceIds.add(id);
+    for (const { redis, connectionId } of await this.distinctStackRedis(log)) {
+      let poolKeys: string[];
+      let queueKeys: string[];
+      try {
+        [poolKeys, queueKeys] = await Promise.all([
+          redis.keys('encore:pool:*'),
+          redis.keys('encore:queue:*')
+        ]);
+      } catch (err) {
+        log?.(
+          `encore-scaler: failed to scan Valkey ${connectionId} for pools/queues to ` +
+            'resume; continuing with the remaining connections',
+          err
+        );
+        continue;
+      }
+      for (const key of poolKeys) {
+        const id = key.slice('encore:pool:'.length);
+        if (id) { workspaceIds.add(id); workspaceIdsWithPool.add(id); }
+      }
+      for (const key of queueKeys) {
+        const id = key.slice('encore:queue:'.length);
+        if (id) workspaceIds.add(id);
+      }
     }
 
     for (const workspaceId of workspaceIds) {
@@ -504,6 +542,30 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
         );
       }
     }
+  }
+
+  // Every physically distinct Valkey this registry can reach: the injected
+  // process-global connection plus one per provisioned stack with its own
+  // store, deduplicated by connectionId so a stack sharing the global Valkey is
+  // not scanned twice. Resolution failures are logged and skipped, never thrown.
+  private async distinctStackRedis(
+    log?: (msg: string, err?: unknown) => void
+  ): Promise<Array<{ redis: Redis; connectionId: string }>> {
+    const byConnection = new Map<string, Redis>();
+    byConnection.set(valkeyConnectionId(this.config.redisUrl), this.config.redis);
+    let connections: ScalerStackConnection[] = [];
+    try {
+      connections = await this.listStackConnections({ fresh: true });
+    } catch (err) {
+      log?.('encore-scaler: failed to enumerate stack Valkey connections to resume', err);
+    }
+    for (const connection of connections) {
+      if (!connection.redis || !connection.connectionId) continue;
+      if (!byConnection.has(connection.connectionId)) {
+        byConnection.set(connection.connectionId, connection.redis);
+      }
+    }
+    return [...byConnection].map(([connectionId, redis]) => ({ redis, connectionId }));
   }
 
   // Tear down a single workspace's scaler: stop its background loop and destroy

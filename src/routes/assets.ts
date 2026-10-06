@@ -1161,6 +1161,14 @@ type AssetsRouterOptions = {
   packaging?: import('../pipeline/packaging.js').PackagingService;
   // Redis for resolving Encore instance URL at packaging time.
   packagingRedis?: import('ioredis').Redis;
+  // Per-stack replacements for `packagingRedis` (every scaler key lives on the
+  // job's own stack's Valkey, #615). `packagingRedisForJob` resolves the Valkey
+  // of the stack an Encore job was dispatched on, for the job-url / instance /
+  // pin reads; `packagingRedisForStack` resolves the ambient request stack's
+  // Valkey, for the submit preflight. Both preferred over `packagingRedis`,
+  // which is the first stack's connection.
+  packagingRedisForJob?: (encoreJobId: string) => Promise<import('ioredis').Redis | undefined>;
+  packagingRedisForStack?: () => Promise<import('ioredis').Redis | undefined>;
   // On-demand packager provisioning (epic #226, issue #244). Invoked the first
   // time a pipeline reaches a `package` step: it provisions + wires the Encore
   // packager to the shared queue and output storage if absent, waits for
@@ -1503,6 +1511,24 @@ async function resolveEncoreJobUrlForPackaging(
   redis: import('ioredis').Redis | undefined
 ): Promise<PackagingTarget | undefined> {
   return resolvePackagingTarget(redis, encoreJobId);
+}
+
+// The scaler-state Valkey of the stack `encoreJobId` was dispatched on: the
+// per-stack resolver when wired, else the injected first-stack connection.
+async function packagingRedisForJob(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForJob'>,
+  encoreJobId: string
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForJob) return opts.packagingRedis;
+  return opts.packagingRedisForJob(encoreJobId);
+}
+
+// The ambient request stack's scaler-state Valkey, for stack-level probes.
+async function packagingRedisForStack(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForStack'>
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForStack) return opts.packagingRedis;
+  return opts.packagingRedisForStack();
 }
 
 // ---------------------------------------------------------------------------
@@ -2666,7 +2692,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const resolved = await resolveEncoreJobUrlForPackaging(
         encoreJobId,
-        opts.packagingRedis
+        await packagingRedisForJob(opts, encoreJobId)
       );
       if (!resolved) {
         reply.code(409).send({
@@ -3151,10 +3177,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // pin failure means the Redis the pool state was just read from is
           // faulty, and failing the step would deny a run that is still likely to
           // succeed. Unpinned is the pre-fix behaviour, not worse than it.
-          if (opts.packagingRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
+          const pinRedis = packageOnlyEncoreJobId
+            ? await packagingRedisForJob(opts, packageOnlyEncoreJobId)
+            : undefined;
+          if (pinRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
             try {
               await pinInstanceForPackaging(
-                opts.packagingRedis,
+                pinRedis,
                 packageOnlyInstanceId,
                 packageOnlyEncoreJobId
               );
@@ -5194,9 +5223,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // opt-in: a dependency with no wired probe client is reported
         // not_configured and does NOT trip the guard, so deployments/tests
         // without a live queue/storage submit exactly as before.
-        const queueEndpoint = opts.packagingRedis
-          ? `redis://${opts.packagingRedis.options.host ?? 'localhost'}:${
-              opts.packagingRedis.options.port ?? 6379
+        const packagingRedis = await packagingRedisForStack(opts);
+        const queueEndpoint = packagingRedis
+          ? `redis://${packagingRedis.options.host ?? 'localhost'}:${
+              packagingRedis.options.port ?? 6379
             }`
           : undefined;
         const preflight = await checkStackReachability(
@@ -5212,7 +5242,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             bucket: request.connections?.sourceBucket ?? opts.sourceBucket
           },
           {
-            ...(opts.packagingRedis ? { queueClient: opts.packagingRedis } : {}),
+            ...(packagingRedis ? { queueClient: packagingRedis } : {}),
             ...(request.connections?.storageClient
               ? { storageClient: request.connections.storageClient }
               : {})
@@ -5411,7 +5441,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // Resolve the Encore instance URL + UUID from Redis. Both must be present
       // (stored at dispatch time). If the instance has been scaled down, packaging
       // cannot proceed — the Encore job data is only accessible while the instance runs.
-      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
+      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(
+        encoreJobId,
+        await packagingRedisForJob(opts, encoreJobId)
+      );
       if (!resolvedPackagingTarget) {
         return reply.code(409).send({ error: 'instance_not_found', message: 'Encore instance no longer in pool — cannot resolve job URL for packaging' });
       }
