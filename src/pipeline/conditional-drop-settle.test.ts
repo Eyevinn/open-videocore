@@ -176,6 +176,10 @@ describe('#709 conditional gone-from-active-set drop settle', () => {
     const done = await jobs.get(jobId);
     expect(done?.status).toBe('done');
     expect(done?.droppedByScaler).toBe(false); // marker cleared on real success
+    // #1023: the drop's failure text is cleared with the marker, so a corrected
+    // job does not settle `done` while still explaining a failure.
+    expect(done?.progress).toBe(100);
+    expect(done?.error).toBeUndefined();
     // Source asset recovered to ready with the produced rendition recorded.
     const asset = await assets.get(assetId);
     expect(asset?.status).toBe('ready');
@@ -351,6 +355,15 @@ describe('#709 (c) poller resumes a drop-failed pipeline on a corrective SUCCESS
     const done = await jobs.get(job.id);
     expect(done?.status).toBe('done');
     expect(done?.droppedByScaler).toBe(false);
+    // #1023: end-to-end through the real poller, the recovered job carries no
+    // failure text — the drop's error string does not survive the correction.
+    expect(done?.progress).toBe(100);
+    expect(done?.error).toBeUndefined();
+    // ...and the correction is still traceable on the record. The poller applies
+    // completions with no audit emitter, so this record-level annotation is the
+    // ONLY trace of the drop on this production path.
+    expect(done?.droppedThenRecovered).toBe(true);
+    expect(done?.correctedDropError).toBe('dropped by Encore: gone from active set with no completion');
 
     // Source asset recovered to ready with the produced rendition.
     const recoveredAsset = await assets.get(asset.id);

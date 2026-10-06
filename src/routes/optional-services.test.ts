@@ -9,12 +9,16 @@ import {
 // imported function for a spy so no real OSC call is made.
 const createInstance = vi.fn();
 const getInstance = vi.fn();
+const listInstances = vi.fn();
 const removeInstance = vi.fn();
 const saveSecret = vi.fn();
 
 vi.mock('@osaas/client-core', () => ({
   createInstance: (...args: unknown[]) => createInstance(...args),
   getInstance: (...args: unknown[]) => getInstance(...args),
+  // The teardown probe confirms an empty getInstance result against the
+  // instance list before reporting not_found (issue #1039).
+  listInstances: (...args: unknown[]) => listInstances(...args),
   removeInstance: (...args: unknown[]) => removeInstance(...args),
   saveSecret: (...args: unknown[]) => saveSecret(...args),
   Context: class {}
@@ -59,6 +63,10 @@ async function waitForOperation(
 beforeEach(() => {
   createInstance.mockReset();
   getInstance.mockReset();
+  listInstances.mockReset();
+  // Default: the confirming read succeeds and lists nothing, so an empty probe
+  // means the instance really is gone.
+  listInstances.mockResolvedValue([]);
   removeInstance.mockReset();
   saveSecret.mockReset();
   getServiceAccessToken.mockClear();

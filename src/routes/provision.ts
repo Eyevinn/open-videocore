@@ -8,14 +8,24 @@ import {
   createInstance,
   getInstance,
   getPortsForInstance,
-  saveSecret,
-  waitForInstanceReady
+  saveSecret
 } from '@osaas/client-core';
+// Readiness waits go through this bounded helper, NOT @osaas/client-core's
+// waitForInstanceReady (issue #1038). The SDK helper has no deadline and does
+// not wrap its getInstanceHealth call in a try (lib/core.js:343-353, v0.24.0),
+// so one transient `fetch failed` mid-wait aborted the entire stack provision.
+import {
+  DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS,
+  DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+  waitForInstanceReadyBounded
+} from '../services/instance-readiness.js';
 import { Client as MinioClient } from 'minio';
 import nano from 'nano';
 import {
   deprovisionStack,
   deprovisionStackFromConfig,
+  foldTeardownResults,
+  type ServiceTeardownResult,
   type StackTeardownResult
 } from '../services/deprovision.js';
 import {
@@ -35,7 +45,9 @@ import {
 } from '../services/stack.js';
 import {
   packagerOscApiFromContext,
-  teardownOnDemandPackager
+  packagerTeardownAsServiceResults,
+  teardownOnDemandPackager,
+  type PackagerTeardownResult
 } from '../services/packager-provisioning.js';
 import { computeStackReadiness } from '../services/stack-readiness.js';
 import {
@@ -282,6 +294,14 @@ type ProvisionRouterOptions = {
   // operator can retry via POST /api/v1/profiles/bootstrap. Optional: when
   // omitted (e.g. no profile repository wired) seeding is skipped.
   seedProfiles?: () => Promise<void>;
+  // Bound (ms) on how long each backing instance's readiness wait polls before
+  // the provision gives up and rolls back (issue #1038). Unset uses
+  // DEFAULT_INSTANCE_READY_TIMEOUT_MS (5 min). main.ts wires
+  // PROVISION_READY_TIMEOUT_MS; tests inject a few milliseconds.
+  readyTimeoutMs?: number;
+  // Cadence (ms) between health probes inside that wait. Unset uses
+  // DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS (1s, the SDK's own cadence).
+  readyPollIntervalMs?: number;
 };
 
 // Async operation view returned by GET /operations and GET /operations/:id.
@@ -533,8 +553,33 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
     getScalerRegistry,
     operationStore: ops,
     publicBaseUrl,
-    seedProfiles
+    seedProfiles,
+    readyTimeoutMs,
+    readyPollIntervalMs
   } = opts;
+
+  // Readiness-wait budget shared by every backing instance this route creates
+  // (issue #1038). Resolved once here so all five waits use one bound, and so
+  // tests can drive the deadline without touching the environment.
+  const readinessOptions = {
+    timeoutMs: readyTimeoutMs ?? DEFAULT_INSTANCE_READY_TIMEOUT_MS,
+    pollIntervalMs: readyPollIntervalMs ?? DEFAULT_INSTANCE_READY_POLL_INTERVAL_MS
+  } as const;
+
+  // Wait for one backing instance to report `running`, bounded. Every readiness
+  // wait in this route goes through here: @osaas/client-core's
+  // waitForInstanceReady polls getInstanceHealth in a `while (!instanceOk)` loop
+  // with no deadline AND no try (lib/core.js:343-353, v0.24.0), so a single
+  // dropped poll (`fetch failed`) rejected the wait and aborted the whole stack
+  // even when the instance came up moments later. The shared helper retries a
+  // failed probe until the deadline and, on timeout, throws an error naming the
+  // service plus the last probe error — which lands in the catch below and runs
+  // the existing rollback instead of surfacing a bare `fetch failed`.
+  const awaitReady = (serviceId: string, instanceName: string, label: string) =>
+    waitForInstanceReadyBounded(osc, serviceId, instanceName, {
+      ...readinessOptions,
+      label
+    });
 
   // The parameter-store namespace this route WRITES under (issue #804): the
   // deployment-wide CONSTANT, identical to the one the runtime resolver reads
@@ -869,11 +914,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           RootUser: 'admin',
           RootPassword: minioRootPasswordRef
         });
-        await waitForInstanceReady('minio-minio', name, osc);
+        await awaitReady('minio-minio', name, 'object storage');
         const minioEndpoint = instanceUrl(minio);
 
         // 1b. Create the source and packaged buckets on the live MinIO instance.
-        // waitForInstanceReady passes when the container health check is green,
+        // The readiness wait passes when the container health check is green,
         // but the MinIO S3 API may still be initialising. Retry with backoff
         // until S3 is actually accepting connections.
         const minioUrl = new URL(minioEndpoint);
@@ -997,11 +1042,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         const couchdb = await provision('apache-couchdb', {
           AdminPassword: couchdbAdminPasswordRef
         });
-        await waitForInstanceReady('apache-couchdb', name, osc);
+        await awaitReady('apache-couchdb', name, 'document store');
         const couchdbUrl = instanceUrl(couchdb);
 
-        // 2b. Create the required CouchDB databases. waitForInstanceReady
-        // passes when the container is healthy but the HTTP API may still be
+        // 2b. Create the required CouchDB databases. The readiness wait passes
+        // when the container is healthy but the HTTP API may still be
         // starting up — retry with backoff the same way we do for MinIO.
         const couchAdminUrl = couchdbUrl
           .replace(/\/$/, '')
@@ -1033,7 +1078,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // 3. Valkey — queue / coordination backbone.
         currentService = 'valkey-io-valkey';
         await provision('valkey-io-valkey', {});
-        await waitForInstanceReady('valkey-io-valkey', name, osc);
+        await awaitReady('valkey-io-valkey', name, 'queue');
         const redisUrl = await redisUrlFrom(osc, 'valkey-io-valkey', name);
 
         // Encore and its paired callback listener are NOT provisioned here: the
@@ -1052,7 +1097,8 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // Each is created ONLY when the request opted in — opted-out means zero
         // cost (nothing is provisioned). Both flow through the same provision()
         // helper (so they land in provisioned[] and are covered by the
-        // partial-failure cleanup below) and waitForInstanceReady, and their
+        // partial-failure cleanup below) and the same bounded readiness wait as
+        // the core stack (awaitReady, #1038), and their
         // instance names are recorded into the StackConfig persisted below.
 
         // 5a. eyevinn-auto-subtitles ("Subtitle Generator") — Whisper transcription.
@@ -1080,7 +1126,11 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           await provision(AUTO_SUBTITLES_SERVICE_ID, {
             openaikey: openaiKeyRef
           });
-          await waitForInstanceReady(AUTO_SUBTITLES_SERVICE_ID, name, osc);
+          await awaitReady(
+            AUTO_SUBTITLES_SERVICE_ID,
+            name,
+            'subtitle generation'
+          );
           autoSubtitlesInstanceName = name;
         }
 
@@ -1090,7 +1140,7 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         if (wantSceneDetect) {
           currentService = SCENE_DETECT_SERVICE_ID;
           await provision(SCENE_DETECT_SERVICE_ID, {});
-          await waitForInstanceReady(SCENE_DETECT_SERVICE_ID, name, osc);
+          await awaitReady(SCENE_DETECT_SERVICE_ID, name, 'scene detection');
           sceneDetectInstanceName = name;
         }
 
@@ -1246,13 +1296,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // call the tenant was never told to make. Tear them down best-effort
           // here, in dependency-safe order, reusing the SAME idempotent
           // teardown the DELETE route uses (deprovisionStackFromConfig ->
-          // teardownService: probes getInstance first, tolerates already-gone).
+          // teardownService: probes getInstance, CONFIRMS an empty probe against
+          // the instance list, and tolerates a confirmed already-gone instance).
           //
           // CRITICAL (issue #736 trap): only `created` is rolled back. provision()
           // is idempotent (#417) and ADOPTS a pre-existing instance on "already
           // taken"; those live in `provisioned` but NOT `created`, so a rollback
           // never deletes an instance the tenant already had.
           let rollback: StackTeardownResult | undefined;
+          let rollbackThrew: string | undefined;
           if (created.length > 0) {
             try {
               rollback = await deprovisionStackFromConfig(
@@ -1270,6 +1322,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 );
               }
             } catch (rollbackErr) {
+              rollbackThrew =
+                rollbackErr instanceof Error
+                  ? rollbackErr.message
+                  : String(rollbackErr);
               app.log.error(
                 { rollbackErr, name, created },
                 'rollback of created instances threw; some may still be running'
@@ -1277,10 +1333,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             }
           }
 
+          // A rollback that threw tore down NOTHING we can account for, so every
+          // created instance is unaccounted-for rather than gone (issue #1039:
+          // an unverifiable teardown must never read as "nothing left"). Report
+          // each one as a failed teardown so it lands in `leftovers`, in
+          // `stillRunning`, and in the persisted services[] a retry reads.
+          const rollbackServices: ServiceTeardownResult[] =
+            rollback?.services ??
+            created.map((c) => ({
+              serviceId: c.serviceId,
+              role: 'unknown',
+              status: 'failed' as const,
+              error: rollbackThrew ?? 'rollback did not run'
+            }));
+
           // Created instances that could NOT be torn down are still running and
           // still billing — surfaced in the operation result with the exact
           // deprovision call so the tenant can finish removing them.
-          const leftovers = (rollback?.services ?? []).filter(
+          const leftovers = rollbackServices.filter(
             (s) => s.status === 'failed'
           );
 
@@ -1330,20 +1400,43 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             // Report the rollback outcome so the caller knows the created
             // instances were torn down (or, if teardown itself failed, exactly
             // which leftovers remain and how to remove them) — issue #736.
+            //
+            // When this operation created nothing there was nothing to roll
+            // back, which is NOT the same as "nothing is left": any instance the
+            // run ADOPTED is still running. That case reports `not_attempted`
+            // rather than the old `not_found`, which read as an empty stack
+            // (issue #1039). `stillRunning` lists everything that survives —
+            // adopted instances included — with the call that removes them.
             result: {
               name,
               failedService: currentService,
-              rollback: rollback
-                ? { status: rollback.status, services: rollback.services }
-                : { status: 'not_found', services: [] },
+              rollback:
+                created.length === 0
+                  ? {
+                      status: 'not_attempted',
+                      services: [],
+                      reason: 'this operation created no instances'
+                    }
+                  : {
+                      status: rollback?.status ?? 'failed',
+                      services: rollbackServices
+                    },
+              ...(stillRunning.length > 0
+                ? {
+                    stillRunning: stillRunning.map((p) => ({
+                      serviceId: p.serviceId,
+                      instanceName: p.name
+                    })),
+                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                  }
+                : {}),
               ...(leftovers.length > 0
                 ? {
                     leftovers: leftovers.map((s) => ({
                       serviceId: s.serviceId,
                       instanceName: name,
                       error: s.error
-                    })),
-                    removeLeftoversWith: `DELETE /api/v1/provision/${name}`
+                    }))
                   }
                 : {})
             }
@@ -1617,7 +1710,15 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
                 'on-demand packager teardown failed; continuing static teardown'
               );
             }
-            const result = await deprovisionStack(osc, name);
+            // Fold the packager outcome into the reported result (issue #1056).
+            // There is no stored config to keep on this path, but the result
+            // must not read as clean while the packager is still running. The
+            // static TEARDOWN_ORDER also covers PACKAGER_SERVICE_ID, so the
+            // fold MERGES onto that entry instead of reporting two packagers.
+            const result = foldTeardownResults(
+              await deprovisionStack(osc, name),
+              packagerTeardownAsServiceResults(packagerTeardown)
+            );
             if (result.status === 'failed') {
               app.log.error({ result }, 'stack teardown reported failures');
             }
@@ -1636,7 +1737,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const config = await paramStore.loadStackConfig(workspaceId, name);
           if (!config) {
             // Idempotent: a retry after a successful teardown (entry already
-            // gone) lands here. Report not_found rather than erroring.
+            // gone) lands here. Report not_found rather than erroring — but
+            // still sweep any scaler state left under this name: a stack torn
+            // down while the scaler teardown was a no-op (it was keyed by the
+            // namespace, not the stack) left its pool keys and possibly its
+            // Encore instances behind, and re-issuing the DELETE is the
+            // operator's way to clean that up. teardown() is a clean no-op
+            // when there is nothing under the name.
+            const staleRegistry = getScalerRegistry?.();
+            if (staleRegistry) {
+              try {
+                await staleRegistry.teardown(name);
+              } catch (err) {
+                app.log.warn(
+                  { err, name },
+                  'scaler teardown for an already-removed stack failed; continuing'
+                );
+              }
+            }
             ops.update(op.id, {
               status: 'done',
               completedAt: Date.now(),
@@ -1653,13 +1771,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // absent or the pool is empty. Guard failures the same way the
           // parameter-store cleanup below does: a teardown error is logged but
           // must not abort the static-service deprovision that follows.
+          //
+          // Keyed by the STACK NAME: since #615 the registry's loop key is the
+          // stack the transcode resolved to (the encoreJobId prefix), and since
+          // #804 `workspaceId` here is the constant config namespace, which is
+          // not a stack. Passing the namespace made this a silent no-op, so a
+          // deprovisioned stack left its Encore instances, their callback
+          // listeners and its pool keys behind, billing until removed by hand.
           const scalerRegistry = getScalerRegistry?.();
           if (scalerRegistry) {
             try {
-              await scalerRegistry.teardown(workspaceId);
+              await scalerRegistry.teardown(name);
             } catch (err) {
               app.log.error(
-                { err, name, workspaceId },
+                { err, name },
                 'scaler teardown failed before static-service deprovision; continuing'
               );
             }
@@ -1674,7 +1799,10 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // (consumer-before-producer, mirroring TEARDOWN_ORDER). Safe whether
           // or not packaging ever ran: not_found when no packager exists. A
           // failure is logged but must not abort the static-service teardown
-          // that follows (same policy as the scaler teardown above).
+          // that follows (same policy as the scaler teardown above) — though,
+          // unlike before issue #1056, the outcome is now folded into the
+          // reported result below rather than only logged, so a packager that
+          // survives teardown keeps the stored config and is named.
           //
           // SKIP this reconciliation when the packager IS already recorded in
           // config.services[] (e.g. a stack persisted by an older eager path):
@@ -1685,8 +1813,12 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const packagerInStoredServices = config.services.some(
             (s) => s.serviceId === PACKAGER_SERVICE_ID
           );
+          // Left undefined when the packager IS in the stored services[]: the
+          // stored-config teardown below reports it, so folding it again would
+          // double-count it (see packagerTeardownAsServiceResults).
+          let packagerTeardown: PackagerTeardownResult | undefined;
           if (!packagerInStoredServices) {
-            const packagerTeardown = await teardownOnDemandPackager(
+            packagerTeardown = await teardownOnDemandPackager(
               packagerOscApiFromContext(osc),
               name
             );
@@ -1704,18 +1836,31 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // torn down too: their instance names are passed alongside services[]
           // and deprovisionStackFromConfig merges (and dedupes) them so a stack
           // that activated auto-subtitles or scene-detect is fully removed.
-          const result = await deprovisionStackFromConfig(
-            osc,
-            name,
-            config.services,
-            {
-              ...(config.autoSubtitlesInstanceName
-                ? { autoSubtitlesInstanceName: config.autoSubtitlesInstanceName }
-                : {}),
-              ...(config.sceneDetectInstanceName
-                ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
-                : {})
-            }
+          //
+          // The on-demand packager torn down above is NOT in that stored list,
+          // so its outcome is folded in here (issue #1056) and the stack status
+          // is re-aggregated over the combined list. That gives the packager the
+          // same retry semantics as any stored service: a `failed` packager
+          // makes the whole result `failed`, which keeps the parameter-store
+          // entry below and names the still-running instance in result.services.
+          const result = foldTeardownResults(
+            await deprovisionStackFromConfig(
+              osc,
+              name,
+              config.services,
+              {
+                ...(config.autoSubtitlesInstanceName
+                  ? {
+                      autoSubtitlesInstanceName:
+                        config.autoSubtitlesInstanceName
+                    }
+                  : {}),
+                ...(config.sceneDetectInstanceName
+                  ? { sceneDetectInstanceName: config.sceneDetectInstanceName }
+                  : {})
+              }
+            ),
+            packagerTeardownAsServiceResults(packagerTeardown)
           );
 
           if (result.status === 'failed') {
