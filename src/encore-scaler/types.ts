@@ -23,7 +23,13 @@
 // Encore resolves s3:// URIs against AWS S3 and gets a 404.
 export type EncoreS3Config = {
   endpoint: string;     // full URL, e.g. https://oscaidev-jonas.minio-minio.auto.prod-se.osaas.io
-  accessKeyId: string;  // MinIO root user (always "admin" in OSC stacks)
+  // The object store's access key id FOR THE RESOLVED STACK (issue #1094),
+  // produced by resolveEncoreS3Config from that stack's stored config — per
+  // stack, no longer a deployment-wide root user. A stack provisioned before
+  // #1094 still resolves to the legacy root user until #1096 migrates it.
+  accessKeyId: string;
+  // SECRET. Goes into the spawned instance's create body (instance-pool.ts) and
+  // nowhere else — never a log line, never an API response.
   secretAccessKey: string;
   region?: string;      // S3 region string — MinIO ignores it but Encore requires a value
 };

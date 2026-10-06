@@ -79,6 +79,7 @@ import {
   type StackRedisResolution
 } from './services/scaler-redis-url.js';
 import { resolveEncoreS3Config } from './services/encore-s3-config.js';
+import { resolveObjectStoreCredential } from './services/object-store-credentials.js';
 import {
   makeInternalEndpointResolver,
   makeOscInternalEndpointLookup,
@@ -644,8 +645,9 @@ await app.register(provisionRouter, {
   // scaler use — never process-global endpoints. The queue probe is a lazily-
   // connected IORedis on the stack's Valkey URL (config.redisUrl, credential-
   // free `redis://host:port` — see redisUrlFrom in routes/provision.ts); the
-  // storage probe is a MinioClient on config.minioEndpoint with the deployment
-  // MinIO admin credentials (identical construction to
+  // storage probe is a MinioClient on config.minioEndpoint with the PROBED
+  // STACK's own object-store credential, resolved from that same stored config
+  // (issue #1094 — identical construction to
   // workspace-stack.ts buildConnectionsFromStack). Probe clients are
   // short-lived per request: the lazyConnect IORedis is not kept resident.
   reachabilityProbeFactory: (config): StackReachabilityDeps => {
@@ -661,12 +663,23 @@ await app.register(provisionRouter, {
       try {
         const url = new URL(config.minioEndpoint);
         const useSSL = url.protocol === 'https:';
+        // Probe with the PROBED STACK's own object-store credential (issue
+        // #1094), resolved from the same stored config the endpoint comes from —
+        // identical construction to workspace-stack.ts
+        // buildConnectionsFromStack. Probing a per-stack object store with the
+        // legacy deployment-wide root credential would report every migrated
+        // stack's storage as unreachable.
+        const probeCredential = resolveObjectStoreCredential({
+          storedAccessKeyId: config.objectStoreAccessKeyId,
+          seed: minioPassword,
+          legacySecretAccessKey: minioPassword
+        });
         deps.storageClient = new MinioClient({
           endPoint: url.hostname,
           port: url.port ? Number(url.port) : useSSL ? 443 : 80,
           useSSL,
-          accessKey: 'admin',
-          secretKey: minioPassword
+          accessKey: probeCredential.accessKeyId,
+          secretKey: probeCredential.secretAccessKey
         });
       } catch {
         // A malformed stored endpoint leaves storageClient unset: the storage
@@ -1332,6 +1345,11 @@ function activateScaler(redisUrl: string): void {
         {
           paramStore,
           secretAccessKey: encoreS3SecretKey,
+          // Seed for the per-stack object-store credential (issue #1094). The
+          // resolver uses it only when the resolved stack's stored config
+          // carries an `objectStoreAccessKeyId`; otherwise the legacy
+          // deployment-wide secret above is used, unchanged.
+          objectStoreCredentialSeed: process.env['MINIO_ROOT_PASSWORD'],
           // A configured static endpoint is a complete, intentional
           // configuration: defer to it (the registry reads undefined as "use
           // the static s3Config", workspace-registry.ts:206-209) instead of
@@ -1707,7 +1725,8 @@ function activateScaler(redisUrl: string): void {
   // and reuses the running instance on subsequent executions. Issue #245 wraps
   // this in a per-stack single-flight guard for concurrent first executions.
   //
-  // Requires the MinIO root password (packager S3 secret) and the OSC PAT
+  // Requires the deployment object-store credential material (from which the
+  // packager's per-stack S3 secret is resolved, issue #1094) and the OSC PAT
   // (packager fetches Encore job data). When either is missing this is a no-op
   // (undefined), so packaging degrades to the pre-#244 behaviour rather than
   // failing the pipeline.
@@ -1815,10 +1834,26 @@ function activateScaler(redisUrl: string): void {
           // docs/investigations/991-internal-object-store-endpoint-paths.md.
           minioEndpoint,
           packagedBucket,
-          publicBaseUrl
+          publicBaseUrl,
+          // The resolved stack's own object-store access key id (issue #1094),
+          // read from the SAME stored config the endpoint and bucket come from.
+          // Absent for a stack provisioned before #1094, in which case the
+          // packager keeps the legacy root user.
+          ...(stackCfg?.objectStoreAccessKeyId
+            ? { objectStoreAccessKeyId: stackCfg.objectStoreAccessKeyId }
+            : {})
         },
         secrets: {
           minioRootPassword: packagerMinioPassword,
+          // The matching per-stack secret, derived from the stored (non-secret)
+          // access key id plus the deployment seed (issue #1094). For a
+          // not-yet-migrated stack this resolves to the legacy pair, so the
+          // packager's credential is unchanged there.
+          objectStoreSecretAccessKey: resolveObjectStoreCredential({
+            storedAccessKeyId: stackCfg?.objectStoreAccessKeyId,
+            seed: packagerMinioPassword,
+            legacySecretAccessKey: packagerMinioPassword
+          }).secretAccessKey,
           oscPersonalAccessToken: packagerPat
         },
         log: app.log,
