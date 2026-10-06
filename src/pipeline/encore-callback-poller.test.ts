@@ -158,6 +158,14 @@ class FakeRedis {
   // #707: the success path hdel's keys.jobInstance so a later reconcile tick's
   // drop diff can't re-observe a completed job. ioredis hdel accepts one or more
   // fields and returns the count actually removed.
+  // Bounded message retry: the poller counts consecutive failures of one
+  // message in a hash (HINCRBY) and clears the field on success/dead-letter.
+  async hincrby(key: string, field: string, by: number): Promise<number> {
+    const h = this.hash(key);
+    const next = Number(h.get(field) ?? '0') + by;
+    h.set(field, String(next));
+    return next;
+  }
   async hdel(key: string, ...fields: string[]): Promise<number> {
     const h = this.hash(key);
     let removed = 0;
@@ -821,29 +829,128 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
   });
 
-  // A poller draining a per-stack Valkey (one per stack connection, beside the
-  // activation poller) applies the completion from its own Valkey but hands
-  // packaging off on the activation Valkey, where the packagers listen.
-  it('enqueues packaging on packagingRedis when draining a stack Valkey', async () => {
+  // Multi-stack: each stack has its own Valkey, where its scaler loop
+  // dispatches, its callback listeners write completions, and its packager
+  // consumes. A poller started on a second stack's Valkey (beside the one on
+  // the first stack's) must apply the completion found there and hand
+  // packaging off on that SAME Valkey, onto that stack's queue key — nothing
+  // may land on the first stack's Valkey.
+  it('drains a second stack’s Valkey and hands packaging off on that same Valkey', async () => {
     const encoreUuid = 'uuid-handoff-stack-valkey';
-    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
-    const activationRedis = new FakeRedis();
+    const stackRedis = new FakeRedis();
+    const seeded = await seedScenario(stackRedis, jobs, assets, pipelines, {
+      encoreUuid,
+      withPackageStep: true,
+      stackName: 'stack2'
+    });
+    await jobs.update(findLocalJobId(seeded.externalId), { status: 'running' });
+    await stackRedis.zadd(
+      QUEUE_KEY,
+      Date.now(),
+      JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` })
+    );
     const d = {
-      ...baseDeps(successFetch(externalId, encoreUuid), undefined),
-      packagingRedis: activationRedis as unknown as import('ioredis').Redis
+      ...baseDeps(successFetch(seeded.externalId, encoreUuid), undefined),
+      redis: stackRedis as unknown as import('ioredis').Redis,
+      resolvePackagingQueueKey: async (defaultKey: string) =>
+        `${defaultKey}:${currentRequestStackName()}`
     };
 
     const stop = startEncoreCallbackPoller(d);
     try {
-      await waitFor(() => activationRedis.zmembers(PACKAGING_QUEUE_KEY).length === 1);
+      await waitFor(() => stackRedis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`).length === 1);
     } finally {
       stop();
     }
 
     expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
-    const execution = await pipelines.get(pipelineId);
+    expect(redis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`)).toHaveLength(0);
+    expect(stackRedis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    const execution = await pipelines.get(seeded.pipelineId);
     expect(execution?.steps.find((s) => s.name === 'transcode')?.status).toBe('done');
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // A completion for a job still `queued` (its onDispatched hook missed it —
+  // the hook ran outside the job's stack, or the process restarted between
+  // dispatch and the hook) must not be rejected as `queued -> done` forever:
+  // the completion proves the dispatch, so the poller advances the job first.
+  it('advances a job never marked running before settling its completion', async () => {
+    const encoreUuid = 'uuid-queued-completion';
+    const seeded = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid,
+      withPackageStep: false
+    });
+    const localJobId = findLocalJobId(seeded.externalId);
+    expect((await jobs.get(localJobId))?.status).toBe('queued');
+    await redis.zadd(
+      QUEUE_KEY,
+      Date.now(),
+      JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` })
+    );
+    const d = baseDeps(successFetch(seeded.externalId, encoreUuid), undefined);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(localJobId))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    expect((await assets.get(seeded.assetId))?.status).toBe('ready');
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(0);
+    expect(redis.zmembers(`${QUEUE_KEY}:dead`)).toHaveLength(0);
+  });
+
+  // A message whose handling keeps throwing used to be put back with its
+  // original score and popped straight back — once a second, forever — so it
+  // blocked every later completion on that Valkey. It must be retried a bounded
+  // number of times BEHIND the rest of the queue and then dead-lettered, and a
+  // healthy completion queued after it must still be applied.
+  it('dead-letters a message that keeps failing without blocking later completions', async () => {
+    const poisonUuid = 'uuid-poison';
+    const healthyUuid = 'uuid-healthy';
+    const poison = await seedAndEnqueue(poisonUuid);
+    const healthy = await seedAndEnqueue(healthyUuid);
+    const poisonMessage = JSON.stringify({ jobId: poisonUuid, url: `${BASE_URL}/encoreJobs/${poisonUuid}` });
+    const healthyMessage = JSON.stringify({ jobId: healthyUuid, url: `${BASE_URL}/encoreJobs/${healthyUuid}` });
+    // The poison message is at the head of the queue.
+    await redis.zadd(QUEUE_KEY, 1, poisonMessage);
+    await redis.zadd(QUEUE_KEY, 2, healthyMessage);
+    // Its terminal write fails every time (a CouchDB write the repository
+    // rejects, say); the healthy job's writes go through.
+    const poisonLocalId = findLocalJobId(poison.externalId);
+    const originalUpdate = jobs.update.bind(jobs);
+    jobs.update = async (id, patch) => {
+      if (id === poisonLocalId && patch.status === 'done') throw new Error('write rejected');
+      return originalUpdate(id, patch);
+    };
+    const fetchFn = makeFetch({
+      successfulUuids: [poisonUuid, healthyUuid],
+      jobDocs: {
+        [poisonUuid]: { externalId: poison.externalId, status: 'SUCCESSFUL', output: [] },
+        [healthyUuid]: { externalId: healthy.externalId, status: 'SUCCESSFUL', output: [] }
+      }
+    });
+    const d = {
+      ...baseDeps(fetchFn, undefined),
+      maxMessageAttempts: 3,
+      messageRetryBackoffMs: () => 5
+    };
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(`${QUEUE_KEY}:dead`).length === 1);
+      await waitFor(async () => (await jobs.get(findLocalJobId(healthy.externalId)))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    expect(redis.zmembers(`${QUEUE_KEY}:dead`)).toEqual([poisonMessage]);
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(0);
+    expect(redis.zmembers(`${QUEUE_KEY}:processing`)).toHaveLength(0);
+    expect(await redis.hgetall(`${QUEUE_KEY}:attempts`)).toEqual({});
+    expect((await jobs.get(poisonLocalId))?.status).toBe('running');
   });
 
   // Multi-stack: a transcode on a non-first stack must provision and enqueue for
