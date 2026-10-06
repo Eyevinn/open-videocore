@@ -905,13 +905,38 @@ async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void
   // should release the pin immediately rather than waiting out its TTL.
   let packagingHandedOff = false;
 
+  // A completion whose terminal write already landed on an earlier attempt of
+  // this same message: completeTranscode no-oped (applied=false) because the job
+  // is already `done`. That earlier attempt then threw before its pipeline
+  // advance was persisted — observed on OSC as an on-demand packager create
+  // failing and the catch's own pipeline write failing with a gateway 500 — and
+  // the message was re-queued. Gating the advance on `applied` alone made the
+  // retry skip it, so the execution sat at transcode=running / package=pending
+  // for good: the job was terminal, so no sweep looked at it, and the package
+  // step never started, so the stalled-package bound never applied. The advance
+  // must therefore also run for a no-op SUCCESSFUL completion while a running
+  // execution still carries this job's transcode step as `running` — exactly the
+  // shape a lost advance leaves behind. Everything else below (webhooks, pin,
+  // slot decrement) stays gated on `applied`, so a genuine duplicate callback
+  // produces no second event; and the drop-recovery re-open stays `applied`-only
+  // too, since a no-op completion must never re-open a failed execution.
+  const completionAlreadyPersisted = !result.applied && success && found.job.status === 'done';
+
   // Advance the matching PipelineExecution — copied from src/routes/internal.ts
   // (the encore-callback handler). It can't be shared without a refactor.
-  if (result.applied && deps.pipelineRepository) {
+  if ((result.applied || completionAlreadyPersisted) && deps.pipelineRepository) {
     let execution = await deps.pipelineRepository.findRunningByAssetAndStep(
       found.job.assetId,
       'transcode'
     );
+    if (completionAlreadyPersisted && execution) {
+      deps.logger.warn({
+        msg: 'encore-callback-poller: completion already persisted but the pipeline advance was never applied — resuming the transcode->package handoff',
+        externalId,
+        jobId: found.job.id,
+        executionId: execution.id
+      });
+    }
     // #709: reversible drop-detection recovery. When the scaler's
     // gone-from-active-set drop settled this job it also FAILED the pipeline's
     // `transcode` step and moved the execution to `failed` (settleFailedTranscode
@@ -924,7 +949,7 @@ async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void
     // execution whose transcode step carries THIS externalId — a genuine
     // Encore-error failure (job never carried droppedByScaler, so completeTranscode
     // no-oped and result.applied is false) never reaches here.
-    if (!execution && success) {
+    if (!execution && success && result.applied) {
       const failedExecutions = await deps.pipelineRepository.listByAsset(found.job.assetId);
       const reopenable = failedExecutions.find(
         (e) =>
