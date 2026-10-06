@@ -550,9 +550,12 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // not scanned twice. Resolution failures are logged and skipped, never thrown.
   private async distinctStackRedis(
     log?: (msg: string, err?: unknown) => void
-  ): Promise<Array<{ redis: Redis; connectionId: string }>> {
-    const byConnection = new Map<string, Redis>();
-    byConnection.set(valkeyConnectionId(this.config.redisUrl), this.config.redis);
+  ): Promise<Array<{ redis: Redis; redisUrl: string; connectionId: string }>> {
+    const byConnection = new Map<string, { redis: Redis; redisUrl: string }>();
+    byConnection.set(valkeyConnectionId(this.config.redisUrl), {
+      redis: this.config.redis,
+      redisUrl: this.config.redisUrl
+    });
     let connections: ScalerStackConnection[] = [];
     try {
       connections = await this.listStackConnections({ fresh: true });
@@ -562,10 +565,14 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     for (const connection of connections) {
       if (!connection.redis || !connection.connectionId) continue;
       if (!byConnection.has(connection.connectionId)) {
-        byConnection.set(connection.connectionId, connection.redis);
+        byConnection.set(connection.connectionId, {
+          redis: connection.redis,
+          redisUrl:
+            this.redisConnections.get(connection.stackKey)?.redisUrl ?? this.config.redisUrl
+        });
       }
     }
-    return [...byConnection].map(([connectionId, redis]) => ({ redis, connectionId }));
+    return [...byConnection].map(([connectionId, entry]) => ({ ...entry, connectionId }));
   }
 
   // Tear down a single workspace's scaler: stop its background loop and destroy
@@ -606,8 +613,14 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     //    the other store and closes the per-stack connection in step 3.
     const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
     const stores: Array<{ redis: Redis; redisUrl: string }> = [{ redis, redisUrl }];
-    if (redis !== this.config.redis) {
-      stores.push({ redis: this.config.redis, redisUrl: this.config.redisUrl });
+    // Every other Valkey this registry knows: the stale copy can be on
+    // whichever stack's Valkey was the activation one when the fallback bound
+    // this stack to it, and that is not necessarily the current first stack.
+    const seen = new Set<Redis>([redis]);
+    for (const other of await this.distinctStackRedis()) {
+      if (seen.has(other.redis)) continue;
+      seen.add(other.redis);
+      stores.push({ redis: other.redis, redisUrl: other.redisUrl });
     }
     for (const store of stores) {
       let instances: Awaited<ReturnType<typeof listInstances>> = [];
