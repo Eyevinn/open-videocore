@@ -86,6 +86,7 @@ import { mountAssetClip } from './asset-clip.js';
 // own. Full contract grounding, including what the API does NOT expose, is in
 // that module's header.
 import { mountAssetTracks } from './tracks-panel.js';
+import { AUDIO_EDIT_COPY } from './audio-track-edit.js';
 
 // Comments panel (issue #900): the free-text notes on an asset, plus one control
 // to add another. ADD + READ ONLY — the API exposes exactly `post` and `get` on
@@ -105,6 +106,21 @@ import { mountAssetComments } from './comments-panel.js';
 // operation of any kind), is in that module's header; the interaction design it
 // implements is docs/design/asset-version-chain.md.
 import { mountVersionChain } from './version-chain.js';
+
+// External identifiers panel (issue #908, broken out of #796): the
+// `{ namespace, id }` correlations to upstream systems of record, which until now
+// were reachable only by whatever integration wrote them. The sub-resource is the
+// ONLY surface that exposes them — `assetSchema` declares no
+// `externalIdentifiers` property, so the GET /assets/{id} body this renderer
+// already holds cannot supply them.
+//
+// The panel offers exactly the affordances the verified contract can perform:
+// `GET` + `POST` on /assets/{id}/external-ids and `DELETE` on
+// /{namespace}/{externalId}. There is NO PUT and NO PATCH, so "edit" is POST +
+// DELETE, two requests, and the form says so. Full contract grounding — including
+// why POST appends rather than replaces, and why a 409 can only be handled
+// reactively — is in that module's header.
+import { mountAssetExternalIds } from './external-ids.js';
 
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
@@ -206,6 +222,39 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add/edit/remove an asset's external
+// identifiers (issue #908). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` AND `delete` to `editor` and `admin`
+// only, and `methodToAction` (:79-93) maps POST -> write and DELETE -> delete, so
+// BOTH mutating operations on this sub-resource — POST /assets/{id}/external-ids
+// and DELETE /assets/{id}/external-ids/{namespace}/{externalId} — are refused to a
+// `viewer` with 403 by `resourceAuthorizationPreHandler('asset')`
+// (src/auth/authorize.ts:126, registered src/routes/assets.ts:1748). One predicate
+// covers both because the matrix grants the two actions to exactly the same roles.
+// GET on the same sub-resource is `read`, which a viewer DOES hold — hence a
+// viewer still sees every namespace and value, read-only. Client-side mirror
+// only: the 403 is still handled if it arrives.
+function canChangeExternalIds() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add or remove an asset's editorial audio
+// tracks (issue #903). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only and
+// `delete` to the same two, and `methodToAction` (:79-93) maps POST -> write and
+// DELETE -> delete. Both track routes sit under
+// `resourceAuthorizationPreHandler('asset')`, registered plugin-scoped on EVERY
+// asset route (src/routes/assets.ts:1748), so POST /assets/{id}/audio-tracks and
+// DELETE /assets/{id}/audio-tracks/{trackId} are both refused to a `viewer` with
+// 403 `forbidden_insufficient_role` (:99). A viewer still holds `read`, so the
+// tracks panel itself stays fully visible — only the write controls go.
+// Client-side mirror only: the 403 is still handled if it arrives.
+function canEditAudioTracks() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2882,18 +2931,49 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //        `technical.video = [{ codec, width, height, bitrateBps }]`
     //        (src/data/asset-document.ts:402-404).
     //
-    // GET /api/v1/assets/{id}/tracks exists but is NOT called: its handler sends
-    // `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []` off the same
-    // document (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would
-    // cost a round-trip for bytes this renderer is holding.
+    // GET /api/v1/assets/{id}/tracks exists but is NOT called on the render
+    // path: its handler sends `asset.audioTracks ?? []` /
+    // `asset.subtitleTracks ?? []` off the same document
+    // (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would cost a
+    // round-trip for bytes this renderer is holding. The audio editor DOES call
+    // it, but only after a 204 from a remove, which carries no body — see
+    // public/audio-track-edit.js.
     //
-    // Mounted here, with the other read-only information blocks (status history,
-    // metadata, scenes) and ABOVE the action controls, because it is reporting
-    // only: #902 is explicitly read-only, so the panel creates no add/remove
-    // affordance for the POST/DELETE track routes that do exist.
+    // Mounted here, with the other information blocks (status history, metadata,
+    // scenes) and ABOVE the action controls, because it is predominantly
+    // reporting: the only writes it offers are the two scoped to its own audio
+    // section.
+    //
+    // ── Audio track add/remove (issue #903, broken out of #794) ──
+    // Contract fetched before these calls were written and cited in full in
+    // public/audio-track-edit.js:
+    //   POST /api/v1/assets/{id}/audio-tracks — body
+    //        { language (required, 1-64), codec? (1-64), channels? (int 1-64),
+    //        label? (1-128), default? } `additionalProperties: false`
+    //        (addAudioTrackSchema, src/routes/assets.ts:821-827, wired :5325-5355);
+    //        201 returns the asset's FULL updated `{ audioTracks }` (:5333,
+    //        :5351-5353), so a successful add needs no follow-up read. 404 is the
+    //        only other declared response.
+    //   DELETE /api/v1/assets/{id}/audio-tracks/{trackId} — no body; 204 (empty,
+    //        no content-type on the wire) or 404 (src/routes/assets.ts:5360-5382).
+    //        The handler filters the list and patches ONE key (:5375, :5379), so
+    //        it deletes no media and touches nothing else.
+    // `asset.id` is the ULID even when this pane was opened by slug, which is
+    // what both routes need: each hands its raw path param to `repo.get` with no
+    // slug fallback (:5339, :5370).
     mountAssetTracks({
       asset: asset,
       host: body,
+      audioEdit: canEditAudioTracks()
+        ? {
+            assetId: asset.id,
+            apiFetch: apiFetch,
+            confirmModal: confirmModal,
+          }
+        : null,
+      // A viewer keeps the whole panel (they hold `read`) and is told once why
+      // the controls are not there, rather than being left to wonder.
+      audioEditDenied: canEditAudioTracks() ? null : AUDIO_EDIT_COPY.roleNote,
     });
 
     // ── Versions: the asset's whole version chain (issue #907) ──
@@ -3251,6 +3331,54 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       host: body,
       canChange: canChangeReviewState(),
       apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
+
+    // ── External identifiers: upstream { namespace, id } correlations (issue #908) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/external-ids.js. `openapi.json .paths` carries
+    // EXACTLY three operations for this sub-resource — checked key by key:
+    //   GET  /api/v1/assets/{id}/external-ids — 200 is a bare ARRAY of
+    //        { namespace, id } (both `required`, additionalProperties: false),
+    //        "in persisted order … no dedup, sort, or reformatting"; 404 { error }
+    //        only when the ASSET is unknown (an asset with none is 200 []).
+    //        (…].get; src/routes/assets.ts:3315-3362)
+    //   POST /api/v1/assets/{id}/external-ids — body REQUIRED
+    //        { namespace (1..256), id (1..1024) }; 200 = the full asset,
+    //        400 { error }, 404 { error }, 409 { error, reason:
+    //        'external_id_conflict', namespace, externalId, conflictingAssetId }.
+    //        (…].post; src/routes/assets.ts:3173-3209, schema :501-518, 409
+    //        envelope :524-531 sent at :2696-2704)
+    //   DELETE /api/v1/assets/{id}/external-ids/{namespace}/{externalId} — no
+    //        body; 204 idempotently whether or not the pair was attached,
+    //        400/404 { error }. (…].delete; src/routes/assets.ts:3247-3294)
+    //
+    // THERE IS NO PUT AND NO PATCH on either path, and POST cannot substitute for
+    // one: it APPENDS to the set (src/data/asset-repo.ts:1546-1551) rather than
+    // replacing within a namespace. So the panel's "edit" is POST-then-DELETE —
+    // two requests, not atomic, add first so a failure between them leaves both
+    // pairs rather than neither — and the edit form says so on screen. The remove
+    // affordance exists only because DELETE does; nothing here is offered for a
+    // method the spec does not declare.
+    //
+    // The panel must issue its own GET: `assetSchema` declares no
+    // `externalIdentifiers` property (openapi.json .paths["/api/v1/assets/{id}"]
+    // .get 200 schema, additionalProperties: false), which is precisely why the
+    // sub-resource exists (src/routes/assets.ts:3293-3299). For the same reason the
+    // POST's 200 asset body is NOT a read-back — the serializer strips the field —
+    // so every write re-reads the sub-resource.
+    //
+    // Mounted between the review block and the action controls, and the
+    // sub-resource path takes the ULID (`asset.id`) — GET/POST resolve with a
+    // plain `repo.get` and no slug fallback (:3353, :3195).
+    await mountAssetExternalIds({
+      assetId: asset.id,
+      anchorEl: actionsDiv,
+      host: body,
+      canChange: canChangeExternalIds(),
+      apiFetch: apiFetch,
+      confirmModal: confirmModal,
       showMsg: showMsg,
     });
 
@@ -8047,6 +8175,11 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirror of the ADR-018 write+delete gate for the external-ids
+  // sub-resource (issue #908). Exported so a DOM/unit test can assert the
+  // add/edit/remove controls are offered to exactly the roles that hold both
+  // `write` and `delete`, and that a viewer still sees the list.
+  canChangeExternalIds,
   // Client-side mirror of the ADR-018 write gate for POST /assets/{id}/clip
   // (issue #793). Exported so a DOM/unit test can assert the Clip control is
   // offered to exactly the roles that hold `write`.

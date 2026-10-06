@@ -64,7 +64,12 @@ import {
   makeRequestScopedStorageFactory,
   requestStackNameFromHeaders,
   runWithRequestStack,
-  currentRequestStackName
+  runWithRequestedStack,
+  runWithPersistedStack,
+  adoptResolvedStackName,
+  currentRequestStackName,
+  currentDocumentStackName,
+  PERSISTED_STACK_FALLBACK_MESSAGE
 } from './services/request-stack-context.js';
 import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
@@ -149,7 +154,7 @@ import {
 } from './pipeline/watch-folder.js';
 import { healthRouter } from './routes/health.js';
 import { resolveBuildInfo } from './build-info.js';
-import { startEncoreCallbackPoller } from './pipeline/encore-callback-poller.js';
+import { startEncoreCallbackPoller, type PollerDeps } from './pipeline/encore-callback-poller.js';
 import {
   reconcileFailedTranscodes,
   settleFailedTranscode
@@ -159,7 +164,9 @@ import { reconcileInterruptedIngests } from './pipeline/interrupted-ingest-recon
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
-  packagerOscApiFromContext
+  packagerOscApiFromContext,
+  packagerQueueForStack,
+  packagingStackName
 } from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
@@ -176,6 +183,7 @@ import { valkeyConnectionId } from './encore-scaler/valkey-connection-id.js';
 import { resolveJobThroughputCap } from './encore-scaler/job-throughput-cap.js';
 import { decideRetry, clearRetryState, makePriorAttemptCanceler } from './encore-scaler/retry-store.js';
 import { decodeEncoreJobId } from './data/job-repo.js';
+import { DEPLOYMENT_CONTEXT } from './auth/workspace.js';
 import {
   createJob,
   getJob,
@@ -485,8 +493,13 @@ registerAuth(app);
 // the AsyncLocalStorage scope keeps the store attached for every later hook, the
 // handler, and any work the handler detaches (the URL-pull worker and its
 // follow-on metadata extraction).
+//
+// The header is UNTRUSTED, so it enters through `runWithRequestedStack`: it
+// ROUTES this request (unchanged), but it is not eligible to be persisted on a
+// document until the resolver below confirms it names a provisioned stack
+// (issue #1097 review, BLOCKING 2).
 app.addHook('onRequest', (request, _reply, done) => {
-  runWithRequestStack(requestStackNameFromHeaders(request.headers), done);
+  runWithRequestedStack(requestStackNameFromHeaders(request.headers), done);
 });
 
 // Resolve per-request connections. Auth is handled by the OSC SAT gate upstream;
@@ -496,6 +509,14 @@ app.addHook('preHandler', async (request) => {
   const stackName = currentRequestStackName();
   try {
     request.connections = await stackResolver.resolve(stackName);
+    // The identity the connections were ACTUALLY built from
+    // (WorkspaceConnections.stackName, services/workspace-stack.ts:188) becomes
+    // the value documents created later in this request are stamped with (issue
+    // #1097). Taken from the resolution we already awaited, so it costs no extra
+    // parameter-store read, and it is by construction a provisioned stack name —
+    // never the raw header — so a persisted stackName can never name a different
+    // stack than the one the document was written into.
+    adoptResolvedStackName(request.connections.stackName);
   } catch (err) {
     // A bad or partially-provisioned stack config (e.g. empty couchdbUrl) must
     // not take down every route including health probes. Degrade to no connections
@@ -1050,6 +1071,37 @@ let sharedRedis: IORedis | undefined;
 let packaging: PackagingService | undefined;
 let scalerRegistry: WorkspaceEncoreScalerRegistry | undefined;
 let stopEncoreCallbackPoller: (() => void) | undefined;
+// Everything the callback poller needs except the Valkey it drains, captured at
+// activation so a poller can be started per stack Valkey later.
+let callbackPollerOptions: Omit<PollerDeps, 'redis'> | undefined;
+let activationConnectionId: string | undefined;
+// Callback pollers for every stack Valkey other than the activation one, keyed
+// by connectionId. See syncStackCallbackPollers.
+const stackCallbackPollers = new Map<string, () => void>();
+
+// The Valkey a stack's scaler state lives on. Since #615 each provisioned stack
+// has its own Valkey and its scaler loop, the callback listeners paired with its
+// Encore instances, its packaging pins and its retry bookkeeping all live there;
+// the "activation" connection (`sharedRedis`) is merely the first-listed stack's
+// Valkey plus the fallback for the fixed single-stack deployment context. Every
+// consumer outside a scaler loop — routes, hooks, the packaging queue — resolves
+// its connection through these two accessors, which go through the registry so
+// they hand out the identical connection object the stack's loop uses.
+//
+// `stackRedisForEncoreJob`: by the stack encoded in the job id (the loop key).
+// `stackRedisForAmbientStack`: by the stack the current request or background
+// worker runs in (the resolver-confirmed identity, never the raw header). With
+// no ambient stack, the first-listed stack's connection.
+async function stackRedisForEncoreJob(encoreJobId: string): Promise<IORedis | undefined> {
+  if (!scalerRegistry) return undefined;
+  return scalerRegistry.redisForEncoreJob(encoreJobId);
+}
+async function stackRedisForAmbientStack(): Promise<IORedis | undefined> {
+  if (!scalerRegistry) return undefined;
+  const stackName = currentDocumentStackName();
+  if (!stackName) return sharedRedis;
+  return (await scalerRegistry.resolveStackRedis(stackName)).redis;
+}
 
 // Bucket names are stack-invariant (created at provision time, see provision.ts)
 // so a static default is correct for every workspace.
@@ -1109,6 +1161,19 @@ async function resolveStackRedis(): Promise<StackRedisResolution> {
   return resolveStackRedisUrl(stackResolver);
 }
 
+// The queue key to enqueue the ambient stack's packaging jobs onto: the key its
+// packager was created with (StackConfig.packagerQueue), or `defaultKey` for a
+// packager provisioned before per-stack keys existed and for deployments
+// without a parameter store.
+async function packagingQueueKey(defaultKey: string): Promise<string> {
+  if (!paramStore) return defaultKey;
+  const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+  const stackName = packagingStackName(names, currentRequestStackName());
+  if (!stackName) return defaultKey;
+  const cfg = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
+  return cfg?.packagerQueue ?? defaultKey;
+}
+
 // Bring the scaler, packaging service, and callback poller up against a stack's
 // Valkey. Idempotent: a no-op when already active on the same URL. This is
 // invoked at startup (if a stack already exists) and from onStackChange the
@@ -1164,10 +1229,12 @@ function activateScaler(redisUrl: string): void {
       throw new Error('parameter store unavailable; cannot resolve stack name');
     }
     const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-    if (names.length === 0) {
+    // The ambient stack's packager: the stalled-package sweep runs once inside
+    // each provisioned stack, and each stack has its own packager.
+    const stackName = packagingStackName(names, currentRequestStackName());
+    if (!stackName) {
       throw new Error('no provisioned stack; cannot resolve packager instance');
     }
-    const stackName = names[0]!;
     const packagerApi = packagerOscApiFromContext(oscContext);
     const sat = await packagerApi.getServiceAccessToken(PACKAGER_SERVICE_ID);
     const instance = await packagerApi.getInstance(
@@ -1308,17 +1375,18 @@ function activateScaler(redisUrl: string): void {
     // Job record queued->running and the source asset to `processing`. The
     // scaler has no repositories of its own, so we resolve the job here by the
     // encoreJobId (our externalId) it was submitted with.
-    onDispatched: async (encoreJobId: string) => {
-      const found = await jobRepository.findByEncoreJobId(encoreJobId);
-      if (!found) return;
-      const { job } = found;
-      if (job.status === 'queued' || job.status === 'pending') {
-        await jobRepository.update(job.id, { status: 'running' });
-      }
-      if (job.assetId) {
-        await assetRepository.update(job.assetId, { status: 'processing' });
-      }
-    },
+    onDispatched: (encoreJobId: string) =>
+      inEncoreJobStack(encoreJobId, async () => {
+        const found = await jobRepository.findByEncoreJobId(encoreJobId);
+        if (!found) return;
+        const { job } = found;
+        if (job.status === 'queued' || job.status === 'pending') {
+          await jobRepository.update(job.id, { status: 'running' });
+        }
+        if (job.assetId) {
+          await assetRepository.update(job.assetId, { status: 'processing' });
+        }
+      }),
     // Durably capture each Encore dispatch on the Job record (ADR-012, #380).
     // The scaler already records the attempt count in the TTL'd Valkey key and
     // clears it on re-dispatch/settle; this appends the same attempt to the
@@ -1327,11 +1395,12 @@ function activateScaler(redisUrl: string): void {
     // no repositories, so we resolve the job here by its encoreJobId. Best-
     // effort: the scaler swallows failures so a durable-write hiccup never
     // re-queues an already-dispatched job.
-    onEncodeDispatched: async (encoreJobId: string, attempt: number) => {
-      const found = await jobRepository.findByEncoreJobId(encoreJobId);
-      if (!found) return;
-      await jobRepository.appendEncodeAttempt(found.job.id, { index: attempt });
-    },
+    onEncodeDispatched: (encoreJobId: string, attempt: number) =>
+      inEncoreJobStack(encoreJobId, async () => {
+        const found = await jobRepository.findByEncoreJobId(encoreJobId);
+        if (!found) return;
+        await jobRepository.appendEncodeAttempt(found.job.id, { index: attempt });
+      }),
     // Once per tick, reconcile transcode jobs stuck non-terminal against Encore's
     // terminal FAILED / garbage-collected (404) outcomes (issue #273). A failed
     // Encore job never produces a completion message (the callback listener only
@@ -1425,180 +1494,189 @@ function activateScaler(redisUrl: string): void {
     // the job here by its encoreJobId (externalId), exactly as onDispatched does.
     // Best-effort: the scaler swallows a thrown hook so a repo hiccup never
     // blocks the re-enqueue that already succeeded.
-    onJobInterrupted: async (encoreJobId: string, reason: 'interrupted_by_scaledown') => {
-      const found = await jobRepository.findByEncoreJobId(encoreJobId);
-      if (!found) return;
-      await jobRepository.update(found.job.id, {
-        interrupted: true,
-        interruptionReason: reason
-      });
-    },
+    onJobInterrupted: (encoreJobId: string, reason: 'interrupted_by_scaledown') =>
+      inEncoreJobStack(encoreJobId, async () => {
+        const found = await jobRepository.findByEncoreJobId(encoreJobId);
+        if (!found) return;
+        await jobRepository.update(found.job.id, {
+          interrupted: true,
+          interruptionReason: reason
+        });
+      }),
     onJobsDropped: async (drops) => {
       for (const { encoreJobId, reason } of drops) {
-        try {
-          const found = await jobRepository.findByEncoreJobId(encoreJobId);
-          if (!found) continue;
-          // #704: when reconcile() recovered Encore's OWN terminal failure text
-          // (the FAILED encoreJob document's `message`, e.g. "Job execution
-          // failed: Could not find location for profile program! Profiles: {}"),
-          // surface THAT as the caller-facing failure so a user can tell a
-          // configuration problem from a platform one. The generic
-          // gone-from-active-set wording is reserved for the genuine
-          // no-reported-cause case (Encore stopped reporting the job without
-          // ever telling us why) — `reason` undefined.
-          const failureText =
-            reason && reason.trim().length > 0
-              ? `dropped by Encore: ${reason}`
-              : 'dropped by Encore: gone from active set with no completion';
+        await inEncoreJobStack(encoreJobId, async () => {
+          try {
+            const found = await jobRepository.findByEncoreJobId(encoreJobId);
+            if (!found) return;
+            // #704: when reconcile() recovered Encore's OWN terminal failure text
+            // (the FAILED encoreJob document's `message`, e.g. "Job execution
+            // failed: Could not find location for profile program! Profiles: {}"),
+            // surface THAT as the caller-facing failure so a user can tell a
+            // configuration problem from a platform one. The generic
+            // gone-from-active-set wording is reserved for the genuine
+            // no-reported-cause case (Encore stopped reporting the job without
+            // ever telling us why) — `reason` undefined.
+            const failureText =
+              reason && reason.trim().length > 0
+                ? `dropped by Encore: ${reason}`
+                : 'dropped by Encore: gone from active set with no completion';
 
-          // #727: route reconcile-detected drops through the SAME retry gate as
-          // callback-detected failures (encore-callback-poller.ts:481). #295 made
-          // transport- and IO-class encode failures retriable, but a read severed
-          // mid-encode produces no FAILED callback — Encore never signals FAILED,
-          // the job simply leaves QUEUED/IN_PROGRESS and reconcile() observes it as
-          // a drop. That was the ONE class #295 was built to retry that could never
-          // structurally reach the gate. So before settling terminal, ask
-          // decideRetry whether the recovered Encore message (carried on `reason`,
-          // #704) is a transport/IO-retryable signature that should be
-          // re-dispatched, honouring its contract exactly as the callback poller
-          // does:
-          //   - action:'retry' — the job has already been re-queued with backoff
-          //     and pinned back to RUNNING; do NOT settle (that would fail the
-          //     caller-facing job while the retry is pending).
-          //   - action:'settle' — settle terminal exactly as today.
-          // Classification is on `failureText`: a case-insensitive substring match
-          // (retry-policy.ts classifyEncoreFailure), so the `dropped by Encore: `
-          // prefix does not interfere with matching a signature carried in `reason`.
-          // When `reason` is undefined the text is the generic gone-from-active-set
-          // wording — no signature matches, so it classifies `deterministic` and
-          // settles exactly as before (no behaviour change; composes safely with
-          // #728). interrupted_by_scaledown (#514) never reaches here: it is
-          // classified structurally at the drain boundary
-          // (scaler-loop.requeueScaleDownInterruptions -> onJobInterrupted) and
-          // re-enqueued before reconcile()'s drop diff, so it is never raised as a
-          // drop while its payload is available.
-          //
-          // Only route jobs that are still non-terminal through the gate. A job
-          // already settled terminal must NOT be re-dispatched (its Valkey attempts
-          // could otherwise re-queue a completed job); fall straight through to the
-          // idempotent settle, which no-ops via completeTranscode. This preserves
-          // #709's conditional settle for the still-`running` case below.
-          const decoded = decodeEncoreJobId(encoreJobId);
-          const isTerminal =
-            found.job.status === 'done' ||
-            found.job.status === 'failed' ||
-            found.job.status === 'cancelled';
-          if (decoded && !isTerminal) {
-            let decision;
-            try {
-              decision = await decideRetry(
-                redis,
-                decoded.workspaceId,
-                encoreJobId,
-                failureText,
-                // #745: a reconcile-detected "drop" can be a FALSE POSITIVE (the
-                // job is still IN_PROGRESS on its instance). Cancel that prior
-                // attempt before re-dispatching so the same externalId is never
-                // active on two instances at once. Encore's serviceId is 'encore'
-                // (src/encore-scaler/types.ts:16).
-                makePriorAttemptCanceler(() => oscContext.getServiceAccessToken('encore'))
-              );
-            } catch (err) {
-              // If the retry gate itself errors, fall through to the normal
-              // terminal settle rather than leaving the job hung — mirrors
-              // encore-callback-poller.ts:487.
-              app.log.warn(
-                { err, encoreJobId },
-                'encore-scaler: onJobsDropped retry gate error — settling terminal'
-              );
-              decision = undefined;
-            }
-            if (decision?.action === 'retry') {
-              // decideRetry has already re-queued the job (with backoff) and pinned
-              // the caller-facing status back to RUNNING, so the job stays
-              // non-terminal until the retry succeeds or the bound is exhausted. Do
-              // NOT settle.
-              app.log.warn(
-                {
+            // #727: route reconcile-detected drops through the SAME retry gate as
+            // callback-detected failures (encore-callback-poller.ts:481). #295 made
+            // transport- and IO-class encode failures retriable, but a read severed
+            // mid-encode produces no FAILED callback — Encore never signals FAILED,
+            // the job simply leaves QUEUED/IN_PROGRESS and reconcile() observes it as
+            // a drop. That was the ONE class #295 was built to retry that could never
+            // structurally reach the gate. So before settling terminal, ask
+            // decideRetry whether the recovered Encore message (carried on `reason`,
+            // #704) is a transport/IO-retryable signature that should be
+            // re-dispatched, honouring its contract exactly as the callback poller
+            // does:
+            //   - action:'retry' — the job has already been re-queued with backoff
+            //     and pinned back to RUNNING; do NOT settle (that would fail the
+            //     caller-facing job while the retry is pending).
+            //   - action:'settle' — settle terminal exactly as today.
+            // Classification is on `failureText`: a case-insensitive substring match
+            // (retry-policy.ts classifyEncoreFailure), so the `dropped by Encore: `
+            // prefix does not interfere with matching a signature carried in `reason`.
+            // When `reason` is undefined the text is the generic gone-from-active-set
+            // wording — no signature matches, so it classifies `deterministic` and
+            // settles exactly as before (no behaviour change; composes safely with
+            // #728). interrupted_by_scaledown (#514) never reaches here: it is
+            // classified structurally at the drain boundary
+            // (scaler-loop.requeueScaleDownInterruptions -> onJobInterrupted) and
+            // re-enqueued before reconcile()'s drop diff, so it is never raised as a
+            // drop while its payload is available.
+            //
+            // Only route jobs that are still non-terminal through the gate. A job
+            // already settled terminal must NOT be re-dispatched (its Valkey attempts
+            // could otherwise re-queue a completed job); fall straight through to the
+            // idempotent settle, which no-ops via completeTranscode. This preserves
+            // #709's conditional settle for the still-`running` case below.
+            const decoded = decodeEncoreJobId(encoreJobId);
+            const isTerminal =
+              found.job.status === 'done' ||
+              found.job.status === 'failed' ||
+              found.job.status === 'cancelled';
+            // The retry bookkeeping (job payload / attempts, written by the
+            // loop at dispatch) and the queue the retry is pushed back onto are
+            // on THIS job's stack's Valkey, not the activation one: on any other
+            // stack the gate found no payload there and settled terminal
+            // without ever retrying.
+            const stackRedis = await scalerRegistry!.redisForEncoreJob(encoreJobId);
+            if (decoded && !isTerminal) {
+              let decision;
+              try {
+                decision = await decideRetry(
+                  stackRedis,
+                  decoded.workspaceId,
                   encoreJobId,
-                  attempt: decision.attempt,
-                  failureClass: decision.failureClass,
-                  backoffMs: decision.backoffMs,
-                  failureText
-                },
-                'encore-scaler: reconcile-detected drop — transport-class failure, re-dispatching'
-              );
-              continue; // retry pending; do not settle this drop.
-            }
-            if (decision?.action === 'skip') {
-              // #743: a retry entry for this job is already queued/inflight, so
-              // decideRetry did NOT enqueue a duplicate. The pending retry keeps
-              // the job non-terminal, so do NOT settle this drop.
-              app.log.info(
-                {
-                  encoreJobId,
-                  failureClass: decision.failureClass,
-                  failureText
-                },
-                'encore-scaler: reconcile-detected drop — retry already queued/inflight, skipping duplicate re-dispatch'
-              );
-              continue; // retry already pending; do not settle this drop.
-            }
-            if (decision?.action === 'settle') {
-              app.log.info(
-                {
-                  encoreJobId,
-                  reason: decision.reason,
-                  failureClass: decision.failureClass
-                },
-                'encore-scaler: reconcile-detected drop settling terminal'
-              );
-              // Retries exhausted / non-retryable: fall through to the terminal
-              // settle below, then clear the #295 retry bookkeeping.
-            }
-          }
-
-          await settleFailedTranscode(
-            {
-              jobs: jobRepository,
-              assets: assetRepository,
-              pipeline: pipelineRepository,
-              // #829: the scaler's dropped-job settle is the third path that
-              // applies a transcode terminal state, and it is invisible to both
-              // the poller's sweep and the #273 sweep (the job is gone from the
-              // instance's active set, so Encore no longer reports it). Without a
-              // dispatcher here the job goes `failed`, the asset goes `failed`,
-              // and the subscriber is told nothing. This settle is CONDITIONAL
-              // (#709) — see the documented failed -> complete correction
-              // sequence at the dispatch site in failed-transcode-reconciler.ts.
-              webhookDispatcher,
-              logger: {
-                info: (...a: unknown[]) => app.log.info(a),
-                warn: (...a: unknown[]) => app.log.warn(a)
+                  failureText,
+                  // #745: a reconcile-detected "drop" can be a FALSE POSITIVE (the
+                  // job is still IN_PROGRESS on its instance). Cancel that prior
+                  // attempt before re-dispatching so the same externalId is never
+                  // active on two instances at once. Encore's serviceId is 'encore'
+                  // (src/encore-scaler/types.ts:16).
+                  makePriorAttemptCanceler(() => oscContext.getServiceAccessToken('encore'))
+                );
+              } catch (err) {
+                // If the retry gate itself errors, fall through to the normal
+                // terminal settle rather than leaving the job hung — mirrors
+                // encore-callback-poller.ts:487.
+                app.log.warn(
+                  { err, encoreJobId },
+                  'encore-scaler: onJobsDropped retry gate error — settling terminal'
+                );
+                decision = undefined;
               }
-            },
-            found.job,
-            // #704: surface Encore's OWN recovered failure text when reconcile()
-            // captured one, else the generic gone-from-active-set wording.
-            failureText,
-            // #709: a gone-from-active-set drop is an INFERENCE (the job vanished
-            // from Encore's live set with no callback, ADR-016), not proof of
-            // failure. Settle it CONDITIONALLY so a genuine SUCCESSFUL callback
-            // arriving out of order can still correct the job to `done` and resume
-            // the pipeline (package / playback URL), rather than being frozen out
-            // by first-terminal-write-wins.
-            'gone-from-active-set'
-          );
-          // #727/#295: the job has now settled terminal (exhausted / non-retryable
-          // / no recovered reason). Drop the retry bookkeeping so it does not linger
-          // for the full TTL — matches the callback poller's terminal path
-          // (encore-callback-poller.ts:633). Best-effort: a stray key self-expires.
-          if (decoded) {
-            await clearRetryState(redis, encoreJobId).catch(() => {});
+              if (decision?.action === 'retry') {
+                // decideRetry has already re-queued the job (with backoff) and pinned
+                // the caller-facing status back to RUNNING, so the job stays
+                // non-terminal until the retry succeeds or the bound is exhausted. Do
+                // NOT settle.
+                app.log.warn(
+                  {
+                    encoreJobId,
+                    attempt: decision.attempt,
+                    failureClass: decision.failureClass,
+                    backoffMs: decision.backoffMs,
+                    failureText
+                  },
+                  'encore-scaler: reconcile-detected drop — transport-class failure, re-dispatching'
+                );
+                return; // retry pending; do not settle this drop.
+              }
+              if (decision?.action === 'skip') {
+                // #743: a retry entry for this job is already queued/inflight, so
+                // decideRetry did NOT enqueue a duplicate. The pending retry keeps
+                // the job non-terminal, so do NOT settle this drop.
+                app.log.info(
+                  {
+                    encoreJobId,
+                    failureClass: decision.failureClass,
+                    failureText
+                  },
+                  'encore-scaler: reconcile-detected drop — retry already queued/inflight, skipping duplicate re-dispatch'
+                );
+                return; // retry already pending; do not settle this drop.
+              }
+              if (decision?.action === 'settle') {
+                app.log.info(
+                  {
+                    encoreJobId,
+                    reason: decision.reason,
+                    failureClass: decision.failureClass
+                  },
+                  'encore-scaler: reconcile-detected drop settling terminal'
+                );
+                // Retries exhausted / non-retryable: fall through to the terminal
+                // settle below, then clear the #295 retry bookkeeping.
+              }
+            }
+
+            await settleFailedTranscode(
+              {
+                jobs: jobRepository,
+                assets: assetRepository,
+                pipeline: pipelineRepository,
+                // #829: the scaler's dropped-job settle is the third path that
+                // applies a transcode terminal state, and it is invisible to both
+                // the poller's sweep and the #273 sweep (the job is gone from the
+                // instance's active set, so Encore no longer reports it). Without a
+                // dispatcher here the job goes `failed`, the asset goes `failed`,
+                // and the subscriber is told nothing. This settle is CONDITIONAL
+                // (#709) — see the documented failed -> complete correction
+                // sequence at the dispatch site in failed-transcode-reconciler.ts.
+                webhookDispatcher,
+                logger: {
+                  info: (...a: unknown[]) => app.log.info(a),
+                  warn: (...a: unknown[]) => app.log.warn(a)
+                }
+              },
+              found.job,
+              // #704: surface Encore's OWN recovered failure text when reconcile()
+              // captured one, else the generic gone-from-active-set wording.
+              failureText,
+              // #709: a gone-from-active-set drop is an INFERENCE (the job vanished
+              // from Encore's live set with no callback, ADR-016), not proof of
+              // failure. Settle it CONDITIONALLY so a genuine SUCCESSFUL callback
+              // arriving out of order can still correct the job to `done` and resume
+              // the pipeline (package / playback URL), rather than being frozen out
+              // by first-terminal-write-wins.
+              'gone-from-active-set'
+            );
+            // #727/#295: the job has now settled terminal (exhausted / non-retryable
+            // / no recovered reason). Drop the retry bookkeeping so it does not linger
+            // for the full TTL — matches the callback poller's terminal path
+            // (encore-callback-poller.ts:633). Best-effort: a stray key self-expires.
+            if (decoded) {
+              await clearRetryState(stackRedis, encoreJobId).catch(() => {});
+            }
+          } catch (err) {
+            app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');
           }
-        } catch (err) {
-          app.log.warn({ err, encoreJobId }, 'encore-scaler: onJobsDropped settle failed');
-        }
+        });
       }
     }
   });
@@ -1609,7 +1687,15 @@ function activateScaler(redisUrl: string): void {
   // and receive a completion callback.
   packaging = new PackagingService({
     assets: assetRepository,
-    queue: makeOscPackagerQueue(redis, undefined, app.log),
+    // Enqueue on the ambient stack's Valkey (its packager consumes its own
+    // stack's Valkey — see ensurePackaging below) and onto the key recorded for
+    // that stack's packager.
+    queue: makeOscPackagerQueue(
+      async () => (await stackRedisForAmbientStack()) ?? redis,
+      undefined,
+      app.log,
+      packagingQueueKey
+    ),
     publicBaseUrl: packagingPublicBaseUrl(),
     // Observable `package` Job records (issue #976): created at enqueue time,
     // stamped onto the execution's `package` step as `steps[].jobId`, and
@@ -1666,9 +1752,13 @@ function activateScaler(redisUrl: string): void {
     // the ensurePackaging closure is dropped.
     const packagerEnsureGuard = new PackagerEnsureSingleFlight();
     ensurePackaging = async () => {
-      // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
-      // this activation is bound to. Mirrors resolveStackRedisUrl: the first
-      // provisioned stack for the namespace is the default.
+      // Resolve the stack (name + MinIO endpoint + packaged bucket) the packaging
+      // work belongs to: the ambient stack (packagingStackName), which both
+      // callers establish — the assets router from the request's X-Stack-Name,
+      // the callback poller from the job's persisted stackName (#1097). It used
+      // to always take the first provisioned stack, so a transcode on any other
+      // stack handed its renditions to the first stack's packager, which read
+      // the first stack's object store and failed every HeadObject with a 404.
       //
       // Issue #335: this resolution used to swallow failures — a param-store
       // error was warn-logged, and an unresolvable stack returned silently — so
@@ -1687,11 +1777,11 @@ function activateScaler(redisUrl: string): void {
       let stackCfg: StackConfig | undefined;
       try {
         const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-        if (names.length > 0) {
-          stackName = names[0];
+        stackName = packagingStackName(names, currentRequestStackName());
+        if (stackName) {
           stackCfg = await paramStore.loadStackConfig(
             STACK_CONFIG_NAMESPACE,
-            names[0]!
+            stackName
           );
           if (stackCfg?.minioEndpoint) minioEndpoint = stackCfg.minioEndpoint;
           if (stackCfg?.packagedBucket) packagedBucket = stackCfg.packagedBucket;
@@ -1723,7 +1813,16 @@ function activateScaler(redisUrl: string): void {
         osc: packagerApi,
         coords: {
           stackName: resolvedStackName,
-          redisUrl,
+          // The stack's OWN Valkey (StackConfig.redisUrl), where its scaler
+          // loop, its completion poller and the producers of its packaging
+          // queue all are — never the activation connection, which is another
+          // stack's Valkey for every stack but the first. A packager created
+          // before per-stack packaging was the first stack's, on that same
+          // Valkey, so it keeps working unchanged.
+          redisUrl: stackCfg?.redisUrl && stackCfg.redisUrl.length > 0 ? stackCfg.redisUrl : redisUrl,
+          // Only used when the packager is created; an already-running packager
+          // keeps the key it was built with (StackConfig.packagerQueue).
+          redisQueue: packagerQueueForStack(resolvedStackName),
           // PUBLIC endpoint, deliberately (issue #991 sibling-path audit). The
           // packager's `S3EndpointUrl` is fixed in its create body at provision
           // time (services/packager-provisioning.ts buildPackagerCreateBody), so
@@ -1781,13 +1880,17 @@ function activateScaler(redisUrl: string): void {
               s.serviceId === PACKAGER_SERVICE_ID &&
               s.instanceName === instanceName
           );
-          if (already) return;
+          const packagerQueue = packagerQueueForStack(resolvedStackName);
+          if (already && current.packagerQueue === packagerQueue) return;
           const updated: StackConfig = {
             ...current,
-            services: [
-              ...current.services,
-              { serviceId: PACKAGER_SERVICE_ID, instanceName }
-            ]
+            services: already
+              ? current.services
+              : [
+                  ...current.services,
+                  { serviceId: PACKAGER_SERVICE_ID, instanceName }
+                ],
+            packagerQueue
           };
           await paramStore.storeStackConfig(
             STACK_CONFIG_NAMESPACE,
@@ -1811,8 +1914,7 @@ function activateScaler(redisUrl: string): void {
   // Encore completion callback poller (background). Drains the Valkey sorted set
   // the callback listener writes to and applies transcode completions even when
   // the public callback route is unreachable (e.g. local runs).
-  stopEncoreCallbackPoller = startEncoreCallbackPoller({
-    redis,
+  callbackPollerOptions = {
     jobRepository,
     assetRepository,
     pipelineRepository,
@@ -1822,6 +1924,9 @@ function activateScaler(redisUrl: string): void {
     // "packaging-queue"; overridable so the poller can target a differently
     // named packager queue without a code change.
     packagingQueueKey: process.env['PACKAGING_QUEUE_KEY'],
+    // Per-stack packager queues: resolves the key the job's stack's packager
+    // consumes, falling back to packagingQueueKey above.
+    resolvePackagingQueueKey: packagingQueueKey,
     // #464: bounds for the independent job-status reconciliation sweep. All keep
     // the poller's own defaults (30s interval, page size 100, no instance cap)
     // when the env var is unset, so behaviour is unchanged out of the box.
@@ -1865,7 +1970,9 @@ function activateScaler(redisUrl: string): void {
     // that settles through this poller shows up in the Logs tab.
     pipelineLog: logStore,
     logger: app.log
-  });
+  };
+  stopEncoreCallbackPoller = startEncoreCallbackPoller({ redis, ...callbackPollerOptions });
+  activationConnectionId = valkeyConnectionId(redisUrl);
 
   // Publish the freshly-live connections into the router option objects so every
   // already-registered plugin picks them up on its next request/tick (#103).
@@ -1908,6 +2015,10 @@ async function deactivateScaler(): Promise<void> {
 
   stopEncoreCallbackPoller?.();
   stopEncoreCallbackPoller = undefined;
+  for (const stop of stackCallbackPollers.values()) stop();
+  stackCallbackPollers.clear();
+  callbackPollerOptions = undefined;
+  activationConnectionId = undefined;
 
   // Destroy all pooled OSC Encore instances before stopping loops.
   // Without this, instances accumulate across restarts because the Valkey pool
@@ -1956,11 +2067,68 @@ async function deactivateScaler(): Promise<void> {
 // against the first stack's Valkey when one exists and we are not yet active;
 // deactivate when the last stack is gone. Invoked at startup and after every
 // provision/teardown via onStackChange.
+// Run a scaler hook inside the stack its job was dispatched on. The scaler loops
+// run outside any request — a loop resumed at boot carries no ambient stack —
+// so a hook's job lookup resolved the first-listed stack's repositories and
+// missed every job on any other stack: onDispatched never advanced the job to
+// `running`, and its completion was then rejected as `queued -> done`. The
+// encoreJobId's prefix is the scaler's stack key; DEPLOYMENT_CONTEXT (a
+// single-stack env-override deployment) is not a stack name and keeps the
+// default resolution.
+function inEncoreJobStack<T>(encoreJobId: string, fn: () => Promise<T>): Promise<T> {
+  const stackKey = decodeEncoreJobId(encoreJobId)?.workspaceId;
+  return runWithRequestStack(
+    stackKey && stackKey !== DEPLOYMENT_CONTEXT ? stackKey : undefined,
+    fn
+  );
+}
+
+// Run a callback poller on every stack's Valkey, not just the activation one.
+//
+// Since #615 each stack's scaler loop dispatches on its own stack's Valkey, and
+// the callback listener paired with each Encore instance writes completions to
+// that same Valkey. The poller was only ever started on the activation Valkey,
+// so a completion on any other stack was never drained: the reconcile then saw
+// the job leave Encore's active set with no completion recorded and failed it
+// as "dropped by Encore: gone from active set with no completion", although
+// Encore had finished it successfully.
+//
+// One poller per DISTINCT connection (the registry's connectionId, #1074), so a
+// stack that shares the activation Valkey is not drained twice. Each poller
+// hands packaging off on the Valkey it drains, which is where that stack's
+// packager listens (ensurePackaging). Called on every reconcile (startup and
+// each provision/deprovision), so a stack provisioned later gets its poller
+// without a restart; a connection no longer listed has its poller stopped. The
+// enumeration is read fresh, bypassing the registry's status-poll cache, so the
+// stack that was just provisioned is not missed for its lifetime.
+async function syncStackCallbackPollers(): Promise<void> {
+  if (!scalerRegistry || !sharedRedis || !callbackPollerOptions) return;
+  const live = new Set<string>();
+  for (const connection of await scalerRegistry.listStackConnections({ fresh: true })) {
+    const { connectionId, redis, stackKey } = connection;
+    if (!connectionId || !redis || connectionId === activationConnectionId) continue;
+    live.add(connectionId);
+    if (stackCallbackPollers.has(connectionId)) continue;
+    stackCallbackPollers.set(
+      connectionId,
+      startEncoreCallbackPoller({ ...callbackPollerOptions, redis })
+    );
+    app.log.info({ stackKey, connectionId }, 'encore-callback-poller: started for stack Valkey');
+  }
+  for (const [connectionId, stop] of stackCallbackPollers) {
+    if (live.has(connectionId)) continue;
+    stop();
+    stackCallbackPollers.delete(connectionId);
+    app.log.info({ connectionId }, 'encore-callback-poller: stopped for stack Valkey');
+  }
+}
+
 async function reconcileScaler(): Promise<void> {
   if (!storageAvailable) return;
   const resolution = await resolveStackRedis();
   if (resolution.outcome === 'resolved') {
     if (!sharedRedis) activateScaler(resolution.redisUrl);
+    await syncStackCallbackPollers();
     return;
   }
   if (sharedRedis) {
@@ -2065,6 +2233,8 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   clipRunner,
   packaging,
   packagingRedis: sharedRedis,
+  packagingRedisForJob: stackRedisForEncoreJob,
+  packagingRedisForStack: stackRedisForAmbientStack,
   pipelineRepository,
   commentRepository,
   // Profile store for per-profile profileParams key validation (issue #290)
@@ -2093,6 +2263,7 @@ const jobsRouterOptions: Parameters<typeof jobsRouter>[1] & { prefix: string } =
   prefix: '/api/v1/jobs',
   repository: jobRepository,
   redis: sharedRedis,
+  redisForJob: stackRedisForEncoreJob,
   pipelineRepository,
   // Read-time `assetName` enrichment on the jobs listing + detail (issue #988).
   // The SAME repository instance the pipelines router below resolves its own
@@ -2144,6 +2315,7 @@ const internalRouterOptions: Parameters<typeof internalRouter>[1] & { prefix: st
   repository: assetRepository,
   webhookDispatcher,
   redis: sharedRedis,
+  redisForJob: stackRedisForEncoreJob,
   pipelineRepository,
   // Post-package relocation (issue #208, ADR-011). Resolve the stack's MinIO
   // client + packaged/staging bucket at callback time so a packaging success can
@@ -2191,19 +2363,58 @@ const triggerPostUploadThumbnail = thumbnailExtractor
 // the upload route and the watch-folder service. The upload route resolves the
 // caller's workspace before invoking this, so the sync storageFor() can be read
 // synchronously.
+// `stackName` is the asset's persisted stack identity (`Asset.stackName`, issue
+// #1097). An upload/watch-folder asset is created OUTSIDE any job, so this is
+// the only durable record of where it lives; the whole detached continuation
+// below runs inside it so the extraction and the thumbnail trigger's own
+// `resolve(currentRequestStackName())` (services/post-upload-thumbnail.ts) see
+// that stack rather than the first-listed one. This is precisely the follow-up
+// the #1100 fix left open in that file's header comment. Absent (pre-#1097
+// asset, or a path with no ambient stack) keeps today's behaviour and is
+// reported at debug level.
 const onObjectStored =
   storageAvailable
-    ? (assetId: string, objectKey: string, storage?: WorkspaceStorage) => {
-        const effectiveStorage = storage ?? storageFor();
-        if (probe) {
-          void extractTechnicalMetadata(
-            { assetId, objectKey },
-            { assets: assetRepository, storage: effectiveStorage, probe }
-          );
-        }
-        triggerPostUploadThumbnail?.(assetId, objectKey, effectiveStorage);
-      }
+    ? (
+        assetId: string,
+        objectKey: string,
+        storage?: WorkspaceStorage,
+        stackName?: string
+      ) =>
+        runWithPersistedStack(
+          stackName,
+          () => onObjectStoredInStack(assetId, objectKey, storage),
+          () =>
+            app.log.debug(
+              { assetId, objectKey },
+              `post-object-stored pipeline: ${PERSISTED_STACK_FALLBACK_MESSAGE}`
+            )
+        )
     : undefined;
+
+function onObjectStoredInStack(
+  assetId: string,
+  objectKey: string,
+  storage?: WorkspaceStorage
+): void {
+  const effectiveStorage = storage ?? storageFor();
+  // The stack this work is running in: the request's (issue #1058) or the
+  // asset's persisted one, re-entered by the wrapper above (issue #1097).
+  const stackName = currentRequestStackName();
+  if (probe) {
+    void extractTechnicalMetadata(
+      // Passed explicitly as well, so the extractor re-enters the stack on its
+      // own and stays correct however it is invoked.
+      { assetId, objectKey, ...(stackName ? { stackName } : {}) },
+      { assets: assetRepository, storage: effectiveStorage, probe, stackLog: app.log }
+    );
+  }
+  // Poster frame (issue #7). The trigger captures the AMBIENT stack name
+  // synchronously and then does a REAL resolve() from inside its own detached
+  // continuation (issue #1100, services/post-upload-thumbnail.ts) — so because
+  // the wrapper above has already re-entered the asset's persisted stack, the
+  // name it captures is that stack, with no cache-timing dependency.
+  triggerPostUploadThumbnail?.(assetId, objectKey, effectiveStorage);
+}
 
 // Registered UNCONDITIONALLY (mirroring assetsRouter above, main.ts:1184) so
 // the upload/multipart routes always enter the route tree and therefore the

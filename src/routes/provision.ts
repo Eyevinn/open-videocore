@@ -1955,7 +1955,24 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           const config = await paramStore.loadStackConfig(workspaceId, name);
           if (!config) {
             // Idempotent: a retry after a successful teardown (entry already
-            // gone) lands here. Report not_found rather than erroring.
+            // gone) lands here. Report not_found rather than erroring — but
+            // still sweep any scaler state left under this name: a stack torn
+            // down while the scaler teardown was a no-op (it was keyed by the
+            // namespace, not the stack) left its pool keys and possibly its
+            // Encore instances behind, and re-issuing the DELETE is the
+            // operator's way to clean that up. teardown() is a clean no-op
+            // when there is nothing under the name.
+            const staleRegistry = getScalerRegistry?.();
+            if (staleRegistry) {
+              try {
+                await staleRegistry.teardown(name);
+              } catch (err) {
+                app.log.warn(
+                  { err, name },
+                  'scaler teardown for an already-removed stack failed; continuing'
+                );
+              }
+            }
             ops.update(op.id, {
               status: 'done',
               completedAt: Date.now(),
@@ -1972,13 +1989,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // absent or the pool is empty. Guard failures the same way the
           // parameter-store cleanup below does: a teardown error is logged but
           // must not abort the static-service deprovision that follows.
+          //
+          // Keyed by the STACK NAME: since #615 the registry's loop key is the
+          // stack the transcode resolved to (the encoreJobId prefix), and since
+          // #804 `workspaceId` here is the constant config namespace, which is
+          // not a stack. Passing the namespace made this a silent no-op, so a
+          // deprovisioned stack left its Encore instances, their callback
+          // listeners and its pool keys behind, billing until removed by hand.
           const scalerRegistry = getScalerRegistry?.();
           if (scalerRegistry) {
             try {
-              await scalerRegistry.teardown(workspaceId);
+              await scalerRegistry.teardown(name);
             } catch (err) {
               app.log.error(
-                { err, name, workspaceId },
+                { err, name },
                 'scaler teardown failed before static-service deprovision; continuing'
               );
             }

@@ -94,6 +94,7 @@ import {
   PublicManifestBaseUrlError
 } from '../pipeline/packaging.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
+import { runWithPersistedStack } from '../services/request-stack-context.js';
 import { type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
   extractTechnicalMetadata,
@@ -1160,6 +1161,14 @@ type AssetsRouterOptions = {
   packaging?: import('../pipeline/packaging.js').PackagingService;
   // Redis for resolving Encore instance URL at packaging time.
   packagingRedis?: import('ioredis').Redis;
+  // Per-stack replacements for `packagingRedis` (every scaler key lives on the
+  // job's own stack's Valkey, #615). `packagingRedisForJob` resolves the Valkey
+  // of the stack an Encore job was dispatched on, for the job-url / instance /
+  // pin reads; `packagingRedisForStack` resolves the ambient request stack's
+  // Valkey, for the submit preflight. Both preferred over `packagingRedis`,
+  // which is the first stack's connection.
+  packagingRedisForJob?: (encoreJobId: string) => Promise<import('ioredis').Redis | undefined>;
+  packagingRedisForStack?: () => Promise<import('ioredis').Redis | undefined>;
   // On-demand packager provisioning (epic #226, issue #244). Invoked the first
   // time a pipeline reaches a `package` step: it provisions + wires the Encore
   // packager to the shared queue and output storage if absent, waits for
@@ -1502,6 +1511,24 @@ async function resolveEncoreJobUrlForPackaging(
   redis: import('ioredis').Redis | undefined
 ): Promise<PackagingTarget | undefined> {
   return resolvePackagingTarget(redis, encoreJobId);
+}
+
+// The scaler-state Valkey of the stack `encoreJobId` was dispatched on: the
+// per-stack resolver when wired, else the injected first-stack connection.
+async function packagingRedisForJob(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForJob'>,
+  encoreJobId: string
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForJob) return opts.packagingRedis;
+  return opts.packagingRedisForJob(encoreJobId);
+}
+
+// The ambient request stack's scaler-state Valkey, for stack-level probes.
+async function packagingRedisForStack(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForStack'>
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForStack) return opts.packagingRedis;
+  return opts.packagingRedisForStack();
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,21 +2131,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // during a long transfer — after which the factory THROWS rather than
   // returning the wrong stack. Same reason, and the same shape, as
   // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts:83).
+  //
+  // `stackName` is the DURABLE stack identity read off the asset (or the job
+  // that produced it) — `Asset.stackName` / `Job.stackName` (issue #1097). The
+  // extractor re-enters it so a detached extraction resolves the right stack's
+  // repositories even once the ambient request context is gone. Omit it and the
+  // extractor keeps today's behaviour (ambient context, else first-listed stack).
   function triggerExtraction(
     assetId: string,
     objectKey: string,
     externalSource?: ExternalProbeSource,
-    storage?: WorkspaceStorage
+    storage?: WorkspaceStorage,
+    stackName?: string
   ): boolean {
     if (!opts.probe || !storageFor) {
       return false;
     }
     void extractRunner(
-      { assetId, objectKey, ...(externalSource ? { externalSource } : {}) },
+      {
+        assetId,
+        objectKey,
+        ...(externalSource ? { externalSource } : {}),
+        ...(stackName ? { stackName } : {})
+      },
       {
         assets: repo,
         storage: storage ?? storageFor(),
         probe: opts.probe,
+        stackLog: app.log,
         ...opts.extractDeps
       }
     );
@@ -2134,16 +2174,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // extractor never throws (it records failures on the asset), so callers read
   // back the asset to learn whether recovery succeeded. Assumes probe + storage
   // are configured (the route checks this before calling).
-  async function runExtractionSync(assetId: string, objectKey: string): Promise<void> {
+  async function runExtractionSync(
+    assetId: string,
+    objectKey: string,
+    stackName?: string
+  ): Promise<void> {
     if (!opts.probe || !storageFor) {
       return;
     }
     await extractRunner(
-      { assetId, objectKey },
+      { assetId, objectKey, ...(stackName ? { stackName } : {}) },
       {
         assets: repo,
         storage: storageFor(),
         probe: opts.probe,
+        stackLog: app.log,
         ...opts.extractDeps
       }
     );
@@ -2647,7 +2692,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const resolved = await resolveEncoreJobUrlForPackaging(
         encoreJobId,
-        opts.packagingRedis
+        await packagingRedisForJob(opts, encoreJobId)
       );
       if (!resolved) {
         reply.code(409).send({
@@ -2964,7 +3009,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       for (let i = 0; i < stepsCopy.length; i++) {
         const step = stepsCopy[i];
         if (step.name === 'extract-metadata') {
-          triggerExtraction(asset.id, sourceObjectKey);
+          // asset.stackName (issue #1097): the detached probe re-enters the
+          // stack the asset actually lives on.
+          triggerExtraction(asset.id, sourceObjectKey, undefined, undefined, asset.stackName);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           logSettledStep(step.name, 'done');
           continue;
@@ -3130,10 +3177,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // pin failure means the Redis the pool state was just read from is
           // faulty, and failing the step would deny a run that is still likely to
           // succeed. Unpinned is the pre-fix behaviour, not worse than it.
-          if (opts.packagingRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
+          const pinRedis = packageOnlyEncoreJobId
+            ? await packagingRedisForJob(opts, packageOnlyEncoreJobId)
+            : undefined;
+          if (pinRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
             try {
               await pinInstanceForPackaging(
-                opts.packagingRedis,
+                pinRedis,
                 packageOnlyInstanceId,
                 packageOnlyEncoreJobId
               );
@@ -3475,7 +3525,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           request.log
         );
         // Fire-and-forget probe against the external source (job reads in place).
-        triggerExtraction(extAsset.id, extObjectKey, source);
+        // Carries the job's persisted stack (issue #1097) so the detached probe's
+        // asset write resolves this stack and not the first-listed one.
+        triggerExtraction(extAsset.id, extObjectKey, source, undefined, extJob.stackName);
         return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
       }
 
@@ -3582,7 +3634,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // has no equivalent, so calling it there would fail silently. Giving the
       // thumbnail path the same external-source treatment is a separate change.
       void runner(
-        { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
+        {
+          jobId: job.id,
+          assetId: asset.id,
+          objectKey,
+          sourceUrl,
+          // The stack the job was just created against (issue #1097). The pull
+          // is detached and can be re-driven after a process restart, so the
+          // worker re-enters this persisted identity rather than depending on
+          // the ambient context it inherits from this request.
+          stackName: job.stackName
+        },
         {
           jobs,
           assets: repo,
@@ -3596,6 +3658,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // therefore outlives this request.
           pipelineLog,
           pipelineLogErrors: request.log,
+          stackLog: request.log,
           // Terminal `job.completed` / `job.failed` emission for this job happens
           // inside the worker, where the pull actually settles (issue #1000).
           // Threaded after the `pullDeps` spread so an injected test dep bag can
@@ -3604,20 +3667,25 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           auditLog: request.log
         }
       )
-        .then(async () => {
-          const settled = await repo.get(asset.id);
-          if (settled?.status === 'processing') {
-            triggerExtraction(asset.id, objectKey, undefined, pullStorage);
-            // Same `pullStorage` handle, for the same reason (issue #1051
-            // review): this runs AFTER the request's work has settled, so
-            // `storageFor()` can have aged past the resolver TTL and would throw
-            // inside this detached continuation. Passing the handle resolved at
-            // request time keeps the thumbnail path symmetric with the
-            // extraction path immediately above instead of silently depending on
-            // the ambient request-stack context.
-            triggerThumbnail(asset.id, objectKey, request, pullStorage);
-          }
-        })
+        // The read-back runs in the job's PERSISTED stack (issue #1097) rather
+        // than relying on the ambient context this continuation inherited, so it
+        // resolves the same repository the pull just wrote to.
+        .then(() =>
+          runWithPersistedStack(job.stackName, async () => {
+            const settled = await repo.get(asset.id);
+            if (settled?.status === 'processing') {
+              triggerExtraction(asset.id, objectKey, undefined, pullStorage, job.stackName);
+              // Same `pullStorage` handle, for the same reason (issue #1051
+              // review): this runs AFTER the request's work has settled, so
+              // `storageFor()` can have aged past the resolver TTL and would throw
+              // inside this detached continuation. Passing the handle resolved at
+              // request time keeps the thumbnail path symmetric with the
+              // extraction path immediately above instead of silently depending on
+              // the ambient request-stack context.
+              triggerThumbnail(asset.id, objectKey, request, pullStorage);
+            }
+          })
+        )
         // This continuation outlives the request, so nothing is left to surface
         // a rejection: `repo.get` resolves the stack through the ambient context
         // and can fail on its own (a dead CouchDB, a stack de-provisioned mid
@@ -4874,14 +4942,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset recovered to `ready`.
       const wedged = asset.status === 'processing' && asset.technicalMetadataError !== undefined;
       if (wedged) {
-        await runExtractionSync(asset.id, source.objectKey);
+        await runExtractionSync(asset.id, source.objectKey, asset.stackName);
         const settled = await repo.get(asset.id);
         return reply.code(200).send({
           assetId: asset.id,
           status: settled?.status ?? asset.status
         });
       }
-      triggerExtraction(asset.id, source.objectKey);
+      triggerExtraction(asset.id, source.objectKey, undefined, undefined, asset.stackName);
       return reply.code(202).send({ assetId: asset.id, status: 'extracting' });
     }
   );
@@ -5155,9 +5223,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // opt-in: a dependency with no wired probe client is reported
         // not_configured and does NOT trip the guard, so deployments/tests
         // without a live queue/storage submit exactly as before.
-        const queueEndpoint = opts.packagingRedis
-          ? `redis://${opts.packagingRedis.options.host ?? 'localhost'}:${
-              opts.packagingRedis.options.port ?? 6379
+        const packagingRedis = await packagingRedisForStack(opts);
+        const queueEndpoint = packagingRedis
+          ? `redis://${packagingRedis.options.host ?? 'localhost'}:${
+              packagingRedis.options.port ?? 6379
             }`
           : undefined;
         const preflight = await checkStackReachability(
@@ -5173,7 +5242,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             bucket: request.connections?.sourceBucket ?? opts.sourceBucket
           },
           {
-            ...(opts.packagingRedis ? { queueClient: opts.packagingRedis } : {}),
+            ...(packagingRedis ? { queueClient: packagingRedis } : {}),
             ...(request.connections?.storageClient
               ? { storageClient: request.connections.storageClient }
               : {})
@@ -5372,7 +5441,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // Resolve the Encore instance URL + UUID from Redis. Both must be present
       // (stored at dispatch time). If the instance has been scaled down, packaging
       // cannot proceed — the Encore job data is only accessible while the instance runs.
-      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
+      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(
+        encoreJobId,
+        await packagingRedisForJob(opts, encoreJobId)
+      );
       if (!resolvedPackagingTarget) {
         return reply.code(409).send({ error: 'instance_not_found', message: 'Encore instance no longer in pool — cannot resolve job URL for packaging' });
       }

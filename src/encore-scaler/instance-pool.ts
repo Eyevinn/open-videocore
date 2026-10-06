@@ -507,6 +507,12 @@ async function createOrAdoptCallbackListener(
   callbackSat: string
 ): Promise<{ instance: OscInstance; adopted: boolean }> {
   try {
+    console.info(
+      '[encore-scaler] spawn: creating callback listener %s for Encore instance %s (workspace=%s)',
+      instanceId,
+      encoreUrl,
+      config.workspaceId
+    );
     const created = (await createInstance(
       config.oscContext,
       ENCORE_CALLBACK_LISTENER_SERVICE_ID,
@@ -520,6 +526,12 @@ async function createOrAdoptCallbackListener(
     )) as OscInstance;
     return { instance: created, adopted: false };
   } catch (err) {
+    console.warn(
+      '[encore-scaler] spawn: create of callback listener %s failed (workspace=%s): %s',
+      instanceId,
+      config.workspaceId,
+      err instanceof Error ? err.message : String(err)
+    );
     // Adopt-on-"already taken": the listener is named after its Encore
     // instance, so a create that landed behind a 504 makes the retry collide
     // with itself.
@@ -594,15 +606,38 @@ async function spawnPooledInstance(
       if (config.profilesUrl) {
         instanceBody['profilesUrl'] = config.profilesUrl;
       }
+      // Say what is being created before the call: a create that hangs or
+      // fails at the gateway otherwise leaves no record of having been tried.
+      console.info(
+        '[encore-scaler] spawn: creating Encore instance %s (workspace=%s attempt=%d/%d)',
+        name,
+        config.workspaceId,
+        attempt,
+        maxAttempts
+      );
       instance = (await createInstance(
         config.oscContext,
         ENCORE_SERVICE_ID,
         sat,
         instanceBody
       )) as OscInstance;
+      console.info(
+        '[encore-scaler] spawn: created Encore instance %s (workspace=%s attempt=%d)',
+        name,
+        config.workspaceId,
+        attempt
+      );
       break;
     } catch (err) {
       lastErr = err;
+      console.warn(
+        '[encore-scaler] spawn: create of Encore instance %s failed (workspace=%s attempt=%d/%d): %s',
+        name,
+        config.workspaceId,
+        attempt,
+        maxAttempts,
+        err instanceof Error ? err.message : String(err)
+      );
       // #1071 ADOPT-ON-"ALREADY TAKEN". `name` is computed ONCE, outside this
       // loop, so every attempt sends the same name. That is deliberate: when a
       // previous attempt timed out at the gateway (504) but completed behind it,
@@ -1182,6 +1217,11 @@ export async function destroyInstance(
   config: EncoreScalerConfig
 ): Promise<void> {
   const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+  console.info(
+    '[encore-scaler] destroy: removing Encore instance %s and its callback listener (workspace=%s)',
+    instanceId,
+    config.workspaceId
+  );
   try {
     await removeInstance(config.oscContext, ENCORE_SERVICE_ID, instanceId, sat);
   } catch (err) {
@@ -1204,14 +1244,84 @@ export async function destroyInstance(
       instanceId,
       callbackSat
     );
-  } catch {
-    // Listener already removed or unreachable — nothing to do.
+  } catch (err) {
+    // Listener already removed or unreachable — nothing more to do here; the
+    // orphan reaper (#778) picks up a listener that outlives its instance.
+    console.warn(
+      '[encore-scaler] destroy: callback listener %s removal failed (workspace=%s): %s',
+      instanceId,
+      config.workspaceId,
+      err instanceof Error ? err.message : String(err)
+    );
   }
   // Only drop the pool record after OSC removal succeeds (or confirmed gone).
   // Dropping it on a transient failure would cause the pool to lose track of a
   // still-running instance, making the next tick spawn a replacement — which is
   // exactly the runaway-spawning bug this fixes.
   await config.redis.hdel(keys.pool(config.workspaceId), instanceId);
+}
+
+// Evict pool records whose Encore instance no longer exists on OSC.
+//
+// reconcile() keeps an instance whose Encore API cannot be reached: an outage
+// mid-job must never cost the job. But a pool record can also outlive its
+// instance — a teardown that removed the Encore instance and died before the
+// pool write, or an instance removed outside the scaler. Such a record is
+// permanently "unreachable": it is counted as idle capacity (activeJobs 0), so
+// the loop never scales up, every dispatch to it fails and re-queues the job,
+// and the queue sits there for good. Observed on OSC as a job `running` for 16+
+// minutes with queueDepth 1 and one pool instance that no longer existed.
+//
+// Only the ids the caller found unreachable are checked, against OSC's own
+// list of the Encore service — the authoritative existence answer (getInstance
+// swallows every error but 401, so its undefined means "could not confirm", not
+// "gone"). An instance OSC still lists is kept, as before. One that is absent is
+// destroyed through destroyInstance, which tolerates the 404 on the Encore
+// removal, removes the paired callback listener (the half of the pair that was
+// left behind on OSC) and drops the pool record. A listing failure evicts
+// nothing. Returns the evicted ids so the loop can re-queue the jobs that were
+// mapped to them.
+export async function evictVanishedInstances(
+  config: EncoreScalerConfig,
+  unreachableIds: readonly string[]
+): Promise<string[]> {
+  if (unreachableIds.length === 0) return [];
+  let onOsc: OscInstance[];
+  try {
+    const sat = await config.oscContext.getServiceAccessToken(ENCORE_SERVICE_ID);
+    onOsc = (await oscListInstances(config.oscContext, ENCORE_SERVICE_ID, sat)) as OscInstance[];
+    if (!Array.isArray(onOsc)) return [];
+  } catch {
+    // Cannot confirm anything this pass; the records stay and are re-checked
+    // on the next tick.
+    return [];
+  }
+  const existing = new Set<string>();
+  for (const inst of onOsc) {
+    if (typeof inst.name === 'string' && inst.name.length > 0) existing.add(inst.name);
+  }
+  const evicted: string[] = [];
+  for (const instanceId of unreachableIds) {
+    if (existing.has(instanceId)) continue;
+    console.warn(
+      '[encore-scaler] reconcile: pool instance %s is unreachable and no longer exists on OSC ' +
+        '(workspace=%s) — evicting its pool record and removing its callback listener',
+      instanceId,
+      config.workspaceId
+    );
+    try {
+      await destroyInstance(instanceId, config);
+      evicted.push(instanceId);
+    } catch (err) {
+      console.error(
+        '[encore-scaler] reconcile: failed to evict vanished instance %s (workspace=%s):',
+        instanceId,
+        config.workspaceId,
+        err
+      );
+    }
+  }
+  return evicted;
 }
 
 // Default grace window for the orphan reaper (#778): how long an instance must
