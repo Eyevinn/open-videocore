@@ -46,6 +46,9 @@ import {
 } from '../services/stack.js';
 import {
   LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
+  MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS,
+  MINIMUM_OBJECT_STORE_SEED_LENGTH,
+  assessObjectStoreCredentialSeed,
   newObjectStoreCredentialGeneration,
   planObjectStoreCredential,
   type ObjectStoreCredentialPlan
@@ -606,6 +609,37 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
   }
   if (!couchdbAdminPassword) {
     throw new Error('COUCHDB_ADMIN_PASSWORD environment variable is required');
+  }
+
+  // MINIO_ROOT_PASSWORD is also the per-stack credential derivation SEED
+  // (issue #1094). Presence alone is not enough for that second role: the
+  // derived secret is handed to spawned transcoders and per-job instances as a
+  // plaintext field, so a WEAK seed would let one leaked stack credential be
+  // turned back into the seed offline — and with it, every other stack's
+  // credential. Checked ONCE here, at registration time, so the operator sees
+  // it in the startup log rather than discovering it per provision.
+  //
+  // A weak seed is NOT fatal: planObjectStoreCredential keeps such a deployment
+  // on the legacy deployment-wide credential, which is byte-identically the
+  // pre-#1094 behaviour. Failing startup would break working deployments for a
+  // property they never had. So this warns, loudly, and the feature stays off
+  // until the seed is strong enough. The log line carries only the assessment,
+  // never the seed or any part of it.
+  const objectStoreSeedAssessment =
+    assessObjectStoreCredentialSeed(minioRootPassword);
+  if (!objectStoreSeedAssessment.acceptable) {
+    app.log.warn(
+      {
+        reason: objectStoreSeedAssessment.reason,
+        estimatedEntropyBits: objectStoreSeedAssessment.estimatedEntropyBits,
+        minimumLength: MINIMUM_OBJECT_STORE_SEED_LENGTH,
+        minimumEntropyBits: MINIMUM_OBJECT_STORE_SEED_ENTROPY_BITS
+      },
+      'MINIO_ROOT_PASSWORD is too weak to derive per-stack object-store ' +
+        'credentials from (issue #1094); newly provisioned stacks will keep ' +
+        'the deployment-wide object-store credential until it is replaced ' +
+        'with a high-entropy value'
+    );
   }
 
   // OpenAI API key for eyevinn-auto-subtitles' Whisper transcription (issue
@@ -1287,6 +1321,26 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
         // still on the legacy deployment-wide password keeps its pre-#1094
         // behaviour (no object-store secret is minted for it) until #1096
         // migrates it.
+        //
+        // BEST-EFFORT, by review (issue #1094). These two writes are NOT
+        // load-bearing for the stack that is being provisioned: nothing resolves
+        // `{{secrets.<stack>.objectstore.*}}` yet — the scaler passes the
+        // literal secret in the encore create body
+        // (encore-scaler/instance-pool.ts) and the per-job ffmpeg bodies take
+        // theirs from `s3Config` (pipeline/osc-rewrap.ts,
+        // pipeline/osc-thumbnail.ts) — they pre-establish the secret NAMES under
+        // each consuming serviceId for the follow-up that switches those paths
+        // to references. Unlike the #212 block above, which only runs when the
+        // operator supplied an external bucket, this runs on EVERY per-stack
+        // provision, so leaving it as a bare `await` in the main try block made
+        // a single `saveSecret` hiccup roll back an otherwise fully provisioned
+        // stack. saveSecret POSTs /mysecrets/<serviceId> and rejects on a
+        // non-2xx (@osaas/client-core lib/core.js:355-369, lib/core.d.ts:154),
+        // and OSC exposes no delete, so a half-written pair cannot be cleaned up
+        // either (docs/osc-feedback/incoming-no-osc-secret-deletion-for-stack-
+        // teardown.md). Catching here keeps the failure proportional: the stack
+        // stays up, the operator gets a warning, and a retried provision
+        // re-attempts the same (deterministic) secret names and values.
         if (objectStorePlan.perStack) {
           const objectStoreCreds: ExternalStorageCredentials = {
             bucket: SOURCE_BUCKET,
@@ -1294,14 +1348,31 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
             secretAccessKey: objectStorePlan.credential.secretAccessKey,
             endpointUrl: minioEndpoint
           };
-          await applyCredentialMapping(
-            EXTERNAL_STORAGE_SERVICE_IDS.encore,
-            encoreCredentialMapping(objectStoreCreds, OBJECT_STORE)
-          );
-          await applyCredentialMapping(
-            EXTERNAL_STORAGE_SERVICE_IDS.ffmpegS3,
-            ffmpegS3CredentialMapping(objectStoreCreds, OBJECT_STORE)
-          );
+          for (const [serviceId, mapping] of [
+            [
+              EXTERNAL_STORAGE_SERVICE_IDS.encore,
+              encoreCredentialMapping(objectStoreCreds, OBJECT_STORE)
+            ],
+            [
+              EXTERNAL_STORAGE_SERVICE_IDS.ffmpegS3,
+              ffmpegS3CredentialMapping(objectStoreCreds, OBJECT_STORE)
+            ]
+          ] as const) {
+            try {
+              await applyCredentialMapping(serviceId, mapping);
+            } catch (secretErr) {
+              // The error object can carry the response body, so it is logged
+              // under `err` only — never the credential, which is not part of
+              // the message the SDK throws.
+              app.log.warn(
+                { err: secretErr, name, serviceId },
+                'could not persist the per-stack object-store credential as ' +
+                  'an OSC secret; the stack is unaffected because no runtime ' +
+                  'path resolves this secret reference yet, and a retried ' +
+                  'provision re-attempts the write'
+              );
+            }
+          }
         }
 
         // Persist the stack's non-secret connection coordinates to the OSC
