@@ -120,6 +120,11 @@ export type PollerDeps = {
   // packager is wired to (src/main.ts ensurePackaging). Optional: unset enqueues
   // on `redis`, which is the activation Valkey for the activation poller.
   packagingRedis?: Redis;
+  // Resolves the queue key the ambient stack's packager consumes (per-stack
+  // packager queues), given the key above as the fallback. Called inside the
+  // job's persisted stack, so a completion on any stack enqueues for that
+  // stack's packager. Optional: unset enqueues onto packagingQueueKey as before.
+  resolvePackagingQueueKey?: (defaultKey: string) => Promise<string>;
   // #464: bounds for the independent reconciliation sweep. All optional; when
   // unset the poller applies the defaults below so behaviour is identical to
   // before these knobs existed. Threaded the same way queueKey/packagingQueueKey
@@ -256,7 +261,7 @@ async function enqueuePackagingJob(
   assetId: string,
   encoreJobUrl: string
 ): Promise<void> {
-  const queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
+  let queueKey = deps.packagingQueueKey ?? DEFAULT_PACKAGING_QUEUE_KEY;
   const message = JSON.stringify({ jobId: assetId, url: encoreJobUrl });
   // Record the observable `package` Job and stamp it onto the execution's
   // running `package` step (issue #976) BEFORE the ZADD, so the packager cannot
@@ -272,8 +277,13 @@ async function enqueuePackagingJob(
   // fresh, healthy run. Best-effort — purgeStalePackagingJobs never throws, so a
   // purge hiccup cannot block the enqueue below.
   const packagingRedis = deps.packagingRedis ?? deps.redis;
-  await purgeStalePackagingJobs(packagingRedis, queueKey, { logger: deps.logger });
   try {
+    // Inside the try: a parameter-store failure resolving the per-stack key
+    // fails this job like a failed ZADD, rather than throwing into the poller.
+    if (deps.resolvePackagingQueueKey) {
+      queueKey = await deps.resolvePackagingQueueKey(queueKey);
+    }
+    await purgeStalePackagingJobs(packagingRedis, queueKey, { logger: deps.logger });
     await packagingRedis.zadd(queueKey, Date.now(), message);
     deps.logger.info({ msg: 'encore-callback-poller: enqueued packaging job', queueKey, assetId, url: encoreJobUrl });
   } catch (err) {

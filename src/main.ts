@@ -162,7 +162,9 @@ import { reconcileInterruptedIngests } from './pipeline/interrupted-ingest-recon
 import { PackagingService, packagingPublicBaseUrl } from './pipeline/packaging.js';
 import {
   PackagerEnsureSingleFlight,
-  packagerOscApiFromContext
+  packagerOscApiFromContext,
+  packagerQueueForStack,
+  packagingStackName
 } from './services/packager-provisioning.js';
 import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
@@ -1120,6 +1122,19 @@ async function resolveStackRedis(): Promise<StackRedisResolution> {
   return resolveStackRedisUrl(stackResolver);
 }
 
+// The queue key to enqueue the ambient stack's packaging jobs onto: the key its
+// packager was created with (StackConfig.packagerQueue), or `defaultKey` for a
+// packager provisioned before per-stack keys existed and for deployments
+// without a parameter store.
+async function packagingQueueKey(defaultKey: string): Promise<string> {
+  if (!paramStore) return defaultKey;
+  const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+  const stackName = packagingStackName(names, currentRequestStackName());
+  if (!stackName) return defaultKey;
+  const cfg = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackName);
+  return cfg?.packagerQueue ?? defaultKey;
+}
+
 // Bring the scaler, packaging service, and callback poller up against a stack's
 // Valkey. Idempotent: a no-op when already active on the same URL. This is
 // invoked at startup (if a stack already exists) and from onStackChange the
@@ -1615,7 +1630,7 @@ function activateScaler(redisUrl: string): void {
   // and receive a completion callback.
   packaging = new PackagingService({
     assets: assetRepository,
-    queue: makeOscPackagerQueue(redis, undefined, app.log),
+    queue: makeOscPackagerQueue(redis, undefined, app.log, packagingQueueKey),
     publicBaseUrl: packagingPublicBaseUrl(),
     // Observable `package` Job records (issue #976): created at enqueue time,
     // stamped onto the execution's `package` step as `steps[].jobId`, and
@@ -1671,9 +1686,13 @@ function activateScaler(redisUrl: string): void {
     // the ensurePackaging closure is dropped.
     const packagerEnsureGuard = new PackagerEnsureSingleFlight();
     ensurePackaging = async () => {
-      // Resolve the stack (name + MinIO endpoint + packaged bucket) whose Valkey
-      // this activation is bound to. Mirrors resolveStackRedisUrl: the first
-      // provisioned stack for the namespace is the default.
+      // Resolve the stack (name + MinIO endpoint + packaged bucket) the packaging
+      // work belongs to: the ambient stack (packagingStackName), which both
+      // callers establish — the assets router from the request's X-Stack-Name,
+      // the callback poller from the job's persisted stackName (#1097). It used
+      // to always take the first provisioned stack, so a transcode on any other
+      // stack handed its renditions to the first stack's packager, which read
+      // the first stack's object store and failed every HeadObject with a 404.
       //
       // Issue #335: this resolution used to swallow failures — a param-store
       // error was warn-logged, and an unresolvable stack returned silently — so
@@ -1692,11 +1711,11 @@ function activateScaler(redisUrl: string): void {
       let stackCfg: StackConfig | undefined;
       try {
         const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-        if (names.length > 0) {
-          stackName = names[0];
+        stackName = packagingStackName(names, currentRequestStackName());
+        if (stackName) {
           stackCfg = await paramStore.loadStackConfig(
             STACK_CONFIG_NAMESPACE,
-            names[0]!
+            stackName
           );
           if (stackCfg?.minioEndpoint) minioEndpoint = stackCfg.minioEndpoint;
           if (stackCfg?.packagedBucket) packagedBucket = stackCfg.packagedBucket;
@@ -1729,6 +1748,9 @@ function activateScaler(redisUrl: string): void {
         coords: {
           stackName: resolvedStackName,
           redisUrl,
+          // Only used when the packager is created; an already-running packager
+          // keeps the key it was built with (StackConfig.packagerQueue).
+          redisQueue: packagerQueueForStack(resolvedStackName),
           // PUBLIC endpoint, deliberately (issue #991 sibling-path audit). The
           // packager's `S3EndpointUrl` is fixed in its create body at provision
           // time (services/packager-provisioning.ts buildPackagerCreateBody), so
@@ -1770,13 +1792,17 @@ function activateScaler(redisUrl: string): void {
               s.serviceId === PACKAGER_SERVICE_ID &&
               s.instanceName === instanceName
           );
-          if (already) return;
+          const packagerQueue = packagerQueueForStack(resolvedStackName);
+          if (already && current.packagerQueue === packagerQueue) return;
           const updated: StackConfig = {
             ...current,
-            services: [
-              ...current.services,
-              { serviceId: PACKAGER_SERVICE_ID, instanceName }
-            ]
+            services: already
+              ? current.services
+              : [
+                  ...current.services,
+                  { serviceId: PACKAGER_SERVICE_ID, instanceName }
+                ],
+            packagerQueue
           };
           await paramStore.storeStackConfig(
             STACK_CONFIG_NAMESPACE,
@@ -1810,6 +1836,9 @@ function activateScaler(redisUrl: string): void {
     // "packaging-queue"; overridable so the poller can target a differently
     // named packager queue without a code change.
     packagingQueueKey: process.env['PACKAGING_QUEUE_KEY'],
+    // Per-stack packager queues: resolves the key the job's stack's packager
+    // consumes, falling back to packagingQueueKey above.
+    resolvePackagingQueueKey: packagingQueueKey,
     // #464: bounds for the independent job-status reconciliation sweep. All keep
     // the poller's own defaults (30s interval, page size 100, no instance cap)
     // when the env var is unset, so behaviour is unchanged out of the box.
