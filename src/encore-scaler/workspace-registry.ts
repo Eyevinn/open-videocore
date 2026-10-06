@@ -593,43 +593,70 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       this.loops.delete(workspaceId);
     }
 
-    // 2. Destroy every pooled instance. Reads directly from THIS stack's Valkey
-    //    (issue #615) so teardown works even for a pool that outlived its
-    //    in-memory loop (e.g. resumed by resumeExistingWorkspaces() but never
-    //    re-registered). A missing/empty pool yields an empty list — a clean
-    //    no-op. If Redis itself is unavailable the read rejects; swallow it so
-    //    teardown stays a no-op (there is nothing we can safely destroy without
-    //    the pool state), but still close the per-stack connection in step 3.
+    // 2. Destroy every pooled instance. Reads THIS stack's Valkey (issue #615)
+    //    so teardown works even for a pool that outlived its in-memory loop
+    //    (e.g. resumed by resumeExistingWorkspaces() but never re-registered),
+    //    AND the injected first-stack Valkey when that is a different store: a
+    //    stack resolved while its config had no Valkey URL yet used to be
+    //    bound to the first stack's Valkey, so its pool could live there, and
+    //    a stale copy of it would otherwise outlive the stack. On each store,
+    //    every pooled instance is destroyed and the stack's scaler keys are
+    //    purged. A missing/empty pool is a clean no-op. If a Valkey is
+    //    unavailable its read rejects; swallow it so teardown still handles
+    //    the other store and closes the per-stack connection in step 3.
     const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
-    let instances: Awaited<ReturnType<typeof listInstances>> = [];
-    try {
-      instances = await listInstances(redis, workspaceId);
-    } catch {
-      instances = [];
+    const stores: Array<{ redis: Redis; redisUrl: string }> = [{ redis, redisUrl }];
+    if (redis !== this.config.redis) {
+      stores.push({ redis: this.config.redis, redisUrl: this.config.redisUrl });
     }
+    for (const store of stores) {
+      let instances: Awaited<ReturnType<typeof listInstances>> = [];
+      try {
+        instances = await listInstances(store.redis, workspaceId);
+      } catch {
+        instances = [];
+      }
 
-    if (instances.length > 0) {
-      // destroyInstance() only reads oscContext, redis and workspaceId from the
-      // config (instance-pool.ts:171-198). Build a minimal correctly-typed config
-      // for this workspace; getToken is required by the type but unused on the
-      // teardown path.
-      const scalerConfig: EncoreScalerConfig = {
-        workspaceId,
-        maxInstances: this.config.maxInstances,
-        minInstances: this.config.minInstances,
-        idleTimeoutMs: this.config.idleTimeoutMs,
-        reconcileGraceMs: this.config.reconcileGraceMs,
-        oscContext: this.config.oscContext,
-        redis,
-        redisUrl,
-        getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
-        s3Config: this.config.s3Config,
-        profilesUrl: this.config.profilesUrl,
-        onDispatched: this.config.onDispatched
-      };
+      if (instances.length > 0) {
+        // destroyInstance() only reads oscContext, redis and workspaceId from
+        // the config (instance-pool.ts). Build a minimal correctly-typed config
+        // for this workspace on THIS store; getToken is required by the type
+        // but unused on the teardown path.
+        const scalerConfig: EncoreScalerConfig = {
+          workspaceId,
+          maxInstances: this.config.maxInstances,
+          minInstances: this.config.minInstances,
+          idleTimeoutMs: this.config.idleTimeoutMs,
+          reconcileGraceMs: this.config.reconcileGraceMs,
+          oscContext: this.config.oscContext,
+          redis: store.redis,
+          redisUrl: store.redisUrl,
+          getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
+          s3Config: this.config.s3Config,
+          profilesUrl: this.config.profilesUrl,
+          onDispatched: this.config.onDispatched
+        };
 
-      for (const inst of instances) {
-        await destroyInstance(inst.instanceId, scalerConfig);
+        for (const inst of instances) {
+          await destroyInstance(inst.instanceId, scalerConfig);
+        }
+      }
+
+      // Purge the stack's remaining scaler keys on this store so a deprovisioned
+      // stack neither shows up in GET /scaler/status nor is resumed at the next
+      // boot. Best-effort: the stack's own Valkey is being deprovisioned anyway.
+      try {
+        await store.redis.del(
+          keys.pool(workspaceId),
+          keys.queue(workspaceId),
+          keys.inflight(workspaceId),
+          keys.jobInstance(workspaceId),
+          keys.jobStatus(workspaceId),
+          keys.orphanSeen(workspaceId),
+          keys.spawnFailure(workspaceId)
+        );
+      } catch {
+        // Unreachable store: nothing more to clean here.
       }
     }
 

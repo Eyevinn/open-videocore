@@ -1754,13 +1754,20 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // absent or the pool is empty. Guard failures the same way the
           // parameter-store cleanup below does: a teardown error is logged but
           // must not abort the static-service deprovision that follows.
+          //
+          // Keyed by the STACK NAME: since #615 the registry's loop key is the
+          // stack the transcode resolved to (the encoreJobId prefix), and since
+          // #804 `workspaceId` here is the constant config namespace, which is
+          // not a stack. Passing the namespace made this a silent no-op, so a
+          // deprovisioned stack left its Encore instances, their callback
+          // listeners and its pool keys behind, billing until removed by hand.
           const scalerRegistry = getScalerRegistry?.();
           if (scalerRegistry) {
             try {
-              await scalerRegistry.teardown(workspaceId);
+              await scalerRegistry.teardown(name);
             } catch (err) {
               app.log.error(
-                { err, name, workspaceId },
+                { err, name },
                 'scaler teardown failed before static-service deprovision; continuing'
               );
             }

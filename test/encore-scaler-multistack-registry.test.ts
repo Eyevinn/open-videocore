@@ -24,6 +24,7 @@ vi.mock('@osaas/client-core', () => ({
   getInstance: vi.fn()
 }));
 
+import { removeInstance } from '@osaas/client-core';
 import { WorkspaceEncoreScalerRegistry } from '../src/encore-scaler/workspace-registry.js';
 import { keys } from '../src/encore-scaler/types.js';
 import { valkeyConnectionId } from '../src/encore-scaler/valkey-connection-id.js';
@@ -55,6 +56,16 @@ class FakeRedis {
   }
   async llen(): Promise<number> {
     return 0;
+  }
+  async hdel(key: string, ...fields: string[]): Promise<number> {
+    let n = 0;
+    for (const f of fields) if (this.hashes.get(key)?.delete(f)) n++;
+    return n;
+  }
+  async del(...ks: string[]): Promise<number> {
+    let n = 0;
+    for (const k of ks) if (this.hashes.delete(k)) n++;
+    return n;
   }
   disconnect(): void {
     this.disconnected = true;
@@ -216,5 +227,36 @@ describe('resumeExistingWorkspaces across stack Valkeys', () => {
     const loops = (registry as unknown as { loops: Map<string, unknown> }).loops;
     expect([...loops.keys()]).toEqual(['stack1']);
     expect(warnings.some((w) => w.includes('failed to scan Valkey'))).toBe(true);
+  });
+});
+
+describe('teardown of a stack', () => {
+  it('destroys the pool on the stack’s own Valkey AND a stale copy on the first stack’s, and purges both', async () => {
+    const globalRedis = new FakeRedis(GLOBAL_URL);
+    const stack2Redis = new FakeRedis(STACK2_URL);
+    const record = (id: string) =>
+      JSON.stringify({ instanceId: id, url: `https://${id}.example`, activeJobs: 0, lastIdleAt: Date.now() });
+    await stack2Redis.hset(keys.pool('stack2'), 'inst-live', record('inst-live'));
+    // Left behind on the first stack's Valkey by a mid-provision fallback.
+    await globalRedis.hset(keys.pool('stack2'), 'inst-stale', record('inst-stale'));
+    await globalRedis.hset(keys.jobInstance('stack2'), 'stack2__job-1', 'inst-stale');
+    const registry = makeRegistry({
+      globalRedis,
+      urls: { stack1: GLOBAL_URL, stack2: STACK2_URL },
+      opened: new Map([[STACK2_URL, stack2Redis]])
+    });
+    registries.push(registry);
+    vi.mocked(removeInstance).mockReset();
+
+    await registry.teardown('stack2');
+
+    const removed = vi.mocked(removeInstance).mock.calls.map((c) => c[2]);
+    expect(removed.filter((id) => id === 'inst-live').length).toBeGreaterThan(0);
+    expect(removed.filter((id) => id === 'inst-stale').length).toBeGreaterThan(0);
+    expect(await stack2Redis.hgetall(keys.pool('stack2'))).toEqual({});
+    expect(await globalRedis.hgetall(keys.pool('stack2'))).toEqual({});
+    expect(await globalRedis.hgetall(keys.jobInstance('stack2'))).toEqual({});
+    expect(stack2Redis.disconnected).toBe(true);
+    expect(globalRedis.disconnected).toBe(false);
   });
 });
