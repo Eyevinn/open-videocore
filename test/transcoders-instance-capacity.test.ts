@@ -5,10 +5,11 @@
 //
 // The old helper inferred capacity as "the highest activeJobs seen in this pool,
 // floored at 1". With JOBS_PER_INSTANCE = 1 that coincided with the truth, which
-// hid two defects: raise the constant and every card under-reports capacity until
-// some instance happens to reach the new value, and the amber `load-partial`
-// branch was unreachable — with capacity pinned at 1 and activeJobs in {0,1},
-// every busy instance satisfied `activeJobs >= capacity`.
+// hid a defect: raise the constant and every card under-reports capacity until
+// some instance happens to reach the new value.
+//
+// The capacity READOUT is what this file pins. The pill's colour is no longer a
+// function of utilisation at all (#980) — see transcoders-instance-health.test.ts.
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - GET /api/v1/scaler/status response: `scalerStatusSchema` in
@@ -19,20 +20,15 @@
 //     draining? }.
 //   - Capacity source: JOBS_PER_INSTANCE (src/encore-scaler/types.ts), reported
 //     verbatim by the status handler.
-//   - Load classes: .tc-load.load-idle / .load-partial / .load-full
-//     (public/style.css:852-866).
-//   - public/app.js: resolveJobsPerInstance, loadClass, loadLabel,
-//     renderTranscodersTab.
+//   - Utilisation readout: .tc-load (public/style.css). It is now UNCOLOURED —
+//     colouring utilisation was the #980 defect and the traffic light moved to
+//     the .tc-health pill; see test/transcoders-instance-health.test.ts.
+//   - public/app.js: resolveJobsPerInstance, renderTranscodersTab.
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-  resolveJobsPerInstance,
-  loadClass,
-  loadLabel,
-  renderTranscodersTab,
-} from '../public/app.js';
+import { resolveJobsPerInstance, renderTranscodersTab } from '../public/app.js';
 
 async function flush() {
   for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -92,28 +88,6 @@ describe('resolveJobsPerInstance (issue #979)', () => {
   });
 });
 
-// ─── loadClass / loadLabel ───────────────────────────────────────────────────
-
-describe('loadClass (issue #979)', () => {
-  it('reaches load-partial once capacity is greater than one', () => {
-    expect(loadClass(0, 4)).toBe('load-idle');
-    expect(loadClass(1, 4)).toBe('load-partial');
-    expect(loadClass(3, 4)).toBe('load-partial');
-    expect(loadClass(4, 4)).toBe('load-full');
-  });
-
-  it('collapses to idle/full at capacity 1, where partial cannot exist', () => {
-    expect(loadClass(0, 1)).toBe('load-idle');
-    expect(loadClass(1, 1)).toBe('load-full');
-  });
-
-  it('labels every class it can return', () => {
-    expect(loadLabel('load-idle')).toBe('idle');
-    expect(loadLabel('load-partial')).toBe('partially loaded');
-    expect(loadLabel('load-full')).toBe('at capacity');
-  });
-});
-
 // ─── The rendered instance card ──────────────────────────────────────────────
 
 describe('renderTranscodersTab instance cards (issue #979)', () => {
@@ -146,21 +120,7 @@ describe('renderTranscodersTab instance cards (issue #979)', () => {
     expect(loads).toEqual(['1 / 4', '0 / 4']);
   });
 
-  it('renders an instance below capacity as partially loaded, not at capacity', async () => {
-    stubStatus(
-      statusPayload(4, [
-        { instanceId: 'inst-1', url: 'https://inst-1.example', activeJobs: 1, lastIdleAt: Date.now() },
-      ])
-    );
-    const container = await render(undefined);
-
-    const load = container.querySelector('.tc-load')!;
-    expect(load.classList.contains('load-partial')).toBe(true);
-    expect(load.classList.contains('load-full')).toBe(false);
-    expect(load.getAttribute('title')).toBe('partially loaded');
-  });
-
-  it('still renders a saturated instance as at capacity', async () => {
+  it('reports a saturated instance as N / N', async () => {
     stubStatus(
       statusPayload(4, [
         { instanceId: 'inst-1', url: 'https://inst-1.example', activeJobs: 4, lastIdleAt: Date.now() },
@@ -169,9 +129,7 @@ describe('renderTranscodersTab instance cards (issue #979)', () => {
     const container = await render(undefined);
 
     const load = container.querySelector('.tc-load')!;
-    expect(load.classList.contains('load-full')).toBe(true);
     expect(load.textContent!.replace(/\s+/g, ' ').trim()).toBe('4 / 4');
-    expect(load.getAttribute('title')).toBe('at capacity');
   });
 
   it('falls back to a capacity of 1 against a server that does not report the field', async () => {
@@ -184,7 +142,19 @@ describe('renderTranscodersTab instance cards (issue #979)', () => {
 
     const load = container.querySelector('.tc-load')!;
     expect(load.textContent!.replace(/\s+/g, ' ').trim()).toBe('1 / 1');
-    expect(load.classList.contains('load-full')).toBe(true);
+  });
+
+  it('does not colour the utilisation readout — utilisation is not health (#980)', async () => {
+    stubStatus(
+      statusPayload(1, [
+        { instanceId: 'inst-1', url: 'https://inst-1.example', activeJobs: 1, lastIdleAt: Date.now() },
+      ])
+    );
+    const container = await render(undefined);
+
+    const load = container.querySelector('.tc-load')!;
+    // The whole #980 defect was that being busy painted the readout --danger.
+    expect([...load.classList]).toEqual(['tc-load', 'text-mono']);
   });
 });
 
