@@ -47,6 +47,7 @@ import {
   ENCODE_COMPLETION_EVENT_TYPE,
   encodeCompletionEventSchema
 } from './encode-completion-event.js';
+import { currentRequestStackName } from '../services/request-stack-context.js';
 
 // Parse a ZRANGEBYSCORE score bound the way Valkey does: '-inf'/'+inf' and the
 // exclusive '(' prefix (e.g. '(1700000000000'). Kept alongside FakeRedis so its
@@ -269,7 +270,12 @@ async function seedScenario(
   jobs: InMemoryJobRepository,
   assets: InMemoryAssetRepository,
   pipelines: InMemoryPipelineRepository,
-  opts: { encoreUuid: string; jobStatus?: 'queued' | 'failed' | 'done'; withPackageStep?: boolean }
+  opts: {
+    encoreUuid: string;
+    jobStatus?: 'queued' | 'failed' | 'done';
+    withPackageStep?: boolean;
+    stackName?: string;
+  }
 ): Promise<{ externalId: string; assetId: string; pipelineId: string }> {
   const record: EncoreInstanceRecord = {
     instanceId: INSTANCE_ID,
@@ -284,7 +290,7 @@ async function seedScenario(
   await assets.update(asset.id, { status: 'processing' });
 
   // Local transcode job; encoreJobId embeds the workspace so decodeEncoreJobId works.
-  const job = await jobs.create({ type: 'transcode', assetId: asset.id });
+  const job = await jobs.create({ type: 'transcode', assetId: asset.id, stackName: opts.stackName });
   const externalId = encodeEncoreJobId(WORKSPACE, job.id);
   await jobs.update(job.id, { encoreJobId: externalId, status: 'queued' });
   if (opts.jobStatus === 'failed') {
@@ -728,10 +734,11 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
 
   // Seed a transcode+package pipeline in the running-transcode state, then enqueue
   // the completion message the callback listener would have written.
-  async function seedAndEnqueue(encoreUuid: string) {
+  async function seedAndEnqueue(encoreUuid: string, stackName?: string) {
     const seeded = await seedScenario(redis, jobs, assets, pipelines, {
       encoreUuid,
-      withPackageStep: true
+      withPackageStep: true,
+      stackName
     });
     // completeTranscode only settles a running job to done (mirrors the #464 test).
     await jobs.update(findLocalJobId(seeded.externalId), { status: 'running' });
@@ -812,6 +819,62 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(1);
     const execution = await pipelines.get(pipelineId);
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // Multi-stack: a transcode on a non-first stack must provision and enqueue for
+  // ITS stack's packager. Both hooks run inside the job's persisted stack, and
+  // the job lands on the key resolvePackagingQueueKey returns for that stack —
+  // not the shared default key another stack's packager also drains.
+  it('provisions and enqueues for the job’s persisted stack', async () => {
+    const encoreUuid = 'uuid-handoff-stack2';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid, 'stack2');
+
+    const ensuredFor: (string | undefined)[] = [];
+    const ensurePackaging = vi.fn(async () => {
+      ensuredFor.push(currentRequestStackName());
+    });
+    const resolvePackagingQueueKey = vi.fn(async (defaultKey: string) =>
+      currentRequestStackName() === 'stack2' ? `${defaultKey}:stack2` : defaultKey
+    );
+    const d = {
+      ...baseDeps(successFetch(externalId, encoreUuid), ensurePackaging),
+      resolvePackagingQueueKey
+    };
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(ensuredFor).toEqual(['stack2']);
+    expect(resolvePackagingQueueKey).toHaveBeenCalledWith(PACKAGING_QUEUE_KEY);
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    const enqueued = JSON.parse(redis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`)[0]!);
+    expect(enqueued.jobId).toBe((await pipelines.get(pipelineId))!.assetId);
+  });
+
+  it('fails the package job without enqueueing when the per-stack queue key cannot be resolved', async () => {
+    const encoreUuid = 'uuid-handoff-key-throw';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+    const d = {
+      ...baseDeps(successFetch(externalId, encoreUuid), undefined),
+      resolvePackagingQueueKey: vi.fn(async () => {
+        throw new Error('parameter store unavailable');
+      })
+    };
+    const assetId = (await pipelines.get(pipelineId))!.assetId;
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await assets.get(assetId))?.packagingError !== undefined);
+    } finally {
+      stop();
+    }
+
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    expect((await assets.get(assetId))?.packagingError).toContain('parameter store unavailable');
   });
 
   // #976: the transcode->package handoff is the OSC-native enqueue path (it

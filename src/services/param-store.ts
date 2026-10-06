@@ -80,6 +80,15 @@ export type StackConfig = {
   // existed have no value here and MUST still load without error, and an unset
   // value falls through to the remote default index (byte-identical to today).
   encoreProfilesUrl?: string;
+  // The Valkey queue key this stack's on-demand packager consumes. Every
+  // packager listens on the same shared Valkey, so a packager provisioned for a
+  // non-first stack gets its own key (packagerQueueForStack) — otherwise any
+  // stack's packager could pop another stack's job and read the wrong object
+  // store. Recorded when the packager is created so producers enqueue onto
+  // exactly the key it was built with. Optional for back-compat: a packager
+  // provisioned before this field existed consumes the shared default key, and
+  // an unset value keeps enqueueing there.
+  packagerQueue?: string;
   // Per-role storage backend metadata (issue #211). Optional for back-compat:
   // configs written before this field existed have no `storage`, in which case
   // both roles are the default per-stack MinIO backend (sourceBucket /

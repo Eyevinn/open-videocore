@@ -36,13 +36,19 @@ export function packagerQueueKey(): string {
 
 // Construct the production PackageQueue. Each enqueue serialises the job to JSON
 // and ZADDs it onto the sorted set (FIFO with the packager's BZPOPMIN consumer).
+// `resolveQueueKey`, when given, picks the key per enqueue (per-stack packager
+// queues, resolved from the ambient stack) with `defaultQueueKey` as fallback.
 export function makeOscPackagerQueue(
   client: RedisLike,
-  queueKey: string = packagerQueueKey(),
-  logger: QueueLogger = NOOP_QUEUE_LOGGER
+  defaultQueueKey: string = packagerQueueKey(),
+  logger: QueueLogger = NOOP_QUEUE_LOGGER,
+  resolveQueueKey?: (defaultKey: string) => Promise<string>
 ): PackageQueue {
   return {
     async enqueue(job: PackagingJob): Promise<void> {
+      const queueKey = resolveQueueKey
+        ? await resolveQueueKey(defaultQueueKey)
+        : defaultQueueKey;
       // #498: purge stale ghost entries before enqueue (shared with the automatic
       // transcode->package handoff — see purgeStalePackagingJobs in
       // encore-callback-poller.ts). The manual package-start path
