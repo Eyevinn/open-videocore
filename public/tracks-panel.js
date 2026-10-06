@@ -1,20 +1,31 @@
 /**
  * open-videocore ops dashboard — tracks-panel.js
  *
- * The read-only "Tracks" block on the asset detail view (issue #902, broken out
- * of #794): one section per track kind — video, audio, subtitle — each listing
- * only the attributes the API actually exposes for that kind, and each with an
- * explicit empty state when the asset has none.
+ * The "Tracks" block on the asset detail view (issue #902, broken out of #794):
+ * one section per track kind — video, audio, subtitle — each listing only the
+ * attributes the API actually exposes for that kind, and each with an explicit
+ * empty state when the asset has none.
  *
- * READ-ONLY BY DEFAULT, with ONE opt-in exception: the subtitle section gains
- * add + remove controls when — and only when — the caller passes
- * `subtitleControls` (issue #904, see "SUBTITLE CONTROLS" below). Without that
- * argument this module still creates no form control and issues no request of
- * any kind, so the video and audio sections remain read-only reporting surfaces
- * and the audio add/remove routes that exist have nothing here to originate
- * from. It never issues a GET during render either: every value the first render
- * shows is already in the `GET /assets/{id}` body the detail view fetched, so
- * the panel adds no round-trip to the render.
+ * READ-ONLY BY DEFAULT, with TWO independent opt-ins. Mounted with neither it
+ * is byte-for-byte the panel #902 shipped: no form control, no listener, no
+ * request of any kind.
+ *
+ * Mounted WITH `audioEdit` (issue #903, broken out of #794) the editorial audio
+ * group additionally renders add/remove controls — but this module still writes
+ * nothing itself for audio: it asks public/audio-track-edit.js for two nodes (a
+ * per-row control and the add block) and that module owns the calls, the
+ * confirmation step, the inline error and the refresh. Layout stays here;
+ * everything that writes audio stays there.
+ *
+ * Mounted WITH `subtitleControls` (issue #904, see "SUBTITLE CONTROLS" below)
+ * the subtitle section gains its own add form and per-row Remove control, owned
+ * by this module. The two opt-ins are scoped to their own section and neither
+ * implies the other: video stays a reporting surface in every case.
+ *
+ * It issues no GET during render in any configuration: every value the first
+ * render shows is already in the `GET /assets/{id}` body the detail view
+ * fetched, so the panel adds no round-trip to the render. Both editors issue
+ * requests only once an operator activates one of their controls.
  *
  * Every operator-visible string is written with `textContent` / `createElement`
  * — no server value ever reaches `innerHTML`, including a subtitle `format` or
@@ -96,10 +107,25 @@
  *     the API publishes no key that would justify any of that, so each group
  *     carries its own count and the `Audio` heading carries none.
  *
+ *   AUDIO, ADD + REMOVE (issue #903) — `POST /api/v1/assets/{id}/audio-tracks`
+ *     (201 → the full updated `{ audioTracks }`) and
+ *     `DELETE /api/v1/assets/{id}/audio-tracks/{trackId}` (204, empty body).
+ *     Both operate on the EDITORIAL list only. The full request/response
+ *     contract for them — bodies, bounds, both 404 shapes, and the post-remove
+ *     re-read — is cited in public/audio-track-edit.js, which owns those calls.
+ *     Nothing in this file issues them.
+ *
  * WHAT THE API DOES NOT EXPOSE (checked, not assumed):
  *   - There is no GET on `/api/v1/assets/{id}/audio-tracks` or
  *     `…/subtitle-tracks`. In `openapi.json` those paths carry only `post`, and
  *     `…/{trackId}` only `delete` (src/routes/assets.ts:5279, 5314, 5344, 5392).
+ *   - There is no UPDATE of any kind on a track: no PUT and no PATCH on either
+ *     track path. A track's language, codec, channels, label or default flag
+ *     cannot be edited in place, so this panel offers add and remove only —
+ *     changing a track means removing it and adding a new one, which mints a
+ *     new id.
+ *   - There is no add/remove route for VIDEO tracks at all (no path in
+ *     `openapi.json` contains "video"), so the video section stays read-only.
  *   - `GET /api/v1/assets/{id}/tracks` DOES exist and is the only *dedicated*
  *     read for the two editorial kinds — but it is not a second source of truth:
  *     its handler sends `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []`
@@ -192,11 +218,17 @@
  *     arrives anyway is still reported inline.
  */
 
+import { createAudioTrackEditor } from './audio-track-edit.js';
+
 // ─── Copy deck ───────────────────────────────────────────────────────────────
 
 export const TRACKS_COPY = Object.freeze({
   heading: 'Tracks',
-  /** Says outright that this block only reports; #902 is read-only. */
+  /**
+   * Says outright that this block only reports. Used when the panel is mounted
+   * WITHOUT an audio editor — the editor supplies its own intro (#903), because
+   * a panel that can add and remove audio tracks must not claim to be read-only.
+   */
   intro:
     'Track structure as the API reports it. Read-only — tracks are added and ' +
     'removed through the API, not from this panel.',
@@ -249,6 +281,15 @@ export const TRACKS_COPY = Object.freeze({
   introEditable:
     'Track structure as the API reports it. Subtitle tracks can be added and ' +
     'removed here; video and audio are reported only.',
+
+  /**
+   * Replaces `intro` when BOTH opt-ins are mounted — the #903 audio editor and
+   * the #904 subtitle controls. Neither single-feature line is true then: one
+   * would call audio read-only, the other would call subtitles read-only.
+   */
+  introEditableBoth:
+    'Track structure as the API reports it. Editorial audio tracks and ' +
+    'subtitle tracks can be added and removed here; video is reported only.',
 
   actionsColumn: 'Actions',
   btnRemove: 'Remove',
@@ -607,9 +648,10 @@ function el(tag, className, text) {
  * Every cell is set with `textContent`. A cell may be a string, or
  * `{ text, mono }` to render it in the monospace class used for ids elsewhere in
  * the UI, or `{ text, badge: true }` for the "Default" flag, or `{ node }` to
- * place an already-built element (the per-row Remove control, issue #904 — the
- * only way a control ever enters one of these tables, and only when the caller
- * opted in).
+ * place an already-built element: the per-row Remove control — the only way a
+ * control ever enters one of these tables, and only when the caller opted in.
+ * For audio (#903) that node is built by public/audio-track-edit.js, never by
+ * this module; for subtitles (#904) it is built below.
  *
  * @param {string} caption
  * @param {string[]} columns
@@ -638,7 +680,9 @@ function renderTable(caption, columns, rows) {
       const spec = typeof cell === 'object' && cell !== null ? cell : { text: String(cell) };
       const td = document.createElement('td');
       if (spec.node) {
-        td.className = 'tracks-row-actions';
+        // Both names are kept: the shared action-cell class the tables already
+        // use, plus the tracks-specific one the panel's own stylesheet targets.
+        td.className = 'cell-actions tracks-row-actions';
         td.appendChild(spec.node);
       } else if (spec.badge) {
         td.appendChild(el('span', 'badge badge-active', spec.text));
@@ -710,7 +754,15 @@ function appendVideoSection(block, videoTracks, extractionError) {
   block.appendChild(el('div', 'tracks-note', TRACKS_COPY.videoNote));
 }
 
-function appendAudioSection(block, editorial, probed) {
+/**
+ * @param {HTMLElement} block
+ * @param {object[]} editorial  the asset's editorial `audioTracks`
+ * @param {object[]} probed     `technicalMetadata.audioTracks`
+ * @param {object}   [editor]   the #903 audio editor, when editing is enabled
+ * @param {string}   [deniedNote]  why the controls are absent, when they are
+ *                                 absent for a reason worth stating
+ */
+function appendAudioSection(block, editorial, probed, editor, deniedNote) {
   // The `Audio` heading is deliberately UNCOUNTED. Editorial tracks and probed
   // source streams are different objects with no shared id (see CONTRACT
   // GROUNDING), so `editorial.length + probed.length` would be exactly the merge
@@ -718,17 +770,33 @@ function appendAudioSection(block, editorial, probed) {
   // streams is not a four-track asset. Each group carries its own count instead.
   block.appendChild(renderSectionTitle(TRACKS_COPY.audioHeading));
 
+  // Hand the list over before asking for any row control: the editor resets its
+  // per-render control registry here, and keeps the list as the fallback for a
+  // failed post-remove re-read.
+  if (editor) editor.setTracks(editorial);
+
+  // Add and remove act on the EDITORIAL list only, so the controls belong to
+  // that group — never to the probed streams, which no endpoint can change.
+  const addBlock = editor ? editor.addBlock() : null;
+
   if (editorial.length === 0 && probed.length === 0) {
     block.appendChild(
       renderEmpty('audio-tracks', TRACKS_COPY.audioEmpty, TRACKS_COPY.audioEmptyDetail)
     );
+    // The empty state is still a place an operator adds the FIRST track from:
+    // an asset with no audio at all is exactly when adding one matters, so the
+    // control sits below the empty box rather than being withheld with it.
+    if (addBlock) block.appendChild(addBlock);
+    else if (deniedNote) block.appendChild(el('div', 'tracks-note', deniedNote));
     return;
   }
 
   block.appendChild(renderGroupTitle(TRACKS_COPY.audioEditorialGroup, editorial.length));
   if (editorial.length > 0) {
+    const columns = ['Language', 'Label', 'Codec', 'Channels', 'Default', 'Track ID'];
+    if (editor) columns.push(editor.actionsColumn);
     const rows = editorial.map(function (t) {
-      return [
+      const cells = [
         attr(t.language),
         attr(t.label),
         attr(t.codec),
@@ -736,17 +804,25 @@ function appendAudioSection(block, editorial, probed) {
         t.default === true ? { text: TRACKS_COPY.defaultFlag, badge: true } : TRACKS_COPY.absent,
         { text: attr(t.id), mono: true },
       ];
+      // A track the server sent without an `id` cannot be removed: `trackId` is
+      // a required path parameter and the handler matches on it. The cell says
+      // so rather than offering a button that could only ever 404.
+      if (editor) {
+        cells.push(
+          typeof t.id === 'string' && t.id !== ''
+            ? { node: editor.removeControl(t) }
+            : TRACKS_COPY.absent
+        );
+      }
+      return cells;
     });
-    block.appendChild(
-      renderTable(
-        'Editorial audio tracks',
-        ['Language', 'Label', 'Codec', 'Channels', 'Default', 'Track ID'],
-        rows
-      )
-    );
+    block.appendChild(renderTable('Editorial audio tracks', columns, rows));
   } else {
     block.appendChild(el('div', 'tracks-none', TRACKS_COPY.audioEditorialNone));
   }
+
+  if (addBlock) block.appendChild(addBlock);
+  else if (deniedNote) block.appendChild(el('div', 'tracks-note', deniedNote));
 
   block.appendChild(renderGroupTitle(TRACKS_COPY.audioProbedGroup, probed.length));
   if (probed.length > 0) {
@@ -1033,6 +1109,22 @@ function appendSubtitleSection(block, subtitles, controls) {
 // ─── Block ───────────────────────────────────────────────────────────────────
 
 /**
+ * The one intro line for a given pair of opt-ins, so no configuration claims a
+ * section is read-only when it is not.
+ *
+ * @param {boolean} subtitlesEditable  the #904 controls are mounted AND writable
+ * @param {object|null} audioEditor    the #903 editor, when mounted
+ * @returns {string}
+ */
+function introFor(subtitlesEditable, audioEditor) {
+  if (subtitlesEditable && audioEditor) return TRACKS_COPY.introEditableBoth;
+  if (subtitlesEditable) return TRACKS_COPY.introEditable;
+  // The editor owns its own wording for the audio-only case (#903).
+  if (audioEditor) return audioEditor.panelIntro;
+  return TRACKS_COPY.intro;
+}
+
+/**
  * Build the whole block for one asset read. PURE: no fetch, no listeners.
  *
  * @param {object} data
@@ -1041,6 +1133,13 @@ function appendSubtitleSection(block, subtitles, controls) {
  * @param {object[]} data.audioProbed      from `probedAudioStreamsFromAsset`
  * @param {object[]} data.subtitles        `asset.subtitleTracks`
  * @param {string}   [data.extractionError] `asset.technicalMetadataError`
+ * @param {object}   [data.audioEditor]   the #903 editor from
+ *                                        createAudioTrackEditor. Absent =>
+ *                                        the audio section stays read-only.
+ * @param {string}   [data.audioEditDenied] note explaining absent controls
+ * @param {object}   [data.subtitleControls] the #904 subtitle add/remove
+ *                                        controls. Absent => the subtitle
+ *                                        section stays read-only.
  * @returns {HTMLElement}
  */
 export function renderTracksBlock(data) {
@@ -1049,23 +1148,24 @@ export function renderTracksBlock(data) {
   const audioEditorial = Array.isArray(d.audioEditorial) ? d.audioEditorial : [];
   const audioProbed = Array.isArray(d.audioProbed) ? d.audioProbed : [];
   const subtitles = Array.isArray(d.subtitles) ? d.subtitles : [];
-  // Opt-in only (issue #904). Absent — the default — and this render is exactly
+  // Both opt-in only. Absent — the default for each — and this render is exactly
   // the read-only panel #902 shipped: no control, no listener, no request.
   const subtitleControls =
     d.subtitleControls && typeof d.subtitleControls === 'object' ? d.subtitleControls : null;
   const editable = !!(subtitleControls && subtitleControls.canChange);
+  const editor = d.audioEditor || null;
 
   const block = el('div', 'mt12 tracks-block');
   block.id = 'asset-tracks';
   block.appendChild(el('div', 'section-title', TRACKS_COPY.heading));
-  // The intro must not promise read-only when one section is not. Still says in
-  // words which kinds are editable, because only subtitles are.
-  block.appendChild(
-    el('div', 'tracks-note', editable ? TRACKS_COPY.introEditable : TRACKS_COPY.intro)
-  );
+  // The intro must not promise read-only when a section is not, and it names
+  // the kinds that are editable rather than leaving the operator to probe for
+  // them. Audio alone keeps the editor's own line (#903); subtitles alone and
+  // both-at-once are stated here.
+  block.appendChild(el('div', 'tracks-note', introFor(editable, editor)));
 
   appendVideoSection(block, video, d.extractionError);
-  appendAudioSection(block, audioEditorial, audioProbed);
+  appendAudioSection(block, audioEditorial, audioProbed, editor, d.audioEditDenied);
   appendSubtitleSection(block, subtitles, subtitleControls);
 
   return block;
@@ -1076,13 +1176,15 @@ export function renderTracksBlock(data) {
 /**
  * Render the "Tracks" block into the asset detail view.
  *
- * Synchronous and network-free: all four record sets — the video attributes, the
- * editorial audio and subtitle tracks, and the probed source streams — are
- * properties of the `GET /assets/{id}` body the caller already holds, so the
- * panel neither re-reads the asset nor calls `GET /assets/{id}/tracks` for
- * bytes it was handed (see CONTRACT GROUNDING). It therefore adds no round-trip
- * to the detail render, and there is no "tracks unavailable" state: an absent
- * array is a known-empty kind, not a failed read.
+ * The RENDER is synchronous and network-free: all four record sets — the video
+ * attributes, the editorial audio and subtitle tracks, and the probed source
+ * streams — are properties of the `GET /assets/{id}` body the caller already
+ * holds, so the panel neither re-reads the asset nor calls
+ * `GET /assets/{id}/tracks` for bytes it was handed (see CONTRACT GROUNDING).
+ * It adds no round-trip to the detail render, and there is no "tracks
+ * unavailable" state: an absent array is a known-empty kind, not a failed read.
+ * That holds whether or not `audioEdit` is passed — the editor issues requests
+ * only when an operator activates one of its controls.
  *
  * The block is inserted before `anchorEl` when given, else appended to `host`.
  *
@@ -1109,14 +1211,26 @@ export function renderTracksBlock(data) {
  *                                      paths (never a slug — neither handler
  *                                      resolves one). Defaults to `asset.id`.
  * @param {boolean}     [opts.canChange] client-role mirror of the ADR-018 matrix
- *                                      (editor|admin); defaults to false, so the
- *                                      controls are off unless asked for.
- * @param {Function}    [opts.apiFetch] house API helper; required for controls
+ *                                      (editor|admin) for the SUBTITLE controls;
+ *                                      defaults to false, so they are off unless
+ *                                      asked for.
+ * @param {Function}    [opts.apiFetch] house API helper; required for the
+ *                                      subtitle controls
  * @param {Function}    [opts.confirmModal] house confirmation primitive;
- *                                      required for the Remove control
+ *                                      required for the subtitle Remove control
  * @param {(event: {op: 'add'|'remove', track: object|null}) => any} [opts.onChanged]
- *        called after a write has been applied AND the list re-read, so a caller
- *        can keep other views in step. Its failures are its own.
+ *        called after a subtitle write has been applied AND the list re-read, so
+ *        a caller can keep other views in step. Its failures are its own.
+ * @param {object}      [opts.audioEdit]  enables the #903 audio add/remove
+ *        controls, independently of the subtitle ones. Omit both and the panel
+ *        is exactly the read-only #902 one.
+ *        `{ assetId, apiFetch, confirmModal, onChanged? }` — `assetId` must be
+ *        the ULID (the track routes do not resolve slugs); `onChanged` is called
+ *        with the post-write `audioTracks` after the section has refreshed, so
+ *        the caller can keep its own copy of the asset in step.
+ * @param {string}      [opts.audioEditDenied]  shown in the audio section
+ *        INSTEAD of the controls, when the caller withheld them for a reason an
+ *        operator should see (e.g. a read-only client role).
  * @returns {{ block: HTMLElement, update: (asset: object) => void,
  *            refreshSubtitles: () => Promise<void> }}
  */
@@ -1124,10 +1238,11 @@ export function mountAssetTracks(opts) {
   const o = opts || {};
 
   let rendered = null;
-  // The most recent asset body this panel was given. Held so a subtitle refresh
-  // can re-render the OTHER sections unchanged: `technicalMetadata` (video +
-  // probed audio) is not touched by either subtitle write, so re-reading the
-  // whole asset for it would be a round-trip for bytes we already have.
+  // The most recent asset body this panel was given. Held so a track refresh —
+  // audio or subtitle — can re-render the OTHER sections unchanged:
+  // `technicalMetadata` (video + probed audio) is not touched by any of the four
+  // track writes, so re-reading the whole asset for it would be a round-trip for
+  // bytes we already have.
   let held = o.asset || {};
   // One pending inline message, rendered by the next render pass. Held here
   // rather than written into the DOM after the fact because a successful write
@@ -1149,6 +1264,29 @@ export function mountAssetTracks(opts) {
 
   const subtitlesPath = '/assets/' + encodeURIComponent(assetId) + '/subtitle-tracks';
   const tracksPath = '/assets/' + encodeURIComponent(assetId) + '/tracks';
+
+  // The #903 audio editor, created ONCE so the add form's open/closed state, the
+  // inline error and the success line survive the re-render a successful write
+  // triggers. Independent of the subtitle controls above: either, both or
+  // neither may be mounted.
+  const editor = o.audioEdit
+    ? createAudioTrackEditor({
+        assetId: o.audioEdit.assetId,
+        apiFetch: o.audioEdit.apiFetch,
+        confirmModal: o.audioEdit.confirmModal,
+        onChanged: function (audioTracks) {
+          // `audioTracks` is the authoritative post-write list (the add 201's
+          // body, or the post-remove re-read of GET /assets/{id}/tracks). It is
+          // merged into the held body so the re-render keeps every other
+          // section — including the subtitle list — exactly as last read.
+          held = Object.assign({}, held, { audioTracks: audioTracks });
+          update(held);
+          if (typeof o.audioEdit.onChanged === 'function') {
+            o.audioEdit.onChanged(audioTracks);
+          }
+        },
+      })
+    : null;
 
   function place(block) {
     if (!rendered) {
@@ -1271,6 +1409,8 @@ export function mountAssetTracks(opts) {
       subtitles: editorial.subtitleTracks,
       extractionError: a.technicalMetadataError,
       subtitleControls: subtitleControls(),
+      audioEditor: editor,
+      audioEditDenied: o.audioEditDenied,
     });
     place(next);
     rendered = next;
