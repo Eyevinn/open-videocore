@@ -27,6 +27,7 @@ import {
 } from './types.js';
 import {
   destroyInstance,
+  evictVanishedInstances,
   listInstances,
   reapOrphanedInstances,
   resolvePendingSpawns,
@@ -1077,6 +1078,44 @@ export class EncoreScalerLoop {
         poolUncheckedInstances.push(`${instanceId}(unreachable)`);
       }
       poolPass.push({ instanceId, record, real });
+    }
+
+    // An unreachable instance is kept (an outage mid-job must never cost the
+    // job) UNLESS OSC confirms it no longer exists: then its pool record is a
+    // leftover of a teardown or an external removal, and keeping it blocks
+    // the workspace — it counts as idle capacity so nothing scales up, and every
+    // dispatch to it fails and re-queues the job. Evict such records, and
+    // re-queue the jobs still mapped to them exactly as a scale-down
+    // interruption (the work on them is lost the same way). An evicted
+    // instance no longer makes the pool view partial, so it is dropped from
+    // the unchecked list too. Never fatal to the pass.
+    const unreachableIds = poolPass
+      .filter(({ real }) => real === undefined)
+      .map(({ instanceId }) => instanceId);
+    if (unreachableIds.length > 0) {
+      let evicted: string[] = [];
+      try {
+        evicted = await evictVanishedInstances(this.config, unreachableIds);
+      } catch (err) {
+        console.error(
+          '[encore-scaler] reconcile: vanished-instance check failed (workspace=%s):',
+          workspaceId,
+          err
+        );
+      }
+      if (evicted.length > 0) {
+        const gone = new Set(evicted);
+        for (const instanceId of evicted) {
+          await this.requeueScaleDownInterruptions(instanceId, new Set());
+        }
+        for (let i = poolPass.length - 1; i >= 0; i--) {
+          if (gone.has(poolPass[i]!.instanceId)) poolPass.splice(i, 1);
+        }
+        for (let i = poolUncheckedInstances.length - 1; i >= 0; i--) {
+          const entry = poolUncheckedInstances[i]!;
+          if (gone.has(entry.replace(/\(unreachable\)$/, ''))) poolUncheckedInstances.splice(i, 1);
+        }
+      }
     }
 
     // Every pool instance on which Encore currently reports `externalId` active.

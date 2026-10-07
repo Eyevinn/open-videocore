@@ -23,7 +23,13 @@
 // Encore resolves s3:// URIs against AWS S3 and gets a 404.
 export type EncoreS3Config = {
   endpoint: string;     // full URL, e.g. https://oscaidev-jonas.minio-minio.auto.prod-se.osaas.io
-  accessKeyId: string;  // MinIO root user (always "admin" in OSC stacks)
+  // The object store's access key id FOR THE RESOLVED STACK (issue #1094),
+  // produced by resolveEncoreS3Config from that stack's stored config — per
+  // stack, no longer a deployment-wide root user. A stack provisioned before
+  // #1094 still resolves to the legacy root user until #1096 migrates it.
+  accessKeyId: string;
+  // SECRET. Goes into the spawned instance's create body (instance-pool.ts) and
+  // nowhere else — never a log line, never an API response.
   secretAccessKey: string;
   region?: string;      // S3 region string — MinIO ignores it but Encore requires a value
 };
@@ -312,6 +318,33 @@ export type EncoreInstanceRecord = {
   //     act on an unconfirmable instance.
   // Absent on every normal record.
   pendingReadySince?: number;
+  // #1109: back-off bookkeeping for the ONE piece of work resolvePendingSpawns
+  // does on a pending record — creating (or adopting) the paired callback
+  // listener the timed-out spawn never got to. Only ever set while
+  // `pendingReadySince` is set, and cleared the moment the listener exists.
+  //
+  // Without these the resolver re-attempted the create on EVERY tick until the
+  // readiness deadline: ~90 createInstance calls per stuck instance at a 10s
+  // tick and a 15-minute budget, with no distinction between a 500 that will
+  // pass and a 422 that never will. The spawn path has always classified its
+  // own create failures (spawnPooledInstance, instance-pool.ts) — these fields
+  // give the resolver, which retries ACROSS ticks rather than inside one call,
+  // somewhere to keep the same decision between ticks.
+  //
+  // How many listener creates the resolver has attempted for this instance.
+  // Drives the exponential back-off interval.
+  listenerCreateAttempts?: number;
+  // Epoch ms before which the resolver must not attempt another listener
+  // create. Set after a RETRYABLE failure (5xx/408/429/transport, or a "name
+  // already taken" the follow-up getInstance could not confirm).
+  listenerCreateNextAttemptAt?: number;
+  // Epoch ms at which a listener create failed PERMANENTLY (a rejected body, a
+  // bad token, an exhausted quota — anything isTransientOscError calls
+  // non-transient). No further create is attempted for this instance: it stays
+  // pending, is never dispatched to, and is destroyed on its normal deadline so
+  // a clean spawn can replace it. Recorded rather than inferred so the
+  // condition is visible on the record instead of being a silent stall.
+  listenerCreateBlockedAt?: number;
 };
 
 export type QueuedJob = {
