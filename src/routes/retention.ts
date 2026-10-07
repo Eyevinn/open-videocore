@@ -35,6 +35,15 @@ import { z } from 'zod';
 // existing behaviour for every deployment that does not opt in.
 export const RETENTION_DISABLED_MS = 0;
 
+// The largest accepted retention window: 100 years in ms. Any realistic media
+// archive policy is orders of magnitude below this, while it is ~2,700x smaller
+// than the ±8.64e15 ms Date range, so `archivedAt + retentionMs` can never leave
+// the representable range for any stamp a real asset carries. PATCH /config is
+// intentionally unauthenticated (see header), so an unbounded window would let
+// any caller feed date arithmetic downstream of this value — bounding it here
+// keeps that blast radius at a 400.
+export const MAX_RETENTION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
+
 // Resolve the boot-time retention window (12-factor: config via env). Unset,
 // non-numeric, or negative all resolve to disabled (0 = never purge), matching
 // the acceptance criterion that an unset/`0` value is behaviourally identical to
@@ -53,6 +62,10 @@ export function auditRetentionMsFromEnv(): number {
 
 // Shared env parse for a retention window: unset/non-numeric/negative -> 0
 // (disabled). Mirrors the parseInt env convention in src/main.ts:468-469.
+// Clamped to MAX_RETENTION_MS so a boot-time value can never exceed what
+// `retentionConfigSchema` accepts — GET /config serializes through that same
+// schema, so an out-of-bounds env value would otherwise make the endpoint
+// unreadable rather than merely over-generous.
 function retentionMsFromEnv(name: string): number {
   const raw = process.env[name];
   if (!raw) {
@@ -62,7 +75,7 @@ function retentionMsFromEnv(name: string): number {
   if (!Number.isFinite(parsed) || parsed < 0) {
     return RETENTION_DISABLED_MS;
   }
-  return parsed;
+  return Math.min(parsed, MAX_RETENTION_MS);
 }
 
 type RetentionRouterOptions = {
@@ -79,8 +92,12 @@ type RetentionRouterOptions = {
 };
 
 const retentionConfigSchema = z.object({
-  // 0 = retention disabled (never purge); any positive value is a window in ms.
-  retentionMs: z.number().int().min(0),
+  // 0 = retention disabled (never purge); any positive value is a window in ms,
+  // up to MAX_RETENTION_MS. The upper bound is defence in depth for every
+  // consumer that does date arithmetic on the window: `archivedAt + retentionMs`
+  // must stay inside the representable Date range (see
+  // src/data/asset-retention.ts purgeAfterOf, which is total regardless).
+  retentionMs: z.number().int().min(0).max(MAX_RETENTION_MS),
   // The audit-log window (issue #566). 0 = indefinite retention (never purge).
   auditRetentionMs: z.number().int().min(0)
 });

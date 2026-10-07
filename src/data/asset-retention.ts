@@ -41,9 +41,10 @@ export type AssetRetentionWindow = {
   // When the asset entered `archived` (ISO 8601) — archivedAtOf(asset).
   archivedAt: string;
   // Earliest instant the purge sweep may replace this asset with a tombstone
-  // (ISO 8601), or `null` when it will never be purged: either retention is
-  // disabled (retentionMs === 0) or `archivedAt` is unparseable, which the sweep
-  // also refuses to purge on.
+  // (ISO 8601), or `null` when it will never be purged: retention is disabled
+  // (retentionMs === 0), `archivedAt` is unparseable (which the sweep also
+  // refuses to purge on), or `archivedAt + retentionMs` falls outside the
+  // representable Date range (see purgeAfterOf).
   purgeAfter: string | null;
   // The effective instance-global window at read time, in ms. 0 = never purge.
   retentionMs: number;
@@ -78,11 +79,27 @@ export function assetRetentionWindow(
   };
 }
 
+// The widest instant a JS `Date` can represent: ±8,640,000,000,000,000 ms from
+// the epoch (ECMA-262 "Time Values and Time Range"). A `Date` outside it is the
+// invalid date, and `toISOString()` on it throws `RangeError: Invalid time value`.
+const MAX_TIME_VALUE_MS = 8.64e15;
+
 // `archivedAt + retentionMs`, the inverse of the sweep's eligibility test
 // (`archivedAtMs > cutoff` where `cutoff = now - retentionMs`,
 // archived-asset-purge-sweep.ts:128,146-150). `null` when retention is disabled,
 // and `null` when the stamp cannot be parsed — the sweep refuses to purge on an
 // unparseable stamp (:147-150), so claiming a purge instant would be a lie.
+//
+// TOTAL by construction: it must never throw. `withRetentionWindow`
+// (src/routes/assets.ts:2057) calls this on every response that serializes an
+// archived asset, so a throw here would turn the asset read, list, versions,
+// search and every mutation echo into a 500 for any archived asset. The sum can
+// leave the representable Date range because `effectiveMs` is the live
+// instance-global window (`retentionMs`, src/routes/retention.ts) — operator
+// input, not a derived value. Out of range is reported as `null`, reusing the
+// SAME "never purged" semantics already used for a disabled window and an
+// unparseable stamp: a window that ends beyond the end of representable time is
+// a window the sweep can never act on.
 function purgeAfterOf(archivedAt: string, effectiveMs: number): string | null {
   if (effectiveMs <= 0) {
     return null;
@@ -91,5 +108,9 @@ function purgeAfterOf(archivedAt: string, effectiveMs: number): string | null {
   if (Number.isNaN(archivedAtMs)) {
     return null;
   }
-  return new Date(archivedAtMs + effectiveMs).toISOString();
+  const purgeAfterMs = archivedAtMs + effectiveMs;
+  if (!Number.isFinite(purgeAfterMs) || Math.abs(purgeAfterMs) > MAX_TIME_VALUE_MS) {
+    return null;
+  }
+  return new Date(purgeAfterMs).toISOString();
 }
