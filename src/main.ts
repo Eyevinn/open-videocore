@@ -26,6 +26,7 @@ import {
   ensureParameterStore,
   paramStoreFromEnv,
   configKvStoreFromEnv,
+  makeScalerConfigStore,
   type StackConfig
 } from './services/param-store.js';
 import { saveSecret } from '@osaas/client-core';
@@ -2592,6 +2593,14 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   maxInstances: encoreMaxInstances,
   minInstances: 0,
   idleTimeoutMs: encoreIdleTimeoutMs,
+  // Durable scaler runtime config (#1077). Reuses the SAME generic
+  // eyevinn-app-config-svc key/value store the storage-backend registry writes
+  // through (`backendKvStore`, built with configKvStoreFromEnv above) — one
+  // dedicated instance-global key, `openvideocore/scalerconfig`. Undefined when
+  // the parameter store is unconfigured, in which case PATCH /scaler/config
+  // responds 501 instead of accepting a change that cannot survive a restart.
+  // The boot-time read of this key is issue #1078.
+  ...(backendKvStore ? { configStore: makeScalerConfigStore(backendKvStore) } : {}),
   onConfigChange: (cfg) => {
     if (scalerRegistry) {
       scalerRegistry.setMaxInstances(cfg.maxInstances);
