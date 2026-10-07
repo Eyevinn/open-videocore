@@ -71,6 +71,7 @@ import {
   currentDocumentStackName,
   PERSISTED_STACK_FALLBACK_MESSAGE
 } from './services/request-stack-context.js';
+import { reconcileWatchFolders } from './services/watch-folder-wiring.js';
 import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
@@ -2461,6 +2462,13 @@ await app.register(assetUploadRouter, {
 //      onStackChange the moment one is provisioned, mirroring activateScaler.
 //      This closes the gap in issue #643/#636 where the watch-folder was only
 //      ever built from MINIO_URL and therefore silently did nothing on OSC.
+//      ONE INSTANCE PER PROVISIONED STACK since issue #1099: the parameter-store
+//      path enumerates stacks with stackResolver.listStackNames() and resolves
+//      each BY NAME, because a watcher watches exactly one bucket on one client
+//      and the previous no-name resolve() only ever reached the FIRST listed
+//      stack — so drops into stack B's bucket were never ingested at all. See
+//      services/watch-folder-wiring.ts for the reconciliation + the
+//      global-config / per-stack-source-location decision.
 //
 // Fail-loud config validation (issue #642): we CLASSIFY the config first and,
 // when the feature is requested (WATCH_FOLDER_ENABLED=true) but its storage
@@ -2499,48 +2507,60 @@ let watchFolder: WatchFolderService | undefined =
 // workspace-stack.ts:buildEnvConnections).
 const watchFolderFromEnv = watchFolder !== undefined;
 
-// (Re)build the watch-folder from the resolved stack's parameter-store-backed
-// storage connection (issue #643). No-op unless WATCH_FOLDER_ENABLED=true and
-// we are NOT already wired from the env override. Idempotent: if a running
-// watch-folder is already pointed at the resolved bucket on the same endpoint we
-// leave it running; otherwise we (re)create it against the current storage
-// client + source bucket and start it. Never throws — a resolve failure leaves
-// the watch-folder as-is and is logged.
+// Live watch-folder instances on the parameter-store path, keyed by stack name
+// (issue #1099; `''` is the default/unnamed resolution — see
+// services/watch-folder-wiring.ts stackRegistryKey). Reconciled in place so
+// boot and every onStackChange converge on "one watcher per provisioned stack".
+// Empty on the env-override path, which owns `watchFolder` exclusively.
+const watchFoldersByStack = new Map<string, WatchFolderService>();
+
+// (Re)build the watch-folder from each provisioned stack's parameter-store-backed
+// storage connection (issue #643, per-stack since #1099). No-op unless
+// WATCH_FOLDER_ENABLED=true and we are NOT already wired from the env override.
+// Idempotent: a watcher already pointed at its stack's resolved bucket and
+// running is left alone; otherwise it is (re)created against that stack's
+// storage client + source bucket and started. Never throws — a per-stack resolve
+// failure leaves that stack's watcher as-is, is logged, and does not stop the
+// other stacks from being wired.
 async function wireWatchFolderFromStack(): Promise<void> {
   if (!watchFolderEnabled() || watchFolderFromEnv) return;
-  try {
-    const conns = await stackResolver.resolve();
-    const client = conns.storageClient;
-    if (!client) {
-      // No object storage on the resolved stack yet (no stack provisioned, or a
-      // partial/invalid one). Nothing to watch; leave any prior instance be.
-      return;
-    }
-    const bucket = conns.sourceBucket;
-    // Already wired against this bucket and running: nothing to do. (The stack's
-    // storage endpoint is stack-invariant for a given deployment, so an
-    // unchanged bucket + a live service means the wiring still holds.)
-    if (watchFolder && watchFolder.currentBucket() === bucket && watchFolder.isRunning()) {
-      return;
-    }
-    // Rebuild against the freshly resolved client/bucket. Stop any stale prior
-    // instance first so its notification listener + poll timer are detached.
-    watchFolder?.stop();
-    watchFolder = new WatchFolderService({
-      client,
-      bucket,
-      repository: assetRepository,
-      log: app.log,
-      onObjectStored
-    });
-    watchFolder.start();
-    app.log.info(
-      { bucket, source: 'parameter-store' },
-      'watch-folder ingest wired from provisioned stack storage'
-    );
-  } catch (err) {
-    app.log.warn({ err }, 'watch-folder: failed to wire from provisioned stack storage');
-  }
+  const { defaultWatchFolder } = await reconcileWatchFolders({
+    listStackNames: () => stackResolver.listStackNames(),
+    resolveStack: (stackName) => stackResolver.resolve(stackName),
+    registry: watchFoldersByStack,
+    log: app.log,
+    createWatchFolder: ({ stackName, client, bucket }) =>
+      new WatchFolderService({
+        client,
+        bucket,
+        repository: assetRepository,
+        log: app.log,
+        onObjectStored,
+        // Pin this watcher's ingest to the stack it was built from (issue
+        // #1099). `assetRepository` is the stack-delegating
+        // PerWorkspaceAssetRepository and `onObjectStored` reads the
+        // request-scoped storage factory, both of which key on the stack name
+        // (services/request-stack-context.ts), so without this every drop —
+        // whichever stack's bucket it landed in — would be written to the first
+        // listed stack. The resolve() re-warms this stack's resolver cache entry
+        // first, because the synchronous resolveCached() reads inside
+        // onObjectStored would otherwise miss once the entry ages past the
+        // resolver TTL between reconciles.
+        runInStackContext: (fn) =>
+          runWithRequestStack(stackName, async () => {
+            await stackResolver.resolve(stackName);
+            return fn();
+          })
+      })
+  });
+  // Keep the single `watchFolder` binding the admin + storage routers read
+  // pointed at the DEFAULT stack's watcher — the stack a request with no
+  // X-Stack-Name resolves to — so single-stack behaviour is byte-for-byte
+  // unchanged. Those two routers still expose one instance (their response
+  // shapes are part of the published contract); on a multi-stack installation
+  // they therefore report and toggle the default stack's watcher, while ingest
+  // itself now runs on every stack.
+  if (defaultWatchFolder) watchFolder = defaultWatchFolder;
 }
 
 // Operational status (issue #16). Unauthenticated; reports background service
@@ -2992,11 +3012,12 @@ if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
   }
 }
 
-// Parameter-store path (Open Source Cloud, issue #643): if a stack was already
+// Parameter-store path (Open Source Cloud, issue #643): if any stack was already
 // provisioned in a previous run (self-discovered from the parameter store),
-// wire + start the watch-folder against its object storage now. On a fresh OSC
-// deployment no stack exists yet, so this is a no-op and the watch-folder comes
-// online later from onStackChange the moment the first stack is provisioned.
+// wire + start one watch-folder per stack against that stack's own object
+// storage now (issue #1099). On a fresh OSC deployment no stack exists yet, so
+// this is a no-op and the watch-folders come online later from onStackChange the
+// moment a stack is provisioned.
 // Skipped entirely when the env-override path already owns the watch-folder.
 if (!watchFolderFromEnv) {
   await wireWatchFolderFromStack();
