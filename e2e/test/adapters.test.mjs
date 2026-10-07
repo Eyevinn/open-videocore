@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { githubAdapter, registryAdapter, oscInstanceAdapter, SERVICE_ID } from '../runner/adapters.mjs';
+import { githubAdapter, oscInstanceAdapter, SERVICE_ID } from '../runner/adapters.mjs';
 
 const res = (status, body, headers = {}) => ({ ok: status >= 200 && status < 300, status, json: async () => body, headers: { get: (k) => headers[k.toLowerCase()] ?? null } });
 
@@ -10,18 +10,6 @@ test('github: head sha from commits/main, error on non-200', async () => {
   assert.equal(await g.headSha(), 'abc');
   assert.equal(urls[0], 'https://api.github.com/repos/Eyevinn/open-videocore/commits/main');
   await assert.rejects(githubAdapter({ fetchImpl: async () => res(403, {}) }).headSha(), /HTTP 403/);
-});
-
-test('registry: token exchange then HEAD manifest, returns Docker-Content-Digest', async () => {
-  const seen = [];
-  const r = registryAdapter({ user: 'u', token: 'p', fetchImpl: async (u, init = {}) => {
-    seen.push([String(u), init.method ?? 'GET']);
-    return String(u).includes('/token') ? res(200, { token: 'bearer-x' }) : res(200, {}, { 'docker-content-digest': 'sha256:abc' });
-  } });
-  assert.equal(await r.latestDigest(), 'sha256:abc');
-  assert.match(seen[0][0], /ghcr\.io\/token.*eyevinn-osaas\/open-videocore:pull/);
-  assert.deepEqual(seen[1], ['https://ghcr.io/v2/eyevinn-osaas/open-videocore/manifests/latest', 'HEAD']);
-  await assert.rejects(registryAdapter({ user: 'u', token: 'p', fetchImpl: async () => res(401, {}) }).latestDigest(), /HTTP 401/);
 });
 
 function fakeCore({ existing }) {

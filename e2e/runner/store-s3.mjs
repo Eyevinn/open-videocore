@@ -1,8 +1,8 @@
 // Result store on an S3-compatible bucket (the OSC object-storage service is MinIO). Same keys as the file
-// store: results/by-digest/<digest>.json and results/latest.json, which the promote workflow reads.
+// store: results/by-commit/<commit>.json and results/latest.json, which the promote workflow reads.
 // Contract: @aws-sdk/client-s3 3.1147.0 exports S3Client, GetObjectCommand, PutObjectCommand
 // (checked with `typeof` on the installed package). A missing key surfaces as name "NoSuchKey" / HTTP 404.
-import { assertDigest } from '../lib/digest.mjs';
+import { assertCommit } from '../lib/commit.mjs';
 
 /**
  * @param {{ bucket: string, endpoint?: string, region?: string, accessKeyId?: string, secretAccessKey?: string, client?: { send(cmd: any): Promise<any> }, sdk?: any }} opts
@@ -15,20 +15,20 @@ export async function s3Store({ bucket, endpoint, region = 'us-east-1', accessKe
     forcePathStyle: true, // MinIO and other S3-compatible stores address buckets by path
     credentials: accessKeyId ? { accessKeyId, secretAccessKey } : undefined,
   });
-  const key = (digest) => `results/by-digest/${assertDigest(digest)}.json`;
+  const key = (commit) => `results/by-commit/${assertCommit(commit)}.json`;
   const put = (Key, record) => s3.send(new mod.PutObjectCommand({ Bucket: bucket, Key, Body: JSON.stringify(record, null, 2), ContentType: 'application/json' }));
   return {
-    async get(digest) {
+    async get(commit) {
       try {
-        const out = await s3.send(new mod.GetObjectCommand({ Bucket: bucket, Key: key(digest) }));
+        const out = await s3.send(new mod.GetObjectCommand({ Bucket: bucket, Key: key(commit) }));
         return JSON.parse(await out.Body.transformToString());
       } catch (e) {
         if (e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) return undefined;
         throw e;
       }
     },
-    async put(digest, record) {
-      await put(key(digest), record);
+    async put(commit, record) {
+      await put(key(commit), record);
       await put('results/latest.json', record);
     },
   };

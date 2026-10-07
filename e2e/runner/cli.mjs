@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// One cycle. Env: see wire.mjs and README. Exit 0 only when the digest's result is green (fresh or already
+// One cycle. Env: see wire.mjs and README. Exit 0 only when the commit's result is green (fresh or already
 // recorded); anything else exits 1 so a scheduler flags it, including a red result found on a skip. 2 = config.
 import { runCycle } from './cycle.mjs';
 import { buildDeps, ConfigError } from './wire.mjs';
