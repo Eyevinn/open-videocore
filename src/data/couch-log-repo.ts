@@ -51,6 +51,7 @@
 import type { StackCouch, StoredDoc } from './couchdb.js';
 import {
   applyLogQuery,
+  applyOldestPage,
   mintLogRecordId,
   LOG_LEVELS,
   LOG_STORE_MAX_RECORDS,
@@ -60,6 +61,7 @@ import {
   type LogLevel,
   type LogReader,
   type LogRecord,
+  type LogRetentionStore,
   type LogStoreErrorLog,
   type LogStoreOptions
 } from '../services/log-store.js';
@@ -153,7 +155,7 @@ const MAX_EVICTIONS_PER_APPEND = 50;
 // the audit entry, never rewrite history" as applied at
 // src/data/audit-repo.ts:187-215. The single removal path is the retained-window
 // eviction below, which deletes a whole document and never edits one.
-export class CouchLogStore implements LogReader {
+export class CouchLogStore implements LogReader, LogRetentionStore {
   // Same bounded-retention contract as the in-memory store
   // (LOG_STORE_MAX_RECORDS, src/services/log-store.ts): the oldest records are
   // evicted once the partition exceeds the cap, which keeps the daily CouchDB
@@ -385,6 +387,68 @@ export class CouchLogStore implements LogReader {
   async size(): Promise<number> {
     const couch = this.couchFor();
     return couch.count(SELECTOR);
+  }
+
+  // Enumerate ONE page of log records in oldest-first order (ascending `_id`),
+  // for the bounded log-retention purge sweep (issue #1067). Retention expires
+  // the OLDEST aged records, so ascending order lets the sweep page from the
+  // tail forward and stop as soon as it reaches records inside the window.
+  //
+  // Mango `find` with no explicit `sort` scans the primary `_id` index, so pages
+  // come back ascending by `_id`; because every log `_id` is a process-wide
+  // monotonic ULID (append(), above), that IS append order, and skip/limit
+  // paging is globally consistent across pages. This is the same documented
+  // assumption CouchAuditRepository.listOldestPage rests on
+  // (src/data/audit-repo.ts) and that the eviction + high-water-mark scans here
+  // already rest on. The per-page sort through the shared `applyOldestPage`
+  // (src/services/log-store.ts) normalises the returned page and keeps these
+  // semantics identical to the in-memory store's; it does not, on its own,
+  // guarantee cross-page order.
+  //
+  // NOT the newest-first `list()` read path: no fetch-cap walk and no `degraded`
+  // signalling, because the sweep deliberately wants the OLDEST end of the
+  // partition — which is exactly what one unsorted page already gives. An
+  // unreadable document is skipped rather than thrown, as on the read path.
+  async listOldestPage(opts: { limit: number; offset?: number }): Promise<LogRecord[]> {
+    const couch = this.couchFor();
+    const docs = await couch.find(SELECTOR, { limit: opts.limit, skip: opts.offset ?? 0 });
+    const records: LogRecord[] = [];
+    for (const doc of docs) {
+      if (doc.resourceType !== RESOURCE_TYPE) continue;
+      const record = fromDoc(doc);
+      if (record) records.push(record);
+    }
+    // Page already fetched with the caller's limit/offset; normalise its order
+    // only (offset 0 over the materialised page).
+    return applyOldestPage(records, { limit: records.length });
+  }
+
+  // Purge (expire) a single log record: WHOLE-DOCUMENT removal of its immutable
+  // document, never an in-place edit. This is the second removal path on this
+  // store, alongside the retained-window eviction (evictOverflow below), and it
+  // exists solely to enforce the operator-configured retention window (issue
+  // #1067) — the two are complementary: eviction bounds the record COUNT,
+  // retention bounds record AGE. Both uphold append-only-UNTIL-purge: a record
+  // is either present verbatim or gone, never rewritten.
+  //
+  // Shape taken verbatim from CouchAuditRepository.purgeEntry
+  // (src/data/audit-repo.ts): read the document, refuse anything that is not a
+  // log document, then `couch.remove` (read `_rev` + destroy,
+  // src/data/couchdb.ts). Returns true when a live record was removed, false
+  // when nothing matched (already gone / not a log document), so the sweep can
+  // count purges exactly.
+  async purgeEntry(id: string): Promise<boolean> {
+    const couch = this.couchFor();
+    const doc = await couch.get(id);
+    if (!doc || doc.resourceType !== RESOURCE_TYPE) {
+      return false;
+    }
+    await couch.remove(id);
+    // Keep the local retained estimate honest so the eviction path does not
+    // chase documents retention already removed; it only drives eviction, so an
+    // approximation under concurrent writers is fine (the next append re-trims).
+    this.retained = Math.max(0, this.retained - 1);
+    return true;
   }
 
   private async ensureSeeded(couch: StackCouch): Promise<void> {
