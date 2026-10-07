@@ -969,9 +969,21 @@ function buildColumns(renderCtx) {
         //     (spec §5.1, §5.4 — #896).
         // Re-drive is independent of the lifecycle axis (it is a metadata-
         // extraction recovery), so a wedged archived row still offers it.
-        if (a.status === 'archived') {
-          return redriveBtn;
-        }
+        //
+        // The guard is scoped to the Archive control ALONE. An earlier revision
+        // returned early for an archived row, which also withheld Rename — but
+        // renaming an archived asset is a PERMITTED operation, so that removed a
+        // working affordance rather than a dead one. Contract: openapi.json
+        // `paths['/api/v1/assets/{id}'].patch` declares responses 200 / 404 /
+        // 422 only (no 409 and no status-conflict response), and its
+        // `requestBody` schema accepts a bare `{ name }` (`name`: string,
+        // minLength 1, maxLength 256). The handler (src/routes/assets.ts →
+        // `app.patch('/:id')`) carries no archived guard, and `repo.update`
+        // consults `applyStatus` ONLY when `patch.status !== undefined`
+        // (src/data/asset-repo.ts), so a name-only PATCH on an archived asset
+        // never reaches the terminal-state machine and answers 200. Every other
+        // permitted control therefore stays rendered on an archived row.
+        const isArchived = a.status === 'archived';
 
         return (
           redriveBtn +
@@ -1023,14 +1035,20 @@ function buildColumns(renderCtx) {
           // deliberately NOT `disabled` here: a disabled control is unfocusable
           // and carries no explanation, which is precisely what #896 asks the UI
           // to provide (spec §5.1).
-          '<button class="btn-danger asset-delete-btn" data-id="' +
-          escHtml(a.id) +
-          '" data-name="' +
-          escHtml(a.name || a.slug || '') +
-          (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })
-            ? '" data-locked="true'
-            : '') +
-          '" style="font-size:12px;padding:3px 8px;">Archive</button>'
+          //
+          // THIS is the single control the archived check suppresses — an
+          // already-archived row gets no Archive button, while Re-drive and
+          // Rename above remain available.
+          (isArchived
+            ? ''
+            : '<button class="btn-danger asset-delete-btn" data-id="' +
+              escHtml(a.id) +
+              '" data-name="' +
+              escHtml(a.name || a.slug || '') +
+              (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })
+                ? '" data-locked="true'
+                : '') +
+              '" style="font-size:12px;padding:3px 8px;">Archive</button>')
         );
       },
     },
