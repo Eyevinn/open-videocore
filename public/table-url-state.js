@@ -33,6 +33,17 @@
  *   status filter: one status value, or a comma-separated set. e.g. `jobs.status=failed`
  *          or `jobs.status=queued,running`.
  *   q      filter: free-text search string.
+ *   tags   filter: one tag, or a comma-separated set, e.g. `assets.tags=news,sports`
+ *          (issue #914). Parsed exactly like `status` — the comma-separated form is
+ *          what `GET /api/v1/search/?tags=` itself accepts (`tagsSchema`,
+ *          src/routes/search.ts:139-150), so the URL and the request agree without
+ *          a re-encoding step.
+ *   meta   filter: comma-separated `key=value` pairs over an asset's free-form
+ *          operator metadata, e.g. `assets.meta=genre=documentary,language=sv`
+ *          (issue #914). Each pair becomes one `metadata.<key>=<value>` request
+ *          param (`extractMetadataFilter`, src/routes/search.ts:221-240). Only the
+ *          FIRST `=` splits a pair, so a value may contain `=`; a value may not
+ *          contain a comma, since that is the pair separator here.
  *   from   filter: ISO date (inclusive lower bound), YYYY-MM-DD or full ISO.
  *   to     filter: ISO date (inclusive upper bound).
  *   page   1-based page number (offset-style paging).
@@ -62,6 +73,8 @@ const PARAM_KEYS = Object.freeze({
   sort: 'sort',
   status: 'status',
   q: 'q',
+  tags: 'tags',
+  meta: 'meta',
   from: 'from',
   to: 'to',
   page: 'page',
@@ -81,6 +94,8 @@ const BASE_DEFAULTS = Object.freeze({
   sort: null, // { field: string, dir: 'asc'|'desc' } | null (server default order)
   status: [], // string[]  (empty = no status filter)
   q: '', // string
+  tags: [], // string[]  (empty = no tag filter)
+  meta: [], // string[] of 'key=value' pairs (empty = no metadata filter)
   from: null, // string | null (ISO date)
   to: null, // string | null (ISO date)
   page: 1, // 1-based
@@ -118,6 +133,8 @@ function resolveDefaults(defaults) {
     sort,
     status: normalizeStatusValue('status' in d ? d.status : BASE_DEFAULTS.status),
     q: typeof d.q === 'string' ? d.q : BASE_DEFAULTS.q,
+    tags: normalizeStatusValue('tags' in d ? d.tags : BASE_DEFAULTS.tags),
+    meta: normalizeMetaValue('meta' in d ? d.meta : BASE_DEFAULTS.meta),
     from: normalizeDateValue('from' in d ? d.from : BASE_DEFAULTS.from),
     to: normalizeDateValue('to' in d ? d.to : BASE_DEFAULTS.to),
     page: clampInt(d.page, BASE_DEFAULTS.page, PAGE_MIN, PAGE_MAX),
@@ -195,6 +212,46 @@ function normalizeStatusValue(v) {
     if (!t || seen.has(t)) continue;
     seen.add(t);
     out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Normalize a free-form metadata filter into a de-duped `key=value` string[]
+ * (empty = no filter). Issue #914.
+ *
+ * Deliberately NOT normalizeStatusValue: a bare token with no `=`, or one whose
+ * key side is blank, is not a filter the backend can express — the request param
+ * is literally `metadata.<key>=<value>` (`extractMetadataFilter`,
+ * src/routes/search.ts:221-240) — so such tokens are dropped rather than sent as
+ * something the server would ignore. Only the FIRST `=` splits a pair, so a value
+ * may itself contain `=`. An EMPTY value side is kept: `metadata.genre=` is a real
+ * filter (match the empty string), not a malformed one, and silently dropping it
+ * would show the operator rows their filter said to exclude.
+ */
+function normalizeMetaValue(v) {
+  let parts;
+  if (Array.isArray(v)) {
+    parts = v;
+  } else if (typeof v === 'string') {
+    parts = v.split(',');
+  } else {
+    return [];
+  }
+  const out = [];
+  const seenKeys = new Set();
+  for (const p of parts) {
+    if (typeof p !== 'string') continue;
+    const eq = p.indexOf('=');
+    if (eq < 0) continue;
+    const key = p.slice(0, eq).trim();
+    const value = p.slice(eq + 1).trim();
+    // One filter per key: the backend keeps only the first value for a repeated
+    // key, so a second pair for the same key would be a promise the request
+    // cannot keep.
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    out.push(key + '=' + value);
   }
   return out;
 }
@@ -326,6 +383,12 @@ function decodeTableState(input, ns, defaults) {
   const qRaw = readParam(params, ns, PARAM_KEYS.q);
   const q = qRaw != null ? qRaw : def.q;
 
+  // structured asset filters (issue #914)
+  const tagsRaw = readParam(params, ns, PARAM_KEYS.tags);
+  const tags = tagsRaw != null ? normalizeStatusValue(tagsRaw) : def.tags;
+  const metaRaw = readParam(params, ns, PARAM_KEYS.meta);
+  const meta = metaRaw != null ? normalizeMetaValue(metaRaw) : def.meta;
+
   // date range
   const fromRaw = readParam(params, ns, PARAM_KEYS.from);
   const from = fromRaw != null ? normalizeDateValue(fromRaw) ?? def.from : def.from;
@@ -347,7 +410,7 @@ function decodeTableState(input, ns, defaults) {
   const colsRaw = readParam(params, ns, PARAM_KEYS.cols);
   const cols = colsRaw != null ? normalizeColumnsValue(colsRaw) ?? def.cols : def.cols;
 
-  return { sort, status, q, from, to, page, cursor, size, cols };
+  return { sort, status, q, tags, meta, from, to, page, cursor, size, cols };
 }
 
 // ─── Core: encode (state -> URL params) ──────────────────────────────────────
@@ -402,6 +465,12 @@ function encodeTableState(state, ns, defaults, into) {
   if (s.q !== def.q && s.q.length) {
     set(PARAM_KEYS.q, s.q);
   }
+  if (!shallowEqualStringArray(s.tags, def.tags) && s.tags.length) {
+    set(PARAM_KEYS.tags, s.tags.join(','));
+  }
+  if (!shallowEqualStringArray(s.meta, def.meta) && s.meta.length) {
+    set(PARAM_KEYS.meta, s.meta.join(','));
+  }
   if (s.from !== def.from && s.from) {
     set(PARAM_KEYS.from, s.from);
   }
@@ -441,6 +510,8 @@ function normalizeState(state, def) {
     sort: 'sort' in st ? normalizeSortValue(st.sort) : def.sort,
     status: 'status' in st ? normalizeStatusValue(st.status) : def.status,
     q: typeof st.q === 'string' ? st.q : def.q,
+    tags: 'tags' in st ? normalizeStatusValue(st.tags) : def.tags,
+    meta: 'meta' in st ? normalizeMetaValue(st.meta) : def.meta,
     from: 'from' in st ? normalizeDateValue(st.from) : def.from,
     to: 'to' in st ? normalizeDateValue(st.to) : def.to,
     page: 'page' in st ? clampInt(st.page, def.page, PAGE_MIN, PAGE_MAX) : def.page,
