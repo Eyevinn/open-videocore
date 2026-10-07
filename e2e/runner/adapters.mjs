@@ -1,7 +1,5 @@
 // Real adapters. Contract sources:
 //  - GitHub REST  GET /repos/{owner}/{repo}/commits/{ref}  -> { sha }
-//  - GHCR (OCI distribution API) token exchange + HEAD /v2/<name>/manifests/<tag> -> Docker-Content-Digest.
-//    NOT verified authenticated: the package is private (anonymous token -> 401, checked 2026-10-07).
 //  - OSC: @osaas/client-core 0.24.0 lib/core.d.ts and lib/context.d.ts
 //      Context(config?), ctx.getServiceAccessToken(serviceId), createInstance(ctx, serviceId, sat, body),
 //      getInstance(ctx, serviceId, name, sat), restartInstance(ctx, serviceId, name, sat),
@@ -20,24 +18,6 @@ export function githubAdapter({ repo = 'Eyevinn/open-videocore', token, fetchImp
       const { sha } = await res.json();
       if (!sha) throw new Error('GitHub response has no sha');
       return sha;
-    },
-  };
-}
-
-export function registryAdapter({ image = 'eyevinn-osaas/open-videocore', tag = 'latest', user, token, fetchImpl = fetch } = {}) {
-  return {
-    async latestDigest() {
-      const basic = Buffer.from(`${user}:${token}`).toString('base64');
-      const t = await fetchImpl(`https://ghcr.io/token?service=ghcr.io&scope=repository:${image}:pull`, { headers: { authorization: `Basic ${basic}` } });
-      if (!t.ok) throw new Error(`GHCR token exchange returned HTTP ${t.status}`);
-      const bearer = (await t.json()).token;
-      const m = await fetchImpl(`https://ghcr.io/v2/${image}/manifests/${tag}`, {
-        method: 'HEAD',
-        headers: { authorization: `Bearer ${bearer}`, accept: 'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' },
-      });
-      const digest = m.headers.get('docker-content-digest');
-      if (!m.ok || !digest) throw new Error(`GHCR manifest HEAD returned HTTP ${m.status}`);
-      return digest;
     },
   };
 }
