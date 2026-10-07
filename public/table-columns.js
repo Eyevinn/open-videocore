@@ -46,6 +46,13 @@
  *   view stays shareable). Storage is best-effort — private-mode and quota errors
  *   are swallowed, because losing a column preference must never break the table.
  *
+ *   RESET (issue #962) is the exact inverse, and has to clear BOTH writes: a reset
+ *   that forgot only the stored default would be undone by the `cols` still in the
+ *   address bar, and one that forgot only the URL would come back on the next bare
+ *   visit. Because only the consumer knows its namespace and its URL contract, the
+ *   chooser does not clear either itself — it offers the ACTION (`onReset`) and the
+ *   consumer performs both clears, with clearStoredColumns() for the stored half.
+ *
  * THE LEGALITY RULE
  *   A table that renders nothing identifiable and offers no actions is not a
  *   view, it is a dead end you cannot navigate out of. So a consumer declares
@@ -315,10 +322,19 @@ let chooserUid = 0;
  * @param {string[][]} [options.requireAtLeastOne]
  * @param {() => (string|null)} [options.getActiveSortKey]  lets the list flag a
  *        column that is hidden while the table is still sorted by it.
+ * @param {(keys: string[]) => void} [options.onReset]  called with the table's
+ *        DECLARED default set when the operator resets (issue #962). The consumer
+ *        both applies it and CLEARS every place it remembered a choice — its
+ *        stored default (clearStoredColumns) and its URL state. Defaults to
+ *        `onChange`, which restores the right view but leaves the remembered
+ *        choice in place, so a consumer that persists anything should wire this.
+ * @param {() => boolean} [options.getIsCustomized]  whether there is anything to
+ *        reset (a stored default or a column param in the URL). Only the consumer
+ *        can answer that, so when it is omitted the reset action stays enabled.
  * @param {string} [options.label]  button caption (default 'Columns').
  * @param {Document} [options.doc]  injectable document (tests / detached panes).
- * @returns {{el:HTMLElement, refresh:function, close:function, destroy:function,
- *            isOpen:function}}
+ * @returns {{el:HTMLElement, refresh:function, reset:function, close:function,
+ *            destroy:function, isOpen:function}}
  *
  * A non-modal popover, deliberately: choosing columns is a light, repeated
  * adjustment made WHILE reading the table, and a modal would hide the very rows
@@ -334,6 +350,9 @@ export function createColumnChooser(options) {
   const onChange = typeof opts.onChange === 'function' ? opts.onChange : () => {};
   const getActiveSortKey =
     typeof opts.getActiveSortKey === 'function' ? opts.getActiveSortKey : () => null;
+  const onReset = typeof opts.onReset === 'function' ? opts.onReset : onChange;
+  const getIsCustomized =
+    typeof opts.getIsCustomized === 'function' ? opts.getIsCustomized : () => true;
   const groups = groupsOf(opts);
 
   const uid = ++chooserUid;
@@ -378,19 +397,38 @@ export function createColumnChooser(options) {
   if (!hint.textContent) hint.hidden = true;
   panel.appendChild(hint);
 
+  // Two actions, deliberately side by side in the SAME panel the toggles live in
+  // (issue #962): the control that let an operator customize the table is the only
+  // place they will look to undo it, and a reset parked anywhere else is a reset
+  // nobody finds. They are NOT redundant even for a table whose declared default
+  // happens to be "every column", so each says what it writes, not just what it
+  // shows: "Show all" is a choice (remembered like any other toggle), "Reset to
+  // defaults" is the withdrawal of one.
   const actions = doc.createElement('div');
   actions.className = 'ops-columns-actions';
   const showAll = doc.createElement('button');
   showAll.type = 'button';
   showAll.className = 'ops-columns-showall btn-ghost';
   showAll.textContent = 'Show all';
+  showAll.title = 'Show every column, and remember that as your preference.';
   actions.appendChild(showAll);
+  const resetBtn = doc.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.className = 'ops-columns-reset btn-ghost';
+  resetBtn.textContent = 'Reset to defaults';
+  resetBtn.title =
+    'Forget your saved column preference and this link’s columns, and go back to the default columns.';
+  actions.appendChild(resetBtn);
   panel.appendChild(actions);
 
   el.appendChild(panel);
 
   showAll.addEventListener('click', function () {
     commit(declaredKeys(columns));
+  });
+
+  resetBtn.addEventListener('click', function () {
+    reset();
   });
 
   // The ONE path a toggle takes. It normalizes first, so `onChange` only ever
@@ -402,6 +440,22 @@ export function createColumnChooser(options) {
     const next = normalizeVisibleColumns(requestedKeys, columns, { requireAtLeastOne: groups });
     onChange(next);
     refresh();
+  }
+
+  /**
+   * Reset to the table's DECLARED default set (issue #962).
+   *
+   * Routed through `onReset` rather than `commit` on purpose: committing would
+   * persist the default set as a fresh preference, which is the opposite of what
+   * reset means. The default set is derived the same way a first load derives it —
+   * normalizeVisibleColumns() with no request — so there is one definition of
+   * "default", not a second copy that can drift from the declared columns.
+   */
+  function reset() {
+    const defaults = normalizeVisibleColumns(null, columns, { requireAtLeastOne: groups });
+    onReset(defaults);
+    refresh();
+    return defaults;
   }
 
   /** Rebuild the checkbox list from the current visible set. */
@@ -416,6 +470,11 @@ export function createColumnChooser(options) {
 
     btnCount.textContent = ' ' + visible.length + ' of ' + declared.length;
     showAll.disabled = visible.length === declared.length;
+    // Reset is NOT disabled just because the view already looks default: the
+    // state it clears is invisible (a stored default, a `cols` still in the URL)
+    // and can describe the default set exactly. Only the consumer can say whether
+    // any of it is there, which is what getIsCustomized() answers.
+    resetBtn.disabled = !getIsCustomized();
 
     list.innerHTML = '';
     for (const col of columns) {
@@ -523,7 +582,7 @@ export function createColumnChooser(options) {
 
   refresh();
 
-  return { el, refresh, open, close, isOpen, destroy, _button: btn, _panel: panel };
+  return { el, refresh, reset, open, close, isOpen, destroy, _button: btn, _panel: panel };
 }
 
 /** Human sentence for the panel hint, naming the columns that are protected. */
