@@ -53,6 +53,15 @@ export const STACK_SERVICES = [
 // string (mirrors the FFPROBE_SERVICE_ID / AUTO_SUBTITLES_SERVICE_ID pattern).
 export const PACKAGER_SERVICE_ID = 'eyevinn-encore-packager' as const;
 
+// The human-readable role reported for the packager in a teardown result. The
+// on-demand packager is torn down from TWO places — the static TEARDOWN_ORDER
+// below (store-less path) and teardownOnDemandPackager (the ground-truth
+// reconciliation used when it is absent from the stored services[]). Both fold
+// into the SAME per-service result list, so the role must be identical in both
+// or the merged entry would be incoherent. Exported as one constant rather than
+// repeating the literal (issue #1056).
+export const PACKAGER_TEARDOWN_ROLE = 'packaging' as const;
+
 // A stack service descriptor: the OSC serviceId plus its human-readable role.
 // This is a structural supertype of the STACK_SERVICES entries (which narrow to
 // literal serviceId/role via `as const`). It is deliberately widened to string
@@ -124,7 +133,7 @@ export const SCENE_DETECT_SERVICE_ID = 'eyevinn-function-scenes' as const;
 // packaging ever executed. role 'packaging' matches the pre-#243 provision entry.
 const TEARDOWN_ONLY_PACKAGER: StackService = {
   serviceId: PACKAGER_SERVICE_ID,
-  role: 'packaging'
+  role: PACKAGER_TEARDOWN_ROLE
 };
 
 export const TEARDOWN_ORDER: readonly StackService[] = [

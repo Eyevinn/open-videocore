@@ -149,7 +149,18 @@ export type WatchFolderOptions = {
   log: WatchFolderLogger;
   // Same callback the upload route fires post-upload (issue #6 ffprobe). When
   // provided, a newly ingested object triggers fire-and-forget extraction.
-  onObjectStored?: (assetId: string, objectKey: string) => void;
+  // `stackName` is the asset's PERSISTED stack identity (`Asset.stackName`,
+  // issue #1097), passed for symmetry with the upload route
+  // (src/routes/asset-upload.ts) so the detached continuation re-enters the
+  // stack the asset was actually written to instead of relying on the ambient
+  // context it happens to inherit from the sweep. Undefined on a watch-folder
+  // asset created with no ambient stack, which keeps today's behaviour.
+  onObjectStored?: (
+    assetId: string,
+    objectKey: string,
+    storage?: undefined,
+    stackName?: string
+  ) => void;
   // Operator-configured total storage cap (issue #579, ADR-020). Watch-folder
   // ingest is an operator/other-system dropping bytes DIRECTLY into the bucket,
   // bypassing the API — the bytes already exist and there is nothing to reject
@@ -184,7 +195,9 @@ export class WatchFolderService {
   private readonly log: WatchFolderLogger;
   private readonly onObjectStored?: (
     assetId: string,
-    objectKey: string
+    objectKey: string,
+    storage?: undefined,
+    stackName?: string
   ) => void;
   private readonly quota?: StorageQuotaGuard;
   private readonly runInStackContext: <T>(fn: () => Promise<T>) => Promise<T>;
@@ -400,7 +413,18 @@ export class WatchFolderService {
         // Advance to processing and fire metadata extraction, mirroring the
         // upload route's post-upload behaviour.
         await this.repo.update(asset.id, { status: 'processing' });
-        this.onObjectStored?.(asset.id, parsed.localKey);
+        // The asset's own persisted stack (issue #1097), not the ambient
+        // context. Under the per-stack wiring (issue #1099) the two now agree
+        // by construction: `create` above ran inside this watcher's
+        // `runInStackContext`, so asset-repo.ts stamped `stackName` from
+        // `currentDocumentStackName()` — i.e. the stack whose source bucket
+        // received the drop. Passing the PERSISTED value keeps the detached
+        // continuation correct even for the env-override/no-context path, where
+        // `runInStackContext` is the identity wrapper.
+        // `storage` stays undefined: the watch-folder has no per-request storage
+        // handle, and the callback falls back to its own `storageFor()` resolved
+        // INSIDE the stack this argument re-enters.
+        this.onObjectStored?.(asset.id, parsed.localKey, undefined, asset.stackName);
         this.log.info(
           { assetId: asset.id, objectKey: parsed.localKey },
           'watch-folder: ingested direct-drop object'
