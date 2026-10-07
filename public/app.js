@@ -77,6 +77,15 @@ import { mountAssetRename, openRenameDialog } from './asset-rename.js';
 // 502 is reported as an outright failure, is in that module's header.
 import { mountAssetClip } from './asset-clip.js';
 
+// Collection rename affordance (issue #928): the same control, for the `name`
+// field that PATCH /api/v1/collections/{id} accepts since issue #926 but that
+// nothing in this UI could trigger — a collection could only be named at
+// creation. Both modules adapt ONE shared component (public/rename-dialog.js),
+// so the two interactions cannot drift. UI only — no route or schema changes.
+// Full contract grounding, including why membership (`assetIds`) can neither be
+// sent nor affected, is in that module's header.
+import { mountCollectionRename } from './collection-rename.js';
+
 // Read-only tracks panel (issue #902, broken out of #794): one section per track
 // kind — video, audio, subtitle — each listing only the attributes the API
 // exposes for that kind, each with an explicit empty state. All of it comes from
@@ -222,6 +231,24 @@ function canChangeReviewState() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may rename a collection (issue #928). The SAME
+// matrix and the same answer as canRenameAsset, which is the point: ADR-018
+// decision 4 states there is no asset/collection distinction in the permission
+// table, and the code agrees — `authorize()` takes `resourceType` but does not
+// index `MATRIX` with it (src/auth/authorize.ts:64-73, "`asset` and `collection`
+// are identical (no cascade, decision 4)"). `methodToAction` (:79-93) maps
+// PATCH -> write, and `resourceAuthorizationPreHandler('collection')` is
+// registered on the collections router (src/routes/collections.ts:267), so
+// PATCH /collections/{id} is refused to a `viewer` with 403
+// `forbidden_insufficient_role`. Kept as its own named function rather than
+// re-using canRenameAsset so that if the server ever does distinguish the two
+// resources, there is already a seam to change. Client-side mirror only: the 403
+// is still handled if it arrives.
+function canRenameCollection() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -5192,6 +5219,71 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
     ].join('');
     body.appendChild(kvDiv);
 
+    // ── Rename: edit the collection's name (issue #928) ──
+    //
+    // Contract, fetched before this call was written (CLAUDE.md rule 7) and
+    // cited in full in public/collection-rename.js:
+    //   PATCH /api/v1/collections/{id} — body carries EXACTLY `name`
+    //        (`updateBodySchema.name = z.string().min(1).max(256).optional()`,
+    //        src/routes/collections.ts:224, inside a `.strict()` object at :229;
+    //        wired at :389-410); 200 = the updated collection, 400 = { error },
+    //        404 = { error }.
+    // The `name` field on this body is the API change issue #928 lists as a
+    // dependency; it landed in issue #926, so this is the affordance for a field
+    // the route already accepts — no route, schema or response shape changes
+    // here.
+    //
+    // Membership is untouched and UNSENDABLE: the body is `.strict()`, so
+    // `assetIds` would be a 400 (collections.ts:207-215 — membership stays on
+    // PUT/DELETE /:id/assets/:assetId), and `applyCollectionUpdate`
+    // (src/data/collection-repo.ts:92-110) assigns only the keys the patch
+    // carries and "never touches `assetIds` or `deleteLock`" (:90). The body is
+    // built in one shared place (`renameRequestBody`, public/rename-dialog.js)
+    // which returns `{ name }` and nothing else.
+    //
+    // Same component as the asset rename (public/rename-dialog.js), so the
+    // dialog, the client-side bounds check, the no-op refusal and the 403/404
+    // handling are shared rather than re-implemented.
+    const collActionsDiv = document.createElement('div');
+    collActionsDiv.className = 'mt12 flex-gap';
+    body.appendChild(collActionsDiv);
+
+    const collActionMsg = document.createElement('div');
+    collActionMsg.id = 'coll-action-msg';
+    collActionMsg.className = 'mt8';
+    // Announced politely so an outcome that does not move focus still reaches
+    // assistive technology (as the asset detail's #action-msg does).
+    collActionMsg.setAttribute('aria-live', 'polite');
+    body.appendChild(collActionMsg);
+
+    const collRename = mountCollectionRename({
+      collection: coll,
+      actionsRow: collActionsDiv,
+      canChange: canRenameCollection(),
+      apiFetch: apiFetch,
+      openModal: openModal,
+      showMsg: showMsg,
+      messageHost: function () {
+        return detailPanel.querySelector('#coll-action-msg') ||
+          detailPanel.querySelector('#coll-detail-body');
+      },
+      onRenamed: async function (updated, message) {
+        // The collections list shows the name in its own column, so keep it in
+        // step with the panel.
+        if (typeof onRefresh === 'function') onRefresh();
+        await rerenderCollectionThenMsg(message, updated ? 'success' : 'error');
+      },
+    });
+
+    // Rename is the only action in this row today, so for a role that cannot
+    // write (no control mounted) the row and its outcome area would be two empty
+    // boxes with margins. Take them back out rather than leaving dead chrome
+    // above the member list.
+    if (!collRename.button) {
+      collActionsDiv.remove();
+      collActionMsg.remove();
+    }
+
     // Add-asset control: searchable multi-select picker with the raw-id field
     // kept as a fallback (issue #915). Adding refreshes only the member list
     // below, so the picker keeps its "Added N assets." result and whatever the
@@ -5207,6 +5299,21 @@ async function showCollectionDetail(id, detailPanel, onRefresh) {
   } catch (err) {
     body.innerHTML = '';
     showMsg(body, 'Failed: ' + err.message, 'error');
+  }
+
+  // Re-render the whole panel from the server, then report the outcome in the
+  // freshly built #coll-action-msg (the re-render replaces the old one). A
+  // rename is NOT patched into the view locally: the 200 carries the updated
+  // collection, and re-reading is the only way a silently different stored value
+  // becomes visible. When the re-read itself fails (e.g. the collection is gone,
+  // the 404 path), showCollectionDetail has already written its own error into
+  // the body and there is no action area, so the message is appended to the body
+  // instead of being dropped.
+  async function rerenderCollectionThenMsg(text, kind) {
+    await showCollectionDetail(id, detailPanel, onRefresh);
+    const host = detailPanel.querySelector('#coll-action-msg') ||
+      detailPanel.querySelector('#coll-detail-body');
+    if (host) showMsg(host, text, kind);
   }
 
   // Re-read the collection and redraw just the membership table.
@@ -8419,6 +8526,15 @@ export {
   // (issue #956). Exported so a DOM/unit test can assert the Rename control is
   // offered to exactly the roles that hold `write`.
   canRenameAsset,
+  // Client-side mirror of the same ADR-018 write gate for
+  // PATCH /collections/{id} (issue #928). Exported so a DOM/unit test can assert
+  // the collection Rename control is offered to exactly the roles that hold
+  // `write` — and to no others.
+  canRenameCollection,
+  // Collection detail panel (issue #928). Exported so a DOM test can drive the
+  // REAL panel — the same code path the Collections tab opens — against the real
+  // collections router, and assert the rename affordance end to end.
+  showCollectionDetail,
   // Client-side mirror of the ADR-018 write+delete gate for the external-ids
   // sub-resource (issue #908). Exported so a DOM/unit test can assert the
   // add/edit/remove controls are offered to exactly the roles that hold both
