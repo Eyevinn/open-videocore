@@ -1,6 +1,7 @@
 import { cases, CaseFailure, SUITE_VERSION } from './cases.mjs';
 import { createClient } from '../lib/http.mjs';
 import { redact } from '../lib/redact.mjs';
+import { sweepLeftovers } from './sweep.mjs';
 
 export const DEFAULT_TIMEOUTS = {
   ingestMs: 120_000, metadataMs: 60_000, transcodeMs: 600_000, packageMs: 600_000, searchMs: 30_000,
@@ -14,6 +15,8 @@ export const DEFAULT_TIMEOUTS = {
 export async function runSuite({ client, anon, config, sleep, now = Date.now }) {
   const cfg = { pollMs: 2_000, ...config, timeouts: { ...DEFAULT_TIMEOUTS, ...config.timeouts } };
   const ctx = { client, anon, config: cfg, sleep, now, state: {} };
+  let swept = 0;
+  if (cfg.sweep !== false) { try { swept = await sweepLeftovers({ client, now }); } catch { /* best effort */ } }
   const results = [];
   let chainBroken = false;
   for (const c of cases) {
@@ -31,7 +34,7 @@ export async function runSuite({ client, anon, config, sleep, now = Date.now }) 
     try { await client.request('DELETE', `/api/v1/assets/${ctx.state.assetId}`, { query: { force: 'true' } }); } catch { /* best effort */ }
   }
   const status = results.some((r) => r.status === 'fail') ? 'red' : 'green';
-  return { suiteVersion: SUITE_VERSION, status, build: ctx.state.build, cases: results };
+  return { suiteVersion: SUITE_VERSION, status, build: ctx.state.build, swept, cases: results };
 }
 
 export { createClient };

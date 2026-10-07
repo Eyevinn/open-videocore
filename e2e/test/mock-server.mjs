@@ -8,6 +8,7 @@ export function startMock({ token = 'tok', commit = 'abc1234', faults = {} } = {
   const assets = new Map();
   const jobs = new Map();
   const calls = [];
+  const seed = (a) => assets.set(a.id, { tags: [], renditions: [], status: 'ready', ...a });
   const json = (res, code, body) => {
     res.writeHead(code, { 'content-type': 'application/json' });
     res.end(body === undefined ? '' : JSON.stringify(body));
@@ -23,10 +24,13 @@ export function startMock({ token = 'tok', commit = 'abc1234', faults = {} } = {
     if (!faults.openAuth && req.headers.authorization !== `Bearer ${token}`) return json(res, 401, { error: 'unauthorized' });
     const m = (re) => p.match(re);
     let x;
-    if (req.method === 'GET' && p === '/api/v1/assets/') return json(res, 200, { items: [...assets.values()] });
+    if (req.method === 'GET' && p === '/api/v1/assets/') {
+      const all = [...assets.values()]; const limit = Number(url.searchParams.get('limit') ?? 50); const offset = Number(url.searchParams.get('offset') ?? 0);
+      return json(res, 200, { items: all.slice(offset, offset + limit), limit, offset, total: all.length });
+    }
     if (req.method === 'POST' && p === '/api/v1/assets/ingest-url') {
       const id = randomUUID(); const jobId = randomUUID();
-      assets.set(id, { id, name: body.title, status: 'processing', tags: [], renditions: [] });
+      assets.set(id, { id, name: body.title, status: 'processing', tags: [], renditions: [], createdAt: new Date().toISOString() });
       jobs.set(jobId, { id: jobId, type: 'ingest-url', assetId: id, status: faults.ingestJobFails ? 'failed' : 'done', error: faults.ingestJobFails ? 'download failed' : undefined });
       if (!faults.ingestJobFails) assets.get(id).status = 'ready';
       return json(res, 202, { assetId: id, jobId });
@@ -65,6 +69,6 @@ export function startMock({ token = 'tok', commit = 'abc1234', faults = {} } = {
     return json(res, 404, { error: 'not found', p });
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
-    baseUrl: `http://127.0.0.1:${server.address().port}`, token, assets, calls, close: () => new Promise((r) => server.close(r)),
+    baseUrl: `http://127.0.0.1:${server.address().port}`, token, assets, calls, seed, close: () => new Promise((r) => server.close(r)),
   })));
 }

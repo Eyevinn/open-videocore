@@ -2,15 +2,12 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 /** Result store on a directory: results/by-digest/<digest>.json and results/latest.json. For tests and local use. */
-const DIGEST = /^sha256:[0-9a-f]{64}$/;
+import { assertDigest } from '../lib/digest.mjs';
 
 export function fileStore(dir) {
   // The digest comes off the network (a registry header) and becomes a file name: accept only the exact
   // form, so a hostile value like ../../x can never leave results/by-digest/.
-  const file = (digest) => {
-    if (!DIGEST.test(String(digest))) throw new Error(`refusing malformed image digest: ${String(digest).slice(0, 80)}`);
-    return path.join(dir, 'results', 'by-digest', `${digest}.json`);
-  };
+  const file = (digest) => path.join(dir, 'results', 'by-digest', `${assertDigest(digest)}.json`);
   return {
     async get(digest) {
       try { return JSON.parse(await readFile(file(digest), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return undefined; throw e; }
