@@ -223,6 +223,22 @@ function canChangeReviewState() {
   return r === 'editor' || r === 'admin';
 }
 
+// Whether the current client role may add or remove an asset's subtitle tracks
+// (issue #940). Same matrix, read before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` and `delete` to `editor` and
+// `admin` and NEITHER to `viewer`, and `methodToAction` (:79-93) maps
+// POST -> write and DELETE -> delete, so both
+// POST /assets/{id}/subtitle-tracks and
+// DELETE /assets/{id}/subtitle-tracks/{trackId} are refused to a `viewer` with
+// 403 by `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1773). A viewer keeps the read-only panel, which is `read`
+// on GET /assets/{id} and permitted. Client-side mirror only: the 403 is still
+// handled if it arrives.
+function canChangeSubtitleTracks() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
 // Whether the current client role may rename an asset (issue #956). Same matrix,
 // checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
 // `write` to `editor` and `admin` only, and `methodToAction` (:79-93) maps
@@ -2967,39 +2983,41 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       body.appendChild(sceneDiv);
     }
 
-    // ── Tracks: video / audio / subtitle (issue #902) ──
+    // ── Tracks: video / audio / subtitle (issue #902, + subtitle add/remove #940) ──
     //
-    // Contract, fetched before this call was written (CLAUDE.md rule 7) and cited
-    // in full in public/tracks-panel.js. Every field comes from the ONE
-    // GET /api/v1/assets/{id} 200 body already awaited above — the panel adds no
-    // round-trip:
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/tracks-panel.js. Every field on first paint comes
+    // from the ONE GET /api/v1/assets/{id} 200 body already awaited above — the
+    // panel adds no round-trip to the render:
     //   Editorial audio + subtitle: `audioTracks` / `subtitleTracks` on that
     //        body. Item schemas { id, language, codec?, channels?, label?,
     //        default? } and { id, language, format, objectKey?, label?,
-    //        default? } (audioTrackOutSchema src/routes/assets.ts:795-802,
-    //        subtitleTrackOutSchema :806-813). Both properties are `.optional()`
-    //        on assetSchema (:907, :908) and absent means the asset has none of
-    //        that kind (:905-906) — never "unknown" — so each renders its own
+    //        default? } (audioTrackOutSchema src/routes/assets.ts:804-811,
+    //        subtitleTrackOutSchema :815-822). Both properties are `.optional()`
+    //        on assetSchema (:916, :917) and absent means the asset has none of
+    //        that kind (:914-915) — never "unknown" — so each renders its own
     //        empty state.
     //   Video: NO endpoint exposes a video-track array. The only video
     //        attributes in any response are on `technicalMetadata`
-    //        (src/routes/assets.ts:884, schema :752-762) — the same four fields
+    //        (src/routes/assets.ts:893, schema :761-771) — the same four fields
     //        the persistence layer writes into the document's video track,
     //        `technical.video = [{ codec, width, height, bitrateBps }]`
     //        (src/data/asset-document.ts:402-404).
     //
-    // GET /api/v1/assets/{id}/tracks exists but is NOT called on the render
-    // path: its handler sends `asset.audioTracks ?? []` /
-    // `asset.subtitleTracks ?? []` off the same document
-    // (src/routes/assets.ts:5268-5271, repo.get at :5264), so it would cost a
-    // round-trip for bytes this renderer is holding. The audio editor DOES call
-    // it, but only after a 204 from a remove, which carries no body — see
-    // public/audio-track-edit.js.
-    //
-    // Mounted here, with the other information blocks (status history, metadata,
-    // scenes) and ABOVE the action controls, because it is predominantly
-    // reporting: the only writes it offers are the two scoped to its own audio
-    // section.
+    // The two subtitle writes (#940), also verified against the live schema:
+    //   POST /api/v1/assets/{id}/subtitle-tracks — body REQUIRED,
+    //        additionalProperties: false, required ["language","format"]:
+    //        language (string 1..64), format ("vtt"|"srt"|"ttml"), label
+    //        (string 1..128, optional), default (boolean, optional).
+    //        201 = { track, uploadUrl? } where `track` is the object the handler
+    //        persisted; 404 = { error, message? } for an unknown/foreign asset;
+    //        400 (undeclared but real) for a body the schema refuses.
+    //        (addSubtitleTrackSchema src/routes/assets.ts:915-920, route
+    //        :6527-6569, `track` built :6555-6564 and sent :6567.)
+    //   DELETE /api/v1/assets/{id}/subtitle-tracks/{trackId} — no body, no query
+    //        params; 204 on removal, 404 for an unknown asset OR an unknown
+    //        track. Removes the TRACK RECORD only and leaves the subtitle object
+    //        in storage (src/routes/assets.ts:6571, :6575-6597).
     //
     // ── Audio track add/remove (issue #903, broken out of #794) ──
     // Contract fetched before these calls were written and cited in full in
@@ -3007,20 +3025,49 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //   POST /api/v1/assets/{id}/audio-tracks — body
     //        { language (required, 1-64), codec? (1-64), channels? (int 1-64),
     //        label? (1-128), default? } `additionalProperties: false`
-    //        (addAudioTrackSchema, src/routes/assets.ts:821-827, wired :5325-5355);
-    //        201 returns the asset's FULL updated `{ audioTracks }` (:5333,
-    //        :5351-5353), so a successful add needs no follow-up read. 404 is the
+    //        (addAudioTrackSchema, src/routes/assets.ts:907-913, wired :6462-6492);
+    //        201 returns the asset's FULL updated `{ audioTracks }` (:6470,
+    //        :6490), so a successful add needs no follow-up read. 404 is the
     //        only other declared response.
     //   DELETE /api/v1/assets/{id}/audio-tracks/{trackId} — no body; 204 (empty,
-    //        no content-type on the wire) or 404 (src/routes/assets.ts:5360-5382).
-    //        The handler filters the list and patches ONE key (:5375, :5379), so
-    //        it deletes no media and touches nothing else.
-    // `asset.id` is the ULID even when this pane was opened by slug, which is
-    // what both routes need: each hands its raw path param to `repo.get` with no
-    // slug fallback (:5339, :5370).
+    //        no content-type on the wire) or 404 (src/routes/assets.ts:6497-6519).
+    //        The handler filters the list and patches ONE key, so it deletes no
+    //        media and touches nothing else.
+    //
+    // All four writes are gated by resourceAuthorizationPreHandler('asset')
+    // (src/auth/authorize.ts:126, registered src/routes/assets.ts:1938): POST ->
+    // write, DELETE -> delete, neither held by `viewer` — hence
+    // canChangeSubtitleTracks() and canEditAudioTracks().
+    //
+    // GET /api/v1/assets/{id}/tracks exists but is NOT called on the render
+    // path, nor after a subtitle write: its handler sends
+    // `asset.audioTracks ?? []` / `asset.subtitleTracks ?? []` off the same
+    // document (src/routes/assets.ts:6453-6454, repo.get at :6447), so it would
+    // cost a round-trip for bytes this renderer — or the write's own response —
+    // already holds. The audio editor DOES call it, but only after a 204 from a
+    // remove, which carries no body — see public/audio-track-edit.js.
+    //
+    // Mounted here, with the other information blocks (status history, metadata,
+    // scenes) and ABOVE the action row: the panel is still overwhelmingly a
+    // report, and both sets of track controls belong beside the lists they
+    // change rather than in the asset-wide action row, which is for whole-asset
+    // verbs.
+    //
+    // `confirmModal` is handed in rather than imported: tracks-panel.js is
+    // imported BY this module, so importing back would be a cycle (the same
+    // injection pattern delete-blocked.js and lock-detail.js use). Without it
+    // the panel offers no remove control at all, so neither destructive call can
+    // happen unconfirmed. `asset.id` is the ULID even when this pane was opened
+    // by slug — every one of these sub-resource routes takes params.id straight
+    // to repo.get and does not resolve slugs.
     mountAssetTracks({
       asset: asset,
       host: body,
+      assetId: asset.id,
+      apiFetch: apiFetch,
+      canChange: canChangeSubtitleTracks(),
+      confirmModal: confirmModal,
+      showMsg: showMsg,
       audioEdit: canEditAudioTracks()
         ? {
             assetId: asset.id,
