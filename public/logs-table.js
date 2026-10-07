@@ -72,6 +72,34 @@
  *
  * SECURITY: mirrors app.js's XSS posture. Every dynamic value written into a cell
  * HTML string passes through escHtml() (imported from the shared primitive).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TWO EMPTY STATES (issue #997)
+ *
+ * `{ items: [], nextCursor: null }` is returned both when the log store has
+ * never been written to and when the operator's filters match nothing — and the
+ * tab used to render the SAME "no entries match the current filters" row for
+ * both, which reads as "your filter is too narrow" on a stack where nothing has
+ * ever reported. That is the ambiguity #822 fixed for the Search tab's format
+ * filter ("an empty page is indistinguishable from 'no assets match'"), and the
+ * fix follows #806's shape: say the real reason, but ONLY when it actually
+ * applies, so the ordinary state is untouched (public/app.js:2863-2873 renders
+ * its unconfigured-steps note only when something is genuinely unconfigured).
+ * The headline + detail-line + `data-empty` presentation mirrors the per-kind
+ * empty states in public/tracks-panel.js:344-351 / :374-384.
+ *
+ * NO BACKEND CHANGE. The distinction is derived from reads this endpoint already
+ * answers, not from a new field:
+ *   - An UNFILTERED FIRST PAGE (no from/to/q, no cursor) that returns zero items
+ *     is proof the store holds nothing. Retention here is count-based only —
+ *     records are evicted oldest-first at a cap (LOG_STORE_MAX_RECORDS,
+ *     src/services/log-store.ts:143 and :347; same contract for the durable
+ *     store, src/data/couch-log-repo.ts:157-164) — so eviction can never empty a
+ *     store that was written to. Empty therefore means never written.
+ *   - Any response carrying at least one item proves entries exist, so later
+ *     filtered-to-nothing pages fall back to the ordinary no-results message.
+ *   - A FILTERED or cursor-paged empty page proves nothing on its own and never
+ *     promotes the explanatory state by itself.
  */
 
 import {
@@ -110,6 +138,31 @@ export const LOG_ORDER = Object.freeze(['asc', 'desc']);
 // The `level` enum — verified present on the LogRecord schema (optional field).
 // Used only for column presentation / a badge class; NOT a server filter.
 export const LOG_LEVELS = Object.freeze(['debug', 'info', 'warn', 'error']);
+
+// ─── Copy deck (issue #997) ──────────────────────────────────────────────────
+//
+// Exported so a test asserts against the shipped strings rather than a copy of
+// them (the public/tracks-panel.js TRACKS_COPY pattern). `data-empty` kinds are
+// part of this deck: they are what CSS and tests key the two states on.
+
+export const LOGS_COPY = Object.freeze({
+  /** Ordinary no-results state: entries exist, these filters match none of them. */
+  emptyFiltered: 'No log entries match the current filters.',
+  emptyFilteredKind: 'logs-filtered',
+
+  /**
+   * Nothing-has-ever-been-written state. Says the store is empty — NOT that the
+   * operator's filters are too narrow — and says what makes entries appear.
+   */
+  emptyNeverWritten: 'No log entries have been recorded yet.',
+  emptyNeverWrittenDetail:
+    'The log store on this stack has never received an entry, so this is an ' +
+    'empty history rather than one filtered down to nothing. Records appear ' +
+    'here as soon as a pipeline step (ingest, transcode, package) reports one — ' +
+    'if activity has already run and this stays empty, nothing is wired up to ' +
+    'write here yet.',
+  emptyNeverWrittenKind: 'logs-never-written',
+});
 
 // Per-table URL-state defaults. Natural order is newest-first (order=desc),
 // matching the endpoint default — the most useful default for operators.
@@ -200,6 +253,25 @@ export function buildLogsQuery(snap) {
 
 function isBareDate(v) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(v).trim());
+}
+
+/**
+ * True when the request this snapshot produces narrows nothing: no time range, no
+ * message search, and no cursor — i.e. the newest page of the whole store.
+ *
+ * Such a request is the ONLY read from which "zero items" proves the store has
+ * never been written to (see TWO EMPTY STATES above). `order` is irrelevant: it
+ * reverses a page, it cannot hide records. Exported for unit testing.
+ *
+ * @param {object} snap  the primitive state snapshot (or the spliced effective one).
+ * @returns {boolean}
+ */
+export function isUnfilteredFirstPage(snap) {
+  const s = snap || {};
+  if (s.cursor != null && s.cursor !== '') return false;
+  const filters = s.filters || {};
+  const set = (v) => typeof v === 'string' && v.trim() !== '';
+  return !set(filters.from) && !set(filters.to) && !set(filters.q);
 }
 
 // ─── Sort <-> URL contract mappers ───────────────────────────────────────────
@@ -383,6 +455,13 @@ export function createLogsTable(deps) {
     { name: 'q', control: searchFilterControl(initialFilters.q) },
   ];
 
+  // Which empty state the tab is in (issue #997). `null` = not answered yet: no
+  // unfiltered read has come back and no response has carried an item, so the
+  // honest fallback is the ordinary no-results message. Updated after every
+  // successful load; read (not copied) by the resolver below, so a repaint
+  // triggered by sort/paging chrome always shows the current answer.
+  let storeEmpty = null;
+
   const table = createOpsTable({
     caption: '',
     columns,
@@ -392,8 +471,18 @@ export function createLogsTable(deps) {
     initialSort: urlSortToInitialSort(urlState.sort),
     initialFilters,
     rowKey: (r) => r && r.seq,
-    emptyText: 'No log entries match the current filters.',
+    emptyText: LOGS_COPY.emptyFiltered,
     columnChooser: columnVisibility.chooser,
+    emptyState: function () {
+      if (storeEmpty === true) {
+        return {
+          text: LOGS_COPY.emptyNeverWritten,
+          detail: LOGS_COPY.emptyNeverWrittenDetail,
+          kind: LOGS_COPY.emptyNeverWrittenKind,
+        };
+      }
+      return { text: LOGS_COPY.emptyFiltered, kind: LOGS_COPY.emptyFilteredKind };
+    },
   });
 
   // Seed the initial cursor from the URL so a shared deep-linked page restores.
@@ -466,6 +555,14 @@ export function createLogsTable(deps) {
       // primitive can enable/disable Next. No total exists in cursor mode.
       const nextCursor = res && res.nextCursor != null ? res.nextCursor : null;
       table.state.setPageInfo({ nextCursor });
+      // Classify the empty state BEFORE painting, so the row the primitive draws
+      // for this response already carries the right message (see TWO EMPTY
+      // STATES above for why only these two reads are conclusive).
+      if (items.length > 0) {
+        storeEmpty = false;
+      } else if (isUnfilteredFirstPage(effectiveSnap)) {
+        storeEmpty = true;
+      }
       table.setRows(items);
     } catch (err) {
       table.setStatus('error', 'Failed to load logs: ' + (err && err.message ? err.message : String(err)));

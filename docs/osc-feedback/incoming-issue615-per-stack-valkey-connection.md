@@ -14,10 +14,10 @@
 > queue, which is stack-scoped by the activated stack). Owned per-stack
 > connections are disconnected on `teardown`/`stopAll`.
 >
-> One NARROWED residual remains (see "Narrowed residual" below): the restart-time
-> `resumeExistingWorkspaces()` discovery SCAN still runs against the process-global
-> connection; a stack whose pool/queue keys live only on a different physical
-> Valkey is resumed lazily on its next request rather than eagerly at boot.
+> The restart-time `resumeExistingWorkspaces()` discovery scan now covers every
+> provisioned stack's Valkey (see "Narrowed residual" below, since closed), so a
+> stack whose pool/queue keys live only on its own physical Valkey is resumed
+> eagerly at boot like the first one.
 
 ## Context
 Issue #615 fixed the transcode path so it resolves the target stack's connection
@@ -71,12 +71,18 @@ enqueued on stack B's Valkey. If stack A's Valkey is the unreachable dependency,
 a transcode against healthy stack B no longer fails on stack A's queue — the
 issue #615 acceptance scenario is met.
 
-## Narrowed residual
-`resumeExistingWorkspaces()` restart discovery still SCANS the process-global
-connection (`this.config.redis`) for `encore:pool:*` / `encore:queue:*` keys. Once
-a workspaceId is discovered it is re-bound to its per-stack Valkey, but a stack
-whose keys live only on a different physical Valkey is not eagerly resumed at
-boot — it is resumed lazily on its next submit/request (`getOrCreate` ->
-`resolveStackRedis`). This is a boot-eagerness gap, not a routing-correctness gap:
-live job routing is fully per-stack. A future improvement would enumerate the
-provisioned stacks from the parameter store and scan each stack's Valkey at boot.
+## Narrowed residual (closed)
+`resumeExistingWorkspaces()` restart discovery used to SCAN only the process-global
+connection (`this.config.redis`) for `encore:pool:*` / `encore:queue:*` keys, so a
+stack whose keys lived only on its own physical Valkey came back from a restart
+with no loop until its next submit/request. It now enumerates the provisioned
+stacks (`listStackConnections({ fresh: true })`), scans each distinct Valkey, and
+resumes every discovered workspace on its own connection. A Valkey that cannot be
+scanned is logged and skipped so it never starves the others.
+
+The same restart case uncovered the other consumers that were still on the
+process-global connection — the completion poller, the packaging queue and
+packager wiring, the routes' job-instance / packaging-pin lookups and the
+reconcile drop hook's retry gate — which now all resolve the job's or the
+ambient stack's Valkey through the registry (`resolveStackRedis` /
+`redisForEncoreJob`).

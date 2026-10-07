@@ -38,8 +38,10 @@
 // the interaction store above: hiding a column must not reset paging, change the
 // sort, or trigger a refetch.
 import {
+  clearStoredColumns,
   createColumnChooser,
   normalizeVisibleColumns,
+  readStoredColumns,
   resolveInitialColumns,
   writeStoredColumns,
 } from './table-columns.js';
@@ -325,6 +327,12 @@ export function createOpsTableState(config) {
 //   onChange(keys)     called AFTER the choice is recorded and persisted, so the
 //                      table can mirror it into the URL. Deliberately not a
 //                      refetch hook: the request is unchanged by definition.
+//   onReset(keys)      called AFTER a reset (issue #962) has forgotten the stored
+//                      default and dropped `explicit`, so the table's only job is
+//                      to mirror the now-default set into the URL — where
+//                      `urlCols()` returning null drops the `<ns>.cols` param
+//                      instead of rewriting it. Falls back to onChange when
+//                      absent, which still produces the correct URL.
 //
 // Returns:
 //   chooser     pass straight through as createOpsTable({ columnChooser }).
@@ -368,6 +376,33 @@ export function createColumnVisibility(options) {
       writeStoredColumns(ns, keys, win);
       if (typeof o.onChange === 'function') o.onChange(keys);
     },
+    // Reset to defaults (issue #962) — the exact inverse of onChange above, and
+    // it has to undo BOTH of its writes. Clearing only one is not a partial
+    // reset, it is no reset at all: a surviving `<ns>.cols` param re-applies on
+    // this refresh, and a surviving stored default re-applies on the next bare
+    // visit. `keys` is the declared default set the primitive has already
+    // painted, so this only forgets.
+    onReset: function (keys) {
+      choice.keys = keys;
+      // 1) The URL half. Dropping `explicit` is what REMOVES the param rather
+      //    than rewriting it: urlCols() then reports null, and encodeTableState
+      //    clears every param in this namespace before writing back only the
+      //    non-default ones.
+      choice.explicit = false;
+      choice.source = 'default';
+      // 2) The stored half. Best-effort like the write it undoes; a blocked
+      //    store had nothing to forget in the first place.
+      clearStoredColumns(ns, win);
+      const cb = typeof o.onReset === 'function' ? o.onReset : o.onChange;
+      if (typeof cb === 'function') cb(keys);
+    },
+    // Whether there is anything left to reset, so the action is greyed out in a
+    // view that is already pristine. `explicit` covers both a choice made in this
+    // session and one the URL arrived with; the stored read covers a default
+    // saved in an earlier one.
+    isCustomized: function () {
+      return choice.explicit || readStoredColumns(ns, win) != null;
+    },
   };
 
   return {
@@ -392,13 +427,20 @@ export function createColumnVisibility(options) {
 //               column against the chooser; `chooserLabel` names a column whose
 //               header caption is empty (e.g. a thumbnail column) in that list.
 //   columnChooser: optional (issue #959) — { visible?, requireAtLeastOne?, label?,
-//               onChange? }. `visible` is the initial visible key set (null/absent
-//               = every declared column); `requireAtLeastOne` is a list of groups
-//               that must each keep one visible member; `onChange(keys)` fires
-//               after an operator toggle so the consumer can persist it. Present =
-//               a "Columns" control is mounted in the filter bar. Toggling NEVER
-//               touches the interaction store, so paging/sort/filters and the
-//               in-flight request are all unaffected.
+//               onChange?, onReset?, isCustomized? }. `visible` is the initial
+//               visible key set (null/absent = every declared column);
+//               `requireAtLeastOne` is a list of groups that must each keep one
+//               visible member; `onChange(keys)` fires after an operator toggle so
+//               the consumer can persist it. `onReset(keys)` fires when the
+//               operator resets (issue #962) and receives the DECLARED default
+//               set — the consumer's job there is to CLEAR whatever it persisted
+//               in onChange, not to persist again; it falls back to `onChange`
+//               when absent. `isCustomized()` reports whether there is anything
+//               left to reset, which greys the action out when there is not.
+//               Present = a "Columns" control is mounted in the filter bar.
+//               Toggling NEVER touches the interaction store, so paging/sort/
+//               filters and the in-flight request are all unaffected — and
+//               neither does a reset: it is the same repaint-only path.
 //   filters:    [{ name, control(state, onChange) -> HTMLElement }] — slot-based.
 //               Each table populates its own column-appropriate controls (status
 //               select, date-range, free-text). The primitive owns no filter
@@ -407,6 +449,15 @@ export function createColumnVisibility(options) {
 //   pageSize:   bounded, visible page size (default DEFAULT_PAGE_SIZE)
 //   rowKey:     (row) => string   — stable key for a row (defaults to row.id)
 //   emptyText:  shown when a successful load returns zero rows
+//   emptyState: optional (issue #997) — () => ({ text?, detail?, kind? }), resolved
+//               on EVERY paint of the empty row. For a table whose empty row has
+//               more than one meaning (e.g. "the store has never been written to"
+//               vs "the current filters match nothing"): `text` replaces
+//               emptyText, `detail` is rendered as a secondary line under it, and
+//               `kind` is written to the cell's `data-empty` attribute so CSS and
+//               tests can tell the two states apart. Mirrors the headline+detail
+//               +data-empty empty state in public/tracks-panel.js:344-351. Absent
+//               (or a resolver returning nothing) keeps the plain emptyText row.
 //   caption:    optional table title text rendered above the filter bar
 //   onRowsRendered: (tbody) => void — called after EVERY repaint that paints data
 //               rows, so a consumer's per-row wiring (row click, action buttons,
@@ -431,6 +482,10 @@ export function createOpsTable(config) {
   // data rows — including a column-visibility repaint, which is exactly the one a
   // consumer cannot see coming.
   const onRowsRendered = typeof cfg.onRowsRendered === 'function' ? cfg.onRowsRendered : null;
+  // Optional per-paint resolver for the empty row (issue #997). Kept out of the
+  // interaction store: it is view state the consumer derives from the last
+  // response, so resolving it at paint time needs no emit and no refetch.
+  const emptyStateFor = typeof cfg.emptyState === 'function' ? cfg.emptyState : null;
 
   const state = createOpsTableState({
     pagingMode: cfg.pagingMode,
@@ -616,6 +671,23 @@ export function createOpsTable(config) {
           const applied = setVisibleColumns(keys);
           if (typeof chooserCfg.onChange === 'function') chooserCfg.onChange(applied);
         },
+        // Reset (issue #962) takes the SAME repaint path as a toggle — `null`
+        // normalizes to the declared default set, so "default" is derived here
+        // exactly as it is on a first load with no stored/URL choice. Only the
+        // callback differs: the consumer clears its persistence instead of
+        // writing to it. Falling back to onChange keeps the action live for a
+        // consumer that has not wired onReset, at the cost of re-persisting the
+        // default set rather than forgetting the choice.
+        onReset: function () {
+          const applied = setVisibleColumns(null);
+          const cb =
+            typeof chooserCfg.onReset === 'function'
+              ? chooserCfg.onReset
+              : chooserCfg.onChange;
+          if (typeof cb === 'function') cb(applied);
+        },
+        getIsCustomized:
+          typeof chooserCfg.isCustomized === 'function' ? chooserCfg.isCustomized : undefined,
       })
     : null;
 
@@ -646,10 +718,23 @@ export function createOpsTable(config) {
       return;
     }
     if (status === 'empty' || (status === 'ready' && rows.length === 0)) {
+      // A consumer-supplied resolver can name WHICH empty state this is; with no
+      // resolver (every table before #997) this is the plain emptyText row.
+      const resolved = (emptyStateFor ? emptyStateFor() : null) || {};
+      const text = typeof resolved.text === 'string' && resolved.text !== '' ? resolved.text : emptyText;
+      const detail = typeof resolved.detail === 'string' ? resolved.detail : '';
+      const kind = typeof resolved.kind === 'string' ? resolved.kind : '';
       tbody.appendChild(fullWidthRow(colspan, 'ops-table-empty',
         function(td) {
           td.classList.add('empty');
-          td.textContent = emptyText;
+          if (kind) td.setAttribute('data-empty', kind);
+          td.textContent = text;
+          if (detail) {
+            const d = document.createElement('div');
+            d.className = 'ops-table-empty-detail';
+            d.textContent = detail;
+            td.appendChild(d);
+          }
         }));
       return;
     }
@@ -775,6 +860,13 @@ export function createOpsTable(config) {
     // emits, so a consumer can restore a persisted set without provoking a fetch.
     getVisibleColumns: function() { return visibleKeys.slice(); },
     setVisibleColumns,
+    // Reset to the declared default set (issue #962) — the same action the
+    // chooser's own button runs, including the consumer's clear-what-you-stored
+    // callback, so a caller never has to re-implement half of it. No-op without a
+    // chooser configured, where there is no customization to undo.
+    resetVisibleColumns: function() {
+      return columnChooser ? columnChooser.reset() : visibleKeys.slice();
+    },
     // Exposed so a consumer/test can drive the chooser panel directly.
     columnChooser,
   };
