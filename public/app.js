@@ -157,6 +157,17 @@ import { mountAssetExternalIds } from './external-ids.js';
 // is in that module's header.
 import { mountAssetTags } from './asset-tags.js';
 
+// Export action (issue #945, broken out of #796): pick one of the export
+// destinations this deployment has registered (read live from
+// GET /api/v1/export-destinations), trigger POST /assets/{id}/deliver, and read
+// the outcome truthfully. Copy and visual treatment for the in-progress /
+// exported / failed / not-available states come from
+// docs/design/export-action-states.md (issue #911), plus the two states that
+// spec deferred until a destination-carrying endpoint existed ("nothing
+// registered" and "the list could not be read"). The module header carries the
+// full contract grounding for both calls.
+import { mountExportAction } from './export-action.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -245,6 +256,19 @@ function canChangeDeleteLock() {
 // read-only (docs/findings/review-state-contract-897.md §4). Client-side mirror
 // only: the 403 is still handled if it arrives.
 function canChangeReviewState() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may export an asset (issue #945). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-92) maps
+// POST -> write, so POST /assets/{id}/deliver is refused to a `viewer` with 403
+// by `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1773). Client-side mirror only: the 403 is still handled
+// if it arrives. A `viewer` may still READ the destinations list, which needs
+// only `read`.
+function canExportAsset() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -3611,6 +3635,60 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       apiFetch: apiFetch,
       showMsg: showMsg,
       fmtDate: fmtDate,
+    });
+
+    // ── Export to a registered destination (issue #945) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/export-action.js:
+    //   GET  /api/v1/export-destinations — no parameters; responses are exactly
+    //        200 { destinations: [ { id, name, role, backend, bucket,
+    //        accessKeyId, endpointUrl?, region?, publicBaseUrl?, pathTemplate?,
+    //        hasSessionToken, deletable, createdAt, credentials } ] }
+    //        (`destinationListSchema` / `destinationViewSchema`,
+    //        src/routes/export-destinations.ts:125-127 / :95-123, handler :279-288)
+    //        and 501 { error: 'not_configured' } (:236-239). The implicit
+    //        OSC-managed default (id 'default') is ALWAYS in the 200 list
+    //        (StorageBackendRegistry.list prepends defaultBackendView(),
+    //        src/services/storage-backend-registry.ts:686-693), so "nothing is
+    //        registered" is a list holding only that entry — which the module
+    //        filters out, because the export call refuses it by name.
+    //   POST /api/v1/assets/{id}/deliver — body REQUIRED, exactly
+    //        { destination: string(1..256) }, additionalProperties: false
+    //        (`deliverBodySchema`). Responses are exactly
+    //        200 { assetId, status: 'delivered', destination: { id, name, role },
+    //        bucket, objectKey, bytes, etag, deliveredAt }, 400 bad_request,
+    //        404 not_found, 409 no_object | source_missing,
+    //        422 backend_role | destination_unreachable | destination_unresolved
+    //        | source_too_large, 501 not_configured, 502 delivery_failed,
+    //        504 delivery_timeout. Re-verified after PR #1158 (issue #1131)
+    //        merged, against openapi.json
+    //        .paths["/api/v1/assets/{id}/deliver"].post as it now stands on main.
+    //
+    // The destination picker is built from the live 200 list and from nothing
+    // else, so the submitted value is always an id the API just said it has.
+    // When the list holds no usable destination, the block explains that plainly
+    // instead of offering an empty picker and a submit button that could only
+    // 400 (issue #945's third acceptance criterion).
+    //
+    // The success state may name the bucket and key because a 200 is
+    // falsifiable: `status: 'delivered'` is sent only after the object was
+    // re-read at the destination with the source's byte count. A 504 is reported
+    // as an UNKNOWN outcome rather than as a failure, because the copy may still
+    // complete store-side — the honesty rule this ticket's prerequisite
+    // investigation (docs/findings/export-truthful-status-944.md) established
+    // for the other export endpoint, applied here.
+    //
+    // The path takes the ULID (`asset.id`), which this pane holds even when it
+    // was opened by slug.
+    mountExportAction({
+      assetId: asset.id,
+      sourceName: asset.name,
+      anchorEl: actionsDiv,
+      host: body,
+      canExport: canExportAsset(),
+      apiFetch: apiFetch,
+      wireCopyIds: wireCopyIdButtons,
     });
 
     // ── Delete protection: lock / unlock (issue #895) ──
