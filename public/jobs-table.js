@@ -79,6 +79,10 @@ import {
   SORT_DESC,
 } from './ops-ui-table.js';
 import { copyableIdCellHtml, wireCopyIdButtons } from './copy-id.js';
+// columnKeysOf is imported from the column model (not the table primitive)
+// because that is where "the keys a column set declares" is defined; JOBS_COLUMN_KEYS
+// below is derived through it so the key list has one source (issue #960).
+import { columnKeysOf } from './table-columns.js';
 import {
   decodeTableState,
   applyTableState,
@@ -136,16 +140,21 @@ const JOBS_DEFAULTS = Object.freeze({
 
 // The declared column keys, in render order. Exported so consumers and tests name
 // the same vocabulary the `jobs.cols` URL param and the stored preference use.
-export const JOBS_COLUMN_KEYS = Object.freeze([
-  'id',
-  'type',
-  'status',
-  'assetId',
-  'progress',
-  'createdAt',
-  'updatedAt',
-  'actions',
-]);
+//
+// DERIVED from buildColumns() rather than written out again (issue #960 review):
+// a hand-maintained copy is a second source of truth for the same list, and a
+// column added to buildColumns() without updating the copy — or renamed in only
+// one of the two — would drift silently, which is the exact failure this
+// vocabulary exists to prevent. Deriving it means the parity cannot be broken,
+// so there is no invariant left to assert.
+//
+// buildColumns() is defined further down the module; a `function` declaration is
+// hoisted, so calling it here is safe. It is called with inert renderers because
+// only the KEYS are wanted: every injected helper is used solely inside a cell
+// renderer's closure, never while the column list is being built.
+export const JOBS_COLUMN_KEYS = Object.freeze(
+  columnKeysOf(buildColumns({ fmtDate: () => '', renderBadge: () => '' }))
+);
 
 // This table's OWN lock rule — the primitive takes it as configuration precisely
 // because it cannot be guessed from the assets table (issue #960's first note).
@@ -413,9 +422,12 @@ function searchControl(initial) {
 //
 // Lifted out of the createOpsTable() call (issue #960) because the column set is
 // now an input to the visibility wiring as well as to the table: both have to see
-// the SAME declarations, and JOBS_COLUMN_KEYS above has to stay in step with the
-// keys below. Cell renderers return escaped HTML strings (the convention the
-// primitive documents); every dynamic value passes through escHtml.
+// the SAME declarations. This function is the SINGLE source of the jobs column
+// vocabulary — JOBS_COLUMN_KEYS above is derived from its output, so adding,
+// renaming or removing a column here updates the exported key list by
+// construction and the two cannot drift. Cell renderers return escaped HTML
+// strings (the convention the primitive documents); every dynamic value passes
+// through escHtml.
 function buildColumns(renderCtx) {
   const fmtDate = renderCtx.fmtDate;
   const renderBadge = renderCtx.renderBadge;
@@ -560,7 +572,11 @@ export function createJobsTable(deps) {
     urlCols: initial.cols,
     requireAtLeastOne: JOBS_REQUIRED_COLUMN_GROUPS,
     label: 'Columns',
-    win: win || undefined,
+    // Passed straight through, as the assets and logs tables do. Coercing a null
+    // `win` to undefined here would discard the caller's instruction: `win: null`
+    // means "there is no window, use no storage", and the primitive and the
+    // storage helpers both honour that distinction (issue #960 review).
+    win,
     // Mirror the choice into the URL so the view stays shareable. syncUrl() and
     // NOT a re-render of the view: the working set, the client-side filter/sort
     // passes and the page window are all untouched by a column toggle, and the

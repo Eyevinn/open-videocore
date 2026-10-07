@@ -43,6 +43,7 @@ import {
   normalizeVisibleColumns,
   readStoredColumns,
   resolveInitialColumns,
+  undeclaredGroupKeys,
   writeStoredColumns,
 } from './table-columns.js';
 
@@ -321,7 +322,10 @@ export function createOpsTableState(config) {
 //   urlCols            the decoded `<ns>.cols` value (null/absent = unspecified).
 //   requireAtLeastOne  the table's own "cannot hide them all" groups.
 //   label              chooser button caption (default 'Columns').
-//   win                injectable window (tests / SSR-safety).
+//   win                injectable window (tests / SSR-safety). Pass it straight
+//                      through: an explicit `null` means "no window", so no
+//                      stored preference is read or written, and coercing it to
+//                      undefined would instead reach the real localStorage.
 //   stored             optional pre-read stored set; omit it (the normal case) to
 //                      have the stored default for `ns` read from storage.
 //   onChange(keys)     called AFTER the choice is recorded and persisted, so the
@@ -347,6 +351,23 @@ export function createColumnVisibility(options) {
   const columns = Array.isArray(o.columns) ? o.columns : [];
   const groups = Array.isArray(o.requireAtLeastOne) ? o.requireAtLeastOne : [];
   const win = 'win' in o ? o.win : typeof window !== 'undefined' ? window : undefined;
+
+  // Dev-time invariant (issue #960 review). Each table's key vocabulary is now
+  // DERIVED from its own column definitions, so that half cannot drift — but a
+  // lock rule still names its keys by hand, and a rule naming a column the table
+  // no longer declares silently becomes a weaker rule (see undeclaredGroupKeys).
+  // Report it here, where a table wires itself up, instead of waiting for an
+  // operator to find the hole. Warn-only, and only when something is actually out
+  // of step: a mis-stated rule must never stop the table from rendering.
+  const unknownGroupKeys = undeclaredGroupKeys(columns, groups);
+  if (unknownGroupKeys.length && typeof console !== 'undefined' && console.warn) {
+    console.warn(
+      '[table-columns] ' + (ns || 'table') +
+        ': requireAtLeastOne names column(s) this table does not declare: ' +
+        unknownGroupKeys.join(', ') +
+        ' — the rule cannot be enforced for them.'
+    );
+  }
 
   // URL -> stored default -> every declared column (one rule, every table).
   const choice = resolveInitialColumns({

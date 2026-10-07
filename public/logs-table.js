@@ -110,6 +110,10 @@ import {
   SORT_ASC,
   SORT_DESC,
 } from './ops-ui-table.js';
+// columnKeysOf is imported from the column model (not the table primitive)
+// because that is where "the keys a column set declares" is defined; LOGS_COLUMN_KEYS
+// below is derived through it so the key list has one source (issue #960).
+import { columnKeysOf } from './table-columns.js';
 import {
   decodeTableState,
   applyTableState,
@@ -180,13 +184,21 @@ const URL_DEFAULTS = Object.freeze({
 
 // The declared column keys, in render order. Exported so consumers and tests name
 // the same vocabulary the `logs.cols` URL param and the stored preference use.
-export const LOGS_COLUMN_KEYS = Object.freeze([
-  'timestamp',
-  'level',
-  'category',
-  'message',
-  'seq',
-]);
+//
+// DERIVED from buildColumns() rather than written out again (issue #960 review):
+// a hand-maintained copy is a second source of truth for the same list, and a
+// column added to buildColumns() without updating the copy — or renamed in only
+// one of the two — would drift silently, which is the exact failure this
+// vocabulary exists to prevent. Deriving it means the parity cannot be broken,
+// so there is no invariant left to assert.
+//
+// buildColumns() is defined further down the module; a `function` declaration is
+// hoisted, so calling it here is safe. It is called with an inert formatter
+// because only the KEYS are wanted: `fmtDate` is used solely inside a cell
+// renderer's closure, never while the column list is being built.
+export const LOGS_COLUMN_KEYS = Object.freeze(
+  columnKeysOf(buildColumns({ fmtDate: () => '' }))
+);
 
 // This table's OWN "cannot hide" rules, which are NOT the assets table's (issue
 // #960's first note — the primitive takes them as configuration for exactly this
@@ -347,6 +359,11 @@ function searchFilterControl(initial) {
 // documents). Every dynamic value passes through escHtml. `level`/`category` are
 // OPTIONAL on the record (see contract note); their cells degrade to '—' when the
 // field is absent, so a record without them still renders cleanly.
+//
+// This function is the SINGLE source of the logs column vocabulary —
+// LOGS_COLUMN_KEYS above is derived from its output, so adding, renaming or
+// removing a column here updates the exported key list by construction and the
+// two cannot drift (issue #960 review).
 
 function buildColumns(renderCtx) {
   const fmtDate = renderCtx.fmtDate;
