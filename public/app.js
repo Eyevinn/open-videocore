@@ -131,6 +131,16 @@ import { mountVersionChain } from './version-chain.js';
 // reactively — is in that module's header.
 import { mountAssetExternalIds } from './external-ids.js';
 
+// Tags panel (issue #934, broken out of #792): the asset's tag list plus an add
+// control and a per-tag remove control. Tags have been readable AND writable
+// over the API since #11 (POST /assets/{id}/tags, DELETE /assets/{id}/tags/{tag})
+// but nothing in this UI could write one. UI only — no route or schema changes.
+// The panel mirrors the API's own validation bounds client-side and re-renders
+// only from server answers; full contract grounding, including the verified
+// "any characters allowed" rule and the list-cap asymmetry on the append route,
+// is in that module's header.
+import { mountAssetTags } from './asset-tags.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -247,6 +257,20 @@ function canChangeSubtitleTracks() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add or remove an asset's tags (issue
+// #934). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` AND `delete` to `editor` and
+// `admin` and neither to `viewer`; `methodToAction` (:79-93) maps POST -> write
+// and DELETE -> delete, and `resourceAuthorizationPreHandler('asset')` (:126,
+// registered src/routes/assets.ts:1773) applies both to the tag sub-resource —
+// verified against the real router: a viewer gets 403 on POST /tags AND on
+// DELETE /tags/{tag}. A viewer still READS the tags, which arrive on the asset
+// body itself. Client-side mirror only: the 403 is still handled if it arrives.
+function canChangeTags() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2823,7 +2847,11 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       ['Title', escHtml(asset.title || asset.name || '—')],
       ['Status', statusCell],
       ['MIME type', escHtml(asset.mimeType || '—')],
-      ['Tags', renderTags(asset.tags)],
+      // Tags are NOT a key/value row any more (issue #934): they live in the
+      // editable "Tags" block mounted just below this grid. Two renderings of
+      // one list is exactly how a stale UI happens — the block re-renders from
+      // the asset each mutation returns, and this grid is built once per detail
+      // read, so a row here would keep showing the pre-mutation list.
       ['Created', escHtml(fmtDate(asset.createdAt))],
       ['Updated', escHtml(fmtDate(asset.updatedAt))]
     );
@@ -2859,6 +2887,40 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     body.appendChild(kvDiv);
     // Bind the ULID copy affordance (issue #851).
     wireCopyIdButtons(kvDiv);
+
+    // ── Tags: add / remove (issue #934, broken out of #792) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full — with the verified constraints — in public/asset-tags.js:
+    //   READ: there is NO GET /assets/{id}/tags. `openapi.json
+    //        .paths["/api/v1/assets/{id}/tags"]` declares `post` only; the list
+    //        is the optional `tags` array on the asset body already awaited
+    //        above (`assetSchema`, src/routes/assets.ts:919), so the panel adds
+    //        no round-trip. Absent and `[]` both mean "no tags" and both occur.
+    //   POST /api/v1/assets/{id}/tags — body REQUIRED
+    //        { tags: string[] }, each 1..128 chars, 1..128 items,
+    //        additionalProperties: false; 200 = the FULL asset, 404 { error }.
+    //        APPENDS and deduplicates (src/routes/assets.ts:5568-5590, merge at
+    //        :5583 via normalizeTags, src/data/asset-repo.ts:1297).
+    //   DELETE /api/v1/assets/{id}/tags/{tag} — no body; 200 = the FULL asset,
+    //        404 { error }. Removing an absent tag is a 200 no-op
+    //        (src/routes/assets.ts:5595-5618, filter at :5609).
+    // Mounted directly under the key/value grid, where the read-only "Tags" row
+    // used to be, so the tags stay where operators already look for them — and
+    // so there is exactly ONE rendering of the list. Both mutations return the
+    // full asset and the panel re-renders from THAT (never from a local edit),
+    // which is what keeps the list in step with the server after every change.
+    //
+    // The sub-resource takes the ULID (`asset.id`): unlike GET /:id neither
+    // handler resolves a slug (verified — POST to /assets/<slug>/tags 404s), and
+    // this pane holds the ULID even when it was opened by slug.
+    mountAssetTags({
+      asset: asset,
+      host: body,
+      canChange: canChangeTags(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
 
     // ── Status history (issue #889) ──
     // The audited lifecycle trail. Rendered here so a status transition an
