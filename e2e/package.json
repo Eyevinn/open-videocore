@@ -1,0 +1,15 @@
+{
+  "name": "open-videocore-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end suite and runner for the open-videocore beta image. Not part of the root `ci` run.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "suite": "node suite/cli.mjs",
+    "cycle": "node runner/cli.mjs"
+  },
+  "dependencies": {
+    "@osaas/client-core": "0.24.0"
+  }
+}
