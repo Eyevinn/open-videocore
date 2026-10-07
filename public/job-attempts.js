@@ -45,7 +45,13 @@
  *       NOT in this enum (src/data/job-repo.ts:39-42), so it is not handled as
  *       an attempt classification here.
  *
- *   status: 'pending'|'running'|'done'|'failed'   src/routes/jobs.ts:53 (JOB_STATUSES)
+ *   status: 'pending'|'queued'|'running'|'done'|'failed'|'cancelled'
+ *       All six members of JOB_STATUSES (src/data/job-repo.ts:56), surfaced by
+ *       `jobSchema` as `z.enum(JOB_STATUSES)` (src/routes/jobs.ts:53) and by the
+ *       GET /api/v1/jobs/{id} 200 schema (openapi.json:15691-15698). Three are
+ *       terminal — `done`, `failed`, `cancelled` (TERMINAL_JOB_STATUSES,
+ *       src/data/job-repo.ts:64) — and three are active: `pending`, `queued`,
+ *       `running` (ACTIVE_JOB_STATUSES, src/data/job-repo.ts:65-67).
  *
  * WHAT "SUCCEEDED" MEANS ON AN ATTEMPT. The contract has no success flag per
  * attempt. The completion path records, on success, ONLY `endedAt` and no
@@ -186,6 +192,36 @@ export function hasAttemptHistory(job) {
   return !!(job && Array.isArray(job.encodeAttemptLog) && job.encodeAttemptLog.length > 1);
 }
 
+// Closing sentence of the attempt summary line, keyed on the exact JOB_STATUSES
+// enum values (src/data/job-repo.ts:56; the same six members are surfaced by
+// src/routes/jobs.ts:53 and openapi.json:15691-15698). Every member has its own
+// entry — including the terminal `cancelled`, which must never be described as
+// in-flight — so a status added to the enum later resolves to `undefined` here
+// and simply gets no closing claim, rather than silently inheriting another
+// state's sentence. Same drift-proofing intent as ATTEMPT_CLASSIFICATION_COPY.
+//
+// Values are functions because the `done` wording depends on what evidence the
+// attempt log actually carries; the rest ignore their argument.
+export const JOB_STATUS_SUMMARY_COPY = {
+  // Active (ACTIVE_JOB_STATUSES, src/data/job-repo.ts:65-67). One wording that
+  // is true of all three: a `queued` or `pending` job is not yet "running".
+  pending: function () { return ' — still in progress.'; },
+  queued: function () { return ' — still in progress.'; },
+  running: function () { return ' — still in progress.'; },
+  // Terminal (TERMINAL_JOB_STATUSES, src/data/job-repo.ts:64).
+  done: function (ctx) {
+    // Name the attempt only when the attempt log actually recorded it. With no
+    // log rows the dispatch COUNT is all we have, and it is not an attempt
+    // index — claiming "recovered on attempt N" from it would be an assertion
+    // the UI has no evidence for.
+    return ctx.recoveredAttemptIndex === undefined
+      ? ' — recovered after ' + ctx.count + ' dispatches.'
+      : ' — recovered on attempt ' + ctx.recoveredAttemptIndex + '.';
+  },
+  failed: function () { return ' — the job then failed.'; },
+  cancelled: function () { return ' — the job was cancelled.'; }
+};
+
 /**
  * One line that answers "was this job retried, and did it recover?".
  *
@@ -214,13 +250,21 @@ export function attemptSummaryLine(job) {
       ', ' + failed.length + ' attempt' + (failed.length === 1 ? '' : 's') +
       ' failed (' + classes.join(', ') + ')';
   }
-  if (job.status === 'done') {
-    const lastIndex = rows.length > 0 ? rows[rows.length - 1].index : count;
-    line += ' — recovered on attempt ' + lastIndex + '.';
-  } else if (job.status === 'failed') {
-    line += ' — the job then failed.';
+  // Own-property lookup only: a server status that happens to name an inherited
+  // Object.prototype member ('constructor', 'toString') must not resolve to a
+  // callable and get stringified into operator-facing copy.
+  const closing = Object.prototype.hasOwnProperty.call(JOB_STATUS_SUMMARY_COPY, job.status)
+    ? JOB_STATUS_SUMMARY_COPY[job.status]
+    : undefined;
+  if (closing) {
+    line += closing({
+      count: count,
+      recoveredAttemptIndex: rows.length > 0 ? rows[rows.length - 1].index : undefined
+    });
   } else {
-    line += ' — still running.';
+    // Status this UI has not learned yet: state the dispatch facts and stop,
+    // rather than guessing whether the job is still in flight.
+    line += '.';
   }
   return line;
 }
