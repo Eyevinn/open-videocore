@@ -1,5 +1,6 @@
 import { cases, CaseFailure, SUITE_VERSION } from './cases.mjs';
 import { createClient } from '../lib/http.mjs';
+import { redact } from '../lib/redact.mjs';
 
 export const DEFAULT_TIMEOUTS = {
   ingestMs: 120_000, metadataMs: 60_000, transcodeMs: 600_000, packageMs: 600_000, searchMs: 30_000,
@@ -22,7 +23,7 @@ export async function runSuite({ client, anon, config, sleep, now = Date.now }) 
       await c.run(ctx);
       results.push({ id: c.id, status: 'pass', ms: now() - t0 });
     } catch (e) {
-      results.push({ id: c.id, status: 'fail', ms: now() - t0, detail: String(e instanceof CaseFailure ? e.message : `${e?.name}: ${e?.message}`).slice(0, 500) });
+      results.push({ id: c.id, status: 'fail', ms: now() - t0, detail: redact(String(e instanceof CaseFailure ? e.message : `${e?.name}: ${e?.message}`), config.secrets).slice(0, 500) });
       if (c.chain) chainBroken = true;
     }
   }
