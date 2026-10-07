@@ -27,6 +27,8 @@ import { CouchWebhookRepository } from '../data/couch-webhook-repo.js';
 import { CouchCollectionRepository } from '../data/couch-collection-repo.js';
 import { CouchProfileRepository } from '../data/couch-profile-repo.js';
 import { CouchPipelineRepository } from '../data/couch-pipeline-repo.js';
+import { CouchCommentRepository } from '../data/couch-comment-repo.js';
+import { InMemoryCommentRepository, type CommentRepository } from '../data/comment-repo.js';
 import type { AuditEmitter } from '../data/audit-emit.js';
 import { InMemoryAssetRepository, type AssetRepository } from '../data/asset-repo.js';
 import { InMemoryJobRepository, type JobRepository } from '../data/job-repo.js';
@@ -48,14 +50,21 @@ import {
 // in-memory LogStore on the no-Couch paths — the same Couch/in-memory pairing
 // `audit` uses above.
 import { CouchLogStore } from '../data/couch-log-repo.js';
-import { LogStore, type LogReader, type LogSink } from './log-store.js';
+import {
+  LogStore,
+  type LogReader,
+  type LogRetentionStore,
+  type LogSink
+} from './log-store.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
+import { resolveObjectStoreCredential } from './object-store-credentials.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
 import { makeHttpEncoreClient, type EncoreClient } from '../pipeline/encore-client.js';
 import type { SubtitleGenerator } from '../pipeline/subtitle-generator.js';
 import type { SceneDetector } from '../pipeline/scene-detector.js';
 import type { Context } from '@osaas/client-core';
 import type { ResolverHealthSignal } from './resolver-health.js';
+import { logObjectStoreClient } from './object-store-stack-identity.js';
 
 // Builders that turn a stored optional-service instance name (from the stack
 // record) into the corresponding pipeline-step generator (issue #217). main.ts
@@ -127,18 +136,41 @@ export type WorkspaceConnections = {
   // on every Couch-backed path, so records written by the pipeline producer
   // survive a restart and are still returned by GET /api/v1/logs; the in-memory
   // LogStore backs the no-Couch dev/test paths. ALWAYS present, like `audit`.
-  // Carries both the `append()` write primitive the pipeline producer uses
-  // (src/services/pipeline-log.ts) and the `list()` read the logs router uses
-  // (src/routes/logs.ts), so one field serves both consumers.
-  logs: LogSink & LogReader;
+  // Carries the `append()` write primitive the pipeline producer uses
+  // (src/services/pipeline-log.ts), the `list()` read the logs router uses
+  // (src/routes/logs.ts), AND the retention surface (issue #1067,
+  // listOldestPage/purgeEntry) the log-retention purge sweep drives per tick —
+  // the same three-way intersection `audit` above carries. Typed as the
+  // intersection so the single field serves all three consumers; both concrete
+  // stores satisfy it.
+  logs: LogSink & LogReader & LogRetentionStore;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
+  // Asset comments for this stack (issue #135, made durable by issue #1046).
+  // ALWAYS present: CouchCommentRepository when the resolved stack (or the env
+  // override) has a CouchDB, InMemoryCommentRepository otherwise — the same
+  // always-present shape `audit` above uses, so PerWorkspaceCommentRepository
+  // never has to branch on undefined. Review comments are durable editorial
+  // content, so the Couch-backed implementation must be reachable on the
+  // PARAMETER-STORE path (a stack provisioned via POST /api/v1/provision sets no
+  // COUCHDB_URL), not only under the env override.
+  comments: CommentRepository;
   storageFor: StorageFactory | undefined;
   storageClient: MinioClient | undefined;
   encore: EncoreClient | undefined;
   sourceBucket: string;
   packagedBucket: string;
-  s3Config: { endpoint: string; accessKey: string; secretKey: string } | undefined;
+  // Object-store credential + endpoint for the resolved stack, TAGGED with the
+  // stack identity it was built for (issue #1093). The tag travels with the
+  // credential — not alongside it — so the submit path can assert that the
+  // bytes will be read with the credential of the stack the request routes to
+  // (objectStoreStackMismatch, services/object-store-stack-identity.ts) instead
+  // of discovering the split as an indistinguishable missing-object error from
+  // the transcoder. `stackName` is undefined on the paths that are not stack
+  // records (env override), exactly like WorkspaceConnections.stackName below.
+  s3Config:
+    | { endpoint: string; accessKey: string; secretKey: string; stackName: string | undefined }
+    | undefined;
   // Per-role storage backend metadata for the resolved stack (issue #211/#213).
   // Carried through so the delivery route can emit backend-appropriate URLs
   // (proxied for 'minio', public/derived object URLs for 'external') without a
@@ -209,9 +241,14 @@ function buildConnectionsFromStack(
   // The parameter-store name this config was loaded under (issue #1058).
   // Carried onto the connections as their stack identity.
   stackName: string | undefined,
-  // Where the durable log store reports its own failures (#996 review finding
-  // 2). Optional so the existing callers/tests are unaffected.
-  log?: StackResolverLogger
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them, and where the object-store client construction below is logged
+  // (issue #1093) — stack id + endpoint host only, never the secret. Required,
+  // like the other module-private helpers here: the sole caller is the
+  // resolver, whose own `log` field always holds a logger (noopLogger when none
+  // was injected).
+  log: StackResolverLogger
 ): WorkspaceConnections | null {
   if (!isValidUrl(config.couchdbUrl) || !isValidUrl(config.minioEndpoint)) {
     return null;
@@ -224,14 +261,42 @@ function buildConnectionsFromStack(
   const server = couchServer(couchUrl);
   const wc = () => new StackCouch(server, dbName);
 
+  // THIS stack's object-store credential (issue #1094). Resolved alongside the
+  // endpoint from the stack's own stored config: when the config carries a
+  // per-stack access key id, the secret is re-derived from it and the
+  // deployment seed; otherwise this returns the legacy deployment-wide
+  // `admin` + password pair, byte-identically to the pre-#1094 behaviour, for a
+  // stack not yet migrated by #1096. `minioPassword` serves as BOTH the
+  // derivation seed and the legacy secret — it is the same
+  // MINIO_ROOT_PASSWORD env value in either role (see the SEED note in
+  // services/object-store-credentials.ts).
+  //
+  // The secret is never logged and never leaves this function except into the
+  // S3 client and `s3Config` below, which feed the object-store clients only.
+  const objectStoreCredential = resolveObjectStoreCredential({
+    storedAccessKeyId: config.objectStoreAccessKeyId,
+    seed: minioPassword,
+    legacySecretAccessKey: minioPassword
+  });
+
   const url = new URL(config.minioEndpoint);
   const useSSL = url.protocol === 'https:';
   const minioClient = new MinioClient({
     endPoint: url.hostname,
     port: url.port ? Number(url.port) : useSSL ? 443 : 80,
     useSSL,
-    accessKey: 'admin',
-    secretKey: minioPassword
+    accessKey: objectStoreCredential.accessKeyId,
+    secretKey: objectStoreCredential.secretAccessKey
+  });
+  // Record WHICH stack this object-store client was pointed at (issue #1093).
+  // Every stack's buckets carry the same literal names, so without this line a
+  // client aimed at the wrong instance is invisible in the logs until a read
+  // fails with a missing-object error that names nothing. Stack id + endpoint
+  // HOST only — `minioPassword` is never logged.
+  logObjectStoreClient(log, {
+    source: 'stack-resolver',
+    stackName,
+    endpoint: config.minioEndpoint
   });
 
   const assets = new CouchAssetRepository(wc);
@@ -244,6 +309,10 @@ function buildConnectionsFromStack(
   const webhooks = new CouchWebhookRepository(wc);
   const profiles = new CouchProfileRepository(wc);
   const pipelines = new CouchPipelineRepository(wc);
+  // Asset comments over the same per-stack CouchDB connection (issue #1046), so
+  // a stack provisioned through POST /api/v1/provision gets the DURABLE comment
+  // store without any COUCHDB_URL env var being set.
+  const comments = new CouchCommentRepository(wc, log);
   // Audit store over the same per-stack CouchDB connection (issue #564).
   const audit = new CouchAuditRepository(wc);
   // Operational log store over the SAME per-stack CouchDB connection (issue
@@ -286,12 +355,24 @@ function buildConnectionsFromStack(
     logs,
     profiles,
     pipelines,
+    comments,
     storageFor,
     storageClient: minioClient,
     encore,
     sourceBucket: config.sourceBucket,
     packagedBucket: config.packagedBucket,
-    s3Config: { endpoint: config.minioEndpoint, accessKey: 'admin', secretKey: minioPassword },
+    // Per-stack object-store credential (issue #1094) — the same pair the
+    // client above authenticates with, so every consumer of `s3Config` (the
+    // ephemeral per-job runners, pipeline/runner-option.ts) speaks to the stack
+    // with the stack's own key rather than a deployment-wide root credential.
+    // Tagged with the stack identity the credential was resolved from (issue
+    // #1093) so the submit path can assert credential/route agreement.
+    s3Config: {
+      endpoint: config.minioEndpoint,
+      accessKey: objectStoreCredential.accessKeyId,
+      secretKey: objectStoreCredential.secretAccessKey,
+      stackName
+    },
     // Carry the per-role storage backend metadata (issue #211) so the delivery
     // route can branch on backend type without re-reading the parameter store.
     storage: config.storage,
@@ -343,9 +424,11 @@ export function stackResolvedMinioEndpoint(
 // MINIO_ACCESS_KEY/MINIO_SECRET_KEY pair.
 function buildEnvConnections(
   oscContext: Context,
-  // Where the durable log store reports its own failures (#996 review finding
-  // 2). Optional so the existing callers/tests are unaffected.
-  log?: StackResolverLogger
+  // Where the durable comment store (issue #1046) and the durable log store
+  // (#996 review finding 2) report their own failures instead of swallowing
+  // them, and where the env-override object-store client construction is logged
+  // on the same seam as the per-stack one (issue #1093).
+  log: StackResolverLogger
 ): WorkspaceConnections | undefined {
   const couchUrl = process.env['COUCHDB_URL'];
   const minioUrl = process.env['MINIO_URL'];
@@ -368,9 +451,12 @@ function buildEnvConnections(
   // Operational log store (issue #996): durable on the Couch env path so
   // GET /api/v1/logs survives a restart there too, in-memory when no COUCHDB_URL
   // is configured.
-  let logs: LogSink & LogReader;
+  let logs: LogSink & LogReader & LogRetentionStore;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
+  // Asset comments: always present, Couch-backed on the couch env path and
+  // in-memory otherwise (issue #1046) — same always-present shape as `audit`.
+  let comments: CommentRepository;
 
   if (couchUrl) {
     const dbName = process.env['COUCHDB_ASSETS_DB'] ?? 'assets';
@@ -384,6 +470,7 @@ function buildEnvConnections(
     webhooks = new CouchWebhookRepository(wc);
     profiles = new CouchProfileRepository(wc);
     pipelines = new CouchPipelineRepository(wc);
+    comments = new CouchCommentRepository(wc, log);
     audit = new CouchAuditRepository(wc);
     // `log` so a failed overflow eviction or an over-cap read window is reported
     // instead of swallowed (#996 review finding 2).
@@ -402,6 +489,10 @@ function buildEnvConnections(
     search = new InMemorySearchRepository(mem, collections);
     profiles = new InMemoryProfileRepository();
     pipelines = new InMemoryPipelineRepository();
+    // MINIO_URL set but no COUCHDB_URL: nothing durable to store comments in on
+    // this path, so they are ephemeral. PerWorkspaceCommentRepository warns when
+    // it resolves to this implementation.
+    comments = new InMemoryCommentRepository();
   }
 
   let storageFor: StorageFactory | undefined;
@@ -420,6 +511,15 @@ function buildEnvConnections(
     });
     const client = storageClient;
     storageFor = () => new WorkspaceStorage(client, sourceBucket);
+    // Same construction log as the per-stack path (issue #1093). `stackName` is
+    // undefined here because the env override is not a stack record, which is
+    // itself the useful signal: a deployment logging this line is not routing
+    // per stack at all. Endpoint HOST only; MINIO_SECRET_KEY is never logged.
+    logObjectStoreClient(log, {
+      source: 'env-override',
+      stackName: undefined,
+      endpoint: minioUrl
+    });
   }
 
   const encoreUrl = process.env['ENCORE_URL'];
@@ -431,10 +531,21 @@ function buildEnvConnections(
     : undefined;
 
   return {
-    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor, storageClient, encore,
     sourceBucket, packagedBucket,
-    s3Config: minioUrl ? { endpoint: minioUrl, accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin', secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '' } : undefined,
+    s3Config: minioUrl
+      ? {
+          endpoint: minioUrl,
+          accessKey: process.env['MINIO_ACCESS_KEY'] ?? 'admin',
+          secretKey: process.env['MINIO_SECRET_KEY'] ?? process.env['MINIO_ROOT_PASSWORD'] ?? '',
+          // Not a stack record, so there is no stack identity to tag the
+          // credential with (issue #1093) — and therefore nothing for the
+          // submit-time assertion to compare, which leaves the env-override
+          // path's behaviour unchanged.
+          stackName: undefined
+        }
+      : undefined,
     // The env-override path has no parameter-store record, so no per-role
     // backend metadata: delivery keeps its default (proxied) behaviour.
     storage: undefined,
@@ -464,8 +575,11 @@ function buildInMemoryConnections(): WorkspaceConnections {
   const search = new InMemorySearchRepository(assets, collections);
   const profiles = new InMemoryProfileRepository();
   const pipelines = new InMemoryPipelineRepository();
+  // No stack resolved (no parameter store / non-ready / invalid config): comments
+  // are ephemeral here, which PerWorkspaceCommentRepository warns about.
+  const comments = new InMemoryCommentRepository();
   return {
-    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines,
+    assets, jobs, search, webhooks, collections, audit, logs, profiles, pipelines, comments,
     storageFor: undefined, storageClient: undefined,
     encore: undefined,
     sourceBucket: 'openvideocore-source',
@@ -793,6 +907,11 @@ export class WorkspaceStackResolver {
   constructor(opts: {
     paramStore: ParamStore | undefined;
     oscContext: Context;
+    // MINIO_ROOT_PASSWORD. Since #1094 this value has TWO roles, both handled
+    // by resolveObjectStoreCredential in buildConnectionsFromStack: it is the
+    // HMAC seed the per-stack object-store credential is derived from, and it is
+    // the legacy deployment-wide secret used for a stack provisioned before
+    // #1094 (i.e. one whose stored config carries no objectStoreAccessKeyId).
     minioPassword: string;
     couchPassword: string;
     // Builders that activate the OPTIONAL subtitles/scene-detect steps from the

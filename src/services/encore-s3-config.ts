@@ -63,31 +63,53 @@
 //   - StackConfig.minioEndpoint: string (src/services/param-store.ts:52-95).
 //   - EncoreS3Config = { endpoint, accessKeyId, secretAccessKey, region? }
 //     (src/encore-scaler/types.ts:24-29).
+//   - StackConfig.objectStoreAccessKeyId?: string and
+//     resolveObjectStoreCredential({ storedAccessKeyId, seed,
+//     legacySecretAccessKey }): ObjectStoreCredential (issue #1094,
+//     src/services/param-store.ts and src/services/object-store-credentials.ts).
 //   - WorkspaceEncoreScalerRegistry option
 //     `resolveS3Config?: (stackKey: string) => Promise<EncoreS3Config |
 //     undefined>`, whose undefined result means "use the static s3Config"
 //     (src/encore-scaler/workspace-registry.ts:88, :206-209, :328-330).
 
 import { STACK_CONFIG_NAMESPACE } from './workspace-stack.js';
+import { DEPLOYMENT_CONTEXT } from '../auth/workspace.js';
 import { OBJECT_STORE_SERVICE_ID } from './stack.js';
+import { resolveObjectStoreCredential } from './object-store-credentials.js';
+import {
+  logObjectStoreClient,
+  objectStoreEndpointHost,
+  ObjectStoreStackMismatchError
+} from './object-store-stack-identity.js';
 import type { ParamStore, StackConfig } from './param-store.js';
 import type { EncoreS3Config } from '../encore-scaler/types.js';
 
-// MinIO root user. Always `admin` in OSC-provisioned stacks — the provision
-// route creates the instance with that root user (src/routes/provision.ts) and
-// the stack resolver builds its own S3 client with the same literal
-// (src/services/workspace-stack.ts:249).
-const MINIO_ROOT_USER = 'admin';
-
 export type EncoreS3ConfigLogger = {
   error: (obj: unknown, msg?: string) => void;
+  // Construction log for the object-store config handed to a spawned
+  // transcoder (issue #1093): stack id + endpoint host only, never the secret.
+  // OPTIONAL so every existing caller/test that wired an error-only logger
+  // keeps type-checking; `logObjectStoreClient` no-ops when it is absent.
+  info?: (obj: unknown, msg?: string) => void;
 };
 
 export type ResolveEncoreS3ConfigDeps = {
   paramStore: ParamStore | undefined;
-  // Object-store secret for the spawned instances. Absent means there are no
-  // credentials to hand Encore at all.
+  // LEGACY, deployment-wide object-store secret for the spawned instances
+  // (ENCORE_S3_SECRET_KEY / MINIO_SECRET_KEY / MINIO_ROOT_PASSWORD). Used for a
+  // stack provisioned BEFORE #1094 — one whose stored config carries no
+  // `objectStoreAccessKeyId` — and for the static env-var override. Absent
+  // together with `objectStoreCredentialSeed` means there are no credentials to
+  // hand Encore at all.
   secretAccessKey: string | undefined;
+  // Seed for the PER-STACK object-store credential (issue #1094;
+  // MINIO_ROOT_PASSWORD). When the resolved stack's config carries an
+  // `objectStoreAccessKeyId`, the credential handed to the spawned transcoder is
+  // derived from that id and this seed — so a transcoder spawned for stack A
+  // gets a key that only opens stack A's object store. Optional: without it (or
+  // for a not-yet-migrated stack) the legacy pair above is used, byte-identical
+  // to the pre-#1094 behaviour.
+  objectStoreCredentialSeed?: string | undefined;
   // True when a complete static ENCORE_S3_ENDPOINT + secret pair was configured
   // (local dev / ops override). That is an intentional, complete configuration,
   // so this resolver defers to it by returning undefined rather than throwing.
@@ -168,18 +190,26 @@ async function mapEndpointForTranscoder(
 
 // `stackKey` is the EFFECTIVE stack identity the transcode request resolved to
 // (issue #615), so it IS the stack name: load its config by name directly. Only
-// when that exact stack has no stored config (e.g. the fixed DEPLOYMENT_CONTEXT
-// of a single-stack env-override deployment, which is not itself a stack name)
-// do we fall back to the first provisioned stack — so a named stack is never
-// mis-resolved to the first-provisioned one, while single-stack behaviour is
-// unchanged.
+// when that exact stack has no stored config AND exactly one stack is
+// provisioned (the fixed DEPLOYMENT_CONTEXT of a single-stack deployment, which
+// is not itself a stack name) do we fall back to that stack. Any other miss now
+// REFUSES with ObjectStoreStackMismatchError (issue #1093) instead of
+// substituting the first-provisioned stack's credential — see the refusal block
+// below for why that substitution is the mis-route that surfaces as NoSuchKey.
 export async function resolveEncoreS3Config(
   deps: ResolveEncoreS3ConfigDeps,
   stackKey: string
 ): Promise<EncoreS3Config | undefined> {
-  const { paramStore, secretAccessKey, staticFallbackConfigured, log, resolveEndpoint } = deps;
+  const {
+    paramStore,
+    secretAccessKey,
+    objectStoreCredentialSeed,
+    staticFallbackConfigured,
+    log,
+    resolveEndpoint
+  } = deps;
 
-  if (!secretAccessKey) {
+  if (!secretAccessKey && !objectStoreCredentialSeed) {
     if (staticFallbackConfigured) return undefined;
     throw new Error(
       'encore-scaler: cannot resolve object-store credentials for transcoding — none of ENCORE_S3_SECRET_KEY, MINIO_SECRET_KEY or MINIO_ROOT_PASSWORD is set. ' +
@@ -194,12 +224,26 @@ export async function resolveEncoreS3Config(
   }
 
   let config: StackConfig | undefined;
+  // The stack name the config was ACTUALLY loaded under (issue #1093). Equal to
+  // `stackKey` on the direct hit; the first-provisioned name on the documented
+  // fallback below. Logged on construction so "which stack is this transcoder
+  // reading with" is answerable from logs alone — the fallback is legitimate for
+  // a single-stack deployment keyed by DEPLOYMENT_CONTEXT, and indistinguishable
+  // from a mis-route without it.
+  let resolvedStackName: string | undefined;
+  // Stack names provisioned under the constant namespace. Read ONLY when the
+  // direct read missed (so the hit path costs no extra round trip), and used
+  // both for the fallback itself and for the #1093 decision below about whether
+  // that fallback is the documented single-stack case or a mis-route.
+  let provisionedNames: string[] = [];
   try {
     config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey);
+    if (config) resolvedStackName = stackKey;
     if (!config) {
-      const names = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
-      if (names.length > 0) {
-        config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, names[0]!);
+      provisionedNames = await paramStore.listStackNames(STACK_CONFIG_NAMESPACE);
+      if (provisionedNames.length > 0) {
+        config = await paramStore.loadStackConfig(STACK_CONFIG_NAMESPACE, provisionedNames[0]!);
+        if (config) resolvedStackName = provisionedNames[0]!;
       }
     }
   } catch (err) {
@@ -215,6 +259,79 @@ export async function resolveEncoreS3Config(
     );
   }
 
+  // THE #1093 REFUSAL. This is the seam where a transcode actually acquires the
+  // credential it will read the source bytes with, and it does NOT go through
+  // request.connections: the scaler calls this resolver with the routed stack
+  // key (main.ts `resolveS3Config`), so a divergence here is invisible to every
+  // check made at the route edge.
+  //
+  // The divergence is the first-provisioned fallback above. When
+  // loadStackConfig(STACK_CONFIG_NAMESPACE, stackKey) misses — a config written
+  // under a pre-#804 derived namespace and not yet migrated, a renamed or
+  // deleted stack record, a parameter store restored from an older snapshot —
+  // the fallback hands the spawned transcoder ANOTHER stack's endpoint and
+  // credential. Every stack's source bucket carries the same literal name
+  // (routes/provision.ts), so that read does not fail as "wrong stack": it
+  // fails, minutes later and inside the transcoder, as a NoSuchKey naming
+  // nothing. Logging it (below) made it diagnosable; it did not make it stop.
+  //
+  // The fallback is kept ONLY for the case it was introduced for: `stackKey` is
+  // the fixed DEPLOYMENT_CONTEXT (auth/workspace.ts, the literal 'default'),
+  // which is NOT a stack name. The submit path uses it when no stack identity
+  // was resolved at all — no stack resolver wired, or a single-stack deployment
+  // that names nothing (routes/assets.ts transcodeStackIdentity: `resolved ??
+  // DEPLOYMENT_CONTEXT`). There is no stack to disagree with, so resolving to
+  // the first provisioned stack is unchanged, documented behaviour.
+  //
+  // Any OTHER key is a stack identity the resolver believed in
+  // (WorkspaceStackResolver.resolveStackName only ever returns a name it found
+  // a config for, or undefined). If that exact stack's config then fails to
+  // load here, we have a real stack whose credential we do not have, and
+  // `names[0]` is an arbitrary pick among the others — exactly the mis-route
+  // #1093 is about. That refuses, naming the expected (routed) and actual
+  // (substituted) stack ids, BEFORE the #991 hook probes the wrong instance.
+  //
+  // Counting provisioned names cannot make this call: a stack whose config has
+  // gone missing is also missing from `listStackNames`, so "two stacks, one
+  // unreadable" and "one stack, keyed by the deployment context" look
+  // identical from the list alone. The KEY is the discriminator, not the count.
+  if (
+    config &&
+    resolvedStackName !== undefined &&
+    resolvedStackName !== stackKey &&
+    stackKey !== DEPLOYMENT_CONTEXT
+  ) {
+    const mismatch = {
+      expectedStack: stackKey,
+      actualStack: resolvedStackName,
+      // Endpoint HOST only — `secretAccessKey` is never read here, and the
+      // error type carries no credential field at all.
+      actualEndpointHost: objectStoreEndpointHost(config.minioEndpoint)
+    };
+    log.error(
+      {
+        stackKey,
+        namespace: STACK_CONFIG_NAMESPACE,
+        expectedStack: mismatch.expectedStack,
+        actualStack: mismatch.actualStack,
+        actualEndpointHost: mismatch.actualEndpointHost,
+        provisionedStackCount: provisionedNames.length
+      },
+      "encore-scaler: refusing to spawn a transcoder with another stack's object-store credential (issue #1093)"
+    );
+    // A complete static ENCORE_S3_ENDPOINT + secret pair is a single global
+    // object store deliberately configured by the operator — there is no
+    // per-stack routing to violate — so defer to it exactly as every other
+    // unresolvable branch in this function does, rather than failing a working
+    // local/ops deployment. The error line above still records the miss.
+    if (staticFallbackConfigured) return undefined;
+    throw new ObjectStoreStackMismatchError(
+      mismatch,
+      `encore-scaler: no object-store config is stored for stack "${stackKey}" under namespace "${STACK_CONFIG_NAMESPACE}", ` +
+        `so spawning a transcoder would silently substitute stack "${resolvedStackName}"'s credential`
+    );
+  }
+
   if (config?.minioEndpoint) {
     // The object-store instance name, for the platform's `getInternalEndpoint`
     // lookup (issue #991). Read from the config already loaded above, so this
@@ -225,15 +342,61 @@ export async function resolveEncoreS3Config(
       (s) => s.serviceId === OBJECT_STORE_SERVICE_ID
     )?.instanceName;
 
+    // Resolve the CREDENTIAL alongside the endpoint, from the SAME stack config
+    // (issue #1094). A stack that carries a per-stack access key id hands the
+    // spawned transcoder that key and its derived secret; a stack provisioned
+    // before #1094 falls back to the legacy deployment-wide `admin` + secret
+    // pair, exactly as before. The secret is returned to the scaler (which puts
+    // it in the Encore create body, instance-pool.ts:618-622) and is never
+    // logged here — note that every log line in this module carries only the
+    // endpoint, stack key and namespace.
+    const credential = resolveObjectStoreCredential({
+      storedAccessKeyId: config.objectStoreAccessKeyId,
+      seed: objectStoreCredentialSeed,
+      legacySecretAccessKey: secretAccessKey
+    });
+
+    // Refuse on an EMPTY resolved secret (issue #1094 review, non-blocking
+    // finding). The guard at the top of this function accepts a deployment that
+    // has a seed but no legacy secret; a pre-#1094 stack read under that
+    // configuration resolves to the legacy `admin` id with an empty secret
+    // (object-store-credentials.ts returns `legacySecretAccessKey ?? ''`), and
+    // spawning a transcoder with it fails every S3 call with a 403 that looks
+    // like a missing object. Fail here, where the cause is still visible,
+    // instead of relying on the main.ts env fallback chain to keep this
+    // unreachable.
+    if (!credential.secretAccessKey) {
+      if (staticFallbackConfigured) return undefined;
+      throw new Error(
+        `encore-scaler: resolved an EMPTY object-store secret for stack "${resolvedStackName}" — ` +
+          'the stack carries no per-stack object-store access key id and no ENCORE_S3_SECRET_KEY, MINIO_SECRET_KEY or MINIO_ROOT_PASSWORD is set as the legacy credential. ' +
+          'Refusing to spawn a transcoder whose every object-store call would fail authorization.'
+      );
+    }
+
+    const endpoint = await mapEndpointForTranscoder(
+      config.minioEndpoint,
+      resolveEndpoint,
+      objectStoreInstanceName,
+      log
+    );
+
+    // Construction log for the transcoder's object-store client (issue #1093).
+    // `endpointHost` is the host of the endpoint the TRANSCODER will use, which
+    // is the in-cluster address when the #991 hook mapped it — so this line is
+    // also how an operator tells the mapped and public paths apart. Stack id +
+    // host only: the resolved `secretAccessKey` is never logged.
+    logObjectStoreClient(log, {
+      source: 'transcoder-config',
+      stackName: resolvedStackName,
+      endpoint,
+      requestedStackName: stackKey
+    });
+
     return {
-      endpoint: await mapEndpointForTranscoder(
-        config.minioEndpoint,
-        resolveEndpoint,
-        objectStoreInstanceName,
-        log
-      ),
-      accessKeyId: MINIO_ROOT_USER,
-      secretAccessKey
+      endpoint,
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey
     };
   }
 
