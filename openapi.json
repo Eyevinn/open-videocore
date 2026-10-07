@@ -20470,11 +20470,16 @@
                     "auditRetentionMs": {
                       "type": "integer",
                       "minimum": 0
+                    },
+                    "logRetentionMs": {
+                      "type": "integer",
+                      "minimum": 0
                     }
                   },
                   "required": [
                     "retentionMs",
-                    "auditRetentionMs"
+                    "auditRetentionMs",
+                    "logRetentionMs"
                   ],
                   "additionalProperties": false
                 }
@@ -20501,6 +20506,10 @@
                   "auditRetentionMs": {
                     "type": "integer",
                     "minimum": 0
+                  },
+                  "logRetentionMs": {
+                    "type": "integer",
+                    "minimum": 0
                   }
                 },
                 "additionalProperties": false
@@ -20523,11 +20532,16 @@
                     "auditRetentionMs": {
                       "type": "integer",
                       "minimum": 0
+                    },
+                    "logRetentionMs": {
+                      "type": "integer",
+                      "minimum": 0
                     }
                   },
                   "required": [
                     "retentionMs",
-                    "auditRetentionMs"
+                    "auditRetentionMs",
+                    "logRetentionMs"
                   ],
                   "additionalProperties": false
                 }
