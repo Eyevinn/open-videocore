@@ -10,7 +10,11 @@ The end-to-end suite and the runner that tests the beta image on OSC (eng-open-v
 | `suite/run.mjs`, `suite/cli.mjs` | runs the cases in order; a failed chain case marks the rest `skipped`; deletes its asset on the way out |
 | `runner/cycle.mjs` | one runner cycle: skip if this `:latest` digest is tested, create-or-restart the instance, wait for `/health` `build.commit` to equal `main`'s head, run the suite, record. Statuses: `green`, `red`, `stale`, `infra-error` |
 | `runner/adapters.mjs` | GitHub head SHA, GHCR `:latest` digest, OSC instance create/restart, `/health` probe |
-| `runner/store-file.mjs` | result store on a directory (`results/by-digest/<digest>.json`) |
+| `runner/store-s3.mjs`, `runner/store-file.mjs` | result store on an S3-compatible bucket (MinIO) or a directory; same keys (`results/by-digest/<digest>.json`, `results/latest.json`); digests are validated before they become a key |
+| `runner/wire.mjs`, `runner/cli.mjs` | environment to dependencies; one cycle; exit 0 only for green |
+| `suite/sweep.mjs` | deletes `e2e-*` assets older than an hour that a crashed run left behind (runs before the cases) |
+| `job/run_cycle.py` | the OSC My Job entrypoint: installs Node from the `nodejs-wheel-binaries` wheel if none is on PATH, `npm ci`, runs one cycle |
+| `fixtures/clip.mp4` | 6 s, 640x360, H.264 + AAC, 372 KB, generated from ffmpeg test sources (no third-party content) |
 | `test/` | `node:test`: the suite against `mock-server.mjs`, the cycle with fake adapters, the adapters with fake `fetch` and a fake OSC client |
 
 ## Run
@@ -36,9 +40,27 @@ Verified: every path, field and enum in the suite against `openapi.json` v1.5.0;
 - The `instance.url` field name (documented in the client's `createInstance` example only).
 - Encore reachability from the runner's tenant, and how long transcode and package take (the 600 s timeouts are a guess).
 
-## Not built yet
+## Scheduling (OSC My Job)
 
-- The results bucket store (the cycle takes any `{get, put}`; only the directory store exists). The promote workflow reads `results/by-digest/<digest>.json` over HTTPS.
-- The OSC scheduled job that runs `npm run cycle` every 15 minutes.
-- The fixture clip (public domain, H.264/AAC, under 5 MB) hosted where the instance can fetch it.
-- The sweep of leftover `e2e-*` assets older than one hour at the start of a run.
+My Jobs run Python (python-job-runner limits, from `get-runtime-limits`: 512 Mi, 6 h max, one run at a time,
+no retry, no disk kept between runs, cron in UTC). `job/run_cycle.py` bridges to Node. Create it with:
+
+- `sourceUrl`: `https://github.com/Eyevinn/open-videocore`
+- `workerCmd`: `python e2e/job/run_cycle.py`
+- `cronSchedule`: `*/15 * * * *`
+- `configService`: a parameter store holding the variables below, **not** the one the agent tasks load
+
+Variables: `GHCR_USER`, `GHCR_TOKEN` (read:packages), `OSC_ACCESS_TOKEN`, `E2E_INSTANCE_OSC_ACCESS_TOKEN`,
+`E2E_PARAMETER_STORE`, `E2E_PARAMETER_STORE_API_KEY`, `E2E_MINIO_ROOT_PASSWORD`, `E2E_COUCHDB_ADMIN_PASSWORD`,
+`E2E_S3_ENDPOINT`, `E2E_S3_BUCKET`, `E2E_S3_ACCESS_KEY`, `E2E_S3_SECRET_KEY`, and
+`E2E_SOURCE_URL=https://raw.githubusercontent.com/Eyevinn/open-videocore/main/e2e/fixtures/clip.mp4`
+(optional `GITHUB_TOKEN`, `E2E_INSTANCE_NAME`, default `ovce2e`).
+
+## Not built / not verified yet
+
+- The job itself is not created and the bucket does not exist. Nothing has run in OSC.
+- Unknown until the first run in the job pod: network access and `pip` there (the shim exits 70 with a clear
+  message if the wheel can't be installed), and whether `workerCmd` runs from the repository root.
+- The instance's ingest may refuse the raw.githubusercontent.com URL (SSRF rules); then host the clip in the
+  runner's bucket instead.
+- Everything under "Not verified, needs the first live run" above.

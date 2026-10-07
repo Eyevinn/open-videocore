@@ -3,13 +3,16 @@
   "private": true,
   "type": "module",
   "description": "End-to-end suite and runner for the open-videocore beta image. Not part of the root `ci` run.",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "test": "node --test \"test/*.test.mjs\"",
     "suite": "node suite/cli.mjs",
     "cycle": "node runner/cli.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1147.0",
     "@osaas/client-core": "0.24.0"
   }
 }

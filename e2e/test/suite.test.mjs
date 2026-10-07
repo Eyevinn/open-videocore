@@ -64,3 +64,32 @@ test('results never contain the token', async () => {
   const { result, mock } = await run({ openAuth: true });
   assert.equal(JSON.stringify(result).includes(mock.token), false);
 });
+
+import { sweepLeftovers } from '../suite/sweep.mjs';
+
+test('sweep deletes only old e2e- assets, keeps recent and foreign ones, and runs before the cases', async () => {
+  const mock = await startMock();
+  try {
+    const old = new Date(Date.now() - 3 * 3600_000).toISOString();
+    mock.seed({ id: 'old-e2e', name: 'e2e-20260101', createdAt: old });
+    mock.seed({ id: 'new-e2e', name: 'e2e-now', createdAt: new Date().toISOString() });
+    mock.seed({ id: 'product', name: 'Real asset', createdAt: old });
+    const client = createClient({ baseUrl: mock.baseUrl, token: mock.token });
+    const result = await runSuite({ client, anon: createClient({ baseUrl: mock.baseUrl }), config: fastCfg });
+    assert.equal(result.swept, 1);
+    assert.deepEqual([...mock.assets.keys()].sort(), ['new-e2e', 'product']);
+    assert.equal(result.status, 'green');
+  } finally { await mock.close(); }
+});
+
+test('sweep pages through the list', async () => {
+  const mock = await startMock();
+  try {
+    const old = new Date(Date.now() - 3 * 3600_000).toISOString();
+    for (let i = 0; i < 5; i++) mock.seed({ id: `o${i}`, name: `e2e-${i}`, createdAt: old });
+    const client = createClient({ baseUrl: mock.baseUrl, token: mock.token });
+    const n = await sweepLeftovers({ client, pageSize: 2 }); // three list calls
+    assert.equal(n, 5);
+    assert.equal(mock.assets.size, 0);
+  } finally { await mock.close(); }
+});
