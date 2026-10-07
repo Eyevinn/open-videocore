@@ -854,6 +854,20 @@ function asSlot(factory) {
 // cell does not look different from another.
 const EMPTY_CELL = '—';
 
+// The same em-dash, with a name a screen reader can read out (WCAG 2.1 AA,
+// 1.1.1 / 1.3.1). A bare "—" is announced as "dash" or skipped entirely, which
+// makes an UNKNOWN cell indistinguishable from an empty one — exactly the
+// distinction this column exists to draw.
+//
+// `role="img"` rather than a `.visually-hidden` span, which is the pattern used
+// elsewhere (lock-state.js:148): a naked <span> is a `generic` element, and
+// aria-label on it is ignored by design, while role="img" makes the glyph a
+// single named graphic and REPLACES the dash in the accessible name instead of
+// appending to it. The visible text stays exactly one em-dash either way.
+function unknownCellHtml(label) {
+  return '<span role="img" aria-label="' + escHtml(label) + '">' + EMPTY_CELL + '</span>';
+}
+
 /**
  * Rendition count. VERIFIED FIELD: `renditions`, an ARRAY (not a count) on BOTH
  * projections — openapi.json
@@ -908,7 +922,10 @@ function renditionCountCellHtml(asset) {
  * only the markup is duplicated, never the state list.
  */
 function reviewStateCellHtml(asset, carriesReviewState) {
-  if (!carriesReviewState) return EMPTY_CELL;
+  // Named, not bare: "unknown on this tier" is a different statement from "no
+  // review state", and a sighted operator gets that from the header plus the
+  // tier they are in. See unknownCellHtml() for why role="img".
+  if (!carriesReviewState) return unknownCellHtml('Review state unknown for this search result');
   const raw = asset && typeof asset.reviewState === 'string' && asset.reviewState
     ? asset.reviewState
     : 'draft';
