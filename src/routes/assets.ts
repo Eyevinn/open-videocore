@@ -990,11 +990,17 @@ const tracksSchema = z.object({
 // Attached by the ONE helper `withRetentionWindow` (below) at every response
 // that serializes an EXISTING asset — the single-asset reads (`GET /:id`,
 // `GET /by-external-id/...`), the `GET /` listing (so `?status=archived` rows
-// carry it), the `GET /:id/versions` chain (which includes archived members by
-// design), and the mutation bodies that echo the stored asset — so the rule is
-// uniform rather than per-route. Creation responses (`201`) are the only
-// exception, and only because a newly created asset is never `archived`. The
-// TAMS-address lookup resolves `ready` assets only, so it never carries one.
+// carry it), the deprecated free-text alias `GET /assets/search` (which has no
+// status filter, so archived rows reach it too), the `GET /:id/versions` chain
+// (which includes archived members by design), and the mutation bodies that
+// echo the stored asset — so the rule is uniform rather than per-route.
+//
+// Exactly TWO responses typed with `assetSchema` do NOT route through the
+// helper, both because they can never carry an archived asset:
+//   - creation responses (`201`): a newly created asset is never `archived`;
+//   - `GET /assets/by-tams-address`: it resolves `ready` assets only.
+// Any NEW route that serializes a stored asset belongs in the first list, not
+// this one, unless it is provably archived-free.
 const retentionWindowSchema = z
   .object({
     archivedAt: z
@@ -3876,7 +3882,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       reply.header('deprecation', 'true');
       reply.header('link', '</api/v1/search/>; rel="successor-version"');
       const items = await repo.search(request.query.q);
-      return { items };
+      // Map through the shared helper like every other existing-asset response
+      // (issue #1034): this alias has no status filter, so archived assets DO
+      // come back through it, and the response schema is the same `assetSchema`
+      // that advertises `retention` for them.
+      return { items: items.map(withRetentionWindow) };
     }
   );
 
