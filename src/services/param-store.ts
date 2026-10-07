@@ -80,6 +80,30 @@ export type StackConfig = {
   // existed have no value here and MUST still load without error, and an unset
   // value falls through to the remote default index (byte-identical to today).
   encoreProfilesUrl?: string;
+  // The object store's PER-STACK access key id (issue #1094). NON-SECRET: an
+  // identifier, like a username — the same classification the #212 external
+  // credential mapping gives `accessKeyId`
+  // (services/external-storage-credentials.ts:33). The matching SECRET access
+  // key is NEVER stored here (nor anywhere else at rest): it is derived from
+  // this id plus the deployment seed by resolveObjectStoreCredential
+  // (services/object-store-credentials.ts) and persisted as an OSC secret for
+  // the services that consume it by reference.
+  //
+  // Optional for back-compat, mirroring `status?` / the fields above: a stack
+  // provisioned BEFORE #1094 carries no value here, and its absence is the
+  // signal to use the legacy process-global `admin` + deployment-password
+  // credential (removed, with the stacks migrated, by #1096). Present means the
+  // stack's object store was created with its own credential.
+  objectStoreAccessKeyId?: string;
+  // The Valkey queue key this stack's on-demand packager consumes. Every
+  // packager listens on the same shared Valkey, so a packager provisioned for a
+  // non-first stack gets its own key (packagerQueueForStack) — otherwise any
+  // stack's packager could pop another stack's job and read the wrong object
+  // store. Recorded when the packager is created so producers enqueue onto
+  // exactly the key it was built with. Optional for back-compat: a packager
+  // provisioned before this field existed consumes the shared default key, and
+  // an unset value keeps enqueueing there.
+  packagerQueue?: string;
   // Per-role storage backend metadata (issue #211). Optional for back-compat:
   // configs written before this field existed have no `storage`, in which case
   // both roles are the default per-stack MinIO backend (sourceBucket /
@@ -951,6 +975,12 @@ export interface OscInstanceApi {
     sat: string,
     body: Record<string, unknown>
   ): Promise<{ name?: string }>;
+  // Readiness wait for an instance this module just created. NOT
+  // @osaas/client-core's waitForInstanceReady: main.ts fulfils this with the
+  // bounded waitForInstanceReadyBounded (src/services/instance-readiness.ts,
+  // issue #1055), so a Valkey that never reports `running` gives up at a
+  // deadline instead of hanging the startup bootstrap forever. The rejection is
+  // caught by the warn-and-continue handler at the end of ensureParameterStore.
   waitForInstanceReady(serviceId: string, name: string): Promise<void>;
   getPortsForInstance(
     serviceId: string,

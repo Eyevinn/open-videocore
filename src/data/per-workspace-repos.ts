@@ -78,6 +78,12 @@ import type {
   PipelineRepository,
   PipelineExecution
 } from './pipeline-repo.js';
+import {
+  InMemoryCommentRepository,
+  type Comment,
+  type CommentRepository,
+  type CreateCommentInput
+} from './comment-repo.js';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
 import type {
   EncoreClient,
@@ -242,6 +248,65 @@ export class PerWorkspacePipelineRepository implements PipelineRepository {
     step: PipelineStepName
   ): Promise<PipelineExecution | undefined> {
     return (await this.repo()).findRunningByAssetAndStep(assetId, step);
+  }
+}
+
+// Minimal logger surface (structurally satisfied by Fastify's logger) for the
+// durability warning below. Optional so callers/tests that don't wire a logger
+// keep working.
+export type PerWorkspaceCommentLogger = {
+  warn: (obj: unknown, msg?: string) => void;
+};
+
+// Asset comments resolved per stack (issue #1046).
+//
+// Comments used to be a process-global InMemoryCommentRepository, so every
+// review comment was lost on restart. They are now a field on
+// WorkspaceConnections (src/services/workspace-stack.ts `comments`) backed by
+// CouchCommentRepository for any stack that has a CouchDB — including a stack
+// provisioned through POST /api/v1/provision, whose CouchDB URL arrives from the
+// parameter store and NOT from COUCHDB_URL. This facade resolves that field at
+// call time, exactly like PerWorkspacePipelineRepository above, so a stack
+// provisioned after boot is picked up with no restart.
+//
+// DURABILITY WARNING. The resolved field is in-memory only when the resolved
+// stack has no CouchDB at all, in which case comments are lost on restart. That
+// has to be audible, so it is logged the first time a resolution lands on the
+// in-memory implementation (and again after any return to a durable store, so a
+// later relapse is not swallowed). It is logged here rather than once at boot
+// because the resolution is deliberately lazy: at boot there may be no stack
+// yet, and a boot-time verdict would be stale the moment one is provisioned.
+export class PerWorkspaceCommentRepository implements CommentRepository {
+  private warnedInMemory = false;
+  constructor(
+    private readonly resolver: WorkspaceStackResolver,
+    private readonly log?: PerWorkspaceCommentLogger
+  ) {}
+  private async repo(): Promise<CommentRepository> {
+    const comments = (await this.resolver.resolve()).comments;
+    if (comments instanceof InMemoryCommentRepository) {
+      if (!this.warnedInMemory) {
+        this.warnedInMemory = true;
+        this.log?.warn(
+          { store: 'in-memory', reason: 'no CouchDB in the resolved stack' },
+          'asset comments are being served from the IN-MEMORY store because the ' +
+            'resolved stack has no CouchDB — comments will be LOST on restart ' +
+            '(issue #1046). Provision a stack with CouchDB, or set COUCHDB_URL, ' +
+            'for a durable comment store.'
+        );
+      }
+    } else {
+      // Durable again (e.g. a stack was provisioned after boot): re-arm so a
+      // later fall back to in-memory is reported rather than silently ignored.
+      this.warnedInMemory = false;
+    }
+    return comments;
+  }
+  async create(input: CreateCommentInput): Promise<Comment> {
+    return (await this.repo()).create(input);
+  }
+  async listByAsset(assetId: string): Promise<Comment[]> {
+    return (await this.repo()).listByAsset(assetId);
   }
 }
 

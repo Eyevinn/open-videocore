@@ -27,6 +27,21 @@
 //     capacity the scaler loop itself treats as "busy"
 //     (scaler-loop.ts:245 `activeJobs >= JOBS_PER_INSTANCE`, :395 dispatch
 //     guard). Reported on the wire (#979) so a client never has to infer it.
+//   - ScalerStackConnection + WorkspaceEncoreScalerRegistry.listStackConnections():
+//     src/encore-scaler/workspace-registry.ts — { stackKey, connectionId?, redis?,
+//     unobservedReason? }, resolved through the registry's own
+//     resolveStackRedis(), i.e. the identical connection object each loop uses.
+//   - valkeyConnectionId(redisUrl): src/encore-scaler/valkey-connection-id.ts —
+//     non-secret label for a physical Valkey.
+//
+// #1074: this endpoint used to read ONE connection — the process-global one
+// main.ts assigns on activation. The loops do not: each resolves its stack's own
+// Valkey (workspace-registry.ts resolveStackRedis, issue #615). So a pool living
+// on a per-stack Valkey was ABSENT from the response rather than reported empty,
+// and a depth could come from a different physical store than the loop that owns
+// the queue ever read. It now fans out over every connection the loops use,
+// labels each reported workspace with the connection it was read from, and
+// reports a workspace it could not query as UNOBSERVED instead of dropping it.
 
 import type { FastifyPluginAsync } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -35,6 +50,7 @@ import { z } from 'zod';
 import { JOBS_PER_INSTANCE, keys } from '../encore-scaler/types.js';
 import { listInstances } from '../encore-scaler/instance-pool.js';
 import { readSpawnFailure } from '../encore-scaler/spawn-failure.js';
+import type { ScalerStackConnection } from '../encore-scaler/workspace-registry.js';
 import type { ScalerConfigStore } from '../services/param-store.js';
 
 type ScalerRouterOptions = {
@@ -42,7 +58,24 @@ type ScalerRouterOptions = {
   // (no stack provisioned yet). Set live by main.ts the moment a stack is
   // provisioned, so GET /status flips to scalerActive:true without a restart
   // (#103); the status endpoint reports scalerActive:false while it is undefined.
+  //
+  // This is the PROCESS-GLOBAL connection (the first-provisioned stack's Valkey,
+  // also the fallback every loop uses when no per-stack URL resolves). It is one
+  // of the connections GET /status observes, not the only one — see
+  // listStackConnections below (#1074).
   redis?: Redis;
+  // Non-secret label for `redis` above (#1074), produced by valkeyConnectionId()
+  // from the same URL the registry hashes, so a stack that falls back to the
+  // process-global Valkey reports the SAME connectionId as this connection
+  // instead of appearing to be a second store. Defaults to
+  // DEFAULT_CONNECTION_ID when unwired (single-connection deployments, tests).
+  redisConnectionId?: string;
+  // Enumerate the per-stack Valkey connections the scaler loops actually use
+  // (#1074). Wired by main.ts to WorkspaceEncoreScalerRegistry
+  // .listStackConnections(). Absent (or returning []) keeps the historical
+  // single-connection behaviour, with every reported workspace still labelled
+  // with the connection it came from.
+  listStackConnections?: () => Promise<ScalerStackConnection[]>;
   // Upper bound on instances per workspace pool (ENCORE_MAX_INSTANCES).
   maxInstances: number;
   // Minimum instances to keep warm (0 = scale to zero when idle). Default 0.
@@ -159,14 +192,64 @@ const spawnFailureSchema = z
 
 const workspaceSchema = z.object({
   workspaceId: z.string(),
-  queueDepth: z.number(),
-  inflightDepth: z.number(),
+  // Which physical Valkey these numbers were read from (#1074). A non-secret
+  // label (valkeyConnectionId) — never a URL, host or port, because this endpoint
+  // is unauthenticated. Absent only on an unobserved row whose connection could
+  // not even be resolved. Two rows with the same workspaceId and different
+  // connectionIds mean the keys exist on two stores, which is itself the finding.
+  connectionId: z.string().optional(),
+  // False when this workspace's Valkey could not be queried (#1074). The pool
+  // state below is then unknown, NOT empty: an operator must be able to tell "no
+  // instances in this pool" (observed:true, instances:[]) from "this pool was not
+  // observed" (observed:false). An unqueryable workspace is reported with this
+  // flag, never silently omitted.
+  observed: z.boolean(),
+  unobservedReason: z
+    .string()
+    .describe(
+      'Why this workspace could not be queried. Carries the shape of the fault ' +
+        'only — connection strings and error text stay in the server log, since ' +
+        'this endpoint is unauthenticated.'
+    )
+    .optional(),
+  // Read from the SAME Valkey the owning loop reads (#1074), identified by
+  // connectionId above. Absent when observed is false — the depth is unknown
+  // then, and reporting 0 would read as "empty queue".
+  queueDepth: z.number().optional(),
+  inflightDepth: z.number().optional(),
   instances: z.array(instanceSchema),
   spawnFailure: spawnFailureSchema.optional()
 });
 
+// One physical Valkey the status read covered, and the provisioned stacks bound
+// to it (#1074). This is what makes the coverage of the response explicit: a
+// client can see which connections were reached, which were not, and which stacks
+// hang off each — without any connection string reaching the wire.
+const connectionSchema = z.object({
+  connectionId: z
+    .string()
+    .describe(
+      'Stable non-secret identifier for a physical Valkey. Equal for every ' +
+        'stack sharing a store, different for different stores. Absent when the ' +
+        'connection could not be resolved at all.'
+    )
+    .optional(),
+  stacks: z
+    .array(z.string())
+    .describe(
+      'Provisioned stacks whose scaler loop uses this connection. Empty for the ' +
+        'process-global connection when no stack resolved to it.'
+    ),
+  observed: z.boolean(),
+  unobservedReason: z.string().optional()
+});
+
 const scalerStatusSchema = z.object({
   workspaces: z.array(workspaceSchema),
+  // Every connection this read covered (#1074), observed or not. Without it,
+  // "the response lists two workspaces" could not be distinguished from "the
+  // response lists the two workspaces it managed to reach".
+  connections: z.array(connectionSchema),
   maxInstances: z.number(),
   // How many concurrent jobs ONE instance can take before the scaler counts it
   // as busy (#979). A server-owned config constant, reported alongside
@@ -244,6 +327,163 @@ async function scanWorkspaceIds(redis: Redis): Promise<string[]> {
   return [...found];
 }
 
+// ---------------------------------------------------------------------------
+// Multi-connection observation (#1074).
+//
+// The scaler's loops are spread over one Valkey per provisioned stack. A status
+// read therefore has to fan out over those same connections, label what it found
+// with the connection it came from, and say plainly which connections it could
+// not reach.
+// ---------------------------------------------------------------------------
+
+// Label used for the process-global connection when main.ts has not supplied one
+// (single-connection deployments and tests). Deliberately not a URL.
+const DEFAULT_CONNECTION_ID = 'valkey-default';
+
+const UNREACHABLE_CONNECTION_REASON =
+  'this Valkey connection could not be read (scan failed); the pool state is ' +
+  'unknown, not empty';
+const UNREADABLE_WORKSPACE_REASON =
+  'this pool could not be read from its Valkey; the state below is unknown, not empty';
+
+type WorkspaceView = z.infer<typeof workspaceSchema>;
+type ConnectionView = z.infer<typeof connectionSchema>;
+
+// One physical Valkey to observe, plus the provisioned stacks bound to it.
+type ObservationTarget = {
+  connectionId: string;
+  redis: Redis;
+  stacks: Set<string>;
+};
+
+// Collapse the process-global connection and the per-stack connections into one
+// target per PHYSICAL store.
+//
+// Deduplicated on both the connection object and the connectionId: a stack that
+// resolves to the process-global Valkey reuses that very connection object
+// (resolveStackRedis, workspace-registry.ts), and two stacks sharing a URL share
+// both. Without the collapse the same workspace would be reported once per stack
+// that happens to share a store.
+//
+// A stack whose connection could not be resolved at all has no target; it is
+// returned separately so it can be reported UNOBSERVED rather than dropped.
+function collectTargets(
+  globalRedis: Redis | undefined,
+  globalConnectionId: string,
+  stackConnections: ScalerStackConnection[]
+): { targets: ObservationTarget[]; unresolved: ScalerStackConnection[] } {
+  const byConnectionId = new Map<string, ObservationTarget>();
+  const byRedis = new Map<Redis, ObservationTarget>();
+  const unresolved: ScalerStackConnection[] = [];
+
+  const add = (connectionId: string, redis: Redis, stackKey?: string): void => {
+    let target = byRedis.get(redis) ?? byConnectionId.get(connectionId);
+    if (!target) {
+      target = { connectionId, redis, stacks: new Set() };
+      byConnectionId.set(connectionId, target);
+      byRedis.set(redis, target);
+    }
+    if (stackKey) target.stacks.add(stackKey);
+  };
+
+  // The process-global connection first, so it keeps its own label: it is a
+  // connection in its own right even when no stack resolves to it (it is where
+  // keys written before per-stack resolution, or by an env-override deployment,
+  // live).
+  if (globalRedis) add(globalConnectionId, globalRedis);
+
+  for (const connection of stackConnections) {
+    if (!connection.redis || !connection.connectionId) {
+      unresolved.push(connection);
+      continue;
+    }
+    add(connection.connectionId, connection.redis, connection.stackKey);
+  }
+
+  return { targets: [...byConnectionId.values()], unresolved };
+}
+
+// Read one workspace's pool state from the connection its loop uses. Every depth
+// and every instance in the returned row came from `target.redis`, so the numbers
+// and the connectionId reported next to them cannot disagree.
+async function observeWorkspace(
+  target: ObservationTarget,
+  workspaceId: string
+): Promise<WorkspaceView> {
+  try {
+    const [queueDepth, inflightDepth, instances, spawnFailure] = await Promise.all([
+      target.redis.llen(keys.queue(workspaceId)),
+      target.redis.llen(keys.inflight(workspaceId)),
+      listInstances(target.redis, workspaceId),
+      // #1071. readSpawnFailure is total (never throws, drops a junk record) so
+      // one unreadable key cannot take the whole status response down.
+      readSpawnFailure(target.redis, workspaceId)
+    ]);
+    return {
+      workspaceId,
+      connectionId: target.connectionId,
+      observed: true,
+      queueDepth,
+      inflightDepth,
+      instances: instances.map(toInstanceView),
+      spawnFailure
+    };
+  } catch {
+    // Reported, not dropped (#1074): a workspace whose Valkey answered the scan
+    // but failed the reads is exactly the one an operator needs to see.
+    return {
+      workspaceId,
+      connectionId: target.connectionId,
+      observed: false,
+      unobservedReason: UNREADABLE_WORKSPACE_REASON,
+      instances: []
+    };
+  }
+}
+
+// Observe one physical Valkey: which workspaces live on it, and their depths AS
+// THAT STORE HAS THEM.
+async function observeTarget(
+  target: ObservationTarget
+): Promise<{ workspaces: WorkspaceView[]; connection: ConnectionView }> {
+  const stacks = [...target.stacks].sort();
+  let scanned: string[];
+  try {
+    scanned = await scanWorkspaceIds(target.redis);
+  } catch {
+    // The store is unreachable, so nothing on it is known. Every stack bound to
+    // it is still reported — as unobserved — and the connection itself is marked
+    // so the gap is visible even when no stack name is bound to it.
+    return {
+      workspaces: stacks.map((stackKey) => ({
+        workspaceId: stackKey,
+        connectionId: target.connectionId,
+        observed: false,
+        unobservedReason: UNREACHABLE_CONNECTION_REASON,
+        instances: []
+      })),
+      connection: {
+        connectionId: target.connectionId,
+        stacks,
+        observed: false,
+        unobservedReason: UNREACHABLE_CONNECTION_REASON
+      }
+    };
+  }
+
+  // Union of "has keys on this store" and "is a provisioned stack on this store",
+  // so a provisioned pool with no keys at all is reported EMPTY instead of being
+  // absent from the response (#1074).
+  const workspaceIds = [...new Set([...scanned, ...stacks])].sort();
+  const workspaces = await Promise.all(
+    workspaceIds.map((workspaceId) => observeWorkspace(target, workspaceId))
+  );
+  return {
+    workspaces,
+    connection: { connectionId: target.connectionId, stacks, observed: true }
+  };
+}
+
 export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
 
@@ -262,15 +502,58 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
     '/status',
     { schema: { tags: ['admin'], response: { 200: scalerStatusSchema } } },
     async () => {
-      const redis = opts.redis;
-      if (!redis) {
+      // Enumerate the Valkeys the loops use (#1074). A failure here must not
+      // blank the response: fall back to the process-global connection, which is
+      // then the only one reported — and `connections` says so, so the narrower
+      // coverage is visible rather than implied.
+      let stackConnections: ScalerStackConnection[] = [];
+      if (opts.listStackConnections) {
+        try {
+          stackConnections = await opts.listStackConnections();
+        } catch (err) {
+          fastify.log.warn(
+            { err },
+            'scaler-status: could not enumerate per-stack Valkey connections; ' +
+              'reporting the process-global connection only'
+          );
+        }
+      }
+
+      const { targets, unresolved } = collectTargets(
+        opts.redis,
+        opts.redisConnectionId ?? DEFAULT_CONNECTION_ID,
+        stackConnections
+      );
+
+      // Stacks whose connection could not be resolved: reported as unobserved
+      // workspaces (and as unobserved connections), never omitted.
+      const unresolvedWorkspaces: WorkspaceView[] = unresolved.map((connection) => ({
+        workspaceId: connection.stackKey,
+        observed: false,
+        unobservedReason:
+          connection.unobservedReason ??
+          "this stack's Valkey connection could not be resolved",
+        instances: []
+      }));
+      const unresolvedConnections: ConnectionView[] = unresolved.map((connection) => ({
+        stacks: [connection.stackKey],
+        observed: false,
+        unobservedReason:
+          connection.unobservedReason ??
+          "this stack's Valkey connection could not be resolved"
+      }));
+
+      if (targets.length === 0) {
         // Scaler off (no stack provisioned yet, or the stack's Valkey URL could
         // not be resolved). Report the CONFIGURED maxInstances, not a literal 0
         // (issue #780): a hardcoded 0 read like a misconfigured instance cap and
         // sent operators looking at scaler config instead of at activation.
-        // `scalerActive:false` is the field that says the scaler is off.
+        // `scalerActive:false` is the field that says the scaler is off. Any
+        // stack whose connection failed to resolve is still listed, so "off" and
+        // "on but unobservable" stay distinguishable (#1074).
         return {
-          workspaces: [],
+          workspaces: unresolvedWorkspaces,
+          connections: unresolvedConnections,
           maxInstances: liveMaxInstances,
           jobsPerInstance: JOBS_PER_INSTANCE,
           idleTimeoutMs: liveIdleTimeoutMs,
@@ -278,30 +561,20 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
         };
       }
 
-      const workspaceIds = await scanWorkspaceIds(redis);
-      const workspaces = await Promise.all(
-        workspaceIds.map(async (workspaceId) => {
-          const [queueDepth, inflightDepth, instances, spawnFailure] = await Promise.all([
-            redis.llen(keys.queue(workspaceId)),
-            redis.llen(keys.inflight(workspaceId)),
-            listInstances(redis, workspaceId),
-            // #1071. readSpawnFailure is total (never throws, drops a junk
-            // record) so one unreadable key cannot take the whole status
-            // response down.
-            readSpawnFailure(redis, workspaceId)
-          ]);
-          return {
-            workspaceId,
-            queueDepth,
-            inflightDepth,
-            instances: instances.map(toInstanceView),
-            spawnFailure
-          };
-        })
+      const observed = await Promise.all(targets.map((target) => observeTarget(target)));
+
+      const workspaces = [
+        ...observed.flatMap((result) => result.workspaces),
+        ...unresolvedWorkspaces
+      ].sort(
+        (a, b) =>
+          a.workspaceId.localeCompare(b.workspaceId) ||
+          (a.connectionId ?? '').localeCompare(b.connectionId ?? '')
       );
 
       return {
         workspaces,
+        connections: [...observed.map((result) => result.connection), ...unresolvedConnections],
         maxInstances: liveMaxInstances,
         // Sourced from the scaler's own constant, not a router option, so the
         // wire value and the loop's busy threshold cannot drift (#979).

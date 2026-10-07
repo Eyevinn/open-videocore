@@ -117,10 +117,34 @@ const URL_PATTERN = /\b[a-z][a-z0-9+.-]{0,30}:\/\/[^\s"'<>\\]+/gi;
 // between the required first and last characters). Unbounded, the inner run was
 // the quadratic shape described above — a long hyphenated token made every
 // offset re-scan to the end of the string.
+//
+// The leading `\b` became a `(?<![A-Za-z0-9])` lookbehind in #1110: `\b` also
+// refuses to start after an underscore (a word character), so `_10.42.3.17:6379`
+// — an env-var-ish name run together with its value — was never a candidate.
+// The lookbehind is fixed-width and only inspects one character, so it is
+// constant work per attempt and changes nothing about linearity. It cannot help
+// with a LETTER or DIGIT glued in front (`x10.42.3.17:6379`), which is what
+// splitGluedHostPrefix() below is for.
 const NETWORK_LOCATION_PATTERN =
-  /(?:\[[0-9A-Fa-f:]{3,}\]|\b[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)(?::\d{1,5})?/g;
+  /(?:\[[0-9A-Fa-f:]{3,}\]|(?<![A-Za-z0-9])[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)(?::\d{1,5})?/g;
 
 const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+// A candidate that is an IP literal with a word glued to the FRONT of it
+// (#1110): `x10.42.3.17:6379`, `host10.0.0.1`. No lookbehind can exclude this,
+// because the glued character is a perfectly good first character for the
+// candidate itself — the whole run is matched as one token and then fails
+// isNetworkLocation(), since `x10` is not an octet and `17` is not a TLD. The
+// prefix is split off here and only the address is redacted, so the operator
+// keeps whatever the prefix was saying.
+//
+// The prefix run is lazy and bounded, and the remainder is fully anchored to
+// exactly four octets with an optional port, so each attempt is constant work
+// over a bounded number of split points — no backtracking blow-up. A DNS name
+// needs no equivalent: a letter glued to `cache.internal.example.net` leaves a
+// candidate that is still name-shaped, so it is already redacted (whole).
+const GLUED_IP_PREFIX_PATTERN =
+  /^([A-Za-z0-9_]{1,64}?)(\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?)$/;
 
 // Extensions of things this system actually names in error text. Only consulted
 // for a candidate with NO port, so `store.example:9000` is still a host even if
@@ -179,8 +203,29 @@ function isNetworkLocation(candidate: string): boolean {
   return /^[A-Za-z]{2,}$/.test(last);
 }
 
+// Redact one NETWORK_LOCATION_PATTERN candidate, keeping any glued prefix that
+// is not part of the address (#1110). Constant work beyond isNetworkLocation().
+function redactNetworkLocation(candidate: string): string {
+  if (isNetworkLocation(candidate)) return REDACTED;
+  const glued = GLUED_IP_PREFIX_PATTERN.exec(candidate);
+  if (!glued) return candidate;
+  const [, prefix = '', address = ''] = glued;
+  return isNetworkLocation(address) ? `${prefix}${REDACTED}` : candidate;
+}
+
 // `Authorization: Bearer <token>` and friends, in whatever casing.
-const AUTH_SCHEME_PATTERN = /\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+//
+// NO LEADING ANCHOR (#1110). This used to start with `\b`, which requires the
+// scheme word to begin at a word boundary — so a scheme glued to a preceding
+// word character (`xBearer abc123DEFghi456`, a header echoed without its
+// separator, a scheme at the tail of a longer identifier) was not matched at
+// all and the token after it was published verbatim. A `(?<![A-Za-z0-9])`
+// lookbehind does not fix that case either: `x` is itself in that class. The
+// anchor is therefore dropped. The cost is over-redaction of a value that
+// follows a word merely ENDING in "token"/"basic"/"bearer", which is the
+// intended failure mode here, and the pattern still starts on a literal
+// alternation so matching stays linear.
+const AUTH_SCHEME_PATTERN = /(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 
 // A `name: value` / `name=value` pair whose NAME reads like a credential. This
 // is what catches an OSC error that echoes back the createInstance request body
@@ -205,7 +250,13 @@ const SENSITIVE_FIELD_SPACED_PATTERN =
   /("?[A-Za-z0-9_.-]{0,64}(?:secret|token|password|passwd|credential|authorization|accesskey|apikey|key)[A-Za-z0-9_.-]{0,64}"?)(\s+)((?=[A-Za-z0-9._~+/=-]*[A-Za-z])(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{12,}|[A-Za-z0-9+/=_-]{20,})(?![A-Za-z0-9._~+/=-])/gi;
 
 // A JWT-shaped blob, for a bare token that appears with no label at all.
-const JWT_PATTERN = /\beyJ[A-Za-z0-9._-]{10,}/g;
+//
+// NO LEADING ANCHOR (#1110), for the same reason as AUTH_SCHEME_PATTERN: with
+// `\b` in front, `6eyJhbGciOiJIUzI1NiJ9...` — a JWT concatenated onto whatever
+// printed before it — did not match and went out whole. `eyJ` is a distinctive
+// enough opener (it is `{"` base64url-encoded) that matching it mid-word costs
+// nothing but a stray prefix character left in front of [redacted].
+const JWT_PATTERN = /eyJ[A-Za-z0-9._-]{10,}/g;
 
 // An HTML/XML-ish tag. OSC's gateway answers a timed-out createInstance with a
 // whole HTML error page, not JSON, and @osaas/client-core puts that page's text
@@ -217,12 +268,20 @@ const JWT_PATTERN = /\beyJ[A-Za-z0-9._-]{10,}/g;
 // character budget go much further, and the operator-facing text is readable
 // again ("504 Gateway Time-out ... nginx").
 //
-// A stray `<` or `>` left over from a non-markup message is deliberately kept
-// AS-IS: this record is served as JSON (GET /scaler/status), where an angle
-// bracket is an ordinary character and entity-encoding it would only corrupt
-// legitimate error text like `expected <n> profiles`. Escaping for a particular
-// rendering context belongs to whatever does that rendering, not to the stored
-// value.
+// ANGLE BRACKETS IN ORDINARY TEXT (comment corrected in #1110; the behaviour
+// is unchanged). This pass cannot tell markup from prose, so a MATCHED PAIR —
+// any `<` and the next `>` within the length bound, whatever sits between them
+// — is stripped as if it were a tag, placeholders included: `expected <n>
+// profiles, got 3` comes out as `expected profiles, got 3`. That is the safe
+// direction — a `<...>` run in an upstream body is markup far more often than
+// it is prose, and losing a placeholder costs the operator nothing the
+// surrounding words do not already say.
+//
+// An UNMATCHED `<` or `>` has no closing partner, so it survives, and it is
+// deliberately kept AS-IS rather than entity-escaped: this record is served as
+// JSON (GET /scaler/status), where an angle bracket is an ordinary character.
+// Escaping for a particular rendering context belongs to whatever does that
+// rendering, not to the stored value.
 //
 // The length bound matters for cost, not for matching: `<[^>]*>` is the same
 // quadratic shape as the rest once the input contains unmatched `<` (measured:
@@ -273,6 +332,14 @@ function clampToTokenBoundary(text: string, max: number): string {
   return text.slice(0, end);
 }
 
+// Is there anything in `text` an operator could read, or is it only delimiters?
+function hasReadableContent(text: string): boolean {
+  for (const character of text) {
+    if (!CLAMP_DELIMITERS.has(character)) return true;
+  }
+  return false;
+}
+
 // What the record says when the thrown value carried no text at all.
 const NO_MESSAGE = 'spawn failed with no error message';
 
@@ -316,9 +383,7 @@ export function redactSpawnFailureMessage(
   // After URLs (whose host is already gone with the whole URL) and before the
   // field passes, so a bare host that appears as a field VALUE is caught by
   // whichever pass reaches it first.
-  text = text.replace(NETWORK_LOCATION_PATTERN, (match) =>
-    isNetworkLocation(match) ? REDACTED : match
-  );
+  text = text.replace(NETWORK_LOCATION_PATTERN, redactNetworkLocation);
   text = text.replace(AUTH_SCHEME_PATTERN, (_match, scheme: string) => `${scheme} ${REDACTED}`);
   text = text.replace(
     SENSITIVE_FIELD_PATTERN,
@@ -337,7 +402,23 @@ export function redactSpawnFailureMessage(
 
   text = text.replace(/\s+/g, ' ').trim();
   if (text.length > SPAWN_FAILURE_MESSAGE_MAX_LENGTH) {
-    text = `${text.slice(0, SPAWN_FAILURE_MESSAGE_MAX_LENGTH - 1).trimEnd()}…`;
+    // The OUTPUT budget is cut at a token boundary too (#1110 finding 3), so
+    // the published message never ends mid-token. Unlike the input clamp this
+    // cut cannot leak — every redaction pass has already run on the text — so
+    // it is purely about not handing an operator half an identifier.
+    //
+    // One fallback: if cutting back to the last delimiter leaves nothing but
+    // delimiters (the budget is filled by a single unbroken run, as it is for
+    // an over-long "tag" the markup pass declined to scan), there is no
+    // readable prefix to keep and the fixed cut is shown instead. Dropping the
+    // run whole would publish an ellipsis and nothing else, and here — after
+    // the passes, not before them — the fragment holds nothing they would have
+    // caught.
+    const aligned = clampToTokenBoundary(text, SPAWN_FAILURE_MESSAGE_MAX_LENGTH - 1).trimEnd();
+    const kept = hasReadableContent(aligned)
+      ? aligned
+      : text.slice(0, SPAWN_FAILURE_MESSAGE_MAX_LENGTH - 1).trimEnd();
+    text = `${kept}…`;
   }
   return text === '' ? NO_MESSAGE : text;
 }
