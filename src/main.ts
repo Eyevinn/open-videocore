@@ -1531,7 +1531,27 @@ function activateScaler(redisUrl: string): void {
     // Additive, not a substitute for the pipeline-step producer (architect's
     // note on #998): the scaler is opt-in per deployment, so it does not fire on
     // every ingest run and cannot alone populate the tab.
-    logSink: logStore,
+    //
+    // WRAPPED IN THE EMITTING WORKSPACE'S STACK (#998 review finding 2).
+    // `logStore` is a PerWorkspaceLogStore: every call resolves the AMBIENT
+    // request stack (src/data/per-workspace-repos.ts) and the scaler runs on a
+    // `setInterval`, outside any request — so a bare `logSink: logStore` wrote
+    // EVERY workspace's failures to the default stack, where
+    // GET /api/v1/logs for any other workspace could never see them. The sink
+    // therefore enters the stack the loop names before delegating, which is the
+    // same fix #1058 applied to the sibling repo-bridge hooks above
+    // (onDispatched / onJobInterrupted / onJobsDropped, all via
+    // inEncoreJobStack). `logScalerEvent` is fire-and-forget and swallows the
+    // rejection, so returning the promise cannot break the loop.
+    logSink: {
+      // `async` because LogSink.append is declared `LogRecord |
+      // Promise<LogRecord>` (src/services/log-store.ts LogSink.append) while
+      // inScalerStack takes a promise-returning callback. The append is still
+      // INVOKED synchronously inside the stack context, which is what the
+      // AsyncLocalStorage read in PerWorkspaceLogStore.store() needs.
+      append: (input, context) =>
+        inScalerStack(context?.workspaceId, async () => logStore.append(input))
+    },
     onJobsDropped: async (drops) => {
       for (const { encoreJobId, reason } of drops) {
         await inEncoreJobStack(encoreJobId, async () => {
@@ -2105,7 +2125,16 @@ async function deactivateScaler(): Promise<void> {
 // single-stack env-override deployment) is not a stack name and keeps the
 // default resolution.
 function inEncoreJobStack<T>(encoreJobId: string, fn: () => Promise<T>): Promise<T> {
-  const stackKey = decodeEncoreJobId(encoreJobId)?.workspaceId;
+  return inScalerStack(decodeEncoreJobId(encoreJobId)?.workspaceId, fn);
+}
+
+// Run a scaler-originated callback inside the stack it belongs to, given the
+// stack key directly. The shared core of inEncoreJobStack above: the loop's own
+// `workspaceId` IS that stack key, so a callback that already knows its
+// workspace (the #998 log sink) needs no job id to decode. DEPLOYMENT_CONTEXT —
+// a single-stack env-override deployment — is not a stack name and keeps the
+// default resolution, exactly as before.
+function inScalerStack<T>(stackKey: string | undefined, fn: () => Promise<T>): Promise<T> {
   return runWithRequestStack(
     stackKey && stackKey !== DEPLOYMENT_CONTEXT ? stackKey : undefined,
     fn

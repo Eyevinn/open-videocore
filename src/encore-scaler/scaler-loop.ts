@@ -40,7 +40,8 @@ import {
   requeueInterruptedByScaleDown
 } from './retry-store.js';
 import { probeCallbackTrust, buildCallbackUri } from './callback-trust-probe.js';
-import { logScalerEvent, type ScalerLogPhase } from './scaler-log.js';
+import { logScalerEvent, ScalerLogThrottle, type ScalerLogPhase } from './scaler-log.js';
+import { spawnFailureSecrets } from './spawn-failure.js';
 import { hasPendingPackaging } from './packaging-pin.js';
 import {
   ACTIVE_PAGE_SIZE,
@@ -170,6 +171,11 @@ export class EncoreScalerLoop {
   // instance has no usable idle timestamp, so the per-tick warning is throttled
   // instead of repeating every 10s until teardown.
   private readonly missingIdleStampWarnedAt = new Map<string, number>();
+  // #998 review finding 3: one log entry per (workspace, phase) per throttle
+  // window, with the collapsed repeats counted into the next entry. Owned by the
+  // loop — one loop per workspace, created once (workspace-registry.ts) — so the
+  // state lives exactly as long as the loop whose appends it is limiting.
+  private readonly logThrottle = new ScalerLogThrottle();
 
   constructor(private config: EncoreScalerConfig) {}
 
@@ -184,17 +190,39 @@ export class EncoreScalerLoop {
   // change behaviour. `phase` is what makes the entry filterable: it becomes the
   // `encore-scaler/<phase>: ` message prefix the `q` substring filter matches
   // (src/services/log-store.ts applyLogQuery).
+  //
+  // THROTTLED (#998 review finding 3). The log store keeps a bounded,
+  // oldest-first window of records (LOG_STORE_MAX_RECORDS, src/services/
+  // log-store.ts) and this loop ticks every 10s, so a workspace stuck in a
+  // failing state would otherwise evict the pipeline history the Logs tab exists
+  // for. At most one entry per (workspace, phase) per window reaches the store;
+  // the repeats in between are counted and reported in the next entry, the same
+  // single-record-plus-counter shape the spawn-failure record uses
+  // (src/encore-scaler/spawn-failure.ts). The first failure after a quiet period
+  // always goes through, and `console.error` below is untouched either way — the
+  // container log keeps every occurrence.
+  //
+  // REDACTED (#998 review finding 1). The error's text is scrubbed by
+  // `describeScalerError` -> `redactSpawnFailureMessage` before it is persisted;
+  // the literal secrets this workspace's OSC calls carry are passed in so the
+  // known-value pass can run, exactly as spawnInstance's failure path does
+  // (instance-pool.ts).
   private logFailure(
     phase: ScalerLogPhase,
     message: string,
     err?: unknown
   ): void {
+    if (!this.config.logSink) return;
+    const suppressed = this.logThrottle.admit(this.config.workspaceId, phase);
+    if (suppressed === undefined) return;
     logScalerEvent(this.config.logSink, {
       phase,
       level: 'error',
       workspaceId: this.config.workspaceId,
       message,
-      err
+      err,
+      secrets: spawnFailureSecrets(this.config),
+      suppressed
     });
   }
 

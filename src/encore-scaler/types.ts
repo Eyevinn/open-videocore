@@ -235,6 +235,17 @@ export type EncoreScalerConfig = {
   // not wired a store behave exactly as before. Every append is fire-and-forget
   // and never throws (see logScalerEvent), and the existing `console.error` at
   // each call site is kept, so this is purely additive.
+  //
+  // Two obligations on whoever wires this (#998 review):
+  //   - A STACK-DELEGATING sink must use the `ScalerLogContext.workspaceId`
+  //     passed to `append()`, not the ambient request stack: the loop runs on a
+  //     `setInterval` with no request context, so a sink that resolves the
+  //     ambient stack writes every workspace's failures to the default one.
+  //     main.ts wraps its PerWorkspaceLogStore accordingly.
+  //   - Appends are already RATE-LIMITED per (workspace, phase) by the loop
+  //     (ScalerLogThrottle), so a sink does not need its own throttle — and
+  //     must not assume one entry per failure: an entry can report collapsed
+  //     repeats.
   logSink?: import('./scaler-log.js').ScalerLogSink;
 };
 
