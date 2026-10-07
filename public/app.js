@@ -5660,20 +5660,35 @@ const SEARCH_FORMAT_PLACEHOLDER = 'video/mp4';
 const SEARCH_FORMAT_HINT =
   'Matches the extracted container format — "video/mp4", "mp4" and "mov" all match an MP4.';
 
+// Scope copy for the Search tab (issue #913). This tab is the only one whose
+// results include collections as well as assets — GET /api/v1/search/ returns
+// `{ assets, collections, ... }` and stamps each hit with a `type`
+// discriminator (verified: src/routes/search.ts collectionHitSchema
+// `type: z.literal('collection')`; openapi.json "/api/v1/search/").
+// Nothing in the UI said so, so the heading, the section title and the query
+// hint now name both kinds. Copy only: the request this tab sends is unchanged.
+const SEARCH_TAB_TITLE = 'Search everything';
+const SEARCH_SECTION_TITLE = 'Search assets and collections';
+const SEARCH_SCOPE_HINT =
+  'Full-text search across the whole workspace: assets and collections both match on ' +
+  'name, description and tags. Container format matches assets only.';
+
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
-  title.textContent = 'Search';
+  title.textContent = SEARCH_TAB_TITLE;
   container.appendChild(title);
 
   const section = document.createElement('div');
   section.className = 'section';
   section.innerHTML = [
-    '<div class="section-title">Search assets</div>',
+    '<div class="section-title">' + escHtml(SEARCH_SECTION_TITLE) + '</div>',
     '<div class="form-row">',
     '  <div class="form-field grow">',
     '    <label for="search-q">Query</label>',
-    '    <input type="text" id="search-q" placeholder="Full-text search…" />',
+    '    <input type="text" id="search-q" placeholder="Full-text search…"',
+    '      aria-describedby="search-scope-hint" />',
+    '    <div class="form-hint" id="search-scope-hint">' + escHtml(SEARCH_SCOPE_HINT) + '</div>',
     '  </div>',
     '  <div class="form-field">',
     '    <label for="search-tags">Tags (comma-separated)</label>',
@@ -8759,6 +8774,11 @@ export {
   renderSearchTab,
   SEARCH_FORMAT_LABEL,
   SEARCH_FORMAT_PLACEHOLDER,
+  // Search-tab scope copy (issue #913). Exported so a DOM/unit test can assert
+  // the tab says it covers collections as well as assets.
+  SEARCH_TAB_TITLE,
+  SEARCH_SECTION_TITLE,
+  SEARCH_SCOPE_HINT,
   // Per-instance capacity is read from the wire, not inferred (issue #979).
   // Exported so a DOM/unit test can assert the card reports the server's
   // `jobsPerInstance`.
