@@ -23,6 +23,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createLogsTable,
   buildLogsQuery,
+  isUnfilteredFirstPage,
+  LOGS_COPY,
   LOGS_NS,
   LOGS_PAGE_SIZE,
   LOGS_LIMIT_MAX,
@@ -236,5 +238,116 @@ describe('createLogsTable composition', () => {
 
   it('requires an apiFetch dependency', () => {
     expect(() => createLogsTable({} as never)).toThrow(/apiFetch/);
+  });
+});
+
+// ─── the two empty states (issue #997) ───────────────────────────────────────
+//
+// GET /api/v1/logs returns `{ items: [], nextCursor: null }` both when the store
+// has never been written to and when the filters match nothing, and the endpoint
+// exposes no "has ever been written" flag. The distinction is derived from the
+// reads it already answers: retention is count-based only (oldest-first eviction
+// at LOG_STORE_MAX_RECORDS, src/services/log-store.ts:143/:347 and
+// src/data/couch-log-repo.ts:157-164), so an UNFILTERED first page returning zero
+// items proves the store never received a write.
+
+async function settle(table: { reload: () => Promise<void> }) {
+  await table.reload();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+function emptyCell(el: HTMLElement) {
+  return el.querySelector('tr.ops-table-empty td');
+}
+
+describe('createLogsTable empty states (issue #997)', () => {
+  it('explains an unfiltered, never-written store instead of showing a no-results message', async () => {
+    const apiFetch = vi.fn().mockResolvedValue({ items: [], nextCursor: null });
+    const table = createLogsTable({ apiFetch, win: null });
+    document.body.appendChild(table.el);
+    await settle(table);
+
+    const cell = emptyCell(table.el)!;
+    expect(cell.getAttribute('data-empty')).toBe(LOGS_COPY.emptyNeverWrittenKind);
+    // Headline says the store is empty — never that a filter excluded anything.
+    expect(cell.firstChild?.textContent).toBe(LOGS_COPY.emptyNeverWritten);
+    expect(cell.textContent).not.toContain(LOGS_COPY.emptyFiltered);
+    // And a detail line says why, and what makes entries appear.
+    const detail = cell.querySelector('.ops-table-empty-detail')!;
+    expect(detail.textContent).toBe(LOGS_COPY.emptyNeverWrittenDetail);
+  });
+
+  it('shows the ordinary no-results message when a filtered page comes back empty', async () => {
+    const win = {
+      location: { search: '?logs.q=nothing-matches-this', pathname: '/', hash: '' },
+      history: { replaceState: vi.fn(), pushState: vi.fn(), state: null },
+    } as unknown as Window;
+    const apiFetch = vi.fn().mockResolvedValue({ items: [], nextCursor: null });
+    const table = createLogsTable({ apiFetch, win });
+    document.body.appendChild(table.el);
+    await settle(table);
+
+    const cell = emptyCell(table.el)!;
+    // A filtered empty page proves nothing about the store, so it must NOT be
+    // promoted to the explanatory state.
+    expect(cell.getAttribute('data-empty')).toBe(LOGS_COPY.emptyFilteredKind);
+    expect(cell.textContent).toBe(LOGS_COPY.emptyFiltered);
+    expect(cell.querySelector('.ops-table-empty-detail')).toBeNull();
+  });
+
+  it('keeps the ordinary no-results message once real entries have been seen', async () => {
+    const apiFetch = vi
+      .fn()
+      .mockResolvedValueOnce({ items: makeLogs(), nextCursor: null })
+      .mockResolvedValue({ items: [], nextCursor: null });
+    const win = {
+      location: { search: '', pathname: '/', hash: '' },
+      history: { replaceState: vi.fn(), pushState: vi.fn(), state: null },
+    } as unknown as Window;
+    const table = createLogsTable({ apiFetch, win });
+    document.body.appendChild(table.el);
+    await settle(table);
+    expect(table.el.querySelectorAll('tbody tr[data-row-key]').length).toBe(5);
+
+    // Filter down to nothing: entries provably exist, so this is a plain
+    // no-results state, not the never-written one.
+    table.state.setFilter('q', 'no-such-message');
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const cell = emptyCell(table.el)!;
+    expect(cell.getAttribute('data-empty')).toBe(LOGS_COPY.emptyFilteredKind);
+    expect(cell.textContent).toBe(LOGS_COPY.emptyFiltered);
+  });
+
+  it('keeps the two empty states textually and structurally distinct', () => {
+    expect(LOGS_COPY.emptyNeverWritten).not.toBe(LOGS_COPY.emptyFiltered);
+    expect(LOGS_COPY.emptyNeverWrittenKind).not.toBe(LOGS_COPY.emptyFilteredKind);
+    // The never-written copy must not blame the filters…
+    expect(LOGS_COPY.emptyNeverWritten.toLowerCase()).not.toContain('filter');
+    // …and the ordinary one must not claim nothing was ever recorded.
+    expect(LOGS_COPY.emptyFiltered.toLowerCase()).toContain('filter');
+  });
+});
+
+describe('isUnfilteredFirstPage', () => {
+  it('is true for the newest page of the whole store, whatever the order', () => {
+    expect(isUnfilteredFirstPage({ filters: {} })).toBe(true);
+    expect(isUnfilteredFirstPage({ filters: { from: '', to: '', q: '  ' }, cursor: null })).toBe(true);
+    expect(isUnfilteredFirstPage({ filters: {}, sort: { columnKey: 'timestamp', direction: 'asc' } })).toBe(true);
+  });
+
+  it('is false once any server-side filter or a cursor narrows the read', () => {
+    expect(isUnfilteredFirstPage({ filters: { q: 'ingest' } })).toBe(false);
+    expect(isUnfilteredFirstPage({ filters: { from: '2026-01-01' } })).toBe(false);
+    expect(isUnfilteredFirstPage({ filters: { to: '2026-01-01' } })).toBe(false);
+    expect(isUnfilteredFirstPage({ filters: {}, cursor: 'opaque-1' })).toBe(false);
+  });
+
+  it('tolerates a missing/garbage snapshot', () => {
+    expect(isUnfilteredFirstPage(undefined)).toBe(true);
+    expect(isUnfilteredFirstPage({})).toBe(true);
   });
 });

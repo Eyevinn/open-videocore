@@ -147,6 +147,11 @@ const jobSchema = z.object({
 type JobsRouterOptions = {
   repository?: JobRepository;
   redis?: Redis; // for Encore instance lookup
+  // Resolves the Valkey holding the scaler state of the stack a job was
+  // dispatched on (every scaler key lives on the job's own stack's Valkey,
+  // #615). Preferred over `redis`, which is the first stack's connection and
+  // reads an empty namespace for a job on any other stack.
+  redisForJob?: (encoreJobId: string) => Promise<Redis | undefined>;
   pipelineRepository?: PipelineRepository; // to release the running pipeline lock on cancel
   // Resolves `assetName` on read (issue #988). OPTIONAL, like every other repo
   // on this router: without it jobs are served exactly as before, with no
@@ -319,7 +324,10 @@ export const jobsRouter: FastifyPluginAsync<JobsRouterOptions> = async (fastify,
       // Annotate with the Encore pool instance that is (or was) running this job.
       // Read from opts live so a stack provisioned after startup (which activates
       // the scaler and sets opts.redis) is picked up without a restart (#103).
-      const redis = opts.redis;
+      const redis =
+        job.encoreJobId && opts.redisForJob
+          ? await opts.redisForJob(job.encoreJobId).catch(() => undefined)
+          : opts.redis;
       if (redis && job.encoreJobId) {
         try {
           const decoded = decodeEncoreJobId(job.encoreJobId);
