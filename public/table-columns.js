@@ -1,8 +1,11 @@
 /**
  * open-videocore ops dashboard — table-columns.js
  *
- * Column visibility for ops-UI tables (issue #959, broken out of #856): the
- * model, the per-operator persistence, and the chooser control.
+ * Column visibility for ops-UI tables (issues #959/#960, broken out of #856): the
+ * model, the per-operator persistence, the load-time precedence rule, and the
+ * chooser control. Table-agnostic from the start, and shared by the assets, jobs
+ * and logs tables since #960 — every table-specific decision (the column set, the
+ * "cannot hide" rules, the namespace) is an input, never a constant in here.
  *
  * WHAT THIS IS
  *   One table-agnostic answer to "which of this table's declared columns are
@@ -67,7 +70,14 @@ export function columnPrefKey(ns) {
 }
 
 function storageOf(win) {
-  const w = win || (typeof window !== 'undefined' ? window : undefined);
+  // `undefined` (or an absent argument) means "use the ambient window". Any
+  // OTHER value is taken at face value, so an explicit `null` opts OUT of
+  // storage instead of silently falling back to the real window: a caller or a
+  // test that injects `win: null` to run without persistence has to be able to
+  // rely on nothing being read from or written to this browser's localStorage
+  // (issue #960 review). Truthy-but-storage-less windows still land on the
+  // `!w.localStorage` / throw paths below.
+  const w = win === undefined ? (typeof window !== 'undefined' ? window : undefined) : win;
   if (!w) return null;
   try {
     // Touching localStorage itself can throw when storage is blocked by policy.
@@ -140,6 +150,70 @@ export function clearStoredColumns(ns, win) {
   }
 }
 
+/**
+ * Decide a table's INITIAL visible set, and whether that set is an EXPLICIT
+ * operator choice. This is the persistence precedence rule stated once, for every
+ * table (issue #960): it was written per-table for the assets table in #959, and
+ * jobs/logs must not each re-derive it or they will drift.
+ *
+ * Precedence, highest first:
+ *   1. the `cols` param already decoded from the URL — a shared link must
+ *      reproduce the sender's view, the same rule sort/filter/page follow. It
+ *      beats storage so that opening a colleague's link does not silently apply
+ *      your own preference.
+ *   2. this browser's stored default for `ns` — an operator who shaped the table
+ *      once should not have to reshape it on every bare visit.
+ *   3. every declared column.
+ *
+ * `explicit` is what decides whether the set is mirrored back into the URL: cases
+ * 1 and 2 are real choices worth encoding, case 3 is the absence of one and stays
+ * out of the query string so a default view still has a clean URL.
+ *
+ * Every candidate goes through normalizeVisibleColumns(), so a hand-edited param,
+ * a set stored before a column was renamed, or one that would empty a required
+ * group is REPAIRED rather than honoured or rejected.
+ *
+ * @param {object} options
+ * @param {string[]|null} [options.urlCols]  decoded `<ns>.cols` (null = absent).
+ * @param {string} options.ns                storage/URL namespace for this table.
+ * @param {Array} options.columns            the table's declared columns.
+ * @param {string[][]} [options.requireAtLeastOne]
+ * @param {Window|null} [options.win]        injectable window (tests). An
+ *        explicit `null` means "no window", so nothing is read from storage;
+ *        omitting it falls back to the ambient `window`.
+ * @param {string[]|null} [options.stored]   pre-read stored set; when `undefined`
+ *        it is read from storage for `ns`. Lets a caller/test supply one directly,
+ *        or pass `null` to opt out of storage entirely.
+ * @returns {{keys:string[], explicit:boolean, source:'url'|'stored'|'default'}}
+ */
+export function resolveInitialColumns(options) {
+  const o = options || {};
+  const columns = Array.isArray(o.columns) ? o.columns : [];
+  const opts = { requireAtLeastOne: o.requireAtLeastOne };
+
+  const urlCols = cleanKeyList(o.urlCols);
+  if (urlCols) {
+    return { keys: normalizeVisibleColumns(urlCols, columns, opts), explicit: true, source: 'url' };
+  }
+
+  // `undefined` (including the key simply being absent) means "read storage";
+  // anything else — a list, or an explicit null — is taken at face value.
+  const stored = o.stored !== undefined ? cleanKeyList(o.stored) : readStoredColumns(o.ns, o.win);
+  if (stored && stored.length) {
+    return {
+      keys: normalizeVisibleColumns(stored, columns, opts),
+      explicit: true,
+      source: 'stored',
+    };
+  }
+
+  return {
+    keys: normalizeVisibleColumns(null, columns, opts),
+    explicit: false,
+    source: 'default',
+  };
+}
+
 // De-dupe / trim an arbitrary key list. Returns null for "nothing usable" so the
 // empty list can never be mistaken for a deliberate "show no columns".
 function cleanKeyList(v) {
@@ -158,11 +232,31 @@ function cleanKeyList(v) {
 
 // ─── Model ───────────────────────────────────────────────────────────────────
 
-function declaredKeys(columns) {
+/**
+ * The keys a column set DECLARES, in render order — the single definition of a
+ * table's column vocabulary.
+ *
+ * Exported (issue #960 review, finding 2) so a table DERIVES its exported key
+ * list from its own buildColumns() rather than maintaining a parallel
+ * hand-written array. A second list is a second source of truth, and the two
+ * drift silently the first time a column is added, renamed or removed in only
+ * one of them — exactly the drift the exported constants exist to prevent.
+ *
+ * Non-string and empty keys are dropped, so a malformed column definition can
+ * never contribute a phantom key to a URL param or a stored preference.
+ *
+ * @param {Array<{key?:string}>} columns
+ * @returns {string[]} declared keys, in declaration order.
+ */
+export function columnKeysOf(columns) {
   return (Array.isArray(columns) ? columns : [])
     .map((c) => c && c.key)
     .filter((k) => typeof k === 'string' && k.length > 0);
 }
+
+// Internal alias — the model below reads as "the declared keys" at its call
+// sites, and there is still only one implementation.
+const declaredKeys = columnKeysOf;
 
 /** A column is hideable unless it opts out with `hideable: false`. */
 export function isHideable(col) {
@@ -176,6 +270,39 @@ function groupsOf(options) {
     .filter((g) => Array.isArray(g))
     .map((g) => g.filter((k) => typeof k === 'string' && k.length > 0))
     .filter((g) => g.length > 0);
+}
+
+/**
+ * Keys named by a table's `requireAtLeastOne` rules that the table does not
+ * actually declare — i.e. the other half of the drift finding 2 is about.
+ *
+ * A lock rule that names a column which no longer exists is not an error the
+ * model can repair, it is a QUIETER rule: normalizeVisibleColumns() only ever
+ * restores `declared.find(k => group.includes(k))`, so an undeclared member can
+ * never be the column that comes back, and a group whose members are ALL
+ * undeclared stops being enforced altogether (nothing is restored, and
+ * lockedColumnKeys() never disables a toggle for it). The operator can then
+ * reach exactly the state the rule was written to prevent.
+ *
+ * Returned rather than thrown: callers report it as a dev-time invariant, because
+ * a mis-stated lock rule must never stop a table from rendering.
+ *
+ * @param {Array<{key?:string}>} columns  the table's declared columns.
+ * @param {string[][]} groups             its requireAtLeastOne rules.
+ * @returns {string[]} the undeclared keys, de-duped; empty when all are in step.
+ */
+export function undeclaredGroupKeys(columns, groups) {
+  const declared = new Set(columnKeysOf(columns));
+  const out = [];
+  const seen = new Set();
+  for (const group of groupsOf({ requireAtLeastOne: groups })) {
+    for (const key of group) {
+      if (declared.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      out.push(key);
+    }
+  }
+  return out;
 }
 
 /**

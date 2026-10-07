@@ -127,18 +127,23 @@
  * on a minimum term length. Enter is a shortcut that flushes a debounce still in
  * flight, never a requirement. See searchFilterControl() below.
  *
- * COLUMN VISIBILITY (issue #959). The operator chooses which of the eight declared
+ * COLUMN VISIBILITY (issues #959/#960). The operator chooses which of the eight declared
  * columns are rendered. This is VIEW state and touches NO part of the request: the
  * two tiers above, their params, the client sort and the paging window are all
  * computed from `snap.sort` / `snap.filters` / `snap.offset`, none of which the
  * chooser writes. Hiding the Created column does not stop the table sorting by
  * createdAt, and hiding Status does not drop the `status` param — so `total` and
  * which rows a page reaches are unchanged by definition, not by convention.
- * Resolution order on load is URL -> stored per-operator default -> all columns;
- * see resolveInitialColumns() below. The chooser's "Reset to defaults" (issue
- * #962) unwinds that same ladder from the top: it clears the `assets.cols` param
- * AND this browser's stored default, so the table falls back to the declared set
- * and stays there on refresh and on the next visit alike.
+ * Resolution order on load is URL -> stored per-operator default -> all columns.
+ * That rule, the storage write, the chooser wiring and the "Reset to defaults"
+ * action (issue #962) now live in the shared primitive (createColumnVisibility in
+ * public/ops-ui-table.js, issue #960), so the jobs and logs tables share ONE
+ * implementation with this one. What stays here is only what is assets-specific:
+ * the declared keys (ASSETS_COLUMN_KEYS), the lock rule
+ * (ASSETS_REQUIRED_COLUMN_GROUPS) and the URL mirror. Reset still unwinds the
+ * same ladder from the top — it clears the `assets.cols` param AND this browser's
+ * stored default, so the table falls back to the declared set and stays there on
+ * refresh and on the next visit alike.
  *
  * ROW RENAME (issue #927). The Actions column carries a Rename control, so an
  * operator renames an asset from the list without opening the detail pane. The
@@ -160,6 +165,7 @@
  */
 
 import {
+  createColumnVisibility,
   createOpsTable,
   escHtml,
   PAGING_OFFSET,
@@ -171,15 +177,12 @@ import {
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
-// Column visibility (issue #959). Model + per-operator persistence + the chooser
-// control all live in one module so any ops table can adopt the same pattern; see
-// the COLUMN VISIBILITY block below for how this table resolves its set.
-import {
-  normalizeVisibleColumns,
-  readStoredColumns,
-  writeStoredColumns,
-  clearStoredColumns,
-} from './table-columns.js';
+// Column visibility (issue #959, lifted into the shared primitive in #960). The
+// model, the per-operator persistence, the chooser control and the reset action
+// (#962) live in public/table-columns.js; createColumnVisibility() above is the
+// primitive's wiring for them, so this table declares only what is ITS own: the
+// column set, the lock rule, and where the choice goes in the URL. See the COLUMN
+// VISIBILITY block below.
 // Presigned thumbnail loading (issue #801). The thumbnail cell is rendered
 // src-less and filled in after each render — see hydrateThumbnails() below and
 // the contract grounding in public/thumbnail-url.js.
@@ -993,39 +996,6 @@ function buildColumns(renderCtx) {
   return renderCtx.selectable ? [selectColumn, ...dataColumns] : dataColumns;
 }
 
-// ─── Column visibility resolution (issue #959) ────────────────────────────────
-//
-// Decide the initial visible set and whether it counts as an EXPLICIT choice.
-// Precedence, highest first:
-//   1. `assets.cols` in the URL — a shared link must reproduce the sender's view,
-//      the same rule sort/filter/page already follow. Beats storage so that
-//      opening a colleague's link does not silently apply your own preference.
-//   2. this browser's stored default — an operator who shaped the table once
-//      should not have to reshape it on every bare visit.
-//   3. every declared column.
-//
-// `explicit` is what decides whether the set is mirrored into the URL: cases 1 and
-// 2 are real choices worth encoding, case 3 is the absence of one and stays out of
-// the query string so a default view still has a clean URL.
-//
-// Both stored and URL values are passed through normalizeVisibleColumns(), so a
-// hand-edited param, a set saved before a column was renamed, or one that would
-// empty the required group is repaired rather than honoured or rejected.
-function resolveInitialColumns(urlCols, storedCols, columns) {
-  const opts = { requireAtLeastOne: ASSETS_REQUIRED_COLUMN_GROUPS };
-  if (urlCols && urlCols.length) {
-    return { keys: normalizeVisibleColumns(urlCols, columns, opts), explicit: true, source: 'url' };
-  }
-  if (storedCols && storedCols.length) {
-    return {
-      keys: normalizeVisibleColumns(storedCols, columns, opts),
-      explicit: true,
-      source: 'stored',
-    };
-  }
-  return { keys: normalizeVisibleColumns(null, columns, opts), explicit: false, source: 'default' };
-}
-
 // ─── Thumbnail hydration (issue #801) ─────────────────────────────────────────
 //
 // Fill in the src of every thumbnail <img> on the page of rows just rendered.
@@ -1144,6 +1114,31 @@ export function createAssetsTable(deps) {
     selection,
   });
 
+  // Column visibility (issues #959/#960). The shared primitive owns the
+  // precedence rule (URL -> stored default -> every declared column), the storage
+  // write and the reset action (#962); this table supplies only its own column
+  // set, its own lock rule and what to do once a choice is made.
+  const columnVisibility = createColumnVisibility({
+    ns: ASSETS_NS,
+    columns,
+    urlCols: urlState.cols,
+    requireAtLeastOne: ASSETS_REQUIRED_COLUMN_GROUPS,
+    label: 'Columns',
+    win,
+    // Mirror the choice into the URL so the view stays shareable. Deliberately
+    // syncUrl() and NOT reload(): the request is identical, so re-issuing it would
+    // be a wasted round-trip and a visible loading flash for a repaint.
+    onChange: function () {
+      syncUrl(table.state.getState());
+    },
+    // Reset to defaults (issue #962). The primitive has already forgotten the
+    // stored default and dropped `explicit`, so syncUrl() now writes a URL with
+    // no `assets.cols` param — the other half of the undo.
+    onReset: function () {
+      syncUrl(table.state.getState());
+    },
+  });
+
   function selectedIds() {
     return [...selection.keys()];
   }
@@ -1160,12 +1155,6 @@ export function createAssetsTable(deps) {
     }
   }
 
-  // Initial visible column set (issue #959): URL -> stored default -> all.
-  const columnChoice = resolveInitialColumns(
-    urlState.cols,
-    readStoredColumns(ASSETS_NS, win),
-    columns
-  );
 
   const filters = [
     { name: 'status', control: asSlot(statusFilterControl(initialFilters.status)) },
@@ -1188,50 +1177,11 @@ export function createAssetsTable(deps) {
     initialFilters,
     rowKey: (a) => a && a.id,
     emptyText: 'No assets found.',
-    // Column chooser (issue #959). The primitive mounts the control and repaints;
-    // this callback owns the two places the choice is remembered.
-    columnChooser: {
-      visible: columnChoice.keys,
-      requireAtLeastOne: ASSETS_REQUIRED_COLUMN_GROUPS,
-      label: 'Columns',
-      onChange: function (keys) {
-        columnChoice.keys = keys;
-        columnChoice.explicit = true;
-        // This browser's default for the next bare visit. Best-effort: a blocked
-        // or full localStorage costs the operator a remembered preference, never
-        // the table.
-        writeStoredColumns(ASSETS_NS, keys, win);
-        // And the URL, so the view stays shareable. Deliberately syncUrl() and
-        // NOT reload(): the request is identical, so re-issuing it would be a
-        // wasted round-trip and a visible loading flash for a repaint.
-        syncUrl(table.state.getState());
-      },
-      // Reset to defaults (issue #962) — the exact inverse of onChange above, and
-      // it has to undo BOTH of its writes. Clearing only one is not a partial
-      // reset, it is no reset at all: a surviving `cols` param re-applies on this
-      // refresh, and a surviving stored default re-applies on the next bare visit.
-      // `keys` is the declared default set the primitive has already painted, so
-      // this callback only forgets.
-      onReset: function (keys) {
-        columnChoice.keys = keys;
-        // 1) The URL half. Dropping `explicit` is what removes the param rather
-        //    than rewriting it: syncUrl sends `cols: null`, and encodeTableState
-        //    clears every param in this namespace before writing back only the
-        //    non-default ones — so `assets.cols` simply does not come back.
-        columnChoice.explicit = false;
-        // 2) The stored half. Best-effort like the write it undoes; a blocked
-        //    store had nothing to forget in the first place.
-        clearStoredColumns(ASSETS_NS, win);
-        syncUrl(table.state.getState());
-      },
-      // Whether there is anything left to reset, so the action is greyed out in a
-      // view that is already pristine. `explicit` covers both a choice made in
-      // this session and one the URL arrived with; the stored read covers a
-      // default saved in an earlier one.
-      isCustomized: function () {
-        return columnChoice.explicit || readStoredColumns(ASSETS_NS, win) != null;
-      },
-    },
+    // Column chooser (issues #959/#960) — the config the shared wiring built.
+    columnChooser: columnVisibility.chooser,
+    // Re-wire row interactions after EVERY repaint, not just after a fetch: a
+    // column toggle rebuilds the tbody without one (issue #960).
+    onRowsRendered: wireRowHandlers,
   });
 
   // No page-scoped-narrowing caveat here by design: status and from/to are
@@ -1281,7 +1231,7 @@ export function createAssetsTable(deps) {
         to: snap.filters.to || null,
         page,
         size: snap.pageSize,
-        cols: columnChoice.explicit ? columnChoice.keys : null,
+        cols: columnVisibility.urlCols(),
       },
       ASSETS_NS,
       { defaults: URL_DEFAULTS, replace: true, win }
@@ -1312,8 +1262,10 @@ export function createAssetsTable(deps) {
       // Status column's lock flag reads it (issue #894).
       projection.carriesLock = page1.projectionCarriesLock !== false;
       table.state.setPageInfo({ total });
+      // setRows() repaints, and the primitive calls wireRowHandlers() for us via
+      // `onRowsRendered` — the same path a column toggle takes, so the handlers
+      // are attached exactly once per repaint however the repaint was provoked.
       table.setRows(rows);
-      wireRowHandlers();
     } catch (err) {
       table.setStatus('error', 'Failed to load assets: ' + (err && err.message ? err.message : err));
     } finally {
@@ -1325,9 +1277,12 @@ export function createAssetsTable(deps) {
     }
   }
 
-  // Attach row-level interactions after each render (rows are rebuilt each load).
-  function wireRowHandlers() {
-    const tbody = table.el.querySelector('tbody');
+  // Attach row-level interactions after each repaint (rows are rebuilt every
+  // time, by a fetch OR by a column toggle). Takes the tbody the primitive hands
+  // it so it does not have to reach back through `table` — which is still being
+  // constructed the first time the primitive paints.
+  function wireRowHandlers(tbodyEl) {
+    const tbody = tbodyEl || table.el.querySelector('tbody');
     if (!tbody) return;
 
     // Thumbnails are rendered src-less and resolved here (issue #801).
@@ -1511,9 +1466,10 @@ export function createAssetsTable(deps) {
     clearSelection,
     // Exposed for tests/consumers that want to drive the primitive directly.
     state: table.state,
-    // Column visibility (issue #959), for consumers/tests that want to read or
-    // drive the chosen set without going through the chooser's DOM.
+    // Column visibility (issues #959/#960), for consumers/tests that want to read
+    // or drive the chosen set without going through the chooser's DOM.
     getVisibleColumns: table.getVisibleColumns,
+    setVisibleColumns: table.setVisibleColumns,
     _table: table,
   };
 }
