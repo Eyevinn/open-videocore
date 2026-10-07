@@ -523,7 +523,8 @@ function statusFilterControl(initial) {
 // input reserves the room; see `.ops-search-*` in public/style.css). The magnifier
 // is drawn in CSS from a bordered circle and a rotated handle: `public/` has no
 // icon set, no icon font and no inline SVG (see the note in public/lock-state.js),
-// and a filter affordance is not the right place to introduce one. It is purely
+// and a filter affordance is not the right place to introduce one. The copy-id
+// control's glyph (issue #990) is drawn the same way, for the same reason. It is purely
 // decorative — `aria-hidden`, not focusable — because the input already carries
 // its own accessible name.
 function searchFilterControl(initial) {
