@@ -86,7 +86,7 @@ export async function submitTranscode(
     auditLog?: AuditErrorLog;
     // Best-effort operational log emission (issue #995). Optional, exactly like
     // `audit` above: when absent no log record is appended and behaviour is
-    // unchanged. Wired to the in-memory LogStore that backs GET /api/v1/logs
+    // unchanged. Wired to the log store that backs GET /api/v1/logs
     // (src/main.ts, `logStore`).
     pipelineLog?: PipelineLogSink;
   }

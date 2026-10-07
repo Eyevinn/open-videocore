@@ -63,14 +63,13 @@
  *       (storage-backend-registry.ts:57), mirrored as
  *       `OSC_MANAGED_DEFAULT_ID` below.
  *
- *   Write — `POST /api/v1/assets/{id}/deliver` (issue #1131, PR #1158)
+ *   Write — `POST /api/v1/assets/{id}/deliver` (issue #1131, PR #1158 — merged)
  *     Handler: `app.post('/:id/deliver', …)`, src/routes/assets.ts (the
  *       "Deliver an EXISTING asset to a registered export destination" block).
- *       Verified on branch `issue-1131/deliver-endpoint`, which also adds
- *       `openapi.json .paths["/api/v1/assets/{id}/deliver"].post`. That PR is
- *       open at the time of writing, so this module is written against the
- *       endpoint's declared contract and its tests stub it; nothing here
- *       requires a live backend.
+ *       Re-verified after #1158 merged, against the generated spec now on main:
+ *       `openapi.json .paths["/api/v1/assets/{id}/deliver"].post`. The shape
+ *       below is that entry, not an anticipated one. This module's tests still
+ *       stub the endpoint; nothing here requires a live backend.
  *     parameters: exactly one — path `id` (string, required). No query params.
  *     requestBody: `required: true`, `application/json`, schema
  *       `{ destination: string(minLength 1, maxLength 256) }` — the ONLY
