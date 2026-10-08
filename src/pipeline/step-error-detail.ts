@@ -136,7 +136,11 @@ export const stepErrorDetailSchema = z.object({
         .describe(
           'The source location the failing read was pointed at, with ' +
             'credentials redacted. Never contains userinfo or a presigned query ' +
-            'string.'
+            'string. A NORMALISED form, not a verbatim copy of the location in ' +
+            'the underlying error text: trailing sentence punctuation is ' +
+            'trimmed and userinfo/query strings are removed, so compare it by ' +
+            'bucket/key rather than by exact string equality with a URL you ' +
+            'submitted.'
         ),
       bucket: z.string().optional().describe('Bucket, when the location was an s3:// URI.'),
       key: z.string().optional().describe('Object key, when the location was an s3:// URI.')
