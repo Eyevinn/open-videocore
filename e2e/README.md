@@ -6,7 +6,7 @@ The end-to-end suite and the runner that tests the beta image on OSC (eng-open-v
 
 | Path | What |
 |---|---|
-| `suite/cases.mjs` | the 11 cases (health, auth-required, auth-accepted, ingest-url, metadata, thumbnails, transcode, package, search, tags-roundtrip, delete) |
+| `suite/cases.mjs` | the 12 cases (health, auth-required, app-auth-required, auth-accepted, ingest-url, metadata, thumbnails, transcode, package, search, tags-roundtrip, delete) |
 | `suite/run.mjs`, `suite/cli.mjs` | runs the cases in order; a failed chain case marks the rest `skipped`; deletes its asset on the way out |
 | `runner/cycle.mjs` | one runner cycle: read the commit from the `:latest` image label; skip if that commit already has a green or red result, create-or-restart the instance, wait for `/health` `build.commit` to equal `main`'s head, run the suite, record. Statuses: `green`, `red`, `stale`, `infra-error` |
 | `runner/adapters.mjs` | the `:latest` image's digest and commit (registry label), OSC instance create/restart (beta channel), `/health` probe |
@@ -31,7 +31,9 @@ GHCR_USER=... GHCR_TOKEN=... OSC_ACCESS_TOKEN=... E2E_INSTANCE_OSC_ACCESS_TOKEN=
 ## What the first live runs taught us (2026-10-08)
 
 - Instances created with `createInstance()` are on the **stable** channel (`channel: stable`, image `:stable`). A beta instance needs `POST <service apiUrl>?beta=true`; the runner now does that and removes a stable instance it finds.
-- The platform ingress answers **every** anonymous request with nginx's 401, `/health` included, and authenticates `x-jwt: Bearer <service access token>`, not `Authorization`. So the `auth-required` case only proves the instance is not publicly open; it cannot test the application's own auth gate (#711) from outside.
+- Two layers authenticate a call. The platform ingress answers **every** anonymous request with nginx's 401, `/health` included, and wants `x-jwt: Bearer <service access token>`. The application then wants `Authorization: Bearer <non-empty>` (a presence check; `src/auth/middleware.ts`) and answers `401 missing access token` without it; the ingress does not translate one into the other (the platform's own `call-service-endpoint` hits the same 401 on `/api/v1/assets/`). The client sends both. `auth-required` (anonymous) proves the instance is not publicly open; `app-auth-required` (`x-jwt` only) reaches the application's own gate, the #711 regression guard.
+- `restartInstance()` returns before the old pod is gone and `waitForInstanceReady()` sees the old pod as ready, so the first registry-based run finished in 4 s against what was probably the pre-restart pod. The adapter now waits for a `Server listening` log line newer than the restart request.
+- The job platform appears to **re-run a job that exits non-zero** shortly afterwards (about 20 s later, repeatedly), despite documenting no retries. The runner therefore exits 0 for every recorded verdict and non-zero only when it itself breaks; the verdict is in the bucket.
 - The platform builds the image without git metadata: on a live **beta** instance `/health` reports `build.commit`, `build.sourceDigest` and `version` as `unknown`, so nothing in `/health` identifies the build (the product's `scripts/source-digest.mjs` only works when its own Dockerfile does the build). Identity therefore comes from the registry: the image's label `io.osaas.repo.commit`, read before the restart and again when the instance is ready.
 
 ## What is and isn't verified

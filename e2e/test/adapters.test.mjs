@@ -46,7 +46,7 @@ test('registry: 401 on the token exchange, a missing label, or a malformed label
 });
 
 // A fake @osaas/client-core that records every call.
-function fakeCore({ existing, images = ['ghcr.io/eyevinn-osaas/open-videocore:latest'] }) {
+function fakeCore({ existing, images = ['ghcr.io/eyevinn-osaas/open-videocore:latest'], logs }) {
   const calls = []; let present = existing;
   class Context {
     constructor(cfg) { calls.push(['Context', cfg]); }
@@ -67,6 +67,7 @@ function fakeCore({ existing, images = ['ghcr.io/eyevinn-osaas/open-videocore:la
     removeInstance: async () => { calls.push(['removeInstance']); present = false; },
     restartInstance: async () => { calls.push(['restartInstance']); },
     waitForInstanceReady: async () => { calls.push(['wait']); },
+    getLogsForInstance: async () => { calls.push(['logs']); return typeof logs === 'function' ? logs() : [JSON.stringify({ time: Date.now() + 1000, msg: 'Server listening at http://127.0.0.1:8080' })]; },
   } };
 }
 const env = { OSC_ACCESS_TOKEN: 'pat', E2E_INSTANCE_OSC_ACCESS_TOKEN: 'o', E2E_PARAMETER_STORE_API_KEY: 'k', E2E_PARAMETER_STORE: 'ps', E2E_MINIO_ROOT_PASSWORD: 'm', E2E_COUCHDB_ADMIN_PASSWORD: 'c' };
@@ -119,4 +120,21 @@ test('healthProbe: sends x-jwt, returns the build, undefined on 401 or network e
   assert.equal(seen[0][1]['x-jwt'], 'Bearer T');
   assert.equal(await healthProbe({ baseUrl: 'https://i', token: 'T' }, async () => ({ ok: false, status: 401 })), undefined);
   assert.equal(await healthProbe({ baseUrl: 'https://i', token: 'T' }, async () => { throw new Error('net'); }), undefined);
+});
+
+test('osc: a restart is only trusted once a "Server listening" line newer than the restart appears', async () => {
+  let polls = 0; let t = 1_000_000;
+  const fresh = () => ++polls < 3
+    ? [JSON.stringify({ time: t - 600_000, msg: 'Server listening at http://old' }), 'not json at all', JSON.stringify({ time: t, msg: 'something else' })]
+    : [JSON.stringify({ time: t + 5000, msg: 'Server listening at http://new' })];
+  const { calls, core } = fakeCore({ existing: true, logs: fresh });
+  await oscInstanceAdapter({ name: 'ovce2e', env, importCore: async () => core, sleep: async () => {}, now: () => t, freshPodMs: 60_000 }).ensureFresh();
+  assert.equal(calls.filter((c) => c[0] === 'logs').length, 3);
+});
+
+test('osc: if no new pod ever starts, ensureFresh fails instead of returning the pre-restart pod', async () => {
+  let t = 1_000_000;
+  const { core } = fakeCore({ existing: true, logs: () => [JSON.stringify({ time: t - 600_000, msg: 'Server listening at http://old' })] });
+  const adapter = oscInstanceAdapter({ name: 'ovce2e', env, importCore: async () => core, sleep: async () => { t += 30_000; }, now: () => t, freshPodMs: 60_000 });
+  await assert.rejects(adapter.ensureFresh(), /pre-restart pod/);
 });

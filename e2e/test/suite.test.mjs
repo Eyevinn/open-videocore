@@ -10,6 +10,7 @@ async function run(faults = {}, cfg = {}) {
     const result = await runSuite({
       client: createClient({ baseUrl: mock.baseUrl, token: mock.token }),
       anon: createClient({ baseUrl: mock.baseUrl }),
+      ingress: createClient({ baseUrl: mock.baseUrl, token: mock.token, appToken: '' }),
       config: { ...fastCfg, ...cfg },
     });
     return { result, mock };
@@ -20,15 +21,28 @@ const byId = (r) => Object.fromEntries(r.cases.map((c) => [c.id, c]));
 test('green against a contract-conformant instance, and cleans up its asset', async () => {
   const { result, mock } = await run();
   assert.equal(result.status, 'green', JSON.stringify(result.cases.filter((c) => c.status !== 'pass')));
-  assert.equal(result.cases.length, 11);
+  assert.equal(result.cases.length, 12);
   assert.equal(mock.assets.size, 0);
   assert.equal(result.build.commit, 'abc1234');
 });
 
-test('anonymous access allowed -> auth-required fails (regression guard for #711)', async () => {
-  const { result } = await run({ openAuth: true });
+test('a fully open service (no ingress wall, no application gate) fails both auth cases', async () => {
+  const { result } = await run({ openAuth: true, appOpen: true });
   assert.equal(result.status, 'red');
   assert.equal(byId(result)['auth-required'].status, 'fail');
+  assert.equal(byId(result)['app-auth-required'].status, 'fail');
+});
+
+test('ingress open but the application still gates: auth-required passes only because the app rejects, app-auth-required passes', async () => {
+  const { result } = await run({ openAuth: true });
+  assert.equal(byId(result)['app-auth-required'].status, 'pass');
+});
+
+test('application without its own auth gate -> app-auth-required fails (regression guard for #711)', async () => {
+  const { result } = await run({ appOpen: true });
+  assert.equal(result.status, 'red');
+  assert.equal(byId(result)['app-auth-required'].status, 'fail');
+  assert.equal(byId(result)['auth-required'].status, 'pass');
 });
 
 test('ingest job failure fails ingest and skips the rest of the chain', async () => {
@@ -65,12 +79,17 @@ test('wrong build commit fails health; "unknown" commit is not a mismatch', asyn
   } finally { await mock.close(); }
 });
 
-test('the client sends x-jwt, never Authorization, and anonymous health is rejected like the ingress does', async () => {
+test('the client sends both x-jwt (ingress) and Authorization (application); x-jwt alone reaches the application gate', async () => {
   const mock = await startMock();
   try {
     assert.equal((await createClient({ baseUrl: mock.baseUrl }).request('GET', '/health')).status, 401);
     assert.equal((await createClient({ baseUrl: mock.baseUrl, token: mock.token }).request('GET', '/health')).status, 200);
     assert.equal((await createClient({ baseUrl: mock.baseUrl, token: mock.token, authHeader: 'authorization' }).request('GET', '/health')).status, 401);
+    const full = await createClient({ baseUrl: mock.baseUrl, token: mock.token }).request('GET', '/api/v1/assets/');
+    assert.equal(full.status, 200);
+    const ingressOnly = await createClient({ baseUrl: mock.baseUrl, token: mock.token, appToken: '' }).request('GET', '/api/v1/assets/');
+    assert.equal(ingressOnly.status, 401);
+    assert.equal(ingressOnly.body.message, 'missing access token');
   } finally { await mock.close(); }
 });
 

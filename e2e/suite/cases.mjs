@@ -58,10 +58,20 @@ export const cases = [
   {
     id: 'auth-required',
     async run(ctx) {
-      // Through the platform ingress this is answered by the login wall (nginx), not by the application, so it does
-      // NOT exercise the application's own auth gate (#711); it only proves the instance is not publicly open.
+      // Through the platform ingress this is answered by the login wall (nginx), not by the application: it only
+      // proves the instance is not publicly open. The application's own gate is the next case.
       const r = await ctx.anon.request('GET', '/api/v1/assets/');
       expectStatus(r, 401);
+    },
+  },
+  {
+    id: 'app-auth-required',
+    async run(ctx) {
+      // x-jwt gets past the wall; without Authorization the application itself must reject (regression guard for
+      // #711, the auth gate returning 401). The message proves the answer came from the application, not nginx.
+      const r = await ctx.ingress.request('GET', '/api/v1/assets/');
+      expectStatus(r, 401);
+      if (r.body?.error !== 'unauthorized') fail(`401 did not come from the application: ${r.text.slice(0, 200)}`);
     },
   },
   {
