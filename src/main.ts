@@ -3070,6 +3070,16 @@ if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
       makePerStackQuotaSum({
         resolver: stackResolver,
         logger: sweepLogger,
+        // Walk only the stacks the resolver will actually CONNECT (#1141 review
+        // finding 1). `listStackNames()` has no status filter, so a
+        // `provisioning`/`failed` record — which the provision route persists on
+        // purpose, and which `resolve()` deliberately refuses to connect —
+        // otherwise looked exactly like a ready stack whose object storage had
+        // degraded, and aborted the sweep. One un-deprovisioned failed provision
+        // would then freeze the deployment-wide total indefinitely. A stack the
+        // resolver will not connect receives no data-plane writes, so its bytes
+        // are not in the total and skipping it cannot under-count.
+        listReadyStackNames: () => stackResolver.listReadyStackNames(),
         // The swept stack's OWN source + packaged buckets, from ITS connections
         // (the per-stack bucket names persisted with the stack config), built on
         // the same MinIO client the request path uses. No object storage on that
@@ -3092,12 +3102,15 @@ if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
         app.log.info({ err: err.message }, 'storage-quota reconciliation skipped');
         return;
       }
-      // A provisioned stack that resolved WITHOUT object storage (#1141 review
-      // finding 2): the resolver degraded to its no-storage fallback or
+      // A READY stack that resolved WITHOUT object storage (#1141 review
+      // findings 1 and 2): the resolver degraded to its no-storage fallback or
       // substituted another stack, so the sum on hand is short by that stack's
       // bytes and was deliberately not written. Distinct from an unreachable
       // stack and worth an operator's attention at the parameter store, so it
       // carries its own message rather than the generic sweep-failed line.
+      // Stacks that are merely not ready (`provisioning`/`failed`) never reach
+      // here — they are not walked, so a stalled provision cannot wedge the
+      // sweep permanently behind this warning.
       if (err instanceof PerStackQuotaSumIncomplete && err.reason === 'stack-without-object-storage') {
         app.log.warn(
           { err: err.message },

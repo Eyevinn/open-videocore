@@ -105,10 +105,29 @@ directly:
 |---|---|---|---|
 | The env-var override (`COUCHDB_URL`/`MINIO_URL`) returns the same connections for every name, while `listStackNames()` still lists the parameter store's stacks — the two are not mutually exclusive, `MINIO_URL` being a documented ops override | `workspace-stack.ts:395-397`, `:1000-1015` vs `:1274-1288` | the same buckets summed once per listed name: **N x the real bytes**, i.e. uploads rejected at ~capacity/N | each distinct object-store identity (endpoint + the two bucket names) is summed at most once per sweep |
 | A requested name with no stored config is re-resolved to the FIRST listed stack instead of throwing | `workspace-stack.ts:1052-1065` | stack 1's bytes counted twice, stack N's dropped | `WorkspaceConnections.stackName` (#1058) is compared against the requested name; a mismatch fails the sweep |
-| A thrown parameter-store refresh is caught INSIDE the resolver and degrades to last-known-good or to no-storage in-memory connections | `workspace-stack.ts:1083-1125` | that stack contributes 0 bytes and the short total is committed | a LISTED stack that yields no buckets fails the sweep (reason `stack-without-object-storage`) — unless NO stack has object storage, which stays the fresh-install `no-object-storage` decline |
+| A thrown parameter-store refresh is caught INSIDE the resolver and degrades to last-known-good or to no-storage in-memory connections | `workspace-stack.ts:1083-1125` | that stack contributes 0 bytes and the short total is committed | a READY stack that yields no buckets fails the sweep (reason `stack-without-object-storage`) — unless NO stack has object storage, which stays the fresh-install `no-object-storage` decline |
 
 The guards fail closed in the same direction as the rest of this section: the
 counter keeps its last good value and the next sweep retries.
+
+**A guard may only fail closed on a FAULT.** `listStackNames()` has no status
+filter, so it also lists the `provisioning` record the provision route writes
+before creating services and the `failed` records it writes on its failure
+paths — records that persist on purpose, because deprovision reads their
+`services[]` to clean up. Those resolve to the same no-storage shape as the
+degraded outcome in the third row, so failing the sweep on "a LISTED stack
+yielded no buckets" meant a single un-deprovisioned failed provision stopped the
+deployment-wide counter from EVER being reconciled again — "last good value
+until the next sweep" became "last good value forever", on a billing-adjacent
+number, behind one warning line. The quota walk therefore enumerates
+`WorkspaceStackResolver.listReadyStackNames()` (the `isReadyStack`-filtered
+listing) rather than `listStackNames()`: a stack the resolver refuses to connect
+receives no data-plane writes, so its bytes are not in the deployment total and
+skipping it neither under-counts nor hides a degraded resolution. Readiness is
+read from the stored record, never inferred from a missing `s3Config` — that
+absence is exactly the degraded shape the third row's guard is for. A
+parameter-store read failure in that listing still THROWS, so "we cannot tell
+which stacks are live" is never mistaken for "those stacks are not live".
 
 ## Consequences
 

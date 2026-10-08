@@ -1288,6 +1288,43 @@ export class WorkspaceStackResolver {
     }
   }
 
+  // The provisioned stack names this resolver will actually CONNECT — i.e. the
+  // subset of `listStackNames()` whose stored config passes `isReadyStack`
+  // (issue #1098, #1141 review finding 1).
+  //
+  // WHY THIS EXISTS. `listStackNames()` applies NO status filter: it returns
+  // every key under the workspace prefix (ParamStore.listStackNames, src/services/
+  // param-store.ts), including the `status: 'provisioning'` record the provision
+  // route writes BEFORE creating services and the `status: 'failed'` record it
+  // writes on a failure path. `resolve()` deliberately refuses to connect those
+  // (`config && isReadyStack(config)` above) and falls back to no-op in-memory
+  // connections, and such a record is expected to PERSIST so the deprovision
+  // route can still read its `services[]` and clean up. A caller that must tell
+  // "this stack is simply not live" apart from "a live stack failed to resolve"
+  // therefore cannot infer it from the connections — both shapes have no
+  // `storageClient` — and must ask here instead. The deployment-wide
+  // storage-quota sum (src/data/storage-quota-stack-sum.ts) is that caller: it
+  // may only skip a non-ready stack, never a degraded one.
+  //
+  // Readiness is read from the SAME record `resolve()` gates on, through the
+  // same one-shot migration helpers (issue #804), so the two cannot drift.
+  //
+  // Unlike `listStackNames()`, a parameter-store failure THROWS rather than
+  // reporting "no stacks": callers use this to decide whether a sweep's result
+  // is complete, and a read failure must not be reported as "those stacks are
+  // not ready" — that would turn a transient outage into a silent skip.
+  async listReadyStackNames(): Promise<string[]> {
+    const ps = this.paramStore;
+    if (!ps) return [];
+    const names = await this.listStackNamesWithMigration(ps);
+    const ready: string[] = [];
+    for (const name of names) {
+      const config = await this.loadStackConfigWithMigration(ps, name);
+      if (config && isReadyStack(config)) ready.push(name);
+    }
+    return ready;
+  }
+
   // Synchronous read of already-resolved connections from cache. Returns
   // undefined when nothing is cached (or the entry expired). The global
   // preHandler hook warms the cache with `resolve()` before any handler runs,

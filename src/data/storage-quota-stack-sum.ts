@@ -53,9 +53,28 @@
 // which bytes get listed; two names resolving to one identity really are one set
 // of buckets), (b) additionally fails the sweep when the resolved connections
 // carry a different `stackName` than the one requested, and (c) fails the sweep
-// when a LISTED stack yields no buckets while some other stack did. The
+// when a READY stack yields no buckets while some other stack did. The
 // "no stack anywhere has object storage" branch is unchanged: that is a fresh
 // install, not a partial pass.
+//
+// ONLY READY STACKS ARE WALKED (#1141 review finding 1). `listStackNames()`
+// applies no status filter — it returns every key under the workspace prefix,
+// including the `status: 'provisioning'` record the provision route writes
+// BEFORE creating services and the `status: 'failed'` records it writes on its
+// failure paths, all of which persist so deprovision can still clean them up.
+// `resolve()` refuses to connect a non-ready record (`isReadyStack`), so it
+// yields the SAME no-storage shape as degraded outcome (c) and would land in
+// (c)'s hard-fail bucket. That made one un-deprovisioned failed provision enough
+// to abort EVERY later sweep — the deployment-wide counter would then never be
+// reconciled again, which is the opposite of this module's own stated promise
+// that the total "keeps its last good value and the next sweep retries". So the
+// walk enumerates `listReadyStackNames()` instead: a non-ready stack cannot be
+// receiving data-plane writes (the resolver will not connect it), its bytes are
+// therefore not in the deployment total, and skipping it neither under-counts
+// nor masks outcome (c) — which is now, precisely, "a stack the resolver WOULD
+// connect resolved without object storage". Readiness is read from the stored
+// record, not inferred from a missing `s3Config`, because that absence is also
+// the degraded shape this guard exists to catch.
 //
 // Contract sources verified before writing (per CLAUDE.md rule 7):
 //   - ReconcileStorage (`sumObjectSizes(): Promise<number>`) and
@@ -77,6 +96,17 @@
 //     not-found alias fallback: :1054-1066; caught-refresh degradation: :1083-1125
 //   - WorkspaceStorage.sumObjectSizes(): src/data/storage.ts
 //   - forEachStack / StackSweepResolver: src/services/for-each-stack.ts
+//   - isReadyStack ("status === undefined || status === 'ready'"; "'provisioning'/
+//     'failed' are skipped by the resolver but remain readable for deprovision
+//     cleanup"): src/services/param-store.ts:121-128
+//   - ParamStore.listStackNames lists by key prefix only, with no status read:
+//     src/services/param-store.ts:607-634
+//   - WorkspaceStackResolver.listStackNames() (no status filter) and
+//     listReadyStackNames() (isReadyStack-filtered, throws on a read failure):
+//     src/services/workspace-stack.ts:1274-1289 / :1291-1326
+//   - non-ready records are persisted on purpose: `status: 'provisioning'`
+//     written before service creation and `status: 'failed'` on the failure
+//     paths, src/routes/provision.ts
 //   - ADR-020 Decision 1 (single deployment-wide counter):
 //     docs/architecture/ADR-020-quota-deployment-model-and-metering-source.md
 
@@ -90,6 +120,18 @@ type Logger = {
 
 export type PerStackQuotaSumDeps = {
   resolver: StackSweepResolver;
+  // The stacks the resolver will actually CONNECT, i.e. `listStackNames()`
+  // filtered by `isReadyStack` (WorkspaceStackResolver.listReadyStackNames).
+  // When supplied, the walk enumerates THESE names instead of every listed key,
+  // so a `provisioning`/`failed` record is skipped rather than being mistaken
+  // for a ready stack that resolved without object storage — see the module
+  // header. A read failure here is expected to THROW: it means "we don't know
+  // which stacks are live", which must not be reported as a complete sum.
+  //
+  // Optional so a caller with no readiness signal (and the module's own tests)
+  // keeps the previous behaviour of treating every listed stack as ready;
+  // src/main.ts always wires the resolver's real listing.
+  listReadyStackNames?(): Promise<string[]>;
   // The buckets whose bytes count toward the cap for ONE stack — the source and
   // packaged buckets of that stack (ADR-020 Decision 2 names exactly those two).
   // Returns an empty list when the stack has no object storage configured, which
@@ -103,7 +145,7 @@ export type PerStackQuotaSumDeps = {
 // from a deployment that simply has no object storage yet
 // (`no-object-storage`) — the latter is the normal state of a fresh install
 // before the first stack is provisioned, not a fault — and both differently from
-// a stack that IS provisioned but resolved without object storage
+// a READY stack (one the resolver would connect) that resolved without object storage
 // (`stack-without-object-storage`), which is the degraded/aliased resolver
 // outcome (c)/(b) above and needs an operator to look at the parameter store.
 export type PerStackQuotaSumSkipReason =
@@ -174,17 +216,30 @@ export function makePerStackQuotaSum(deps: PerStackQuotaSumDeps): ReconcileStora
       // (env override returning one set of connections for every listed name)
       // and the double-count half of outcome (b).
       const summedIdentities = new Set<string>();
-      // Listed stacks that resolved to no buckets at all — outcome (c). Not a
+      // READY stacks that resolved to no buckets at all — outcome (c). Not a
       // hard failure on its own: on a deployment where NO stack has object
       // storage this is the normal fresh-install state, which keeps its own
       // `no-object-storage` reason. It only means "partial pass" once some other
-      // stack did contribute bytes.
+      // stack did contribute bytes. Non-ready stacks never reach here — they are
+      // not enumerated by the walk at all (see `sweepResolver` below).
       const stacksWithoutBuckets: string[] = [];
+
+      // Enumerate only the stacks the resolver will connect. A `provisioning`/
+      // `failed` record is listed by `listStackNames()` and resolves to the same
+      // no-storage fallback as a degraded resolution, so walking the unfiltered
+      // listing let one un-deprovisioned failed provision abort every sweep for
+      // good (#1141 review finding 1). Skipping it cannot under-count: a stack
+      // the resolver refuses to connect is not being written to.
+      const sweepResolver: StackSweepResolver = {
+        listStackNames: () =>
+          deps.listReadyStackNames ? deps.listReadyStackNames() : deps.resolver.listStackNames(),
+        resolve: (stackName) => deps.resolver.resolve(stackName)
+      };
 
       // Each stack's buckets are summed inside that stack's request-stack
       // context, so a dependency resolving the ambient stack sees this stack.
       const pass = await forEachStack(
-        { resolver: deps.resolver, label: 'storage-quota-reconcile', logger: deps.logger },
+        { resolver: sweepResolver, label: 'storage-quota-reconcile', logger: deps.logger },
         async (stackName) => {
           try {
             // Already warmed by forEachStack, so this is the resolver's cache
@@ -223,8 +278,8 @@ export function makePerStackQuotaSum(deps: PerStackQuotaSumDeps): ReconcileStora
             }
 
             const buckets = await deps.bucketsForStack(stackName);
-            // (c) DEGRADED RESOLUTION. A stack that is listed in the parameter
-            // store but resolved without object storage contributes 0 bytes
+            // (c) DEGRADED RESOLUTION. A READY stack (the walk enumerates only
+            // those) that resolved without object storage contributes 0 bytes
             // without throwing. Record it; whether that is a fresh install or a
             // partial pass is decided after the walk.
             if (stackName !== undefined && buckets.length === 0) {
@@ -259,13 +314,16 @@ export function makePerStackQuotaSum(deps: PerStackQuotaSumDeps): ReconcileStora
           'storage-quota reconciliation skipped: no provisioned stack has object storage configured'
         );
       }
-      // Some stacks were summed and others resolved without object storage: the
-      // total on hand is short by those stacks' bytes. Decline, exactly as for
-      // an unreachable stack — the counter keeps its last good value.
+      // Some stacks were summed and other READY stacks resolved without object
+      // storage: the total on hand is short by those stacks' bytes. Decline,
+      // exactly as for an unreachable stack — the counter keeps its last good
+      // value and the next sweep retries. Unlike the pre-fix version this really
+      // is self-clearing: the condition is a degraded resolution, not a durable
+      // parameter-store record, so a recovered resolver writes again next sweep.
       if (stacksWithoutBuckets.length > 0) {
         throw new PerStackQuotaSumIncomplete(
           'stack-without-object-storage',
-          `storage-quota reconciliation skipped: ${stacksWithoutBuckets.length} of ${pass.stacks} provisioned stack(s) resolved without object storage ` +
+          `storage-quota reconciliation skipped: ${stacksWithoutBuckets.length} of ${pass.stacks} ready stack(s) resolved without object storage ` +
             `(${stacksWithoutBuckets.join(', ')}), so the deployment total would be short by their bytes`
         );
       }
