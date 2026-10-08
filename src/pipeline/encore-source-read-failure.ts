@@ -155,7 +155,9 @@ export type SourceReadFailure = {
   // The input location, credentials redacted.
   url: string;
   // Bucket/key, when the location was an `s3://bucket/key` URI (which is what
-  // the transcode path always submits — src/pipeline/transcode.ts:140).
+  // the transcode path always submits — src/pipeline/transcode.ts:140). Split
+  // out of the REDACTED `url` above, so neither can carry userinfo or a
+  // presigned query string.
   bucket?: string;
   key?: string;
   // The HTTP status the storage answered, when the text carried one. Absent for
@@ -234,10 +236,23 @@ export function parseSourceReadFailure(
     return undefined;
   }
 
-  // Redact BEFORE anything is kept: the url and the storage error both leave
-  // this module straight onto an API response.
+  // Redact BEFORE anything is kept: the url, the bucket/key pair and the
+  // storage error all leave this module straight onto an API response.
+  //
+  // `bucket`/`key` are split out of the REDACTED `url`, never out of `rawUri`.
+  // `parseS3Uri`'s bucket group is `[^/]+` (src/routes/assets.ts:1594), so on a
+  // raw URI a `key-id:secret@` userinfo segment lands in `bucket` and a
+  // presigned `?X-Amz-Signature=…` query string lands in `key` — both then get
+  // interpolated into `message` by describe() below, which would publish on two
+  // response fields exactly what `url` redacts on the third. Splitting the
+  // redacted value instead keeps url/bucket/key internally consistent (they
+  // could previously disagree) and costs nothing in the normal case: the
+  // transcode path submits a clean `s3://${sourceBucket}/${sourceObjectKey}`
+  // (src/pipeline/transcode.ts:140), and `stripCredentials`' `new URL`
+  // round-trip (src/services/param-store.ts:162-172) leaves such a URI byte
+  // identical, so the pair still parses to the real bucket and key.
   const url = redactUrlsInText(rawUri);
-  const s3 = parseS3Uri(rawUri);
+  const s3 = parseS3Uri(url);
   const redactedText = redactUrlsInText(message.trim());
   const storageError =
     redactedText.length > MAX_STORAGE_ERROR_CHARS

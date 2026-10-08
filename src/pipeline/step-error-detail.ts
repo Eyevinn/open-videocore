@@ -55,6 +55,10 @@ export type StepErrorCode = (typeof STEP_ERROR_CODES)[number];
 // location can be a presigned URL whose query string carries a live SigV4
 // signature, or carry userinfo, and this field is served to API callers.
 //
+// `bucket`/`key` are split out of that already-redacted `url` and never out of
+// the raw location, so the three fields always agree and none of them can carry
+// userinfo or a presigned query string.
+//
 // `bucket`/`key` are present when the location was an `s3://bucket/key` URI,
 // which is what the transcode path always submits (`inputUri` =
 // `s3://${sourceBucket}/${sourceObjectKey}`, src/pipeline/transcode.ts:140).
@@ -142,8 +146,20 @@ export const stepErrorDetailSchema = z.object({
             'bucket/key rather than by exact string equality with a URL you ' +
             'submitted.'
         ),
-      bucket: z.string().optional().describe('Bucket, when the location was an s3:// URI.'),
-      key: z.string().optional().describe('Object key, when the location was an s3:// URI.')
+      bucket: z
+        .string()
+        .optional()
+        .describe(
+          'Bucket, when the location was an s3:// URI. Split out of the ' +
+            'redacted `url` above, so it never contains userinfo.'
+        ),
+      key: z
+        .string()
+        .optional()
+        .describe(
+          'Object key, when the location was an s3:// URI. Split out of the ' +
+            'redacted `url` above, so it never contains a presigned query string.'
+        )
     })
     .optional()
     .describe('Where the failing read was pointed (credentials redacted).'),
