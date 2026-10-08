@@ -20,7 +20,23 @@ import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 import { WorkspaceAccessError } from '../data/guard.js';
 import { TamsFlowIdSchema, TamsTimerangeSchema } from '../data/asset-document.js';
-import { ASSET_STATUSES } from '../data/asset-repo.js';
+import { ASSET_STATUSES, type Asset } from '../data/asset-repo.js';
+// Per-asset retention window on the read contract (issue #1034). This endpoint
+// serves archived assets (`?status=archived` below), and the deprecated alias
+// `GET /api/v1/assets/search` — which advertises THIS endpoint as its
+// `successor-version` — already carries `retention` on its hits, so the window
+// is projected here too rather than leaving the successor poorer than the alias
+// it replaces. Shape and projection are the SAME shared definitions the assets
+// router uses (src/data/asset-retention.ts), not a parallel declaration.
+import {
+  assetRetentionWindow,
+  AssetRetentionWindowSchema,
+  type AssetRetentionWindow
+} from '../data/asset-retention.js';
+// Boot/fallback resolution of the archived-asset retention window from the
+// environment (12-factor), used when the router is wired without a live getter —
+// identical to src/routes/assets.ts.
+import { archiveRetentionMsFromEnv } from './retention.js';
 import {
   CreatedFromSchema,
   CreatedToSchema,
@@ -100,6 +116,13 @@ const assetSchema = z.object({
   packagingError: z.string().optional(),
   renditions: z.array(renditionSchema).optional(),
   metadata: z.record(z.unknown()).optional(),
+  // Per-asset retention window (issue #1034). Derived, read-only, and present
+  // ONLY while `status === 'archived'` — the same optional member, from the same
+  // shared schema, that `assetSchema` in src/routes/assets.ts publishes, so a
+  // caller reading an archived asset gets the identical shape from the asset
+  // read, the asset list, the deprecated `/assets/search` alias and this
+  // canonical search endpoint.
+  retention: AssetRetentionWindowSchema.optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -239,11 +262,34 @@ function extractMetadataFilter(
 
 type SearchRouterOptions = {
   repository: SearchRepository;
+  // The EFFECTIVE instance-global archived-asset retention window, in ms, read
+  // as a GETTER so every request sees the live value PATCH
+  // /api/v1/retention/config hot-swaps (issue #1034). main.ts binds it to the
+  // same `archiveRetentionMs` instance global the purge loop ticks on and the
+  // assets router reads, so the window this endpoint reports, the window
+  // /api/v1/assets reports, and the window the sweep enforces are ONE value.
+  // Optional: when omitted it falls back to `archiveRetentionMsFromEnv()`,
+  // evaluated per call — the SAME env var main.ts boots from. Used only to
+  // derive the read-only `retention` member of an archived asset hit.
+  retentionMs?: () => number;
 };
 
 export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fastify, opts) => {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
   const repo = opts.repository;
+
+  // Live read of the effective archived-asset retention window (issue #1034),
+  // mirroring src/routes/assets.ts: called per request so the derived
+  // `retention` member reflects a hot-swapped PATCH /api/v1/retention/config.
+  const retentionMsNow = opts.retentionMs ?? archiveRetentionMsFromEnv;
+
+  // Attach the derived, read-only retention window to an asset hit. A no-op for
+  // any asset that is not `archived`: assetRetentionWindow returns undefined and
+  // the hit simply carries no `retention` member (the field is optional).
+  function withRetentionWindow(asset: Asset): Asset & { retention?: AssetRetentionWindow } {
+    const retention = assetRetentionWindow(asset, retentionMsNow());
+    return retention ? { ...asset, retention } : asset;
+  }
 
   // 401 presence gate (issue #711): reject anonymous requests to this
   // workspace-scoped router. Plugin-scoped so it does not affect public routers.
@@ -288,7 +334,12 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
           'rather than consulting a separately maintained index, so an edit made ' +
           'through `PATCH /api/v1/assets/{id}` or `PATCH /api/v1/collections/{id}` ' +
           '— a rename included — is reflected by the next search with nothing ' +
-          'called in between.',
+          'called in between. An asset hit that is `archived` additionally ' +
+          'carries the derived read-only `retention` window (issue #1034) — ' +
+          '`archivedAt`/`purgeAfter`/`retentionMs`, identical in shape and ' +
+          'meaning to the member on `GET /api/v1/assets/{id}` — so ' +
+          '`?status=archived` answers "when may this be purged?" without a ' +
+          'second call. The member is absent on every non-archived hit.',
         querystring: searchQuerySchema,
         response: { 200: searchResultSchema, 400: errorSchema }
       }
@@ -335,9 +386,13 @@ export const searchRouter: FastifyPluginAsync<SearchRouterOptions> = async (fast
       // Stamp the `type: 'asset'` discriminator on each asset hit so the shape is
       // symmetric with collection hits (issue #561). Collection hits already
       // carry `type: 'collection'` from the projection (toCollectionHit).
+      // Each hit also carries the derived `retention` window while it is
+      // archived (issue #1034) — same helper, same shape as the assets router,
+      // so `?status=archived` here answers with the same retention detail the
+      // deprecated `GET /api/v1/assets/search` alias returns.
       return {
         ...result,
-        assets: result.assets.map((a) => ({ ...a, type: 'asset' as const }))
+        assets: result.assets.map((a) => ({ ...withRetentionWindow(a), type: 'asset' as const }))
       };
     }
   );

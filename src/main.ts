@@ -2308,6 +2308,12 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   collectionRepository,
   // Best-effort audit emission for asset mutations (issue #564).
   audit: auditEmitter,
+  // Per-asset retention window on the read contract (issue #1034). Bound to the
+  // SAME live instance global the purge loop ticks on (`archiveRetentionMs`,
+  // hot-swapped by PATCH /api/v1/retention/config), read per request — so the
+  // window a read reports and the window the sweep enforces are one value, and a
+  // config change is reflected on the next read with no restart.
+  retentionMs: () => archiveRetentionMs,
   // Operational log records for the pipeline steps this router drives (issue
   // #995): the `ingest` stage (URL-pull worker + the synchronous
   // extract-metadata / thumbnail / subtitles / scene-detect steps) and the
@@ -2913,7 +2919,16 @@ void reconcileInterruptedIngests({
 }).catch((err) => app.log.warn({ err }, 'interrupted-ingest reconciliation on boot failed'));
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
-await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
+await app.register(searchRouter, {
+  prefix: '/api/v1/search',
+  repository: searchRepository,
+  // Per-asset retention window on archived hits (issue #1034). Bound to the
+  // SAME live instance global the assets router and the purge loop read
+  // (`archiveRetentionMs`, hot-swapped by PATCH /api/v1/retention/config), so
+  // the canonical search endpoint reports the identical window its deprecated
+  // alias `GET /api/v1/assets/search` does.
+  retentionMs: () => archiveRetentionMs
+});
 
 // Webhook registrations (issue #13). Workspace-scoped; behind `authenticate`.
 await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: webhookRepository });

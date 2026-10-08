@@ -42,18 +42,40 @@ import { z } from 'zod';
 // existing behaviour for every deployment that does not opt in.
 export const RETENTION_DISABLED_MS = 0;
 
+// The largest accepted retention window: 100 years in ms. Any realistic media
+// archive policy is orders of magnitude below this, while it is ~2,700x smaller
+// than the ±8.64e15 ms Date range, so `archivedAt + retentionMs` can never leave
+// the representable range for any stamp a real asset carries. PATCH /config is
+// intentionally unauthenticated (see header), so an unbounded window would let
+// any caller feed date arithmetic downstream of this value — bounding it here
+// keeps that blast radius at a 400.
+export const MAX_RETENTION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
+
 // Resolve the boot-time retention window (12-factor: config via env). Unset,
 // non-numeric, or negative all resolve to disabled (0 = never purge), matching
 // the acceptance criterion that an unset/`0` value is behaviourally identical to
 // today. Mirrors the parseInt env convention in src/main.ts:468-469.
+// Clamped to MAX_RETENTION_MS so a boot-time value can never exceed what
+// `retentionConfigSchema.retentionMs` accepts — GET /config serializes through
+// that same schema, so an out-of-bounds env value would otherwise make the
+// endpoint unreadable rather than merely over-generous. The clamp is scoped to
+// THIS window only: `auditRetentionMs` has no upper bound (see below).
 export function archiveRetentionMsFromEnv(): number {
-  return retentionMsFromEnv('ARCHIVE_RETENTION_MS');
+  return Math.min(retentionMsFromEnv('ARCHIVE_RETENTION_MS'), MAX_RETENTION_MS);
 }
 
 // Resolve the boot-time AUDIT-LOG retention window (issue #566). Default off:
 // unset/non-numeric/negative all resolve to 0 = indefinite retention (never
 // purge), so #563's behaviour is preserved for every deployment that does not
 // opt in. Same parse rules as the archived-asset window (12-factor: env config).
+//
+// Deliberately NOT clamped to MAX_RETENTION_MS. ADR-021 fixes this window's
+// contract as "unset/`0`/negative -> `0`" with no upper bound
+// (docs/architecture/ADR-021-audit-log-retention.md:37), and
+// `retentionConfigSchema.auditRetentionMs` is correspondingly
+// `z.number().int().min(0)` with no `.max()` — so there is nothing for a clamp
+// here to keep GET /config inside, and silently shrinking a configured audit
+// window would contradict the documented contract.
 export function auditRetentionMsFromEnv(): number {
   return retentionMsFromEnv('AUDIT_RETENTION_MS');
 }
@@ -69,6 +91,10 @@ export function logRetentionMsFromEnv(): number {
 
 // Shared env parse for a retention window: unset/non-numeric/negative -> 0
 // (disabled). Mirrors the parseInt env convention in src/main.ts:468-469.
+// Range-bounding is the CALLER's business, because the two windows have
+// different documented bounds: the archived-asset window is clamped to
+// MAX_RETENTION_MS by `archiveRetentionMsFromEnv`, the audit-log window is
+// unbounded per ADR-021.
 function retentionMsFromEnv(name: string): number {
   const raw = process.env[name];
   if (!raw) {
@@ -103,8 +129,12 @@ type RetentionRouterOptions = {
 };
 
 const retentionConfigSchema = z.object({
-  // 0 = retention disabled (never purge); any positive value is a window in ms.
-  retentionMs: z.number().int().min(0),
+  // 0 = retention disabled (never purge); any positive value is a window in ms,
+  // up to MAX_RETENTION_MS. The upper bound is defence in depth for every
+  // consumer that does date arithmetic on the window: `archivedAt + retentionMs`
+  // must stay inside the representable Date range (see
+  // src/data/asset-retention.ts purgeAfterOf, which is total regardless).
+  retentionMs: z.number().int().min(0).max(MAX_RETENTION_MS),
   // The audit-log window (issue #566). 0 = indefinite retention (never purge).
   auditRetentionMs: z.number().int().min(0),
   // The operational-log window (issue #1067). 0 = indefinite retention (never
