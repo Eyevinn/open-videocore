@@ -61,9 +61,22 @@ export type ForEachStackResult = {
   // How many stack contexts this pass covered. 1 on a single-stack deployment
   // and on the no-parameter-store path (the single `undefined` context).
   stacks: number;
-  // How many of those contexts threw (resolve or sweep). Reported so a caller
+  // How many of those contexts THREW (resolve or sweep). Reported so a caller
   // whose write must not be based on a partial pass — the deployment-wide
   // storage-quota total, src/data/storage-quota-stack-sum.ts — can skip it.
+  //
+  // `failed === 0` means "nothing raised", NOT "every stack was healthy"
+  // (#1141 review finding 2). `WorkspaceStackResolver.resolve()` has
+  // non-throwing failure modes: a caught parameter-store refresh degrades to
+  // last-known-good or to no-storage in-memory connections
+  // (src/services/workspace-stack.ts:1083-1125) and an unknown stack name is
+  // re-resolved to the first listed stack (:1052-1065). This helper cannot judge
+  // those outcomes — only the sweep knows what a usable resolution looks like
+  // for it — so a caller that COMMITS a value derived from the whole pass must
+  // verify the resolution itself, the way the storage-quota sum does. The four
+  // document sweeps are unaffected: each acts per stack, so a stack that
+  // resolved to an empty in-memory store simply purges nothing that tick and
+  // retries on the next one, with nothing written on another stack's behalf.
   failed: number;
 };
 

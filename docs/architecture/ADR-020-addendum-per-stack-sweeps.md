@@ -23,18 +23,23 @@ The background sweeps wired in `src/main.ts` run OUTSIDE a request, so the
 ambient stack is empty and `WorkspaceStackResolver.resolve()` took its
 no-`stackName` branch — cache key `''`, which resolves `listStackNames()[0]`,
 the FIRST listed stack (`src/services/workspace-stack.ts:906,975-990`). On an
-installation with more than one provisioned stack, four sweeps therefore only
+installation with more than one provisioned stack, five sweeps therefore only
 ever saw stack 1:
 
 | Sweep | Consequence on stacks 2..N before #1098 |
 |---|---|
 | archived-asset purge (#327) | archived assets never purged; storage never reclaimed |
 | audit-retention purge (#566) | audit entries retained indefinitely in spite of the configured window |
+| log-retention purge (#1067) | each stack keeps its own operational log partition, so stacks 2..N retained their log indefinitely in spite of the configured policy |
 | abandoned-upload settle (#726) | wedged `uploading` records never settled; permanent orphans in the asset list |
 | storage-quota reconcile (#579) | bytes erased from the counter on every sweep (the sweep OVERWRITES the total), so the cap silently UNDER-counted |
 
+Issue #1098 names four of these; the log-retention purge is the fifth because
+#1067 landed on `main` after the #1098 branch forked, with the same no-stack-name
+resolution and so the same bug. It is wired through the same helper.
+
 PR #1062 had already fixed the same class of bug for the scaler tick's
-reconcilers by iterating `WorkspaceStackResolver.listStackNames()`, but the four
+reconcilers by iterating `WorkspaceStackResolver.listStackNames()`, but the five
 sweeps above were left on the single default resolution.
 
 ## Decision
@@ -90,13 +95,31 @@ billing-adjacent number. A deployment with no object storage on any stack (fresh
 install, nothing provisioned yet) likewise declines to write rather than zeroing
 the counter, and logs that at info level.
 
+**"Could not be summed" is decided by inspecting the resolution, not by catching
+an exception.** This is the correction from the #1141 review: `resolve(name)` is
+not "that stack's connections or a throw". It has three silent outcomes that
+would each corrupt the one deployment-wide number, so the walk checks for them
+directly:
+
+| Resolver outcome | Where | Effect if trusted | Guard |
+|---|---|---|---|
+| The env-var override (`COUCHDB_URL`/`MINIO_URL`) returns the same connections for every name, while `listStackNames()` still lists the parameter store's stacks — the two are not mutually exclusive, `MINIO_URL` being a documented ops override | `workspace-stack.ts:395-397`, `:1000-1015` vs `:1274-1288` | the same buckets summed once per listed name: **N x the real bytes**, i.e. uploads rejected at ~capacity/N | each distinct object-store identity (endpoint + the two bucket names) is summed at most once per sweep |
+| A requested name with no stored config is re-resolved to the FIRST listed stack instead of throwing | `workspace-stack.ts:1052-1065` | stack 1's bytes counted twice, stack N's dropped | `WorkspaceConnections.stackName` (#1058) is compared against the requested name; a mismatch fails the sweep |
+| A thrown parameter-store refresh is caught INSIDE the resolver and degrades to last-known-good or to no-storage in-memory connections | `workspace-stack.ts:1083-1125` | that stack contributes 0 bytes and the short total is committed | a LISTED stack that yields no buckets fails the sweep (reason `stack-without-object-storage`) — unless NO stack has object storage, which stays the fresh-install `no-object-storage` decline |
+
+The guards fail closed in the same direction as the rest of this section: the
+counter keeps its last good value and the next sweep retries.
+
 ## Consequences
 
-- Retention, audit expiry, upload settling and quota accounting are correct on a
-  multi-stack installation; #1090 is closed by this change rather than deferred.
+- Archived-asset purge, audit expiry, log expiry, upload settling and quota
+  accounting are correct on a multi-stack installation; #1090 is closed by this
+  change rather than deferred.
 - Each sweep's cost grows linearly with the number of provisioned stacks. All
-  four are already off the hot path on generous cadences (1 h / 1 h / 15 min /
-  6 h) and overlap-guarded, so a long pass skips a tick instead of piling up.
+  five are already off the hot path on generous cadences (archived purge 1 h,
+  audit retention 1 h, log retention 1 h, abandoned uploads 15 min, quota
+  reconcile 6 h) and overlap-guarded, so a long pass skips a tick instead of
+  piling up.
 - An unreachable stack degrades to "that stack was not swept this tick", logged,
   and is retried on the next tick.
 - If the deployment model ever becomes genuinely multi-tenant (ADR-020
@@ -107,9 +130,14 @@ the counter, and logs that at info level.
 
 | Claim | Source symbol / line |
 |---|---|
-| No-name resolution means the first listed stack | `src/services/workspace-stack.ts:906` (`resolve`, `cacheKey = stackName ?? ''`), `:975-990` (no-`X-Stack-Name` branch) |
-| Stack list read, empty without a parameter store, never throws | `src/services/workspace-stack.ts:1186-1202` (`listStackNames`) |
-| Cached read is keyed identically to `resolve` | `src/services/workspace-stack.ts:1208-1213` (`resolveCached`) |
+| No-name resolution means the first listed stack | `src/services/workspace-stack.ts:994` (`resolve`, `cacheKey = stackName ?? ''`), `:1068-1081` (no-`X-Stack-Name` branch, `resolvedName = names[0]` at `:1080`) |
+| Stack list read, empty without a parameter store, never throws | `src/services/workspace-stack.ts:1274-1288` (`listStackNames`) |
+| Cached read is keyed identically to `resolve` | `src/services/workspace-stack.ts:1296-1301` (`resolveCached`) |
+| Env override wins over the requested name, and is independent of the stack listing | `src/services/workspace-stack.ts:395-397` (`envOverrideConnectionsActive`), `:1000-1015` (override branch, before the parameter store) vs `:1274-1288` |
+| An unknown stack name resolves to the first listed stack, it does not throw | `src/services/workspace-stack.ts:1054-1066` (`resolvedName = names[0]` at `:1065`) |
+| A caught parameter-store refresh degrades to last-known-good or no-storage connections | `src/services/workspace-stack.ts:1083-1125` (fallback label `in-memory (no object storage)` at `:1102`) |
+| Resolved connections carry the stack identity they were built from | `src/services/workspace-stack.ts:190-198` (`WorkspaceConnections.stackName`), set from `resolvedName` at `:381` |
+| Object-store identity of a resolution (endpoint + the two bucket names) | `src/services/workspace-stack.ts:362-375` (per stack, `sourceBucket`/`packagedBucket` from `StackConfig`, `s3Config.endpoint` = `config.minioEndpoint` at `:371`), `:537-539` (env override, `endpoint: minioUrl`), `:585-587` (no-storage fallback: default bucket names, `s3Config: undefined`) |
 | Ambient stack context is empty outside a request | `src/services/request-stack-context.ts:27-28,46-53` |
 | Repositories resolve the ambient stack | `src/data/per-workspace-repos.ts:99-103` |
 | Scaler tick already iterated the stacks (#1062) | `src/main.ts`, `reconcileFailedTranscodes` |

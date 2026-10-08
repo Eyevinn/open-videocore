@@ -3092,6 +3092,19 @@ if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
         app.log.info({ err: err.message }, 'storage-quota reconciliation skipped');
         return;
       }
+      // A provisioned stack that resolved WITHOUT object storage (#1141 review
+      // finding 2): the resolver degraded to its no-storage fallback or
+      // substituted another stack, so the sum on hand is short by that stack's
+      // bytes and was deliberately not written. Distinct from an unreachable
+      // stack and worth an operator's attention at the parameter store, so it
+      // carries its own message rather than the generic sweep-failed line.
+      if (err instanceof PerStackQuotaSumIncomplete && err.reason === 'stack-without-object-storage') {
+        app.log.warn(
+          { err: err.message },
+          'storage-quota reconciliation skipped: a provisioned stack resolved without object storage; the committed total keeps its last good value'
+        );
+        return;
+      }
       app.log.warn({ err }, 'storage-quota reconciliation sweep failed');
     }
   });
