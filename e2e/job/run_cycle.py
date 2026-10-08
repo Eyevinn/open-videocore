@@ -132,14 +132,12 @@ def environment_facts():
     wanted = ["E2E_S3_ENDPOINT", "E2E_S3_BUCKET", "E2E_S3_ACCESS_KEY", "E2E_S3_SECRET_KEY", "E2E_SOURCE_URL", "OSC_ACCESS_TOKEN",
               "E2E_INSTANCE_OSC_ACCESS_TOKEN", "E2E_PARAMETER_STORE", "E2E_PARAMETER_STORE_API_KEY", "E2E_MINIO_ROOT_PASSWORD",
               "E2E_COUCHDB_ADMIN_PASSWORD"]
-    # A fingerprint (length + first 10 hex of SHA-256) lets a run's value be compared with the intended one without
-    # revealing it. The endpoint and bucket are not secret and are shown as they arrive.
+    # Endpoint and bucket are not secret and are shown as received. Credentials are only reported as set or unset:
+    # anything derived from a secret (a hash, a length) would end up in the pod log and the diag file.
     for k in ("E2E_S3_ENDPOINT", "E2E_S3_BUCKET"):
         log(f"{k} = {os.environ.get(k)!r}")
     for k in ("E2E_S3_ACCESS_KEY", "E2E_S3_SECRET_KEY"):
-        v = os.environ.get(k)
-        log(f"{k}: " + ("unset" if v is None else f"len={len(v)} sha256[:10]={hashlib.sha256(v.encode()).hexdigest()[:10]} "
-                         f"has_whitespace={v != v.strip() or any(c.isspace() for c in v)}"))
+        log(f"{k}: " + ("set" if os.environ.get(k) else "unset"))
     missing = [k for k in wanted if not os.environ.get(k)]
     log("required variables missing: " + (", ".join(missing) if missing else "none"))
 
