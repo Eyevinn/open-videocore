@@ -134,3 +134,23 @@ test('credentials in error messages are redacted from the stored record', async 
   const stored = JSON.stringify(store.get(C1));
   for (const leak of ['abc.def.ghi', 'hunter2-secret-value', 'ghp_ABCDEFGHIJKLMNOPQRSTUV']) assert.equal(stored.includes(leak), false, leak);
 });
+
+test('prepare runs after the instance is up and before the suite', async () => {
+  const order = [];
+  const { d } = deps({
+    instance: { ensureFresh: async () => { order.push('ensure'); return { baseUrl: 'http://i', token: 't' }; } },
+    prepare: async (inst) => { order.push('prepare:' + inst.baseUrl); },
+    runSuite: async () => { order.push('suite'); return { suiteVersion: 'v1', status: 'green', build: {}, cases: [] }; },
+  });
+  await runCycle(d);
+  assert.deepEqual(order, ['ensure', 'prepare:http://i', 'suite']);
+});
+
+test('a prepare failure is infra-error (not red), is not final, and the suite is not run', async () => {
+  const { d, store, log } = deps({ prepare: async () => { throw new Error('provisioning stack e2e failed: quota'); } });
+  const r = await runCycle(d);
+  assert.equal(r.status, 'infra-error');
+  assert.match(r.detail, /preparing the instance failed: provisioning stack e2e failed: quota/);
+  assert.ok(!log.includes('suite'));
+  assert.equal(store.get(C1).status, 'infra-error'); // not green/red, so the next cycle retries this commit
+});
