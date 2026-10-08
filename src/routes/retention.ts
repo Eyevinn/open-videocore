@@ -48,24 +48,37 @@ export const MAX_RETENTION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
 // non-numeric, or negative all resolve to disabled (0 = never purge), matching
 // the acceptance criterion that an unset/`0` value is behaviourally identical to
 // today. Mirrors the parseInt env convention in src/main.ts:468-469.
+// Clamped to MAX_RETENTION_MS so a boot-time value can never exceed what
+// `retentionConfigSchema.retentionMs` accepts — GET /config serializes through
+// that same schema, so an out-of-bounds env value would otherwise make the
+// endpoint unreadable rather than merely over-generous. The clamp is scoped to
+// THIS window only: `auditRetentionMs` has no upper bound (see below).
 export function archiveRetentionMsFromEnv(): number {
-  return retentionMsFromEnv('ARCHIVE_RETENTION_MS');
+  return Math.min(retentionMsFromEnv('ARCHIVE_RETENTION_MS'), MAX_RETENTION_MS);
 }
 
 // Resolve the boot-time AUDIT-LOG retention window (issue #566). Default off:
 // unset/non-numeric/negative all resolve to 0 = indefinite retention (never
 // purge), so #563's behaviour is preserved for every deployment that does not
 // opt in. Same parse rules as the archived-asset window (12-factor: env config).
+//
+// Deliberately NOT clamped to MAX_RETENTION_MS. ADR-021 fixes this window's
+// contract as "unset/`0`/negative -> `0`" with no upper bound
+// (docs/architecture/ADR-021-audit-log-retention.md:37), and
+// `retentionConfigSchema.auditRetentionMs` is correspondingly
+// `z.number().int().min(0)` with no `.max()` — so there is nothing for a clamp
+// here to keep GET /config inside, and silently shrinking a configured audit
+// window would contradict the documented contract.
 export function auditRetentionMsFromEnv(): number {
   return retentionMsFromEnv('AUDIT_RETENTION_MS');
 }
 
 // Shared env parse for a retention window: unset/non-numeric/negative -> 0
 // (disabled). Mirrors the parseInt env convention in src/main.ts:468-469.
-// Clamped to MAX_RETENTION_MS so a boot-time value can never exceed what
-// `retentionConfigSchema` accepts — GET /config serializes through that same
-// schema, so an out-of-bounds env value would otherwise make the endpoint
-// unreadable rather than merely over-generous.
+// Range-bounding is the CALLER's business, because the two windows have
+// different documented bounds: the archived-asset window is clamped to
+// MAX_RETENTION_MS by `archiveRetentionMsFromEnv`, the audit-log window is
+// unbounded per ADR-021.
 function retentionMsFromEnv(name: string): number {
   const raw = process.env[name];
   if (!raw) {
@@ -75,7 +88,7 @@ function retentionMsFromEnv(name: string): number {
   if (!Number.isFinite(parsed) || parsed < 0) {
     return RETENTION_DISABLED_MS;
   }
-  return Math.min(parsed, MAX_RETENTION_MS);
+  return parsed;
 }
 
 type RetentionRouterOptions = {

@@ -47,6 +47,7 @@ import {
 // instance-global retention window, so the route adds no second source of truth.
 import {
   assetRetentionWindow,
+  AssetRetentionWindowSchema,
   type AssetRetentionWindow
 } from '../data/asset-retention.js';
 // Boot/fallback resolution of the archived-asset retention window from the
@@ -1001,43 +1002,21 @@ const tracksSchema = z.object({
 //   - `GET /assets/by-tams-address`: it resolves `ready` assets only.
 // Any NEW route that serializes a stored asset belongs in the first list, not
 // this one, unless it is provably archived-free.
-const retentionWindowSchema = z
-  .object({
-    archivedAt: z
-      .string()
-      .describe(
-        'When the asset entered `archived` (ISO 8601): the `at` of the most ' +
-          'recent `-> archived` transition in `statusHistory`, falling back to ' +
-          '`updatedAt` when no such transition is recorded. Identical to the ' +
-          'value the retention purge sweep measures the window from.'
-      ),
-    purgeAfter: z
-      .string()
-      .nullable()
-      .describe(
-        'EARLIEST POSSIBLE purge time (ISO 8601) — `archivedAt + retentionMs` ' +
-          '— NOT a guaranteed deadline: the purge sweep is timer-driven ' +
-          '(default 1 hour, ARCHIVE_PURGE_INTERVAL_MS) and defers any asset ' +
-          'that still has live child assets, so the asset commonly stays ' +
-          'restorable past this instant. Reaching it does NOT mean the next ' +
-          'restore returns 410. `null` means the asset will never be purged: ' +
-          'either retention is disabled (`retentionMs` 0) or `archivedAt` ' +
-          'cannot be parsed, which the sweep also refuses to purge on.'
-      ),
-    retentionMs: z
-      .number()
-      .int()
-      .min(0)
-      .describe(
-        'The effective instance-global archived-asset retention window in ' +
-          'milliseconds at read time (the same value GET /api/v1/retention/' +
-          'config reports). 0 means retention is disabled — never purge.'
-      )
-  })
-  .describe(
-    'Retention window for an archived asset (issue #1034). Present only while ' +
-      '`status` is `archived`; absent on every other asset.'
-  );
+//
+// The rule extends BEYOND this router: `GET /api/v1/search/`
+// (src/routes/search.ts) serves archived assets through `?status=archived` and
+// projects the same window from the same helper, so the canonical search
+// endpoint is never poorer than the deprecated `GET /assets/search` alias that
+// advertises it as `successor-version`.
+// The wire shape itself is the SHARED `AssetRetentionWindowSchema` from
+// src/data/asset-retention.ts (declared beside the projection that produces it),
+// re-exported here under the local name the asset schema uses. The canonical
+// successor search endpoint `GET /api/v1/search/` (src/routes/search.ts) imports
+// the same schema for its asset hits, so this router and that one publish one
+// definition of `retention` and cannot drift — in particular the DEPRECATED
+// alias `GET /assets/search` can never be richer than the successor-version
+// endpoint it points callers at.
+const retentionWindowSchema = AssetRetentionWindowSchema;
 
 const assetSchema = z.object({
   id: z.string(),

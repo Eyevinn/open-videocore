@@ -2785,7 +2785,16 @@ void reconcileInterruptedIngests({
 }).catch((err) => app.log.warn({ err }, 'interrupted-ingest reconciliation on boot failed'));
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
-await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
+await app.register(searchRouter, {
+  prefix: '/api/v1/search',
+  repository: searchRepository,
+  // Per-asset retention window on archived hits (issue #1034). Bound to the
+  // SAME live instance global the assets router and the purge loop read
+  // (`archiveRetentionMs`, hot-swapped by PATCH /api/v1/retention/config), so
+  // the canonical search endpoint reports the identical window its deprecated
+  // alias `GET /api/v1/assets/search` does.
+  retentionMs: () => archiveRetentionMs
+});
 
 // Webhook registrations (issue #13). Workspace-scoped; behind `authenticate`.
 await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: webhookRepository });
