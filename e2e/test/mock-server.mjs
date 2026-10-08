@@ -4,7 +4,7 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 
-export function startMock({ token = 'tok', commit = 'abc1234', faults = {} } = {}) {
+export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 'sd0000000000dead', faults = {} } = {}) {
   const assets = new Map();
   const jobs = new Map();
   const calls = [];
@@ -20,8 +20,9 @@ export function startMock({ token = 'tok', commit = 'abc1234', faults = {} } = {
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined;
     calls.push(`${req.method} ${url.pathname}`);
     const p = url.pathname;
-    if (p === '/health') return json(res, 200, { status: 'ok', service: 'open-videocore', build: { version: '1.5.0', commit, sourceDigest: 'sd', builtAt: null, packageVersion: '1.5.0' } });
-    if (!faults.openAuth && req.headers.authorization !== `Bearer ${token}`) return json(res, 401, { error: 'unauthorized' });
+    // Like the platform ingress: every path, /health included, needs x-jwt: Bearer <token>.
+    if (!faults.openAuth && req.headers['x-jwt'] !== `Bearer ${token}`) return json(res, 401, { error: 'unauthorized' });
+    if (p === '/health') return json(res, 200, { status: 'ok', service: 'open-videocore-api', build: { version: '1.5.0', commit, sourceDigest, builtAt: null, packageVersion: '1.5.0' } });
     const m = (re) => p.match(re);
     let x;
     if (req.method === 'GET' && p === '/api/v1/assets/') {

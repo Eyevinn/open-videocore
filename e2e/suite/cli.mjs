@@ -12,7 +12,7 @@ const runId = process.env.RUN_ID ?? new Date().toISOString().replace(/\D/g, '').
 const result = await runSuite({
   client: createClient({ baseUrl, token }),
   anon: createClient({ baseUrl }),
-  config: { runId, sourceUrl, expectCommit: process.env.EXPECT_COMMIT },
+  config: { runId, sourceUrl, expectCommit: process.env.EXPECT_COMMIT, expectSourceDigest: process.env.EXPECT_SOURCE_DIGEST },
 });
 console.log(JSON.stringify(result, null, 2));
 process.exit(result.status === 'green' ? 0 : 1);

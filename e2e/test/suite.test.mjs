@@ -54,10 +54,32 @@ test('asset missing from search times out as a failure', async () => {
   assert.match(byId(result).search.detail, /timed out/);
 });
 
-test('wrong build commit fails health', async () => {
+test('wrong build commit fails health; "unknown" commit is not a mismatch', async () => {
   const { result } = await run({}, { expectCommit: 'deadbeef' });
   assert.equal(byId(result).health.status, 'fail');
   assert.match(byId(result).health.detail, /expected deadbeef/);
+  const mock = await startMock({ commit: 'unknown' });
+  try {
+    const r = await runSuite({ client: createClient({ baseUrl: mock.baseUrl, token: mock.token }), anon: createClient({ baseUrl: mock.baseUrl }), config: { ...fastCfg, expectCommit: 'deadbeef' } });
+    assert.equal(byId(r).health.status, 'pass');
+  } finally { await mock.close(); }
+});
+
+test('source digest identity: match passes, mismatch fails', async () => {
+  const ok = await run({}, { expectSourceDigest: 'sd0000000000dead' });
+  assert.equal(byId(ok.result).health.status, 'pass');
+  const bad = await run({}, { expectSourceDigest: 'ffffffffffffffff' });
+  assert.equal(byId(bad.result).health.status, 'fail');
+  assert.match(byId(bad.result).health.detail, /source digest sd0000000000dead, expected ffffffffffffffff/);
+});
+
+test('the client sends x-jwt, never Authorization, and anonymous health is rejected like the ingress does', async () => {
+  const mock = await startMock();
+  try {
+    assert.equal((await createClient({ baseUrl: mock.baseUrl }).request('GET', '/health')).status, 401);
+    assert.equal((await createClient({ baseUrl: mock.baseUrl, token: mock.token }).request('GET', '/health')).status, 200);
+    assert.equal((await createClient({ baseUrl: mock.baseUrl, token: mock.token, authHeader: 'authorization' }).request('GET', '/health')).status, 401);
+  } finally { await mock.close(); }
 });
 
 test('results never contain the token', async () => {
