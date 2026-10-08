@@ -1131,6 +1131,19 @@ Response 202 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
@@ -1164,6 +1177,15 @@ Response 200 (application/json)
         "jobId": "string",
         "encoreJobId": "string",
         "error": "string",
+        "errorDetail": {
+          "code": null,
+          "message": null,
+          "storageError": null,
+          "httpStatus": null,
+          "source": null,
+          "encoreJobId": null,
+          "assetId": null
+        },
         "skipReason": "string",
         "startedAt": "string",
         "completedAt": "string",
@@ -1198,6 +1220,19 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
@@ -1686,6 +1721,15 @@ Response 200 (application/json)
         "jobId": "string",
         "encoreJobId": "string",
         "error": "string",
+        "errorDetail": {
+          "code": null,
+          "message": null,
+          "storageError": null,
+          "httpStatus": null,
+          "source": null,
+          "encoreJobId": null,
+          "assetId": null
+        },
         "skipReason": "string",
         "startedAt": "string",
         "completedAt": "string",
@@ -2362,6 +2406,7 @@ Response 200 (application/json)
           "jobId": null,
           "encoreJobId": null,
           "error": null,
+          "errorDetail": null,
           "skipReason": null,
           "startedAt": null,
           "completedAt": null,
@@ -2397,6 +2442,19 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",
@@ -2429,6 +2487,19 @@ Response 200 (application/json)
       "jobId": "string",
       "encoreJobId": "string",
       "error": "string",
+      "errorDetail": {
+        "code": "source_read_failed",
+        "message": "string",
+        "storageError": "string",
+        "httpStatus": 0,
+        "source": {
+          "url": null,
+          "bucket": null,
+          "key": null
+        },
+        "encoreJobId": "string",
+        "assetId": "string"
+      },
       "skipReason": "string",
       "startedAt": "string",
       "completedAt": "string",

@@ -8482,6 +8482,66 @@
                           "error": {
                             "type": "string"
                           },
+                          "errorDetail": {
+                            "type": "object",
+                            "properties": {
+                              "code": {
+                                "type": "string",
+                                "enum": [
+                                  "source_read_failed"
+                                ],
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                              },
+                              "message": {
+                                "type": "string",
+                                "description": "One human-readable sentence describing the failure."
+                              },
+                              "storageError": {
+                                "type": "string",
+                                "description": "The underlying error text from the storage/transcode layer, with credentials redacted (userinfo and query strings stripped) and length bounded."
+                              },
+                              "httpStatus": {
+                                "type": "number",
+                                "description": "HTTP status the storage answered (404 = key absent, 403 = denied). Absent for a connection-class failure, which never reaches a status."
+                              },
+                              "source": {
+                                "type": "object",
+                                "properties": {
+                                  "url": {
+                                    "type": "string",
+                                    "description": "The source location the failing read was pointed at, with credentials redacted. Never contains userinfo or a presigned query string. A NORMALISED form, not a verbatim copy of the location in the underlying error text: trailing sentence punctuation is trimmed and userinfo/query strings are removed, so compare it by bucket/key rather than by exact string equality with a URL you submitted."
+                                  },
+                                  "bucket": {
+                                    "type": "string",
+                                    "description": "Bucket, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains userinfo."
+                                  },
+                                  "key": {
+                                    "type": "string",
+                                    "description": "Object key, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains a presigned query string."
+                                  }
+                                },
+                                "required": [
+                                  "url"
+                                ],
+                                "additionalProperties": false,
+                                "description": "Where the failing read was pointed (credentials redacted)."
+                              },
+                              "encoreJobId": {
+                                "type": "string",
+                                "description": "The transcoder job id this failure came from, for correlation."
+                              },
+                              "assetId": {
+                                "type": "string",
+                                "description": "The asset this failure belongs to, for correlation."
+                              }
+                            },
+                            "required": [
+                              "code",
+                              "message"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Structured, machine-readable failure detail. Present only for recognised failure classes; branch on `errorDetail.code` rather than parsing `error`."
+                          },
                           "skipReason": {
                             "type": "string"
                           },
@@ -8732,6 +8792,66 @@
                             "error": {
                               "type": "string"
                             },
+                            "errorDetail": {
+                              "type": "object",
+                              "properties": {
+                                "code": {
+                                  "type": "string",
+                                  "enum": [
+                                    "source_read_failed"
+                                  ],
+                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                },
+                                "message": {
+                                  "type": "string",
+                                  "description": "One human-readable sentence describing the failure."
+                                },
+                                "storageError": {
+                                  "type": "string",
+                                  "description": "The underlying error text from the storage/transcode layer, with credentials redacted (userinfo and query strings stripped) and length bounded."
+                                },
+                                "httpStatus": {
+                                  "type": "number",
+                                  "description": "HTTP status the storage answered (404 = key absent, 403 = denied). Absent for a connection-class failure, which never reaches a status."
+                                },
+                                "source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "url": {
+                                      "type": "string",
+                                      "description": "The source location the failing read was pointed at, with credentials redacted. Never contains userinfo or a presigned query string. A NORMALISED form, not a verbatim copy of the location in the underlying error text: trailing sentence punctuation is trimmed and userinfo/query strings are removed, so compare it by bucket/key rather than by exact string equality with a URL you submitted."
+                                    },
+                                    "bucket": {
+                                      "type": "string",
+                                      "description": "Bucket, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains userinfo."
+                                    },
+                                    "key": {
+                                      "type": "string",
+                                      "description": "Object key, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains a presigned query string."
+                                    }
+                                  },
+                                  "required": [
+                                    "url"
+                                  ],
+                                  "additionalProperties": false,
+                                  "description": "Where the failing read was pointed (credentials redacted)."
+                                },
+                                "encoreJobId": {
+                                  "type": "string",
+                                  "description": "The transcoder job id this failure came from, for correlation."
+                                },
+                                "assetId": {
+                                  "type": "string",
+                                  "description": "The asset this failure belongs to, for correlation."
+                                }
+                              },
+                              "required": [
+                                "code",
+                                "message"
+                              ],
+                              "additionalProperties": false,
+                              "description": "Structured, machine-readable failure detail. Present only for recognised failure classes; branch on `errorDetail.code` rather than parsing `error`."
+                            },
                             "skipReason": {
                               "type": "string"
                             },
@@ -8879,6 +8999,66 @@
                           "error": {
                             "type": "string"
                           },
+                          "errorDetail": {
+                            "type": "object",
+                            "properties": {
+                              "code": {
+                                "type": "string",
+                                "enum": [
+                                  "source_read_failed"
+                                ],
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                              },
+                              "message": {
+                                "type": "string",
+                                "description": "One human-readable sentence describing the failure."
+                              },
+                              "storageError": {
+                                "type": "string",
+                                "description": "The underlying error text from the storage/transcode layer, with credentials redacted (userinfo and query strings stripped) and length bounded."
+                              },
+                              "httpStatus": {
+                                "type": "number",
+                                "description": "HTTP status the storage answered (404 = key absent, 403 = denied). Absent for a connection-class failure, which never reaches a status."
+                              },
+                              "source": {
+                                "type": "object",
+                                "properties": {
+                                  "url": {
+                                    "type": "string",
+                                    "description": "The source location the failing read was pointed at, with credentials redacted. Never contains userinfo or a presigned query string. A NORMALISED form, not a verbatim copy of the location in the underlying error text: trailing sentence punctuation is trimmed and userinfo/query strings are removed, so compare it by bucket/key rather than by exact string equality with a URL you submitted."
+                                  },
+                                  "bucket": {
+                                    "type": "string",
+                                    "description": "Bucket, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains userinfo."
+                                  },
+                                  "key": {
+                                    "type": "string",
+                                    "description": "Object key, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains a presigned query string."
+                                  }
+                                },
+                                "required": [
+                                  "url"
+                                ],
+                                "additionalProperties": false,
+                                "description": "Where the failing read was pointed (credentials redacted)."
+                              },
+                              "encoreJobId": {
+                                "type": "string",
+                                "description": "The transcoder job id this failure came from, for correlation."
+                              },
+                              "assetId": {
+                                "type": "string",
+                                "description": "The asset this failure belongs to, for correlation."
+                              }
+                            },
+                            "required": [
+                              "code",
+                              "message"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Structured, machine-readable failure detail. Present only for recognised failure classes; branch on `errorDetail.code` rather than parsing `error`."
+                          },
                           "skipReason": {
                             "type": "string"
                           },
@@ -9018,6 +9198,66 @@
                             },
                             "error": {
                               "type": "string"
+                            },
+                            "errorDetail": {
+                              "type": "object",
+                              "properties": {
+                                "code": {
+                                  "type": "string",
+                                  "enum": [
+                                    "source_read_failed"
+                                  ],
+                                  "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                },
+                                "message": {
+                                  "type": "string",
+                                  "description": "One human-readable sentence describing the failure."
+                                },
+                                "storageError": {
+                                  "type": "string",
+                                  "description": "The underlying error text from the storage/transcode layer, with credentials redacted (userinfo and query strings stripped) and length bounded."
+                                },
+                                "httpStatus": {
+                                  "type": "number",
+                                  "description": "HTTP status the storage answered (404 = key absent, 403 = denied). Absent for a connection-class failure, which never reaches a status."
+                                },
+                                "source": {
+                                  "type": "object",
+                                  "properties": {
+                                    "url": {
+                                      "type": "string",
+                                      "description": "The source location the failing read was pointed at, with credentials redacted. Never contains userinfo or a presigned query string. A NORMALISED form, not a verbatim copy of the location in the underlying error text: trailing sentence punctuation is trimmed and userinfo/query strings are removed, so compare it by bucket/key rather than by exact string equality with a URL you submitted."
+                                    },
+                                    "bucket": {
+                                      "type": "string",
+                                      "description": "Bucket, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains userinfo."
+                                    },
+                                    "key": {
+                                      "type": "string",
+                                      "description": "Object key, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains a presigned query string."
+                                    }
+                                  },
+                                  "required": [
+                                    "url"
+                                  ],
+                                  "additionalProperties": false,
+                                  "description": "Where the failing read was pointed (credentials redacted)."
+                                },
+                                "encoreJobId": {
+                                  "type": "string",
+                                  "description": "The transcoder job id this failure came from, for correlation."
+                                },
+                                "assetId": {
+                                  "type": "string",
+                                  "description": "The asset this failure belongs to, for correlation."
+                                }
+                              },
+                              "required": [
+                                "code",
+                                "message"
+                              ],
+                              "additionalProperties": false,
+                              "description": "Structured, machine-readable failure detail. Present only for recognised failure classes; branch on `errorDetail.code` rather than parsing `error`."
                             },
                             "skipReason": {
                               "type": "string"
@@ -16121,6 +16361,66 @@
                                 "error": {
                                   "type": "string"
                                 },
+                                "errorDetail": {
+                                  "type": "object",
+                                  "properties": {
+                                    "code": {
+                                      "type": "string",
+                                      "enum": [
+                                        "source_read_failed"
+                                      ],
+                                      "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                                    },
+                                    "message": {
+                                      "type": "string",
+                                      "description": "One human-readable sentence describing the failure."
+                                    },
+                                    "storageError": {
+                                      "type": "string",
+                                      "description": "The underlying error text from the storage/transcode layer, with credentials redacted (userinfo and query strings stripped) and length bounded."
+                                    },
+                                    "httpStatus": {
+                                      "type": "number",
+                                      "description": "HTTP status the storage answered (404 = key absent, 403 = denied). Absent for a connection-class failure, which never reaches a status."
+                                    },
+                                    "source": {
+                                      "type": "object",
+                                      "properties": {
+                                        "url": {
+                                          "type": "string",
+                                          "description": "The source location the failing read was pointed at, with credentials redacted. Never contains userinfo or a presigned query string. A NORMALISED form, not a verbatim copy of the location in the underlying error text: trailing sentence punctuation is trimmed and userinfo/query strings are removed, so compare it by bucket/key rather than by exact string equality with a URL you submitted."
+                                        },
+                                        "bucket": {
+                                          "type": "string",
+                                          "description": "Bucket, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains userinfo."
+                                        },
+                                        "key": {
+                                          "type": "string",
+                                          "description": "Object key, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains a presigned query string."
+                                        }
+                                      },
+                                      "required": [
+                                        "url"
+                                      ],
+                                      "additionalProperties": false,
+                                      "description": "Where the failing read was pointed (credentials redacted)."
+                                    },
+                                    "encoreJobId": {
+                                      "type": "string",
+                                      "description": "The transcoder job id this failure came from, for correlation."
+                                    },
+                                    "assetId": {
+                                      "type": "string",
+                                      "description": "The asset this failure belongs to, for correlation."
+                                    }
+                                  },
+                                  "required": [
+                                    "code",
+                                    "message"
+                                  ],
+                                  "additionalProperties": false,
+                                  "description": "Structured, machine-readable failure detail. Present only for recognised failure classes; branch on `errorDetail.code` rather than parsing `error`."
+                                },
                                 "skipReason": {
                                   "type": "string"
                                 },
@@ -16250,6 +16550,66 @@
                           },
                           "error": {
                             "type": "string"
+                          },
+                          "errorDetail": {
+                            "type": "object",
+                            "properties": {
+                              "code": {
+                                "type": "string",
+                                "enum": [
+                                  "source_read_failed"
+                                ],
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                              },
+                              "message": {
+                                "type": "string",
+                                "description": "One human-readable sentence describing the failure."
+                              },
+                              "storageError": {
+                                "type": "string",
+                                "description": "The underlying error text from the storage/transcode layer, with credentials redacted (userinfo and query strings stripped) and length bounded."
+                              },
+                              "httpStatus": {
+                                "type": "number",
+                                "description": "HTTP status the storage answered (404 = key absent, 403 = denied). Absent for a connection-class failure, which never reaches a status."
+                              },
+                              "source": {
+                                "type": "object",
+                                "properties": {
+                                  "url": {
+                                    "type": "string",
+                                    "description": "The source location the failing read was pointed at, with credentials redacted. Never contains userinfo or a presigned query string. A NORMALISED form, not a verbatim copy of the location in the underlying error text: trailing sentence punctuation is trimmed and userinfo/query strings are removed, so compare it by bucket/key rather than by exact string equality with a URL you submitted."
+                                  },
+                                  "bucket": {
+                                    "type": "string",
+                                    "description": "Bucket, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains userinfo."
+                                  },
+                                  "key": {
+                                    "type": "string",
+                                    "description": "Object key, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains a presigned query string."
+                                  }
+                                },
+                                "required": [
+                                  "url"
+                                ],
+                                "additionalProperties": false,
+                                "description": "Where the failing read was pointed (credentials redacted)."
+                              },
+                              "encoreJobId": {
+                                "type": "string",
+                                "description": "The transcoder job id this failure came from, for correlation."
+                              },
+                              "assetId": {
+                                "type": "string",
+                                "description": "The asset this failure belongs to, for correlation."
+                              }
+                            },
+                            "required": [
+                              "code",
+                              "message"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Structured, machine-readable failure detail. Present only for recognised failure classes; branch on `errorDetail.code` rather than parsing `error`."
                           },
                           "skipReason": {
                             "type": "string"
@@ -16386,6 +16746,66 @@
                           },
                           "error": {
                             "type": "string"
+                          },
+                          "errorDetail": {
+                            "type": "object",
+                            "properties": {
+                              "code": {
+                                "type": "string",
+                                "enum": [
+                                  "source_read_failed"
+                                ],
+                                "description": "Stable, machine-readable failure code. `source_read_failed`: the step could not READ its source object \u2014 the storage answered 404 (the key is absent) or 403 (a permissions/credentials verdict), or the connection to the storage failed. Branch on this rather than on the free-text `error`."
+                              },
+                              "message": {
+                                "type": "string",
+                                "description": "One human-readable sentence describing the failure."
+                              },
+                              "storageError": {
+                                "type": "string",
+                                "description": "The underlying error text from the storage/transcode layer, with credentials redacted (userinfo and query strings stripped) and length bounded."
+                              },
+                              "httpStatus": {
+                                "type": "number",
+                                "description": "HTTP status the storage answered (404 = key absent, 403 = denied). Absent for a connection-class failure, which never reaches a status."
+                              },
+                              "source": {
+                                "type": "object",
+                                "properties": {
+                                  "url": {
+                                    "type": "string",
+                                    "description": "The source location the failing read was pointed at, with credentials redacted. Never contains userinfo or a presigned query string. A NORMALISED form, not a verbatim copy of the location in the underlying error text: trailing sentence punctuation is trimmed and userinfo/query strings are removed, so compare it by bucket/key rather than by exact string equality with a URL you submitted."
+                                  },
+                                  "bucket": {
+                                    "type": "string",
+                                    "description": "Bucket, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains userinfo."
+                                  },
+                                  "key": {
+                                    "type": "string",
+                                    "description": "Object key, when the location was an s3:// URI. Split out of the redacted `url` above, so it never contains a presigned query string."
+                                  }
+                                },
+                                "required": [
+                                  "url"
+                                ],
+                                "additionalProperties": false,
+                                "description": "Where the failing read was pointed (credentials redacted)."
+                              },
+                              "encoreJobId": {
+                                "type": "string",
+                                "description": "The transcoder job id this failure came from, for correlation."
+                              },
+                              "assetId": {
+                                "type": "string",
+                                "description": "The asset this failure belongs to, for correlation."
+                              }
+                            },
+                            "required": [
+                              "code",
+                              "message"
+                            ],
+                            "additionalProperties": false,
+                            "description": "Structured, machine-readable failure detail. Present only for recognised failure classes; branch on `errorDetail.code` rather than parsing `error`."
                           },
                           "skipReason": {
                             "type": "string"
