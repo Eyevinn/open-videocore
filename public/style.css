@@ -2910,15 +2910,17 @@ body.detail-standalone .assets-side {
    render their EMPTY state in var(--text-muted) and switch to var(--text) only
    once a value is chosen, so "is anything filtered right now?" is answerable at a
    glance. The search box is covered by its native placeholder; the select and the
-   date inputs carry no placeholder, so public/jobs-table.js markUnset() toggles
-   .is-unset on them (empty <select> option / empty date value).
+   date inputs carry no placeholder, so the shared markUnset()/wireUnset() in
+   public/filter-unset.js toggles .is-unset on them (empty <select> option / empty
+   date value). Every bar calls it — see the rule below.
 
    Two selectors cover all four placeholder-bearing filter boxes. Jobs' search
    box (public/jobs-table.js:342-345) and Audit's action box
    (public/audit-table.js:349-353, an `input[type=text]`) both carry
-   `.ops-filter-search`. Assets' box (public/assets-table.js:430-434, placeholder
-   "Full-text search…") and Logs' box (public/logs-table.js:207-211, a bare
-   `input[type=search]` with no class at all, placeholder "Search message…") are
+   `.ops-filter-search`. Assets' box (`searchFilterControl` in
+   public/assets-table.js, placeholder "Full-text search…") and Logs' box
+   (`searchFilterControl` in public/logs-table.js, a bare `input[type=search]`
+   with no class at all, placeholder "Search message…") are
    reached by the type-qualified selector. Those last two matched no authored
    ::placeholder rule before issue #983, so their placeholder text was still being
    drawn for a light field after the repaint above. Date inputs are deliberately
@@ -2930,24 +2932,45 @@ body.detail-standalone .assets-side {
   opacity: 1; /* Firefox dims placeholders by default. */
 }
 
+/* Two selector pairs for the same state, for the same reason as the colour rule
+   above: Jobs and Audit controls carry `.ops-filter-select` / `.ops-filter-date`,
+   while the Assets status select (public/assets-table.js statusFilterControl) and
+   the Assets and Logs date boxes (dateFilterControl in both files) are bare
+   `select` / `input[type=date]` nested in the bar. All four call sites toggle the
+   class through the shared markUnset()/wireUnset() in public/filter-unset.js, so
+   the muted empty state is now the same on every bar (issue #983 AC2 — before
+   this, only Jobs and Audit muted it and the divergence was hidden behind the
+   white UA default the repaint removed).
+
+   The type-qualified selectors are (0,2,1), so they outrank the (0,1,1)
+   `.ops-table-filters select, .ops-table-filters input[type='date']` colour rule
+   above; the class-only pair is (0,2,0) against that rule's (0,1,0) sibling. */
 .ops-filter-select.is-unset,
-.ops-filter-date.is-unset {
+.ops-filter-date.is-unset,
+.ops-table-filters select.is-unset,
+.ops-table-filters input[type='date'].is-unset {
   color: var(--text-muted);
 }
 
 /* The date field's yyyy-mm-dd format hint is drawn by the UA in its own shadow
    subtree, which does not always inherit the host's color. */
-.ops-filter-date.is-unset::-webkit-datetime-edit {
+.ops-filter-date.is-unset::-webkit-datetime-edit,
+.ops-table-filters input[type='date'].is-unset::-webkit-datetime-edit {
   color: var(--text-muted);
 }
 
 /* The open option list stays legible regardless of the closed control's state:
-   only the placeholder entry ("All statuses", value='') is muted there. */
-.ops-filter-select option {
+   only the placeholder entry ("All statuses", value='') is muted there. Without
+   the bare-`select` pair the Assets list would inherit the muted `color` from its
+   own `.is-unset` host and open entirely greyed — i.e. muting the closed control
+   above is only safe together with this. */
+.ops-filter-select option,
+.ops-table-filters select option {
   color: var(--text);
 }
 
-.ops-filter-select option[value=''] {
+.ops-filter-select option[value=''],
+.ops-table-filters select option[value=''] {
   color: var(--text-muted);
 }
 
@@ -2988,8 +3011,12 @@ body.detail-standalone .assets-side {
 /* One casing and one weight for every filter caption in the bar (issue #983 AC3).
    Jobs and Audit caption with `<label class="ops-filter-label">`
    (public/jobs-table.js:255-257, public/audit-table.js:268); Assets and Logs
-   caption with a `<span>` inside the control's own `<label>`
-   (public/assets-table.js:380-381/418-421/536-537, public/logs-table.js:182-190).
+   caption with a `<span class="ops-filter-caption">` inside the control's own
+   `<label>` (public/assets-table.js `statusFilterControl`,
+   `searchFilterControl`, `structuredTextFilterControl` and `dateFilterControl`;
+   public/logs-table.js `labelledControl`, which every Logs control routes
+   through). Function names rather than line numbers: these refs drifted once
+   already.
    Those two sets had drifted — uppercase/letter-spaced at 11px and inherited
    weight on one side, sentence-case 12px at weight 500 on the other.
 
@@ -3271,8 +3298,8 @@ body.detail-standalone .assets-side {
 /* Pinned rather than inherited: these are pickable column names and read as body
    text, not filter captions. The `label > span { font-weight: 500 }` rule this
    used to outrank is gone (issue #983 folded the caption typography into
-   `.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-slot >
-   label > span` above, which no longer declares a weight), so 400 is now what
+   `.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-caption`
+   above, which no longer declares a weight), so 400 is now what
    these rows would inherit anyway — keeping it declared means a future weight on
    a filter caption cannot reach the chooser by accident. */
 .ops-table-filters .ops-columns-item-label {

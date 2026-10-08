@@ -65,6 +65,10 @@ import {
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
+// Muted empty state for placeholder-less filter controls (issue #984). The class
+// name is a CSS contract, so it is imported rather than restated — see
+// public/filter-unset.js.
+import { markUnset } from './filter-unset.js';
 
 // ─── Contract-grounded constants ──────────────────────────────────────────────
 
@@ -236,19 +240,11 @@ export function renderAssetCell(job) {
 // An UNSET filter control must read as unset (issue #984). The search box gets
 // that for free — it has a native `placeholder`, styled muted by
 // `.ops-filter-search::placeholder` in public/style.css. The select and the two
-// date inputs have no placeholder: "All statuses" is a real <option> and
-// `yyyy-mm-dd` is the UA's own format hint, so both would otherwise paint at
-// full `var(--text)`. Pure CSS cannot cover the date case — an empty
-// `input[type="date"]` matches neither `:placeholder-shown` (date inputs have no
-// placeholder) nor `:not(:valid)` (an empty optional date IS valid) — so the
-// empty state is marked with one explicit class for all three, and
-// `.ops-filter-select.is-unset` / `.ops-filter-date.is-unset` paint it
-// `var(--text-muted)`. Called on every change AND on first render.
-const UNSET_CLASS = 'is-unset';
-
-function markUnset(control) {
-  control.classList.toggle(UNSET_CLASS, control.value === '');
-}
+// date inputs have no placeholder, so markUnset() toggles `.is-unset` on them;
+// the reasoning, and why pure CSS cannot cover the date case, now live once in
+// public/filter-unset.js (imported above) instead of in a private copy here and
+// an identical one in public/audit-table.js. Called on every change AND on first
+// render. Behaviour is unchanged — same class, same toggle condition.
 
 function labelled(labelText, control, forId) {
   const frag = document.createDocumentFragment();

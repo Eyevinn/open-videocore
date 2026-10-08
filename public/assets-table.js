@@ -221,6 +221,10 @@ import { REVIEW_STATES, reviewStateLabel } from './review-state.js';
 // live in one module so the list, the detail panel (#895) and the protected-
 // delete flow (#896) ship one pattern — see docs/ux/asset-lock-state-spec.md §2.
 import { isAssetLocked, lockBadgeHtml, ROW_LOCKED_CLASS } from './lock-state.js';
+// Muted empty state for placeholder-less filter controls (issues #984, #983 AC2).
+// The class name is a CSS contract, so it is imported rather than restated — see
+// public/filter-unset.js.
+import { wireUnset } from './filter-unset.js';
 
 // ─── Contract constants (verified above) ─────────────────────────────────────
 
@@ -590,6 +594,12 @@ function statusFilterControl(initial) {
       sel.appendChild(o);
     });
     if (initial) sel.value = initial;
+    // "All statuses" is a real <option>, not a placeholder, so an unfiltered
+    // select would paint at full var(--text) while the Jobs equivalent is muted —
+    // the one remaining visible difference between the bars after #983's repaint.
+    // wireUnset() adds its own change/input listeners rather than relying on the
+    // descriptor below, whose `event` wiring belongs to the primitive (asSlot()).
+    wireUnset(sel);
     wrap.appendChild(span);
     wrap.appendChild(sel);
     return { el: wrap, input: sel, event: 'change', read: () => sel.value };
@@ -827,6 +837,9 @@ function dateFilterControl(name, labelText, initial) {
     input.type = 'date';
     input.setAttribute('aria-label', labelText);
     if (initial) input.value = initial.length >= 10 ? initial.slice(0, 10) : initial;
+    // Same muted empty state as the Jobs date boxes (issue #983 AC2): the UA's
+    // yyyy-mm-dd hint is not a placeholder, so `.is-unset` is what mutes it.
+    wireUnset(input);
     wrap.appendChild(span);
     wrap.appendChild(input);
     return { el: wrap, input, event: 'change', read: () => input.value };
