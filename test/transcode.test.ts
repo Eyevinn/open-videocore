@@ -233,9 +233,20 @@ describe('transcode job management (issue #8)', () => {
     it('honours explicit preset selection (720p, 480p)', async () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);
+      // The named profiles must exist in the profile store: since issue #1022 a
+      // caller-supplied name the store does not hold is rejected with a 400
+      // instead of being forwarded to a transcoding service that cannot resolve
+      // it. The store IS the index those instances load (GET
+      // /api/v1/profiles/index.yml).
+      for (const preset of ['720p', '480p'] as const) {
+        await h.profiles.create({
+          name: preset,
+          yaml: `name: ${preset}\nencodes:\n  - type: X264Encode\n    height: 720\n`
+        });
+      }
 
       // An explicit `profile` is forwarded verbatim as the server-side named
-      // profile string (src/pipeline/transcode.ts:90,137 — preset ?? 'program').
+      // profile string (src/pipeline/transcode.ts — preset ?? DEFAULT_PROFILE_NAME).
       for (const preset of ['720p', '480p'] as const) {
         h.submitted.length = 0;
         const res = await h.app.inject({
@@ -249,7 +260,15 @@ describe('transcode job management (issue #8)', () => {
       }
     });
 
-    it('forwards a custom profile verbatim', async () => {
+    // Issue #1022: `customProfile` (name + a 1-16 rung `outputs` ladder) is
+    // REMOVED. It used to validate every rung and then submit only `.name`, so
+    // the caller's resolutions/bitrates were silently discarded — the job
+    // document has no inline-ladder field at all (`EncoreJob`: profile: String,
+    // profileParams, outputFolder, baseName, inputs —
+    // github.com/svt/encore, encore-common/.../model/EncoreJob.kt:52-180). The
+    // field is REJECTED rather than ignored: a dropped unknown key would
+    // reproduce exactly the silent-discard this issue is about.
+    it('rejects a body carrying the removed customProfile field with a 400 that explains it', async () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);
       const customProfile = {
@@ -271,11 +290,101 @@ describe('transcode job management (issue #8)', () => {
         headers: A,
         payload: { customProfile }
       });
+      expect(res.statusCode).toBe(400);
+      // The message points the caller at the mechanism that DOES work.
+      expect(res.json().message).toMatch(/customProfile was removed/);
+      expect(res.json().message).toMatch(/\/api\/v1\/profiles/);
+      // Nothing was submitted: the ladder is not silently dropped on the floor.
+      expect(h.submitted).toHaveLength(0);
+    });
+
+    // Issue #1022 acceptance criterion: an unknown profile name is rejected at
+    // submit time with a clear 400 rather than surfacing later as a dropped job.
+    // The store checked here is the same profile index the transcoding instances
+    // load (src/routes/profiles.ts:131-180 GET /index.yml), and
+    // ProfileService.getProfile resolves `profiles[job.profile]` out of exactly
+    // that index — so a name absent from the store could never resolve.
+    it('rejects an unknown profile name with 400 unknown_profile and submits nothing', async () => {
+      const h = await buildApp();
+      const sourceId = await makeSource(h);
+      await h.profiles.create({
+        name: 'program',
+        yaml: 'name: program\nencodes:\n  - type: X264Encode\n    height: 1080\n'
+      });
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: { profile: 'zzz-does-not-exist' }
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('unknown_profile');
+      expect(res.json().message).toContain('zzz-does-not-exist');
+      // Actionable: it names where to look / how to register one.
+      expect(res.json().message).toMatch(/\/api\/v1\/profiles/);
+      expect(h.submitted).toHaveLength(0);
+      // No job record was created for a submission that never happened.
+      expect((await h.jobs.list()).total).toBe(0);
+    });
+
+    // Issue #1022 acceptance criterion: `job.profile` records the profile
+    // ACTUALLY sent. It used to be written from the default while a
+    // customProfile.name was submitted, so the job document named a profile that
+    // was never used.
+    it('records on the job the profile actually submitted (explicit name)', async () => {
+      const h = await buildApp();
+      const sourceId = await makeSource(h);
+      await h.profiles.create({
+        name: 'program',
+        yaml: 'name: program\nencodes:\n  - type: X264Encode\n    height: 1080\n'
+      });
+      await h.profiles.create({
+        name: 'archive',
+        yaml: 'name: archive\nencodes:\n  - type: X264Encode\n    height: 1080\n'
+      });
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: { profile: 'archive' }
+      });
       expect(res.statusCode).toBe(202);
-      // A customProfile is forwarded to Encore by its NAME (a server-side named
-      // profile string); the ladder is resolved server-side, so only the name is
-      // carried in the submit input (src/pipeline/transcode.ts:137).
-      expect(h.submitted[0].profile).toBe('my-custom');
+      const { jobId } = res.json();
+
+      expect(h.submitted).toHaveLength(1);
+      expect(h.submitted[0].profile).toBe('archive');
+      const job = await h.jobs.get(jobId);
+      // The recorded profile is the submitted one — not the 'program' default.
+      expect(job?.profile).toBe('archive');
+      expect(job?.profile).toBe(h.submitted[0].profile);
+
+      // The job as the API serves it agrees too.
+      const observed = await h.app.inject({
+        method: 'GET',
+        url: `/api/v1/jobs/${jobId}`,
+        headers: A
+      });
+      expect(observed.statusCode).toBe(200);
+      expect(observed.json().profile).toBe('archive');
+    });
+
+    it('records the default profile on the job when the caller names none', async () => {
+      const h = await buildApp();
+      const sourceId = await makeSource(h);
+
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/v1/assets/${sourceId}/transcode`,
+        headers: A,
+        payload: {}
+      });
+      expect(res.statusCode).toBe(202);
+      const { jobId } = res.json();
+      const job = await h.jobs.get(jobId);
+      expect(h.submitted[0].profile).toBe('program');
+      expect(job?.profile).toBe(h.submitted[0].profile);
     });
 
     // Note: the 202 happy-path threading of profileParams from
@@ -368,9 +477,13 @@ describe('transcode job management (issue #8)', () => {
       expect(h.submitted).toHaveLength(1);
     });
 
-    it('rejects supplying both profile and customProfile', async () => {
+    it('rejects customProfile even alongside a valid profile name (issue #1022)', async () => {
       const h = await buildApp();
       const sourceId = await makeSource(h);
+      await h.profiles.create({
+        name: '720p',
+        yaml: 'name: 720p\nencodes:\n  - type: X264Encode\n    height: 720\n'
+      });
       const res = await h.app.inject({
         method: 'POST',
         url: `/api/v1/assets/${sourceId}/transcode`,
@@ -378,6 +491,7 @@ describe('transcode job management (issue #8)', () => {
         payload: { profile: '720p', customProfile: { name: 'x', outputs: [] } }
       });
       expect(res.statusCode).toBe(400);
+      expect(h.submitted).toHaveLength(0);
     });
 
     it('404 for unknown source, 409 when no stored object', async () => {
