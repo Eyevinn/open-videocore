@@ -29,10 +29,29 @@
  *       view exactly (same rule the rest of the table's state already follows);
  *     - with no param, the operator's own stored default applies, so their
  *       preferred shape survives a fresh visit to a bare URL;
- *     - with neither, every declared column is shown.
+ *     - with neither, the table's DEFAULT set is shown (see below).
+ *
+ * DECLARED vs DEFAULT (issue #961)
+ *   A table declares every column it CAN paint; it does not have to paint them
+ *   all out of the box. A column marked `defaultVisible: false` is declared,
+ *   listed in the chooser, and addressable by `cols` — but absent until someone
+ *   asks for it. That is what lets a table grow an optional column without
+ *   silently rearranging the view of every operator who never asked for it.
+ *   `defaultVisible` ONLY describes the no-choice-made case: once a URL param or
+ *   a stored preference exists, that set is honoured verbatim and the flag has
+ *   no further say. A column that is both `defaultVisible: false` and
+ *   `hideable: false` is a contradiction; pinning wins, since a column that
+ *   cannot be hidden has to be somewhere.
  *   A toggle writes BOTH: the stored default (so it persists) and the URL (so the
  *   view stays shareable). Storage is best-effort — private-mode and quota errors
  *   are swallowed, because losing a column preference must never break the table.
+ *
+ *   RESET (issue #962) is the exact inverse, and has to clear BOTH writes: a reset
+ *   that forgot only the stored default would be undone by the `cols` still in the
+ *   address bar, and one that forgot only the URL would come back on the next bare
+ *   visit. Because only the consumer knows its namespace and its URL contract, the
+ *   chooser does not clear either itself — it offers the ACTION (`onReset`) and the
+ *   consumer performs both clears, with clearStoredColumns() for the stored half.
  *
  * THE LEGALITY RULE
  *   A table that renders nothing identifiable and offers no actions is not a
@@ -162,6 +181,38 @@ export function isHideable(col) {
   return !(col && col.hideable === false);
 }
 
+/**
+ * Is this column painted when nobody has chosen a set? (issue #961)
+ *
+ * True unless it opts out with `defaultVisible: false` — the flag is opt-IN to
+ * being hidden, so every column declared before this existed keeps its place.
+ */
+export function isDefaultVisible(col) {
+  return !(col && col.defaultVisible === false);
+}
+
+/**
+ * The keys a table paints with NO request of any kind: every declared column
+ * except the ones that opted out, plus any pinned (`hideable: false`) column
+ * regardless of its flag.
+ *
+ * Falls back to every declared key if that set would be empty — a table whose
+ * every column opted out of the default is a declaration bug, and the honest
+ * repair is to paint it rather than to render a headerless grid.
+ *
+ * @param {Array<{key:string,defaultVisible?:boolean,hideable?:boolean}>} columns
+ * @returns {string[]} keys in DECLARED order.
+ */
+export function defaultVisibleColumns(columns) {
+  const declared = declaredKeys(columns);
+  const byKey = new Map((Array.isArray(columns) ? columns : []).map((c) => [c && c.key, c]));
+  const out = declared.filter((k) => {
+    const col = byKey.get(k);
+    return isDefaultVisible(col) || !isHideable(col);
+  });
+  return out.length ? out : declared;
+}
+
 function groupsOf(options) {
   const raw = options && options.requireAtLeastOne;
   if (!Array.isArray(raw)) return [];
@@ -175,8 +226,10 @@ function groupsOf(options) {
  * Turn a REQUESTED key set into a LEGAL visible set.
  *
  * @param {string[]|null} requested  keys the URL / storage / operator asked for;
- *        null or unusable means "no request" -> every declared column.
- * @param {Array<{key:string,hideable?:boolean}>} columns  declared columns.
+ *        null or unusable means "no request" -> the table's DEFAULT set
+ *        (defaultVisibleColumns, i.e. every declared column that did not opt out
+ *        with `defaultVisible: false`).
+ * @param {Array<{key:string,hideable?:boolean,defaultVisible?:boolean}>} columns
  * @param {{requireAtLeastOne?:string[][]}} [options]
  * @returns {string[]} keys in DECLARED order (the order the table paints in).
  *
@@ -185,16 +238,19 @@ function groupsOf(options) {
  *     from before a column was renamed must not resurrect a phantom column);
  *   - `hideable: false` columns are always re-added;
  *   - a group with no surviving member gets its first declared member back;
- *   - an empty outcome falls all the way back to every declared column, so no
- *     input can produce a headerless table.
+ *   - an empty outcome falls all the way back to the default set, so no input
+ *     can produce a headerless table.
+ *
+ * Note that an explicit request is NOT filtered by `defaultVisible` — asking for
+ * an off-by-default column is exactly how it gets painted (issue #961).
  */
 export function normalizeVisibleColumns(requested, columns, options) {
   const declared = declaredKeys(columns);
   if (!declared.length) return [];
-  const all = () => declared.slice();
+  const fallback = () => defaultVisibleColumns(columns);
 
   const asked = cleanKeyList(requested);
-  if (!asked) return all();
+  if (!asked) return fallback();
 
   const askedSet = new Set(asked);
   const byKey = new Map((Array.isArray(columns) ? columns : []).map((c) => [c && c.key, c]));
@@ -216,7 +272,7 @@ export function normalizeVisibleColumns(requested, columns, options) {
   }
 
   const out = declared.filter((k) => visibleSet.has(k));
-  return out.length ? out : all();
+  return out.length ? out : fallback();
 }
 
 /**
@@ -266,10 +322,19 @@ let chooserUid = 0;
  * @param {string[][]} [options.requireAtLeastOne]
  * @param {() => (string|null)} [options.getActiveSortKey]  lets the list flag a
  *        column that is hidden while the table is still sorted by it.
+ * @param {(keys: string[]) => void} [options.onReset]  called with the table's
+ *        DECLARED default set when the operator resets (issue #962). The consumer
+ *        both applies it and CLEARS every place it remembered a choice — its
+ *        stored default (clearStoredColumns) and its URL state. Defaults to
+ *        `onChange`, which restores the right view but leaves the remembered
+ *        choice in place, so a consumer that persists anything should wire this.
+ * @param {() => boolean} [options.getIsCustomized]  whether there is anything to
+ *        reset (a stored default or a column param in the URL). Only the consumer
+ *        can answer that, so when it is omitted the reset action stays enabled.
  * @param {string} [options.label]  button caption (default 'Columns').
  * @param {Document} [options.doc]  injectable document (tests / detached panes).
- * @returns {{el:HTMLElement, refresh:function, close:function, destroy:function,
- *            isOpen:function}}
+ * @returns {{el:HTMLElement, refresh:function, reset:function, close:function,
+ *            destroy:function, isOpen:function}}
  *
  * A non-modal popover, deliberately: choosing columns is a light, repeated
  * adjustment made WHILE reading the table, and a modal would hide the very rows
@@ -285,6 +350,9 @@ export function createColumnChooser(options) {
   const onChange = typeof opts.onChange === 'function' ? opts.onChange : () => {};
   const getActiveSortKey =
     typeof opts.getActiveSortKey === 'function' ? opts.getActiveSortKey : () => null;
+  const onReset = typeof opts.onReset === 'function' ? opts.onReset : onChange;
+  const getIsCustomized =
+    typeof opts.getIsCustomized === 'function' ? opts.getIsCustomized : () => true;
   const groups = groupsOf(opts);
 
   const uid = ++chooserUid;
@@ -329,19 +397,38 @@ export function createColumnChooser(options) {
   if (!hint.textContent) hint.hidden = true;
   panel.appendChild(hint);
 
+  // Two actions, deliberately side by side in the SAME panel the toggles live in
+  // (issue #962): the control that let an operator customize the table is the only
+  // place they will look to undo it, and a reset parked anywhere else is a reset
+  // nobody finds. They are NOT redundant even for a table whose declared default
+  // happens to be "every column", so each says what it writes, not just what it
+  // shows: "Show all" is a choice (remembered like any other toggle), "Reset to
+  // defaults" is the withdrawal of one.
   const actions = doc.createElement('div');
   actions.className = 'ops-columns-actions';
   const showAll = doc.createElement('button');
   showAll.type = 'button';
   showAll.className = 'ops-columns-showall btn-ghost';
   showAll.textContent = 'Show all';
+  showAll.title = 'Show every column, and remember that as your preference.';
   actions.appendChild(showAll);
+  const resetBtn = doc.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.className = 'ops-columns-reset btn-ghost';
+  resetBtn.textContent = 'Reset to defaults';
+  resetBtn.title =
+    'Forget your saved column preference and this link’s columns, and go back to the default columns.';
+  actions.appendChild(resetBtn);
   panel.appendChild(actions);
 
   el.appendChild(panel);
 
   showAll.addEventListener('click', function () {
     commit(declaredKeys(columns));
+  });
+
+  resetBtn.addEventListener('click', function () {
+    reset();
   });
 
   // The ONE path a toggle takes. It normalizes first, so `onChange` only ever
@@ -353,6 +440,22 @@ export function createColumnChooser(options) {
     const next = normalizeVisibleColumns(requestedKeys, columns, { requireAtLeastOne: groups });
     onChange(next);
     refresh();
+  }
+
+  /**
+   * Reset to the table's DECLARED default set (issue #962).
+   *
+   * Routed through `onReset` rather than `commit` on purpose: committing would
+   * persist the default set as a fresh preference, which is the opposite of what
+   * reset means. The default set is derived the same way a first load derives it —
+   * normalizeVisibleColumns() with no request — so there is one definition of
+   * "default", not a second copy that can drift from the declared columns.
+   */
+  function reset() {
+    const defaults = normalizeVisibleColumns(null, columns, { requireAtLeastOne: groups });
+    onReset(defaults);
+    refresh();
+    return defaults;
   }
 
   /** Rebuild the checkbox list from the current visible set. */
@@ -367,6 +470,11 @@ export function createColumnChooser(options) {
 
     btnCount.textContent = ' ' + visible.length + ' of ' + declared.length;
     showAll.disabled = visible.length === declared.length;
+    // Reset is NOT disabled just because the view already looks default: the
+    // state it clears is invisible (a stored default, a `cols` still in the URL)
+    // and can describe the default set exactly. Only the consumer can say whether
+    // any of it is there, which is what getIsCustomized() answers.
+    resetBtn.disabled = !getIsCustomized();
 
     list.innerHTML = '';
     for (const col of columns) {
@@ -474,7 +582,7 @@ export function createColumnChooser(options) {
 
   refresh();
 
-  return { el, refresh, open, close, isOpen, destroy, _button: btn, _panel: panel };
+  return { el, refresh, reset, open, close, isOpen, destroy, _button: btn, _panel: panel };
 }
 
 /** Human sentence for the panel hint, naming the columns that are protected. */
