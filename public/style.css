@@ -1980,16 +1980,21 @@ body.detail-standalone .assets-side {
  * / `input[type=search]` nested in the bar, so match them by type here rather than
  * leaving them to fall through to the white user-agent defaults. Typed input
  * selectors are deliberate: a bare `input` would also paint the column-chooser
- * checkboxes (.ops-columns-item input). */
+ * checkboxes (.ops-columns-item input).
+ *
+ * COLOUR ONLY — do not add font or padding here. The type-qualified selectors are
+ * (0,2,1)/(0,1,1), so any geometry declaration would outrank the padding that
+ * `.ops-table-filters .ops-search-input` (issue #946) and
+ * `.ops-table-filters .ops-search-input-plain` (issue #914) use to reserve room
+ * for the magnifier and the clear control, and typed text would run underneath
+ * them. Geometry for every control in the bar comes from
+ * `.ops-table-filters select, .ops-table-filters input` below. */
 .ops-filter-select,
 .ops-filter-date,
 .ops-filter-search,
 .ops-table-filters select,
 .ops-table-filters input[type='date'],
 .ops-table-filters input[type='search'] {
-  font: inherit;
-  font-size: 13px;
-  padding: 5px 8px;
   background: var(--surface, #1a1a1a);
   color: var(--text, #eee);
   border: 1px solid var(--border, #333);
