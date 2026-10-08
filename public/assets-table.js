@@ -1119,12 +1119,68 @@ function buildColumns(renderCtx) {
       label: 'Actions',
       render: (a) => {
         const wedged = isAssetWedged(a);
+        const redriveBtn = wedged
+          ? '<button class="btn-ghost asset-redrive-btn" data-id="' +
+            escHtml(a.id) +
+            '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
+          : '';
+
+        // Archive is a NO-OP on an asset that is already `archived`, and the app
+        // can tell locally, so the control is withheld rather than offered as a
+        // confirmation for an action that would change nothing (issue #955,
+        // broken out from #853).
+        //   - The second archive SUCCEEDS — it does NOT fail with a 422.
+        //     `isValidTransition` short-circuits on `from === to` ("idempotent
+        //     no-op transitions are allowed", src/data/asset-repo.ts →
+        //     `isValidTransition`), so `applyStatus('archived', 'archived')`
+        //     returns the status and history unchanged instead of throwing, and
+        //     the soft delete (`remove()` → `update({ status: 'archived' })`)
+        //     resolves normally. Contract: openapi.json
+        //     `paths['/api/v1/assets/{id}'].delete.responses` = 204 / 404 / 409 —
+        //     there is no 422 on this route, and the handler
+        //     (src/routes/assets.ts → `app.delete('/:id')`) has no
+        //     already-archived guard. A repeat DELETE answers 204 and the asset
+        //     stays archived.
+        //   - So what is removed here is NOISE, not a confirm-then-fail: a
+        //     destructive-styled button, behind a confirmation dialog, for an
+        //     idempotent no-op. That makes it UNLIKE the two sibling controls
+        //     that gate on locally known status — the jobs table omitting Cancel
+        //     on a settled job (public/jobs-table.js, actions column) and the
+        //     detail panel omitting Restore on a non-archived asset
+        //     (public/app.js, `isArchived` gate) both suppress actions that would
+        //     really be refused. Restore remains reachable for the archived asset
+        //     from its detail panel (a row click).
+        //   - The determination is purely LOCAL and not racy: `status` is a core
+        //     projection column present on every row and in every search tier
+        //     (unlike the lock flag, #896, whose free-text projection omits
+        //     `deleteLock`), and `archived` has no ordinary outbound transition
+        //     (ALLOWED_TRANSITIONS.archived = []) — only the audited restore path
+        //     leaves it, and that re-renders the row.
+        //   - The archive guards that genuinely BLOCK (delete_protected,
+        //     referenced_by_job, has_children, member_of_collection — all 409)
+        //     are untouched and stay enabled. Most are not in the row projection,
+        //     so the 409 response stays the only place that can explain them
+        //     (spec §5.1, §5.4 — #896).
+        // Re-drive is independent of the lifecycle axis (it is a metadata-
+        // extraction recovery), so a wedged archived row still offers it.
+        //
+        // The guard is scoped to the Archive control ALONE. An earlier revision
+        // returned early for an archived row, which also withheld Rename — but
+        // renaming an archived asset is a PERMITTED operation, so that removed a
+        // working affordance rather than a dead one. Contract: openapi.json
+        // `paths['/api/v1/assets/{id}'].patch` declares responses 200 / 404 /
+        // 422 only (no 409 and no status-conflict response), and its
+        // `requestBody` schema accepts a bare `{ name }` (`name`: string,
+        // minLength 1, maxLength 256). The handler (src/routes/assets.ts →
+        // `app.patch('/:id')`) carries no archived guard, and `repo.update`
+        // consults `applyStatus` ONLY when `patch.status !== undefined`
+        // (src/data/asset-repo.ts), so a name-only PATCH on an archived asset
+        // never reaches the terminal-state machine and answers 200. Every other
+        // permitted control therefore stays rendered on an archived row.
+        const isArchived = a.status === 'archived';
+
         return (
-          (wedged
-            ? '<button class="btn-ghost asset-redrive-btn" data-id="' +
-              escHtml(a.id) +
-              '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
-            : '') +
+          redriveBtn +
           // Rename, straight from the row (issue #927 — the "inline-in-list"
           // affordance for the detail view's existing control). It opens the SAME
           // dialog the detail view opens (openRenameDialog, public/asset-rename.js),
@@ -1168,17 +1224,25 @@ function buildColumns(renderCtx) {
           // projection actually carries `deleteLock` — an UNKNOWN row (free-text
           // search tier) falls through to the 409 path instead of guessing.
           //
-          // The button is deliberately NOT `disabled`: a disabled control is
-          // unfocusable and carries no explanation, which is precisely what this
-          // issue asks the UI to provide (spec §5.1).
-          '<button class="btn-danger asset-delete-btn" data-id="' +
-          escHtml(a.id) +
-          '" data-name="' +
-          escHtml(a.name || a.slug || '') +
-          (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })
-            ? '" data-locked="true'
-            : '') +
-          '" style="font-size:12px;padding:3px 8px;">Archive</button>'
+          // Unlike the archived case above, the lock is only one of four archive
+          // guards and the search tier cannot always see it, so the button is
+          // deliberately NOT `disabled` here: a disabled control is unfocusable
+          // and carries no explanation, which is precisely what #896 asks the UI
+          // to provide (spec §5.1).
+          //
+          // THIS is the single control the archived check suppresses — an
+          // already-archived row gets no Archive button, while Re-drive and
+          // Rename above remain available.
+          (isArchived
+            ? ''
+            : '<button class="btn-danger asset-delete-btn" data-id="' +
+              escHtml(a.id) +
+              '" data-name="' +
+              escHtml(a.name || a.slug || '') +
+              (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })
+                ? '" data-locked="true'
+                : '') +
+              '" style="font-size:12px;padding:3px 8px;">Archive</button>')
         );
       },
     },
