@@ -1,18 +1,28 @@
-# ADR-025: Source of the Encore `profilesUrl` — derived app base URL vs. object-store-served profiles
+# ADR-026: Source of the Encore `profilesUrl` — derived app base URL vs. object-store-served profiles
 
 **Status:** PROPOSED 2026-10-04 — decision record only; no product code changes in this PR
-**Date:** 2026-10-04
+**Date:** 2026-10-04 (catalog facts re-confirmed live 2026-10-08; renumbered from the
+draft's ADR-025 after `ADR-025-audit-scope-boundary.md` merged to `main` on 2026-10-05)
 **Author agent:** architect
-**Issue:** #1102 — *ADR deciding whether `profilesUrl` stays derived from the public base URL or moves to object-store-served profiles*. Supersedes the open question left by #284; adopts the direction proposed in #110. Sibling: #1103 (make the reachability probe continuous) — this ADR makes #1103 obsolete, see [D4](#d4--1103-the-continuous-reachability-probe-is-obsolete-as-specified). Related: #84 (profile store), #219/#283 (no OSC self-URL), #315 (parameter-store profiles URL), #337 (self-signed cert on the self-probe), #199/#859/#200 (anonymous-read packaged bucket), #991 (in-cluster object-store endpoint), ADR-003, ADR-021, ADR-023.
+**Issue:** #1102 — *ADR deciding whether `profilesUrl` stays derived from the public base URL or moves to object-store-served profiles*. Supersedes the open question left by #284; adopts the direction of the **now-closed** #110, which this ADR's follow-up implementation issues (§5) supersede as the live tracking work. Sibling: #1103 (make the reachability probe continuous) — this ADR re-scopes #1103, see [D4](#d4--1103-is-re-scoped-the-probe-must-follow-the-resolved-tier). Related: #84 (profile store), #219/#283 (no OSC self-URL), #315 (parameter-store profiles URL), #337 (self-signed cert on the self-probe), #199/#859/#200 (anonymous-read packaged bucket), #991 (in-cluster object-store endpoint), ADR-003, `ADR-021-external-s3-endpoint-source-and-packaged.md`, ADR-023.
+
+**Citation style.** Code is cited as **file path + symbol name**, without line
+numbers: this branch merges `main` but will keep drifting behind it until merge,
+and a record whose whole method is citation-grounding must not land with stale
+line numbers. Every symbol named below was re-verified by `grep` against this
+branch after merging `main` (2026-10-08).
 
 ---
 
 ## Summary of the decision
 
-**Move the Encore `profilesUrl` to an object-store-served profile index (#110).**
+**Move the Encore `profilesUrl` to an object-store-served profile index — the
+direction of the now-closed #110.**
 The app's own `/api/v1/profiles/index.yml` is **demoted from primary to
 fallback** — it stays in the resolver, but a healthy provisioned stack no longer
-depends on it.
+depends on it. #110 and #284 are both closed; they are cited throughout as the
+two *designs*, and the live tracking work is §5's follow-up issues, not either
+closed issue.
 
 The deciding fact is not performance or cost, it is *whether the property the
 current design depends on is expressible in any OSC contract*:
@@ -50,44 +60,41 @@ HTTP-GETs its configured `profilesUrl` with Java's `UrlResource` — a plain,
 unauthenticated GET that cannot present a bearer token. The URL it is handed is
 resolved at boot by a four-tier precedence chain:
 
-- `src/services/public-base-url.ts:87-105` — `resolveEncoreProfilesUrl(defaultProfilesUrl, paramStoreProfilesUrl)`:
-  1. `ENCORE_PROFILES_URL_OVERRIDE` (direct override) — `public-base-url.ts:91-92`;
-  2. **derived local index** — `` `${base}${LOCAL_PROFILES_INDEX_PATH}` `` at
-     `public-base-url.ts:94-95`, where `base` comes from
-     `resolvePublicBaseUrl()` (`public-base-url.ts:40-49`, which today returns
+- `src/services/public-base-url.ts` — `resolveEncoreProfilesUrl(defaultProfilesUrl, paramStoreProfilesUrl)`:
+  1. `ENCORE_PROFILES_URL_OVERRIDE` (direct override);
+  2. **derived local index** — `` `${base}${LOCAL_PROFILES_INDEX_PATH}` ``,
+     where `base` comes from `resolvePublicBaseUrl()` (which today returns
      only the `PUBLIC_BASE_URL` env override) and
-     `LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml'`
-     (`public-base-url.ts:55`);
+     `LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml'`;
   3. a full index URL persisted in the parameter store under
-     `StackConfig.encoreProfilesUrl` — `STACK_ENCORE_PROFILES_URL_FIELD`
-     (`public-base-url.ts:110`), read by
-     `resolveEncoreProfilesUrlFromParamStore` (`public-base-url.ts:134-157`);
+     `StackConfig.encoreProfilesUrl` — `STACK_ENCORE_PROFILES_URL_FIELD`,
+     read by `resolveEncoreProfilesUrlFromParamStore`;
   4. the remote default seed index.
-- `src/main.ts:980` — `const publicBaseUrl = resolvePublicBaseUrl();`
-- `src/main.ts:986-997` — the tier-3 parameter-store read, skipped entirely when
-  tier 1 or 2 is set.
-- `src/main.ts:998-1001` — `const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(encoreProfilesUrl, paramStoreProfilesUrl);`
-- `src/main.ts:964-966` — `encoreProfilesUrl`, the tier-4 remote default
+- `src/main.ts` — `const publicBaseUrl = resolvePublicBaseUrl();`, then the
+  tier-3 parameter-store read (skipped entirely when tier 1 or 2 is set), then
+  `const encoreScalerProfilesUrl = resolveEncoreProfilesUrl(encoreProfilesUrl, paramStoreProfilesUrl);`
+- `src/main.ts` — `encoreProfilesUrl`, the tier-4 remote default
   (`ENCORE_PROFILES_URL`, defaulting to the public `encore-test-profiles`
   index).
-- `src/main.ts:1214` — `profilesUrl: encoreScalerProfilesUrl` on the scaler
-  config; `src/encore-scaler/instance-pool.ts:594-595` spells it onto the OSC
+- `src/main.ts` — `profilesUrl: encoreScalerProfilesUrl` on the scaler
+  config; `src/encore-scaler/instance-pool.ts` spells it onto the OSC
   create body as `instanceBody['profilesUrl']`.
-- `src/main.ts:1002-1008` — when none of tiers 1–3 resolve, a warning is logged
-  and Encore uses the remote default index.
+- `src/main.ts` — when none of tiers 1–3 resolve, the
+  `'profiles URL unresolved to local store …'` warning is logged and Encore
+  uses the remote default index.
 
 So in a normal OSC deployment with `PUBLIC_BASE_URL` set, **tier 2 wins** and
 Encore is pointed at this app's own public URL.
 
 ### 1.2 What serves that path
 
-`src/routes/profiles.ts:132` registers `GET /index.yml`, which renders the
-Encore-format index **live from CouchDB** — `name: <name>/yaml` lines for every
-runnable profile, with an `x-profile-count` response header
-(`profiles.ts:171`) — and `profiles.ts:257` registers `GET /:name/yaml`, which
-returns one profile's raw YAML. Both are unauthenticated *inside the app*: the
-router comment at `profiles.ts:22-25` records that the whole router is
-unauthenticated by design because OSC terminates auth at the edge (ADR-003), and
+`src/routes/profiles.ts` (`profilesRouter`) registers `GET /index.yml`, which
+renders the Encore-format index **live from CouchDB** — `name: <name>/yaml`
+lines for every runnable profile, with an `x-profile-count` response header —
+and `GET /:name/yaml`, which returns one profile's raw YAML. Both are
+unauthenticated *inside the app*: the header comment on `profilesRouter`
+(*"This whole router is unauthenticated by design …"*) records that this is
+deliberate because OSC terminates auth at the edge (ADR-003), and
 the global `preHandler` in `src/main.ts` only resolves stack connections and
 never rejects. **The only thing that can reject Encore's fetch is the OSC auth
 gate at the platform edge.**
@@ -103,17 +110,22 @@ unconfirmed**.
 
 #284 shipped a boot-time confirmation instead of a fix:
 
-- `src/services/profiles-reachability.ts:150-206` —
+- `src/services/profiles-reachability.ts` —
   `checkProfilesIndexReachable({ profilesIndexUrl, usingLocalIndex, log, fetchImpl })`
   issues one unauthenticated GET, exactly as Encore would, and classifies the
-  result as `{ ok: true }` / `auth-wall` (401 or 403, `profiles-reachability.ts:174-182`)
-  / `unreachable` (`:183-190`, `:196-202`). It is **non-fatal by design**
-  (`:136-139`) and logs a hard error rather than aborting boot.
-- `src/services/profiles-reachability.ts:81-119` — `nodeSelfProbeFetch`, the
+  result against the `ReachabilityOutcome` union as `{ ok: true }` /
+  `kind: 'auth-wall'` (401 or 403) / `kind: 'unreachable'`. It is **non-fatal by
+  design** (stated in its doc comment) and logs a hard error rather than
+  aborting boot. Its first statement after picking a fetch is the short-circuit
+  `if (!profilesIndexUrl || !usingLocalIndex) return undefined;`, and its
+  `auth-wall` message names the path and the issue explicitly: *"Confirm the OSC
+  platform has made /api/v1/profiles publicly accessible for this app (issue
+  #284)"*.
+- `src/services/profiles-reachability.ts` — `nodeSelfProbeFetch`, the
   default probe, relaxes TLS verification for this one self-call via a
-  per-request `node:https` agent (`:57`), because the app's own public URL serves
-  a self-signed certificate from inside the cluster (#337).
-- `src/main.ts:2563-2567` — the single call site, fired **once**, after the
+  per-request `node:https` agent (`selfProbeHttpsAgent`), because the app's own
+  public URL serves a self-signed certificate from inside the cluster (#337).
+- `src/main.ts` — the single call site, fired **once**, after the
   server is listening: `void checkProfilesIndexReachable({ profilesIndexUrl: encoreScalerProfilesUrl, usingLocalIndex: Boolean(publicBaseUrl), log: app.log })`.
 
 That is a **one-shot** check. The customer-reported 401 on
@@ -130,14 +142,18 @@ failure we should not be exposed to at all.
 
 ## 2. Verified contracts (cited before the decision)
 
-**How the live contract was fetched (2026-10-04).** Every catalog fact below
-comes from a live query made while writing this ADR, by the method ADR-023 §2.1
-records:
+**How the live contract was fetched (2026-10-04; re-confirmed 2026-10-08).**
+Every catalog fact below comes from a live query made while writing this ADR, by
+the method ADR-023 §2.1 records:
 
 - `POST $OSC_MCP_URL` (`https://mcp.osaas.io/mcp`) with
   `Authorization: Bearer $OSC_ACCESS_TOKEN` and
   `Accept: application/json, text/event-stream`. `initialize` →
-  `serverInfo: { name: 'osc-remote-mcp', version: '8.13.0' }`.
+  `serverInfo: { name: 'osc-remote-mcp', version: '8.13.0' }` on 2026-10-04,
+  **`version: '8.14.1'` on the 2026-10-08 re-confirmation**. C1, C2, C4 and C9
+  were re-fetched at 8.14.1 and are unchanged except for the
+  `set-storage-bucket-public` / `list-objects-on-bucket` description wording
+  recorded in C4.
 - Read-only catalog calls dispatched through the `osc_call_tool` envelope
   (`{ name, args }`), per its live `tools/list` input schema.
 - Full per-category tool schemas read from the scoped surfaces the live
@@ -148,7 +164,7 @@ records:
   against the live subscription catalog
   `GET https://catalog.svc.prod.osaas.io/mysubscriptions`
   (header `x-pat-jwt: Bearer <PAT>`, per
-  `node_modules/@osaas/client-core/lib/context.js:24-31`).
+  the `x-pat-jwt` header set in `node_modules/@osaas/client-core/lib/context.js`).
 
 ### C1 — `profilesUrl` is a bare URL string on the `encore` service; there is no companion credential, header, or token field
 
@@ -226,7 +242,7 @@ matches only `update-my-app-github-token` (a git PAT) and `enable-agentic-sdlc`
 (the word "public" in prose). The same holds in the typed SDK:
 `CreateMyAppBody = { name, type, gitHubUrl, gitHubToken?, configService? }`
 and `MyApp = { id, name, type, gitHubUrl, url, appDns?, tenantId, buildStatus? }`
-— `node_modules/@osaas/client-core/lib/myapp.d.ts:2-18`.
+— `node_modules/@osaas/client-core/lib/myapp.d.ts` (`CreateMyAppBody`, `MyApp`).
 
 **(b) The one public-access toggle that exists explicitly excludes HTTP.** Live
 `set-instance-public-access` description (`mcp/category/instances` → `tools/list`,
@@ -251,36 +267,60 @@ outside the tenant's contract surface entirely, let alone path-scoped.
 (`https://api-minio-minio.auto.prod-se.osaas.io/docs/json`) returns
 `{ serviceDns: string, ports: Array<{name,port,protocol}>, publicAccess: boolean }`
 (all three `required`), matching
-`InternalEndpointInfo` in `node_modules/@osaas/client-core/lib/core.d.ts:130-148`.
+`InternalEndpointInfo` in `node_modules/@osaas/client-core/lib/core.d.ts`.
 It is an **output-only** boolean about the whole instance. No input anywhere in
 that document accepts it, and nothing in it is path-scoped.
 
 **Conclusion.** The 2026-07-08 assurance that `/api/v1/profiles` would be made
 publicly accessible is real, but it is an orchestrator-side configuration with
 **no API to set it, no API to read it, and no event when it changes**. Option
-#284 depends on it permanently. Logged as an OSC capability gap at
-`eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md`
-(the agents repo is where the `osc-feedback` agent consolidates submissions).
+#284 depends on it permanently. Logged as an OSC capability gap in the **agents
+repo** (a separate repository, so it is not part of this PR's diff) at
+`eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md`,
+written 2026-10-08 — that repo is where the `osc-feedback` agent consolidates
+submissions. It carries forward both this gap and the unreported
+`getInternalEndpoint` → `ports: []` gap named in C7.
 
 ### C4 — OSC *does* expose a first-class public-read capability — at bucket granularity
 
 Live `POST https://mcp.osaas.io/mcp/category/storage` → `tools/list`
-(2026-10-04) includes:
+(2026-10-04; re-fetched 2026-10-08 at osc-remote-mcp 8.14.1) includes:
 
-- **`set-storage-bucket-public`** — *"Make a storage bucket publicly readable on
-  the web. Use after create-storage-bucket to serve static files."*
+- **`set-storage-bucket-public`** — description **in full**, verbatim: *"Make a
+  storage bucket publicly readable on the web. Use after create-storage-bucket
+  to serve static files. To publish a static site with a proper public URL, use
+  create-my-page instead."*
   Input schema: `{ bucketName: string, instanceName?: string }`,
-  `required: ["bucketName"]`. `instanceName` is documented as *"Optional MinIO
-  instance name. Defaults to the shared workspace mcpstorage instance"* — so it
-  can target **this stack's own `minio-minio` instance**, not only managed
-  storage.
-- `create-storage-bucket` — `{ bucketName, instanceName? }`.
+  `required: ["bucketName"]`. `instanceName`: *"Optional MinIO instance name.
+  Defaults to the shared workspace mcpstorage instance."*
+- `create-storage-bucket` — `{ bucketName, instanceName? }`, where
+  `instanceName` is documented (8.14.1) as *"Optional MinIO instance name to
+  provision the bucket on … Provide a dedicated instance name (e.g. the name of
+  your minio-minio service instance) to isolate buckets."*
 - `upload-object-to-bucket` — `{ bucketName, objectKey, contentBase64, contentType, instanceName? }`.
-- `list-objects-on-bucket` — `{ bucketName, recursive, maxKeys?, continuationToken?, instanceName? }`.
+- `list-objects-on-bucket` — `{ bucketName, recursive, maxKeys?, continuationToken?, instanceName? }`,
+  now prefixed *"Managed OSC storage only … This tool does NOT support
+  user-deployed minio-minio service instances; use get-service-endpoints on
+  those instances instead."*
 
-So the capability OSC refuses to give at app-path granularity, it gives
-explicitly and by name at **bucket** granularity. That asymmetry is the whole
-argument.
+Two honest qualifications, both recorded rather than argued around:
+
+1. The third sentence of `set-storage-bucket-public` **steers static-site
+   publishing to My Page** (C8), not to a public bucket. It is weighed against
+   that in [D5](#d5--alternatives-considered-and-rejected); the profile index is
+   not a static *site*, it is one machine-fetched object served by exact key,
+   and the My Page rejection rests on naming/publish/lifecycle properties that
+   the steer does not change.
+2. The 8.14.1 `list-objects-on-bucket` caveat shows the managed-storage tool
+   family is at least partly scoped to **managed** OSC storage rather than a
+   tenant's own `minio-minio` instance. **D3 therefore does not depend on these
+   MCP tools at all** — it applies the policy through the S3 API
+   (`setBucketPolicy`) that this codebase already calls against its own instance
+   in production (C6). C4's role in the argument is narrower than "we will call
+   this tool": it is evidence that **public read is a capability OSC exposes and
+   documents at bucket granularity**, which is precisely what C3 shows it does
+   not expose at app-path granularity. That asymmetry is the whole argument, and
+   it survives both qualifications.
 
 ### C5 — The object store itself carries no public/bucket configuration at create time; public read is an S3-API operation
 
@@ -302,21 +342,23 @@ codebase already does (C6) — or through `set-storage-bucket-public` (C4).
 The #110 shape is not new infrastructure; it is the pattern already in
 production for packaged media:
 
-- `src/routes/provision.ts:994-1030` — step *1d*, issue #199: a `GetObject`-only
+- `src/routes/provision.ts` — step *1d* (*"Apply an anonymous (public)
+  read-only bucket policy …"*), issue #199: a `GetObject`-only
   anonymous policy is applied to `PACKAGED_BUCKET` and **only** that bucket
-  (`SOURCE_BUCKET` stays private). The policy built at `provision.ts:1007-1017`
-  is `{ Effect: 'Allow', Principal: { AWS: ['*'] }, Action: ['s3:GetObject'], Resource: ['arn:aws:s3:::<packaged>/*'] }`
-  — no `ListBucket`, no write, so objects are readable by exact key and the
-  bucket is not browsable. Applied with `minioClient.setBucketPolicy(...)` at
-  `provision.ts:1022`, documented as idempotent so re-provision converges, and
-  best-effort with retry/backoff so a policy failure cannot fail a re-provision.
-- `src/routes/assets.ts:3836-3843` — the delivery layer relies on exactly that:
+  (`SOURCE_BUCKET` stays private). The policy is built as the `packagedPolicy`
+  constant — `{ Effect: 'Allow', Principal: { AWS: ['*'] }, Action: ['s3:GetObject'], Resource: ['arn:aws:s3:::<packaged>/*'] }`
+  — with no `ListBucket` and no write, so objects are readable by exact key and
+  the bucket is not browsable. Applied with
+  `minioClient.setBucketPolicy(PACKAGED_BUCKET, packagedPolicy)`, documented
+  there as idempotent so re-provision converges, and best-effort with
+  retry/backoff so a policy failure cannot fail a re-provision.
+- `src/routes/assets.ts` — the delivery layer relies on exactly that:
   a provisioned stack's own object-store endpoint "**IS** the public origin for
   its packaged bucket, so a zero-config stack advertises absolute, anonymously
   fetchable manifest URLs", *"sound precisely because this codebase applies the
   anonymous-read policy to the packaged bucket when it provisions the stack"*.
-- Bucket names: `SOURCE_BUCKET = 'openvideocore-source'` /
-  `PACKAGED_BUCKET = 'openvideocore-packaged'` (`provision.ts:68-69`).
+- Bucket names: the `SOURCE_BUCKET = 'openvideocore-source'` /
+  `PACKAGED_BUCKET = 'openvideocore-packaged'` constants in `provision.ts`.
 
 **This is live evidence that the object store's public origin is not behind the
 SSO auth gate**: HLS/DASH players fetch manifests and segments from it
@@ -328,27 +370,28 @@ anonymously today, in this same product, in the shipped `public` delivery mode
 `src/services/internal-minio-endpoint.ts` already resolves the object store's
 **in-cluster** endpoint for the server-to-transcoder hand-off, with findings
 verified live against prod-se (read-only, 2026-09-29/30 — see the module header
-at `internal-minio-endpoint.ts:40-150`):
+comment in `internal-minio-endpoint.ts`):
 
 - the in-cluster form is `http://<service>.minio-minio.svc.cluster.local:8080`
-  (`DEFAULT_INTERNAL_PORT = 8080` at `:184`; Service port 80 has nothing behind
-  it and must not be used);
+  (the `DEFAULT_INTERNAL_PORT = 8080` constant; Service port 80 has nothing
+  behind it and must not be used);
 - a plain `GET http://<service>.minio-minio.svc.cluster.local:8080/minio/health/live`
   from a pod in the transcoder namespace returned **200 in 23 ms**, and the only
   NetworkPolicies in the cluster cover neither workload;
 - `getInternalEndpoint` returns `ports: []` for a running object-store instance,
-  so the port falls back to `DEFAULT_INTERNAL_PORT` (`internal-minio-endpoint.ts:56-63`;
-  note that the friction file that comment names,
+  so `selectInternalPort` falls back to `DEFAULT_INTERNAL_PORT` (recorded in the
+  same module header; note that the friction file that comment names,
   `docs/osc-feedback/incoming-issue991-minio-internal-port-not-exposed.md`, does
-  **not** exist in either repo — the finding is recorded only in that code
-  comment, and the gap log in §"OSC feedback" below carries it forward);
+  **not** exist in either repo — the finding was recorded only in that code
+  comment, and the agents-repo gap log written with this ADR, 
+  `incoming-profiles-url-public-path-exemption.md`, now carries it forward);
 - the resolver is **opt-out** (`ENCORE_S3_INTERNAL_ENDPOINT=off`), **probed**
-  before use, and **fail-soft** back to the stored public endpoint
-  (`makeInternalEndpointResolver`, `internal-minio-endpoint.ts:479`;
-  `resolveInternalEndpointSettings`, `:658`), and it never throws or fails
-  startup;
+  before use (`makeInternalEndpointProbe`), and **fail-soft** back to the stored
+  public endpoint (`makeInternalEndpointResolver`,
+  `resolveInternalEndpointSettings` in `internal-minio-endpoint.ts`), and it
+  never throws or fails startup;
 - its existing consumer is `resolveEncoreS3Config`
-  (`src/services/encore-s3-config.ts:176`), i.e. the Encore hand-off path.
+  (`src/services/encore-s3-config.ts`), i.e. the Encore hand-off path.
 
 So the reusable, already-hardened seam for pointing Encore at an in-cluster
 object-store URL **exists**, and the implementation does not have to re-derive
@@ -404,12 +447,12 @@ So the #284 design is not merely *fragile* on a catalog deploy — its two
 operative tiers are **unsettable**, and the only operator-managed path that
 works is a hand-typed URL pointing at content nothing maintains. An
 object-store index needs **neither** key: the app already holds the stack's
-object-store coordinates — `StackConfig.minioEndpoint`
-(`src/services/param-store.ts:60`) and
-`StackConfig.services: { serviceId, instanceName }[]` (`:94`), the same two
+object-store coordinates — the `StackConfig.minioEndpoint` and
+`StackConfig.services: { serviceId: string; instanceName: string }[]` fields of
+the `StackConfig` type in `src/services/param-store.ts`, the same two
 fields `internal-minio-endpoint.ts` resolves the in-cluster endpoint from —
-because it provisioned them itself. (`StackConfig.encoreProfilesUrl?` is at
-`:82`.)
+because it provisioned them itself. (`StackConfig.encoreProfilesUrl?` is on the
+same type.)
 
 ---
 
@@ -425,38 +468,44 @@ back (C4, C5, C6) — instead of against an orchestrator-level auth-gate exempti
 no contract can express (C3).
 
 - Bucket: a **new, dedicated** `openvideocore-profiles`, created alongside the
-  existing two in `src/routes/provision.ts` (`:68-69`). Dedicated, not a prefix
+  existing `SOURCE_BUCKET`/`PACKAGED_BUCKET` constants in
+  `src/routes/provision.ts`. Dedicated, not a prefix
   on `openvideocore-packaged`, so the profiles policy and the media policy stay
   independently auditable and a profile object can never collide with a packaged
   key.
 - Objects: `index.yml` plus one `<name>.yml` per runnable profile. The index keeps
-  the Encore-format `name: <relative>` mapping already emitted by
-  `src/routes/profiles.ts:132-175`, with the relative target changed from
-  `<name>/yaml` to `<name>.yml` so it resolves correctly against a bucket base
-  URL.
+  the Encore-format `name: <relative>` mapping already emitted by the
+  `GET /index.yml` handler in `src/routes/profiles.ts`, with the relative target
+  changed from `<name>/yaml` to `<name>.yml` so it resolves correctly against a
+  bucket base URL.
 - `GET /api/v1/profiles/index.yml` and `GET /api/v1/profiles/:name/yaml`
-  (`profiles.ts:132`, `:257`) **stay exactly as they are**. They remain the
+  (both in `profilesRouter`) **stay exactly as they are**. They remain the
   human/monitoring surface — including the `x-profile-count` header contract from
-  #460 (`profiles.ts:171`) — and the fallback source for deployments without
+  #460 — and the fallback source for deployments without
   object storage (D2). Nothing about their body or status contract changes.
 
 ### D2 — The derived app base URL is DEMOTED to a fallback, not deleted
 
-`resolveEncoreProfilesUrl` (`src/services/public-base-url.ts:87-105`) gains one
+`resolveEncoreProfilesUrl` (`src/services/public-base-url.ts`) gains one
 new tier, inserted **above** the derived local index:
 
 | Tier | Source | Status |
 |---|---|---|
-| 1 | `ENCORE_PROFILES_URL_OVERRIDE` | unchanged (`public-base-url.ts:91-92`) |
+| 1 | `ENCORE_PROFILES_URL_OVERRIDE` | unchanged |
 | **2 (new)** | **published object-store index URL**, when the publisher reports the index in sync | **new primary** |
-| 3 | derived `` `${PUBLIC_BASE_URL}${LOCAL_PROFILES_INDEX_PATH}` `` | demoted from primary to fallback (`public-base-url.ts:94-95`) |
-| 4 | parameter-store `StackConfig.encoreProfilesUrl` (#315) | unchanged (`public-base-url.ts:101-102`, `:110`, `:134-157`) |
-| 5 | remote default seed index | unchanged (`src/main.ts:964-966`) |
+| 3 | derived `` `${PUBLIC_BASE_URL}${LOCAL_PROFILES_INDEX_PATH}` `` | demoted from primary to fallback |
+| 4 | parameter-store `StackConfig.encoreProfilesUrl` (#315) | unchanged (`STACK_ENCORE_PROFILES_URL_FIELD`, `resolveEncoreProfilesUrlFromParamStore`) |
+| 5 | remote default seed index | unchanged (`encoreProfilesUrl` / `ENCORE_PROFILES_URL` in `src/main.ts`) |
+
+**The resolver must also report which tier it chose** — see D4: the boot probe's
+scope and its error wording both depend on it, so the resolved tier becomes part
+of the function's return rather than something the call site re-derives from
+`Boolean(publicBaseUrl)`.
 
 Demoted rather than removed, for three reasons, all grounded above:
 
 1. The env-override path (`MINIO_URL`/`COUCHDB_URL`) and the in-memory/local-dev
-   path have no provisioned object store — `src/routes/assets.ts:3849-3851`
+   path have no provisioned object store — `src/routes/assets.ts`
    already records that the stack-endpoint derivation "returns undefined for the
    env-override and in-memory paths". Those deployments must keep working.
 2. The publisher can be out of sync (a failed write, a stack provisioned before
@@ -476,7 +525,7 @@ Encore at a *third-party* index — but the product no longer depends on it.
 **The URL for tier 2 is resolved in this order**, reusing C7's hardened seam:
 
 1. the **in-cluster** endpoint from `makeInternalEndpointResolver`
-   (`src/services/internal-minio-endpoint.ts:479`) — probed before use and
+   (`src/services/internal-minio-endpoint.ts`) — probed before use and
    fail-soft by construction — giving
    `http://<service>.minio-minio.svc.cluster.local:8080/openvideocore-profiles/index.yml`.
    This is the preferred form: it matches the `routing: INTERNAL` the platform
@@ -491,8 +540,9 @@ Encore at a *third-party* index — but the product no longer depends on it.
 ### D3 — Serve the index anonymous-read, not presigned
 
 Apply a `GetObject`-only anonymous policy to `openvideocore-profiles`, as a
-**verbatim re-use of the shape already shipped** for the packaged bucket at
-`src/routes/provision.ts:1007-1022`: `Principal: { AWS: ['*'] }`,
+**verbatim re-use of the shape already shipped** for the packaged bucket — the
+`packagedPolicy` constant and its `setBucketPolicy` call in
+`src/routes/provision.ts`: `Principal: { AWS: ['*'] }`,
 `Action: ['s3:GetObject']`, `Resource: ['arn:aws:s3:::openvideocore-profiles/*']`,
 no `ListBucket`, no write; `setBucketPolicy` is idempotent so re-provision
 converges; best-effort with the same retry/backoff so it cannot fail a
@@ -516,26 +566,77 @@ and it is a strictly **narrower** exposure than the anonymous-read packaged
 bucket this product already ships (C6), which serves actual media. The source
 bucket's privacy is untouched. Anything a profile YAML must never contain
 (credentials, signed URLs) is already true today — `index.yml` and
-`/:name/yaml` are served unauthenticated by `profiles.ts:132`/`:257` right now.
+`/:name/yaml` are served unauthenticated by `profilesRouter` right now.
 
-### D4 — #1103 (the continuous reachability probe) is OBSOLETE as specified
+### D4 — #1103 is RE-SCOPED: the probe must follow the resolved tier
 
-#1103 asks for continuous probing of `${PUBLIC_BASE_URL}/api/v1/profiles/index.yml`
-to detect the auth gate closing. Under D1/D2 that path is no longer the primary
-source, so continuously monitoring it monitors a fallback. **Close #1103 as
-obsolete**, superseded by this ADR.
+#1103 as written asks for **continuous** probing of
+`${PUBLIC_BASE_URL}/api/v1/profiles/index.yml` to detect the auth gate closing.
+Under D1/D2 that path is no longer the primary source, so monitoring it on an
+interval monitors a fallback. **The periodic-probe scope in #1103 is therefore
+rejected** — but #1103 is *not* closed as a no-op, because D1/D2 force a change
+at exactly the call site it names. It is re-scoped to the probe correction below,
+or, if the orchestrator prefers to keep #1103 strictly about periodicity, closed
+and the correction folded into the D1 implementation issue. Either way **the
+correction is mandatory and ships with D1/D2 — the probe cannot be left
+unchanged.**
 
-What replaces it, honestly stated:
+**Why "change nothing" is not available.** `checkProfilesIndexReachable` is
+handed only a resolved URL plus a boolean, and the call site in `src/main.ts`
+computes that boolean from the *old* tier layout:
 
-- `checkProfilesIndexReachable` (`src/services/profiles-reachability.ts:150-206`)
-  and its single boot call site (`src/main.ts:2563-2567`) **stay as they are** —
-  one-shot, non-fatal — and keep guarding the tier-3 fallback for the
-  deployments that still rely on it.
-- The new primary needs its own, cheaper verification: a **publish verification**
-  that the published `index.yml` is fetchable and its profile count matches the
-  store. That is part of the D1 implementation issue, not a separate monitoring
-  project, and it probes an origin this app controls rather than an exemption it
-  does not.
+```ts
+void checkProfilesIndexReachable({
+  profilesIndexUrl: encoreScalerProfilesUrl,
+  usingLocalIndex: Boolean(publicBaseUrl),
+  log: app.log
+})
+```
+
+while the function itself short-circuits on
+`if (!profilesIndexUrl || !usingLocalIndex) return undefined;` and, on 401/403,
+logs *"Confirm the OSC platform has made /api/v1/profiles publicly accessible
+for this app (issue #284)"*. Left alone under D1/D2 that misbehaves in two ways,
+in opposite directions:
+
+1. **`PUBLIC_BASE_URL` set and the new tier 2 winning** — `encoreScalerProfilesUrl`
+   is the *bucket* URL, but `usingLocalIndex` is still `true`. The probe fires at
+   the object store and, on any 401/403/non-OK, reports it with auth-wall / issue
+   #284 wording that is simply wrong for an object-store origin, while the tier-3
+   app path it is supposed to be vouching for is never checked.
+2. **A catalog deploy** — C9 shows `PUBLIC_BASE_URL` cannot be set at all, so
+   `usingLocalIndex` is `false` and the probe is **skipped entirely**. The new
+   primary gets no boot check whatsoever.
+
+In neither case does it guard tier 3, which is what the "stays as it is" reading
+would need it to do.
+
+**The required change (ships with D1/D2):**
+
+- Pass the **resolved tier** explicitly instead of inferring it from
+  `Boolean(publicBaseUrl)`. `resolveEncoreProfilesUrl` returns the tier it chose
+  (D2), and the call site hands that to the probe — replacing the
+  `usingLocalIndex: boolean` parameter with the tier (or an equivalent
+  discriminated `origin: 'object-store' | 'app-path' | 'param-store' | 'remote-default'`).
+- **Scope the message to the origin that was actually probed.** The
+  auth-wall/issue-#284 wording stays for the `app-path` origin, where it is
+  accurate. An `object-store` origin gets its own wording (bucket, key, policy,
+  in-cluster vs public endpoint) and must not mention the login wall.
+- **Probe the object-store primary too**, so the catalog deploy in case 2 keeps a
+  boot check. This is the **publish verification** the primary needs anyway: the
+  published `index.yml` is fetchable and its profile count matches the store.
+  Cheap, non-fatal, and it probes an origin this app controls rather than an
+  exemption it does not.
+- Keep every existing property of the probe: **one-shot**, **non-fatal**, the
+  scoped `nodeSelfProbeFetch` TLS relaxation for the self-call (#337), and the
+  `ReachabilityOutcome` return shape its tests assert against. The re-scoping
+  changes *which origin is probed and how a failure is described*, not the
+  probe's lifecycle or its cost.
+
+No *periodic* probe is introduced. The reason #1103's interval is unnecessary
+under D1/D2 is structural, not budgetary: the object-store origin's reachability
+is a property this app sets and can re-assert at publish time, so there is no
+out-of-band actor to watch for.
 
 ### D5 — Alternatives considered and rejected
 
@@ -549,8 +650,8 @@ What replaces it, honestly stated:
   C3(b) states the auth gate is configured at the **orchestrator level**, so
   this is a platform roadmap item with no tenant-side lever and no date. #285 is
   the precedent for how long such an ask can sit: requested 2026-08-19, still
-  absent from the live manifest on 2026-10-04 (C9). The architecture must not
-  block on it.
+  absent from the live manifest on 2026-10-04 and again on 2026-10-08 (C9). The
+  architecture must not block on it.
 - **Authenticate Encore's profile fetch.** Not expressible: `profilesUrl` is a
   bare string with no companion credential field anywhere in the live `encore`
   schema (C1), and Encore's `UrlResource` sends no custom headers
@@ -561,13 +662,21 @@ What replaces it, honestly stated:
   profile change; and it introduces a resource with no relationship to the
   stack's storage identity or teardown. The object store is already provisioned,
   already policy-managed by this codebase, and already torn down with the stack.
+  Noted against this: the live `set-storage-bucket-public` description itself
+  steers static-site publishing to `create-my-page` (C4). That steer is about
+  serving a *site* at a proper public URL — it does not speak to a single
+  machine-fetched object, and it does not change the globally-unique-name,
+  separate-publish-step or no-teardown-relationship properties on which this
+  rejection rests. Recorded so the trade-off is visible rather than silently
+  resolved.
 - **Pin `StackConfig.encoreProfilesUrl` (#315) to a hand-written object URL.**
   Rejected as the answer: it is an operator-typed string with no publisher, so
   the objects behind it would never be written or kept in sync — and C9 shows it
   is currently the *only* reachable operator-managed tier on a catalog deploy,
   which is exactly the state this ADR is fixing. It stays as tier 4 — the escape
   hatch for an external index — which is what it was designed for
-  (`public-base-url.ts:112-133`).
+  (`resolveEncoreProfilesUrlFromParamStore` and its doc comment in
+  `public-base-url.ts`).
 
 ---
 
@@ -582,7 +691,7 @@ What replaces it, honestly stated:
   public edge at all — matching the `routing: INTERNAL` OSC itself models for
   Encore→object store (C2) — so it is also unaffected by edge TLS, the
   self-signed-cert problem that forced the TLS relaxation in
-  `profiles-reachability.ts:57`/`:81-119` (#337), and public ingress latency.
+  `nodeSelfProbeFetch`/`selfProbeHttpsAgent` (#337), and public ingress latency.
 - **A catalog deploy gets operator-managed profiles by default.** Today it
   cannot have them at all without hand-typing a parameter-store URL, because the
   manifest exposes no key for either env-var tier (C9). This change makes the
@@ -590,15 +699,17 @@ What replaces it, honestly stated:
   dependency on #285 landing.
 - Nothing new is invented: the bucket policy is the shipped `#199` policy (C6),
   the endpoint resolution is the shipped probed/fail-soft resolver (C7), and the
-  index format is the one `profiles.ts:132-175` already emits.
+  index format is the one the `GET /index.yml` handler in `profiles.ts` already
+  emits.
 - The app's `/api/v1/profiles` surface and its `x-profile-count` monitoring
   contract (#460) are untouched.
-- #1103 is retired before it is built (D4).
+- #1103's periodic probe is retired before it is built (D4) — but the probe's
+  existing call site is corrected rather than left mis-scoped.
 
 **Negative / trade-offs:**
 
 - **Profile updates stop being instantaneous.** Today `GET /index.yml` renders
-  live from CouchDB (`profiles.ts:160-175`), so a profile edit is visible to the
+  live from CouchDB (the handler in `profiles.ts`), so a profile edit is visible to the
   next Encore fetch immediately. With D1 a profile write must also be
   **published** as objects, which introduces a window — and a possible
   divergence — between the store and the bucket. Mitigations are mandatory in
@@ -609,14 +720,16 @@ What replaces it, honestly stated:
   completes before the next spawn — not that it is synchronous with the edit.
 - **One more provisioning step and one more bucket** per stack, each a
   best-effort step that must not fail an otherwise-healthy re-provision — the
-  same constraint `provision.ts:994-1030` already lives with.
+  same constraint the step-*1d* policy block in `provision.ts` already lives
+  with.
 - **Operator profile YAML becomes anonymously readable by exact key** at the
   public object-store origin, where today it is readable only through an app
   path that is *supposed* to be gated. Accepted and bounded in D3.
 - **The resolver grows a fifth tier.** `resolveEncoreProfilesUrl` is already a
   four-tier chain; a fifth increases the number of states an operator must reason
-  about. Mitigated by logging the **resolved tier and URL** at boot, and by
-  keeping the existing warning at `src/main.ts:1002-1008` for the
+  about. Mitigated by logging the **resolved tier and URL** at boot (the same
+  resolved tier D4 needs), and by keeping the existing
+  `'profiles URL unresolved to local store …'` warning in `src/main.ts` for the
   nothing-resolved case.
 - **Pre-existing stacks** have no profiles bucket until re-provisioned. They fall
   through to tier 3, i.e. exactly today's behaviour — so the change is
@@ -627,9 +740,9 @@ What replaces it, honestly stated:
 
 ## 5. Follow-up implementation issues to file
 
-1. **`feat: publish the Encore profile index to a dedicated object-store bucket and make it the primary profilesUrl`** — D1, D2, D3. The substance of #110.
+1. **`feat: publish the Encore profile index to a dedicated object-store bucket and make it the primary profilesUrl`** — D1, D2, D3. The substance of the closed #110, which this ADR adopts and these issues supersede as the tracking work.
 2. **`feat: provision an anonymous-read openvideocore-profiles bucket as part of stack provisioning`** — the provisioning half of D3, split out because it changes `src/routes/provision.ts` and the teardown path rather than the profiles/resolver path.
-3. **`fix: close #1103 as obsolete and record why the one-shot profiles reachability probe is retained`** — D4.
+3. **`fix: scope the profiles reachability probe to the resolved profilesUrl tier`** — D4, re-scoping #1103 (reject its periodic-probe scope; correct the mis-scoped call site and extend the boot check to the object-store primary). Must ship with issue 1, since D2's new tier is what mis-scopes the existing call site.
 
 Exact titles and bodies are handed to the orchestrator with this ADR. **This ADR
 files no issues itself.**
@@ -647,7 +760,8 @@ files no issues itself.**
   validation, and the built-in profile seed set (#385).
 - Any change to the source or packaged bucket policies (#199) or to delivery
   mode (#200/#201/#859/#860).
-- The external-endpoint capability gap for source/packaged storage — ADR-021.
+- The external-endpoint capability gap for source/packaged storage —
+  `ADR-021-external-s3-endpoint-source-and-packaged.md`.
 
 ---
 
@@ -655,24 +769,28 @@ files no issues itself.**
 
 | #1102 asks for | Where |
 |---|---|
-| Introspect the live OSC catalog + relevant service schemas; cite contract source and exact fields | §2 (C1–C8), each with the live query that produced it and the exact field names |
+| Introspect the live OSC catalog + relevant service schemas; cite contract source and exact fields | §2 (C1–C9), each with the live query that produced it and the exact field names |
 | Compare the two approaches on reliability, operational cost, profile update flow, fit with OSC | Summary table (reliability/assertability), §4 Negative (operational cost, update flow), C2/C4/C6/C7 (fit with OSC) |
-| Write `docs/architecture/ADR-NNN-profiles-url-source.md` with a decision and consequences | this file; decision §3, consequences §4 |
-| Log any partial/missing OSC capability, e.g. a way to guarantee a public path exemption | `eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md` |
-| If the decision is #284, the probe must become continuous; if #110, open an implementation issue and mark the probe work obsolete | decision is **#110** → D4 marks #1103 obsolete; §5 lists the implementation issues |
+| Write `docs/architecture/ADR-NNN-profiles-url-source.md` with a decision and consequences | this file (`ADR-026-profiles-url-source.md`); decision §3, consequences §4 |
+| Log any partial/missing OSC capability, e.g. a way to guarantee a public path exemption | written 2026-10-08 in the agents repo at `eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md` (separate repository, so not in this PR's diff) |
+| If the decision is #284, the probe must become continuous; if #110, open an implementation issue and mark the probe work obsolete | decision is the **#110 direction** → D4 rejects #1103's periodic scope and re-scopes it to the required call-site correction; §5 lists the implementation issues |
 
 ---
 
 ## 8. References
 
-- Issues: #1102 (this ADR), #110 (object-store-served profiles — adopted),
-  #284 (derived base URL + boot probe — demoted), #1103 (continuous probe —
-  obsolete, D4), #84, #219, #283, #315, #337, #459, #460, #199, #200, #201,
-  #859, #860, #991.
-- ADRs: ADR-003 (auth terminated at the edge), ADR-021 (external S3 endpoint
-  blocker — the same "pin the platform gap with verified contracts" method),
-  ADR-023 §2.1 (the live-MCP introspection method reused in §2).
-- OSC catalog (live, 2026-10-04, via `https://mcp.osaas.io/mcp` +
+- Issues: #1102 (this ADR), #110 (object-store-served profiles — **CLOSED**;
+  direction adopted here and superseded by §5's issues), #284 (derived base URL
+  + boot probe — **CLOSED**; demoted to a fallback here), #1103 (**OPEN**;
+  periodic probe rejected, re-scoped by D4), #84, #219, #283, #315, #337, #459,
+  #460, #199, #200, #201, #859, #860, #991.
+- ADRs: ADR-003 (auth terminated at the edge),
+  `ADR-021-external-s3-endpoint-source-and-packaged.md` (external S3 endpoint
+  blocker — the same "pin the platform gap with verified contracts" method; note
+  that `ADR-021-audit-log-retention.md` shares the number and is **not** the one
+  meant here), ADR-023 §2.1 (the live-MCP introspection method reused in §2).
+- OSC catalog (live, 2026-10-04, re-confirmed 2026-10-08 at osc-remote-mcp
+  8.14.1 for C1/C2/C4/C9, via `https://mcp.osaas.io/mcp` +
   `/mcp/category/{apps,instances,storage,pages}`):
   `get-service-schema(serviceId: "encore", verbosity: "detailed")` →
   `profilesUrl`, `serviceAssociations[0].routing = "INTERNAL"`,
@@ -693,39 +811,46 @@ files no issues itself.**
   `GET /internal-endpoint/{id}` → `{ serviceDns, ports, publicAccess }`.
   Subscription catalog: `GET https://catalog.svc.prod.osaas.io/mysubscriptions`
   (header `x-pat-jwt: Bearer <PAT>`).
-- SDK: `node_modules/@osaas/client-core/lib/core.d.ts:130-148`
+- SDK: `node_modules/@osaas/client-core/lib/core.d.ts`
   (`InternalEndpointInfo`, `getInternalEndpoint`),
-  `lib/myapp.d.ts:2-18` (`MyApp`, `CreateMyAppBody`),
-  `lib/context.js:24-31` (`x-pat-jwt` header), package version 0.24.0.
-- Code (verified contracts):
-  - `src/services/public-base-url.ts:40-49` — `resolvePublicBaseUrl()`;
-    `:55` — `LOCAL_PROFILES_INDEX_PATH`; `:87-105` —
-    `resolveEncoreProfilesUrl` precedence (derivation at `:94-95`);
-    `:110` — `STACK_ENCORE_PROFILES_URL_FIELD`; `:134-157` —
+  `lib/myapp.d.ts` (`MyApp`, `CreateMyAppBody`),
+  `lib/context.js` (`x-pat-jwt` header), package version 0.24.0.
+- Code (verified contracts — **symbol names, no line numbers**; each `grep`-verified
+  on this branch after merging `main`, 2026-10-08):
+  - `src/services/public-base-url.ts` — `resolvePublicBaseUrl`,
+    `LOCAL_PROFILES_INDEX_PATH`, `resolveEncoreProfilesUrl` (the precedence
+    chain, including the `${base}${LOCAL_PROFILES_INDEX_PATH}` derivation),
+    `STACK_ENCORE_PROFILES_URL_FIELD`,
     `resolveEncoreProfilesUrlFromParamStore`.
-  - `src/main.ts:964-966` (remote default), `:980` (`publicBaseUrl`),
-    `:986-997` (parameter-store tier), `:998-1001` (`encoreScalerProfilesUrl`),
-    `:1002-1008` (unresolved warning), `:1214` (`profilesUrl` on the scaler
-    config), `:2563-2567` (the one-shot reachability probe call site).
-  - `src/routes/profiles.ts:22-25` (router unauthenticated by design),
-    `:132-175` (`GET /index.yml`, `x-profile-count` at `:171`),
-    `:257-272` (`GET /:name/yaml`).
-  - `src/services/profiles-reachability.ts:57` + `:81-119`
-    (`nodeSelfProbeFetch`, scoped TLS relaxation), `:136-139` (non-fatal by
-    design), `:150-206` (`checkProfilesIndexReachable`, `auth-wall` at
-    `:174-182`).
-  - `src/encore-scaler/instance-pool.ts:594-595` —
+  - `src/main.ts` — `encoreProfilesUrl` / `ENCORE_PROFILES_URL` (remote
+    default), `publicBaseUrl`, the parameter-store tier read,
+    `encoreScalerProfilesUrl`, the `'profiles URL unresolved to local store …'`
+    warning, `profilesUrl: encoreScalerProfilesUrl` on the scaler config, and
+    the one-shot `checkProfilesIndexReachable(...)` call site after
+    `app.listen`.
+  - `src/routes/profiles.ts` — `profilesRouter` (header comment: *"This whole
+    router is unauthenticated by design …"*), the `'/index.yml'` route and its
+    `x-profile-count` header, the `'/:name/yaml'` route.
+  - `src/services/profiles-reachability.ts` — `selfProbeHttpsAgent` +
+    `nodeSelfProbeFetch` (scoped TLS relaxation), `ReachabilityOutcome`,
+    `checkProfilesIndexReachable` (non-fatal by design per its doc comment; the
+    `!profilesIndexUrl || !usingLocalIndex` short-circuit; the `auth-wall`
+    401/403 branch).
+  - `src/encore-scaler/instance-pool.ts` —
     `instanceBody['profilesUrl']` on the OSC create body.
-  - `src/routes/provision.ts:68-69` (bucket names), `:994-1030` (anonymous
-    `GetObject`-only packaged-bucket policy; policy JSON at `:1007-1017`,
-    `setBucketPolicy` at `:1022`).
-  - `src/routes/assets.ts:3836-3851` — the packaged bucket's public origin and
-    the env-override/in-memory exclusion.
-  - `src/services/internal-minio-endpoint.ts:40-150` (live-verified in-cluster
-    derivation), `:184` (`DEFAULT_INTERNAL_PORT = 8080`), `:479`
-    (`makeInternalEndpointResolver`), `:658`
-    (`resolveInternalEndpointSettings`); consumer
-    `src/services/encore-s3-config.ts:176` (`resolveEncoreS3Config`).
+  - `src/routes/provision.ts` — `SOURCE_BUCKET` / `PACKAGED_BUCKET`, the step
+    *1d* comment (*"Apply an anonymous (public) read-only bucket policy …"*),
+    the `packagedPolicy` JSON and `setBucketPolicy(PACKAGED_BUCKET, packagedPolicy)`.
+  - `src/routes/assets.ts` — the comment block recording that the stack's own
+    object-store endpoint *"IS the public origin for"* its packaged bucket, and
+    the *"env-override and in-memory paths"* exclusion.
+  - `src/services/internal-minio-endpoint.ts` — module header (live-verified
+    in-cluster derivation, 2026-09-29/30), `DEFAULT_INTERNAL_PORT`,
+    `INTERNAL_HEALTH_PATH`, `selectInternalPort`, `makeInternalEndpointProbe`,
+    `makeInternalEndpointResolver`, `resolveInternalEndpointSettings`; consumer
+    `resolveEncoreS3Config` in `src/services/encore-s3-config.ts`.
+  - `src/services/param-store.ts` — the `StackConfig` type's `minioEndpoint`,
+    `services`, and `encoreProfilesUrl?` fields.
 - OSC feedback — in this repo, `docs/osc-feedback/`:
   `incoming-issue285-manifest-profiles-url-override.md` (no manifest key for
   `PUBLIC_BASE_URL` / `ENCORE_PROFILES_URL_OVERRIDE`, still true live — C9),
@@ -736,4 +861,6 @@ files no issues itself.**
   `incoming-08-login-wall-blocks-encore-profile-fetch.md` (the original 401 +
   the unconfirmed 2026-07-08 assurance), `incoming-minio-presigned-blocked.md`
   (presigned GET 403 through the public reverse proxy),
-  `incoming-profiles-url-public-path-exemption.md` (new, written with this ADR).
+  `incoming-profiles-url-public-path-exemption.md` (written 2026-10-08 with this
+  ADR: the C3 capability gap, plus the `getInternalEndpoint` → `ports: []` gap
+  C7 found recorded only in a code comment).
