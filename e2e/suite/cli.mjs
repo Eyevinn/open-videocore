@@ -12,6 +12,7 @@ const runId = process.env.RUN_ID ?? new Date().toISOString().replace(/\D/g, '').
 const result = await runSuite({
   client: createClient({ baseUrl, token }),
   anon: createClient({ baseUrl }),
+  ingress: createClient({ baseUrl, token, appToken: '' }),
   config: { runId, sourceUrl, expectCommit: process.env.EXPECT_COMMIT },
 });
 console.log(JSON.stringify(result, null, 2));

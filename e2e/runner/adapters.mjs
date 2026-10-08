@@ -63,7 +63,7 @@ export function registryAdapter({ user, token, image = 'eyevinn-osaas/open-video
 }
 
 /** @param {{ name: string, env: Record<string,string|undefined>, importCore?: () => Promise<any>, waitGoneMs?: number, sleep?: (ms:number)=>Promise<void> }} opts */
-export function oscInstanceAdapter({ name, env, importCore = () => import('@osaas/client-core'), waitGoneMs = 4 * 60_000, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+export function oscInstanceAdapter({ name, env, importCore = () => import('@osaas/client-core'), waitGoneMs = 4 * 60_000, freshPodMs = 5 * 60_000, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
   const config = () => ({
     name,
     OscAccessToken: env.E2E_INSTANCE_OSC_ACCESS_TOKEN,
@@ -72,6 +72,25 @@ export function oscInstanceAdapter({ name, env, importCore = () => import('@osaa
     MinioRootPassword: env.E2E_MINIO_ROOT_PASSWORD,
     CouchdbAdminPassword: env.E2E_COUCHDB_ADMIN_PASSWORD,
   });
+  /**
+   * restartInstance() returns before the old pod is gone, and waitForInstanceReady() then sees that old pod as ready,
+   * so a suite could run against the pre-restart pod (the first registry-based run finished in 4 s). The instance logs
+   * a pino line {"time": <epoch ms>, "msg": "Server listening at ..."} on every start; wait for one newer than the
+   * moment we asked for the restart. Logs come from client-core getLogsForInstance (string or array of rows).
+   */
+  async function waitForFreshPod(core, ctx, sat, since) {
+    const deadline = now() + freshPodMs;
+    for (;;) {
+      let rows = [];
+      try { const out = await core.getLogsForInstance(ctx, SERVICE_ID, name, sat); rows = Array.isArray(out) ? out : String(out ?? '').split('\n'); } catch { /* retry */ }
+      for (const row of rows) {
+        let j; try { j = JSON.parse(typeof row === 'string' ? row : JSON.stringify(row)); } catch { continue; }
+        if (typeof j?.msg === 'string' && j.msg.startsWith('Server listening') && Number(j.time) >= since - 2000) return;
+      }
+      if (now() > deadline) throw new Error(`no new "Server listening" log line after ${new Date(since).toISOString()} within ${freshPodMs} ms: the instance may still be the pre-restart pod`);
+      await sleep(10_000);
+    }
+  }
   return {
     async ensureFresh() {
       const core = await importCore();
@@ -83,6 +102,7 @@ export function oscInstanceAdapter({ name, env, importCore = () => import('@osaa
       const service = subs.find((s) => s.serviceId === SERVICE_ID);
       if (!service?.apiUrl) throw new Error(`service ${SERVICE_ID} not found in the subscriptions`);
 
+      const since = now();
       let existing;
       try { existing = await core.getInstance(ctx, SERVICE_ID, name, sat); } catch { existing = undefined; }
       if (existing && existing.name === name) {
@@ -118,6 +138,7 @@ export function oscInstanceAdapter({ name, env, importCore = () => import('@osaa
         });
       }
       await core.waitForInstanceReady(SERVICE_ID, name, ctx);
+      await waitForFreshPod(core, ctx, sat, since);
       const inst = await core.getInstance(ctx, SERVICE_ID, name, sat);
       if (!inst?.url) throw new Error('instance has no url');
       return { baseUrl: inst.url, token: sat };

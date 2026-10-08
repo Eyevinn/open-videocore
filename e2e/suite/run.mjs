@@ -12,9 +12,9 @@ export const DEFAULT_TIMEOUTS = {
  * broken stage. Teardown deletes the asset if the `delete` case did not.
  * @param {{ client: any, anon: any, config: any, sleep?: Function, now?: Function }} deps
  */
-export async function runSuite({ client, anon, config, sleep, now = Date.now }) {
+export async function runSuite({ client, anon, ingress, config, sleep, now = Date.now }) {
   const cfg = { pollMs: 2_000, ...config, timeouts: { ...DEFAULT_TIMEOUTS, ...config.timeouts } };
-  const ctx = { client, anon, config: cfg, sleep, now, state: {} };
+  const ctx = { client, anon, ingress: ingress ?? anon, config: cfg, sleep, now, state: {} };
   let swept = 0;
   if (cfg.sweep !== false) { try { swept = await sweepLeftovers({ client, now }); } catch { /* best effort */ } }
   const results = [];

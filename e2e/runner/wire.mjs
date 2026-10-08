@@ -23,6 +23,7 @@ export async function buildDeps(env) {
     runSuite: (inst, expected) => runSuite({
       client: createClient({ baseUrl: inst.baseUrl, token: inst.token }),
       anon: createClient({ baseUrl: inst.baseUrl }),
+      ingress: createClient({ baseUrl: inst.baseUrl, token: inst.token, appToken: '' }),
       config: { secrets, runId: new Date().toISOString().replace(/\D/g, '').slice(0, 14), sourceUrl, expectCommit: expected.commit },
     }),
   };

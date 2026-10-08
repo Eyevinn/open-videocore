@@ -22,6 +22,7 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
     const p = url.pathname;
     // Like the platform ingress: every path, /health included, needs x-jwt: Bearer <token>.
     if (!faults.openAuth && req.headers['x-jwt'] !== `Bearer ${token}`) return json(res, 401, { error: 'unauthorized' });
+    if (p.startsWith('/api/') && !faults.appOpen && !/^Bearer\s+\S+/.test(req.headers.authorization ?? '')) return json(res, 401, { error: 'unauthorized', message: 'missing access token' });
     if (p === '/health') return json(res, 200, { status: 'ok', service: 'open-videocore-api', build: { version: '1.5.0', commit, sourceDigest, builtAt: null, packageVersion: '1.5.0' } });
     const m = (re) => p.match(re);
     let x;
