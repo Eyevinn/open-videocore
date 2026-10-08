@@ -1,11 +1,11 @@
 // One runner cycle (ADR-007 §2). Pure orchestration over injected adapters so every branch is testable
 // offline. Result statuses: green | red | stale | infra-error. The runner never promotes anything.
 //
-// Results are keyed by the COMMIT being tested: the checkout the job runs from. The image is tied to that commit by
-// its SOURCE DIGEST: scripts/source-digest.mjs computes it from a checkout, the image build bakes the same value in,
-// and GET /health reports it as build.sourceDigest (build.commit is usually "unknown" because the platform builds
-// the image without git metadata). The promote workflow reads the commit from the :latest image label
-// io.osaas.repo.commit and looks the result up under that commit.
+// Results are keyed by the COMMIT the tested image was built from, read from the `:latest` image's label
+// io.osaas.repo.commit in the registry. GET /health cannot supply it: the platform builds the image without git
+// metadata, so build.commit and build.sourceDigest are "unknown" (verified on a live beta instance). The label is read
+// before the instance is restarted and again once it is ready; if :latest moved in between, the pod may have pulled a
+// different image, so the result is `stale`. The promote workflow reads the same label from the image it retags.
 import { poll } from '../lib/poll.mjs';
 import { redact } from '../lib/redact.mjs';
 
@@ -13,9 +13,9 @@ const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * @typedef {object} Deps
- * @property {{ expected(): Promise<{ commit: string, sourceDigest: string }> }} source   the commit under test and its source digest
+ * @property {{ latest(): Promise<{ digest: string, commit: string }> }} registry   what `:latest` points at and the commit it was built from
  * @property {{ ensureFresh(): Promise<{ baseUrl: string, token: string }> }} instance   create-or-restart the beta-based instance
- * @property {(inst: { baseUrl: string, token: string }, expected: { commit: string, sourceDigest: string }) => Promise<any>} runSuite
+ * @property {(inst: { baseUrl: string, token: string }, expected: { commit: string }) => Promise<any>} runSuite
  * @property {(inst: { baseUrl: string, token: string }) => Promise<{ commit?: string, sourceDigest?: string, version?: string } | undefined>} health   GET /health build info, undefined if not up
  * @property {{ get(commit: string): Promise<any>, put(commit: string, record: any): Promise<void> }} store
  * @property {string[]} [secrets]    exact values to mask in anything stored or printed
@@ -27,15 +27,16 @@ const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** @param {Deps} d */
 export async function runCycle(d) {
-  const { source, instance, store } = d;
+  const { registry, instance, store } = d;
   const o = { waitMs: 15 * 60_000, pollMs: 10_000, retries: 2, backoffMs: 30_000, ...d.opts };
   const sleep = d.sleep ?? realSleep;
   const now = d.now ?? Date.now;
   const clock = d.clock ?? (() => new Date().toISOString());
   const clean = (v) => redact(v, d.secrets).slice(0, 300);
 
-  const expected = await source.expected();
-  const head = expected.commit;
+  const before = await registry.latest(); // a registry failure aborts the cycle: without a commit there is no key
+  const head = before.commit;
+  const expected = { commit: head };
 
   // Only a green or red result is final. stale and infra-error say nothing about the image, so the next
   // cycle must try the same commit again; treating them as done would leave it untested forever.
@@ -61,16 +62,19 @@ export async function runCycle(d) {
   }
   if (!inst) return finish({ status: 'infra-error', suiteVersion: null, cases: [], detail: clean(`instance create/restart failed: ${lastErr?.message ?? lastErr}`) });
 
-  // The instance must report the source digest of the commit we meant to test, else the image has not landed yet.
-  const matches = (h) => h?.sourceDigest === expected.sourceDigest && (!h.commit || h.commit === 'unknown' || h.commit === head);
+  // /health only tells us the instance is up (it cannot identify the build, see the header). Wait for it.
   let build;
   try {
-    build = await poll(async () => {
-      const h = await d.health(inst);
-      return matches(h) ? h : undefined;
-    }, { timeoutMs: o.waitMs, intervalMs: o.pollMs, sleep, now, what: `/health build.sourceDigest == ${expected.sourceDigest}` });
+    build = await poll(async () => (await d.health(inst)) ?? undefined,
+      { timeoutMs: o.waitMs, intervalMs: o.pollMs, sleep, now, what: 'the instance to answer GET /health' });
   } catch (e) {
     return finish({ status: 'stale', suiteVersion: null, cases: [], detail: clean(e.message) });
+  }
+
+  // :latest must not have moved since we read it, or the pod may be running a different image from the one we keyed.
+  const ready = await registry.latest();
+  if (ready.digest !== before.digest) {
+    return finish({ status: 'stale', suiteVersion: null, cases: [], detail: clean(`:latest moved from ${before.digest} to ${ready.digest} while the instance restarted`) });
   }
 
   let suite;
@@ -78,18 +82,11 @@ export async function runCycle(d) {
     return finish({ status: 'infra-error', suiteVersion: null, cases: [], detail: clean(`suite crashed: ${e?.message ?? e}`) });
   }
 
-  // The instance must still be on the tested build afterwards (a restart onto a newer image mid-run would make the
-  // cases a mix of two builds). main moving on is fine: the result is for `head` and stays valid for it.
-  const after = await d.health(inst);
-  if (!matches(after)) {
-    return finish({ status: 'stale', suiteVersion: suite.suiteVersion, cases: suite.cases, detail: clean(`instance reported source digest ${after?.sourceDigest ?? 'none'} after the suite, expected ${expected.sourceDigest}`) });
-  }
-
   return finish({
     status: suite.status, // green | red
     suiteVersion: suite.suiteVersion,
-    sourceDigest: expected.sourceDigest,
-    version: build.version ?? suite.build?.version,
+    imageDigest: before.digest,
+    version: build?.version ?? suite.build?.version,
     cases: suite.cases,
     swept: suite.swept,
   });

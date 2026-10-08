@@ -129,7 +129,7 @@ def environment_facts():
         f"package-lock.json={os.path.exists(os.path.join(E2E_DIR, 'package-lock.json'))}, "
         f"runner/cli.mjs={os.path.exists(os.path.join(E2E_DIR, 'runner', 'cli.mjs'))}")
     log("environment variable NAMES present (values never logged): " + ", ".join(names))
-    wanted = ["E2E_S3_ENDPOINT", "E2E_S3_BUCKET", "E2E_S3_ACCESS_KEY", "E2E_S3_SECRET_KEY", "E2E_SOURCE_URL", "OSC_ACCESS_TOKEN",
+    wanted = ["GHCR_USER", "GHCR_TOKEN", "E2E_S3_ENDPOINT", "E2E_S3_BUCKET", "E2E_S3_ACCESS_KEY", "E2E_S3_SECRET_KEY", "E2E_SOURCE_URL", "OSC_ACCESS_TOKEN",
               "E2E_INSTANCE_OSC_ACCESS_TOKEN", "E2E_PARAMETER_STORE", "E2E_PARAMETER_STORE_API_KEY", "E2E_MINIO_ROOT_PASSWORD",
               "E2E_COUCHDB_ADMIN_PASSWORD"]
     # Endpoint and bucket are not secret and are shown as received. Credentials are only reported as set or unset:

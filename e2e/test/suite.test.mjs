@@ -65,14 +65,6 @@ test('wrong build commit fails health; "unknown" commit is not a mismatch', asyn
   } finally { await mock.close(); }
 });
 
-test('source digest identity: match passes, mismatch fails', async () => {
-  const ok = await run({}, { expectSourceDigest: 'sd0000000000dead' });
-  assert.equal(byId(ok.result).health.status, 'pass');
-  const bad = await run({}, { expectSourceDigest: 'ffffffffffffffff' });
-  assert.equal(byId(bad.result).health.status, 'fail');
-  assert.match(byId(bad.result).health.detail, /source digest sd0000000000dead, expected ffffffffffffffff/);
-});
-
 test('the client sends x-jwt, never Authorization, and anonymous health is rejected like the ingress does', async () => {
   const mock = await startMock();
   try {
