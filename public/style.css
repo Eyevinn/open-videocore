@@ -1677,6 +1677,16 @@ button:disabled {
   background: color-mix(in srgb, var(--danger) 14%, transparent);
 }
 
+/* Pool at its maxInstances ceiling with work still queued (#981). Amber, like
+   .badge-attention and .tc-health.health-overdue: something an operator may want
+   to act on. Deliberately NOT --danger — a ceiling being honoured is the system
+   working as configured, not a failure — and the clause spells the state out in
+   words, so the colour is reinforcement rather than the only signal. */
+.tc-at-ceiling {
+  color: var(--warning);
+  font-weight: 600;
+}
+
 /* Code block */
 pre.code-block {
   background: var(--bg);

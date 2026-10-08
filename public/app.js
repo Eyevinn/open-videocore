@@ -8591,6 +8591,10 @@ async function renderTranscodersTab(container) {
       loader.remove();
       showMsg(wrap, 'Failed to load scaler status: ' + err.message, 'error');
       summaryEl.textContent = 'Encore scaler pool';
+      // Drop the queue tooltip a previous successful load may have set, so a
+      // failed refresh cannot leave a hover explaining depths that are no longer
+      // on screen (#981).
+      summaryEl.title = '';
       return;
     }
     loader.remove();
@@ -8608,9 +8612,82 @@ async function renderTranscodersTab(container) {
       });
     });
 
-    // Pool-capacity context using maxInstances from the response.
-    summaryEl.textContent = flatInstances.length + ' of ' + maxInstances +
+    // Waiting work across all workspaces (issue #981). The pool's instance count
+    // alone cannot tell a saturated pool from an idle one: "3 of 3 active" reads
+    // the same whether 0 or 12 jobs are backed up behind it.
+    //
+    // `queueDepth` is work accepted but not yet dispatched to an instance — a
+    // per-workspace required number (workspaceSchema.queueDepth, GET
+    // /api/v1/scaler/status in src/routes/scaler.ts:144, mirrored in
+    // openapi.json) populated from `LLEN encore:queue:{workspaceId}`
+    // (src/routes/scaler.ts:267). Summed across the returned workspaces, with the
+    // same `Number(x) || 0` coercion the cards use so a junk value reads as 0
+    // rather than NaN-ing the whole summary.
+    //
+    // `inflightDepth` is on the wire next to it and is DELIBERATELY not surfaced
+    // here (#981 offers that as the alternative to surfacing it). It is the LLEN
+    // of `encore:inflight:{workspaceId}`, which holds a job only for the duration
+    // of a single dispatch attempt: scaler-loop.ts:468 claims one with
+    // `RPOPLPUSH queue -> inflight` and :497 removes it immediately after the
+    // POST ("the job is no longer 'inflight' under this attempt"), with :479 and
+    // :489 closing the window sooner still. So it is a sub-second
+    // dispatch-in-progress counter, not dispatched-but-not-started work, and it
+    // does not mean "running" — running work is `instances[].activeJobs`, which
+    // the cards already show. Reporting it on the summary would flicker between
+    // refreshes of an unchanged pool and would read as 0 while twelve jobs
+    // encoded.
+    let totalQueued = 0;
+    workspaces.forEach(function(ws) {
+      totalQueued += Number(ws && ws.queueDepth) || 0;
+    });
+
+    // Pool-capacity context using maxInstances from the response, plus the queued
+    // count when there is any, so an idle pool still reads cleanly as "N of M
+    // instances active" (#981 criterion c: unchanged at queueDepth === 0) and a
+    // backlog is impossible to miss next to it (criterion a).
+    let summaryText = flatInstances.length + ' of ' + maxInstances +
       ' instance' + (maxInstances === 1 ? '' : 's') + ' active';
+    if (totalQueued > 0) {
+      summaryText += ', ' + totalQueued + ' job' +
+        (totalQueued === 1 ? '' : 's') + ' queued';
+    }
+
+    // The one actionable state (#981 criterion b): work is queued AND the pool
+    // cannot grow to meet it. The scaler only spawns while
+    // `instances.length < maxInstances` (scaler-loop.ts), so below the ceiling a
+    // queue drains itself on the next 10s tick (scaler-loop.ts:174) and needs no
+    // operator; at the ceiling the only lever is maxInstances, which is what the
+    // message names. Requires maxInstances > 0 because a response missing the
+    // field falls back to 0 above, and `length >= 0` would otherwise flag an
+    // empty pool as saturated.
+    const atCeiling = totalQueued > 0 && maxInstances > 0 &&
+      flatInstances.length >= maxInstances;
+
+    // Assigning textContent also clears any element appended by a previous load().
+    summaryEl.textContent = summaryText + (atCeiling ? ' — ' : '');
+    if (atCeiling) {
+      // Its own element, not more text in the line above, so this clause alone
+      // can carry attention styling. Deliberately NOT .msg-error / --danger: a
+      // ceiling being honoured is the system working as configured, so it is
+      // amber information, not a failure (#981: "neither message is styled as an
+      // error"). The state is also named in words, so colour is never the only
+      // channel carrying it (WCAG 1.4.1).
+      const lever = document.createElement('span');
+      lever.className = 'tc-at-ceiling';
+      lever.textContent = 'at maximum capacity. Raise max instances to add throughput.';
+      summaryEl.appendChild(lever);
+    }
+
+    // The line is terse by design; the lifecycle detail lives in a tooltip, which
+    // is supplementary — nothing an operator must act on is tooltip-only.
+    summaryEl.title = totalQueued > 0
+      ? (atCeiling
+        ? 'Queued = accepted but not yet dispatched to an instance. The pool is at ' +
+          'its maxInstances ceiling, so the scaler will not add capacity: the queue ' +
+          'drains only as running jobs finish.'
+        : 'Queued = accepted but not yet dispatched to an instance. The pool is below ' +
+          'maxInstances, so the scaler adds an instance on its next tick (10s).')
+      : '';
 
     if (!scalerActive || flatInstances.length === 0) {
       const empty = document.createElement('div');
