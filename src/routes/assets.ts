@@ -72,6 +72,13 @@ import {
   type TamsQueryAddress
 } from '../tams/tams-query-contract.js';
 import { WorkspaceAccessError } from '../data/guard.js';
+// Archived-at derivation + the "retention disabled" sentinel for the remaining
+// retention window on single-asset reads (issue #891). Deliberately the SAME
+// `archivedAtOf` the purge sweep uses (src/pipeline/archived-asset-purge-sweep.ts:56,146)
+// and the SAME 0-means-never-purge sentinel the retention config route exports,
+// so the advertised deadline cannot drift from the sweep that enforces it.
+import { archivedAtOf } from '../data/asset-tombstone.js';
+import { RETENTION_DISABLED_MS } from './retention.js';
 // Operator-configurable per-namespace external-id uniqueness toggle (issue #577).
 // The route reads the mode at request time (12-factor config-via-env) and passes
 // `enforceUniqueness` down to the repository, which detects the conflict against
@@ -964,6 +971,54 @@ const tracksSchema = z.object({
   subtitleTracks: z.array(subtitleTrackOutSchema)
 });
 
+// Remaining archived-asset retention window (issue #891), the shape
+// docs/findings/asset-restore-contract-888.md §4 recommends. Server-derived and
+// read-only: nothing persists it, the serializer computes it per response from
+// the SAME two inputs the purge sweep uses, so the UI never has to re-derive a
+// deadline from `statusHistory` plus a second round-trip to
+// `GET /api/v1/retention/config`.
+//
+// Contract sources verified before writing (CLAUDE.md rule 7):
+//   - `archivedAtOf(asset)` — last `-> archived` transition in `statusHistory`,
+//     falling back to `updatedAt` (src/data/asset-tombstone.ts:87-95); the
+//     identical function the sweep uses
+//     (src/pipeline/archived-asset-purge-sweep.ts:146).
+//   - `retentionMs` — the instance-global window reported by
+//     `GET /api/v1/retention/config` (`retentionConfigSchema`,
+//     src/routes/retention.ts:80-107), read LIVE per request so a
+//     `PATCH /api/v1/retention/config` hot-swap is reflected immediately.
+//   - `RETENTION_DISABLED_MS === 0` means never purge (src/routes/retention.ts:36;
+//     sweep early-return at src/pipeline/archived-asset-purge-sweep.ts:124-126).
+const retentionSchema = z.object({
+  archivedAt: z
+    .string()
+    .describe(
+      'When the asset entered `archived` (ISO 8601 UTC): the `at` of the most ' +
+        'recent `-> archived` transition in `statusHistory`, falling back to ' +
+        '`updatedAt` when no such transition is recorded.'
+    ),
+  purgeAfter: z
+    .string()
+    .nullable()
+    .describe(
+      'Earliest instant the retention sweep may purge this asset (ISO 8601 ' +
+        'UTC) = `archivedAt` + `retentionMs`. `null` when `retentionMs` is 0 ' +
+        '(retention disabled — the asset never expires automatically). ' +
+        'APPROXIMATE on purpose: the sweep runs on its own interval, so an ' +
+        'asset stays restorable for up to one extra tick after this instant, ' +
+        'and a parent with any live child is deferred further.'
+    ),
+  retentionMs: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      'The instance-global archived-asset retention window in ms, as reported ' +
+        'by `GET /api/v1/retention/config`. 0 means retention is disabled ' +
+        '(never purge), in which case `purgeAfter` is `null`.'
+    )
+});
+
 const assetSchema = z.object({
   id: z.string(),
   // Canonical editorial title of the asset (issue #347). This is the ONE
@@ -1038,6 +1093,12 @@ const assetSchema = z.object({
   subtitleTracks: z.array(subtitleTrackOutSchema).optional(),
   // First-class tags (issue #11). Absent until the first tag is set.
   tags: z.array(z.string()).optional(),
+  // Remaining retention window (issue #891). Present ONLY on the single-asset
+  // reads that attach it (GET /:id, POST /:id/restore) and ONLY while the asset
+  // is `archived` — a live asset has no retention deadline, and no deployment
+  // that leaves the window unwired (tests, embedders) gains a field. Derived
+  // per response, never persisted; see retentionSchema above.
+  retention: retentionSchema.optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -1214,6 +1275,14 @@ type AssetsRouterOptions = {
   // appending log records (no-op), so existing tests are unaffected. Emission
   // never throws, so no route becomes newly failable.
   pipelineLog?: PipelineLogSink;
+  // LIVE instance-global archived-asset retention window in ms (issue #891).
+  // A getter, not a value, for the same reason the purge sweep takes one
+  // (src/main.ts:2385 `retentionMs: () => archiveRetentionMs`): the window is
+  // hot-swappable via PATCH /api/v1/retention/config, so it must be read at
+  // request time rather than captured at registration. When absent the single-
+  // asset reads simply omit the `retention` object (unchanged pre-#891
+  // behaviour for tests and embedders that do not wire it).
+  retentionMs?: () => number;
   // Asset delivery to a named export destination (issue #1131).
   //
   // `deliveryClient` is the object-store client POST /:id/deliver performs the
@@ -1953,6 +2022,47 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // Best-effort operational log sink (issue #995). Undefined => pipeline steps
   // run without appending to the log store GET /api/v1/logs reads.
   const pipelineLog = opts.pipelineLog;
+
+  // Project the remaining retention window onto a single-asset response (issue
+  // #891). Returns the asset UNCHANGED unless all of the following hold, so the
+  // field is never fabricated:
+  //   - the window getter is wired (otherwise this deployment has no live
+  //     retention config to report, and `retention` is simply omitted);
+  //   - the asset is currently `archived` — a live asset is not on the purge
+  //     sweep's candidate list at all (the sweep lists `status=archived`,
+  //     src/pipeline/archived-asset-purge-sweep.ts), so it has no deadline;
+  //   - `archivedAt` parses, so `purgeAfter` can be a real instant.
+  // `retentionMs === RETENTION_DISABLED_MS` (0) yields `purgeAfter: null` rather
+  // than a bogus epoch-plus-zero deadline — the "never purge" convention
+  // (src/routes/retention.ts:36, sweep early-return :124-126) that clients are
+  // expected to render as "no expiry".
+  function withRetention(asset: Asset): Asset & { retention?: z.infer<typeof retentionSchema> } {
+    const retentionMsOf = opts.retentionMs;
+    if (!retentionMsOf || asset.status !== 'archived') {
+      return asset;
+    }
+    const archivedAt = archivedAtOf(asset);
+    const archivedAtMs = Date.parse(archivedAt);
+    if (!Number.isFinite(archivedAtMs)) {
+      return asset;
+    }
+    const retentionMs = retentionMsOf();
+    return {
+      ...asset,
+      retention: {
+        archivedAt,
+        // Same arithmetic as the sweep's eligibility test, stated forwards:
+        // the sweep purges once `archivedAtMs <= now - retentionMs`
+        // (archived-asset-purge-sweep.ts:128,146-150), i.e. once
+        // `archivedAtMs + retentionMs <= now`.
+        purgeAfter:
+          retentionMs === RETENTION_DISABLED_MS
+            ? null
+            : new Date(archivedAtMs + retentionMs).toISOString(),
+        retentionMs
+      }
+    };
+  }
 
   // Resolve the scaler/Encore context key for a transcode request (issue #615).
   // The scaler auto-scaler partitions its Encore pool, Valkey queue keys, and
@@ -4193,7 +4303,11 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           return reply.code(410).send({ error: 'gone', message: 'asset has been purged' });
         }
         if (state.kind === 'asset') {
-          return reply.code(200).send(state.asset);
+          // `retention` (issue #891) is attached HERE rather than in the
+          // repository: it is derived, not stored, and it depends on the live
+          // instance-global window, so it belongs to the response projection.
+          // No-op for any non-archived asset — see withRetention above.
+          return reply.code(200).send(withRetention(state.asset));
         }
         return reply.code(404).send({ error: 'not_found' });
       }
@@ -4201,7 +4315,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       if (!asset) {
         return reply.code(404).send({ error: 'not_found' });
       }
-      return reply.code(200).send(asset);
+      // Same projection on the slug path, so `GET /assets/{slug}` and
+      // `GET /assets/{id}` answer identically (issue #891).
+      return reply.code(200).send(withRetention(asset));
     }
   );
 
@@ -6974,7 +7090,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         },
         request.log
       );
-      return reply.code(200).send(restored);
+      // Same `retention` projection as GET /:id (issue #891), applied for
+      // contract symmetry: the two routes share `assetSchema`, so a client that
+      // re-renders a detail view straight off this response reads the field in
+      // the same place. In practice a successful restore leaves the asset
+      // `ready`/`failed` (restoreTargetStatus, src/data/asset-repo.ts), so
+      // withRetention is a no-op here and the body correctly carries NO
+      // retention deadline — the asset is no longer awaiting purge.
+      return reply.code(200).send(withRetention(restored));
     }
   );
 };
