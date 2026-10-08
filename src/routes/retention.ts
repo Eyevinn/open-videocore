@@ -1,5 +1,5 @@
 // Retention config router (issue #325, foundation for #323; extended for the
-// audit-log retention window in #566).
+// audit-log retention window in #566 and the operational-log window in #1067).
 //
 // Exposes instance-global retention windows that govern how long resources are
 // kept before their retention sweep may purge them:
@@ -7,9 +7,16 @@
 //   - `auditRetentionMs` — the AUDIT-LOG window (#566). Default off (0 =
 //     indefinite retention); when set, the audit purge sweep expires whole
 //     audit entries aged past it. See docs/architecture/ADR-021-audit-log-retention.md.
-// Both share this ONE config surface (not a parallel endpoint): GET /config
-// reports both effective windows so an operator can see the current policy at a
-// glance, and PATCH /config can hot-swap either independently.
+//   - `logRetentionMs`   — the OPERATIONAL-LOG window (#1067). Default off (0 =
+//     indefinite retention); when set, the log purge sweep
+//     (src/pipeline/log-retention-purge-sweep.ts) expires whole log records aged
+//     past it from the persisted log partition (src/data/couch-log-repo.ts).
+//     Same representation and validation as `auditRetentionMs` — the log
+//     partition is modelled on the audit partition, and log volume is higher, so
+//     it gets the same operator-visible window rather than a new mechanism.
+// All three share this ONE config surface (not parallel endpoints): GET /config
+// reports every effective window so an operator can see the current policy at a
+// glance, and PATCH /config can hot-swap any of them independently.
 //
 // Modelled on the Encore auto-scaler config mechanism (src/routes/scaler.ts): a
 // live mutable module-scoped var plus an `onConfigChange` callback, so PATCH
@@ -51,6 +58,15 @@ export function auditRetentionMsFromEnv(): number {
   return retentionMsFromEnv('AUDIT_RETENTION_MS');
 }
 
+// Resolve the boot-time OPERATIONAL-LOG retention window (issue #1067). Default
+// off: unset/non-numeric/negative all resolve to 0 = indefinite retention (never
+// purge), so #996's persist-only behaviour is preserved for every deployment
+// that does not opt in. Same parse rules as the audit and archived-asset windows
+// (12-factor: env config).
+export function logRetentionMsFromEnv(): number {
+  return retentionMsFromEnv('LOG_RETENTION_MS');
+}
+
 // Shared env parse for a retention window: unset/non-numeric/negative -> 0
 // (disabled). Mirrors the parseInt env convention in src/main.ts:468-469.
 function retentionMsFromEnv(name: string): number {
@@ -72,17 +88,28 @@ type RetentionRouterOptions = {
   // 0 = indefinite retention (never purge). Optional so existing callers that
   // only manage the archived-asset window keep working; defaults to 0.
   auditRetentionMs?: number;
+  // The boot-time operational-log retention window in milliseconds (issue
+  // #1067). 0 = indefinite retention (never purge). Optional so existing callers
+  // that only manage the other windows keep working; defaults to 0.
+  logRetentionMs?: number;
   // Callback to propagate a live retention-config change to the sweeps at
   // runtime, mirroring scaler's onConfigChange (src/routes/scaler.ts:40). Fires
-  // with BOTH effective windows so main.ts can update the two instance globals.
-  onConfigChange?: (cfg: { retentionMs: number; auditRetentionMs: number }) => void;
+  // with ALL effective windows so main.ts can update its instance globals.
+  onConfigChange?: (cfg: {
+    retentionMs: number;
+    auditRetentionMs: number;
+    logRetentionMs: number;
+  }) => void;
 };
 
 const retentionConfigSchema = z.object({
   // 0 = retention disabled (never purge); any positive value is a window in ms.
   retentionMs: z.number().int().min(0),
   // The audit-log window (issue #566). 0 = indefinite retention (never purge).
-  auditRetentionMs: z.number().int().min(0)
+  auditRetentionMs: z.number().int().min(0),
+  // The operational-log window (issue #1067). 0 = indefinite retention (never
+  // purge). Same representation/validation as auditRetentionMs above.
+  logRetentionMs: z.number().int().min(0)
 });
 
 export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async (fastify, opts) => {
@@ -92,6 +119,7 @@ export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async
   // scaler.ts holds `liveIdleTimeoutMs` (src/routes/scaler.ts:92-94).
   let liveRetentionMs = opts.retentionMs;
   let liveAuditRetentionMs = opts.auditRetentionMs ?? RETENTION_DISABLED_MS;
+  let liveLogRetentionMs = opts.logRetentionMs ?? RETENTION_DISABLED_MS;
 
   app.get(
     '/config',
@@ -101,9 +129,14 @@ export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async
         response: { 200: retentionConfigSchema }
       }
     },
-    // Report BOTH effective windows so an operator can see the current policy,
-    // including the audit-log retention window (issue #566).
-    async () => ({ retentionMs: liveRetentionMs, auditRetentionMs: liveAuditRetentionMs })
+    // Report EVERY effective window so an operator can see the current policy,
+    // including the audit-log (issue #566) and operational-log (issue #1067)
+    // retention windows.
+    async () => ({
+      retentionMs: liveRetentionMs,
+      auditRetentionMs: liveAuditRetentionMs,
+      logRetentionMs: liveLogRetentionMs
+    })
   );
 
   app.patch(
@@ -116,14 +149,20 @@ export const retentionRouter: FastifyPluginAsync<RetentionRouterOptions> = async
       }
     },
     async (request) => {
-      const { retentionMs, auditRetentionMs } = request.body;
+      const { retentionMs, auditRetentionMs, logRetentionMs } = request.body;
       if (retentionMs !== undefined) liveRetentionMs = retentionMs;
       if (auditRetentionMs !== undefined) liveAuditRetentionMs = auditRetentionMs;
+      if (logRetentionMs !== undefined) liveLogRetentionMs = logRetentionMs;
       opts.onConfigChange?.({
         retentionMs: liveRetentionMs,
-        auditRetentionMs: liveAuditRetentionMs
+        auditRetentionMs: liveAuditRetentionMs,
+        logRetentionMs: liveLogRetentionMs
       });
-      return { retentionMs: liveRetentionMs, auditRetentionMs: liveAuditRetentionMs };
+      return {
+        retentionMs: liveRetentionMs,
+        auditRetentionMs: liveAuditRetentionMs,
+        logRetentionMs: liveLogRetentionMs
+      };
     }
   );
 };

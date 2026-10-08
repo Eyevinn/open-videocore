@@ -55,6 +55,33 @@ function esc(s: unknown): string {
     .replace(/"/g, '&quot;');
 }
 
+// Spec-authored prose (operation / parameter / response descriptions written on
+// the Fastify route schemas) uses backtick code spans, the convention already
+// used throughout those schemas. Escape first, then promote `...` to <code> so
+// field names and query params read as code rather than as literal backticks.
+function escInline(s: unknown): string {
+  return esc(s).replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+
+// Block-level rendering for a multi-paragraph operation `description` from the
+// spec: blank lines separate paragraphs, and a run of lines starting `1.`, `2.`
+// … becomes an ordered list (used by the confirm-then-delete flow, issue #925).
+function renderProse(text: string): string {
+  return text
+    .split(/\n{2,}/)
+    .map((block) => {
+      const lines = block.split('\n');
+      if (lines.every((l) => /^\d+\.\s/.test(l.trim()))) {
+        const items = lines
+          .map((l) => `<li>${escInline(l.trim().replace(/^\d+\.\s*/, ''))}</li>`)
+          .join('');
+        return `<ol class="prose-steps">${items}</ol>`;
+      }
+      return `<p>${escInline(block.replace(/\n/g, ' ').trim())}</p>`;
+    })
+    .join('');
+}
+
 // ===========================================================================
 // 1. API reference data — grouping, descriptions, extraction from the spec
 // ===========================================================================
@@ -113,9 +140,12 @@ const GROUP_META: Record<string, [string, string]> = {
   ui: ['Ops UI', 'Built-in browser dashboard.']
 };
 
-// Hand-written per-endpoint descriptions. The spec has no operation-level
-// summary/description fields, so these are authored here, grounded in each
-// operation's own request/response schema (verified against openapi.json).
+// Hand-written per-endpoint one-line ledes, grounded in each operation's own
+// request/response schema (verified against openapi.json). Most operations have
+// no `description` in the spec, so this is all they get. Where a route schema
+// DOES author an operation-level `description` (see src/routes/*.ts), that text
+// is rendered underneath the lede as the long-form contract — so document an
+// endpoint's real behaviour on its route schema, not here.
 const DESCRIPTIONS: Record<string, string> = {
   'GET /health':
     'Liveness probe that also reports service identity, the build identity of the running image (`build`), resolver health, and per-method ingest availability.',
@@ -226,7 +256,8 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/collections/': 'Create a collection.',
   'GET /api/v1/collections/': 'List collections.',
   'GET /api/v1/collections/{id}': 'Get a collection.',
-  'DELETE /api/v1/collections/{id}': 'Delete a collection.',
+  'DELETE /api/v1/collections/{id}':
+    'Delete a collection. Empty ones delete outright; a non-empty one is refused with 409 until you confirm its member count.',
   'PUT /api/v1/collections/{id}/assets/{assetId}': 'Add an asset to a collection.',
   'DELETE /api/v1/collections/{id}/assets/{assetId}': 'Remove an asset from a collection.',
   'GET /api/v1/storage/buckets': 'List object storage buckets.',
@@ -236,6 +267,50 @@ const DESCRIPTIONS: Record<string, string> = {
   'GET /api/v1/storage/buckets/{bucket}/objects': 'List objects in a bucket.',
   'DELETE /api/v1/storage/buckets/{bucket}/objects/{*}': 'Delete an object from a bucket.',
   'GET /ui': 'Built-in ops dashboard for managing assets, jobs, profiles, and buckets.'
+};
+
+// Curated example bodies for documented error responses, keyed
+// `METHOD PATH STATUS`. Needed where one status carries several variants that a
+// generated example cannot distinguish — a schema-derived sample would pick the
+// first `reason` enum value and show a variant the endpoint never emits.
+//
+// Each body below is transcribed from the handler that sends it, not invented:
+// the two collection 409 variants come from the collections router's error
+// handler (src/routes/collections.ts — CollectionDeleteProtectedError and
+// CollectionInUseError branches), with `message` matching the text those error
+// classes build in src/data/collection-repo.ts.
+const ERROR_EXAMPLES: Record<string, [string, unknown][]> = {
+  'DELETE /api/v1/collections/{id} 409': [
+    [
+      'reason: member_of_collection — retry with ?confirmMemberCount=7',
+      {
+        error: 'delete_blocked',
+        message: 'collection 01J8ZK9F4Q is in use (7 member asset(s))',
+        reason: 'member_of_collection',
+        blockedBy: { jobIds: [], collectionIds: ['01J8ZK9F4Q'] },
+        memberCount: 7
+      }
+    ],
+    [
+      'reason: member_of_collection — stale confirmation, re-confirm with 8',
+      {
+        error: 'delete_blocked',
+        message: 'collection 01J8ZK9F4Q has 8 member asset(s), not the confirmed 7',
+        reason: 'member_of_collection',
+        blockedBy: { jobIds: [], collectionIds: ['01J8ZK9F4Q'] },
+        memberCount: 8
+      }
+    ],
+    [
+      'reason: delete_protected — clear the lock first (no memberCount)',
+      {
+        error: 'delete_blocked',
+        message: 'collection 01J8ZK9F4Q is protected from deletion by an explicit lock',
+        reason: 'delete_protected',
+        blockedBy: { jobIds: [], collectionIds: [] }
+      }
+    ]
+  ]
 };
 
 function groupFor(path: string): string {
@@ -337,8 +412,27 @@ function firstSuccessResponse(op: Operation): [string | null, any] {
   return [null, null];
 }
 
+// Error (4xx/5xx) responses whose route schema carries a real description.
+// fastify-swagger emits the placeholder "Default Response" for every response
+// nobody described, so only intentionally documented failures are rendered —
+// which is what lets a reader implement an error-handling flow (e.g. the
+// confirm-then-delete 409 on collections, issue #925) from the reference alone.
+function documentedErrorResponses(op: Operation): [string, any][] {
+  return Object.entries(op.responses ?? {})
+    .filter(([code, resp]: [string, any]) => {
+      if (!/^[45]/.test(code)) return false;
+      const d = resp?.description;
+      return typeof d === 'string' && d.trim() && d !== 'Default Response';
+    })
+    .sort(([a], [b]) => a.localeCompare(b));
+}
+
 function renderParamsTable(params: any[] | undefined): string {
   if (!params || !params.length) return '';
+  // The Description column is rendered only when at least one parameter carries
+  // a spec-authored description, so endpoints whose route schemas say nothing
+  // keep the original four-column table.
+  const anyDesc = params.some((p) => typeof p.description === 'string' && p.description.trim());
   const rows = params
     .map((p) => {
       const name = esc(p.name ?? '');
@@ -347,10 +441,12 @@ function renderParamsTable(params: any[] | undefined): string {
       const schema = p.schema ?? {};
       const enumVals = schema.enum;
       const typeStr = esc(schema.type ?? 'string') + (enumVals ? ` (${enumVals.join(', ')})` : '');
-      return `<tr><td><code>${name}</code></td><td><span class="tag-${loc}">${loc}</span></td><td>${typeStr}</td><td>${required}</td></tr>`;
+      const descCell = anyDesc ? `<td>${escInline(p.description ?? '')}</td>` : '';
+      return `<tr><td><code>${name}</code></td><td><span class="tag-${loc}">${loc}</span></td><td>${typeStr}</td><td>${required}</td>${descCell}</tr>`;
     })
     .join('');
-  return `<table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const descHead = anyDesc ? '<th>Description</th>' : '';
+  return `<table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th>${descHead}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderJsonBlock(label: string, obj: any): string {
@@ -367,7 +463,9 @@ function renderPropertyNotes(schema: JsonSchema | undefined): string {
   if (!schema || !schema.properties) return '';
   const notes = Object.entries(schema.properties as Record<string, any>).filter(([, v]) => v?.description);
   if (!notes.length) return '';
-  const items = notes.map(([k, v]) => `<li><code>${esc(k)}</code> — ${esc(v.description)}</li>`).join('');
+  const items = notes
+    .map(([k, v]) => `<li><code>${esc(k)}</code> — ${escInline(v.description)}</li>`)
+    .join('');
   return `<div class="field-notes"><strong>Field notes</strong><ul>${items}</ul></div>`;
 }
 
@@ -557,6 +655,19 @@ ${renderCurlBlock('Path', 'GET /api/v1/assets/{id}/stream/*')}
 ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/collections \\\n  -H "Content-Type: application/json" \\\n  -d \'{"name": "Q3 keynotes"}\'')}
 <p>Add and remove assets with ${refEx('PUT', '/api/v1/collections/{id}/assets/{assetId}')} / ${refEx('DELETE', '/api/v1/collections/{id}/assets/{assetId}')}. Full shape in the <a href="ref-collections.html">Collections reference</a>.</p>
 
+<h2 id="deleting-collections">Deleting a collection</h2>
+<p>Deleting a collection never deletes its member assets — membership lives on the collection, so the delete just unlinks them.</p>
+<p>An empty collection deletes outright. A non-empty one is refused, so you can't tear down a grouping you haven't looked at:</p>
+${renderCurlBlock('Request', 'curl -i -X DELETE https://<your-instance>/api/v1/collections/<id>')}
+${renderJsonBlock('Response 409', { error: 'delete_blocked', message: 'collection 01J8ZK9F4Q is in use (7 member asset(s))', reason: 'member_of_collection', blockedBy: { jobIds: [], collectionIds: ['01J8ZK9F4Q'] }, memberCount: 7 })}
+<p>Branch on <code>reason</code>, never on the status code alone. <code>member_of_collection</code> means the collection still holds <code>memberCount</code> assets. Show the user what they're about to unlink, then echo that number back to confirm:</p>
+${renderCurlBlock('Request', 'curl -i -X DELETE "https://<your-instance>/api/v1/collections/<id>?confirmMemberCount=7"')}
+<p>That answers <code>204</code>. The count must match the collection's <em>current</em> membership: if someone added or removed an asset in between, you get the same <code>409 member_of_collection</code> back carrying the new authoritative <code>memberCount</code> — re-confirm with that value and retry. The delete is never silent, so you can't destroy a set that changed under you. <code>?force=true</code> is the blind alternative; it skips the count check entirely.</p>
+<p>A <code>409</code> with <code>reason: "delete_protected"</code> is a different condition and needs a different fix. It means the collection carries an explicit delete lock. There is no <code>memberCount</code>, both <code>blockedBy</code> arrays are empty, and neither <code>?confirmMemberCount=</code> nor <code>?force=true</code> gets past it:</p>
+${renderJsonBlock('Response 409', { error: 'delete_blocked', message: 'collection 01J8ZK9F4Q is protected from deletion by an explicit lock', reason: 'delete_protected', blockedBy: { jobIds: [], collectionIds: [] } })}
+<p>Clear the lock with <code>DELETE /api/v1/collections/{id}/lock</code> first, then delete as normal. Treating <code>delete_protected</code> as a retryable confirmation prompt is the usual integration bug here — no number of retries will ever succeed.</p>
+<p>Every parameter and the full 409 shape are in the <a href="ref-collections.html#delete-api-v1-collections-id">Collections reference</a>.</p>
+
 <h2 id="webhooks">Webhooks</h2>
 <p>Register an HTTP endpoint to be notified as assets and jobs change state, instead of polling:</p>
 ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/webhooks \\\n  -H "Content-Type: application/json" \\\n  -d \'{"url": "https://your-app.example.com/hooks/videocore", "events": ["asset.ready", "transcode.complete", "package.complete"]}\'')}
@@ -689,6 +800,10 @@ table.params th, table.env th, table.model th{color:var(--text-dim); font-weight
 .endpoint h3 .path{background:none; padding:0; color:var(--text); font-size:14.5px}
 .endpoint-desc{color:var(--text-dim); margin:0 0 4px}
 .endpoint h4{font-size:12.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); margin:18px 0 6px; border:none}
+.endpoint-detail{margin:8px 0 4px; font-size:14px}
+.endpoint-detail p{margin:0 0 8px}
+.prose-steps{margin:0 0 8px; padding-left:20px; font-size:14px}
+.prose-steps li{margin-bottom:4px}
 .field-notes{background:var(--bg-side); border-radius:8px; padding:10px 14px; margin:8px 0 4px; font-size:13px}
 .field-notes ul{margin:6px 0 0; padding-left:18px}
 .field-notes li{margin-bottom:4px}
@@ -990,7 +1105,11 @@ function renderGroupPage(key: string): string {
   const items = ops
     .map(([method, path, op]) => {
       const sid = slug(method, path);
-      const desc = DESCRIPTIONS[`${method} ${path}`] ?? '';
+      // Lede: the hand-written one if there is one, otherwise the route
+      // schema's own `summary` — which is better than the blank line endpoints
+      // missing from DESCRIPTIONS used to render.
+      const desc =
+        DESCRIPTIONS[`${method} ${path}`] ?? (typeof op.summary === 'string' ? op.summary : '');
       const paramsHtml = renderParamsTable(op.parameters);
 
       let reqHtml = '';
@@ -1005,6 +1124,13 @@ function renderGroupPage(key: string): string {
       let respHtml = '';
       const [code, resp] = firstSuccessResponse(op);
       if (resp) {
+        // Same rule as the error responses below: "Default Response" is the
+        // fastify-swagger placeholder, so only a real route-schema description
+        // is worth printing.
+        const sd = resp.description;
+        if (typeof sd === 'string' && sd.trim() && sd !== 'Default Response') {
+          respHtml += renderProse(sd);
+        }
         const content = resp.content ?? {};
         if (Object.keys(content).length) {
           for (const [ctype, cval] of Object.entries(content)) {
@@ -1017,13 +1143,32 @@ function renderGroupPage(key: string): string {
         }
       }
 
+      // Documented failures. Rendered as prose + field notes rather than a
+      // synthesized example, because a generated example would pick the first
+      // enum value for a discriminator like `reason` and could show a variant
+      // the endpoint never emits. Curated examples come from ERROR_EXAMPLES.
+      let errHtml = '';
+      for (const [ecode, eresp] of documentedErrorResponses(op)) {
+        errHtml += `<h4>Response ${esc(ecode)}</h4>${renderProse(String(eresp.description))}`;
+        for (const cval of Object.values(eresp.content ?? {})) {
+          errHtml += renderPropertyNotes((cval as any).schema);
+        }
+        for (const [label, body] of ERROR_EXAMPLES[`${method} ${path} ${ecode}`] ?? []) {
+          errHtml += renderJsonBlock(label, body);
+        }
+      }
+
+      const longDesc = typeof op.description === 'string' ? op.description.trim() : '';
+
       return `
 <article class="endpoint" id="${sid}">
   <h3><span class="badge badge-${method}">${method}</span> <code class="path">${esc(path)}</code></h3>
   <p class="endpoint-desc">${esc(desc)}</p>
+  ${longDesc ? `<div class="endpoint-detail">${renderProse(longDesc)}</div>` : ''}
   ${paramsHtml ? `<h4>Parameters</h4>${paramsHtml}` : ''}
   ${reqHtml ? `<h4>Request</h4>${reqHtml}` : ''}
   ${respHtml ? `<h4>Response</h4>${respHtml}` : ''}
+  ${errHtml}
 </article>
 `;
     })
@@ -1432,7 +1577,7 @@ Access Token as the OSC access token. Generate strong passwords for
     <tr><td><code>OSC_ACCESS_TOKEN</code></td><td>Yes</td><td>Injected</td><td>Personal Access Token. Injected automatically at deploy time on OSC.</td></tr>
     <tr><td><code>PARAMETER_STORE_API_KEY</code></td><td>Yes</td><td>Yes</td><td>Config API key of the connected parameter store.</td></tr>
     <tr><td><code>PARAMETER_STORE_INSTANCE_NAME</code></td><td>Yes</td><td>Yes</td><td>Name of the parameter store (default <code>ovcconfig</code>). On OSC this is the <code>ParameterStore</code> deploy-form field.</td></tr>
-    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning object storage instances.</td></tr>
+    <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Deployment-level object-store credential material. Each provisioned stack gets its own object-store access key id and secret derived from this value, so a credential issued for one stack cannot read or write another stack&#39;s buckets. Use a high-entropy value (at least 32 characters, which is what reliably reaches the ~112-bit floor the API enforces — generated, not chosen, e.g. <code>openssl rand -base64 32</code>): the per-stack isolation holds only while this value is expensive to guess, and below that strength newly provisioned stacks keep the deployment-wide credential instead (logged as an error at startup and per affected stack; set ALLOW_SHARED_OBJECT_STORE_CREDENTIAL=true to acknowledge that deliberately and downgrade the startup line to a warning). A stack provisioned by an older build also keeps its original deployment-wide credential until it is migrated. Treat it as a root secret; rotating it invalidates the derived credentials of already-provisioned stacks.</td></tr>
     <tr><td><code>COUCHDB_ADMIN_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning the metadata store.</td></tr>
     <tr><td><code>PORT</code></td><td>No</td><td>No</td><td>HTTP port (default <code>3000</code>). Fixed by the platform on OSC; self-hosted only.</td></tr>
     <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>).</td></tr>
@@ -1704,10 +1849,14 @@ function htmlToText(html: string): string {
   s = s.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, '');
   s = s.replace(/<div class="crumb">[\s\S]*?<\/div>/gi, ''); // breadcrumb, redundant in plain text
   s = s.replace(/<\/(h1|h2|h3|h4|p|li|div|article|section|tr)>/gi, '\n');
+  // Table cells need a separator or a row collapses into one unreadable run
+  // (e.g. "forcequerybooleanoptionalBlind override…" in the parameter tables).
+  s = s.replace(/<\/(td|th)>/gi, ' | ');
   s = s.replace(/<li[^>]*>/gi, '- ');
   s = s.replace(/<br\s*\/?>/gi, '\n');
   s = s.replace(/<[^>]+>/g, '');
   s = decodeEntities(s);
+  s = s.replace(/\s*\|\s*\n/g, '\n');
   s = s.replace(/[ \t]+\n/g, '\n');
   s = s.replace(/\n{3,}/g, '\n\n');
   return s.trim();

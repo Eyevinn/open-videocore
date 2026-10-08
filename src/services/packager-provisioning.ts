@@ -28,8 +28,12 @@
 //                            instance consumes only our pipeline's jobs, #93)
 //     OutputFolder         — s3://<packagedBucket>/
 //     PersonalAccessToken  — OSC PAT, injected as a {{secrets.*}} reference
-//     AwsAccessKeyId       — 'admin' (MinIO root user)
-//     AwsSecretAccessKey   — MinIO root password, injected as a {{secrets.*}} ref
+//     AwsAccessKeyId       — the stack's object-store access key id (issue
+//                            #1094: PackagerStackCoordinates
+//                            .objectStoreAccessKeyId; the legacy root user for a
+//                            stack provisioned before #1094)
+//     AwsSecretAccessKey   — the matching object-store secret, injected as a
+//                            {{secrets.*}} ref (never a literal)
 //     S3EndpointUrl        — the stack's MinIO endpoint
 //     CallbackUrl          — optional; <publicBaseUrl>/api/v1/internal. The
 //                            packager POSTs .../packagerCallback/success|failure.
@@ -63,6 +67,7 @@ import {
   confirmInstanceAbsentVia,
   type ServiceTeardownResult
 } from './deprovision.js';
+import { LEGACY_OBJECT_STORE_ACCESS_KEY_ID } from './object-store-credentials.js';
 
 // Secret purposes (ADR-002 naming: <stackName>.<purpose>), scoped to the
 // PACKAGER_SERVICE_ID. Mirror the purposes the eager path used so a re-provision
@@ -72,6 +77,29 @@ export const PACKAGER_PAT_PURPOSE = 'pat';
 
 // RedisQueue value — must match packagerQueueKey() in osc-packager-queue.ts.
 export const PACKAGER_REDIS_QUEUE = 'encore-packager:jobs';
+
+// The queue key a newly provisioned packager for `stackName` consumes. Scoped
+// per stack because every packager listens on the same shared Valkey: with one
+// common key, a second stack's packager would pop the first stack's jobs (and
+// vice versa) and read renditions from the wrong object store. The key is
+// recorded on the stack config (StackConfig.packagerQueue) so producers enqueue
+// onto exactly the key the packager was created with.
+export function packagerQueueForStack(stackName: string): string {
+  return `${PACKAGER_REDIS_QUEUE}:${stackName}`;
+}
+
+// The stack packaging work targets, out of the provisioned `names`: the ambient
+// stack — a request's X-Stack-Name, or a background worker re-entering a job's
+// persisted stackName (#1097) — when it names a provisioned stack, else the
+// first provisioned stack, which is the single-stack default.
+export function packagingStackName(
+  names: readonly string[],
+  ambientStackName: string | undefined
+): string | undefined {
+  return ambientStackName && names.includes(ambientStackName)
+    ? ambientStackName
+    : names[0];
+}
 
 // The non-secret + secret-reference inputs needed to build the packager create
 // body. Secrets themselves are passed as their raw values and turned into
@@ -84,10 +112,21 @@ export type PackagerStackCoordinates = {
   stackName: string;
   // Valkey connection string for the shared stack queue.
   redisUrl: string;
+  // The queue key the packager consumes. Optional: unset keeps the shared
+  // PACKAGER_REDIS_QUEUE, the pre-per-stack behaviour.
+  redisQueue?: string;
   // The stack's MinIO S3 endpoint URL.
   minioEndpoint: string;
   // The packaged-output bucket name (no scheme/prefix).
   packagedBucket: string;
+  // The stack's object-store access key id (issue #1094). NON-SECRET. The
+  // packager WRITES packaged output to the stack's object store, so it must
+  // authenticate with that stack's own credential rather than the former
+  // deployment-wide root user. Optional for back-compat: omitted (or absent
+  // from the stack's stored config, i.e. a stack provisioned before #1094)
+  // means the legacy root user, so the create body is unchanged for a
+  // not-yet-migrated stack (#1096).
+  objectStoreAccessKeyId?: string;
   // Public base URL for building the packager's HTTP callback URL. Optional:
   // when omitted (local dev without a tunnel) CallbackUrl is left unset.
   publicBaseUrl?: string;
@@ -107,10 +146,11 @@ export function buildPackagerCreateBody(
   return {
     name: coords.stackName,
     RedisUrl: coords.redisUrl,
-    RedisQueue: PACKAGER_REDIS_QUEUE,
+    RedisQueue: coords.redisQueue ?? PACKAGER_REDIS_QUEUE,
     OutputFolder: `s3://${coords.packagedBucket.replace(/\/+$/, '')}/`,
     PersonalAccessToken: refs.patRef,
-    AwsAccessKeyId: 'admin',
+    AwsAccessKeyId:
+      coords.objectStoreAccessKeyId ?? LEGACY_OBJECT_STORE_ACCESS_KEY_ID,
     AwsSecretAccessKey: refs.s3SecretRef,
     S3EndpointUrl: coords.minioEndpoint,
     ...(callbackUrl ? { CallbackUrl: callbackUrl } : {})
@@ -204,8 +244,18 @@ export function packagerOscApiFromContext(
 // non-secret coordinates so a caller can source them from env/OSC without them
 // ever landing in the persisted StackConfig.
 export type PackagerSecrets = {
-  // MinIO root password — reused as the packager's AWS S3 secret.
+  // LEGACY deployment-wide object-store password — reused as the packager's S3
+  // secret for a stack provisioned before #1094 (one whose stored config
+  // carries no objectStoreAccessKeyId). Superseded by
+  // `objectStoreSecretAccessKey` below when that is supplied.
   minioRootPassword: string;
+  // The resolved PER-STACK object-store secret access key (issue #1094),
+  // matching `PackagerStackCoordinates.objectStoreAccessKeyId`. When present it
+  // is what gets saved as the packager's OSC secret and referenced from its
+  // create body, so the packager writes to the stack's object store with that
+  // stack's own credential. Optional for back-compat: absent falls back to
+  // `minioRootPassword`, leaving the pre-#1094 behaviour unchanged.
+  objectStoreSecretAccessKey?: string;
   // OSC personal access token — the packager needs it to fetch Encore job data.
   oscPersonalAccessToken: string;
 };
@@ -285,10 +335,13 @@ export async function ensurePackagerProvisioned(
     patSecretName,
     secrets.oscPersonalAccessToken
   );
+  // The stack's own object-store secret when one was resolved (#1094),
+  // otherwise the legacy deployment-wide password. Only ever handed to
+  // saveSecret; the create body gets the {{secrets.*}} reference.
   await osc.saveSecret(
     PACKAGER_SERVICE_ID,
     s3SecretName,
-    secrets.minioRootPassword
+    secrets.objectStoreSecretAccessKey ?? secrets.minioRootPassword
   );
   const body = buildPackagerCreateBody(coords, {
     patRef: `{{secrets.${patSecretName}}}`,

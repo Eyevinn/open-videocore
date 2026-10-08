@@ -109,6 +109,10 @@ table.params th, table.env th, table.model th{color:var(--text-dim); font-weight
 .endpoint h3 .path{background:none; padding:0; color:var(--text); font-size:14.5px}
 .endpoint-desc{color:var(--text-dim); margin:0 0 4px}
 .endpoint h4{font-size:12.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--text-dim); margin:18px 0 6px; border:none}
+.endpoint-detail{margin:8px 0 4px; font-size:14px}
+.endpoint-detail p{margin:0 0 8px}
+.prose-steps{margin:0 0 8px; padding-left:20px; font-size:14px}
+.prose-steps li{margin-bottom:4px}
 .field-notes{background:var(--bg-side); border-radius:8px; padding:10px 14px; margin:8px 0 4px; font-size:13px}
 .field-notes ul{margin:6px 0 0; padding-left:18px}
 .field-notes li{margin-bottom:4px}
@@ -177,9 +181,9 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <div class="nav-group">
   <a class="nav-group-title active" href="ref-assets.html">
     <span>Assets</span>
-    <span class="group-title-right"><span class="count">51</span><button class="chevron" type="button" data-toggle="group-assets" aria-label="toggle">&#9662;</button></span>
+    <span class="group-title-right"><span class="count">52</span><button class="chevron" type="button" data-toggle="group-assets" aria-label="toggle">&#9662;</button></span>
   </a>
-  <div class="nav-group-items" id="group-assets"><a href="ref-assets.html#get-api-v1-assets" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/</span></a><a href="ref-assets.html#post-api-v1-assets" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/</span></a><a href="ref-assets.html#get-api-v1-assets-by-external-id-namespace-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/by-external-id/{namespace}/{id}</span></a><a href="ref-assets.html#get-api-v1-assets-by-tams-address" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/by-tams-address</span></a><a href="ref-assets.html#post-api-v1-assets-ingest-url" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/ingest-url</span></a><a href="ref-assets.html#get-api-v1-assets-search" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/search</span></a><a href="ref-assets.html#get-api-v1-assets-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#patch-api-v1-assets-id" class="nav-endpoint" data-method="PATCH"><span class="badge badge-PATCH">PATCH</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#delete-api-v1-assets-id" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#post-api-v1-assets-id-audio-tracks" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/audio-tracks</span></a><a href="ref-assets.html#delete-api-v1-assets-id-audio-tracks-trackId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/audio-tracks/{trackId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-clip" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/clip</span></a><a href="ref-assets.html#get-api-v1-assets-id-comments" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/comments</span></a><a href="ref-assets.html#post-api-v1-assets-id-comments" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/comments</span></a><a href="ref-assets.html#get-api-v1-assets-id-delivery" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/delivery</span></a><a href="ref-assets.html#post-api-v1-assets-id-execute" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/execute</span></a><a href="ref-assets.html#get-api-v1-assets-id-executions" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/executions</span></a><a href="ref-assets.html#get-api-v1-assets-id-executions-execId" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/executions/{execId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-export" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/export</span></a><a href="ref-assets.html#get-api-v1-assets-id-external-ids" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/external-ids</span></a><a href="ref-assets.html#post-api-v1-assets-id-external-ids" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/external-ids</span></a><a href="ref-assets.html#delete-api-v1-assets-id-external-ids-namespace-externalId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/external-ids/{namespace}/{externalId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-extract-metadata" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/extract-metadata</span></a><a href="ref-assets.html#get-api-v1-assets-id-files" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/files</span></a><a href="ref-assets.html#put-api-v1-assets-id-lock" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/lock</span></a><a href="ref-assets.html#delete-api-v1-assets-id-lock" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/lock</span></a><a href="ref-assets.html#put-api-v1-assets-id-metadata" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/metadata</span></a><a href="ref-assets.html#post-api-v1-assets-id-multipart-initiate" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/multipart/initiate</span></a><a href="ref-assets.html#delete-api-v1-assets-id-multipart-uploadId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-multipart-uploadId-complete" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}/complete</span></a><a href="ref-assets.html#get-api-v1-assets-id-multipart-uploadId-part-url" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}/part-url</span></a><a href="ref-assets.html#post-api-v1-assets-id-package" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/package</span></a><a href="ref-assets.html#get-api-v1-assets-id-pipelines" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/pipelines</span></a><a href="ref-assets.html#post-api-v1-assets-id-restore" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/restore</span></a><a href="ref-assets.html#get-api-v1-assets-id-review-state" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/review-state</span></a><a href="ref-assets.html#post-api-v1-assets-id-review-state" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/review-state</span></a><a href="ref-assets.html#get-api-v1-assets-id-stream" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/stream/{*}</span></a><a href="ref-assets.html#post-api-v1-assets-id-subtitle-tracks" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/subtitle-tracks</span></a><a href="ref-assets.html#delete-api-v1-assets-id-subtitle-tracks-trackId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/subtitle-tracks/{trackId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-tags" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/tags</span></a><a href="ref-assets.html#delete-api-v1-assets-id-tags-tag" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/tags/{tag}</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails</span></a><a href="ref-assets.html#post-api-v1-assets-id-thumbnails" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/thumbnails</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails-index" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails/{index}</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails-index-url" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails/{index}/url</span></a><a href="ref-assets.html#get-api-v1-assets-id-tracks" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/tracks</span></a><a href="ref-assets.html#post-api-v1-assets-id-transcode" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/transcode</span></a><a href="ref-assets.html#put-api-v1-assets-id-upload" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/upload</span></a><a href="ref-assets.html#post-api-v1-assets-id-upload-complete" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/upload-complete</span></a><a href="ref-assets.html#post-api-v1-assets-id-upload-url" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/upload-url</span></a><a href="ref-assets.html#get-api-v1-assets-id-versions" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/versions</span></a></div>
+  <div class="nav-group-items" id="group-assets"><a href="ref-assets.html#get-api-v1-assets" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/</span></a><a href="ref-assets.html#post-api-v1-assets" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/</span></a><a href="ref-assets.html#get-api-v1-assets-by-external-id-namespace-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/by-external-id/{namespace}/{id}</span></a><a href="ref-assets.html#get-api-v1-assets-by-tams-address" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/by-tams-address</span></a><a href="ref-assets.html#post-api-v1-assets-ingest-url" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/ingest-url</span></a><a href="ref-assets.html#get-api-v1-assets-search" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/search</span></a><a href="ref-assets.html#get-api-v1-assets-id" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#patch-api-v1-assets-id" class="nav-endpoint" data-method="PATCH"><span class="badge badge-PATCH">PATCH</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#delete-api-v1-assets-id" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}</span></a><a href="ref-assets.html#post-api-v1-assets-id-audio-tracks" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/audio-tracks</span></a><a href="ref-assets.html#delete-api-v1-assets-id-audio-tracks-trackId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/audio-tracks/{trackId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-clip" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/clip</span></a><a href="ref-assets.html#get-api-v1-assets-id-comments" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/comments</span></a><a href="ref-assets.html#post-api-v1-assets-id-comments" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/comments</span></a><a href="ref-assets.html#post-api-v1-assets-id-deliver" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/deliver</span></a><a href="ref-assets.html#get-api-v1-assets-id-delivery" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/delivery</span></a><a href="ref-assets.html#post-api-v1-assets-id-execute" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/execute</span></a><a href="ref-assets.html#get-api-v1-assets-id-executions" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/executions</span></a><a href="ref-assets.html#get-api-v1-assets-id-executions-execId" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/executions/{execId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-export" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/export</span></a><a href="ref-assets.html#get-api-v1-assets-id-external-ids" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/external-ids</span></a><a href="ref-assets.html#post-api-v1-assets-id-external-ids" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/external-ids</span></a><a href="ref-assets.html#delete-api-v1-assets-id-external-ids-namespace-externalId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/external-ids/{namespace}/{externalId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-extract-metadata" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/extract-metadata</span></a><a href="ref-assets.html#get-api-v1-assets-id-files" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/files</span></a><a href="ref-assets.html#put-api-v1-assets-id-lock" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/lock</span></a><a href="ref-assets.html#delete-api-v1-assets-id-lock" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/lock</span></a><a href="ref-assets.html#put-api-v1-assets-id-metadata" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/metadata</span></a><a href="ref-assets.html#post-api-v1-assets-id-multipart-initiate" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/multipart/initiate</span></a><a href="ref-assets.html#delete-api-v1-assets-id-multipart-uploadId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-multipart-uploadId-complete" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}/complete</span></a><a href="ref-assets.html#get-api-v1-assets-id-multipart-uploadId-part-url" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/multipart/{uploadId}/part-url</span></a><a href="ref-assets.html#post-api-v1-assets-id-package" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/package</span></a><a href="ref-assets.html#get-api-v1-assets-id-pipelines" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/pipelines</span></a><a href="ref-assets.html#post-api-v1-assets-id-restore" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/restore</span></a><a href="ref-assets.html#get-api-v1-assets-id-review-state" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/review-state</span></a><a href="ref-assets.html#post-api-v1-assets-id-review-state" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/review-state</span></a><a href="ref-assets.html#get-api-v1-assets-id-stream" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/stream/{*}</span></a><a href="ref-assets.html#post-api-v1-assets-id-subtitle-tracks" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/subtitle-tracks</span></a><a href="ref-assets.html#delete-api-v1-assets-id-subtitle-tracks-trackId" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/subtitle-tracks/{trackId}</span></a><a href="ref-assets.html#post-api-v1-assets-id-tags" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/tags</span></a><a href="ref-assets.html#delete-api-v1-assets-id-tags-tag" class="nav-endpoint" data-method="DELETE"><span class="badge badge-DELETE">DELETE</span><span class="nav-path">/api/v1/assets/{id}/tags/{tag}</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails</span></a><a href="ref-assets.html#post-api-v1-assets-id-thumbnails" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/thumbnails</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails-index" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails/{index}</span></a><a href="ref-assets.html#get-api-v1-assets-id-thumbnails-index-url" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/thumbnails/{index}/url</span></a><a href="ref-assets.html#get-api-v1-assets-id-tracks" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/tracks</span></a><a href="ref-assets.html#post-api-v1-assets-id-transcode" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/transcode</span></a><a href="ref-assets.html#put-api-v1-assets-id-upload" class="nav-endpoint" data-method="PUT"><span class="badge badge-PUT">PUT</span><span class="nav-path">/api/v1/assets/{id}/upload</span></a><a href="ref-assets.html#post-api-v1-assets-id-upload-complete" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/upload-complete</span></a><a href="ref-assets.html#post-api-v1-assets-id-upload-url" class="nav-endpoint" data-method="POST"><span class="badge badge-POST">POST</span><span class="nav-path">/api/v1/assets/{id}/upload-url</span></a><a href="ref-assets.html#get-api-v1-assets-id-versions" class="nav-endpoint" data-method="GET"><span class="badge badge-GET">GET</span><span class="nav-path">/api/v1/assets/{id}/versions</span></a></div>
 </div>
 
 <div class="nav-group">
@@ -297,7 +301,8 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
 <article class="endpoint" id="get-api-v1-assets">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/</code></h3>
   <p class="endpoint-desc">List workspace assets.</p>
-  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>limit</code></td><td><span class="tag-query">query</span></td><td>integer</td><td>optional</td></tr><tr><td><code>offset</code></td><td><span class="tag-query">query</span></td><td>integer</td><td>optional</td></tr><tr><td><code>status</code></td><td><span class="tag-query">query</span></td><td>string (uploading, processing, ready, failed, archived)</td><td>optional</td></tr><tr><td><code>parentId</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td></tr><tr><td><code>from</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td></tr><tr><td><code>to</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td></tr></tbody></table>
+  
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>limit</code></td><td><span class="tag-query">query</span></td><td>integer</td><td>optional</td><td></td></tr><tr><td><code>offset</code></td><td><span class="tag-query">query</span></td><td>integer</td><td>optional</td><td></td></tr><tr><td><code>status</code></td><td><span class="tag-query">query</span></td><td>string (uploading, processing, ready, failed, archived)</td><td>optional</td><td></td></tr><tr><td><code>parentId</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td><td></td></tr><tr><td><code>from</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td><td>Inclusive lower bound on the asset creation timestamp (<code>createdAt</code>). Accepts a calendar date (<code>YYYY-MM-DD</code>, interpreted as the first instant of that UTC day) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page.</td></tr><tr><td><code>to</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td><td>Inclusive upper bound on the asset creation timestamp (<code>createdAt</code>). Accepts a calendar date (<code>YYYY-MM-DD</code>, interpreted as the LAST instant of that UTC day, so the named day is included) or a full ISO 8601 date-time. Applied across the whole result set, not just the returned page.</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;items&quot;: [
@@ -340,11 +345,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;offset&quot;: 0,
   &quot;total&quot;: 0
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/</code></h3>
   <p class="endpoint-desc">Create an asset record.</p>
+  
   
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;name&quot;: &quot;string&quot;,
@@ -395,13 +402,15 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-by-external-id-namespace-id">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/by-external-id/{namespace}/{id}</code></h3>
-  <p class="endpoint-desc"></p>
-  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>namespace</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
+  <p class="endpoint-desc">Resolve an asset by an upstream external identifier</p>
+  <div class="endpoint-detail"><p>Resolve a single asset by the <code>{ namespace, id }</code> external identifier correlated to it (ADR-019). <code>namespace</code> labels the upstream system of record; <code>id</code> is the opaque foreign key in that system. Returns the asset when exactly one carries the pair, or 404 when none does.</p></div>
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>namespace</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td><td>Upstream system-of-record label the external id belongs to (e.g. <code>ingest-mam</code>, <code>rights-registry</code>). Required, non-empty.</td></tr><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td><td>Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;id&quot;: &quot;string&quot;,
@@ -441,13 +450,15 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-by-tams-address">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/by-tams-address</code></h3>
   <p class="endpoint-desc">Look up an asset by its TAMS flow/timerange address.</p>
-  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>tamsFlowId</code></td><td><span class="tag-query">query</span></td><td>string</td><td>required</td></tr><tr><td><code>tamsTimerange</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td></tr></tbody></table>
+  
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>tamsFlowId</code></td><td><span class="tag-query">query</span></td><td>string</td><td>required</td><td>TAMS flow id (UUID) to resolve. Addressing mode (1): supplying only tamsFlowId resolves the ready asset carrying this flow. Required.</td></tr><tr><td><code>tamsTimerange</code></td><td><span class="tag-query">query</span></td><td>string</td><td>optional</td><td>TAMS TAI timerange (ADR-008 grammar, e.g. [0:0_10:0)). Addressing mode (2): supplying tamsFlowId + tamsTimerange additionally requires an exact stored-timerange match. Optional.</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;items&quot;: [
@@ -490,11 +501,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;offset&quot;: 0,
   &quot;total&quot;: 0
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-ingest-url">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/ingest-url</code></h3>
   <p class="endpoint-desc">Ingest a video from a public URL into a new asset.</p>
+  
   
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;sourceUrl&quot;: &quot;string&quot;,
@@ -505,17 +518,19 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;string&quot;
   ],
   &quot;sourceBackend&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Legacy alias for `title` (issue #347). The editorial title of the asset. `title` and `name` are two input spellings of the SAME canonical field: both persist to `descriptive.title` and are read back as the `name` property on GET /assets/:id, list, and search responses. Prefer `title`; `title` wins when both are supplied.</li><li><code>title</code> — The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to `descriptive.title` and is read back as the `name` property on GET /assets/:id, list, and search responses (there is NO separate top-level `title` field on responses). Accepted as an alias of `name`; `title` wins when both are supplied.</li><li><code>sourceBackend</code> — Reference (id or name) to a registered external storage backend (issue #548, ADR-017) to source the asset bytes from, instead of the OSC-managed default storage. The backend must be registered (POST /storage/backends) and serve the `source` (or `both`) role. When set, `sourceUrl` addresses the object WITHIN that backend as `s3://&lt;bucket&gt;/&lt;key&gt;` (bucket may be omitted to use the registered backend's bucket, i.e. `s3:///&lt;key&gt;` or a bare `&lt;key&gt;`). No external credentials are ever supplied inline: the registered endpoint + credentials are reused server-side. Omit for the default source.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Legacy alias for <code>title</code> (issue #347). The editorial title of the asset. <code>title</code> and <code>name</code> are two input spellings of the SAME canonical field: both persist to <code>descriptive.title</code> and are read back as the <code>name</code> property on GET /assets/:id, list, and search responses. Prefer <code>title</code>; <code>title</code> wins when both are supplied.</li><li><code>title</code> — The editorial title of the asset (issue #347). This is the canonical write path for title: it persists to <code>descriptive.title</code> and is read back as the <code>name</code> property on GET /assets/:id, list, and search responses (there is NO separate top-level <code>title</code> field on responses). Accepted as an alias of <code>name</code>; <code>title</code> wins when both are supplied.</li><li><code>sourceBackend</code> — Reference (id or name) to a registered external storage backend (issue #548, ADR-017) to source the asset bytes from, instead of the OSC-managed default storage. The backend must be registered (POST /storage/backends) and serve the <code>source</code> (or <code>both</code>) role. When set, <code>sourceUrl</code> addresses the object WITHIN that backend as <code>s3://&lt;bucket&gt;/&lt;key&gt;</code> (bucket may be omitted to use the registered backend's bucket, i.e. <code>s3:///&lt;key&gt;</code> or a bare <code>&lt;key&gt;</code>). No external credentials are ever supplied inline: the registered endpoint + credentials are reused server-side. Omit for the default source.</li></ul></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
   &quot;assetId&quot;: &quot;string&quot;,
   &quot;jobId&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-search">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/search</code></h3>
   <p class="endpoint-desc">Deprecated legacy free-text-only search alias. Use the canonical Search endpoint instead.</p>
-  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>q</code></td><td><span class="tag-query">query</span></td><td>string</td><td>required</td></tr></tbody></table>
+  <div class="endpoint-detail"><p>Deprecated free-text alias. Use the canonical <code>GET /api/v1/search/?q=&lt;term&gt;</code> endpoint instead, which serves the same free-text results plus tag, mimeType, metadata, and TAMS filters with <code>total</code>/<code>page</code> pagination. This alias only accepts <code>q</code> and returns <code>{ items }</code>; it is retained for backward compatibility and will be removed in a future major version.</p></div>
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>q</code></td><td><span class="tag-query">query</span></td><td>string</td><td>required</td><td>Case-insensitive free-text query matched against the asset title (the canonical <code>name</code> field, persisted at <code>descriptive.title</code>) and description — regardless of whether the client set the title through the ingest <code>title</code> field or the legacy <code>name</code> alias (issue #347).</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;items&quot;: [
@@ -555,11 +570,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     }
   ]
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}</code></h3>
   <p class="endpoint-desc">Get a single asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -600,12 +617,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="patch-api-v1-assets-id">
   <h3><span class="badge badge-PATCH">PATCH</span> <code class="path">/api/v1/assets/{id}</code></h3>
   <p class="endpoint-desc">Update asset fields.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;name&quot;: &quot;string&quot;,
@@ -655,20 +674,24 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-assets-id">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}</code></h3>
   <p class="endpoint-desc">Delete an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>force</code></td><td><span class="tag-query">query</span></td><td>boolean</td><td>optional</td></tr><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-audio-tracks">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/audio-tracks</code></h3>
   <p class="endpoint-desc">Add an audio track to an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;language&quot;: &quot;string&quot;,
@@ -689,19 +712,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     }
   ]
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-assets-id-audio-tracks-trackId">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}/audio-tracks/{trackId}</code></h3>
   <p class="endpoint-desc">Remove an audio track.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>trackId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-clip">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/clip</code></h3>
   <p class="endpoint-desc">Clip a time segment of the asset into a new child asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;startSeconds&quot;: 0,
@@ -747,12 +774,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-comments">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/comments</code></h3>
   <p class="endpoint-desc">List review comments on an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>[
@@ -763,11 +792,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;createdAt&quot;: &quot;string&quot;
   }
 ]</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-comments">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/comments</code></h3>
   <p class="endpoint-desc">Add a review comment to an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;body&quot;: &quot;string&quot;
@@ -778,11 +809,38 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;body&quot;: &quot;string&quot;,
   &quot;createdAt&quot;: &quot;string&quot;
 }</code></pre></div>
+  
+</article>
+
+<article class="endpoint" id="post-api-v1-assets-id-deliver">
+  <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/deliver</code></h3>
+  <p class="endpoint-desc"></p>
+  
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
+  <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
+  &quot;destination&quot;: &quot;string&quot;
+}</code></pre></div>
+  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;assetId&quot;: &quot;string&quot;,
+  &quot;status&quot;: &quot;delivered&quot;,
+  &quot;destination&quot;: {
+    &quot;id&quot;: &quot;string&quot;,
+    &quot;name&quot;: &quot;string&quot;,
+    &quot;role&quot;: &quot;packaged&quot;
+  },
+  &quot;bucket&quot;: &quot;string&quot;,
+  &quot;objectKey&quot;: &quot;string&quot;,
+  &quot;bytes&quot;: 0,
+  &quot;etag&quot;: &quot;string&quot;,
+  &quot;deliveredAt&quot;: &quot;string&quot;
+}</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-delivery">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/delivery</code></h3>
   <p class="endpoint-desc">Get playback URLs for an asset (HLS/DASH manifests and/or presigned source download).</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -805,11 +863,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;reason&quot;: &quot;string&quot;
   }
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-execute">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/execute</code></h3>
   <p class="endpoint-desc">Run a multi-step pipeline execution (e.g. transcode + package) against the asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;pipeline&quot;: &quot;transcode&quot;,
@@ -818,7 +878,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;destinationBucket&quot;: &quot;string&quot;,
   &quot;destination&quot;: &quot;string&quot;,
   &quot;externalBackend&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>customProfile</code> — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline `outputs` array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>customProfile</code> — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline <code>outputs</code> array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as <code>profile</code>.</li></ul></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
   &quot;id&quot;: &quot;string&quot;,
   &quot;assetId&quot;: &quot;string&quot;,
@@ -841,11 +901,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;updatedAt&quot;: &quot;string&quot;,
   &quot;destinationBucket&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-executions">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/executions</code></h3>
   <p class="endpoint-desc">List pipeline executions for an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>[
@@ -872,11 +934,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;destinationBucket&quot;: &quot;string&quot;
   }
 ]</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-executions-execId">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/executions/{execId}</code></h3>
   <p class="endpoint-desc">Get a single pipeline execution.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>execId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -901,11 +965,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;updatedAt&quot;: &quot;string&quot;,
   &quot;destinationBucket&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-export">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/export</code></h3>
   <p class="endpoint-desc">Re-wrap the asset into a different container format without re-encoding.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;targetFormat&quot;: &quot;mp4&quot;,
@@ -950,30 +1016,34 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-external-ids">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/external-ids</code></h3>
-  <p class="endpoint-desc"></p>
+  <p class="endpoint-desc">List an asset's upstream external identifiers</p>
+  <div class="endpoint-detail"><p>List the <code>{ namespace, id }</code> external identifiers attached to the asset (ADR-019), exactly as stored. <code>namespace</code> labels the upstream system of record; <code>id</code> is the opaque foreign key in that system. Returns an empty array when the asset carries none, and 404 when the asset id is unknown.</p></div>
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
-  <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>[
+  <h4>Response</h4><p>External identifiers attached to the asset, in persisted order. Empty when none are attached.</p><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>[
   {
     &quot;namespace&quot;: &quot;string&quot;,
     &quot;id&quot;: &quot;string&quot;
   }
 ]</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-external-ids">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/external-ids</code></h3>
-  <p class="endpoint-desc"></p>
+  <p class="endpoint-desc">Attach an upstream external identifier to an asset</p>
+  <div class="endpoint-detail"><p>Attach (or change) an upstream <code>{ namespace, id }</code> external identifier on the asset (ADR-019). When per-namespace uniqueness enforcement is enabled by the operator (EXTERNAL_ID_UNIQUENESS=enforced) and the pair already resolves to a different asset, the request is rejected with a 409 <code>external_id_conflict</code> naming the conflicting asset id. Attaching a pair the asset already carries is a no-op.</p></div>
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;namespace&quot;: &quot;string&quot;,
   &quot;id&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>namespace</code> — Upstream system-of-record label the external id belongs to (e.g. `ingest-mam`, `rights-registry`). Required, non-empty.</li><li><code>id</code> — Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>namespace</code> — Upstream system-of-record label the external id belongs to (e.g. <code>ingest-mam</code>, <code>rights-registry</code>). Required, non-empty.</li><li><code>id</code> — Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.</li></ul></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;id&quot;: &quot;string&quot;,
   &quot;name&quot;: &quot;string&quot;,
@@ -1012,31 +1082,37 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-assets-id-external-ids-namespace-externalId">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}/external-ids/{namespace}/{externalId}</code></h3>
-  <p class="endpoint-desc"></p>
-  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>namespace</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>externalId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
+  <p class="endpoint-desc">Detach an upstream external identifier from an asset</p>
+  <div class="endpoint-detail"><p>Remove the <code>{ namespace, id }</code> external identifier from the asset (ADR-019) — the inverse of <code>POST /assets/{id}/external-ids</code>, for correcting a mistyped or stale correlation. Idempotent: returns 204 whether or not the asset carried the pair, so a repeated call is never an error. 404 is returned only when the asset itself does not exist.</p></div>
+  <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th><th>Description</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td><td>Asset id.</td></tr><tr><td><code>namespace</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td><td>Upstream system-of-record label the external id belongs to (e.g. <code>ingest-mam</code>, <code>rights-registry</code>). Required, non-empty.</td></tr><tr><td><code>externalId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td><td>Opaque foreign-key value in that system (UUID / numeric id / slug). Required, non-empty.</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-extract-metadata">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/extract-metadata</code></h3>
   <p class="endpoint-desc">Extract technical metadata (codec, resolution, duration, bitrate) from the asset's source file.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;assetId&quot;: &quot;string&quot;,
   &quot;status&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-files">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/files</code></h3>
   <p class="endpoint-desc">List the source and derived media files stored for an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1067,11 +1143,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     }
   ]
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="put-api-v1-assets-id-lock">
   <h3><span class="badge badge-PUT">PUT</span> <code class="path">/api/v1/assets/{id}/lock</code></h3>
   <p class="endpoint-desc"></p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;reason&quot;: &quot;string&quot;,
@@ -1115,12 +1193,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-assets-id-lock">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}/lock</code></h3>
   <p class="endpoint-desc"></p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1161,12 +1241,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="put-api-v1-assets-id-metadata">
   <h3><span class="badge badge-PUT">PUT</span> <code class="path">/api/v1/assets/{id}/metadata</code></h3>
   <p class="endpoint-desc">Replace an asset's free-form metadata.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{}</code></pre></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1207,12 +1289,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-multipart-initiate">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/multipart/initiate</code></h3>
   <p class="endpoint-desc">Initiate a multipart upload for large source media.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1220,19 +1304,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;objectKey&quot;: &quot;string&quot;,
   &quot;expiresInSeconds&quot;: 0
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-assets-id-multipart-uploadId">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}/multipart/{uploadId}</code></h3>
   <p class="endpoint-desc">Abort a multipart upload.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>uploadId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-multipart-uploadId-complete">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/multipart/{uploadId}/complete</code></h3>
   <p class="endpoint-desc">Complete a multipart upload.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>uploadId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;parts&quot;: [
@@ -1246,11 +1334,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;id&quot;: &quot;string&quot;,
   &quot;status&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-multipart-uploadId-part-url">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/multipart/{uploadId}/part-url</code></h3>
   <p class="endpoint-desc">Get a presigned URL for one multipart upload part.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>partNumber</code></td><td><span class="tag-query">query</span></td><td>integer</td><td>required</td></tr><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>uploadId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1258,11 +1348,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;partNumber&quot;: 0,
   &quot;expiresInSeconds&quot;: 0
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-package">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/package</code></h3>
   <p class="endpoint-desc">Submit an HLS/DASH packaging job for the asset's transcoded renditions.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;encoreJobId&quot;: &quot;string&quot;,
@@ -1274,11 +1366,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;jobId&quot;: &quot;string&quot;,
   &quot;pipelineMode&quot;: true
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-pipelines">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/pipelines</code></h3>
   <p class="endpoint-desc">List pipeline definitions available to run against the asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>[
@@ -1305,11 +1399,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;destinationBucket&quot;: &quot;string&quot;
   }
 ]</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-restore">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/restore</code></h3>
   <p class="endpoint-desc">Restore a soft-deleted asset within its retention window.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1350,12 +1446,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-review-state">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/review-state</code></h3>
   <p class="endpoint-desc">Get an asset's editorial review state and the transitions that are legal from it.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1363,12 +1461,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;allowedTransitions&quot;: [
     &quot;draft&quot;
   ]
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>reviewState</code> — The current editorial review state. `draft` for assets that have never been submitted (including ones stored before the field existed). INDEPENDENT of the lifecycle `status`.</li><li><code>allowedTransitions</code> — The review states this asset may move to next, from its current `reviewState`. Every value listed here is accepted by POST /assets/{id}/review-state; every state NOT listed (other than `reviewState` itself) is refused with 422. The current state is never listed — re-sending it succeeds as an idempotent no-op but is not a move. May be empty, which means the state is terminal.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>reviewState</code> — The current editorial review state. <code>draft</code> for assets that have never been submitted (including ones stored before the field existed). INDEPENDENT of the lifecycle <code>status</code>.</li><li><code>allowedTransitions</code> — The review states this asset may move to next, from its current <code>reviewState</code>. Every value listed here is accepted by POST /assets/{id}/review-state; every state NOT listed (other than <code>reviewState</code> itself) is refused with 422. The current state is never listed — re-sending it succeeds as an idempotent no-op but is not a move. May be empty, which means the state is terminal.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-review-state">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/review-state</code></h3>
   <p class="endpoint-desc">Transition an asset's editorial review state (draft / in-review / approved / rejected).</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;reviewState&quot;: &quot;draft&quot;
@@ -1411,20 +1511,24 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-stream">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/stream/{*}</code></h3>
   <p class="endpoint-desc">Proxy-stream a packaged HLS/DASH manifest or media segment.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>*</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200</div><pre><code>(no body)</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-subtitle-tracks">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/subtitle-tracks</code></h3>
   <p class="endpoint-desc">Add a subtitle track to an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;language&quot;: &quot;string&quot;,
@@ -1443,19 +1547,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   },
   &quot;uploadUrl&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-assets-id-subtitle-tracks-trackId">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}/subtitle-tracks/{trackId}</code></h3>
   <p class="endpoint-desc">Remove a subtitle track.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>trackId</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 204 (application/json)</div><pre><code>&quot;null&quot;</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-tags">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/tags</code></h3>
   <p class="endpoint-desc">Add a tag to an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;tags&quot;: [
@@ -1500,12 +1608,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="delete-api-v1-assets-id-tags-tag">
   <h3><span class="badge badge-DELETE">DELETE</span> <code class="path">/api/v1/assets/{id}/tags/{tag}</code></h3>
   <p class="endpoint-desc">Remove a tag from an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>tag</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1546,12 +1656,14 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   },
   &quot;parentId&quot;: &quot;string&quot;
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via `title` (or the legacy `name` alias) and persisted to `descriptive.title`; this is the single documented location for title across GET, list, and search responses. There is no separate top-level `title` field.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>name</code> — Canonical editorial title of the asset. Set on ingest via <code>title</code> (or the legacy <code>name</code> alias) and persisted to <code>descriptive.title</code>; this is the single documented location for title across GET, list, and search responses. There is no separate top-level <code>title</code> field.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-thumbnails">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/thumbnails</code></h3>
   <p class="endpoint-desc">List extracted thumbnails.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1560,11 +1672,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;string&quot;
   ]
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-thumbnails">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/thumbnails</code></h3>
   <p class="endpoint-desc">Extract poster frame thumbnails at one or more timecodes.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;timecodes&quot;: [
@@ -1577,19 +1691,23 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;string&quot;
   ]
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-thumbnails-index">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/thumbnails/{index}</code></h3>
   <p class="endpoint-desc">Get a single extracted thumbnail.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>index</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200</div><pre><code>(no body)</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-thumbnails-index-url">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/thumbnails/{index}/url</code></h3>
   <p class="endpoint-desc"></p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr><tr><td><code>index</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1600,14 +1718,26 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;expiresAt&quot;: &quot;string&quot;,
   &quot;expiresInSeconds&quot;: 0
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-tracks">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/tracks</code></h3>
   <p class="endpoint-desc">List an asset's audio and subtitle tracks.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
+  &quot;videoTracks&quot;: [
+    {
+      &quot;codec&quot;: &quot;string&quot;,
+      &quot;width&quot;: 0,
+      &quot;height&quot;: 0,
+      &quot;index&quot;: 0,
+      &quot;bitrateBps&quot;: 0,
+      &quot;frameRate&quot;: 0
+    }
+  ],
   &quot;audioTracks&quot;: [
     {
       &quot;id&quot;: &quot;string&quot;,
@@ -1629,11 +1759,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     }
   ]
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-transcode">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/transcode</code></h3>
   <p class="endpoint-desc">Submit an ABR transcoding job for the asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   <h4>Request</h4><div class="code-block"><div class="code-label">Request body (application/json)</div><pre><code>{
   &quot;profile&quot;: &quot;string&quot;,
@@ -1642,7 +1774,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     &quot;source&quot;: null,
     &quot;forceStyle&quot;: &quot;string&quot;
   }
-}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>profile</code> — Name of a profile registered on this deployment (list them with GET /api/v1/profiles). The encoding ladder lives in the profile; the transcoding service resolves this name against the profile index it loads. A name this deployment does not hold is rejected with a 400 `unknown_profile` at submit time rather than failing later as a dropped job (issue #1022). Omitted: the deployment default profile is used, and the job record reports whichever profile was actually submitted.</li><li><code>customProfile</code> — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline `outputs` array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.</li></ul></div>
+}</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>profile</code> — Name of a profile registered on this deployment (list them with GET /api/v1/profiles). The encoding ladder lives in the profile; the transcoding service resolves this name against the profile index it loads. A name this deployment does not hold is rejected with a 400 <code>unknown_profile</code> at submit time rather than failing later as a dropped job (issue #1022). Omitted: the deployment default profile is used, and the job record reports whichever profile was actually submitted.</li><li><code>customProfile</code> — REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder cannot be submitted inline: the transcoding service resolves a profile by NAME against its own profile index, so an inline <code>outputs</code> array could never reach the encoder — it used to be validated and then discarded. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as <code>profile</code>.</li></ul></div>
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 202 (application/json)</div><pre><code>{
   &quot;jobId&quot;: &quot;string&quot;,
   &quot;encoreJobId&quot;: &quot;string&quot;,
@@ -1655,33 +1787,39 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
     ]
   }
 }</code></pre></div><div class="field-notes"><strong>Field notes</strong><ul><li><code>warning</code> — Present only when profileParams validation could not be performed because the profile YAML was unresolvable (the profile store was unreachable, or no profile was named and the default profile is not in the store). A caller-named profile that a reachable store does not hold is rejected with a 400 instead. The request was still accepted and the keys were forwarded to Encore unchecked.</li></ul></div>
+  
 </article>
 
 <article class="endpoint" id="put-api-v1-assets-id-upload">
   <h3><span class="badge badge-PUT">PUT</span> <code class="path">/api/v1/assets/{id}/upload</code></h3>
   <p class="endpoint-desc">Direct upload of source media for an asset.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;id&quot;: &quot;string&quot;,
   &quot;status&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-upload-complete">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/upload-complete</code></h3>
   <p class="endpoint-desc">Finalize a completed direct or presigned upload.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
   &quot;id&quot;: &quot;string&quot;,
   &quot;status&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="post-api-v1-assets-id-upload-url">
   <h3><span class="badge badge-POST">POST</span> <code class="path">/api/v1/assets/{id}/upload-url</code></h3>
   <p class="endpoint-desc">Get a presigned single-part upload URL for an asset's source media.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1690,11 +1828,13 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   &quot;method&quot;: &quot;string&quot;,
   &quot;expiresInSeconds&quot;: 0
 }</code></pre></div>
+  
 </article>
 
 <article class="endpoint" id="get-api-v1-assets-id-versions">
   <h3><span class="badge badge-GET">GET</span> <code class="path">/api/v1/assets/{id}/versions</code></h3>
   <p class="endpoint-desc">List an asset's version history.</p>
+  
   <h4>Parameters</h4><table class="params"><thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th></tr></thead><tbody><tr><td><code>id</code></td><td><span class="tag-path">path</span></td><td>string</td><td>required</td></tr></tbody></table>
   
   <h4>Response</h4><div class="code-block"><div class="code-label">Response 200 (application/json)</div><pre><code>{
@@ -1738,6 +1878,7 @@ footer.doc-footer{border-top:1px solid var(--border); margin-top:60px; padding-t
   ],
   &quot;versionGroupId&quot;: &quot;string&quot;
 }</code></pre></div>
+  
 </article>
 
     
