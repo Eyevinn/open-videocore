@@ -26,6 +26,7 @@ import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance
 import { keys } from './types.js';
 import { valkeyConnectionId } from './valkey-connection-id.js';
 import type { DroppedJob, EncoreScalerConfig } from './types.js';
+import type { ScalerLogSink } from './scaler-log.js';
 
 export type WorkspaceEncoreScalerConfig = {
   redis: Redis;
@@ -128,6 +129,13 @@ export type WorkspaceEncoreScalerConfig = {
   // annotates the caller-facing Job with the recoverable interruption reason
   // (without changing its status).
   onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
+  // Forwarded to every per-workspace scaler loop: the operational log store the
+  // loop appends its spawn/dispatch/reap/tick FAILURES to (issue #998), so they
+  // are visible through GET /api/v1/logs and the Logs tab instead of only in the
+  // container's stdout. main.ts passes the same store the pipeline-step producer
+  // (#995) writes to and the logs router reads. Unset => the loops log to
+  // `console.error` only, exactly as before.
+  logSink?: ScalerLogSink;
 };
 
 // How long a stack enumeration (listStackKeys) is reused before it is fetched
@@ -387,7 +395,12 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       onEncodeDispatched: this.config.onEncodeDispatched,
       reconcileFailedTranscodes: this.config.reconcileFailedTranscodes,
       onJobsDropped: this.config.onJobsDropped,
-      onJobInterrupted: this.config.onJobInterrupted
+      onJobInterrupted: this.config.onJobInterrupted,
+      // #998: the loop's own failures go to the operational log store as well as
+      // stdout. Passed to EVERY loop (there is one per stack), and each entry
+      // names its workspace, so a multi-stack deployment stays separable in one
+      // tail.
+      logSink: this.config.logSink
     };
 
     const loop = new EncoreScalerLoop(scalerConfig);

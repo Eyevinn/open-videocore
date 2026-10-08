@@ -68,7 +68,7 @@ export type HttpEncoreConfig = {
   fetch?: typeof globalThis.fetch;
 };
 
-// Map our EncoreProfile to Encore's job-creation payload.
+// Map our submit input to Encore's job-creation payload.
 //
 // SMOKE TEST CONFIRMED (2026-06-01): Encore's API schema has NO top-level
 // `outputs` field. Profiles are server-side named configurations — the profile

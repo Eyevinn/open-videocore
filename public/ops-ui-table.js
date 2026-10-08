@@ -297,25 +297,29 @@ export function createOpsTableState(config) {
 //
 // config:
 //   columns:    [{ key, label, sortable?, sortKey?, align?, width?, render?,
-//                  hideable?, chooserLabel? }]
+//                  hideable?, defaultVisible?, chooserLabel? }]
 //               `sortable` enables the tri-state header button; `sortKey` (falls
 //               back to `key`) is what toggleSort() tracks. `render(row)` returns
 //               an escaped HTML string for the cell (matches app.js style); when
 //               omitted the cell shows escaped row[key]. `hideable: false` pins a
-//               column against the chooser; `chooserLabel` names a column whose
-//               header caption is empty (e.g. a thumbnail column) in that list.
+//               column against the chooser; `defaultVisible: false` (issue #961)
+//               declares a column that the chooser offers but the table does not
+//               paint until someone asks for it; `chooserLabel` names a column
+//               whose header caption is empty (e.g. a thumbnail column) in that
+//               list.
 //   columnChooser: optional (issue #959) — { visible?, requireAtLeastOne?, label?,
 //               onChange?, onReset?, isCustomized? }. `visible` is the initial
-//               visible key set (null/absent = every declared column);
+//               visible key set (null/absent = the DEFAULT set, which is every
+//               declared column unless one opted out via `defaultVisible: false`);
 //               `requireAtLeastOne` is a list of groups that must each keep one
 //               visible member; `onChange(keys)` fires after an operator toggle so
 //               the consumer can persist it. `onReset(keys)` fires when the
-//               operator resets (issue #962) and receives the DECLARED default
-//               set — the consumer's job there is to CLEAR whatever it persisted
-//               in onChange, not to persist again; it falls back to `onChange`
-//               when absent. `isCustomized()` reports whether there is anything
-//               left to reset, which greys the action out when there is not.
-//               Present = a "Columns" control is mounted in the filter bar.
+//               operator resets (issue #962) and receives that same DECLARED
+//               default set — the consumer's job there is to CLEAR whatever it
+//               persisted in onChange, not to persist again; it falls back to
+//               `onChange` when absent. `isCustomized()` reports whether there is
+//               anything left to reset, which greys the action out when there is
+//               not. Present = a "Columns" control is mounted in the filter bar.
 //               Toggling NEVER touches the interaction store, so paging/sort/
 //               filters and the in-flight request are all unaffected — and
 //               neither does a reset: it is the same repaint-only path.
@@ -376,8 +380,9 @@ export function createOpsTable(config) {
   const columnGroups = chooserCfg && Array.isArray(chooserCfg.requireAtLeastOne)
     ? chooserCfg.requireAtLeastOne
     : [];
-  // With no chooser configured, `null` normalizes to "every declared column", so
-  // a table that never opts in behaves exactly as it did before.
+  // With no chooser configured, `null` normalizes to the table's DEFAULT set,
+  // which for a table that declares no `defaultVisible: false` column is every
+  // declared column — so a table that never opts in behaves exactly as before.
   let visibleKeys = normalizeVisibleColumns(
     chooserCfg ? chooserCfg.visible : null,
     columns,

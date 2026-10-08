@@ -241,10 +241,11 @@ const DESCRIPTIONS: Record<string, string> = {
   'POST /api/v1/admin/watch-folder/start': 'Start the watch-folder ingest poller.',
   'POST /api/v1/admin/watch-folder/stop': 'Stop the watch-folder ingest poller.',
   'GET /api/v1/scaler/status':
-    'Current transcoder instance pool status (effective `maxInstances`, `jobsPerInstance`, `idleTimeoutMs`).',
+    'Current transcoder instance pool status. `maxInstances` and `idleTimeoutMs` are the values in force in the serving process — a runtime `PATCH` if one has been sent since startup, otherwise the boot-time environment values.',
   'PATCH /api/v1/scaler/config':
-    'Update auto-scaler configuration at runtime (`maxInstances`, `minInstances`, `idleTimeoutMs`).',
-  'GET /api/v1/scaler/config': 'Get auto-scaler configuration.',
+    'Update auto-scaler configuration at runtime. `maxInstances` and `idleTimeoutMs` take effect on the next scaler tick with no restart; `minInstances` is persisted and echoed back but not applied to the running scaler (change the warm floor via `ENCORE_MIN_INSTANCES` and a restart). The values are written to the parameter store before they are applied, so a `200` means saved and applied — `501` when no parameter store is configured and `503` when the write fails, with nothing applied in either case. The stored record is not reloaded at boot yet, so a restart reverts to `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS` until the `PATCH` is re-sent. There is no reset endpoint: send the environment values back explicitly.',
+  'GET /api/v1/scaler/config':
+    'Get the auto-scaler configuration in force in the serving process: the most recent runtime `PATCH` if one has been accepted since startup, otherwise the boot-time values from `ENCORE_MAX_INSTANCES` / `ENCORE_IDLE_TIMEOUT_MS`. It reads the live copy, never the parameter store, and does not say which of the two sources a value came from.',
   'GET /api/v1/retention/config': 'Get the soft-delete retention window configuration.',
   'PATCH /api/v1/retention/config': 'Update the soft-delete retention window configuration.',
   'GET /api/v1/logs/': 'Query structured application logs.',
@@ -355,6 +356,15 @@ for (const eps of groups.values()) {
   });
 }
 
+// True when a JSON Schema accepts no value at all (`{ "not": {} }` — what a
+// never/undefined-typed field compiles to). Such a field exists in the contract
+// only to be REJECTED, so it must not appear in a request example.
+function rejectsEveryValue(schema: JsonSchema | undefined): boolean {
+  if (!schema || typeof schema !== 'object') return false;
+  const not = (schema as JsonSchema)['not'];
+  return typeof not === 'object' && not !== null && Object.keys(not).length === 0;
+}
+
 function exampleForSchema(schema: JsonSchema | undefined, depth = 0): any {
   if (depth > 4 || !schema || typeof schema !== 'object') return null;
   if ('example' in schema) return schema.example;
@@ -366,6 +376,13 @@ function exampleForSchema(schema: JsonSchema | undefined, depth = 0): any {
     const keys = [...Object.keys(props).filter((k) => required.has(k)), ...Object.keys(props).filter((k) => !required.has(k))];
     const out: Record<string, any> = {};
     for (const k of keys.slice(0, 12)) {
+      // A property whose schema is `{ "not": {} }` accepts NO value — it is a
+      // field the API rejects (e.g. a removed field kept in the contract so
+      // supplying it is an error rather than silently ignored, issue #1022).
+      // Showing it in a request example would invite callers to send something
+      // that is guaranteed to 400, so it is omitted from the example; its
+      // `description` still appears in the field notes below the example.
+      if (rejectsEveryValue(props[k])) continue;
       out[k] = exampleForSchema(props[k], depth + 1);
     }
     return out;
@@ -667,8 +684,10 @@ ${renderCurlBlock('Request', 'curl -X POST https://<your-instance>/api/v1/provis
 
 <h2 id="scaler">Tune the transcoder auto-scaler</h2>
 <p>The auto-scaler keeps a per-workspace pool of transcoder instances and scales it on demand. By default it scales to zero when idle, trading standing cost for cold-start latency on the first job of a burst.</p>
-${renderCurlBlock('Request', 'curl -X PATCH https://<your-instance>/api/v1/scaler/config \\\n  -H "Content-Type: application/json" \\\n  -d \'{"minInstances": 1, "maxInstances": 3, "idleTimeoutMs": 300000}\'')}
-<p>Set <code>minInstances</code> to 1 or more for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. See ${refEx('GET', '/api/v1/scaler/status')} for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
+${renderCurlBlock('Request', 'curl -X PATCH https://<your-instance>/api/v1/scaler/config \\\n  -H "Content-Type: application/json" \\\n  -d \'{"maxInstances": 3, "idleTimeoutMs": 300000}\'')}
+<p>This changes <code>maxInstances</code> and <code>idleTimeoutMs</code> from the next scaler tick, with no restart.</p>
+<div class="callout"><strong>Runtime config is saved, but not reloaded at boot.</strong> The values are written to the parameter store first and applied to the serving process second, so a <code>200</code> means both: you get a <code>501</code> if no parameter store is configured and a <code>503</code> if the write fails, and in both cases nothing is applied. Precedence at runtime is two layers: the most recent accepted <code>PATCH</code> wins, otherwise the boot-time environment value. Nothing reads the stored record at boot yet, so a restart or redeploy goes back to <code>ENCORE_MAX_INSTANCES</code> and <code>ENCORE_IDLE_TIMEOUT_MS</code> until the <code>PATCH</code> is re-sent, and the applied value only ever reaches the replica that answered the request. There is no reset endpoint — send the environment values back explicitly, which overwrites the stored snapshot. For a change that must take effect everywhere after a restart, set the environment variable and redeploy.</div>
+<p>The warm floor is the exception: set <code>ENCORE_MIN_INSTANCES</code> to 1 or more (and restart) for production and latency-sensitive workloads, so the first job of a burst never pays the cold start. A <code>minInstances</code> sent to the config endpoint is validated, persisted and echoed back, but the running scaler keeps enforcing the floor it read at boot. See ${refEx('GET', '/api/v1/scaler/status')} for the pool's live state and the <a href="ref-scaler.html">Auto-scaler reference</a> for every field.</p>
 
 <h2 id="optional-services">Optional services</h2>
 <p>Add-on capabilities beyond the core stack are provisioned per workspace, on demand:</p>
@@ -1564,9 +1583,9 @@ Access Token as the OSC access token. Generate strong passwords for
     <tr><td><code>MINIO_ROOT_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Deployment-level object-store credential material. Each provisioned stack gets its own object-store access key id and secret derived from this value, so a credential issued for one stack cannot read or write another stack&#39;s buckets. Use a high-entropy value (at least 32 characters, which is what reliably reaches the ~112-bit floor the API enforces — generated, not chosen, e.g. <code>openssl rand -base64 32</code>): the per-stack isolation holds only while this value is expensive to guess, and below that strength newly provisioned stacks keep the deployment-wide credential instead (logged as an error at startup and per affected stack; set ALLOW_SHARED_OBJECT_STORE_CREDENTIAL=true to acknowledge that deliberately and downgrade the startup line to a warning). A stack provisioned by an older build also keeps its original deployment-wide credential until it is migrated. Treat it as a root secret; rotating it invalidates the derived credentials of already-provisioned stacks.</td></tr>
     <tr><td><code>COUCHDB_ADMIN_PASSWORD</code></td><td>Yes</td><td>Yes</td><td>Admin password used when provisioning the metadata store.</td></tr>
     <tr><td><code>PORT</code></td><td>No</td><td>No</td><td>HTTP port (default <code>3000</code>). Fixed by the platform on OSC; self-hosted only.</td></tr>
-    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>).</td></tr>
-    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Yes</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
-    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Yes</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>).</td></tr>
+    <tr><td><code>ENCORE_MAX_INSTANCES</code></td><td>No</td><td>Yes</td><td>Max transcoder instances the auto-scaler may run per workspace (default <code>3</code>). Can be changed at runtime with <a href="ref-scaler.html">PATCH /api/v1/scaler/config</a>; that change is persisted but is not reloaded at boot, so a restart reverts to this value until the <code>PATCH</code> is re-sent. See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_MIN_INSTANCES</code></td><td>No</td><td>Yes</td><td>Warm floor of transcoder instances kept running even when idle (default <code>0</code> — scale to zero). The only way to change the floor the scaler enforces: a <code>minInstances</code> sent to the runtime config endpoint is persisted and echoed back but not applied. See <a href="guide-operating.html#scaler">Operating a workspace</a>.</td></tr>
+    <tr><td><code>ENCORE_IDLE_TIMEOUT_MS</code></td><td>No</td><td>Yes</td><td>Idle time before a transcoder instance is torn down (default <code>300000</code>). Can be changed at runtime with <a href="ref-scaler.html">PATCH /api/v1/scaler/config</a>, with the same persisted-but-not-reloaded-at-boot caveat.</td></tr>
     <tr><td><code>PUBLIC_BASE_URL</code></td><td>No</td><td>No</td><td>Publicly-reachable base URL of this instance, used to build the profile index URL handed to each transcoder. <strong>Self-hosted only — not configurable on Open Source Cloud</strong> (the OSC deploy form exposes no field for it, and OSC injects no self-URL). Left unset on OSC, transcoders fall back to the remote default profiles index.</td></tr>
   </tbody>
 </table>

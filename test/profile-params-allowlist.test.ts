@@ -250,17 +250,22 @@ describe('POST /:id/transcode profileParams key validation (issue #290)', () => 
     await app.close();
   });
 
-  it('is permissive for a profile not in the store (unknown/custom profile)', async () => {
+  it('is permissive when the profile YAML is unresolvable (unnamed default profile not in the store)', async () => {
     const { app, assets } = await buildApp();
     const id = await makeSource(assets);
     const res = await app.inject({
       method: 'POST',
       url: `/api/v1/assets/${id}/transcode`,
       headers: { authorization: 'Bearer token-a' },
-      payload: { profile: 'not-in-store', profileParams: { anything: 'goes' } }
+      // No `profile` -> the submit default (DEFAULT_PROFILE_NAME, 'program'),
+      // which this store does not hold. A CALLER-NAMED profile missing from a
+      // reachable store is now a 400 `unknown_profile` instead (issue #1022,
+      // asserted in test/transcode.test.ts); the unnamed default stays
+      // permissive so an unseeded deployment can still transcode.
+      payload: { profileParams: { anything: 'goes' } }
     });
     // Not rejected on unknown keys — the profile YAML is unresolvable, so we
-    // degrade permissively rather than falsely rejecting a custom profile.
+    // degrade permissively rather than falsely rejecting.
     expect(res.statusCode).toBe(202);
     await app.close();
   });

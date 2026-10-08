@@ -27,8 +27,20 @@
  *     to       string, created-at upper bound (inclusive)
  *   Response envelope (listSchema, top-level props): { items, limit, offset, total }.
  *   Item fields used here (verified present in the list item schema): id, slug,
- *   name (canonical title), status, tags, thumbnails, createdAt,
- *   technicalMetadataError, deleteLock.
+ *   name (canonical title), status, reviewState, renditions, tags, thumbnails,
+ *   createdAt, technicalMetadataError, deleteLock.
+ *   `reviewState` and `renditions` (issue #961) are
+ *   openapi.json .paths["/api/v1/assets/"].get.responses["200"]
+ *   .content["application/json"].schema.properties.items.items.properties
+ *   .reviewState — a string enum ['draft','in-review','approved','rejected']
+ *   (`reviewStateSchema.optional()`, src/routes/assets.ts:868; `reviewState?:
+ *   AssetReviewState`, src/data/asset-repo.ts:488) — and ….renditions, an ARRAY
+ *   of { id, label, width, height, objectKey, codec?, bitrateBps? } (`renditions?:
+ *   Rendition[]`, src/data/asset-repo.ts:546). There is NO `renditionCount`
+ *   scalar and no `review_state` snake_case spelling in the contract; the count
+ *   is derived from the array's length client-side. Both are OPTIONAL (absent
+ *   from the item schema's `required`: ['id','name','status','statusHistory',
+ *   'createdAt','updatedAt']).
  *   `deleteLock` (issue #894) is
  *   openapi.json .paths["/api/v1/assets/"].get.responses["200"]
  *   .content["application/json"].schema.properties.items.items.properties
@@ -127,18 +139,33 @@
  * on a minimum term length. Enter is a shortcut that flushes a debounce still in
  * flight, never a requirement. See searchFilterControl() below.
  *
- * COLUMN VISIBILITY (issue #959). The operator chooses which of the eight declared
- * columns are rendered. This is VIEW state and touches NO part of the request: the
+ * TIER-2 PROJECTION GAP (review state, issue #961). Same shape as the lock gap
+ * above and verified the same way: `assetSchema` (src/routes/search.ts) has no
+ * `reviewState` and no `slug`, so while a free-text `q` is active those two cells
+ * render an em-dash. For review state that is deliberately NOT the API's `draft`
+ * default — tier 1 can say "absent means draft" because it projects the field and
+ * the route resolves it that way (src/routes/assets.ts:5938); tier 2 cannot say
+ * anything at all. `renditions` IS in the search projection, so the rendition
+ * count is exact on both tiers.
+ *
+ * COLUMN VISIBILITY (issue #959, extended by #961). The operator chooses which of
+ * the ten declared columns are rendered; two of them — Review state and Rendition
+ * count — are declared but OFF until chosen, so a first visit to a bare URL paints
+ * the same eight columns it always did (ASSETS_DEFAULT_COLUMN_KEYS below).
+ * This is VIEW state and touches NO part of the request: the
  * two tiers above, their params, the client sort and the paging window are all
  * computed from `snap.sort` / `snap.filters` / `snap.offset`, none of which the
  * chooser writes. Hiding the Created column does not stop the table sorting by
  * createdAt, and hiding Status does not drop the `status` param — so `total` and
- * which rows a page reaches are unchanged by definition, not by convention.
- * Resolution order on load is URL -> stored per-operator default -> all columns;
- * see resolveInitialColumns() below. The chooser's "Reset to defaults" (issue
- * #962) unwinds that same ladder from the top: it clears the `assets.cols` param
- * AND this browser's stored default, so the table falls back to the declared set
- * and stays there on refresh and on the next visit alike.
+ * which rows a page reaches are unchanged by definition, not by convention. The
+ * two optional columns add no param and no sort axis either: both render from
+ * fields the page already fetched.
+ * Resolution order on load is URL -> stored per-operator default -> the default
+ * column set; see resolveInitialColumns() below. The chooser's "Reset to
+ * defaults" (issue #962) unwinds that same ladder from the top: it clears the
+ * `assets.cols` param AND this browser's stored default, so the table falls back
+ * to the declared default set — the eight painted-by-default columns, not the ten
+ * declared ones — and stays there on refresh and on the next visit alike.
  *
  * ROW RENAME (issue #927). The Actions column carries a Rename control, so an
  * operator renames an asset from the list without opening the detail pane. The
@@ -185,6 +212,11 @@ import {
 // the contract grounding in public/thumbnail-url.js.
 import { applyThumbnail } from './thumbnail-url.js';
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Editorial review state (issue #961). The vocabulary and the display labels are
+// imported rather than restated so the optional "Review state" column, the detail
+// panel's review block and the badge palette cannot drift onto three different
+// spellings of the same four states — see public/review-state.js.
+import { REVIEW_STATES, reviewStateLabel } from './review-state.js';
 // Explicit delete-lock indicator (issue #894). Derivation, copy and markup all
 // live in one module so the list, the detail panel (#895) and the protected-
 // delete flow (#896) ship one pattern — see docs/ux/asset-lock-state-spec.md §2.
@@ -251,16 +283,50 @@ export const ASSETS_SELECT_COLUMN_KEY = 'select';
 
 // The declared column keys, in render order. Exported so consumers and tests name
 // the same vocabulary the `assets.cols` URL param and the stored preference use.
+//
+// DECLARED is not the same as PAINTED (issue #961): `reviewState` and `renditions`
+// are declared, offered by the chooser and addressable by `assets.cols`, but off
+// until an operator asks for them — see ASSETS_OPTIONAL_COLUMN_KEYS below.
 export const ASSETS_COLUMN_KEYS = Object.freeze([
   'thumb',
   'id',
   'slug',
   'title',
   'status',
+  'reviewState',
+  'renditions',
   'tags',
   'created',
   'actions',
 ]);
+
+// Columns that are available but OFF until chosen (issue #961).
+//
+// This is the SINGLE source of truth for the flag: buildColumns() stamps
+// `defaultVisible: false` onto exactly these keys, and ASSETS_DEFAULT_COLUMN_KEYS
+// below is derived from it, so the declared set, the painted-by-default set and
+// the column objects cannot disagree.
+//
+// Why these two and not the rest. The issue asks for slug, id, rendition count,
+// review state and tags as selectable columns; slug, id and tags were ALREADY
+// declared and already toggleable through the chooser (#959), and they are
+// already part of the default view. Turning them off would change the default
+// view, which the issue explicitly forbids. So only the genuinely new pair —
+// rendition count and review state — is added here, and it is added OFF, leaving
+// a first visit to a bare URL pixel-identical to before.
+//
+// Both are secondary, high-cardinality-of-interest-per-operator detail: a
+// transcoding operator wants the rendition count on screen all day, an editor
+// wants the review state, and neither wants the other's column. That is the
+// definition of a chooser column rather than a default one.
+export const ASSETS_OPTIONAL_COLUMN_KEYS = Object.freeze(['reviewState', 'renditions']);
+
+// What the table paints when nobody has chosen: every declared column except the
+// optional ones. This is the pre-#961 set, unchanged, and it is what a bare URL
+// with no stored preference resolves to.
+export const ASSETS_DEFAULT_COLUMN_KEYS = Object.freeze(
+  ASSETS_COLUMN_KEYS.filter((k) => ASSETS_OPTIONAL_COLUMN_KEYS.indexOf(k) === -1)
+);
 
 // The legality rule from the issue: the Actions column and the identifying
 // columns must never ALL be hidden at once, or the table becomes a grid of
@@ -436,7 +502,12 @@ async function fetchAssetsPage(snap, deps) {
     // in src/routes/search.ts which Fastify serializes against). Every row here
     // is therefore lock-state UNKNOWN, not unlocked — see the lock note in the
     // header block and docs/ux/asset-lock-state-spec.md §2 (L0) and gap H1.
-    return { rows, total, projectionCarriesLock: false };
+    // Nor does it carry `reviewState` or `slug` (same verification — neither
+    // appears in `assetSchema`'s properties), so the optional Review state
+    // column renders UNKNOWN on these rows rather than the API's `draft`
+    // default (issue #961). `renditions` IS in this projection, so the rendition
+    // count is exact on both tiers.
+    return { rows, total, projectionCarriesLock: false, projectionCarriesReviewState: false };
   }
 
   // ── Tier 1: exact/range list via GET /api/v1/assets/ (Mango-style). ──
@@ -458,8 +529,10 @@ async function fetchAssetsPage(snap, deps) {
   const rows = applyClientSort(items, snap.sort);
   // This projection DOES carry `deleteLock` (verified: openapi.json
   // .paths["/api/v1/assets/"].get...items.items.properties.deleteLock), so an
-  // absent field on a row genuinely means "not locked".
-  return { rows, total, projectionCarriesLock: true };
+  // absent field on a row genuinely means "not locked". It likewise carries
+  // `reviewState` (…items.items.properties.reviewState), so an absent value
+  // there is the pre-field default `draft` rather than an unknown (issue #961).
+  return { rows, total, projectionCarriesLock: true, projectionCarriesReviewState: true };
 }
 
 // Everything about the interaction state that decides WHICH request to make:
@@ -774,14 +847,110 @@ function asSlot(factory) {
 // documents). Every dynamic value passes through escHtml. Thumbnail/status/tags/
 // actions markup mirrors the previous assets table so styling is unchanged.
 
+// ─── Optional-column cell renderers (issue #961) ──────────────────────────────
+
+// Em-dash for "this projection cannot tell you". Matches the glyph copy-id.js
+// and the Name / Title column already use for an absent value, so one missing
+// cell does not look different from another.
+const EMPTY_CELL = '—';
+
+// The same em-dash, with a name a screen reader can read out (WCAG 2.1 AA,
+// 1.1.1 / 1.3.1). A bare "—" is announced as "dash" or skipped entirely, which
+// makes an UNKNOWN cell indistinguishable from an empty one — exactly the
+// distinction this column exists to draw.
+//
+// `role="img"` rather than a `.visually-hidden` span, which is the pattern used
+// elsewhere (lock-state.js:148): a naked <span> is a `generic` element, and
+// aria-label on it is ignored by design, while role="img" makes the glyph a
+// single named graphic and REPLACES the dash in the accessible name instead of
+// appending to it. The visible text stays exactly one em-dash either way.
+function unknownCellHtml(label) {
+  return '<span role="img" aria-label="' + escHtml(label) + '">' + EMPTY_CELL + '</span>';
+}
+
+/**
+ * Rendition count. VERIFIED FIELD: `renditions`, an ARRAY (not a count) on BOTH
+ * projections — openapi.json
+ * .paths["/api/v1/assets/"].get.responses["200"]...items.items.properties
+ * .renditions (array of { id, label, width, height, objectKey, codec?,
+ * bitrateBps? }) and .paths["/api/v1/search/"].get...assets.items.properties
+ * .renditions. The field is OPTIONAL on both (absent from each schema's
+ * `required`) and `Rendition[] | undefined` on the model (`renditions?:
+ * Rendition[]`, src/data/asset-repo.ts:546). There is NO `renditionCount`
+ * scalar anywhere in the contract — the count is derived here.
+ *
+ * Because the PROPERTY is part of both projections, an absent value is a real
+ * answer and not a projection gap: the asset document carries no renditions, so
+ * the honest rendering is 0, not an em-dash. A non-array value (which the schema
+ * forbids but a hand-rolled fixture can still produce) is treated the same way.
+ */
+function renditionCountCellHtml(asset) {
+  const n = asset && Array.isArray(asset.renditions) ? asset.renditions.length : 0;
+  return escHtml(String(n));
+}
+
+/**
+ * Editorial review state. VERIFIED FIELD: `reviewState`, a STRING enum
+ * ['draft','in-review','approved','rejected'] — openapi.json
+ * .paths["/api/v1/assets/"].get.responses["200"]...items.items.properties
+ * .reviewState, from `reviewStateSchema.optional()` (src/routes/assets.ts:868,
+ * optional so "pre-existing assets serialized before reviewState existed still
+ * validate") over `reviewState?: AssetReviewState` (src/data/asset-repo.ts:488).
+ * It is camelCase on the wire, NOT `review_state`.
+ *
+ * Two different absences, told apart rather than conflated:
+ *   - TIER 1 (GET /api/v1/assets/) carries the property, so an absent value is a
+ *     document written before the field existed. The API itself resolves that to
+ *     `draft` — `const current = asset.reviewState ?? 'draft'` at
+ *     src/routes/assets.ts:5938, commented "Absent reviewState reads as `draft`"
+ *     — so the column shows Draft and agrees with the detail panel.
+ *   - TIER 2 (GET /api/v1/search/) has NO `reviewState` in its projection
+ *     (verified: openapi.json .paths["/api/v1/search/"].get...assets.items
+ *     .properties lists id, name, description, status, parentId, objectKey,
+ *     statusHistory, technicalMetadata*, manifestUrls, packagingError,
+ *     renditions, metadata, createdAt, updatedAt, type — and `assetSchema`,
+ *     src/routes/search.ts, which Fastify serializes against). That is UNKNOWN,
+ *     not draft, so the cell renders an em-dash. Inventing "Draft" there would
+ *     be a claim about editorial approval the payload does not support — the
+ *     same rule the delete-lock badge already follows (gap H1).
+ *
+ * Markup mirrors renderReviewBadge() in public/review-state.js (same classes,
+ * same `data-review-state`) so the two axes stay visually distinct from the
+ * lifecycle `.badge` family and the existing palette applies unchanged. It is
+ * rebuilt as a string rather than reused as a DOM node because this primitive's
+ * cell renderers return escaped HTML; the vocabulary and labels are imported, so
+ * only the markup is duplicated, never the state list.
+ */
+function reviewStateCellHtml(asset, carriesReviewState) {
+  // Named, not bare: "unknown on this tier" is a different statement from "no
+  // review state", and a sighted operator gets that from the header plus the
+  // tier they are in. See unknownCellHtml() for why role="img".
+  if (!carriesReviewState) return unknownCellHtml('Review state unknown for this search result');
+  const raw = asset && typeof asset.reviewState === 'string' && asset.reviewState
+    ? asset.reviewState
+    : 'draft';
+  // An unrecognised fifth state still renders, as its raw wire value: the API is
+  // the authority on the vocabulary (see reviewStateLabel's contract).
+  const known = REVIEW_STATES.indexOf(raw) !== -1;
+  return (
+    '<span class="review-badge review-badge--' +
+    (known ? escHtml(raw) : 'unknown') +
+    '" data-review-state="' +
+    escHtml(raw) +
+    '">' +
+    escHtml(reviewStateLabel(raw)) +
+    '</span>'
+  );
+}
+
 function buildColumns(renderCtx) {
   const renderBadge = renderCtx.renderBadge;
   const renderTags = renderCtx.renderTags;
   const fmtDate = renderCtx.fmtDate;
   const isAssetWedged = renderCtx.isAssetWedged;
   // Mutable holder, written by the fetch layer before each setRows() and read by
-  // the Status renderer below. It cannot go stale: the only writer is the fetch
-  // that produced the very rows being rendered.
+  // the Status and Review state renderers below. It cannot go stale: the only
+  // writer is the fetch that produced the very rows being rendered.
   const projection = renderCtx.projection;
   // Bulk selection (issue #916). `selection` is the live Map the factory owns
   // (id -> label); read at render time so a row that is already selected comes
@@ -908,6 +1077,31 @@ function buildColumns(renderCtx) {
         return cell;
       },
     },
+    // Editorial review (issue #961) — OFF by default; the flag is stamped below
+    // from ASSETS_OPTIONAL_COLUMN_KEYS. Sits straight after Status because the
+    // two are the asset's two state axes, and seeing them adjacent is the point:
+    // review state is INDEPENDENT of the lifecycle status, and a table that put
+    // them at opposite ends would invite reading one as a stage of the other.
+    // Not sortable: neither endpoint takes a `sort` param and applyClientSort()
+    // knows no reviewState axis, so a header control here would be a control
+    // that does nothing.
+    {
+      key: 'reviewState',
+      label: 'Review',
+      chooserLabel: 'Review state',
+      render: (a) => reviewStateCellHtml(a, projection.carriesReviewState),
+    },
+    // Rendition count (issue #961) — OFF by default. A count, not a list: the
+    // labels live on the asset detail panel, and what a list view answers is
+    // "has this been transcoded, and into how many variants?". Right-aligned so
+    // a column of numbers can be scanned down.
+    {
+      key: 'renditions',
+      label: 'Renditions',
+      chooserLabel: 'Rendition count',
+      align: 'right',
+      render: (a) => renditionCountCellHtml(a),
+    },
     {
       key: 'tags',
       label: 'Tags',
@@ -925,12 +1119,68 @@ function buildColumns(renderCtx) {
       label: 'Actions',
       render: (a) => {
         const wedged = isAssetWedged(a);
+        const redriveBtn = wedged
+          ? '<button class="btn-ghost asset-redrive-btn" data-id="' +
+            escHtml(a.id) +
+            '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
+          : '';
+
+        // Archive is a NO-OP on an asset that is already `archived`, and the app
+        // can tell locally, so the control is withheld rather than offered as a
+        // confirmation for an action that would change nothing (issue #955,
+        // broken out from #853).
+        //   - The second archive SUCCEEDS — it does NOT fail with a 422.
+        //     `isValidTransition` short-circuits on `from === to` ("idempotent
+        //     no-op transitions are allowed", src/data/asset-repo.ts →
+        //     `isValidTransition`), so `applyStatus('archived', 'archived')`
+        //     returns the status and history unchanged instead of throwing, and
+        //     the soft delete (`remove()` → `update({ status: 'archived' })`)
+        //     resolves normally. Contract: openapi.json
+        //     `paths['/api/v1/assets/{id}'].delete.responses` = 204 / 404 / 409 —
+        //     there is no 422 on this route, and the handler
+        //     (src/routes/assets.ts → `app.delete('/:id')`) has no
+        //     already-archived guard. A repeat DELETE answers 204 and the asset
+        //     stays archived.
+        //   - So what is removed here is NOISE, not a confirm-then-fail: a
+        //     destructive-styled button, behind a confirmation dialog, for an
+        //     idempotent no-op. That makes it UNLIKE the two sibling controls
+        //     that gate on locally known status — the jobs table omitting Cancel
+        //     on a settled job (public/jobs-table.js, actions column) and the
+        //     detail panel omitting Restore on a non-archived asset
+        //     (public/app.js, `isArchived` gate) both suppress actions that would
+        //     really be refused. Restore remains reachable for the archived asset
+        //     from its detail panel (a row click).
+        //   - The determination is purely LOCAL and not racy: `status` is a core
+        //     projection column present on every row and in every search tier
+        //     (unlike the lock flag, #896, whose free-text projection omits
+        //     `deleteLock`), and `archived` has no ordinary outbound transition
+        //     (ALLOWED_TRANSITIONS.archived = []) — only the audited restore path
+        //     leaves it, and that re-renders the row.
+        //   - The archive guards that genuinely BLOCK (delete_protected,
+        //     referenced_by_job, has_children, member_of_collection — all 409)
+        //     are untouched and stay enabled. Most are not in the row projection,
+        //     so the 409 response stays the only place that can explain them
+        //     (spec §5.1, §5.4 — #896).
+        // Re-drive is independent of the lifecycle axis (it is a metadata-
+        // extraction recovery), so a wedged archived row still offers it.
+        //
+        // The guard is scoped to the Archive control ALONE. An earlier revision
+        // returned early for an archived row, which also withheld Rename — but
+        // renaming an archived asset is a PERMITTED operation, so that removed a
+        // working affordance rather than a dead one. Contract: openapi.json
+        // `paths['/api/v1/assets/{id}'].patch` declares responses 200 / 404 /
+        // 422 only (no 409 and no status-conflict response), and its
+        // `requestBody` schema accepts a bare `{ name }` (`name`: string,
+        // minLength 1, maxLength 256). The handler (src/routes/assets.ts →
+        // `app.patch('/:id')`) carries no archived guard, and `repo.update`
+        // consults `applyStatus` ONLY when `patch.status !== undefined`
+        // (src/data/asset-repo.ts), so a name-only PATCH on an archived asset
+        // never reaches the terminal-state machine and answers 200. Every other
+        // permitted control therefore stays rendered on an archived row.
+        const isArchived = a.status === 'archived';
+
         return (
-          (wedged
-            ? '<button class="btn-ghost asset-redrive-btn" data-id="' +
-              escHtml(a.id) +
-              '" title="Re-run metadata extraction to recover this asset" style="font-size:12px;padding:3px 8px;">Re-drive</button> '
-            : '') +
+          redriveBtn +
           // Rename, straight from the row (issue #927 — the "inline-in-list"
           // affordance for the detail view's existing control). It opens the SAME
           // dialog the detail view opens (openRenameDialog, public/asset-rename.js),
@@ -974,23 +1224,45 @@ function buildColumns(renderCtx) {
           // projection actually carries `deleteLock` — an UNKNOWN row (free-text
           // search tier) falls through to the 409 path instead of guessing.
           //
-          // The button is deliberately NOT `disabled`: a disabled control is
-          // unfocusable and carries no explanation, which is precisely what this
-          // issue asks the UI to provide (spec §5.1).
-          '<button class="btn-danger asset-delete-btn" data-id="' +
-          escHtml(a.id) +
-          '" data-name="' +
-          escHtml(a.name || a.slug || '') +
-          (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })
-            ? '" data-locked="true'
-            : '') +
-          '" style="font-size:12px;padding:3px 8px;">Archive</button>'
+          // Unlike the archived case above, the lock is only one of four archive
+          // guards and the search tier cannot always see it, so the button is
+          // deliberately NOT `disabled` here: a disabled control is unfocusable
+          // and carries no explanation, which is precisely what #896 asks the UI
+          // to provide (spec §5.1).
+          //
+          // THIS is the single control the archived check suppresses — an
+          // already-archived row gets no Archive button, while Re-drive and
+          // Rename above remain available.
+          (isArchived
+            ? ''
+            : '<button class="btn-danger asset-delete-btn" data-id="' +
+              escHtml(a.id) +
+              '" data-name="' +
+              escHtml(a.name || a.slug || '') +
+              (isAssetLocked(a, { projectionCarriesLock: projection.carriesLock })
+                ? '" data-locked="true'
+                : '') +
+              '" style="font-size:12px;padding:3px 8px;">Archive</button>')
         );
       },
     },
   ];
 
-  return renderCtx.selectable ? [selectColumn, ...dataColumns] : dataColumns;
+  // Stamp the off-by-default flag from the one list that declares it (issue
+  // #961), rather than repeating `defaultVisible: false` next to each column and
+  // hoping the two stay in step. `defaultVisible` is read ONLY when nobody has
+  // chosen a set — see defaultVisibleColumns() in public/table-columns.js — so a
+  // stored preference or a `cols` param that names these columns still wins.
+  const declared = dataColumns.map((col) =>
+    ASSETS_OPTIONAL_COLUMN_KEYS.indexOf(col.key) === -1
+      ? col
+      : { ...col, defaultVisible: false }
+  );
+
+  // The selection checkbox column (issue #916) is prepended AFTER that stamp: it
+  // is pinned (`hideable: false`) and is not one of the optional keys, so it has
+  // no business passing through the off-by-default list.
+  return renderCtx.selectable ? [selectColumn, ...declared] : declared;
 }
 
 // ─── Column visibility resolution (issue #959) ────────────────────────────────
@@ -1002,7 +1274,8 @@ function buildColumns(renderCtx) {
 //      opening a colleague's link does not silently apply your own preference.
 //   2. this browser's stored default — an operator who shaped the table once
 //      should not have to reshape it on every bare visit.
-//   3. every declared column.
+//   3. the table's DEFAULT set — ASSETS_DEFAULT_COLUMN_KEYS, i.e. every declared
+//      column except the ones marked `defaultVisible: false` (issue #961).
 //
 // `explicit` is what decides whether the set is mirrored into the URL: cases 1 and
 // 2 are real choices worth encoding, case 3 is the absence of one and stays out of
@@ -1121,8 +1394,16 @@ export function createAssetsTable(deps) {
   // Starts true because the first load is tier 1 unless the URL seeds a `q`.
   // A tags/metadata-only filter also routes to tier 2 (#914), so it is just as
   // lock-blind as a free-text term — the flag has to account for all three.
+  //
+  // `carriesReviewState` (issue #961) is the same tier question asked of a
+  // different field — tier 1 projects `reviewState`, tier 2 does not — and is
+  // tracked separately rather than collapsed into one "tier" flag, because the
+  // two gaps are independent and the search projection may grow one field
+  // without the other. It seeds off the same three-filter condition because the
+  // same three filters are what route a load to tier 2 (fetchAssetsPage above).
   const projection = {
     carriesLock: !(initialFilters.q || initialFilters.tags || initialFilters.meta),
+    carriesReviewState: !(initialFilters.q || initialFilters.tags || initialFilters.meta),
   };
 
   // Bulk selection (issue #916). id -> human-readable label, so a bulk-action
@@ -1309,8 +1590,10 @@ export function createAssetsTable(deps) {
       const page1 = await fetchAssetsPage(snap, { apiFetch: d.apiFetch });
       const { rows, total } = page1;
       // Record which tier produced these rows BEFORE they are rendered — the
-      // Status column's lock flag reads it (issue #894).
+      // Status column's lock flag reads it (issue #894), as does the optional
+      // Review state column (issue #961).
       projection.carriesLock = page1.projectionCarriesLock !== false;
+      projection.carriesReviewState = page1.projectionCarriesReviewState !== false;
       table.state.setPageInfo({ total });
       table.setRows(rows);
       wireRowHandlers();
@@ -1363,8 +1646,7 @@ export function createAssetsTable(deps) {
       // second time, so the accent and the badge cannot drift apart. It is
       // decorative — indigo `--accent`, deliberately not the wedged flag's amber
       // — and never carries meaning the badge does not also carry (§6, WCAG
-      // 1.4.1). Its job is to survive horizontal scrolling of a seven-column
-      // table.
+      // 1.4.1). Its job is to survive horizontal scrolling of a wide table.
       if (tr.querySelector('.asset-lock-flag')) tr.classList.add(ROW_LOCKED_CLASS);
       tr.addEventListener('click', function () {
         tbody.querySelectorAll('tr').forEach((r) => r.classList.remove('row-selected'));

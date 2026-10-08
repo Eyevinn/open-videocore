@@ -621,6 +621,155 @@ tr.row-locked td:first-child {
   flex-wrap: wrap;
 }
 
+/* ── Export action (issue #945) ─────────────────────────────────────────────
+   Pinned by docs/design/export-action-states.md. The block gets its own left
+   rule — a different hue from the review block's — so the two action blocks in
+   the detail pane read as separate things; shape and the always-present
+   "Export" heading carry the distinction, so it survives monochrome rendering
+   (WCAG 1.4.1). */
+.export-block {
+  border-left: 3px solid var(--export-accent, #818cf8);
+  padding-left: 10px;
+}
+
+.export-intro,
+.export-role-note {
+  max-width: 60ch;
+}
+
+.export-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 420px;
+}
+
+.export-field-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.export-field-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* The global input rule signals focus with a border colour change only. For the
+   controls added here, add a real offset outline too, so the focus indicator
+   does not depend on distinguishing two similar border hues
+   (WCAG 2.4.7 Focus Visible / 1.4.11 Non-text Contrast). */
+.export-block select:focus-visible,
+.export-block input:focus-visible,
+.export-block button:focus-visible,
+.export-block a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.export-actions {
+  flex-wrap: wrap;
+}
+
+/* The selected destination's non-secret coordinates (under the picker), and the
+   verified coordinates of a completed export (in the success message). Same
+   label/value pair treatment in both places, so "where it would go" and "where
+   it went" read as the same kind of fact. */
+.export-destination-detail,
+.export-result-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.export-fact {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.export-fact-label {
+  color: var(--text-muted);
+  min-width: 92px;
+}
+
+.export-fact-value {
+  /* An object key or bucket name can be long and must stay readable rather than
+     stretch the detail pane. */
+  overflow-wrap: anywhere;
+}
+
+.export-result-line {
+  font-weight: 600;
+}
+
+.export-retry {
+  margin-top: 8px;
+}
+
+/* An export whose outcome is UNKNOWN (504 delivery_timeout) — the copy may still
+   complete at the destination. Deliberately neither .msg-success nor .msg-error:
+   amber, because the honest statement is "we do not know", and dressing it as
+   either a success or a settled failure is exactly the false report this feature
+   exists to avoid. */
+.msg-warn {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+/* The three standing states of the export block (design spec §5 and the two
+   variants it deferred until a destination-carrying endpoint existed):
+   data-outcome="not-configured" (501 — no destination storage on this
+   deployment), "no-destinations" (configured, but nothing registered) and
+   "destinations-unreadable" (the list could not be read, so nothing can be
+   claimed either way).
+   Deliberately NOT .msg-error: in this UI red means "that failed, try again",
+   and the first two are the deployment's standing configuration state, which no
+   retry changes. Also NOT .msg-unrecoverable, whose copy and
+   data-outcome="unrecoverable" semantics belong to the 410 tombstone. Same
+   shape as that component — heavy left rule, uppercase label row — in its own
+   palette, with its own data-outcome on the element so all of them are
+   distinguishable without matching on prose. */
+.msg-not-configured {
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warning);
+}
+
+.msg-not-configured .not-configured-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.msg-not-configured .not-configured-title {
+  display: block;
+  font-weight: 600;
+}
+
+.msg-not-configured .not-configured-body {
+  display: block;
+  margin-top: 4px;
+}
+
+.msg-not-configured .not-configured-detail {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* Read-only tracks panel (issue #902). Sub-group headings sit a step below
    .section-title so "Editorial tracks" / "Source streams" read as parts of the
    Audio section rather than as sections of their own. */
@@ -1526,6 +1675,16 @@ button:disabled {
 .tc-health.health-stuck {
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+/* Pool at its maxInstances ceiling with work still queued (#981). Amber, like
+   .badge-attention and .tc-health.health-overdue: something an operator may want
+   to act on. Deliberately NOT --danger — a ceiling being honoured is the system
+   working as configured, not a failure — and the clause spells the state out in
+   words, so the colour is reinforcement rather than the only signal. */
+.tc-at-ceiling {
+  color: var(--warning);
+  font-weight: 600;
 }
 
 /* Code block */
@@ -3158,5 +3317,94 @@ td[data-empty='logs-never-written'] .ops-table-empty-detail {
 .audit-detail {
   font-size: 12px;
   color: var(--text-muted);
+  word-break: break-word;
+}
+
+/* ─── Detail-panel raw disclosure (issue #963) ─────────────────────────────── */
+/* The full server record is kept on every detail panel but demoted behind a
+   native <details>, collapsed by default (public/detail-sections.js), so the
+   curated fields lead and the JSON is there when a field this UI does not
+   render yet matters. Native disclosure => keyboard operable and state-exposed
+   with no ARIA of our own (WCAG 2.1 SC 2.1.1, 4.1.2). */
+.raw-disclosure > summary {
+  cursor: pointer;
+  display: list-item;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 4px 2px;
+  width: fit-content;
+}
+
+.raw-disclosure > summary:hover {
+  color: var(--text);
+}
+
+/* A visible, non-colour focus indicator: the summary is a focus stop and the
+   UA default outline is easy to lose against this surface (SC 2.4.7). */
+.raw-disclosure > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Keep the raw JSON scrollable rather than letting it stretch the panel. */
+.raw-disclosure-body {
+  max-height: 420px;
+  overflow: auto;
+}
+
+/* ─── Encode-attempt history (issue #963) ─────────────────────────────────── */
+/* One line answering "was this retried, and did it recover?", above a row-per
+   -attempt table. Shown only for a job with more than one Encore dispatch, so
+   a first-time success gains no empty section. */
+.attempt-summary {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+/* Attempt rows are not clickable — undo the global clickable-row cursor so the
+   timeline does not advertise an interaction it does not have. */
+.attempt-timeline tbody tr:hover {
+  cursor: default;
+}
+
+.attempt-timeline tbody th.attempt-index {
+  padding: 8px 10px;
+  text-align: left;
+  font-family: 'Courier New', monospace;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* The outcome is carried by the WORD ("Failed" / "Succeeded" / "In flight");
+   the colour only reinforces it, so the state survives being read in
+   monochrome (SC 1.4.1). */
+.attempt-outcome {
+  font-weight: 600;
+}
+
+.attempt-outcome-failed {
+  /* The lighter red the job Error row already uses, for contrast above 4.5:1
+     against this surface rather than the saturated --danger. */
+  color: #f87171;
+}
+
+.attempt-outcome-succeeded {
+  color: var(--success);
+}
+
+.attempt-outcome-open {
+  color: var(--warning);
+}
+
+.attempt-outcome-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
   word-break: break-word;
 }

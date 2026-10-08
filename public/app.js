@@ -36,6 +36,22 @@ import { applyThumbnail } from './thumbnail-url.js';
 // button; slugs are shown under their own "Slug" header. Contract grounding for
 // which value each endpoint accepts lives in public/copy-id.js.
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Shared detail-panel primitives (issue #963): the collapsed "Raw" disclosure
+// that holds the full server record, and the copyable field value built on the
+// copy-id.js control. Factored out because the pipeline-execution detail view
+// (issue #964) needs the same two affordances; contract grounding for the
+// values passed in stays with each caller.
+import {
+  createRawDisclosure,
+  rawDisclosureOpen,
+  copyableFieldHtml,
+  wireCopyableFields,
+} from './detail-sections.js';
+// Encode-attempt history (issue #963): the derivation + rendering of
+// `encodeAttemptLog` / `encodeAttempts`, so a job rescued by a classified retry
+// reads differently from a plain slow success. Full contract grounding for
+// every field it touches is in that module's header.
+import { renderAttemptHistory } from './job-attempts.js';
 // Delete-lock detail surface (issue #895): the "Delete protection" block and the
 // lock / unlock / edit-note actions on the asset detail view, implementing
 // docs/ux/asset-lock-state-spec.md §4. State derivation and copy live in
@@ -141,6 +157,17 @@ import { mountAssetExternalIds } from './external-ids.js';
 // is in that module's header.
 import { mountAssetTags } from './asset-tags.js';
 
+// Export action (issue #945, broken out of #796): pick one of the export
+// destinations this deployment has registered (read live from
+// GET /api/v1/export-destinations), trigger POST /assets/{id}/deliver, and read
+// the outcome truthfully. Copy and visual treatment for the in-progress /
+// exported / failed / not-available states come from
+// docs/design/export-action-states.md (issue #911), plus the two states that
+// spec deferred until a destination-carrying endpoint existed ("nothing
+// registered" and "the list could not be read"). The module header carries the
+// full contract grounding for both calls.
+import { mountExportAction } from './export-action.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -229,6 +256,19 @@ function canChangeDeleteLock() {
 // read-only (docs/findings/review-state-contract-897.md §4). Client-side mirror
 // only: the 403 is still handled if it arrives.
 function canChangeReviewState() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may export an asset (issue #945). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-92) maps
+// POST -> write, so POST /assets/{id}/deliver is refused to a `viewer` with 403
+// by `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1773). Client-side mirror only: the 403 is still handled
+// if it arrives. A `viewer` may still READ the destinations list, which needs
+// only `read`.
+function canExportAsset() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -3597,6 +3637,60 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       fmtDate: fmtDate,
     });
 
+    // ── Export to a registered destination (issue #945) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/export-action.js:
+    //   GET  /api/v1/export-destinations — no parameters; responses are exactly
+    //        200 { destinations: [ { id, name, role, backend, bucket,
+    //        accessKeyId, endpointUrl?, region?, publicBaseUrl?, pathTemplate?,
+    //        hasSessionToken, deletable, createdAt, credentials } ] }
+    //        (`destinationListSchema` / `destinationViewSchema`,
+    //        src/routes/export-destinations.ts:125-127 / :95-123, handler :279-288)
+    //        and 501 { error: 'not_configured' } (:236-239). The implicit
+    //        OSC-managed default (id 'default') is ALWAYS in the 200 list
+    //        (StorageBackendRegistry.list prepends defaultBackendView(),
+    //        src/services/storage-backend-registry.ts:686-693), so "nothing is
+    //        registered" is a list holding only that entry — which the module
+    //        filters out, because the export call refuses it by name.
+    //   POST /api/v1/assets/{id}/deliver — body REQUIRED, exactly
+    //        { destination: string(1..256) }, additionalProperties: false
+    //        (`deliverBodySchema`). Responses are exactly
+    //        200 { assetId, status: 'delivered', destination: { id, name, role },
+    //        bucket, objectKey, bytes, etag, deliveredAt }, 400 bad_request,
+    //        404 not_found, 409 no_object | source_missing,
+    //        422 backend_role | destination_unreachable | destination_unresolved
+    //        | source_too_large, 501 not_configured, 502 delivery_failed,
+    //        504 delivery_timeout. Re-verified after PR #1158 (issue #1131)
+    //        merged, against openapi.json
+    //        .paths["/api/v1/assets/{id}/deliver"].post as it now stands on main.
+    //
+    // The destination picker is built from the live 200 list and from nothing
+    // else, so the submitted value is always an id the API just said it has.
+    // When the list holds no usable destination, the block explains that plainly
+    // instead of offering an empty picker and a submit button that could only
+    // 400 (issue #945's third acceptance criterion).
+    //
+    // The success state may name the bucket and key because a 200 is
+    // falsifiable: `status: 'delivered'` is sent only after the object was
+    // re-read at the destination with the source's byte count. A 504 is reported
+    // as an UNKNOWN outcome rather than as a failure, because the copy may still
+    // complete store-side — the honesty rule this ticket's prerequisite
+    // investigation (docs/findings/export-truthful-status-944.md) established
+    // for the other export endpoint, applied here.
+    //
+    // The path takes the ULID (`asset.id`), which this pane holds even when it
+    // was opened by slug.
+    mountExportAction({
+      assetId: asset.id,
+      sourceName: asset.name,
+      anchorEl: actionsDiv,
+      host: body,
+      canExport: canExportAsset(),
+      apiFetch: apiFetch,
+      wireCopyIds: wireCopyIdButtons,
+    });
+
     // ── Delete protection: lock / unlock (issue #895) ──
     //
     // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
@@ -4158,9 +4252,25 @@ async function showJobDetail(id, detailPanel) {
 // `opts.afterCancel()` runs after a successful in-panel cancel (embedded only).
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
 // the fetched job (or throws if the fetch fails / 404s).
+//
+// CONTRACT: GET /api/v1/jobs/{id} — `jobSchema`, src/routes/jobs.ts:50-145
+// (openapi.json:15658, path key "/api/v1/jobs/{id}", method `get`; the spec
+// assigns this operation no operationId). Per-field grounding is inline at each
+// row below; the encode-attempt fields (`encodeAttempts`, `encodeAttemptLog`)
+// are grounded in public/job-attempts.js's header.
+//
+// Issue #963 shape: the panel LEADS with curated fields, then the encode-attempt
+// history (only when the job was actually retried), and ends with the full
+// record behind a collapsed "Raw" disclosure — it no longer dumps
+// JSON.stringify(job) as the primary surface.
 async function renderJobDetailBody(id, bodyEl, opts) {
   opts = opts || {};
   const body = bodyEl;
+  // Read the raw-disclosure state BEFORE the container is cleared. The detached
+  // window re-renders this body every DETAIL_POLL_INTERVAL_MS (public/detail.js
+  // tick()), so without carrying the operator's own expansion across the
+  // re-render the raw record would slam shut under them every 5 seconds.
+  const rawWasOpen = rawDisclosureOpen(body);
   body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
@@ -4194,10 +4304,39 @@ async function renderJobDetailBody(id, bodyEl, opts) {
     }
     if (job.profile) kvRows.push(['Profile', escHtml(job.profile)]);
     if (job.progress != null) kvRows.push(['Progress', escHtml(job.progress + '%')]);
+    // Bytes pulled, for a URL-pull ingest job (issue #963). `bytesTransferred`
+    // is a REQUIRED number on the job (src/routes/jobs.ts:72; present in the
+    // GET 200 `required` list, openapi.json:15802-15813) and `totalBytes` is
+    // OPTIONAL (src/routes/jobs.ts:73) — absent when the source served no
+    // content-length, which is why the "of N" half is conditional. Shown only
+    // for the job type that transfers bytes: `type` is
+    // 'ingest-url' | 'transcode' | 'package' (src/routes/jobs.ts:52 ->
+    // JOB_TYPES, src/data/job-repo.ts:84).
+    if (job.type === 'ingest-url' && job.bytesTransferred != null) {
+      kvRows.push(['Transferred',
+        escHtml(fmtBytes(job.bytesTransferred)) +
+          (job.totalBytes != null
+            ? ' <span class="text-muted">of ' + escHtml(fmtBytes(job.totalBytes)) + '</span>'
+            : '')]);
+    }
     kvRows.push(['Created', escHtml(fmtDate(job.createdAt))]);
     kvRows.push(['Updated', escHtml(fmtDate(job.updatedAt))]);
     if (job.error) {
       kvRows.push(['Error', '<span style="color:var(--error,#f87171)">' + escHtml(job.error) + '</span>']);
+    }
+    // Encore job id (issue #963). This is the handle the transcode job's
+    // completion signal is correlated by — it is what an operator greps for in
+    // the Encore instance's own logs — so it must be on screen and copyable,
+    // not buried in the raw record. OPTIONAL on the wire and present only for
+    // transcode jobs (src/routes/jobs.ts:80-81; openapi.json:15725, absent from
+    // the GET 200 `required` list at openapi.json:15802-15813), so the row is
+    // conditional. Rendered through the shared click-to-copy control
+    // (public/copy-id.js via copyableFieldHtml) rather than a hover tooltip:
+    // the value IS the visible text, and the button carries the aria-live
+    // feedback.
+    if (job.encoreJobId) {
+      kvRows.push(['Encore Job ID',
+        copyableFieldHtml(job.encoreJobId, 'Copy Encore job id')]);
     }
     if (job.encoreInstanceId) {
       // Placeholder value; resolved to a link (or plain text) after render once
@@ -4212,6 +4351,17 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
     }).join('');
     body.appendChild(kvDiv);
+    // Bind the click-to-copy control(s) in the field list (currently the Encore
+    // job id). Idempotent, so a re-render on the poll tick re-binds safely.
+    wireCopyableFields(kvDiv);
+
+    // Encode-attempt history (issue #963). Renders NOTHING when the job was
+    // dispatched once: a single-attempt job has no history to compare and must
+    // not get an empty section. When it was retried, the timeline is how a
+    // rescued run (classified failure + backoff + a later success) is told apart
+    // from a plain slow success without reading JSON.
+    const attemptHistory = renderAttemptHistory(job, { fmtDate: fmtDate });
+    if (attemptHistory) body.appendChild(attemptHistory);
 
     // Resolve the Encore instance to a clickable link via the scaler status.
     if (job.encoreInstanceId) {
@@ -4311,10 +4461,17 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       body.appendChild(actions);
     }
 
-    const pre = document.createElement('pre');
-    pre.className = 'code-block mt12';
-    pre.textContent = JSON.stringify(job, null, 2);
-    body.appendChild(pre);
+    // The full server record, kept but demoted (issue #963). It is the only
+    // view guaranteed complete when the API grows a field this panel does not
+    // render yet, so it stays — behind a disclosure, COLLAPSED by default, so
+    // the curated fields above are what the panel leads with. `rawWasOpen`
+    // carries an operator's own expansion across the detached window's poll
+    // re-render.
+    body.appendChild(createRawDisclosure(job, {
+      label: 'Raw job JSON',
+      open: rawWasOpen,
+      className: 'mt12',
+    }));
     return job;
   } catch (err) {
     body.innerHTML = '';
@@ -8434,6 +8591,10 @@ async function renderTranscodersTab(container) {
       loader.remove();
       showMsg(wrap, 'Failed to load scaler status: ' + err.message, 'error');
       summaryEl.textContent = 'Encore scaler pool';
+      // Drop the queue tooltip a previous successful load may have set, so a
+      // failed refresh cannot leave a hover explaining depths that are no longer
+      // on screen (#981).
+      summaryEl.title = '';
       return;
     }
     loader.remove();
@@ -8451,9 +8612,82 @@ async function renderTranscodersTab(container) {
       });
     });
 
-    // Pool-capacity context using maxInstances from the response.
-    summaryEl.textContent = flatInstances.length + ' of ' + maxInstances +
+    // Waiting work across all workspaces (issue #981). The pool's instance count
+    // alone cannot tell a saturated pool from an idle one: "3 of 3 active" reads
+    // the same whether 0 or 12 jobs are backed up behind it.
+    //
+    // `queueDepth` is work accepted but not yet dispatched to an instance — a
+    // per-workspace required number (workspaceSchema.queueDepth, GET
+    // /api/v1/scaler/status in src/routes/scaler.ts:144, mirrored in
+    // openapi.json) populated from `LLEN encore:queue:{workspaceId}`
+    // (src/routes/scaler.ts:267). Summed across the returned workspaces, with the
+    // same `Number(x) || 0` coercion the cards use so a junk value reads as 0
+    // rather than NaN-ing the whole summary.
+    //
+    // `inflightDepth` is on the wire next to it and is DELIBERATELY not surfaced
+    // here (#981 offers that as the alternative to surfacing it). It is the LLEN
+    // of `encore:inflight:{workspaceId}`, which holds a job only for the duration
+    // of a single dispatch attempt: scaler-loop.ts:468 claims one with
+    // `RPOPLPUSH queue -> inflight` and :497 removes it immediately after the
+    // POST ("the job is no longer 'inflight' under this attempt"), with :479 and
+    // :489 closing the window sooner still. So it is a sub-second
+    // dispatch-in-progress counter, not dispatched-but-not-started work, and it
+    // does not mean "running" — running work is `instances[].activeJobs`, which
+    // the cards already show. Reporting it on the summary would flicker between
+    // refreshes of an unchanged pool and would read as 0 while twelve jobs
+    // encoded.
+    let totalQueued = 0;
+    workspaces.forEach(function(ws) {
+      totalQueued += Number(ws && ws.queueDepth) || 0;
+    });
+
+    // Pool-capacity context using maxInstances from the response, plus the queued
+    // count when there is any, so an idle pool still reads cleanly as "N of M
+    // instances active" (#981 criterion c: unchanged at queueDepth === 0) and a
+    // backlog is impossible to miss next to it (criterion a).
+    let summaryText = flatInstances.length + ' of ' + maxInstances +
       ' instance' + (maxInstances === 1 ? '' : 's') + ' active';
+    if (totalQueued > 0) {
+      summaryText += ', ' + totalQueued + ' job' +
+        (totalQueued === 1 ? '' : 's') + ' queued';
+    }
+
+    // The one actionable state (#981 criterion b): work is queued AND the pool
+    // cannot grow to meet it. The scaler only spawns while
+    // `instances.length < maxInstances` (scaler-loop.ts), so below the ceiling a
+    // queue drains itself on the next 10s tick (scaler-loop.ts:174) and needs no
+    // operator; at the ceiling the only lever is maxInstances, which is what the
+    // message names. Requires maxInstances > 0 because a response missing the
+    // field falls back to 0 above, and `length >= 0` would otherwise flag an
+    // empty pool as saturated.
+    const atCeiling = totalQueued > 0 && maxInstances > 0 &&
+      flatInstances.length >= maxInstances;
+
+    // Assigning textContent also clears any element appended by a previous load().
+    summaryEl.textContent = summaryText + (atCeiling ? ' — ' : '');
+    if (atCeiling) {
+      // Its own element, not more text in the line above, so this clause alone
+      // can carry attention styling. Deliberately NOT .msg-error / --danger: a
+      // ceiling being honoured is the system working as configured, so it is
+      // amber information, not a failure (#981: "neither message is styled as an
+      // error"). The state is also named in words, so colour is never the only
+      // channel carrying it (WCAG 1.4.1).
+      const lever = document.createElement('span');
+      lever.className = 'tc-at-ceiling';
+      lever.textContent = 'at maximum capacity. Raise max instances to add throughput.';
+      summaryEl.appendChild(lever);
+    }
+
+    // The line is terse by design; the lifecycle detail lives in a tooltip, which
+    // is supplementary — nothing an operator must act on is tooltip-only.
+    summaryEl.title = totalQueued > 0
+      ? (atCeiling
+        ? 'Queued = accepted but not yet dispatched to an instance. The pool is at ' +
+          'its maxInstances ceiling, so the scaler will not add capacity: the queue ' +
+          'drains only as running jobs finish.'
+        : 'Queued = accepted but not yet dispatched to an instance. The pool is below ' +
+          'maxInstances, so the scaler adds an instance on its next tick (10s).')
+      : '';
 
     if (!scalerActive || flatInstances.length === 0) {
       const empty = document.createElement('div');
