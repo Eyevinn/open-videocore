@@ -1,5 +1,6 @@
 // Builds the cycle's dependencies from the environment, shared by the one-shot CLI and the server.
 import { registryAdapter, oscInstanceAdapter, healthProbe } from './adapters.mjs';
+import { ensureStack } from './stack.mjs';
 import { fileStore } from './store-file.mjs';
 import { s3Store } from './store-s3.mjs';
 import { createClient, runSuite } from '../suite/run.mjs';
@@ -19,6 +20,7 @@ export async function buildDeps(env) {
     registry: registryAdapter({ user: need('GHCR_USER'), token: need('GHCR_TOKEN') }),
     instance: oscInstanceAdapter({ name: env.E2E_INSTANCE_NAME ?? 'ovce2e', env }),
     health: healthProbe,
+    prepare: (inst) => ensureStack(createClient({ baseUrl: inst.baseUrl, token: inst.token }), { name: env.E2E_STACK_NAME ?? 'e2e' }),
     store,
     runSuite: (inst, expected) => runSuite({
       client: createClient({ baseUrl: inst.baseUrl, token: inst.token }),

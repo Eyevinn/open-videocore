@@ -18,6 +18,7 @@ const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @property {(inst: { baseUrl: string, token: string }, expected: { commit: string }) => Promise<any>} runSuite
  * @property {(inst: { baseUrl: string, token: string }) => Promise<{ commit?: string, sourceDigest?: string, version?: string } | undefined>} health   GET /health build info, undefined if not up
  * @property {{ get(commit: string): Promise<any>, put(commit: string, record: any): Promise<void> }} store
+ * @property {(inst: { baseUrl: string, token: string }) => Promise<any>} [prepare]   make the instance ready for the suite (provision its stack); a failure is infra-error
  * @property {string[]} [secrets]    exact values to mask in anything stored or printed
  * @property {{ waitMs?: number, pollMs?: number, retries?: number, backoffMs?: number }} [opts]
  * @property {(ms: number) => Promise<void>} [sleep]
@@ -75,6 +76,12 @@ export async function runCycle(d) {
   const ready = await registry.latest();
   if (ready.digest !== before.digest) {
     return finish({ status: 'stale', suiteVersion: null, cases: [], detail: clean(`:latest moved from ${before.digest} to ${ready.digest} while the instance restarted`) });
+  }
+
+  if (d.prepare) {
+    try { await d.prepare(inst); } catch (e) {
+      return finish({ status: 'infra-error', suiteVersion: null, cases: [], detail: clean(`preparing the instance failed: ${e?.message ?? e}`) });
+    }
   }
 
   let suite;
