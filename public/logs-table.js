@@ -251,10 +251,16 @@ function tableSortToUrlSort(sort) {
 // cursor table: a new filter starts a fresh cursor walk). Initial values come
 // from the decoded URL state so a shared link reconstructs the controls.
 
+// The caption span carries `ops-filter-caption` so the bar's caption typography
+// (`.ops-table-filters .ops-filter-caption` in public/style.css, issue #983) can
+// be keyed off a named hook instead of "any span inside a filter label" — the
+// structural selector it replaced also caught the Assets hint spans
+// (`.form-hint.ops-filter-hint`) and uppercased whole help sentences.
 function labelledControl(className, labelText, control, ariaLabel) {
   const wrap = document.createElement('label');
   wrap.className = className;
   const span = document.createElement('span');
+  span.className = 'ops-filter-caption';
   span.textContent = labelText;
   if (ariaLabel) control.setAttribute('aria-label', ariaLabel);
   wrap.appendChild(span);

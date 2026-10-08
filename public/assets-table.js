@@ -560,12 +560,22 @@ function stateSignature(snap) {
 // wires its native events to the supplied `onChange(value)` (the primitive maps
 // that to state.setFilter(name, value), which resets paging). Initial values come
 // from the decoded URL state so a shared link reconstructs the controls.
+//
+// Every control captions itself with a `<span class="ops-filter-caption">` as the
+// first child of its `<label>`. The class is the hook the bar's caption typography
+// is keyed off (`.ops-table-filters .ops-filter-caption` in public/style.css,
+// issue #983); it replaced a structural `.ops-filter-slot > label > span`
+// selector that also matched the hint spans below, which rendered the tag and
+// metadata help sentences in uppercase. A caption span added here without the
+// class gets the plain label treatment, not the bar's; the DOM seam is asserted in
+// test/assets-tag-metadata-filters.test.ts.
 
 function statusFilterControl(initial) {
   return function () {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-status';
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = 'Status';
     const sel = document.createElement('select');
     sel.setAttribute('aria-label', 'Filter by status');
@@ -605,6 +615,7 @@ function searchFilterControl(initial) {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-q';
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = 'Search';
 
     const field = document.createElement('div');
@@ -738,6 +749,7 @@ function structuredTextFilterControl(opts) {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-' + opts.name;
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = opts.label;
 
     const field = document.createElement('div');
@@ -809,6 +821,7 @@ function dateFilterControl(name, labelText, initial) {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-' + name;
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = labelText;
     const input = document.createElement('input');
     input.type = 'date';
