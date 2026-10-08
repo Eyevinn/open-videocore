@@ -5841,14 +5841,18 @@ const SEARCH_SCOPE_HINT =
 //   - The Assets tab's free-text box hits the same endpoint but reads only
 //     `res.assets` and drops the collection hits (public/assets-table.js),
 //     so it can never surface a collection.
-//   - The Collections tab lists every collection via GET /api/v1/collections
-//     with no query at all.
+//   - The Collections tab lists every collection via GET /api/v1/collections/
+//     with no query parameters at all (verified: openapi.json
+//     "/api/v1/collections/" get.parameters === []), so it cannot narrow.
 // So this tab is the only place a search can return a collection, and the copy
-// below says exactly that.
+// below says exactly that. It leads with that differentiator rather than
+// restating the scope: SEARCH_TAB_TITLE, SEARCH_SECTION_TITLE and
+// SEARCH_SCOPE_HINT already say this tab covers assets and collections, so
+// repeating it here would be the fourth statement of scope in one viewport.
 const SEARCH_TAB_INTRO =
-  'Searches across everything and returns collections as well as assets. It is the ' +
-  'only search that returns collections — the filter box on the Assets tab narrows ' +
-  'the asset list only, and the Collections tab just lists collections.';
+  'The only search that returns collections — the filter box on the Assets tab ' +
+  'narrows the asset list only, and the Collections tab just lists every ' +
+  'collection without searching.';
 
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
@@ -9038,10 +9042,13 @@ export {
   SEARCH_TAB_TITLE,
   SEARCH_SECTION_TITLE,
   SEARCH_SCOPE_HINT,
-  // The copy that tells the two search-ish surfaces apart (issue #948).
-  // Exported so a DOM/unit test can assert the Search tab still says it
-  // returns collections, rather than re-typing the sentence.
-  SEARCH_TAB_INTRO,
+  // NOTE (issue #948): SEARCH_TAB_INTRO is deliberately NOT exported. The
+  // "states it returns collections" acceptance criterion is already pinned by
+  // the #913 assertions on SEARCH_SECTION_TITLE / SEARCH_SCOPE_HINT above; the
+  // intro adds the Assets-filter-vs-Collections-tab contrast on top of that.
+  // Exporting it without a test that imports it would ship a dead export and a
+  // comment that claims coverage nothing provides, so the constant stays
+  // module-local until a test actually asserts it.
   // Per-instance capacity is read from the wire, not inferred (issue #979).
   // Exported so a DOM/unit test can assert the card reports the server's
   // `jobsPerInstance`.

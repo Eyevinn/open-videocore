@@ -30,9 +30,13 @@
     <!-- Issue #913: this is the only tab whose results include collections as
          well as assets (GET /api/v1/search/ returns both arrays), so the label
          says "everything" rather than leaving the scope to be guessed.
-         Issue #948: the tooltip spells the same distinction out, since the
-         Assets tab now has a free-text box of its own that returns assets only. -->
-    <button class="tab-btn" data-tab="search" title="Search across everything — assets and collections">Search everything</button>
+         Issue #948: no hover-only tooltip here. The Assets tab now has a
+         free-text box of its own that returns assets only, but that
+         distinction is carried by the .search-tab-intro paragraph the tab
+         renders, which assistive tech announces — a `title` attribute is not
+         reliably surfaced to screen readers or to keyboard users tabbing the
+         strip, and it would only repeat the visible label. -->
+    <button class="tab-btn" data-tab="search">Search everything</button>
     <button class="tab-btn" data-tab="webhooks">Webhooks</button>
     <button class="tab-btn" data-tab="storage">Storage</button>
     <button class="tab-btn" data-tab="provision">Provision</button>
