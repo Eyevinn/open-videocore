@@ -117,7 +117,7 @@ import {
   objectStoreStackMismatchMessage,
   isObjectStoreStackMismatchError
 } from '../services/object-store-stack-identity.js';
-import { submitTranscode } from '../pipeline/transcode.js';
+import { submitTranscode, DEFAULT_PROFILE_NAME } from '../pipeline/transcode.js';
 import {
   logPipelineEvent,
   type PipelineLogSink,
@@ -223,7 +223,6 @@ import {
   firstUnreachable
 } from '../services/stack-reachability.js';
 import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
-import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
   REWRAP_FORMATS,
@@ -302,21 +301,41 @@ const storageTieringSchema = z.object({
     )
 });
 
-// A custom Encore profile a caller may supply instead of a named preset. Kept
-// permissive (forwarded to Encore) but bounded so it cannot be abused.
-const encoreOutputSchema = z.object({
-  label: z.string().min(1).max(64),
-  width: z.number().int().positive(),
-  height: z.number().int().positive(),
-  videoBitrateBps: z.number().int().positive(),
-  audioBitrateBps: z.number().int().positive(),
-  format: z.string().min(1).max(32)
-});
+// `customProfile` is REMOVED from the API (issue #1022). It used to accept a
+// full `outputs` ladder (label/width/height/videoBitrateBps/audioBitrateBps/
+// format, 1-16 renditions), validate every field, and then submit only its
+// `name` — so every encoding setting a caller supplied was silently discarded.
+//
+// Contract that makes an inline ladder impossible (fetched 2026-10-05 from
+// github.com/svt/encore, the upstream transcoding service this API submits to —
+// the same project cited by src/pipeline/encore-client.ts:33-36):
+//   - `encore-common/.../model/EncoreJob.kt:52,58,66,74,180` — the job document
+//     is `profile: String` + `profileParams: Map<String, Any?>` + outputFolder +
+//     baseName + inputs. No `outputs` / inline-profile field exists.
+//   - `encore-common/.../service/profile/ProfileService.kt` —
+//     `getProfile(job: EncoreJob)` resolves `profiles[job.profile]` out of the
+//     server-side profile index and throws "Could not find location for profile
+//     ${job.profile}!" otherwise.
+// A ladder is therefore expressed by REGISTERING a profile (POST
+// /api/v1/profiles — src/routes/profiles.ts:209-234, stored in the per-tenant
+// profile store the transcoding instances load via GET
+// /api/v1/profiles/index.yml) and naming it in `profile`.
+//
+// The field is kept in the schema purely to REJECT it with that explanation: if
+// it were simply dropped, Zod would strip the unknown key and a caller's ladder
+// would still vanish silently — the exact failure mode #1022 is about.
+const REMOVED_CUSTOM_PROFILE_MESSAGE =
+  'customProfile was removed: an encoding ladder cannot be supplied inline — the transcoding service resolves a profile by NAME only. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.';
 
-const customProfileSchema = z.object({
-  name: z.string().min(1).max(128),
-  outputs: z.array(encoreOutputSchema).min(1).max(16)
-});
+const removedCustomProfileSchema = z
+  .undefined({ invalid_type_error: REMOVED_CUSTOM_PROFILE_MESSAGE })
+  .describe(
+    'REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder ' +
+      'cannot be submitted inline: the transcoding service resolves a profile by NAME against ' +
+      'its own profile index, so an inline `outputs` array could never reach the encoder — it ' +
+      'used to be validated and then discarded. Register the ladder as a profile ' +
+      '(POST /api/v1/profiles) and pass its name as `profile`.'
+  );
 
 // profileParams (issue #287): a flat string map forwarded verbatim into the
 // Encore job document's `profileParams` object, which Encore evaluates as SpEL
@@ -366,27 +385,39 @@ const burnInSchema = z.object({
     )
 });
 
-const transcodeBodySchema = z
-  .object({
-    profile: z.string().min(1).optional(),
-    customProfile: customProfileSchema.optional(),
-    profileParams: profileParamsSchema.optional(),
-    burnIn: burnInSchema.optional()
-  })
-  .refine((b) => !(b.profile && b.customProfile), {
-    message: 'specify either profile or customProfile, not both'
-  });
+const transcodeBodySchema = z.object({
+  // Name of a profile registered in the profile store (GET /api/v1/profiles).
+  // An unknown name is rejected with a 400 BEFORE submission (issue #1022) so a
+  // typo surfaces here rather than as a dropped job on the transcoding side.
+  // Omitted -> DEFAULT_PROFILE_NAME.
+  profile: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Name of a profile registered on this deployment (list them with GET /api/v1/profiles). ' +
+        'The encoding ladder lives in the profile; the transcoding service resolves this name ' +
+        'against the profile index it loads. A name this deployment does not hold is rejected ' +
+        'with a 400 `unknown_profile` at submit time rather than failing later as a dropped ' +
+        'job (issue #1022). Omitted: the deployment default profile is used, and the job ' +
+        'record reports whichever profile was actually submitted.'
+    ),
+  customProfile: removedCustomProfileSchema,
+  profileParams: profileParamsSchema.optional(),
+  burnIn: burnInSchema.optional()
+});
 
 const transcodeAcceptedSchema = z.object({
   jobId: z.string(),
   encoreJobId: z.string(),
   // Non-fatal notice (issue #394). Present ONLY when profileParams validation
-  // could not be performed because the profile YAML was unresolvable — either a
-  // custom profile that is not in the operator profile store, or the profile
-  // store was unreachable. The request was still accepted (202) and the
-  // profileParams keys were forwarded to Encore UNCHECKED. Absent when the keys
-  // were validated against the profile's declared params, or when the request
-  // carried no profileParams at all.
+  // could not be performed because the profile YAML was unresolvable — either
+  // the profile store was unreachable, or no profile was named and the default
+  // profile is not in the store (a CALLER-NAMED profile missing from a reachable
+  // store is now a 400, not a warning — issue #1022). The request was still
+  // accepted (202) and the profileParams keys were forwarded to Encore
+  // UNCHECKED. Absent when the keys were validated against the profile's
+  // declared params, or when the request carried no profileParams at all.
   warning: z
     .object({
       code: z
@@ -404,9 +435,10 @@ const transcodeAcceptedSchema = z.object({
     })
     .describe(
       'Present only when profileParams validation could not be performed because the ' +
-        'profile YAML was unresolvable (a custom profile not in the store, or the profile ' +
-        'store was unreachable). The request was still accepted and the keys were forwarded ' +
-        'to Encore unchecked.'
+        'profile YAML was unresolvable (the profile store was unreachable, or no profile ' +
+        'was named and the default profile is not in the store). A caller-named profile ' +
+        'that a reachable store does not hold is rejected with a 400 instead. The request ' +
+        'was still accepted and the keys were forwarded to Encore unchecked.'
     )
     .optional()
 });
@@ -2004,6 +2036,43 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return { dataPlaneStack, controlPlaneStack };
   }
 
+  // Reject a caller-supplied profile name the profile store does not hold
+  // (issue #1022). The transcoding service resolves `profile` against its own
+  // index and FAILS the job with "Could not find location for profile <name>!"
+  // when the name is absent (ProfileService.getProfile —
+  // github.com/svt/encore, encore-common/.../service/profile/ProfileService.kt,
+  // fetched 2026-10-05); the index it loads is exactly this store, served at GET
+  // /api/v1/profiles/index.yml (src/routes/profiles.ts:131-180). So a name this
+  // store does not hold cannot resolve, and submitting it only converts a
+  // typo into a job that dies after dispatch. We answer a 400 at submit time
+  // instead.
+  //
+  // Returns undefined (allow) when:
+  //   - no name was supplied (the submit path's own default applies, and a
+  //     deployment whose store has not been seeded must still be able to
+  //     transcode — that case stays permissive, as it did before);
+  //   - no profile store is wired on this deployment (nothing to check against);
+  //   - the store is UNREACHABLE — `resolveProfileYaml` reports
+  //     `store-unreachable` (src/pipeline/resolve-profile-yaml.ts:33-36) and we
+  //     keep the pre-existing permissive behaviour rather than turning a store
+  //     outage into a blanket rejection of every transcode.
+  async function unknownProfileReason(
+    profileName: string | undefined,
+    log: { warn: (obj: unknown, msg?: string) => void }
+  ): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const resolution = await resolveProfileYaml(opts.profileRepository, profileName);
+    if (resolution.status === 'found') return undefined;
+    if (resolution.status === 'store-unreachable') {
+      log.warn(
+        { err: resolution.error, profileName },
+        'profile existence check skipped: profile store unreachable (issue #1022)'
+      );
+      return undefined;
+    }
+    return `profile "${profileName}" is not registered on this deployment — list the available profiles with GET /api/v1/profiles, or register this one with POST /api/v1/profiles before submitting`;
+  }
+
   // The single submit-time routing assertion for any path that dispatches a
   // transcode (issues #1058 and #1093). Returns the refusal to send, or
   // undefined when the request is correctly routed — which is every
@@ -2564,7 +2633,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
     reply: import('fastify').FastifyReply,
-    encodeOpts?: { profile?: string; customProfile?: EncoreProfile; profileParams?: Record<string, string> },
+    encodeOpts?: { profile?: string; profileParams?: Record<string, string> },
     // Optional per-execution destination override (issue #207). Already
     // validated + trailing-slash-normalized by the edge schema. Persisted on the
     // execution record so #208 (packager relocation) and #210 (delivery) can
@@ -2896,6 +2965,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     // (issue #286) up front, when the pipeline includes a transcode step, so no
     // dangling running execution is created for a job Encore cannot run.
     if (steps.includes('transcode')) {
+      // Reject a profile name this deployment does not hold (issue #1022) before
+      // a running execution is created: the name could only fail on the
+      // transcoding side, after dispatch, leaving the execution hanging.
+      const unknownProfile = await unknownProfileReason(encodeOpts?.profile, request.log);
+      if (unknownProfile) {
+        reply.code(400).send({ error: 'unknown_profile', message: unknownProfile });
+        return undefined;
+      }
       const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
       if (unrunnable) {
         reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
@@ -3102,7 +3179,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               sourceBucket: request.connections?.sourceBucket ?? (opts.sourceBucket as string),
               outputBucket: resolvedOutputBucket,
               preset: encodeOpts?.profile,
-              customProfile: encodeOpts?.customProfile,
               // profileParams (issue #288): forwarded verbatim into the same
               // transcode submission path as POST /:id/transcode so SpEL-
               // parametrised profiles work from execute too. Undefined leaves
@@ -4955,11 +5031,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   );
 
   // Submit an ABR transcoding job to Encore (issue #8). Workspace-scoped and
-  // behind `authenticate`. Resolves a preset (default 1080p) or a custom
-  // profile, creates a TranscodeJob, advances the source asset to `processing`,
-  // and submits to Encore. Returns the job id + Encore job id immediately; the
-  // caller polls GET /api/v1/jobs/:id and the Encore callback finishes the work.
+  // behind `authenticate`. Resolves the named profile (default
+  // DEFAULT_PROFILE_NAME), creates a TranscodeJob, advances the source asset to
+  // `processing`, and submits to Encore. Returns the job id + Encore job id
+  // immediately; the caller polls GET /api/v1/jobs/:id and the Encore callback
+  // finishes the work. The recorded `Job.profile` is the profile actually
+  // submitted (issue #1022).
   //   202 — accepted, transcode submitted
+  //   400 — `unknown_profile` — the named profile is not registered on this
+  //         deployment, so it could never resolve on the transcoding side
+  //         (issue #1022); `unknown_profile_params` — a profileParams key the
+  //         profile does not declare; a body carrying the REMOVED
+  //         `customProfile` field (issue #1022 — an encoding ladder cannot be
+  //         supplied inline; register a profile and name it)
   //   404 — unknown/foreign source asset (existence not leaked)
   //   409 — `no_object` — the source asset has no stored object to transcode
   //         (pipeline/source-object.ts NO_SOURCE_OBJECT_ERROR);
@@ -5016,6 +5100,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       let profileParamsWarning:
         | { code: 'profile_params_unvalidated'; message: string; profile: string; unvalidatedKeys: string[] }
         | undefined;
+      // Reject a caller-supplied profile name this deployment does not hold
+      // (issue #1022) BEFORE any other profile check: an unknown name can only
+      // fail on the transcoding side ("Could not find location for profile …"),
+      // and that failure arrives after dispatch, long after the 202.
+      const unknownProfile = await unknownProfileReason(request.body.profile, request.log);
+      if (unknownProfile) {
+        return reply.code(400).send({ error: 'unknown_profile', message: unknownProfile });
+      }
       // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
       // platform tier (issue #286) before submitting to Encore.
       const unrunnable = await unrunnableProfileReason(request.body.profile);
@@ -5034,13 +5126,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // operator-managed profile store — the same profiles GET /api/v1/profiles
       // serves and Encore loads — and reject keys that profile does not declare
       // with a descriptive 400, so a mistyped SpEL param name is an actionable
-      // error rather than a silently-ignored value. Degrades gracefully: a
-      // custom profile (not in the store) or an unresolvable profile is treated
-      // permissively (validateProfileParams passes an undefined YAML through), so
-      // custom/operator profiles are never falsely rejected. An empty/absent map
-      // always passes.
-      if (request.body.profileParams && !request.body.customProfile) {
-        const profileName = request.body.profile ?? 'program';
+      // error rather than a silently-ignored value. Degrades gracefully: an
+      // unresolvable profile YAML is treated permissively (validateProfileParams
+      // passes an undefined YAML through), so a store outage — or an unseeded
+      // store on the default-profile path — never falsely rejects. An
+      // empty/absent map always passes. Since issue #1022 a CALLER-NAMED profile
+      // missing from a reachable store is already a 400 above, so the
+      // unresolvable case reaching here is the store outage or the unnamed
+      // default.
+      if (request.body.profileParams) {
+        const profileName = request.body.profile ?? DEFAULT_PROFILE_NAME;
         // Resolve the profile YAML while distinguishing a genuine not-found from
         // an unreachable profile store (issue #392). A store outage makes
         // ProfileRepository.get() THROW (couch-profile-repo does not catch); the
@@ -5261,7 +5356,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceAssetId: asset.id,
             sourceObjectKey: source.objectKey,
             preset: request.body.profile,
-            customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
             burnInSubtitlesFilter,
             // Read the transcode INPUT from the resolved stack's per-stack
@@ -5471,6 +5565,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // progress as a first-class PipelineExecution. The first step runs immediately;
   // asynchronous steps (transcode/package) advance via OSC callbacks.
   //   202 — pipeline execution created
+  //   400 — `unknown_profile` (issue #1022) — for a pipeline containing a
+  //         transcode step, the named profile is not registered on this
+  //         deployment; or the body carries the REMOVED `customProfile` field
   //   404 — unknown asset
   //   409 — a pipeline is already running / asset has no stored object /
   //         (package-only, issue #739) `no_renditions` — nothing to package,
@@ -5496,7 +5593,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: z.object({
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
           profile: z.string().min(1).optional(),
-          customProfile: customProfileSchema.optional(),
+          customProfile: removedCustomProfileSchema,
           // profileParams (issue #288): reuses the same flat string map validated
           // on POST /:id/transcode (profileParamsSchema, issue #287) and forwards
           // it into the shared transcode submission path so SpEL-parametrised
@@ -5566,7 +5663,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         reply,
         {
           profile: request.body.profile,
-          customProfile: request.body.customProfile as EncoreProfile | undefined,
           profileParams: request.body.profileParams
         },
         resolvedDestination.destinationBucket

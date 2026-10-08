@@ -94,8 +94,13 @@ async function makeSource(assets: InMemoryAssetRepository): Promise<string> {
 
 describe('warning field on accepted transcode response when validation skipped (issue #394)', () => {
   it('(a) skipped validation (unresolvable profile) -> 202 WITH a warning naming the profile + unvalidated keys', async () => {
-    // Store reachable, but the chosen profile is not in it -> not-found ->
-    // validation skipped -> warning present.
+    // Store reachable, but the profile being submitted is not in it ->
+    // not-found -> validation skipped -> warning present. Since issue #1022 a
+    // caller-NAMED profile missing from a reachable store is rejected with a
+    // 400 `unknown_profile` (it could only fail on the transcoding side after
+    // dispatch), so the unresolvable case this warning describes is reached by
+    // naming NO profile: the submit default ('program') is absent from this
+    // empty store.
     const profiles = new InMemoryProfileRepository();
     const { app, assets, submitted } = await buildApp(profiles);
     const id = await makeSource(assets);
@@ -105,7 +110,7 @@ describe('warning field on accepted transcode response when validation skipped (
       url: `/api/v1/assets/${id}/transcode`,
       headers: { authorization: 'Bearer token-a' },
       // Deliberately unsorted keys so we can assert the reported set is sorted.
-      payload: { profile: 'not-in-store', profileParams: { zeta: '1', alpha: '2' } }
+      payload: { profileParams: { zeta: '1', alpha: '2' } }
     });
 
     // Acceptance + status unchanged.
@@ -118,10 +123,35 @@ describe('warning field on accepted transcode response when validation skipped (
     // The non-fatal warning is present and describes the skip.
     expect(body.warning).toBeDefined();
     expect(body.warning.code).toBe('profile_params_unvalidated');
-    expect(body.warning.profile).toBe('not-in-store');
+    expect(body.warning.profile).toBe('program');
     expect(body.warning.unvalidatedKeys).toEqual(['alpha', 'zeta']);
-    expect(body.warning.message).toContain('not-in-store');
+    expect(body.warning.message).toContain('program');
     expect(body.warning.message).toMatch(/skipped/i);
+
+    await app.close();
+  });
+
+  // Issue #1022: the warning above must NOT be the answer to a caller-named
+  // profile a reachable store does not hold. That name can only fail on the
+  // transcoding side (ProfileService.getProfile -> "Could not find location for
+  // profile <name>!"), after dispatch, long after the 202 — so it is rejected at
+  // submit time with a 400 and nothing is submitted.
+  it('(c) a caller-NAMED profile missing from a reachable store -> 400, not a warning', async () => {
+    const profiles = new InMemoryProfileRepository();
+    const { app, assets, submitted } = await buildApp(profiles);
+    const id = await makeSource(assets);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/v1/assets/${id}/transcode`,
+      headers: { authorization: 'Bearer token-a' },
+      payload: { profile: 'not-in-store', profileParams: { zeta: '1' } }
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('unknown_profile');
+    expect(res.json().message).toContain('not-in-store');
+    expect(submitted).toHaveLength(0);
 
     await app.close();
   });
