@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { startMock } from './mock-server.mjs';
 import { createClient, runSuite } from '../suite/run.mjs';
 
-const fastCfg = { runId: 't1', sourceUrl: 'http://fixture/clip.mp4', pollMs: 1, timeouts: { ingestMs: 500, metadataMs: 500, transcodeMs: 500, packageMs: 500, searchMs: 50 } };
+const fastCfg = { runId: 't1', sourceUrl: 'http://fixture/clip.mp4', pollMs: 1, timeouts: { ingestMs: 500, readyMs: 500, metadataMs: 500, transcodeMs: 500, packageMs: 500, searchMs: 50 } };
 async function run(faults = {}, cfg = {}) {
   const mock = await startMock({ faults });
   try {
@@ -125,4 +125,23 @@ test('sweep pages through the list', async () => {
     assert.equal(n, 5);
     assert.equal(mock.assets.size, 0);
   } finally { await mock.close(); }
+});
+
+test('an asset still processing after the ingest job is waited for, not failed on the first look', async () => {
+  const { result } = await run({ slowReady: 4 });
+  assert.equal(result.status, 'green', JSON.stringify(result.cases.filter((c) => c.status !== 'pass')));
+});
+
+test('metadata extraction that records an error fails ingest-url with the error, and skips the rest', async () => {
+  const { result } = await run({ slowReady: 2, extractionError: true });
+  const c = byId(result);
+  assert.equal(c['ingest-url'].status, 'fail');
+  assert.match(c['ingest-url'].detail, /metadata extraction failed: ffprobe failed/);
+  assert.equal(c.metadata.status, 'skipped');
+});
+
+test('an asset that never leaves processing times out as a failure', async () => {
+  const { result } = await run({ slowReady: 1e9 });
+  assert.equal(byId(result)['ingest-url'].status, 'fail');
+  assert.match(byId(result)['ingest-url'].detail, /timed out.*to leave processing/);
 });

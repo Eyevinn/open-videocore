@@ -34,7 +34,8 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
       const id = randomUUID(); const jobId = randomUUID();
       assets.set(id, { id, name: body.title, status: 'processing', tags: [], renditions: [], createdAt: new Date().toISOString() });
       jobs.set(jobId, { id: jobId, type: 'ingest-url', assetId: id, status: faults.ingestJobFails ? 'failed' : 'done', error: faults.ingestJobFails ? 'download failed' : undefined });
-      if (!faults.ingestJobFails) assets.get(id).status = 'ready';
+      if (!faults.ingestJobFails) assets.get(id).status = faults.slowReady ? 'processing' : 'ready';
+      if (faults.slowReady) assets.get(id).readyAfter = faults.slowReady;
       return json(res, 202, { assetId: id, jobId });
     }
     if (req.method === 'GET' && (x = m(/^\/api\/v1\/jobs\/([^/]+)$/))) {
@@ -43,7 +44,10 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
     if ((x = m(/^\/api\/v1\/assets\/([^/]+)(\/.*)?$/))) {
       const a = assets.get(x[1]); const sub = x[2] ?? '';
       if (!a) return json(res, 404, {});
-      if (req.method === 'GET' && sub === '') return json(res, 200, a);
+      if (req.method === 'GET' && sub === '') {
+        if (a.readyAfter !== undefined && a.status === 'processing' && --a.readyAfter <= 0) { a.status = faults.extractionError ? 'processing' : 'ready'; if (faults.extractionError) a.technicalMetadataError = 'ffprobe failed'; }
+        return json(res, 200, a);
+      }
       if (req.method === 'PATCH' && sub === '') { Object.assign(a, { tags: body.tags ?? a.tags }); return json(res, 200, a); }
       if (req.method === 'DELETE' && sub === '') { assets.delete(a.id); return json(res, 204); }
       if (req.method === 'POST' && sub === '/extract-metadata') { a.technicalMetadata = { codec: 'h264', width: 1280, height: 720, durationSeconds: 5, bitrateBps: 1e6, containerFormat: 'mp4', audioTracks: [], extractedAt: 'now' }; return json(res, 202, {}); }
