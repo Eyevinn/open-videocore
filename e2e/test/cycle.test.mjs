@@ -4,13 +4,14 @@ import { runCycle } from '../runner/cycle.mjs';
 
 const HEAD = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
+const SD = '6c7c967485812293';
 function deps(over = {}) {
   const store = new Map();
   const log = [];
   const d = {
-    github: { headSha: async () => HEAD },
+    source: { expected: async () => ({ commit: HEAD, sourceDigest: SD }) },
     instance: { ensureFresh: async () => { log.push('ensure'); return { baseUrl: 'http://i', token: 't' }; } },
-    health: async () => ({ commit: HEAD, sourceDigest: 'sd', version: '1.5.0' }),
+    health: async () => ({ commit: 'unknown', sourceDigest: SD, version: 'unknown' }),
     runSuite: async () => { log.push('suite'); return { suiteVersion: 'v1', status: 'green', build: { commit: HEAD }, cases: [{ id: 'health', status: 'pass' }] }; },
     store: { get: async (k) => store.get(k), put: async (k, v) => { store.set(k, v); } },
     opts: { waitMs: 50, pollMs: 1, retries: 2, backoffMs: 1 },
@@ -29,7 +30,7 @@ test('green: records the result keyed by the commit', async () => {
   const rec = store.get(HEAD);
   assert.equal(rec.commit, HEAD);
   assert.equal(rec.suiteVersion, 'v1');
-  assert.equal(rec.sourceDigest, 'sd');
+  assert.equal(rec.sourceDigest, SD);
 });
 
 test('already tested commit (green or red) is skipped and carries its status', async () => {
@@ -79,29 +80,43 @@ test('create/restart succeeding on the second attempt still runs the suite', asy
   assert.deepEqual(log, ['suite']);
 });
 
-test('instance reporting a different commit than main is stale and the suite is not run', async () => {
-  const { d, log } = deps({ health: async () => ({ commit: OTHER }) });
+test('instance reporting a different source digest is stale and the suite is not run', async () => {
+  const { d, log } = deps({ health: async () => ({ commit: 'unknown', sourceDigest: 'ffffffffffffffff' }) });
   const r = await runCycle(d);
   assert.equal(r.status, 'stale');
   assert.match(r.detail, /timed out/);
   assert.deepEqual(log, ['ensure']);
 });
 
-test('instance moving to another commit during the suite is stale, with the cases kept for diagnosis', async () => {
+test('a known but different build.commit is stale even when the digest matches', async () => {
+  const { d, log } = deps({ health: async () => ({ commit: OTHER, sourceDigest: SD }) });
+  const r = await runCycle(d);
+  assert.equal(r.status, 'stale');
+  assert.deepEqual(log, ['ensure']);
+});
+
+test('instance moving to another build during the suite is stale, with the cases kept for diagnosis', async () => {
   let calls = 0;
-  const { d } = deps({ health: async () => ({ commit: ++calls === 1 ? HEAD : OTHER }) });
+  const { d } = deps({ health: async () => ({ commit: 'unknown', sourceDigest: ++calls === 1 ? SD : 'ffffffffffffffff' }) });
   const r = await runCycle(d);
   assert.equal(r.status, 'stale');
   assert.match(r.detail, /after the suite/);
   assert.equal(r.cases.length, 1);
 });
 
-test('main moving on during the suite does not invalidate the result for the tested commit', async () => {
-  let heads = 0;
-  const { d, store } = deps({ github: { headSha: async () => (++heads === 1 ? HEAD : OTHER) } });
+test('the commit under test is read once per cycle', async () => {
+  let reads = 0;
+  const { d, store } = deps({ source: { expected: async () => { reads++; return { commit: HEAD, sourceDigest: SD }; } } });
   assert.equal((await runCycle(d)).status, 'green');
   assert.equal(store.get(HEAD).status, 'green');
-  assert.equal(heads, 1); // head is read once per cycle
+  assert.equal(reads, 1);
+});
+
+test('the suite receives the expected commit and source digest', async () => {
+  let got;
+  const { d } = deps({ runSuite: async (inst, expected) => { got = expected; return { suiteVersion: 'v1', status: 'green', build: {}, cases: [] }; } });
+  await runCycle(d);
+  assert.deepEqual(got, { commit: HEAD, sourceDigest: SD });
 });
 
 test('a suite crash is infra-error', async () => {

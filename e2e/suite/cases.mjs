@@ -42,12 +42,18 @@ export const cases = [
   {
     id: 'health',
     async run(ctx) {
-      const r = await ctx.anon.request('GET', '/health');
+      // /health sits behind the same ingress wall as everything else, so this call is authenticated.
+      const r = await ctx.client.request('GET', '/health');
       expectStatus(r, 200);
       const build = r.body?.build;
-      if (!build?.commit) fail('GET /health has no build.commit');
+      if (!build) fail('GET /health has no build object');
       ctx.state.build = { commit: build.commit, sourceDigest: build.sourceDigest, version: build.version };
-      if (ctx.config.expectCommit && build.commit !== ctx.config.expectCommit) {
+      // The platform builds the image without git metadata, so build.commit is often "unknown"; the source digest
+      // (scripts/source-digest.mjs, reproducible from a checkout) is the identity that is always present.
+      if (ctx.config.expectSourceDigest && build.sourceDigest !== ctx.config.expectSourceDigest) {
+        fail(`instance runs source digest ${build.sourceDigest}, expected ${ctx.config.expectSourceDigest}`);
+      }
+      if (ctx.config.expectCommit && build.commit && build.commit !== 'unknown' && build.commit !== ctx.config.expectCommit) {
         fail(`instance runs ${build.commit}, expected ${ctx.config.expectCommit}`);
       }
     },
@@ -55,8 +61,10 @@ export const cases = [
   {
     id: 'auth-required',
     async run(ctx) {
+      // Through the platform ingress this is answered by the login wall (nginx), not by the application, so it does
+      // NOT exercise the application's own auth gate (#711); it only proves the instance is not publicly open.
       const r = await ctx.anon.request('GET', '/api/v1/assets/');
-      expectStatus(r, 401); // regression guard for #711: the auth gate must reject anonymous reads
+      expectStatus(r, 401);
     },
   },
   {

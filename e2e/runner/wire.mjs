@@ -1,5 +1,7 @@
 // Builds the cycle's dependencies from the environment, shared by the one-shot CLI and the server.
-import { githubAdapter, oscInstanceAdapter, healthProbe } from './adapters.mjs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { localSource, oscInstanceAdapter, healthProbe } from './adapters.mjs';
 import { fileStore } from './store-file.mjs';
 import { s3Store } from './store-s3.mjs';
 import { createClient, runSuite } from '../suite/run.mjs';
@@ -8,7 +10,8 @@ export class ConfigError extends Error {}
 
 export async function buildDeps(env) {
   const need = (k) => { if (!env[k]) throw new ConfigError(`missing env ${k}`); return env[k]; };
-  const secrets = ['GITHUB_TOKEN', 'OSC_ACCESS_TOKEN', 'E2E_INSTANCE_OSC_ACCESS_TOKEN', 'E2E_PARAMETER_STORE_API_KEY',
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const secrets = [ 'OSC_ACCESS_TOKEN', 'E2E_INSTANCE_OSC_ACCESS_TOKEN', 'E2E_PARAMETER_STORE_API_KEY',
     'E2E_MINIO_ROOT_PASSWORD', 'E2E_COUCHDB_ADMIN_PASSWORD', 'E2E_S3_SECRET_KEY'].map((k) => env[k]).filter(Boolean);
   const store = env.E2E_S3_ENDPOINT
     ? await s3Store({ bucket: need('E2E_S3_BUCKET'), endpoint: env.E2E_S3_ENDPOINT, accessKeyId: need('E2E_S3_ACCESS_KEY'), secretAccessKey: need('E2E_S3_SECRET_KEY') })
@@ -16,14 +19,14 @@ export async function buildDeps(env) {
   const sourceUrl = need('E2E_SOURCE_URL');
   return {
     secrets,
-    github: githubAdapter({ token: env.GITHUB_TOKEN }),
+    source: localSource({ repoRoot }),
     instance: oscInstanceAdapter({ name: env.E2E_INSTANCE_NAME ?? 'ovce2e', env }),
     health: healthProbe,
     store,
-    runSuite: (inst, expectCommit) => runSuite({
+    runSuite: (inst, expected) => runSuite({
       client: createClient({ baseUrl: inst.baseUrl, token: inst.token }),
       anon: createClient({ baseUrl: inst.baseUrl }),
-      config: { secrets, runId: new Date().toISOString().replace(/\D/g, '').slice(0, 14), sourceUrl, expectCommit },
+      config: { secrets, runId: new Date().toISOString().replace(/\D/g, '').slice(0, 14), sourceUrl, expectCommit: expected.commit, expectSourceDigest: expected.sourceDigest },
     }),
   };
 }

@@ -1,9 +1,12 @@
 // Minimal HTTP client for the suite. Never logs or returns the token.
 
 /**
- * @param {{ baseUrl: string, token?: string, fetchImpl?: typeof fetch, timeoutMs?: number }} opts
+ * Calls to an OSC service instance go through the platform ingress, which authenticates the header
+ * `x-jwt: Bearer <service access token>` (the same header the platform's own call-service-endpoint tool sends;
+ * osaas-ai src/mcp/tools/services.ts). Anonymous calls get nginx's 401 for every path, /health included.
+ * @param {{ baseUrl: string, token?: string, authHeader?: string, fetchImpl?: typeof fetch, timeoutMs?: number }} opts
  */
-export function createClient({ baseUrl, token, fetchImpl = fetch, timeoutMs = 30_000 }) {
+export function createClient({ baseUrl, token, authHeader = 'x-jwt', fetchImpl = fetch, timeoutMs = 30_000 }) {
   const root = baseUrl.replace(/\/+$/, '');
   return {
     /**
@@ -16,7 +19,7 @@ export function createClient({ baseUrl, token, fetchImpl = fetch, timeoutMs = 30
       const url = new URL(root + path);
       for (const [k, v] of Object.entries(query ?? {})) if (v !== undefined) url.searchParams.set(k, String(v));
       const headers = { accept: 'application/json' };
-      if (token) headers.authorization = `Bearer ${token}`;
+      if (token) headers[authHeader] = `Bearer ${token}`;
       if (json !== undefined) headers['content-type'] = 'application/json';
       const res = await fetchImpl(url, {
         method,
