@@ -1967,12 +1967,11 @@ body.detail-standalone .assets-side {
   gap: 4px;
 }
 
-.ops-filter-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-muted);
-}
+/* Caption typography for the whole bar lives in one rule further down
+   (`.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-slot >
+   label > span`, issue #983) rather than being split between here and the
+   Assets-side `label > span` rule — the two had drifted to different casing and
+   weight. This class is kept as the Jobs/Audit caption hook only. */
 
 /* One colour system for every control in the shared bar (issue #983). The Jobs
  * controls carry the `.ops-filter-*` classes; the Assets (public/assets-table.js)
@@ -1984,11 +1983,19 @@ body.detail-standalone .assets-side {
  *
  * COLOUR ONLY — do not add font or padding here. The type-qualified selectors are
  * (0,2,1)/(0,1,1), so any geometry declaration would outrank the padding that
- * `.ops-table-filters .ops-search-input` (issue #946) and
- * `.ops-table-filters .ops-search-input-plain` (issue #914) use to reserve room
- * for the magnifier and the clear control, and typed text would run underneath
- * them. Geometry for every control in the bar comes from
- * `.ops-table-filters select, .ops-table-filters input` below. */
+ * `.ops-table-filters .ops-search-input` (issue #946, declared below) uses to
+ * reserve room for the magnifier and the clear control, and typed text would run
+ * underneath them. Geometry for every control in the bar comes from
+ * `.ops-table-filters select, .ops-table-filters input` below.
+ *
+ * `color-scheme: dark` belongs here alongside the background: the parts the UA
+ * draws for itself — the fallback placeholder rendering, the date field's
+ * yyyy-mm-dd hint, its calendar picker indicator, the search field's own
+ * affordances — follow the used colour scheme, not our `color`. Without it they
+ * keep painting light-mode onto a now-dark field. The app is single-theme (`:root`
+ * at the top of this file declares the dark palette unconditionally, and there is
+ * no `prefers-color-scheme` branch anywhere in the sheet), so this is
+ * unconditional too. */
 .ops-filter-select,
 .ops-filter-date,
 .ops-filter-search,
@@ -1999,6 +2006,7 @@ body.detail-standalone .assets-side {
   color: var(--text, #eee);
   border: 1px solid var(--border, #333);
   border-radius: 4px;
+  color-scheme: dark;
 }
 
 .ops-filter-search {
@@ -2010,8 +2018,18 @@ body.detail-standalone .assets-side {
    once a value is chosen, so "is anything filtered right now?" is answerable at a
    glance. The search box is covered by its native placeholder; the select and the
    date inputs carry no placeholder, so public/jobs-table.js markUnset() toggles
-   .is-unset on them (empty <select> option / empty date value). */
-.ops-filter-search::placeholder {
+   .is-unset on them (empty <select> option / empty date value).
+
+   All three search boxes are listed: Jobs' carries `.ops-filter-search`
+   (public/jobs-table.js:345), Assets' carries `.ops-search-input`
+   (public/assets-table.js:430-434, placeholder "Full-text search…") and Logs'
+   is a bare `input[type=search]` with no class at all
+   (public/logs-table.js:207-211, placeholder "Search message…"). The last two
+   matched no authored ::placeholder rule, so their placeholder text was still
+   being drawn for a light field after the repaint above. */
+.ops-filter-search::placeholder,
+.ops-table-filters input[type='search']::placeholder,
+.ops-table-filters input[type='date']::placeholder {
   color: var(--text-muted);
   opacity: 1; /* Firefox dims placeholders by default. */
 }
@@ -2037,11 +2055,28 @@ body.detail-standalone .assets-side {
   color: var(--text-muted);
 }
 
+/* One focus treatment for the whole bar. The generic `:focus` set near the top of
+   this file (`input[type="text"], input[type="url"], input[type="password"],
+   select, textarea`) does not cover `input[type=date]` or `input[type=search]`,
+   so the Assets and Logs date/search controls had no author focus style at all
+   while the Jobs ones (the `.ops-filter-*` classes) got the accent ring. Same
+   selector set as the colour rule above so the two cannot drift apart. */
 .ops-filter-select:focus-visible,
 .ops-filter-date:focus-visible,
-.ops-filter-search:focus-visible {
+.ops-filter-search:focus-visible,
+.ops-table-filters select:focus-visible,
+.ops-table-filters input[type='date']:focus-visible,
+.ops-table-filters input[type='search']:focus-visible {
   outline: 2px solid var(--accent, #6366f1);
   outline-offset: 1px;
+}
+
+/* The bar's date/search inputs also take the accent border on focus that the
+   generic `select:focus` / `input[type="text"]:focus` rule gives every other
+   field in the app, so the whole bar reacts identically. */
+.ops-table-filters input[type='date']:focus,
+.ops-table-filters input[type='search']:focus {
+  border-color: var(--accent);
 }
 
 /* Assets table filter controls (issue #369). Each control is a <label> that
@@ -2054,8 +2089,26 @@ body.detail-standalone .assets-side {
   color: var(--text-muted);
 }
 
-.ops-table-filters label > span {
+/* One casing and one weight for every filter caption in the bar (issue #983 AC3).
+   Jobs and Audit caption with `<label class="ops-filter-label">`
+   (public/jobs-table.js:255-257, public/audit-table.js:268); Assets and Logs
+   caption with a `<span>` inside the control's own `<label>`
+   (public/assets-table.js:380-381/418-421/536-537, public/logs-table.js:182-190).
+   Those two sets had drifted — uppercase/letter-spaced at 11px and inherited
+   weight on one side, sentence-case 12px at weight 500 on the other.
+
+   Qualified with `.ops-table-filters` so it reaches (0,2,0)/(0,3,2) and outranks
+   `.ops-table-filters label { font-size: 12px }` above, and restricted to a
+   `.ops-filter-slot` direct-child label so the column chooser's own rows
+   (`label.ops-columns-item > span.ops-columns-item-label`, nested deeper inside
+   `.ops-columns-slot`) keep their sentence case and weight 400. */
+.ops-table-filters .ops-filter-label,
+.ops-table-filters .ops-filter-slot > label > span {
+  font-size: 11px;
   font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
 }
 
 .ops-table-filters select,
