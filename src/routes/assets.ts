@@ -38,7 +38,8 @@ import {
   type AssetAudioTrack,
   type AssetRepository,
   type PackagedOutput,
-  type SubtitleTrack
+  type SubtitleTrack,
+  type VideoTrack
 } from '../data/asset-repo.js';
 // Created-at range filtering (issue #833). The wire grammar, the inclusive
 // bound semantics and the normalisation to canonical UTC instants live in ONE
@@ -93,6 +94,7 @@ import {
   PublicManifestBaseUrlError
 } from '../pipeline/packaging.js';
 import { runPull, type PullDeps } from '../pipeline/url-pull-worker.js';
+import { runWithPersistedStack } from '../services/request-stack-context.js';
 import { type StorageQuotaGuard } from '../data/storage-quota.js';
 import {
   extractTechnicalMetadata,
@@ -110,7 +112,12 @@ import {
   STACK_CONFIG_NAMESPACE,
   stackResolvedMinioEndpoint
 } from '../services/workspace-stack.js';
-import { submitTranscode } from '../pipeline/transcode.js';
+import {
+  objectStoreStackMismatch,
+  objectStoreStackMismatchMessage,
+  isObjectStoreStackMismatchError
+} from '../services/object-store-stack-identity.js';
+import { submitTranscode, DEFAULT_PROFILE_NAME } from '../pipeline/transcode.js';
 import {
   logPipelineEvent,
   type PipelineLogSink,
@@ -162,7 +169,22 @@ import {
 // SERVER-SIDE; it is never put in the response body.
 import { oscJobLog } from '../pipeline/osc-job-log.js';
 import { parseDestination } from '../pipeline/output-relocation.js';
+// Deliver an existing asset object to a registered export destination (issue
+// #1131). The module owns the byte movement (server-side CopyObject) and the
+// landing verification that makes the endpoint's terminal status truthful.
+import {
+  deliverAssetObject,
+  destinationEndpointRefusal,
+  type DeliveryFailureReason,
+  type DeliveryObjectClient
+} from '../pipeline/asset-delivery.js';
 import { requireSourceObject, tryResolveSourceObject } from '../pipeline/source-object.js';
+// Pre-dispatch verification that the transcode source object is actually present
+// and readable in the bucket the transcoder will read (issue #1059).
+import {
+  checkTranscodeSourceReadable,
+  type SourceStatReader
+} from '../pipeline/source-readiness.js';
 import {
   backendOutputDestination,
   DEFAULT_BACKEND_ID
@@ -201,7 +223,6 @@ import {
   firstUnreachable
 } from '../services/stack-reachability.js';
 import { isJobThroughputCapExceededError } from '../encore-scaler/job-throughput-cap.js';
-import type { EncoreProfile } from '../pipeline/encode-presets.js';
 import {
   rewrap,
   REWRAP_FORMATS,
@@ -280,21 +301,41 @@ const storageTieringSchema = z.object({
     )
 });
 
-// A custom Encore profile a caller may supply instead of a named preset. Kept
-// permissive (forwarded to Encore) but bounded so it cannot be abused.
-const encoreOutputSchema = z.object({
-  label: z.string().min(1).max(64),
-  width: z.number().int().positive(),
-  height: z.number().int().positive(),
-  videoBitrateBps: z.number().int().positive(),
-  audioBitrateBps: z.number().int().positive(),
-  format: z.string().min(1).max(32)
-});
+// `customProfile` is REMOVED from the API (issue #1022). It used to accept a
+// full `outputs` ladder (label/width/height/videoBitrateBps/audioBitrateBps/
+// format, 1-16 renditions), validate every field, and then submit only its
+// `name` — so every encoding setting a caller supplied was silently discarded.
+//
+// Contract that makes an inline ladder impossible (fetched 2026-10-05 from
+// github.com/svt/encore, the upstream transcoding service this API submits to —
+// the same project cited by src/pipeline/encore-client.ts:33-36):
+//   - `encore-common/.../model/EncoreJob.kt:52,58,66,74,180` — the job document
+//     is `profile: String` + `profileParams: Map<String, Any?>` + outputFolder +
+//     baseName + inputs. No `outputs` / inline-profile field exists.
+//   - `encore-common/.../service/profile/ProfileService.kt` —
+//     `getProfile(job: EncoreJob)` resolves `profiles[job.profile]` out of the
+//     server-side profile index and throws "Could not find location for profile
+//     ${job.profile}!" otherwise.
+// A ladder is therefore expressed by REGISTERING a profile (POST
+// /api/v1/profiles — src/routes/profiles.ts:209-234, stored in the per-tenant
+// profile store the transcoding instances load via GET
+// /api/v1/profiles/index.yml) and naming it in `profile`.
+//
+// The field is kept in the schema purely to REJECT it with that explanation: if
+// it were simply dropped, Zod would strip the unknown key and a caller's ladder
+// would still vanish silently — the exact failure mode #1022 is about.
+const REMOVED_CUSTOM_PROFILE_MESSAGE =
+  'customProfile was removed: an encoding ladder cannot be supplied inline — the transcoding service resolves a profile by NAME only. Register the ladder as a profile (POST /api/v1/profiles) and pass its name as `profile`.';
 
-const customProfileSchema = z.object({
-  name: z.string().min(1).max(128),
-  outputs: z.array(encoreOutputSchema).min(1).max(16)
-});
+const removedCustomProfileSchema = z
+  .undefined({ invalid_type_error: REMOVED_CUSTOM_PROFILE_MESSAGE })
+  .describe(
+    'REMOVED (issue #1022). Supplying this field is rejected with a 400. An encoding ladder ' +
+      'cannot be submitted inline: the transcoding service resolves a profile by NAME against ' +
+      'its own profile index, so an inline `outputs` array could never reach the encoder — it ' +
+      'used to be validated and then discarded. Register the ladder as a profile ' +
+      '(POST /api/v1/profiles) and pass its name as `profile`.'
+  );
 
 // profileParams (issue #287): a flat string map forwarded verbatim into the
 // Encore job document's `profileParams` object, which Encore evaluates as SpEL
@@ -344,27 +385,39 @@ const burnInSchema = z.object({
     )
 });
 
-const transcodeBodySchema = z
-  .object({
-    profile: z.string().min(1).optional(),
-    customProfile: customProfileSchema.optional(),
-    profileParams: profileParamsSchema.optional(),
-    burnIn: burnInSchema.optional()
-  })
-  .refine((b) => !(b.profile && b.customProfile), {
-    message: 'specify either profile or customProfile, not both'
-  });
+const transcodeBodySchema = z.object({
+  // Name of a profile registered in the profile store (GET /api/v1/profiles).
+  // An unknown name is rejected with a 400 BEFORE submission (issue #1022) so a
+  // typo surfaces here rather than as a dropped job on the transcoding side.
+  // Omitted -> DEFAULT_PROFILE_NAME.
+  profile: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Name of a profile registered on this deployment (list them with GET /api/v1/profiles). ' +
+        'The encoding ladder lives in the profile; the transcoding service resolves this name ' +
+        'against the profile index it loads. A name this deployment does not hold is rejected ' +
+        'with a 400 `unknown_profile` at submit time rather than failing later as a dropped ' +
+        'job (issue #1022). Omitted: the deployment default profile is used, and the job ' +
+        'record reports whichever profile was actually submitted.'
+    ),
+  customProfile: removedCustomProfileSchema,
+  profileParams: profileParamsSchema.optional(),
+  burnIn: burnInSchema.optional()
+});
 
 const transcodeAcceptedSchema = z.object({
   jobId: z.string(),
   encoreJobId: z.string(),
   // Non-fatal notice (issue #394). Present ONLY when profileParams validation
-  // could not be performed because the profile YAML was unresolvable — either a
-  // custom profile that is not in the operator profile store, or the profile
-  // store was unreachable. The request was still accepted (202) and the
-  // profileParams keys were forwarded to Encore UNCHECKED. Absent when the keys
-  // were validated against the profile's declared params, or when the request
-  // carried no profileParams at all.
+  // could not be performed because the profile YAML was unresolvable — either
+  // the profile store was unreachable, or no profile was named and the default
+  // profile is not in the store (a CALLER-NAMED profile missing from a reachable
+  // store is now a 400, not a warning — issue #1022). The request was still
+  // accepted (202) and the profileParams keys were forwarded to Encore
+  // UNCHECKED. Absent when the keys were validated against the profile's
+  // declared params, or when the request carried no profileParams at all.
   warning: z
     .object({
       code: z
@@ -382,9 +435,10 @@ const transcodeAcceptedSchema = z.object({
     })
     .describe(
       'Present only when profileParams validation could not be performed because the ' +
-        'profile YAML was unresolvable (a custom profile not in the store, or the profile ' +
-        'store was unreachable). The request was still accepted and the keys were forwarded ' +
-        'to Encore unchecked.'
+        'profile YAML was unresolvable (the profile store was unreachable, or no profile ' +
+        'was named and the default profile is not in the store). A caller-named profile ' +
+        'that a reachable store does not hold is rejected with a 400 instead. The request ' +
+        'was still accepted and the keys were forwarded to Encore unchecked.'
     )
     .optional()
 });
@@ -728,6 +782,65 @@ const exportBodySchema = z.object({
   // export is additionally recorded as a version of the source asset.
   asVersion: z.boolean().optional()
 });
+
+// Deliver request (issue #1131): WHICH registered export destination the
+// asset's existing source object is to be delivered to. `destination` is the
+// stable id OR the human name of a registered output-role destination — the
+// SAME reference form the named-destination job path accepts
+// (`resolveJobDestination`, below) and the same records
+// GET /api/v1/export-destinations lists (src/routes/export-destinations.ts:
+// 279-288). Nothing else is accepted: this endpoint delivers bytes that already
+// exist, so there is no format, profile or output-name to choose. The bound
+// mirrors the destination id/name bound on the export-destinations surface
+// (`z.string().min(1).max(256)`, export-destinations.ts:301).
+const deliverBodySchema = z.object({
+  destination: z.string().min(1).max(256)
+});
+
+// Deliver result (issue #1131). Describes the object AS VERIFIED at the
+// destination after the copy: the bucket + key it was re-read at, its byte
+// count and etag. `status` is a single terminal value — the endpoint answers
+// 200 only when the object really landed, so a 200 can never mean "submitted"
+// or "probably".
+const deliverResultSchema = z.object({
+  assetId: z.string(),
+  status: z.literal('delivered'),
+  destination: z.object({
+    id: z.string(),
+    name: z.string(),
+    role: z.enum(['packaged', 'both'])
+  }),
+  bucket: z.string(),
+  objectKey: z.string(),
+  bytes: z.number(),
+  etag: z.string(),
+  deliveredAt: z.string()
+});
+
+// How each delivery failure reason (src/pipeline/asset-delivery.ts) surfaces as
+// HTTP. Exhaustive by type, so a new reason cannot be added without deciding
+// how it is reported — and none of them can be reported as a 200.
+//   - a destination we cannot write to / verify, and an over-size source, are
+//     caller-actionable 422s (the same code the #209 destination pre-flight
+//     uses for an unreachable destination bucket);
+//   - missing source BYTES are a 409: the asset document named an object that
+//     is not in the bucket, so there was nothing to deliver;
+//   - a failed copy, or a copy that did not land, is a 502 — the store is
+//     downstream of us and reported (or silently produced) a failure;
+//   - an unsettled delivery is a 504: we genuinely do not know the outcome, so
+//     it must not be dressed up as either success or a clean failure.
+const DELIVERY_FAILURE_RESPONSE: Record<
+  DeliveryFailureReason,
+  { status: 409 | 422 | 502 | 504; error: string }
+> = {
+  destination_unreachable: { status: 422, error: 'destination_unreachable' },
+  source_missing: { status: 409, error: 'source_missing' },
+  source_too_large: { status: 422, error: 'source_too_large' },
+  copy_failed: { status: 502, error: 'delivery_failed' },
+  not_landed: { status: 502, error: 'delivery_failed' },
+  timeout: { status: 504, error: 'delivery_timeout' }
+};
+
 // Clip / trim request (issue #17): a time window in seconds. `endSeconds` must
 // be strictly greater than `startSeconds`. Optional `outputName` names the new
 // child asset.
@@ -838,7 +951,47 @@ const addSubtitleTrackSchema = z.object({
   default: z.boolean().optional()
 });
 
+// Machine-probed video tracks (issue #978). Mirrors the PERSISTED per-track
+// shape one-for-one — `VideoTrackSchema` in src/data/asset-document.ts
+// (index?, codec, width, height, bitrateBps?, frameRate?), stored at
+// `technical.video[]` — so the read API reports exactly what the probe wrote,
+// including the `index` / `frameRate` that `technicalMetadata` cannot carry.
+// Unlike `audioTrackOutSchema` above there is no `id`: these are stream
+// descriptors, not editorial records, so they are read-only and not individually
+// addressable.
+const videoTrackOutSchema = z.object({
+  index: z.number().optional(),
+  codec: z.string(),
+  width: z.number(),
+  height: z.number(),
+  bitrateBps: z.number().optional(),
+  frameRate: z.number().optional()
+});
+
+// Project an asset's video tracks for the read API (issue #978). The canonical
+// source is `asset.videoTracks`, mapped straight off the persisted
+// `technical.video[]` (asset-document.ts `fromAssetDocument`). A repository that
+// keeps flat assets without a document round-trip (the in-memory tier) has no
+// such array, so fall back to the single track `technicalFromAsset` would
+// persist for that asset (asset-document.ts: codec, width, height, bitrateBps
+// off `technicalMetadata`) — the same bytes either tier would store, so both
+// backends answer identically. Unprobed asset: empty array, never undefined.
+function videoTracksOf(asset: Asset): VideoTrack[] {
+  if (asset.videoTracks) {
+    return asset.videoTracks;
+  }
+  const tm = asset.technicalMetadata;
+  if (!tm) {
+    return [];
+  }
+  return [{ codec: tm.codec, width: tm.width, height: tm.height, bitrateBps: tm.bitrateBps }];
+}
+
 const tracksSchema = z.object({
+  // Always present, like the two arrays below: empty when the asset has not
+  // been probed (or carries no video stream). Additive — adding a required
+  // property to a RESPONSE does not break existing readers.
+  videoTracks: z.array(videoTrackOutSchema),
   audioTracks: z.array(audioTrackOutSchema),
   subtitleTracks: z.array(subtitleTrackOutSchema)
 });
@@ -1040,6 +1193,14 @@ type AssetsRouterOptions = {
   packaging?: import('../pipeline/packaging.js').PackagingService;
   // Redis for resolving Encore instance URL at packaging time.
   packagingRedis?: import('ioredis').Redis;
+  // Per-stack replacements for `packagingRedis` (every scaler key lives on the
+  // job's own stack's Valkey, #615). `packagingRedisForJob` resolves the Valkey
+  // of the stack an Encore job was dispatched on, for the job-url / instance /
+  // pin reads; `packagingRedisForStack` resolves the ambient request stack's
+  // Valkey, for the submit preflight. Both preferred over `packagingRedis`,
+  // which is the first stack's connection.
+  packagingRedisForJob?: (encoreJobId: string) => Promise<import('ioredis').Redis | undefined>;
+  packagingRedisForStack?: () => Promise<import('ioredis').Redis | undefined>;
   // On-demand packager provisioning (epic #226, issue #244). Invoked the first
   // time a pipeline reaches a `package` step: it provisions + wires the Encore
   // packager to the shared queue and output storage if absent, waits for
@@ -1079,12 +1240,30 @@ type AssetsRouterOptions = {
   // logged, never propagated — no route becomes newly failable.
   audit?: AuditEmitter;
   // Best-effort operational log emission for pipeline steps (issue #995). Wired
-  // to the in-memory LogStore's `append()` write primitive — the same instance
+  // to the log store's `append()` write primitive — the same instance
   // GET /api/v1/logs reads (src/main.ts, `logStore`; read path
   // src/routes/logs.ts:94). When absent, pipeline execution proceeds without
   // appending log records (no-op), so existing tests are unaffected. Emission
   // never throws, so no route becomes newly failable.
   pipelineLog?: PipelineLogSink;
+  // Asset delivery to a named export destination (issue #1131).
+  //
+  // `deliveryClient` is the object-store client POST /:id/deliver performs the
+  // server-side copy + landing verification with. In PRODUCTION the route uses
+  // the per-request stack client (`request.connections.storageClient`,
+  // src/services/workspace-stack.ts:148) so a delivery always runs against the
+  // same store this request's bytes live in; this option exists so a test can
+  // inject a fake, and when both are present the injected one wins — the same
+  // precedence `opts.subtitleGenerator ?? request.connections?.subtitleGenerator`
+  // uses. When neither is available the route answers 501.
+  deliveryClient?: DeliveryObjectClient;
+  // The object-storage endpoint `deliveryClient` is authenticated against, used
+  // to refuse a destination that declares a DIFFERENT endpoint (whose
+  // credentials this API cannot hold — see destinationEndpointRefusal in
+  // src/pipeline/asset-delivery.ts). Production reads it from the resolved
+  // stack (`request.connections.s3Config.endpoint`,
+  // src/services/workspace-stack.ts:152); injectable here for tests.
+  deliveryEndpoint?: string;
 };
 
 // Outcome of kicking off an OPTIONAL, fire-and-forget pipeline step (subtitles,
@@ -1364,6 +1543,24 @@ async function resolveEncoreJobUrlForPackaging(
   redis: import('ioredis').Redis | undefined
 ): Promise<PackagingTarget | undefined> {
   return resolvePackagingTarget(redis, encoreJobId);
+}
+
+// The scaler-state Valkey of the stack `encoreJobId` was dispatched on: the
+// per-stack resolver when wired, else the injected first-stack connection.
+async function packagingRedisForJob(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForJob'>,
+  encoreJobId: string
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForJob) return opts.packagingRedis;
+  return opts.packagingRedisForJob(encoreJobId);
+}
+
+// The ambient request stack's scaler-state Valkey, for stack-level probes.
+async function packagingRedisForStack(
+  opts: Pick<AssetsRouterOptions, 'packagingRedis' | 'packagingRedisForStack'>
+): Promise<import('ioredis').Redis | undefined> {
+  if (!opts.packagingRedisForStack) return opts.packagingRedis;
+  return opts.packagingRedisForStack();
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,6 +2036,120 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     return { dataPlaneStack, controlPlaneStack };
   }
 
+  // Reject a caller-supplied profile name the profile store does not hold
+  // (issue #1022). The transcoding service resolves `profile` against its own
+  // index and FAILS the job with "Could not find location for profile <name>!"
+  // when the name is absent (ProfileService.getProfile —
+  // github.com/svt/encore, encore-common/.../service/profile/ProfileService.kt,
+  // fetched 2026-10-05); the index it loads is exactly this store, served at GET
+  // /api/v1/profiles/index.yml (src/routes/profiles.ts:131-180). So a name this
+  // store does not hold cannot resolve, and submitting it only converts a
+  // typo into a job that dies after dispatch. We answer a 400 at submit time
+  // instead.
+  //
+  // Returns undefined (allow) when:
+  //   - no name was supplied (the submit path's own default applies, and a
+  //     deployment whose store has not been seeded must still be able to
+  //     transcode — that case stays permissive, as it did before);
+  //   - no profile store is wired on this deployment (nothing to check against);
+  //   - the store is UNREACHABLE — `resolveProfileYaml` reports
+  //     `store-unreachable` (src/pipeline/resolve-profile-yaml.ts:33-36) and we
+  //     keep the pre-existing permissive behaviour rather than turning a store
+  //     outage into a blanket rejection of every transcode.
+  async function unknownProfileReason(
+    profileName: string | undefined,
+    log: { warn: (obj: unknown, msg?: string) => void }
+  ): Promise<string | undefined> {
+    if (!profileName || !opts.profileRepository) return undefined;
+    const resolution = await resolveProfileYaml(opts.profileRepository, profileName);
+    if (resolution.status === 'found') return undefined;
+    if (resolution.status === 'store-unreachable') {
+      log.warn(
+        { err: resolution.error, profileName },
+        'profile existence check skipped: profile store unreachable (issue #1022)'
+      );
+      return undefined;
+    }
+    return `profile "${profileName}" is not registered on this deployment — list the available profiles with GET /api/v1/profiles, or register this one with POST /api/v1/profiles before submitting`;
+  }
+
+  // The single submit-time routing assertion for any path that dispatches a
+  // transcode (issues #1058 and #1093). Returns the refusal to send, or
+  // undefined when the request is correctly routed — which is every
+  // single-stack, env-override and no-resolver deployment, whose behaviour is
+  // therefore unchanged.
+  //
+  // TWO independent splits, both of which end as the same indistinguishable
+  // missing-object error from the transcoder (every stack's source bucket
+  // carries the identical literal name, routes/provision.ts), and both answered
+  // with the same 409 `stack_routing_mismatch` so the client contract is one
+  // error code:
+  //
+  //   1. DOCUMENTS vs control plane (issue #1058): the stack the asset/job
+  //      documents were resolved from (WorkspaceConnections.stackName) is not
+  //      the stack the transcoder will be created against.
+  //   2. REQUEST CREDENTIAL vs control plane — DEFENCE IN DEPTH, not the #1093
+  //      mitigation. `WorkspaceConnections.s3Config` is tagged with the stack
+  //      identity it was built for, and that tag is compared here. Today the
+  //      tag and `connections.stackName` are set from the same local at every
+  //      producer (workspace-stack.ts buildConnectionsFromStack /
+  //      buildEnvConnections / buildInMemoryConnections), so after check (1) has
+  //      passed this one cannot fire on any path that exists now. It is kept
+  //      because the credential is carried, cached, re-read from the resolver
+  //      cache and handed to runner factories separately from the document
+  //      connections — a future path that rebuilds or injects an s3Config can
+  //      break that equality, and this catches it at the edge for the cost of a
+  //      string compare.
+  //
+  //      The PRODUCTION-REACHABLE #1093 mis-route is NOT visible from here: the
+  //      credential the spawned transcoder is actually created with is resolved
+  //      by services/encore-s3-config.ts resolveEncoreS3Config, from the
+  //      parameter store, against the routed stack key — never from
+  //      request.connections. That resolver now refuses the first-provisioned
+  //      substitution itself (ObjectStoreStackMismatchError), and the submit
+  //      path below maps that refusal onto this same 409.
+  //
+  // Both compare stack IDENTITY, never endpoint hostnames: the transcoder uses
+  // the in-cluster address while the API uses the public ingress for the SAME
+  // instance (issue #991), so hostnames legitimately differ.
+  function transcodeRoutingRefusal(
+    request: import('fastify').FastifyRequest,
+    controlPlaneStack: string | undefined
+  ): { message: string; logFields: Record<string, unknown>; logMessage: string } | undefined {
+    const documents = stackRoutingMismatch(request, controlPlaneStack);
+    if (documents) {
+      return {
+        message: `the source object was written to stack "${documents.dataPlaneStack}" but the transcoder would be created against stack "${documents.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`,
+        logFields: {
+          reason: 'documents',
+          dataPlaneStack: documents.dataPlaneStack,
+          controlPlaneStack: documents.controlPlaneStack
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+      };
+    }
+    const credential = objectStoreStackMismatch(
+      request.connections?.s3Config,
+      controlPlaneStack
+    );
+    if (credential) {
+      return {
+        message: objectStoreStackMismatchMessage(credential),
+        logFields: {
+          reason: 'request-object-store-credential',
+          expectedStack: credential.expectedStack,
+          actualStack: credential.actualStack,
+          // Endpoint HOST only — the resolved secret is never logged.
+          actualEndpointHost: credential.actualEndpointHost
+        },
+        logMessage:
+          'refusing to dispatch a transcode: the resolved object-store credential belongs to a different stack than the request routes to (issue #1093)'
+      };
+    }
+    return undefined;
+  }
+
   // Resolve whether a named transcode profile can execute on this platform tier
   // (issue #286). Returns a human message when the profile is a stored GPU-only
   // (NVENC/CUDA) profile that cannot run on OSC's CPU-only Encore instances, so
@@ -1889,21 +2200,34 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // during a long transfer — after which the factory THROWS rather than
   // returning the wrong stack. Same reason, and the same shape, as
   // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts:83).
+  //
+  // `stackName` is the DURABLE stack identity read off the asset (or the job
+  // that produced it) — `Asset.stackName` / `Job.stackName` (issue #1097). The
+  // extractor re-enters it so a detached extraction resolves the right stack's
+  // repositories even once the ambient request context is gone. Omit it and the
+  // extractor keeps today's behaviour (ambient context, else first-listed stack).
   function triggerExtraction(
     assetId: string,
     objectKey: string,
     externalSource?: ExternalProbeSource,
-    storage?: WorkspaceStorage
+    storage?: WorkspaceStorage,
+    stackName?: string
   ): boolean {
     if (!opts.probe || !storageFor) {
       return false;
     }
     void extractRunner(
-      { assetId, objectKey, ...(externalSource ? { externalSource } : {}) },
+      {
+        assetId,
+        objectKey,
+        ...(externalSource ? { externalSource } : {}),
+        ...(stackName ? { stackName } : {})
+      },
       {
         assets: repo,
         storage: storage ?? storageFor(),
         probe: opts.probe,
+        stackLog: app.log,
         ...opts.extractDeps
       }
     );
@@ -1919,16 +2243,21 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // extractor never throws (it records failures on the asset), so callers read
   // back the asset to learn whether recovery succeeded. Assumes probe + storage
   // are configured (the route checks this before calling).
-  async function runExtractionSync(assetId: string, objectKey: string): Promise<void> {
+  async function runExtractionSync(
+    assetId: string,
+    objectKey: string,
+    stackName?: string
+  ): Promise<void> {
     if (!opts.probe || !storageFor) {
       return;
     }
     await extractRunner(
-      { assetId, objectKey },
+      { assetId, objectKey, ...(stackName ? { stackName } : {}) },
       {
         assets: repo,
         storage: storageFor(),
         probe: opts.probe,
+        stackLog: app.log,
         ...opts.extractDeps
       }
     );
@@ -2077,7 +2406,30 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // than thrown because this is a fire-and-forget pipeline step: throwing here
   // would fail the whole execution, which an unconfigured optional step must
   // never do.
-  function triggerThumbnail(assetId: string, objectKey: string, request: import('fastify').FastifyRequest): boolean {
+  //
+  // `storage` has exactly the meaning it has on `triggerExtraction` above
+  // (issue #1051 review): a caller that already resolved a WorkspaceStorage
+  // hands it in instead of resolving a fresh one here. Callers running INSIDE
+  // the request may omit it and get the resolver-cache entry the onRequest hook
+  // warmed for this request's stack; a caller that reaches this AFTER the
+  // request's work has settled MUST pass the handle, because `storageFor()` is a
+  // cache read whose entry can age past the resolver TTL (`CACHE_TTL_MS`,
+  // services/workspace-stack.ts) during a long transfer — after which the
+  // factory THROWS rather than returning the wrong stack, and here that throw
+  // would land in a detached continuation. Same shape as
+  // `triggerExtraction(assetId, objectKey, externalSource?, storage?)` and
+  // `onObjectStored(assetId, objectKey, storage?)` (routes/asset-upload.ts).
+  //
+  // Note this only covers the DATA plane. The runner factory is still built from
+  // `request.connections` (issue #1062), which is request-scoped state captured
+  // synchronously here rather than a TTL'd cache read, so it stays correct for a
+  // non-default `x-stack-name` even when called from a detached continuation.
+  function triggerThumbnail(
+    assetId: string,
+    objectKey: string,
+    request: import('fastify').FastifyRequest,
+    storage?: WorkspaceStorage
+  ): boolean {
     if (!opts.thumbnailExtractor || !storageFor) {
       return false;
     }
@@ -2097,7 +2449,12 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     }
     void thumbnailRunner(
       { assetId, objectKey, timecodes: [1] },
-      { assets: repo, storage: storageFor(), extractor: resolvedExtractor, ...opts.thumbnailDeps }
+      {
+        assets: repo,
+        storage: storage ?? storageFor(),
+        extractor: resolvedExtractor,
+        ...opts.thumbnailDeps
+      }
     ).catch(() => {
       /* thumbnail failures are recorded on the asset by the runner */
     });
@@ -2276,7 +2633,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     pipelineName: keyof typeof BUILT_IN_PIPELINES,
     request: import('fastify').FastifyRequest,
     reply: import('fastify').FastifyReply,
-    encodeOpts?: { profile?: string; customProfile?: EncoreProfile; profileParams?: Record<string, string> },
+    encodeOpts?: { profile?: string; profileParams?: Record<string, string> },
     // Optional per-execution destination override (issue #207). Already
     // validated + trailing-slash-normalized by the edge schema. Persisted on the
     // execution record so #208 (packager relocation) and #210 (delivery) can
@@ -2310,20 +2667,17 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
     // submit with.
     const controlPlane = await transcodeStackIdentity(request);
     if (steps.includes('transcode')) {
-      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
-      if (mismatch) {
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the bytes would actually be read with (#1093).
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
         request.log.error(
-          {
-            assetId: asset.id,
-            pipeline: pipelineName,
-            dataPlaneStack: mismatch.dataPlaneStack,
-            controlPlaneStack: mismatch.controlPlaneStack
-          },
-          'refusing to start pipeline: the source bytes and the transcoder resolve different stacks (issue #1058)'
+          { assetId: asset.id, pipeline: pipelineName, ...refusal.logFields },
+          refusal.logMessage
         );
         reply.code(409).send({
           error: 'stack_routing_mismatch',
-          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+          message: refusal.message
         });
         return undefined;
       }
@@ -2407,7 +2761,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
       const resolved = await resolveEncoreJobUrlForPackaging(
         encoreJobId,
-        opts.packagingRedis
+        await packagingRedisForJob(opts, encoreJobId)
       );
       if (!resolved) {
         reply.code(409).send({
@@ -2448,12 +2802,177 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       }
     }
 
+    // #1059: the resolver above proves the asset RECORDS a source key. It does
+    // NOT prove the BYTES are still in the bucket the transcoder reads — and for
+    // large sources they sometimes are not (#1057 / #1058). Without this check
+    // the execution is accepted, the scaler spawns a transcoder, and the run
+    // fails ~2 minutes later with an opaque probe 404 that names nothing. So HEAD
+    // (stat) the EXACT bucket + key the transcode step is about to put in the
+    // job's `s3://<bucket>/<key>` input (transcode.ts:120) and fail here, before
+    // any execution record exists, with an error naming bucket, key and endpoint.
+    //
+    // Gated on the pipeline CONTAINING a transcode step (`transcode`, `abr-vod`,
+    // `full`), the same condition the profile pre-flights below use — a transcode
+    // reads this object store location whether it is the first step or runs after
+    // the fire-and-forget ones. Pipelines with no transcode step are untouched:
+    // `package` reads the transcoder's OUTPUT, not the source (see above), and the
+    // fire-and-forget steps record their own per-step outcome on the asset.
+    //
+    // The stat goes through the per-request StorageFactory, which is bound to the
+    // SAME per-stack `config.sourceBucket` (workspace-stack.ts:213-214) that the
+    // input URI's bucket is taken from (:248, carried as
+    // WorkspaceConnections.sourceBucket) — so it addresses exactly the object the
+    // transcoder will read. OPT-IN, fail-open: a deployment with no object store
+    // wired cannot verify presence, and must keep submitting exactly as before,
+    // so the guard is skipped with a warning rather than blocking the pipeline.
+    if (steps.includes('transcode')) {
+      const preflightSource = tryResolveSourceObject(asset);
+      const transcodeSourceBucket =
+        request.connections?.sourceBucket ?? opts.sourceBucket;
+      // Same per-stack endpoint the spawned transcoder is configured with
+      // (StackConfig.minioEndpoint -> EncoreS3Config.endpoint, see
+      // services/encore-s3-config.ts); undefined on the env-override path.
+      const transcodeSourceEndpoint = stackResolvedMinioEndpoint(request.connections);
+      let sourceStatReader: SourceStatReader | undefined;
+      try {
+        // Take the stat reader from the SAME resolution the bucket and the
+        // endpoint above come from: this request's already-resolved connections
+        // (`WorkspaceConnections.storageFor`, services/workspace-stack.ts:147,
+        // bound to that stack's `config.sourceBucket` at :274, the same field
+        // the input URI's bucket is read from at :248). The router-level factory
+        // reaches the same stack by a different route — the ambient request stack
+        // name plus a CACHED read (`makeRequestScopedStorageFactory`,
+        // services/request-stack-context.ts:78-92) — which yields nothing and
+        // THROWS once that cache entry goes cold, degrading the check to
+        // "submitting unverified" on a stack whose connections this request
+        // already holds. Resolving the probe, the bucket and the reported
+        // endpoint from one object removes that second resolution entirely, so
+        // the diagnostic can never name an endpoint the probe did not address.
+        // Fall back to the router-level factory only where `connections` carries
+        // no storage (env-override path). The invariant is "same resolved
+        // stack", not "same URL" — the spawned transcoder is legitimately handed
+        // an in-cluster alias of that same object store
+        // (services/internal-minio-endpoint.ts).
+        const connectionsStorageFor = request.connections?.storageFor;
+        sourceStatReader = connectionsStorageFor
+          ? connectionsStorageFor()
+          : storageFor
+            ? storageFor()
+            : undefined;
+      } catch (err) {
+        // storageFor() throws when the resolved stack has no object storage
+        // (main.ts:658-664). Treated as "cannot verify", not as a failure.
+        request.log.warn(
+          { err, bucket: transcodeSourceBucket },
+          'could not open object storage to verify the transcode source object (issue #1059) — submitting unverified'
+        );
+        sourceStatReader = undefined;
+      }
+      // An `s3://<bucket>/<key>` objectKey is an EXTERNAL-bucket registration
+      // (assets.ts:3166/3182 store the full locator, not a workspace-local key),
+      // which lives outside the stack source bucket this stat addresses. Stat'ing
+      // the locator as a local key would 409 against the wrong bucket with a
+      // message that misdescribes the cause, so leave those sources to the
+      // transcode step (pipeline/transcode.ts composes its own URI for them).
+      const externalSourceLocator = preflightSource?.objectKey.startsWith('s3://') ?? false;
+      if (externalSourceLocator) {
+        request.log.info(
+          { assetId: asset.id, objectKey: preflightSource?.objectKey },
+          'source is an external-bucket locator — starting the transcode pipeline WITHOUT verifying the source object (issue #1059)'
+        );
+      }
+      // No bucket resolved at all (no stack connections AND no configured source
+      // bucket): there is nothing to name in a diagnostic and nothing to stat
+      // against, so this is the same "cannot verify" case as having no object
+      // store wired. The 501 guard above only covers `firstStep === 'transcode'`,
+      // so a `full` pipeline can reach here with neither bucket source set.
+      if (preflightSource && sourceStatReader && transcodeSourceBucket && !externalSourceLocator) {
+        const readiness = await checkTranscodeSourceReadable(
+          {
+            bucket: transcodeSourceBucket,
+            objectKey: preflightSource.objectKey,
+            ...(transcodeSourceEndpoint ? { endpoint: transcodeSourceEndpoint } : {}),
+            // The stack identity #1058's gate just RESOLVED for this request,
+            // not the deployment-wide default: the gate above has already proved
+            // the data plane and the control plane agree, so `controlPlane`
+            // names the one stack this submission concerns. Falling back to
+            // DEPLOYMENT_CONTEXT only where #1058 also does — no resolver wired
+            // or no provisioned stack (transcodeStackIdentity, assets.ts) —
+            // keeps single-stack and env-override deployments byte-identical.
+            stackName: controlPlane.resolved ?? request.connections?.stackName ?? DEPLOYMENT_CONTEXT,
+            // The size recorded when ingest completed (issue #1059): the URL
+            // pull worker's `bytesTransferred` (pipeline/url-pull-worker.ts) or
+            // the upload route's (routes/asset-upload.ts), persisted on the
+            // asset as `Asset.sourceSizeBytes` (data/asset-repo.ts) via the
+            // document's `administrative.storage.sizeBytes`
+            // (data/asset-document.ts). Undefined for assets ingested before
+            // #1059, and for paths that never learn the length (external-bucket
+            // registration) — the size comparison is then skipped and presence
+            // alone is enforced. The length always describes
+            // `preflightSource.objectKey`: the repositories clear it when
+            // `objectKey` is patched to a DIFFERENT key with no new size, and
+            // every ingest-completion path that can replace the object under the
+            // same deterministic key writes the object's true length in the same
+            // patch (routes/asset-upload.ts `finalizedSourceSizeBytes`, used by
+            // the presigned single-part and multipart finalizes, plus the
+            // streamed PUT and the URL-pull worker's `bytesTransferred`).
+            ...(asset.sourceSizeBytes !== undefined
+              ? { expectedSizeBytes: asset.sourceSizeBytes }
+              : {})
+          },
+          sourceStatReader
+        );
+        if (!readiness.readable) {
+          request.log.warn(
+            {
+              assetId: asset.id,
+              bucket: transcodeSourceBucket,
+              objectKey: preflightSource.objectKey,
+              endpoint: transcodeSourceEndpoint,
+              stack: controlPlane.resolved ?? request.connections?.stackName,
+              reason: readiness.reason,
+              expectedSizeBytes: asset.sourceSizeBytes,
+              observedSizeBytes: readiness.sizeBytes
+            },
+            'refusing to start a transcode pipeline: the source object is not readable (issue #1059)'
+          );
+          // `probe-failed` means the object store could not be asked at all —
+          // a dependency failure (502), not a conflict with the asset's state.
+          // Everything else is a definite answer ABOUT the asset's source, so it
+          // takes the same 409 shape as the other source-related refusals above.
+          if (readiness.reason === 'probe-failed') {
+            reply
+              .code(502)
+              .send({ error: 'source_verification_failed', message: readiness.message });
+          } else {
+            reply.code(409).send({ error: 'source_unreadable', message: readiness.message });
+          }
+          return undefined;
+        }
+      } else if (!sourceStatReader || !transcodeSourceBucket) {
+        request.log.warn(
+          { assetId: asset.id, bucket: transcodeSourceBucket },
+          !transcodeSourceBucket
+            ? 'no source bucket resolved for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+            : 'no object storage wired for this stack — starting the transcode pipeline WITHOUT verifying the source object exists (issue #1059)'
+        );
+      }
+    }
+
     void firstStep; // pre-flight above used firstStep; execution drives the loop
 
     // Reject a named GPU-only (NVENC/CUDA) profile the platform cannot execute
     // (issue #286) up front, when the pipeline includes a transcode step, so no
     // dangling running execution is created for a job Encore cannot run.
     if (steps.includes('transcode')) {
+      // Reject a profile name this deployment does not hold (issue #1022) before
+      // a running execution is created: the name could only fail on the
+      // transcoding side, after dispatch, leaving the execution hanging.
+      const unknownProfile = await unknownProfileReason(encodeOpts?.profile, request.log);
+      if (unknownProfile) {
+        reply.code(400).send({ error: 'unknown_profile', message: unknownProfile });
+        return undefined;
+      }
       const unrunnable = await unrunnableProfileReason(encodeOpts?.profile);
       if (unrunnable) {
         reply.code(422).send({ error: 'profile_unrunnable', message: unrunnable });
@@ -2567,7 +3086,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       for (let i = 0; i < stepsCopy.length; i++) {
         const step = stepsCopy[i];
         if (step.name === 'extract-metadata') {
-          triggerExtraction(asset.id, sourceObjectKey);
+          // asset.stackName (issue #1097): the detached probe re-enters the
+          // stack the asset actually lives on.
+          triggerExtraction(asset.id, sourceObjectKey, undefined, undefined, asset.stackName);
           stepsCopy[i] = { ...step, status: 'done', startedAt: now(), completedAt: now() };
           logSettledStep(step.name, 'done');
           continue;
@@ -2658,7 +3179,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
               sourceBucket: request.connections?.sourceBucket ?? (opts.sourceBucket as string),
               outputBucket: resolvedOutputBucket,
               preset: encodeOpts?.profile,
-              customProfile: encodeOpts?.customProfile,
               // profileParams (issue #288): forwarded verbatim into the same
               // transcode submission path as POST /:id/transcode so SpEL-
               // parametrised profiles work from execute too. Undefined leaves
@@ -2733,10 +3253,13 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // pin failure means the Redis the pool state was just read from is
           // faulty, and failing the step would deny a run that is still likely to
           // succeed. Unpinned is the pre-fix behaviour, not worse than it.
-          if (opts.packagingRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
+          const pinRedis = packageOnlyEncoreJobId
+            ? await packagingRedisForJob(opts, packageOnlyEncoreJobId)
+            : undefined;
+          if (pinRedis && packageOnlyInstanceId && packageOnlyEncoreJobId) {
             try {
               await pinInstanceForPackaging(
-                opts.packagingRedis,
+                pinRedis,
                 packageOnlyInstanceId,
                 packageOnlyEncoreJobId
               );
@@ -3042,10 +3565,45 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           assetId: extAsset.id,
           sourceUrl: extObjectKey
         });
+        // Audit: ingest-url job submitted (issue #1000). One entry, targetId = the
+        // new job id, emitted right after the durable job record exists — the same
+        // moment and the same shape the transcode submission uses
+        // (src/pipeline/transcode.ts:104-114). `system` origin matches every other
+        // `job.*` entry (transcode + package), so the job lifecycle reads as one
+        // consistent origin regardless of which surface triggered it.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.submitted',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         await jobs.update(extJob.id, { status: 'running' });
         await jobs.update(extJob.id, { status: 'done', progress: 100 });
+        // Audit: this branch settles the job terminally INLINE (the bytes already
+        // live in the external bucket, so no pull worker runs and nothing else can
+        // ever emit the terminal entry for it). Same shape as the pull worker's
+        // success entry (src/pipeline/url-pull-worker.ts) minus `bytesTransferred`,
+        // which is meaningless when no bytes were transferred.
+        emitAudit(
+          audit,
+          {
+            actor: originActor('system'),
+            action: 'job.completed',
+            targetType: 'job',
+            targetId: extJob.id,
+            detail: { jobType: 'ingest-url', assetId: extAsset.id }
+          },
+          request.log
+        );
         // Fire-and-forget probe against the external source (job reads in place).
-        triggerExtraction(extAsset.id, extObjectKey, source);
+        // Carries the job's persisted stack (issue #1097) so the detached probe's
+        // asset write resolves this stack and not the first-listed one.
+        triggerExtraction(extAsset.id, extObjectKey, source, undefined, extJob.stackName);
         return reply.code(202).send({ assetId: extAsset.id, jobId: extJob.id });
       }
 
@@ -3107,13 +3665,62 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // TTL of its own, so holding it across the pull is safe.
       const pullStorage = storageFor();
 
+      // Audit: ingest-url job submitted (issue #1000). See the external-backend
+      // branch above for the shape rationale. Emitted BEFORE the detached pull
+      // runner starts, so the audit trail records the submission regardless of the
+      // pull outcome — and the asset's history no longer starts mid-pipeline.
+      // `sourceUrl` is deliberately NOT in the detail bag: a pull source may be a
+      // pre-signed URL carrying credentials in its query string.
+      // This submission and the terminal job.completed/job.failed the worker emits
+      // can land in the same millisecond (equal `at`); the audit store mints
+      // monotonic ULID ids so GET /api/v1/audit's equal-`at` tiebreak resolves to
+      // true write order and never renders the lifecycle inverted (issue #1000
+      // review; CONTRACT: monotonic id minting in src/data/audit-repo.ts record()).
+      emitAudit(
+        audit,
+        {
+          actor: originActor('system'),
+          action: 'job.submitted',
+          targetType: 'job',
+          targetId: job.id,
+          detail: { jobType: 'ingest-url', assetId: asset.id }
+        },
+        request.log
+      );
+
       // Detached, non-blocking. runPull never throws (records failures on the
       // job), so an unhandled rejection cannot crash the process. Once the pull
       // reaches a terminal state we fire-and-forget technical metadata
-      // extraction against the now-stored object (issue #6); we only extract if
-      // the asset actually advanced to `processing` (pull succeeded).
+      // extraction AND poster-frame extraction against the now-stored object
+      // (issues #6, #1050); we only run either if the asset actually advanced to
+      // `processing` (pull succeeded).
+      //
+      // issue #1050: this branch previously ran extraction only, so a
+      // URL-ingested asset never got a `thumbnails` entry while an uploaded one
+      // did (main.ts onObjectStored runs both). The pull lands the bytes in
+      // OSC-managed storage under our own `ingest/<id>` key, so the thumbnail
+      // runner's presignedGet of that key resolves exactly as it does for an
+      // upload — the two paths are now at parity.
+      //
+      // Deliberately NOT applied to the external-backend branch above: there
+      // objectKey is `s3://<foreign-bucket>/<key>`, and the thumbnail runner
+      // resolves its source via deps.storage.presignedGet (thumbnail.ts:119),
+      // which cannot presign a bucket this deployment's storage does not own.
+      // triggerExtraction takes an externalSource for that case; triggerThumbnail
+      // has no equivalent, so calling it there would fail silently. Giving the
+      // thumbnail path the same external-source treatment is a separate change.
       void runner(
-        { jobId: job.id, assetId: asset.id, objectKey, sourceUrl },
+        {
+          jobId: job.id,
+          assetId: asset.id,
+          objectKey,
+          sourceUrl,
+          // The stack the job was just created against (issue #1097). The pull
+          // is detached and can be re-driven after a process restart, so the
+          // worker re-enters this persisted identity rather than depending on
+          // the ambient context it inherits from this request.
+          stackName: job.stackName
+        },
         {
           jobs,
           assets: repo,
@@ -3126,15 +3733,35 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
           // the Logs tab gets of a URL-pull ingest, which runs detached and
           // therefore outlives this request.
           pipelineLog,
-          pipelineLogErrors: request.log
+          pipelineLogErrors: request.log,
+          stackLog: request.log,
+          // Terminal `job.completed` / `job.failed` emission for this job happens
+          // inside the worker, where the pull actually settles (issue #1000).
+          // Threaded after the `pullDeps` spread so an injected test dep bag can
+          // never silently drop the emitter.
+          audit,
+          auditLog: request.log
         }
       )
-        .then(async () => {
-          const settled = await repo.get(asset.id);
-          if (settled?.status === 'processing') {
-            triggerExtraction(asset.id, objectKey, undefined, pullStorage);
-          }
-        })
+        // The read-back runs in the job's PERSISTED stack (issue #1097) rather
+        // than relying on the ambient context this continuation inherited, so it
+        // resolves the same repository the pull just wrote to.
+        .then(() =>
+          runWithPersistedStack(job.stackName, async () => {
+            const settled = await repo.get(asset.id);
+            if (settled?.status === 'processing') {
+              triggerExtraction(asset.id, objectKey, undefined, pullStorage, job.stackName);
+              // Same `pullStorage` handle, for the same reason (issue #1051
+              // review): this runs AFTER the request's work has settled, so
+              // `storageFor()` can have aged past the resolver TTL and would throw
+              // inside this detached continuation. Passing the handle resolved at
+              // request time keeps the thumbnail path symmetric with the
+              // extraction path immediately above instead of silently depending on
+              // the ambient request-stack context.
+              triggerThumbnail(asset.id, objectKey, request, pullStorage);
+            }
+          })
+        )
         // This continuation outlives the request, so nothing is left to surface
         // a rejection: `repo.get` resolves the stack through the ambient context
         // and can fail on its own (a dead CouchDB, a stack de-provisioned mid
@@ -3144,7 +3771,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         .catch((err: unknown) => {
           request.log.error(
             { err, assetId: asset.id, jobId: job.id },
-            'post-pull metadata extraction could not be started'
+            'post-pull metadata/thumbnail extraction could not be started'
           );
         });
 
@@ -4391,24 +5018,32 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // the asset recovered to `ready`.
       const wedged = asset.status === 'processing' && asset.technicalMetadataError !== undefined;
       if (wedged) {
-        await runExtractionSync(asset.id, source.objectKey);
+        await runExtractionSync(asset.id, source.objectKey, asset.stackName);
         const settled = await repo.get(asset.id);
         return reply.code(200).send({
           assetId: asset.id,
           status: settled?.status ?? asset.status
         });
       }
-      triggerExtraction(asset.id, source.objectKey);
+      triggerExtraction(asset.id, source.objectKey, undefined, undefined, asset.stackName);
       return reply.code(202).send({ assetId: asset.id, status: 'extracting' });
     }
   );
 
   // Submit an ABR transcoding job to Encore (issue #8). Workspace-scoped and
-  // behind `authenticate`. Resolves a preset (default 1080p) or a custom
-  // profile, creates a TranscodeJob, advances the source asset to `processing`,
-  // and submits to Encore. Returns the job id + Encore job id immediately; the
-  // caller polls GET /api/v1/jobs/:id and the Encore callback finishes the work.
+  // behind `authenticate`. Resolves the named profile (default
+  // DEFAULT_PROFILE_NAME), creates a TranscodeJob, advances the source asset to
+  // `processing`, and submits to Encore. Returns the job id + Encore job id
+  // immediately; the caller polls GET /api/v1/jobs/:id and the Encore callback
+  // finishes the work. The recorded `Job.profile` is the profile actually
+  // submitted (issue #1022).
   //   202 — accepted, transcode submitted
+  //   400 — `unknown_profile` — the named profile is not registered on this
+  //         deployment, so it could never resolve on the transcoding side
+  //         (issue #1022); `unknown_profile_params` — a profileParams key the
+  //         profile does not declare; a body carrying the REMOVED
+  //         `customProfile` field (issue #1022 — an encoding ladder cannot be
+  //         supplied inline; register a profile and name it)
   //   404 — unknown/foreign source asset (existence not leaked)
   //   409 — `no_object` — the source asset has no stored object to transcode
   //         (pipeline/source-object.ts NO_SOURCE_OBJECT_ERROR);
@@ -4417,7 +5052,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         key's bytes have not landed (issues #388 / #389);
   //         `stack_routing_mismatch` — the source bytes and the transcoder would
   //         resolve DIFFERENT stacks, so the transcode would fail with an
-  //         indistinguishable 404 (issue #1058). Refused up front rather than
+  //         indistinguishable 404 (issue #1058), or the object-store credential
+  //         the transcoder would be spawned with belongs to another stack than
+  //         this request routes to (issue #1093). Refused rather than
   //         submitted; retry naming one stack consistently via `X-Stack-Name`.
   //   501 — transcoding is not configured on this deployment
   //   502 — Encore rejected the submission
@@ -4463,6 +5100,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       let profileParamsWarning:
         | { code: 'profile_params_unvalidated'; message: string; profile: string; unvalidatedKeys: string[] }
         | undefined;
+      // Reject a caller-supplied profile name this deployment does not hold
+      // (issue #1022) BEFORE any other profile check: an unknown name can only
+      // fail on the transcoding side ("Could not find location for profile …"),
+      // and that failure arrives after dispatch, long after the 202.
+      const unknownProfile = await unknownProfileReason(request.body.profile, request.log);
+      if (unknownProfile) {
+        return reply.code(400).send({ error: 'unknown_profile', message: unknownProfile });
+      }
       // Reject a named GPU-only (NVENC/CUDA) profile that cannot execute on this
       // platform tier (issue #286) before submitting to Encore.
       const unrunnable = await unrunnableProfileReason(request.body.profile);
@@ -4481,13 +5126,16 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // operator-managed profile store — the same profiles GET /api/v1/profiles
       // serves and Encore loads — and reject keys that profile does not declare
       // with a descriptive 400, so a mistyped SpEL param name is an actionable
-      // error rather than a silently-ignored value. Degrades gracefully: a
-      // custom profile (not in the store) or an unresolvable profile is treated
-      // permissively (validateProfileParams passes an undefined YAML through), so
-      // custom/operator profiles are never falsely rejected. An empty/absent map
-      // always passes.
-      if (request.body.profileParams && !request.body.customProfile) {
-        const profileName = request.body.profile ?? 'program';
+      // error rather than a silently-ignored value. Degrades gracefully: an
+      // unresolvable profile YAML is treated permissively (validateProfileParams
+      // passes an undefined YAML through), so a store outage — or an unseeded
+      // store on the default-profile path — never falsely rejects. An
+      // empty/absent map always passes. Since issue #1022 a CALLER-NAMED profile
+      // missing from a reachable store is already a 400 above, so the
+      // unresolvable case reaching here is the store outage or the unnamed
+      // default.
+      if (request.body.profileParams) {
+        const profileName = request.body.profile ?? DEFAULT_PROFILE_NAME;
         // Resolve the profile YAML while distinguishing a genuine not-found from
         // an unreachable profile store (issue #392). A store outage makes
         // ProfileRepository.get() THROW (couch-profile-repo does not catch); the
@@ -4643,20 +5291,19 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // here and reused as the scaler context below, so the identity we verified
       // is the identity we submit with.
       const controlPlane = await transcodeStackIdentity(request);
-      const mismatch = stackRoutingMismatch(request, controlPlane.resolved);
-      if (mismatch) {
+      // Both routing splits: documents (#1058) and the object-store credential
+      // the source read would actually use (#1093). Asserted BEFORE the
+      // reachability preflight below, so a mis-routed credential is named as
+      // such rather than probing the wrong instance first.
+      const refusal = transcodeRoutingRefusal(request, controlPlane.resolved);
+      if (refusal) {
         request.log.error(
-          {
-            assetId: asset.id,
-            objectKey: source.objectKey,
-            dataPlaneStack: mismatch.dataPlaneStack,
-            controlPlaneStack: mismatch.controlPlaneStack
-          },
-          'refusing to submit transcode: the source bytes and the transcoder resolve different stacks (issue #1058)'
+          { assetId: asset.id, objectKey: source.objectKey, ...refusal.logFields },
+          refusal.logMessage
         );
         return reply.code(409).send({
           error: 'stack_routing_mismatch',
-          message: `the source object was written to stack "${mismatch.dataPlaneStack}" but the transcoder would be created against stack "${mismatch.controlPlaneStack}" — both stacks use the same bucket name, so the transcode would fail with an indistinguishable 404. Retry naming one stack consistently via X-Stack-Name.`
+          message: refusal.message
         });
       }
       try {
@@ -4671,9 +5318,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         // opt-in: a dependency with no wired probe client is reported
         // not_configured and does NOT trip the guard, so deployments/tests
         // without a live queue/storage submit exactly as before.
-        const queueEndpoint = opts.packagingRedis
-          ? `redis://${opts.packagingRedis.options.host ?? 'localhost'}:${
-              opts.packagingRedis.options.port ?? 6379
+        const packagingRedis = await packagingRedisForStack(opts);
+        const queueEndpoint = packagingRedis
+          ? `redis://${packagingRedis.options.host ?? 'localhost'}:${
+              packagingRedis.options.port ?? 6379
             }`
           : undefined;
         const preflight = await checkStackReachability(
@@ -4689,7 +5337,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             bucket: request.connections?.sourceBucket ?? opts.sourceBucket
           },
           {
-            ...(opts.packagingRedis ? { queueClient: opts.packagingRedis } : {}),
+            ...(packagingRedis ? { queueClient: packagingRedis } : {}),
             ...(request.connections?.storageClient
               ? { storageClient: request.connections.storageClient }
               : {})
@@ -4708,7 +5356,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
             sourceAssetId: asset.id,
             sourceObjectKey: source.objectKey,
             preset: request.body.profile,
-            customProfile: request.body.customProfile as EncoreProfile | undefined,
             profileParams: request.body.profileParams,
             burnInSubtitlesFilter,
             // Read the transcode INPUT from the resolved stack's per-stack
@@ -4755,6 +5402,33 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         if (isJobThroughputCapExceededError(err)) {
           return reply.code(err.statusCode).send(err.toResponseBody());
         }
+        // The credential the TRANSCODER would be spawned with belongs to a
+        // different stack than this request routes to (issue #1093). Resolved
+        // deep in the scaler's `resolveS3Config` callback
+        // (services/encore-s3-config.ts), which refuses rather than silently
+        // substituting the first-provisioned stack's object store. Answer the
+        // SAME 409 `stack_routing_mismatch` the edge checks above answer — it
+        // is the same class of fault, and a client must not have to distinguish
+        // "mis-routed, retry naming one stack" from a 502 transcoder failure.
+        // The error carries two stack ids and an endpoint host; it has no
+        // credential field, so nothing secret can reach the body or the log.
+        if (isObjectStoreStackMismatchError(err)) {
+          request.log.error(
+            {
+              assetId: asset.id,
+              objectKey: source.objectKey,
+              reason: 'transcoder-object-store-credential',
+              expectedStack: err.expectedStack,
+              actualStack: err.actualStack,
+              actualEndpointHost: err.actualEndpointHost
+            },
+            'refusing to dispatch a transcode: the object-store credential the transcoder would be spawned with belongs to a different stack than the request routes to (issue #1093)'
+          );
+          return reply.code(409).send({
+            error: 'stack_routing_mismatch',
+            message: err.message
+          });
+        }
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'encore_submit_failed', message });
       }
@@ -4773,9 +5447,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //   409 — pipeline already running / job not found / instance unavailable /
   //         `stack_routing_mismatch` (issue #1058, pipeline mode only — it shares
   //         `startPipelineExecution` with POST /:id/execute, whose abr-vod
-  //         pipeline contains a transcode step)
+  //         pipeline contains a transcode step),
+  //         (pipeline mode, issue #1059) `source_unreadable` — the source object
+  //         is missing from the bucket the transcode step would read. The #1058
+  //         stack-routing gate runs FIRST (is this the right stack at all?), then
+  //         the #1059 readiness gate (are the bytes actually there?).
   //   501 — required service not configured on this deployment
-  //   502 — Encore submission failed
+  //   502 — Encore submission failed, or (pipeline mode, issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
   app.post(
     '/:id/package',
     {
@@ -4856,7 +5535,10 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
       // Resolve the Encore instance URL + UUID from Redis. Both must be present
       // (stored at dispatch time). If the instance has been scaled down, packaging
       // cannot proceed — the Encore job data is only accessible while the instance runs.
-      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(encoreJobId, opts.packagingRedis);
+      const resolvedPackagingTarget = await resolveEncoreJobUrlForPackaging(
+        encoreJobId,
+        await packagingRedisForJob(opts, encoreJobId)
+      );
       if (!resolvedPackagingTarget) {
         return reply.code(409).send({ error: 'instance_not_found', message: 'Encore instance no longer in pool — cannot resolve job URL for packaging' });
       }
@@ -4883,6 +5565,9 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // progress as a first-class PipelineExecution. The first step runs immediately;
   // asynchronous steps (transcode/package) advance via OSC callbacks.
   //   202 — pipeline execution created
+  //   400 — `unknown_profile` (issue #1022) — for a pipeline containing a
+  //         transcode step, the named profile is not registered on this
+  //         deployment; or the body carries the REMOVED `customProfile` field
   //   404 — unknown asset
   //   409 — a pipeline is already running / asset has no stored object /
   //         (package-only, issue #739) `no_renditions` — nothing to package,
@@ -4891,9 +5576,15 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   //         pooled, so the job URL the packager needs cannot be resolved /
   //         `stack_routing_mismatch` (issue #1058) — for any pipeline CONTAINING
   //         a transcode step, the source bytes and the transcoder would resolve
-  //         different stacks; refused before the execution record is created
+  //         different stacks; refused before the execution record is created /
+  //         `source_unreadable` (issue #1059) — the asset records a source key but
+  //         the object is missing / empty / the wrong size in the bucket the
+  //         transcode step would read. The two gates run in that order: #1058
+  //         settles WHICH stack, then #1059 checks the bytes are there on it
   //   501 — pipeline execution or the required OSC service is not configured
-  //   502 — the first step's submission failed
+  //   502 — the first step's submission failed, or (issue #1059)
+  //         `source_verification_failed` — the object store could not be asked
+  //         whether the transcode source exists
   app.post(
     '/:id/execute',
     {
@@ -4902,7 +5593,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         body: z.object({
           pipeline: z.enum(PIPELINE_NAMES as [string, ...string[]]),
           profile: z.string().min(1).optional(),
-          customProfile: customProfileSchema.optional(),
+          customProfile: removedCustomProfileSchema,
           // profileParams (issue #288): reuses the same flat string map validated
           // on POST /:id/transcode (profileParamsSchema, issue #287) and forwards
           // it into the shared transcode submission path so SpEL-parametrised
@@ -4972,7 +5663,6 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         reply,
         {
           profile: request.body.profile,
-          customProfile: request.body.customProfile as EncoreProfile | undefined,
           profileParams: request.body.profileParams
         },
         resolvedDestination.destinationBucket
@@ -5269,6 +5959,263 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         const message = err instanceof Error ? err.message : String(err);
         return reply.code(502).send({ error: 'rewrap_failed', message });
       }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // Deliver an EXISTING asset to a registered export destination (issue #1131).
+  //
+  // Prerequisite for #945 (and the #910/#911 export-from-detail UI): the caller
+  // supplies `(assetId, destination)` and gets back a terminal, truthful answer
+  // about whether the asset's source object is now AT that destination.
+  //
+  // WHY A NEW ENDPOINT AND NOT A `destination` FIELD ON POST /:id/export.
+  // `/:id/export` is a container re-wrap/transmux: it dispatches an OSC ffmpeg
+  // `-c copy` job via `rewrapRunner` and answers 201 with a NEW CHILD ASSET
+  // (`exportBodySchema` = `{ targetFormat, outputName?, asVersion? }`, handler
+  // above). Its output location is the workspace's own bucket, fixed by the
+  // runner's `s3Config` (`requestRunnerS3Config`), and the ffmpeg-s3 job body
+  // carries exactly ONE S3 identity (`ffmpegS3CredentialMapping`,
+  // src/services/external-storage-credentials.ts:155-180) — so that job cannot
+  // be pointed at a separately-credentialed destination, and a `destination`
+  // field there would have to mean "transmux, then relocate", i.e. two
+  // operations with two failure modes behind one 201-with-an-asset contract.
+  // Delivery has a different terminal condition ("the object is present at the
+  // destination"), so it gets its own endpoint and its own 200 body, and
+  // `/:id/export` keeps its current meaning unchanged.
+  //
+  // COMPOSITION (all pre-existing contracts, nothing new invented):
+  //   - the destination reference is resolved by `resolveJobDestination`
+  //     (above) — the SAME #573/#574 path POST /:id/package and
+  //     POST /:id/execute use, so a destination's optional path template
+  //     (`StorageBackendRegistry.resolveDestinationBucket`,
+  //     src/services/storage-backend-registry.ts:982-998) keys a delivered
+  //     object exactly as it keys packaged output;
+  //   - the resolved string is split by `parseDestination`
+  //     (src/pipeline/output-relocation.ts:57-80) into { bucket, prefix };
+  //   - the bytes move by server-side CopyObject and the landing is VERIFIED by
+  //     re-reading the destination object (src/pipeline/asset-delivery.ts).
+  //
+  // TRUTHFUL TERMINAL STATUS. 200 `{ status: 'delivered' }` is sent only after
+  // the object has been re-read at the destination with the source's byte
+  // count. Everything else is an error naming what went wrong:
+  //   400 — the reference names no registered export destination (or names the
+  //         OSC-managed default, which is where the asset already is)
+  //   404 — unknown/foreign asset (existence is not leaked)
+  //   409 — the asset has no stored source object (`no_object`, the shared
+  //         source-resolution contract), or its bytes are gone from the source
+  //         bucket (`source_missing`) so there was nothing to copy
+  //   422 — the destination is registered for a non-output role, or is not
+  //         writable/verifiable with the credentials this API holds
+  //   501 — no storage-backend registry, or no object storage, on this
+  //         deployment
+  //   502 — the copy failed, or the store reported success but the object is
+  //         not actually at the destination
+  //   504 — the delivery did not settle within the bound, so its outcome could
+  //         not be confirmed
+  app.post(
+    '/:id/deliver',
+    {
+      schema: {
+        params: z.object({ id: z.string() }),
+        body: deliverBodySchema,
+        response: {
+          200: deliverResultSchema,
+          400: errorSchema,
+          404: errorSchema,
+          409: errorSchema,
+          422: errorSchema,
+          501: errorSchema,
+          502: errorSchema,
+          504: errorSchema
+        }
+      }
+    },
+    async (request, reply) => {
+      const asset = await repo.get(request.params.id);
+      if (!asset) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      // Unified source-object resolution (issue #612): a source-less asset
+      // fails here the same way it fails for every other source-consuming
+      // operation (409 `no_object`).
+      const source = requireSourceObject(asset, reply);
+      if (!source) return reply;
+
+      const registry = opts.storageBackendRegistry;
+      if (!registry) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'storage-backend registry is not configured'
+        });
+      }
+
+      const ref = request.body.destination;
+      // The implicit OSC-managed default (ADR-017 D3) is the store the asset
+      // already lives in, not somewhere to deliver TO. `resolveForOutput`
+      // answers undefined for it by design
+      // (storage-backend-registry.ts:1040-1042), so name it explicitly rather
+      // than reporting it as an unknown destination.
+      if (ref === DEFAULT_BACKEND_ID) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: `"${DEFAULT_BACKEND_ID}" is the platform-managed default store the asset already lives in, not an export destination; name a destination registered via POST /api/v1/export-destinations`
+        });
+      }
+      // Resolve the destination RECORD first, under the SAME workspace
+      // namespace the export-destinations surface registers records in
+      // (`workspaceId = STACK_CONFIG_NAMESPACE`,
+      // src/routes/export-destinations.ts:187), so this endpoint addresses
+      // exactly the destinations GET /api/v1/export-destinations lists.
+      // Resolving the record up front (rather than going straight to
+      // `resolveJobDestination`) is what lets a registered-but-wrong-role
+      // backend get its own, accurate error: `resolveDestinationBucket` folds
+      // that case into the generic "no destination matches" 400
+      // (storage-backend-registry.ts:988-991), which would misreport a
+      // destination that IS registered.
+      const record = await registry.resolveForOutput(STACK_CONFIG_NAMESPACE, ref);
+      if (!record) {
+        return reply.code(400).send({
+          error: 'bad_request',
+          message: new UnknownDestinationBackendError(ref).message
+        });
+      }
+      // Only output-role backends are export destinations (ADR-018 D1 —
+      // `isExportDestination`, src/routes/export-destinations.ts:174-176). A
+      // 'source'/'archive' backend is read/cold storage; delivering to it would
+      // silently cross the two surfaces, so it is refused with the same
+      // `backend_role`-style 422 the job path uses (`resolveJobDestination`
+      // above).
+      if (record.role !== 'packaged' && record.role !== 'both') {
+        return reply.code(422).send({
+          error: 'backend_role',
+          message: `storage backend "${ref}" is registered for the "${record.role}" role and cannot receive a delivery; register it with role "packaged" or "both"`
+        });
+      }
+
+      // Resolve the destination to the SAME `<bucket>/<prefix>/` string the
+      // relocation path consumes, through the SAME resolver the package/execute
+      // jobs use — so a #574 path template applies to a delivery identically.
+      // An error (unknown reference, unrenderable template, no registry) has
+      // already been sent by the resolver.
+      const resolved = await resolveJobDestination(
+        { destination: ref, assetId: asset.id },
+        reply
+      );
+      if (!resolved.ok) return reply;
+      const target =
+        resolved.destinationBucket !== undefined
+          ? parseDestination(resolved.destinationBucket)
+          : undefined;
+      if (!target) {
+        // A named destination always resolves to a non-empty bucket string, so
+        // this is defence in depth: refuse rather than copy to an unparseable
+        // location.
+        request.log.error(
+          { assetId: asset.id, destinationId: record.id },
+          'destination reference resolved to no usable bucket path'
+        );
+        return reply.code(422).send({
+          error: 'destination_unresolved',
+          message: `export destination "${ref}" did not resolve to a usable bucket path`
+        });
+      }
+
+      // A destination that declares its OWN endpoint cannot be delivered to
+      // from here: its secret access key lives write-only in OSC per-service
+      // secrets, so this process holds no credential for that endpoint, and
+      // copying to a same-named bucket on our own store would report a success
+      // for bytes that never reached the operator (see
+      // `destinationEndpointRefusal`, src/pipeline/asset-delivery.ts). Refuse
+      // instead of producing a false success.
+      const deploymentEndpoint = opts.deliveryEndpoint ?? request.connections?.s3Config?.endpoint;
+      const endpointRefusal = destinationEndpointRefusal(record.endpointUrl, deploymentEndpoint);
+      if (endpointRefusal) {
+        request.log.warn(
+          { assetId: asset.id, destinationId: record.id },
+          'refusing delivery: the destination is registered at an endpoint this API holds no credentials for (issue #1131)'
+        );
+        return reply.code(422).send({
+          error: 'destination_unreachable',
+          message: endpointRefusal
+        });
+      }
+
+      // The copy client: the per-request stack client in production, an
+      // injected fake in tests (see the option docs).
+      const client = opts.deliveryClient ?? request.connections?.storageClient;
+      if (!client) {
+        return reply.code(501).send({
+          error: 'not_configured',
+          message: 'object storage is not configured; asset delivery is unavailable'
+        });
+      }
+
+      // Where the source bytes are now. A rendition/external source is stored
+      // as an `s3://bucket/key` URI (`parseS3Uri`, above); a plain key lives in
+      // THIS request's stack source bucket (`WorkspaceConnections.sourceBucket`,
+      // src/services/workspace-stack.ts:150), falling back to the router's
+      // configured bucket and finally the documented default.
+      const s3Source = parseS3Uri(source.objectKey);
+      const sourceLocation = s3Source
+        ? { bucket: s3Source.bucket, key: s3Source.key }
+        : {
+            bucket:
+              request.connections?.sourceBucket ?? opts.sourceBucket ?? DEFAULT_SOURCE_BUCKET,
+            key: source.objectKey
+          };
+
+      const outcome = await deliverAssetObject(client, {
+        source: sourceLocation,
+        target
+      });
+      if (!outcome.ok) {
+        const mapped = DELIVERY_FAILURE_RESPONSE[outcome.reason];
+        request.log.warn(
+          {
+            assetId: asset.id,
+            destinationId: record.id,
+            reason: outcome.reason,
+            bucket: target.bucket
+          },
+          'asset delivery did not land at the destination'
+        );
+        return reply.code(mapped.status).send({
+          error: mapped.error,
+          message: outcome.message
+        });
+      }
+
+      // Audit the delivery (issue #564 emitter): emitted ONLY on a verified
+      // landing, so the audit trail cannot claim a delivery that did not
+      // happen. Fire-and-forget — a failed audit write never fails the request.
+      emitAudit(
+        audit,
+        {
+          actor: originActor('user'),
+          action: 'asset.delivered',
+          targetType: 'asset',
+          targetId: asset.id,
+          detail: {
+            destinationId: record.id,
+            destinationName: record.name,
+            bucket: outcome.bucket,
+            objectKey: outcome.objectKey,
+            bytes: outcome.bytes
+          }
+        },
+        request.log
+      );
+      return reply.code(200).send({
+        assetId: asset.id,
+        status: 'delivered' as const,
+        destination: { id: record.id, name: record.name, role: record.role },
+        bucket: outcome.bucket,
+        objectKey: outcome.objectKey,
+        bytes: outcome.bytes,
+        etag: outcome.etag,
+        deliveredAt: new Date().toISOString()
+      });
     }
   );
 
@@ -5575,9 +6522,14 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
   // omitted from the response.
   // -------------------------------------------------------------------------
 
-  // List an asset's audio + subtitle tracks.
-  //   200 — { audioTracks, subtitleTracks } (each possibly empty)
+  // List an asset's video + audio + subtitle tracks.
+  //   200 — { videoTracks, audioTracks, subtitleTracks } (each possibly empty)
   //   404 — unknown/foreign asset
+  //
+  // `videoTracks` (issue #978) is the machine-probed set, projected from the
+  // persisted `technical.video[]` (asset-document.ts) onto `asset.videoTracks`;
+  // the other two are editorial records managed through the POST/DELETE routes
+  // below. Read-only: there is no write path for video tracks.
   app.get(
     '/:id/tracks',
     {
@@ -5593,6 +6545,7 @@ export const assetsRouter: FastifyPluginAsync<AssetsRouterOptions> = async (fast
         return reply.code(404).send({ error: 'not_found' });
       }
       return reply.code(200).send({
+        videoTracks: videoTracksOf(asset),
         audioTracks: asset.audioTracks ?? [],
         subtitleTracks: asset.subtitleTracks ?? []
       });
