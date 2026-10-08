@@ -2020,16 +2020,19 @@ body.detail-standalone .assets-side {
    date inputs carry no placeholder, so public/jobs-table.js markUnset() toggles
    .is-unset on them (empty <select> option / empty date value).
 
-   All three search boxes are listed: Jobs' carries `.ops-filter-search`
-   (public/jobs-table.js:345), Assets' carries `.ops-search-input`
-   (public/assets-table.js:430-434, placeholder "Full-text search…") and Logs'
-   is a bare `input[type=search]` with no class at all
-   (public/logs-table.js:207-211, placeholder "Search message…"). The last two
-   matched no authored ::placeholder rule, so their placeholder text was still
-   being drawn for a light field after the repaint above. */
+   Two selectors cover all four placeholder-bearing filter boxes. Jobs' search
+   box (public/jobs-table.js:342-345) and Audit's action box
+   (public/audit-table.js:349-353, an `input[type=text]`) both carry
+   `.ops-filter-search`. Assets' box (public/assets-table.js:430-434, placeholder
+   "Full-text search…") and Logs' box (public/logs-table.js:207-211, a bare
+   `input[type=search]` with no class at all, placeholder "Search message…") are
+   reached by the type-qualified selector. Those last two matched no authored
+   ::placeholder rule before issue #983, so their placeholder text was still being
+   drawn for a light field after the repaint above. Date inputs are deliberately
+   NOT listed: they expose no ::placeholder: their empty-state hint is UA chrome
+   (`::-webkit-datetime-edit`), which follows the `color-scheme: dark` set above. */
 .ops-filter-search::placeholder,
-.ops-table-filters input[type='search']::placeholder,
-.ops-table-filters input[type='date']::placeholder {
+.ops-table-filters input[type='search']::placeholder {
   color: var(--text-muted);
   opacity: 1; /* Firefox dims placeholders by default. */
 }
@@ -2097,15 +2100,22 @@ body.detail-standalone .assets-side {
    Those two sets had drifted — uppercase/letter-spaced at 11px and inherited
    weight on one side, sentence-case 12px at weight 500 on the other.
 
+   The Jobs/Audit treatment is the target, so Assets and Logs move onto it rather
+   than the other way round: #983 names the Jobs bar as the one that already looks
+   right, so this rule must not restyle it. That is why there is no `font-weight`
+   declaration here — `.ops-filter-label` never carried one, and both caption sets
+   sit in a `<label>`, so both inherit the same 400. Declaring 500 would have
+   silently bolded the reference bar to fix the other two.
+
    Qualified with `.ops-table-filters` so it reaches (0,2,0)/(0,3,2) and outranks
    `.ops-table-filters label { font-size: 12px }` above, and restricted to a
    `.ops-filter-slot` direct-child label so the column chooser's own rows
    (`label.ops-columns-item > span.ops-columns-item-label`, nested deeper inside
-   `.ops-columns-slot`) keep their sentence case and weight 400. */
+   `.ops-columns-slot` behind `.ops-columns > .ops-columns-panel >
+   .ops-columns-list`) keep their sentence case. */
 .ops-table-filters .ops-filter-label,
 .ops-table-filters .ops-filter-slot > label > span {
   font-size: 11px;
-  font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-muted);
@@ -2310,8 +2320,13 @@ body.detail-standalone .assets-side {
   cursor: not-allowed;
 }
 
-/* Outranks `.ops-table-filters label > span { font-weight: 500 }`: those are
-   filter captions, these are pickable column names and read as body text. */
+/* Pinned rather than inherited: these are pickable column names and read as body
+   text, not filter captions. The `label > span { font-weight: 500 }` rule this
+   used to outrank is gone (issue #983 folded the caption typography into
+   `.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-slot >
+   label > span` above, which no longer declares a weight), so 400 is now what
+   these rows would inherit anyway — keeping it declared means a future weight on
+   a filter caption cannot reach the chooser by accident. */
 .ops-table-filters .ops-columns-item-label {
   font-weight: 400;
 }
