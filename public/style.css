@@ -2446,6 +2446,17 @@ tbody tr.coll-row.row-selected {
   margin-top: 16px;
 }
 
+/* Search tab intro copy (issue #948) — sits between the panel title and the
+   first section, and says what this tab does that the Assets tab filter does
+   not. The gap above is .panel-title's own bottom margin; this rule only sets
+   its own gap below, so it does not depend on that value. */
+.search-tab-intro {
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 70ch;
+  margin: 0 0 16px;
+}
+
 /* Clip-asset dialog (issue #793). Same furniture again — .form-row/.form-field
    for the in/out pair, .msg.msg-error for the inline refusal. */
 .clip-dialog .clip-dialog-intro,

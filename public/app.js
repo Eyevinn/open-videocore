@@ -5830,11 +5830,40 @@ const SEARCH_SCOPE_HINT =
   'Full-text search across the whole workspace: assets and collections both match on ' +
   'name, description and tags. Container format matches assets only.';
 
+// Why this tab exists alongside the Assets tab's filter box (issue #948). The
+// two surfaces look alike now that both take structured filters, so the copy
+// has to carry the distinction. #913 above named the scope; this intro says why
+// you would come here rather than to the Assets tab:
+//   - GET /api/v1/search returns BOTH kinds of hit — `assets` (type: 'asset')
+//     and `collections` (type: 'collection', issue #561); see the verified
+//     contract note above normaliseSearchResults and src/routes/search.ts
+//     (collectionHitSchema / searchResultSchema).
+//   - The Assets tab's free-text box hits the same endpoint but reads only
+//     `res.assets` and drops the collection hits (public/assets-table.js),
+//     so it can never surface a collection.
+//   - The Collections tab lists every collection via GET /api/v1/collections/
+//     with no query parameters at all (verified: openapi.json
+//     "/api/v1/collections/" get.parameters === []), so it cannot narrow.
+// So this tab is the only place a search can return a collection, and the copy
+// below says exactly that. It leads with that differentiator rather than
+// restating the scope: SEARCH_TAB_TITLE, SEARCH_SECTION_TITLE and
+// SEARCH_SCOPE_HINT already say this tab covers assets and collections, so
+// repeating it here would be the fourth statement of scope in one viewport.
+const SEARCH_TAB_INTRO =
+  'The only search that returns collections — the filter box on the Assets tab ' +
+  'narrows the asset list only, and the Collections tab just lists every ' +
+  'collection without searching.';
+
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
   title.textContent = SEARCH_TAB_TITLE;
   container.appendChild(title);
+
+  const intro = document.createElement('p');
+  intro.className = 'text-muted search-tab-intro';
+  intro.textContent = SEARCH_TAB_INTRO;
+  container.appendChild(intro);
 
   const section = document.createElement('div');
   section.className = 'section';
@@ -9013,6 +9042,13 @@ export {
   SEARCH_TAB_TITLE,
   SEARCH_SECTION_TITLE,
   SEARCH_SCOPE_HINT,
+  // NOTE (issue #948): SEARCH_TAB_INTRO is deliberately NOT exported. The
+  // "states it returns collections" acceptance criterion is already pinned by
+  // the #913 assertions on SEARCH_SECTION_TITLE / SEARCH_SCOPE_HINT above; the
+  // intro adds the Assets-filter-vs-Collections-tab contrast on top of that.
+  // Exporting it without a test that imports it would ship a dead export and a
+  // comment that claims coverage nothing provides, so the constant stays
+  // module-local until a test actually asserts it.
   // Per-instance capacity is read from the wire, not inferred (issue #979).
   // Exported so a DOM/unit test can assert the card reports the server's
   // `jobsPerInstance`.
