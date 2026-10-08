@@ -4,7 +4,7 @@ import { redact } from '../lib/redact.mjs';
 import { sweepLeftovers } from './sweep.mjs';
 
 export const DEFAULT_TIMEOUTS = {
-  ingestMs: 120_000, metadataMs: 60_000, transcodeMs: 600_000, packageMs: 600_000, searchMs: 30_000,
+  ingestMs: 120_000, readyMs: 300_000, metadataMs: 60_000, transcodeMs: 600_000, packageMs: 600_000, searchMs: 30_000,
 };
 
 /**

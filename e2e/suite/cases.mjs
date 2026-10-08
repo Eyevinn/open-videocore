@@ -93,7 +93,14 @@ export const cases = [
       ctx.state.assetId = r.body.assetId; // recorded first so teardown can still delete it
       ctx.state.title = title;
       await waitForJob(ctx, r.body.jobId, ctx.config.timeouts.ingestMs, 'ingest job');
-      const asset = await getAsset(ctx);
+      // The ingest job finishing does not make the asset ready: a detached metadata extraction (an ffprobe job, which
+      // may have to start its service first) advances `processing` -> `ready` (src/pipeline/metadata-extractor.ts),
+      // or records technicalMetadataError and leaves it in `processing`. Wait for either outcome.
+      const asset = await poll(async () => {
+        const a = await getAsset(ctx);
+        return a.status === 'ready' || a.status === 'failed' || a.technicalMetadataError ? a : undefined;
+      }, { timeoutMs: ctx.config.timeouts.readyMs, intervalMs: ctx.config.pollMs, sleep: ctx.sleep, now: ctx.now, what: `asset ${ctx.state.assetId} to leave processing` });
+      if (asset.technicalMetadataError) fail(`metadata extraction failed: ${String(asset.technicalMetadataError).slice(0, 300)}`);
       if (asset.status !== 'ready') fail(`asset status is ${asset.status}, expected ready`);
     },
   },
