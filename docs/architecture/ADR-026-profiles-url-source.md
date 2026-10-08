@@ -277,8 +277,9 @@ publicly accessible is real, but it is an orchestrator-side configuration with
 #284 depends on it permanently. Logged as an OSC capability gap in the **agents
 repo** (a separate repository, so it is not part of this PR's diff) at
 `eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md`,
-written 2026-10-08 — that repo is where the `osc-feedback` agent consolidates
-submissions. It carries forward both this gap and the unreported
+written and pushed 2026-10-08 on the agents-repo branch
+`osc-feedback/profiles-url-public-path-exemption` (awaiting merge there) — that
+repo is where the `osc-feedback` agent consolidates submissions. It carries forward both this gap and the unreported
 `getInternalEndpoint` → `ports: []` gap named in C7.
 
 ### C4 — OSC *does* expose a first-class public-read capability — at bucket granularity
@@ -646,7 +647,9 @@ out-of-band actor to watch for.
   *was* detected, by the customer. The exposure is the problem.
 - **Keep #284 and ask OSC for a guaranteed public path.** Rejected as the
   *primary* plan; pursued in parallel as feedback (logged in the agents repo at
-  `eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md`).
+  `eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md`,
+  branch `osc-feedback/profiles-url-public-path-exemption`, not yet submitted to
+  OSC — it goes out with the weekly consolidation).
   C3(b) states the auth gate is configured at the **orchestrator level**, so
   this is a platform roadmap item with no tenant-side lever and no date. #285 is
   the precedent for how long such an ask can sit: requested 2026-08-19, still
@@ -772,7 +775,7 @@ files no issues itself.**
 | Introspect the live OSC catalog + relevant service schemas; cite contract source and exact fields | §2 (C1–C9), each with the live query that produced it and the exact field names |
 | Compare the two approaches on reliability, operational cost, profile update flow, fit with OSC | Summary table (reliability/assertability), §4 Negative (operational cost, update flow), C2/C4/C6/C7 (fit with OSC) |
 | Write `docs/architecture/ADR-NNN-profiles-url-source.md` with a decision and consequences | this file (`ADR-026-profiles-url-source.md`); decision §3, consequences §4 |
-| Log any partial/missing OSC capability, e.g. a way to guarantee a public path exemption | written 2026-10-08 in the agents repo at `eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md` (separate repository, so not in this PR's diff) |
+| Log any partial/missing OSC capability, e.g. a way to guarantee a public path exemption | written 2026-10-08 in the agents repo at `eng-open-videocore-agents/docs/osc-feedback/incoming-profiles-url-public-path-exemption.md`, pushed on branch `osc-feedback/profiles-url-public-path-exemption` (separate repository, so not in this PR's diff) |
 | If the decision is #284, the probe must become continuous; if #110, open an implementation issue and mark the probe work obsolete | decision is the **#110 direction** → D4 rejects #1103's periodic scope and re-scopes it to the required call-site correction; §5 lists the implementation issues |
 
 ---
