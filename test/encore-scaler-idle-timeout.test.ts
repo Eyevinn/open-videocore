@@ -23,6 +23,11 @@
 //     status returns { workspaces, maxInstances, idleTimeoutMs, scalerActive };
 //     PATCH /config body is scalerConfigSchema.partial(), idleTimeoutMs floor
 //     MIN_IDLE_TIMEOUT_MS = 10_000.
+//   - ScalerConfigStore.save (src/services/param-store.ts). Since issue #1077
+//     PATCH /config persists before it applies, so the router needs a
+//     `configStore`; a capturing in-memory stub is supplied below and the
+//     fan-out assertions are unchanged. The persistence contract itself is
+//     covered in src/routes/scaler.config-persistence.test.ts.
 
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -201,9 +206,14 @@ describe('Encore idle timeout — runtime scale-down (issue #87)', () => {
 describe('scaler router — observable + runtime-configurable idle timeout (issue #87)', () => {
   let app: FastifyInstance;
   const changes: Array<{ maxInstances: number; minInstances: number; idleTimeoutMs: number }> = [];
+  // Durable config snapshots the router persisted (issue #1077). A PATCH only
+  // applies after this resolves, so the router needs one wired to accept a
+  // change at all.
+  const persisted: Array<{ maxInstances: number; minInstances: number; idleTimeoutMs: number }> = [];
 
   beforeEach(async () => {
     changes.length = 0;
+    persisted.length = 0;
     app = Fastify();
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
@@ -213,6 +223,12 @@ describe('scaler router — observable + runtime-configurable idle timeout (issu
       maxInstances: 3,
       minInstances: 0,
       idleTimeoutMs: 300_000,
+      configStore: {
+        save: async (cfg) => {
+          persisted.push(cfg);
+        },
+        load: async () => persisted[persisted.length - 1]
+      },
       onConfigChange: (cfg) => changes.push(cfg)
     });
     await app.ready();
@@ -238,6 +254,8 @@ describe('scaler router — observable + runtime-configurable idle timeout (issu
     expect(patch.json()).toMatchObject({ idleTimeoutMs: 60_000 });
     // Fanned out via onConfigChange for the registry to apply to live loops.
     expect(changes).toEqual([{ maxInstances: 3, minInstances: 0, idleTimeoutMs: 60_000 }]);
+    // ...and persisted first, so it survives a restart (issue #1077).
+    expect(persisted).toEqual([{ maxInstances: 3, minInstances: 0, idleTimeoutMs: 60_000 }]);
 
     const status = await app.inject({ method: 'GET', url: '/scaler/status' });
     expect(status.json()).toMatchObject({ idleTimeoutMs: 60_000 });
@@ -250,7 +268,8 @@ describe('scaler router — observable + runtime-configurable idle timeout (issu
       payload: { idleTimeoutMs: 500 }
     });
     expect(res.statusCode).toBe(400);
-    // No change fanned out on a rejected patch.
+    // No change fanned out on a rejected patch — and nothing persisted either.
     expect(changes).toHaveLength(0);
+    expect(persisted).toHaveLength(0);
   });
 });

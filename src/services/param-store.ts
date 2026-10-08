@@ -80,6 +80,30 @@ export type StackConfig = {
   // existed have no value here and MUST still load without error, and an unset
   // value falls through to the remote default index (byte-identical to today).
   encoreProfilesUrl?: string;
+  // The object store's PER-STACK access key id (issue #1094). NON-SECRET: an
+  // identifier, like a username — the same classification the #212 external
+  // credential mapping gives `accessKeyId`
+  // (services/external-storage-credentials.ts:33). The matching SECRET access
+  // key is NEVER stored here (nor anywhere else at rest): it is derived from
+  // this id plus the deployment seed by resolveObjectStoreCredential
+  // (services/object-store-credentials.ts) and persisted as an OSC secret for
+  // the services that consume it by reference.
+  //
+  // Optional for back-compat, mirroring `status?` / the fields above: a stack
+  // provisioned BEFORE #1094 carries no value here, and its absence is the
+  // signal to use the legacy process-global `admin` + deployment-password
+  // credential (removed, with the stacks migrated, by #1096). Present means the
+  // stack's object store was created with its own credential.
+  objectStoreAccessKeyId?: string;
+  // The Valkey queue key this stack's on-demand packager consumes. Every
+  // packager listens on the same shared Valkey, so a packager provisioned for a
+  // non-first stack gets its own key (packagerQueueForStack) — otherwise any
+  // stack's packager could pop another stack's job and read the wrong object
+  // store. Recorded when the packager is created so producers enqueue onto
+  // exactly the key it was built with. Optional for back-compat: a packager
+  // provisioned before this field existed consumes the shared default key, and
+  // an unset value keeps enqueueing there.
+  packagerQueue?: string;
   // Per-role storage backend metadata (issue #211). Optional for back-compat:
   // configs written before this field existed have no `storage`, in which case
   // both roles are the default per-stack MinIO backend (sourceBucket /
@@ -734,6 +758,125 @@ export function makeHttpConfigKvStore(config: HttpParamStoreConfig): ConfigKvSto
   };
 }
 
+// ---------------------------------------------------------------------------
+// Scaler runtime config (issue #1077 — write side; issue #1078 — boot read side)
+// ---------------------------------------------------------------------------
+//
+// PATCH /api/v1/scaler/config used to mutate only module-scope values in
+// routes/scaler.ts, so an operator's change was lost on the next restart. The
+// values are now persisted here, and this block is the CONTRACT the boot-load
+// side (#1078) reads. Do not change the key or the value shape without changing
+// both sides.
+//
+// SCOPE: instance-global, NOT per-stack and NOT per-workspace. The scaler pool
+// ceiling/idle timeout are deployment-wide (main.ts reads them once from
+// ENCORE_MAX_INSTANCES / ENCORE_IDLE_TIMEOUT_MS at main.ts:887,897 and the
+// WorkspaceEncoreScalerRegistry applies them across every workspace via
+// setMaxInstances/setIdleTimeoutMs), and the scaler config route is deliberately
+// unauthenticated — it has no workspace or stack name in scope. They are
+// therefore NOT fields on StackConfig (which is keyed per workspace+stack by
+// stackConfigKey) but one dedicated key, written through the same
+// eyevinn-app-config-svc HTTP contract via ConfigKvStore.
+//
+// KEY: `openvideocore/scalerconfig` — ONE segment after the shared
+// `openvideocore/` prefix. That is deliberate: the stale-namespace scan in
+// services/workspace-stack.ts (scanStaleNamespacedStacks, `segments.length !== 2`)
+// only considers two-segment keys as candidate stack configs, so a single-segment
+// key can never be mistaken for one and needs no entry in
+// RESERVED_KEY_SEGMENTS.
+//
+// VALUE: a JSON object carrying ALL THREE fields, always written as a complete
+// snapshot (never a partial patch), so one read yields a complete config:
+//   {"maxInstances":3,"minInstances":0,"idleTimeoutMs":300000}
+// Non-secret by construction: three integers, no credentials, nothing
+// workspace-identifying.
+export const SCALER_CONFIG_KEY = 'openvideocore/scalerconfig' as const;
+
+// The persisted scaler runtime config. Every field is REQUIRED in the stored
+// blob — the writer always sends a full snapshot (see SCALER_CONFIG_KEY), so the
+// reader never has to merge a partial record.
+export type ScalerRuntimeConfig = {
+  // Upper bound on Encore instances per workspace pool.
+  maxInstances: number;
+  // Instances kept warm (0 = scale to zero when idle).
+  minInstances: number;
+  // Idle time in ms before an idle instance is torn down.
+  idleTimeoutMs: number;
+};
+
+// Parse a stored scaler-config blob, returning undefined for anything that is
+// not a usable config so a caller (boot load, #1078) can fall back to its env
+// defaults instead of throwing.
+//
+// The check is STRUCTURAL plus a minimal sanity floor, NOT the route's full
+// range check. The authoritative bounds live with the request validation in
+// routes/scaler.ts (`scalerConfigSchema`: maxInstances 1..20, minInstances
+// 0..10, idleTimeoutMs >= MIN_IDLE_TIMEOUT_MS) and are applied at WRITE time.
+// Re-applying them here would mean that tightening a bound later silently
+// discards a previously-valid persisted value at boot — so the reader only
+// rejects values that are not usable integers at all.
+export function parseScalerRuntimeConfig(raw: string): ScalerRuntimeConfig | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const record = parsed as Record<string, unknown>;
+  const asInt = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isInteger(value) ? value : undefined;
+  const maxInstances = asInt(record['maxInstances']);
+  const minInstances = asInt(record['minInstances']);
+  const idleTimeoutMs = asInt(record['idleTimeoutMs']);
+  if (maxInstances === undefined || minInstances === undefined || idleTimeoutMs === undefined) {
+    return undefined;
+  }
+  // Sanity floor only: a pool cap below 1 could never run a job, and negative
+  // warm-instance / idle values are nonsense rather than policy.
+  if (maxInstances < 1 || minInstances < 0 || idleTimeoutMs < 0) return undefined;
+  return { maxInstances, minInstances, idleTimeoutMs };
+}
+
+// Durable store for the instance-global scaler runtime config. Narrow on
+// purpose: the PATCH route only needs `save`, and the boot path (#1078) only
+// needs `load`, so each side can be tested with a one-method stub.
+export interface ScalerConfigStore {
+  // Persist a COMPLETE config snapshot. Rejects (throws) when the write did not
+  // land durably — the PATCH route turns that into a non-2xx and leaves the live
+  // values untouched, so the API never reports a value it did not persist.
+  save(config: ScalerRuntimeConfig): Promise<void>;
+  // Read the persisted config, or undefined when nothing is stored (or the
+  // stored blob is unusable — see parseScalerRuntimeConfig).
+  load(): Promise<ScalerRuntimeConfig | undefined>;
+}
+
+// Build a ScalerConfigStore over the generic ConfigKvStore (same
+// eyevinn-app-config-svc HTTP contract as every other persisted record). Mirrors
+// the ParamStoreBackendRecordStore idiom in services/storage-backend-registry.ts
+// (`this.kv.set(key, JSON.stringify(record))`): a JSON blob under one key, and a
+// failed write propagates as a thrown error from ConfigKvStore.set
+// (param-store.ts `config kv write failed: <status> <body>`).
+export function makeScalerConfigStore(kv: ConfigKvStore): ScalerConfigStore {
+  return {
+    async save(config) {
+      // Normalised to exactly the three contract fields so no extra key can
+      // leak into the stored blob from a caller's wider object.
+      const snapshot: ScalerRuntimeConfig = {
+        maxInstances: config.maxInstances,
+        minInstances: config.minInstances,
+        idleTimeoutMs: config.idleTimeoutMs
+      };
+      await kv.set(SCALER_CONFIG_KEY, JSON.stringify(snapshot));
+    },
+    async load() {
+      const raw = await kv.get(SCALER_CONFIG_KEY);
+      if (!raw) return undefined;
+      return parseScalerRuntimeConfig(raw);
+    }
+  };
+}
+
 export const PARAM_STORE_SERVICE_ID = 'eyevinn-app-config-svc' as const;
 
 // OSC instance name must be alphanumeric-only (OSC constraint).
@@ -832,6 +975,12 @@ export interface OscInstanceApi {
     sat: string,
     body: Record<string, unknown>
   ): Promise<{ name?: string }>;
+  // Readiness wait for an instance this module just created. NOT
+  // @osaas/client-core's waitForInstanceReady: main.ts fulfils this with the
+  // bounded waitForInstanceReadyBounded (src/services/instance-readiness.ts,
+  // issue #1055), so a Valkey that never reports `running` gives up at a
+  // deadline instead of hanging the startup bootstrap forever. The rejection is
+  // caught by the warn-and-continue handler at the end of ensureParameterStore.
   waitForInstanceReady(serviceId: string, name: string): Promise<void>;
   getPortsForInstance(
     serviceId: string,

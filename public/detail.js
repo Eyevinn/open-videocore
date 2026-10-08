@@ -37,7 +37,10 @@ function getParam(name) {
 // 'pipeline' so callers can use either spelling for a pipeline execution.
 const rawType = getParam('type');
 const type = rawType === 'execution' ? 'pipeline' : rawType;
-const id = getParam('id');
+// Mutable for the asset view only: navigating the version chain (issue #907)
+// moves this window to another member of the same chain, and the self-poll below
+// must follow it rather than snapping back to the id the window was opened with.
+let id = getParam('id');
 const stackParam = getParam('stack');
 
 // Target the same stack as the opener without depending on its localStorage.
@@ -100,8 +103,28 @@ function buildChrome(headingText) {
   return body;
 }
 
+// Move this window to another member of the asset's version chain (issue #907).
+// The window's own id is what the poll and the page URL are keyed on, so both
+// are updated before the re-render: a reload then shows the version the operator
+// navigated to, not the one they opened the window with.
+function navigateToAsset(nextId, bodyEl) {
+  if (!nextId || nextId === id) return Promise.resolve();
+  id = nextId;
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('id', nextId);
+    window.history.replaceState(null, '', url.toString());
+  } catch (_) {
+    // A browser that refuses the history write still navigates; only the
+    // address bar goes stale.
+  }
+  return runAsset(bodyEl);
+}
+
 async function runAsset(bodyEl) {
-  const asset = await renderAssetDetailBody(id, bodyEl);
+  const asset = await renderAssetDetailBody(id, bodyEl, {
+    onNavigate: function (nextId) { return navigateToAsset(nextId, bodyEl); },
+  });
   // Prefer the human-friendly title/name once fetched; fall back to the id.
   const label = (asset && (asset.title || asset.name)) || id;
   document.title = 'Asset ' + label + ' — open-videocore ops';
