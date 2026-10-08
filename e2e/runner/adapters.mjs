@@ -1,7 +1,4 @@
 // Real adapters. Contract sources (verified 2026-10-08):
-//  - Local source identity: `git rev-parse HEAD` and `node scripts/source-digest.mjs <root>` of the checkout the job
-//    runs from (the job pod clones the repo; scripts/source-digest.mjs is the product's own digest, also reported by
-//    GET /health as build.sourceDigest).
 //  - OSC, @osaas/client-core 0.24.0 (lib/core.d.ts, lib/context.d.ts, lib/index.d.ts):
 //      new Context({personalAccessToken, environment}); ctx.getServiceAccessToken(serviceId);
 //      getInstance / restartInstance / removeInstance(ctx, serviceId, name, sat); waitForInstanceReady(serviceId, name, ctx);
@@ -15,21 +12,52 @@
 //    Calls to the instance itself use `x-jwt: Bearer <sat>` (platform call-service-endpoint); anonymous calls get nginx's 401.
 //  - Service config from get-service-schema eyevinn-open-videocore: name, OscAccessToken, ParameterStoreApiKey,
 //    ParameterStore, MinioRootPassword, CouchdbAdminPassword (required). Instance names: ^[a-z0-9]+$, max 20.
-import { execFileSync } from 'node:child_process';
-import path from 'node:path';
-
 export const SERVICE_ID = 'eyevinn-open-videocore';
 
-/** @param {{ repoRoot: string, exec?: typeof execFileSync }} opts */
-export function localSource({ repoRoot, exec = execFileSync }) {
-  const run = (cmd, args) => String(exec(cmd, args, { cwd: repoRoot, encoding: 'utf8', timeout: 60_000 })).trim();
+/**
+ * The commit the `:latest` image was built from, read from the registry. The platform builds the image without git
+ * metadata, so GET /health reports build.commit/sourceDigest as "unknown" (verified on a live beta instance
+ * 2026-10-08); the image itself carries the commit as the label io.osaas.repo.commit (confirmed on the image).
+ * Contract: the OCI distribution API. GET https://ghcr.io/token?service=ghcr.io&scope=repository:<image>:pull with
+ * Basic auth returns {token}; GET /v2/<image>/manifests/<tag> returns an image index (manifests[] with
+ * platform.os/architecture) or a manifest (config.digest); GET /v2/<image>/blobs/<config digest> is the image config
+ * JSON, whose labels are config.Labels (some tools print them lowercase, so both are read).
+ * The package is private: anonymous requests get 401 (checked), so this needs a read:packages token. The
+ * authenticated path has NOT been exercised yet; the first live run is the test.
+ * @param {{ user: string, token: string, image?: string, tag?: string, fetchImpl?: typeof fetch }} opts
+ */
+export function registryAdapter({ user, token, image = 'eyevinn-osaas/open-videocore', tag = 'latest', fetchImpl = fetch }) {
+  const ACCEPT = 'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json';
+  const get = async (url, bearer, extra = {}) => {
+    const res = await fetchImpl(url, { headers: { authorization: `Bearer ${bearer}`, ...extra }, signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`registry ${new URL(url).pathname.split('/').slice(3, 4)[0] ?? 'request'} returned HTTP ${res.status}`);
+    return res;
+  };
   return {
-    async expected() {
-      const commit = run('git', ['rev-parse', 'HEAD']);
-      const sourceDigest = run('node', [path.join('scripts', 'source-digest.mjs'), repoRoot]);
-      if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('git rev-parse HEAD did not return a commit sha');
-      if (!sourceDigest) throw new Error('source-digest.mjs printed nothing');
-      return { commit, sourceDigest };
+    /** @returns {Promise<{ digest: string, commit: string }>} digest = what the tag points to now */
+    async latest() {
+      const basic = Buffer.from(`${user}:${token}`).toString('base64');
+      const t = await fetchImpl(`https://ghcr.io/token?service=ghcr.io&scope=repository:${image}:pull`, { headers: { authorization: `Basic ${basic}` }, signal: AbortSignal.timeout(30_000) });
+      if (!t.ok) throw new Error(`registry token exchange returned HTTP ${t.status}`);
+      const bearer = (await t.json()).token;
+      if (!bearer) throw new Error('registry token exchange returned no token');
+      const top = await get(`https://ghcr.io/v2/${image}/manifests/${tag}`, bearer, { accept: ACCEPT });
+      const digest = top.headers.get('docker-content-digest');
+      let manifest = await top.json();
+      if (Array.isArray(manifest.manifests)) { // an index: take the linux/amd64 image, never an attestation
+        const pick = manifest.manifests.find((m) => m.platform?.os === 'linux' && m.platform?.architecture === 'amd64')
+          ?? manifest.manifests.find((m) => m.platform?.architecture && m.platform.architecture !== 'unknown');
+        if (!pick?.digest) throw new Error('image index has no usable platform manifest');
+        manifest = await (await get(`https://ghcr.io/v2/${image}/manifests/${pick.digest}`, bearer, { accept: ACCEPT })).json();
+      }
+      const cfgDigest = manifest.config?.digest;
+      if (!cfgDigest) throw new Error('manifest has no config digest');
+      const cfg = await (await get(`https://ghcr.io/v2/${image}/blobs/${cfgDigest}`, bearer)).json();
+      const labels = cfg.config?.Labels ?? cfg.config?.labels ?? {};
+      const commit = labels['io.osaas.repo.commit'];
+      if (!/^[0-9a-f]{40}$/.test(String(commit))) throw new Error('image has no usable io.osaas.repo.commit label');
+      if (!digest) throw new Error('registry returned no docker-content-digest');
+      return { digest, commit };
     },
   };
 }

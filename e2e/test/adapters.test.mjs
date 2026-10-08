@@ -1,21 +1,48 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { localSource, oscInstanceAdapter, healthProbe, SERVICE_ID } from '../runner/adapters.mjs';
+import { registryAdapter, oscInstanceAdapter, healthProbe, SERVICE_ID } from '../runner/adapters.mjs';
 
 const COMMIT = 'c'.repeat(40);
+const res = (status, body, headers = {}) => ({ ok: status >= 200 && status < 300, status, json: async () => body, headers: { get: (k) => headers[k.toLowerCase()] ?? null } });
 
-test('localSource: commit from git, digest from scripts/source-digest.mjs of the checkout', async () => {
-  const calls = [];
-  const exec = (cmd, args, opts) => { calls.push([cmd, ...args]); return cmd === 'git' ? `${COMMIT}\n` : '6c7c967485812293\n'; };
-  const r = await localSource({ repoRoot: '/repo', exec }).expected();
-  assert.deepEqual(r, { commit: COMMIT, sourceDigest: '6c7c967485812293' });
-  assert.deepEqual(calls[0], ['git', 'rev-parse', 'HEAD']);
-  assert.deepEqual(calls[1], ['node', 'scripts/source-digest.mjs', '/repo']);
+// A fake GHCR: token endpoint, an image index with an attestation entry, an amd64 manifest, and the config blob.
+function fakeRegistry({ labels = { 'io.osaas.repo.commit': COMMIT }, index = true, tokenStatus = 200, blobKey = 'Labels' } = {}) {
+  const seen = [];
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url); seen.push([u, init.headers]);
+    if (u.includes('/token')) return tokenStatus === 200 ? res(200, { token: 'BEARER' }) : res(tokenStatus, {});
+    if (u.endsWith('/manifests/latest')) {
+      return index
+        ? res(200, { manifests: [{ digest: 'sha256:att', platform: { os: 'unknown', architecture: 'unknown' } }, { digest: 'sha256:amd', platform: { os: 'linux', architecture: 'amd64' } }] }, { 'docker-content-digest': 'sha256:indexdigest' })
+        : res(200, { config: { digest: 'sha256:cfg' } }, { 'docker-content-digest': 'sha256:manifestdigest' });
+    }
+    if (u.endsWith('/manifests/sha256:amd')) return res(200, { config: { digest: 'sha256:cfg' } });
+    if (u.endsWith('/blobs/sha256:cfg')) return res(200, { config: { [blobKey]: labels } });
+    return res(404, {});
+  };
+  return { seen, fetchImpl };
+}
+const regOpts = { user: 'u', token: 'p' };
+
+test('registry: token exchange (Basic), index -> linux/amd64 manifest -> config labels; returns tag digest and commit', async () => {
+  const { seen, fetchImpl } = fakeRegistry();
+  const r = await registryAdapter({ ...regOpts, fetchImpl }).latest();
+  assert.deepEqual(r, { digest: 'sha256:indexdigest', commit: COMMIT });
+  assert.match(seen[0][0], /ghcr\.io\/token.*scope=repository:eyevinn-osaas\/open-videocore:pull/);
+  assert.equal(seen[0][1].authorization, `Basic ${Buffer.from('u:p').toString('base64')}`);
+  assert.ok(seen.slice(1).every(([, h]) => h.authorization === 'Bearer BEARER'));
+  assert.ok(!seen.some(([u]) => u.endsWith('/manifests/sha256:att')), 'the attestation entry is never fetched');
 });
 
-test('localSource: refuses a malformed commit or an empty digest', async () => {
-  await assert.rejects(localSource({ repoRoot: '/r', exec: (c) => (c === 'git' ? 'nonsense' : 'd') }).expected(), /commit sha/);
-  await assert.rejects(localSource({ repoRoot: '/r', exec: (c) => (c === 'git' ? COMMIT : '') }).expected(), /printed nothing/);
+test('registry: a plain manifest (no index) and lowercase "labels" both work', async () => {
+  const { fetchImpl } = fakeRegistry({ index: false, blobKey: 'labels' });
+  assert.equal((await registryAdapter({ ...regOpts, fetchImpl }).latest()).commit, COMMIT);
+});
+
+test('registry: 401 on the token exchange, a missing label, or a malformed label are errors', async () => {
+  await assert.rejects(registryAdapter({ ...regOpts, fetchImpl: fakeRegistry({ tokenStatus: 401 }).fetchImpl }).latest(), /HTTP 401/);
+  await assert.rejects(registryAdapter({ ...regOpts, fetchImpl: fakeRegistry({ labels: {} }).fetchImpl }).latest(), /io\.osaas\.repo\.commit/);
+  await assert.rejects(registryAdapter({ ...regOpts, fetchImpl: fakeRegistry({ labels: { 'io.osaas.repo.commit': '../x' } }).fetchImpl }).latest(), /io\.osaas\.repo\.commit/);
 });
 
 // A fake @osaas/client-core that records every call.
