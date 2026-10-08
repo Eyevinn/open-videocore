@@ -41,6 +41,8 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import { completeTranscode, type CallbackRendition } from './transcode.js';
 import type { PipelineLogSink } from '../services/pipeline-log.js';
 import { dispatchTranscodeCompletionEvents } from './transcode-completion-events.js';
+// #1060: structured source-read failure detail for the failed `transcode` step.
+import { buildSourceReadErrorDetail } from './encore-source-read-failure.js';
 import type { WebhookDispatcher } from '../services/webhook-dispatcher.js';
 import { decodeEncoreJobId } from '../data/job-repo.js';
 import {
@@ -955,10 +957,23 @@ async function handleMessageInStack(deps: PollerDeps, raw: string): Promise<void
       const tIdx = steps.findIndex((s) => s.name === 'transcode' && s.encoreJobId === externalId);
 
       if (!success) {
+        const failureText = job.message ?? `encore status: ${status}`;
+        // #1060: when the failure is a SOURCE-READ failure (the storage answered
+        // 404/403 for the input object, or the connection to it failed), attach
+        // the structured detail alongside the unchanged free text. Same builder
+        // the other two settle paths use (failed-transcode-reconciler.ts
+        // releasePipelineLock, routes/internal.ts), so the same Encore message
+        // yields the same detail whichever path observed the failure.
+        const errorDetail = buildSourceReadErrorDetail({
+          failureText,
+          encoreJobId: externalId,
+          assetId: found.job.assetId
+        });
         steps[tIdx] = {
           ...steps[tIdx],
           status: 'failed',
-          error: job.message ?? `encore status: ${status}`,
+          error: failureText,
+          ...(errorDetail ? { errorDetail } : {}),
           completedAt: now
         };
         await deps.pipelineRepository.update(execution.id, { steps, status: 'failed' });

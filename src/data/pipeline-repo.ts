@@ -11,6 +11,7 @@
 
 import { monotonicFactory } from 'ulid';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
+import type { StepErrorDetail } from '../pipeline/step-error-detail.js';
 
 const ulid = monotonicFactory();
 
@@ -46,6 +47,17 @@ export type StepExecution = {
   jobId?: string; // internal job repo ID (transcode steps)
   encoreJobId?: string; // Encore external job ID (transcode steps)
   error?: string;
+  // Machine-readable companion to `error` for the failure classes we can
+  // recognise (issue #1060). ADDITIVE and OPTIONAL in exactly the way
+  // `skipReason` below is: `error` keeps carrying the same free text it always
+  // did, the status enum is untouched, and a failure we cannot classify simply
+  // leaves this absent. Present today only for `source_read_failed` — a
+  // transcode whose SOURCE object could not be read (404/403/connection), where
+  // it carries the redacted source location, the HTTP status, and the
+  // transcoder job + asset ids so the caller does not have to open the
+  // transcoder job and then the bucket to find out the key is missing. Built by
+  // buildSourceReadErrorDetail (src/pipeline/encore-source-read-failure.ts).
+  errorDetail?: StepErrorDetail;
   // Why a `skipped` step did not run (issue #789), e.g. the optional service
   // instance for this stack is unconfigured. Only set when status is `skipped`;
   // `error` stays reserved for genuine failures.
@@ -221,7 +233,22 @@ export class InMemoryPipelineRepository implements PipelineRepository {
 function clone(execution: PipelineExecution): PipelineExecution {
   return {
     ...execution,
-    steps: execution.steps.map((s) => ({ ...s })),
+    // `errorDetail` (#1060) is the only nested object on a step, so it is copied
+    // explicitly — a shallow step spread would otherwise hand callers a
+    // reference into the store.
+    steps: execution.steps.map((s) => ({
+      ...s,
+      ...(s.errorDetail !== undefined
+        ? {
+            errorDetail: {
+              ...s.errorDetail,
+              ...(s.errorDetail.source !== undefined
+                ? { source: { ...s.errorDetail.source } }
+                : {})
+            }
+          }
+        : {})
+    })),
     ...(execution.resolvedOutputLocation !== undefined
       ? { resolvedOutputLocation: { ...execution.resolvedOutputLocation } }
       : {}),

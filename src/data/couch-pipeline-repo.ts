@@ -18,6 +18,7 @@ import type {
   StepExecution
 } from './pipeline-repo.js';
 import type { PipelineStepName } from '../pipeline/pipelines.js';
+import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
 import type { StoredDoc, StackCouch } from './couchdb.js';
 import { monotonicFactory } from 'ulid';
 
@@ -169,12 +170,19 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
   const rawSteps = Array.isArray(doc['steps']) ? (doc['steps'] as unknown[]) : [];
   const steps: StepExecution[] = rawSteps.map((s) => {
     const step = s as Record<string, unknown>;
+    const errorDetail = toStepErrorDetail(step['errorDetail']);
     return {
       name: step['name'] as PipelineStepName,
       status: step['status'] as StepExecution['status'],
       jobId: step['jobId'] as string | undefined,
       encoreJobId: step['encoreJobId'] as string | undefined,
       error: step['error'] as string | undefined,
+      // Structured failure detail (#1060). `toDoc` persists whole step objects,
+      // so the write side already round-trips it; this read side has to name it
+      // explicitly because the mapper rebuilds steps field by field. Validated
+      // against the response contract on the way out, so a malformed document
+      // degrades to "no detail" instead of 500ing the GET that reads it.
+      ...(errorDetail !== undefined ? { errorDetail } : {}),
       startedAt: step['startedAt'] as string | undefined,
       completedAt: step['completedAt'] as string | undefined,
       progress: step['progress'] as number | undefined
@@ -207,6 +215,34 @@ function fromDoc(doc: StoredDoc): PipelineExecution {
 function stripPartition(id: string): string {
   const idx = id.indexOf(':');
   return idx >= 0 ? id.slice(idx + 1) : id;
+}
+
+// Narrow a stored `steps[].errorDetail` value to a StepErrorDetail (#1060), or
+// give back undefined so the step hydrates with NO detail.
+//
+// Why validate here rather than just checking "is it an object": this mapper
+// feeds GET /api/v1/pipelines[/:executionId] and the three asset execution
+// routes, all of which serialize the step through `stepExecutionSchema`, whose
+// `errorDetail` member IS `stepErrorDetailSchema`
+// (src/pipeline/step-error-detail.ts:106-151, embedded at
+// src/routes/pipelines.ts and src/routes/assets.ts). That schema requires
+// `code` to be one of STEP_ERROR_CODES and `message` to be a string, and — if
+// `source` is present at all — requires `source.url` to be a string. A stored
+// document whose `errorDetail` were `{}`, a string, or `{ source: {} }` would
+// pass an "is it an object" check, hydrate, and then fail serialization,
+// turning a read of one bad document into a 500. Parsing with the response
+// schema itself means the only values that reach a StepExecution are values the
+// response can actually carry; anything else degrades to "no detail", which is
+// exactly the pre-#1060 behaviour.
+//
+// Parsing (rather than casting) is also what makes this type-safe without an
+// assertion: `stepErrorDetailSchema` and `StepErrorDetail` are asserted
+// mutually assignable at src/pipeline/step-error-detail.ts:155-161, so the
+// parsed output needs no cast. zod strips unknown keys, so the hydrated detail
+// is a fresh object containing only contract fields.
+function toStepErrorDetail(value: unknown): StepExecution['errorDetail'] {
+  const parsed = stepErrorDetailSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 // Narrow a stored value to the { bucket, prefix } resolved-location shape
