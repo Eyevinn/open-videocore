@@ -500,6 +500,44 @@ tr.row-locked td:first-child {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* Pre-flight block flag next to a destructive control (issue #921). The reason a
+   delete is already known to be refused, stated in words beside the button so
+   the operator reads it BEFORE activating anything — colour carries nothing here
+   (WCAG 1.4.1) and the text is wired to the button with aria-describedby, so it
+   is announced with the control rather than only on hover.
+
+   The control itself is deliberately NOT disabled: `.action-blocked` keeps it
+   enabled and focusable so its explanation stays reachable (the trade
+   docs/ux/asset-lock-state-spec.md §5.1 settled for the asset archive). */
+.action-blocked-note {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+/* Blocked variant of a danger button. Deliberately NO `opacity`: compositing
+   the whole control dragged its 13px label (`button, .btn` sets font-size 13px)
+   down to ~2.95:1, under the 4.5:1 WCAG 1.4.3 floor for normal text and under
+   the 3:1 of 1.4.11 — and dimming is the wrong signal anyway for a control that
+   stays enabled on purpose. The state is already carried in words by
+   `.action-blocked-note` (--text-muted on --bg, 7.36:1) and wired to the button
+   with aria-describedby, so the visual treatment only has to be
+   non-destructive. Two cues, neither of them load-bearing (colour alone never
+   says "blocked" — WCAG 1.4.1):
+     - a left accent strip, the same device as tr.row-locked and .lock-block;
+     - a brighter label, measured against the button's composited fill
+       (rgba(239, 68, 68, 0.15) over --bg => #31191e, over --surface => #3a232b):
+       #f87171 gives 5.92:1 on --bg and 5.22:1 on --surface. The unblocked
+       var(--danger) label measures 4.35:1 / 3.83:1 on the same fills, so the
+       blocked state is the HIGHER-contrast one — it is never the dimmer of the
+       two. */
+.btn-danger.action-blocked {
+  box-shadow: inset 3px 0 0 var(--danger);
+  color: #f87171;
+}
+
 /* "Delete protection" block on the asset detail view (issue #895). Text only —
    the lock is never carried by colour or shape alone (WCAG 1.4.1). The left
    accent is the same indigo as the list flag so the two surfaces read as one
