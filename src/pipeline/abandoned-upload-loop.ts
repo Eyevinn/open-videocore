@@ -91,6 +91,10 @@ export type AbandonedUploadSweepLoopOptions = {
   // The current settle threshold (ms), read every tick. 0/disabled skips the
   // sweep entirely.
   thresholdMs(): number;
+  // Run one tick's sweep once per provisioned stack (issue #1098). Bound in
+  // main.ts to perStackSweepRunner (src/services/for-each-stack.ts); unset, the
+  // sweep runs exactly once, as before. Mirrors ArchivedAssetPurgeLoop.
+  forEachStack?(run: () => Promise<void>): Promise<void>;
   logger?: Logger;
 };
 
@@ -130,22 +134,31 @@ export class AbandonedUploadSweepLoop {
   }
 
   // One tick: read the live threshold and run the sweep unless the threshold is
-  // unset (0/disabled), in which case the sweep is skipped entirely.
+  // unset (0/disabled), in which case the sweep is skipped entirely. The
+  // threshold is instance-global, so it is read ONCE per tick and the same value
+  // applies to every stack swept below.
   async tick(): Promise<void> {
     const thresholdMs = this.options.thresholdMs();
     if (!Number.isFinite(thresholdMs) || thresholdMs <= 0) {
       return; // threshold unset — never settle (skip the sweep entirely)
     }
-    const result = await settleAbandonedUploads({
-      ...this.options.sweepDeps,
-      thresholdMs
-    });
-    if (result.settled > 0) {
-      this.options.logger?.info?.(
-        '[abandoned-upload-sweep] tick complete: scanned=%d settled=%d',
-        result.scanned,
-        result.settled
-      );
-    }
+    const runSweep = async (): Promise<void> => {
+      const result = await settleAbandonedUploads({
+        ...this.options.sweepDeps,
+        thresholdMs
+      });
+      if (result.settled > 0) {
+        this.options.logger?.info?.(
+          '[abandoned-upload-sweep] tick complete: scanned=%d settled=%d',
+          result.scanned,
+          result.settled
+        );
+      }
+    };
+    // Once per provisioned stack when wired (issue #1098); otherwise exactly
+    // once, unchanged.
+    const perStack = this.options.forEachStack?.bind(this.options);
+    if (perStack) await perStack(runSweep);
+    else await runSweep();
   }
 }
