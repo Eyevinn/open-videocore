@@ -26,8 +26,8 @@
 //
 // The OSC call itself is injected as a `SceneDetector` so it can be stubbed in
 // tests and swapped without touching the orchestration logic, and — crucially —
-// so the un-contract-verified runtime wire shape stays isolated in exactly one
-// place (osc-scene-detect.ts).
+// so the runtime wire shape stays isolated in exactly one place
+// (osc-scene-detect.ts).
 //
 // Contract sources (runtime shape confirmed 2026-09-25, issue #797):
 //   - eyevinn-function-scenes ("Scene Detect Media Function"), get-service-schema:
@@ -36,17 +36,22 @@
 //     config, NOT the runtime endpoint's request/response wire shape.
 //   - The runtime shape was instead confirmed from the upstream service source
 //     `Eyevinn/function-scenes` @ 492a18f23e253194c27800563ea0c96bef187aef —
-//     `api.json` (`#/model/request.medialocator`, `#/model/createJobResponse`) and
-//     the `index.js` route table. It is an ASYNC JOB API rooted at `/api/v1`, and
-//     it returns only keyframe image URIs — see
+//     `api.json` (`#/model/request.medialocator`, `#/model/createJobResponse`,
+//     `#/model/job.state`) and the `index.js` route table. It is an ASYNC JOB API
+//     rooted at `/api/v1`, and it returns only keyframe image URIs — see
 //     docs/investigations/797-function-scenes-runtime-contract.md.
 //   - services/stack.ts SCENE_DETECT_SERVICE_ID.
 //
-// NOTE (#798): the confirmed service returns NO scene-boundary timecodes, so the
-// `scenes`/`cuts` result modelled below cannot be populated from it as things
-// stand. `sceneMetadata` needs re-scoping (keyframe URIs, or a different source
-// for cut timecodes) before this step can work end to end; the types are left
-// unchanged here because #797 is contract-confirmation only.
+// NOTE (#798): osc-scene-detect.ts now speaks that confirmed contract (POST
+// /api/v1 + `medialocator`, then poll the returned status endpoint), so runs no
+// longer 405. But the service still returns NO scene-boundary timecodes, so the
+// `scenes`/`cuts` result modelled below cannot be populated from it. That makes
+// this step a PARTIAL fix, not a completion of #798: a successful run cannot write
+// scene boundaries, so it writes no `sceneMetadata` at all (see
+// `boundariesUnavailable` below) rather than claiming `sceneCount: 0`. Making the
+// step useful end to end needs `sceneMetadata` re-scoped (keyframe URIs, which is an
+// openapi.json change and therefore a ux/architect call) or a different source for
+// cut timecodes, so the types are left unchanged here.
 
 import type { AssetRepository, SceneMetadata, SceneBoundary } from '../data/asset-repo.js';
 import type { WorkspaceStorage } from '../data/storage.js';
@@ -62,14 +67,11 @@ export function sceneUrlTtlSeconds(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SCENE_URL_TTL_SECONDS;
 }
 
-// The raw result a `SceneDetector` returns for one detection run. Kept permissive
-// (every field optional) — originally because the wire shape was unverified, and
-// now because the confirmed eyevinn-function-scenes contract produces NEITHER of
-// these fields (see file header + #798): the parser below defends every field, so
-// a real run degrades to "no scenes" rather than throwing. A detector may report
-// boundaries as either a list of structured cut
-// points (`scenes`) or a bare list of cut timecodes in seconds (`cuts`); the
-// orchestrator normalizes either into our SceneMetadata shape.
+// The raw result a `SceneDetector` returns for one detection run. A detector may
+// report boundaries as either a list of structured cut points (`scenes`) or a bare
+// list of cut timecodes in seconds (`cuts`); the orchestrator normalizes either into
+// our SceneMetadata shape. Both stay optional so a detector can report only the
+// style it has.
 export type SceneDetectorResult = {
   // Structured scene/shot descriptors, when the function reports them directly.
   scenes?: Array<{
@@ -83,6 +85,14 @@ export type SceneDetectorResult = {
   // reports only the transitions. The orchestrator derives [start,end) windows
   // from consecutive cuts.
   cuts?: number[];
+  // Set when the run SUCCEEDED but the backing service structurally cannot report
+  // cut timecodes, so "no boundaries" is a property of the service rather than of
+  // the video. This is the case for the confirmed eyevinn-function-scenes contract
+  // today (see file header + osc-scene-detect.ts). It exists so that outcome is
+  // distinguishable from a genuine no-cut video: `detectScenes` declines to write a
+  // zero-boundary `sceneMetadata` record in this case instead of asserting
+  // `sceneCount: 0`. It is NOT a failure, so it never becomes `sceneDetectionError`.
+  boundariesUnavailable?: { reason: string };
 };
 
 // Calls the OSC scene-detection function against a presigned source URL and
@@ -97,8 +107,17 @@ function isFiniteNumber(value: unknown): value is number {
 
 // Normalize a raw detector result into our SceneMetadata shape. Handles both
 // reporting styles (structured `scenes` or bare `cuts`); when both are present
-// the structured `scenes` list wins. Defends every field because the wire shape
-// is unverified — malformed/partial entries are skipped rather than throwing.
+// the structured `scenes` list wins. Every field is still defended — a detector is
+// an external service, so malformed/partial entries are skipped rather than
+// throwing.
+//
+// NOTE (#798): both branches below are currently UNREACHABLE from the only shipped
+// detector. The confirmed eyevinn-function-scenes contract returns neither `scenes`
+// nor `cuts` (it has no cut timecodes at all), so `makeOscSceneDetector` always
+// reports `boundariesUnavailable` and `detectScenes` never reaches this function.
+// They are kept — not dead code to delete — because they are the target shape for
+// whichever source of cut timecodes the pending `sceneMetadata` re-scope picks
+// (see the file header); do not read them as live code paths until then.
 export function parseSceneResult(result: SceneDetectorResult, now: string): SceneMetadata {
   const boundaries: SceneBoundary[] = [];
 
@@ -150,6 +169,9 @@ export type DetectScenesDeps = {
   ttlSeconds?: number;
   // Test observability hook fired on a recorded failure.
   onError?: (err: unknown) => void;
+  // Observability hook fired when the run succeeded but the detector reported that
+  // boundaries are structurally unavailable, so nothing was written.
+  onBoundariesUnavailable?: (reason: string) => void;
 };
 
 // Run one scene detection to completion. NEVER throws: on any failure it records
@@ -158,6 +180,8 @@ export type DetectScenesDeps = {
 //
 // On success: writes `sceneMetadata` (which clears any prior error).
 // On failure: writes `sceneMetadata: null` + `sceneDetectionError`.
+// When the detector reports `boundariesUnavailable` and produced no boundaries:
+// writes NOTHING (see below).
 export async function detectScenes(
   params: DetectScenesParams,
   deps: DetectScenesDeps
@@ -168,6 +192,20 @@ export async function detectScenes(
     const presignedUrl = await deps.storage.presignedGet(objectKey, ttl);
     const result = await deps.detect(presignedUrl);
     const metadata = parseSceneResult(result, new Date().toISOString());
+
+    // The detector succeeded but told us it structurally cannot report cut
+    // timecodes (#798 — eyevinn-function-scenes returns keyframe images only).
+    // Persisting `{ boundaries: [], sceneCount: 0 }` here would assert "this video
+    // has no scene cuts", which a consumer cannot tell apart from a genuine
+    // single-shot video and which would be wrong for EVERY input. So write nothing:
+    // `sceneMetadata` stays absent, meaning "no scene metadata is available", which
+    // IS distinguishable from a real zero-boundary result. It is not an error
+    // either, so `sceneDetectionError` is deliberately left clear.
+    if (result.boundariesUnavailable && metadata.boundaries.length === 0) {
+      deps.onBoundariesUnavailable?.(result.boundariesUnavailable.reason);
+      return;
+    }
+
     // Detection annotates the asset only; it never drives the lifecycle state
     // machine (the ingest/transcode paths own status transitions).
     await deps.assets.update(assetId, { sceneMetadata: metadata });
