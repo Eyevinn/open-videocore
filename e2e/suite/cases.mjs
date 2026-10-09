@@ -141,12 +141,17 @@ export const cases = [
     id: 'transcode',
     chain: true,
     async run(ctx) {
+      // Use a NAMED profile whose output the packager can package. The first runnable profile in the list is
+      // `archive` (DNxHD video + 24-bit PCM audio in MXF), which Shaka Packager rejects with "Failed to detect the
+      // container type" (seen 2026-10-09 in the packager log), so the package case then waits for manifest URLs that never
+      // come. `program` is the standard x264 profile. Inline `customProfile.outputs` is rejected by the product
+      // (open-videocore #1022), so there is no custom fallback.
+      const wanted = ctx.config.transcodeProfile ?? 'program';
       const list = await ctx.client.request('GET', '/api/v1/profiles/');
       expectStatus(list, 200);
-      const runnable = (list.body?.items ?? []).find((p) => p.runnable)?.name ?? list.body?.profiles?.[0];
-      const json = runnable
-        ? { profile: runnable }
-        : { customProfile: { name: `e2e-${ctx.config.runId}`, outputs: [{ label: '360p', width: 640, height: 360, videoBitrateBps: 800_000, audioBitrateBps: 64_000, format: 'mp4' }] } };
+      const names = new Set([...(list.body?.profiles ?? []), ...(list.body?.items ?? []).map((p) => p.name)]);
+      if (!names.has(wanted)) fail(`transcode profile "${wanted}" is not on the instance; available: ${[...names].slice(0, 20).join(', ') || 'none'}`);
+      const json = { profile: wanted };
       const r = await ctx.client.request('POST', `/api/v1/assets/${ctx.state.assetId}/transcode`, { json });
       expectStatus(r, 202);
       if (!r.body?.jobId) fail('202 response lacks jobId');
@@ -165,11 +170,29 @@ export const cases = [
       });
       expectStatus(r, 202);
       if (r.body?.ok !== true) fail('202 response is not {ok:true}');
-      if (r.body.jobId) await waitForJob(ctx, r.body.jobId, ctx.config.timeouts.packageMs, 'package job');
-      const asset = await poll(async () => {
-        const a = await getAsset(ctx);
-        return a.packagingError || a.manifestUrls?.hls || a.manifestUrls?.dash ? a : undefined;
-      }, { timeoutMs: ctx.config.timeouts.packageMs, intervalMs: ctx.config.pollMs, sleep: ctx.sleep, now: ctx.now, what: 'manifestUrls' });
+      ctx.state.packageJobId = r.body.jobId;
+      const explain = async (why) => {
+        // Say what the product knows when packaging does not complete: the package job's state and error.
+        let extra = '';
+        if (ctx.state.packageJobId) {
+          const j = await ctx.client.request('GET', `/api/v1/jobs/${encodeURIComponent(ctx.state.packageJobId)}`);
+          if (j.status === 200) extra = `; package job is ${j.body?.status}${j.body?.error ? `: ${String(j.body.error).slice(0, 200)}` : ''}`;
+        }
+        fail(`${why}${extra}`);
+      };
+      if (r.body.jobId) {
+        try { await waitForJob(ctx, r.body.jobId, ctx.config.timeouts.packageMs, 'package job'); } catch (e) {
+          if (e instanceof CaseFailure) throw e;
+          await explain(String(e.message));
+        }
+      }
+      let asset;
+      try {
+        asset = await poll(async () => {
+          const a = await getAsset(ctx);
+          return a.packagingError || a.manifestUrls?.hls || a.manifestUrls?.dash ? a : undefined;
+        }, { timeoutMs: ctx.config.timeouts.packageMs, intervalMs: ctx.config.pollMs, sleep: ctx.sleep, now: ctx.now, what: 'manifestUrls' });
+      } catch (e) { await explain(String(e.message)); }
       if (asset.packagingError) fail(`packagingError: ${String(asset.packagingError).slice(0, 300)}`);
     },
   },

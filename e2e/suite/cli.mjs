@@ -13,7 +13,7 @@ const result = await runSuite({
   client: createClient({ baseUrl, token }),
   anon: createClient({ baseUrl }),
   ingress: createClient({ baseUrl, token, appToken: '' }),
-  config: { runId, sourceUrl, expectCommit: process.env.EXPECT_COMMIT },
+  config: { runId, sourceUrl, expectCommit: process.env.EXPECT_COMMIT, transcodeProfile: process.env.E2E_TRANSCODE_PROFILE },
 });
 console.log(JSON.stringify(result, null, 2));
 process.exit(result.status === 'green' ? 0 : 1);
