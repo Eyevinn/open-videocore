@@ -56,13 +56,15 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
         a.thumbnails = ['thumb0.jpg']; return json(res, 200, { assetId: a.id, thumbnails: a.thumbnails });
       }
       if (req.method === 'POST' && sub === '/transcode') {
+        calls.push(`PROFILE ${body.profile}`);
         const jobId = randomUUID(); jobs.set(jobId, { id: jobId, type: 'transcode', assetId: a.id, status: 'done', encoreJobId: 'enc1' });
         a.renditions = [{ id: 'r1', label: '360p', width: 640, height: 360, objectKey: 'k' }];
         return json(res, 202, { jobId, encoreJobId: 'enc1' });
       }
       if (req.method === 'POST' && sub === '/package') {
-        const jobId = randomUUID(); jobs.set(jobId, { id: jobId, type: 'package', assetId: a.id, status: 'done' });
-        if (faults.packagingError) a.packagingError = 'packager failed'; else a.manifestUrls = { hls: 'http://x/master.m3u8' };
+        const jobId = randomUUID(); jobs.set(jobId, { id: jobId, type: 'package', assetId: a.id, status: faults.silentPackager ? 'running' : 'done' });
+        if (faults.silentPackager) { /* the packager failed and never called back: no manifestUrls, no packagingError */ }
+        else if (faults.packagingError) a.packagingError = 'packager failed'; else a.manifestUrls = { hls: 'http://x/master.m3u8' };
         return json(res, 202, { ok: true, jobId });
       }
     }
@@ -71,7 +73,10 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
       const hits = faults.searchEmpty ? [] : [...assets.values()].filter((a) => a.name === q);
       return json(res, 200, { assets: hits, collections: [], collectionTotal: 0, page: 1, total: hits.length });
     }
-    if (req.method === 'GET' && p === '/api/v1/profiles/') return json(res, 200, { profiles: ['default'], items: [{ name: 'default', yaml: '', runnable: true, createdAt: 'a', updatedAt: 'b' }] });
+    if (req.method === 'GET' && p === '/api/v1/profiles/') {
+      const names = faults.noProgramProfile ? ['archive'] : ['archive', 'program']; // `archive` first, as on the real instance
+      return json(res, 200, { profiles: names, items: names.map((name) => ({ name, yaml: '', runnable: true, createdAt: 'a', updatedAt: 'b' })) });
+    }
     return json(res, 404, { error: 'not found', p });
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({

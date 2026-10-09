@@ -145,3 +145,31 @@ test('an asset that never leaves processing times out as a failure', async () =>
   assert.equal(byId(result)['ingest-url'].status, 'fail');
   assert.match(byId(result)['ingest-url'].detail, /timed out.*to leave processing/);
 });
+
+test('transcode uses the named profile `program`, not the first profile in the list (which is `archive`)', async () => {
+  const mock = await startMock();
+  try {
+    const result = await runSuite({ client: createClient({ baseUrl: mock.baseUrl, token: mock.token }), anon: createClient({ baseUrl: mock.baseUrl }), ingress: createClient({ baseUrl: mock.baseUrl, token: mock.token, appToken: '' }), config: fastCfg });
+    assert.equal(result.status, 'green');
+    assert.deepEqual(mock.calls.filter((c) => c.startsWith('PROFILE')), ['PROFILE program']);
+  } finally { await mock.close(); }
+});
+
+test('E2E_TRANSCODE_PROFILE overrides the profile; one that is not on the instance fails with the available names', async () => {
+  const { result } = await run({}, { transcodeProfile: 'x264-nonexistent' });
+  const c = byId(result);
+  assert.equal(c.transcode.status, 'fail');
+  assert.match(c.transcode.detail, /profile "x264-nonexistent" is not on the instance; available: archive, program/);
+  assert.equal(c.package.status, 'skipped');
+  const noProgram = await run({ noProgramProfile: true });
+  assert.match(byId(noProgram.result).transcode.detail, /profile "program" is not on the instance; available: archive/);
+});
+
+test('a packager that fails silently is reported with the package job state, not as a bare timeout', async () => {
+  const { result } = await run({ silentPackager: true });
+  const c = byId(result);
+  assert.equal(c.package.status, 'fail');
+  assert.match(c.package.detail, /timed out/);
+  assert.match(c.package.detail, /package job is running/);
+  for (const id of ['search', 'tags-roundtrip', 'delete']) assert.equal(c[id].status, 'skipped', id);
+});

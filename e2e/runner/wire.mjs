@@ -26,7 +26,7 @@ export async function buildDeps(env) {
       client: createClient({ baseUrl: inst.baseUrl, token: inst.token }),
       anon: createClient({ baseUrl: inst.baseUrl }),
       ingress: createClient({ baseUrl: inst.baseUrl, token: inst.token, appToken: '' }),
-      config: { secrets, runId: new Date().toISOString().replace(/\D/g, '').slice(0, 14), sourceUrl, expectCommit: expected.commit },
+      config: { secrets, runId: new Date().toISOString().replace(/\D/g, '').slice(0, 14), sourceUrl, expectCommit: expected.commit, transcodeProfile: env.E2E_TRANSCODE_PROFILE },
     }),
   };
 }
