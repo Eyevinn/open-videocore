@@ -101,6 +101,10 @@ import {
   applyTableState,
   SORT_DIR,
 } from './table-url-state.js';
+// Muted empty state for placeholder-less filter controls (issues #984, #983 AC2).
+// The class name is a CSS contract, so it is imported rather than restated — see
+// public/filter-unset.js.
+import { wireUnset } from './filter-unset.js';
 
 // ─── Contract-grounded constants (verified above) ────────────────────────────
 
@@ -251,10 +255,16 @@ function tableSortToUrlSort(sort) {
 // cursor table: a new filter starts a fresh cursor walk). Initial values come
 // from the decoded URL state so a shared link reconstructs the controls.
 
+// The caption span carries `ops-filter-caption` so the bar's caption typography
+// (`.ops-table-filters .ops-filter-caption` in public/style.css, issue #983) can
+// be keyed off a named hook instead of "any span inside a filter label" — the
+// structural selector it replaced also caught the Assets hint spans
+// (`.form-hint.ops-filter-hint`) and uppercased whole help sentences.
 function labelledControl(className, labelText, control, ariaLabel) {
   const wrap = document.createElement('label');
   wrap.className = className;
   const span = document.createElement('span');
+  span.className = 'ops-filter-caption';
   span.textContent = labelText;
   if (ariaLabel) control.setAttribute('aria-label', ariaLabel);
   wrap.appendChild(span);
@@ -270,6 +280,14 @@ function dateFilterControl(name, labelText, initial) {
     input.addEventListener('change', function () {
       onChange(input.value);
     });
+    // An empty date box reads as unset here exactly as it does in the Jobs bar
+    // (issue #983 AC2 — the two bars must look the same, including when nothing
+    // is filtered). wireUnset() marks it now and on every change/input;
+    // `.ops-table-filters input[type='date'].is-unset` in public/style.css mutes
+    // the UA's yyyy-mm-dd hint. Logs has no <select> in its bar, so the date
+    // boxes are the only placeholder-less controls on this side — the Message box
+    // is covered by its native ::placeholder.
+    wireUnset(input);
     return labelledControl('ops-filter-' + name, labelText, input, labelText);
   };
 }

@@ -2862,23 +2862,55 @@ body.detail-standalone .assets-side {
   gap: 4px;
 }
 
-.ops-filter-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-muted);
-}
+/* Caption typography for the whole bar lives in one rule further down
+   (`.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-caption`,
+   issue #983) rather than being split between here and the Assets-side
+   `label > span` rule — the two had drifted to different casing and weight. This
+   class is kept as the Jobs/Audit caption hook only. */
 
+/* One colour system for every control in the shared bar (issue #983). The Jobs
+ * controls carry the `.ops-filter-*` classes; the Assets (public/assets-table.js)
+ * and Logs (public/logs-table.js) controls are bare `select` / `input[type=date]`
+ * / `input[type=search]` nested in the bar, so match them by type here rather than
+ * leaving them to fall through to the white user-agent defaults. Typed input
+ * selectors are deliberate: a bare `input` would also paint the column-chooser
+ * checkboxes (.ops-columns-item input).
+ *
+ * ONE EXCEPTION, pre-dating this issue and left alone by it: Audit's action box
+ * (public/audit-table.js:349-353) is an `input[type=text].ops-filter-search`, and
+ * the house input rule at the top of this file (`input[type="text"], …`, (0,1,1))
+ * outranks the `.ops-filter-search` selector below ((0,1,0)), so that one box
+ * keeps var(--bg) #0f1117 and the 6px var(--radius) instead of var(--surface) and
+ * 4px. It is already dark and legible, and #983 AC2 scopes "visually identical"
+ * to the Jobs, Assets and Logs bars, so widening the repaint to Audit is a
+ * separate change rather than a silent ride-along here.
+ *
+ * COLOUR ONLY — do not add font or padding here. The type-qualified selectors are
+ * (0,2,1)/(0,1,1), so any geometry declaration would outrank the padding that
+ * `.ops-table-filters .ops-search-input` (issue #946, declared below) uses to
+ * reserve room for the magnifier and the clear control, and typed text would run
+ * underneath them. Geometry for every control in the bar comes from
+ * `.ops-table-filters select, .ops-table-filters input` below.
+ *
+ * `color-scheme: dark` belongs here alongside the background: the parts the UA
+ * draws for itself — the fallback placeholder rendering, the date field's
+ * yyyy-mm-dd hint, its calendar picker indicator, the search field's own
+ * affordances — follow the used colour scheme, not our `color`. Without it they
+ * keep painting light-mode onto a now-dark field. The app is single-theme (`:root`
+ * at the top of this file declares the dark palette unconditionally, and there is
+ * no `prefers-color-scheme` branch anywhere in the sheet), so this is
+ * unconditional too. */
 .ops-filter-select,
 .ops-filter-date,
-.ops-filter-search {
-  font: inherit;
-  font-size: 13px;
-  padding: 5px 8px;
+.ops-filter-search,
+.ops-table-filters select,
+.ops-table-filters input[type='date'],
+.ops-table-filters input[type='search'] {
   background: var(--surface, #1a1a1a);
   color: var(--text, #eee);
   border: 1px solid var(--border, #333);
   border-radius: 4px;
+  color-scheme: dark;
 }
 
 .ops-filter-search {
@@ -2889,39 +2921,92 @@ body.detail-standalone .assets-side {
    render their EMPTY state in var(--text-muted) and switch to var(--text) only
    once a value is chosen, so "is anything filtered right now?" is answerable at a
    glance. The search box is covered by its native placeholder; the select and the
-   date inputs carry no placeholder, so public/jobs-table.js markUnset() toggles
-   .is-unset on them (empty <select> option / empty date value). */
-.ops-filter-search::placeholder {
+   date inputs carry no placeholder, so the shared markUnset()/wireUnset() in
+   public/filter-unset.js toggles .is-unset on them (empty <select> option / empty
+   date value). Every bar calls it — see the rule below.
+
+   Two selectors cover all four placeholder-bearing filter boxes. Jobs' search
+   box (public/jobs-table.js:342-345) and Audit's action box
+   (public/audit-table.js:349-353, an `input[type=text]`) both carry
+   `.ops-filter-search`. Assets' box (`searchFilterControl` in
+   public/assets-table.js, placeholder "Full-text search…") and Logs' box
+   (`searchFilterControl` in public/logs-table.js, a bare `input[type=search]`
+   with no class at all, placeholder "Search message…") are
+   reached by the type-qualified selector. Those last two matched no authored
+   ::placeholder rule before issue #983, so their placeholder text was still being
+   drawn for a light field after the repaint above. Date inputs are deliberately
+   NOT listed: they expose no ::placeholder: their empty-state hint is UA chrome
+   (`::-webkit-datetime-edit`), which follows the `color-scheme: dark` set above. */
+.ops-filter-search::placeholder,
+.ops-table-filters input[type='search']::placeholder {
   color: var(--text-muted);
   opacity: 1; /* Firefox dims placeholders by default. */
 }
 
+/* Two selector pairs for the same state, for the same reason as the colour rule
+   above: Jobs and Audit controls carry `.ops-filter-select` / `.ops-filter-date`,
+   while the Assets status select (public/assets-table.js statusFilterControl) and
+   the Assets and Logs date boxes (dateFilterControl in both files) are bare
+   `select` / `input[type=date]` nested in the bar. All four call sites toggle the
+   class through the shared markUnset()/wireUnset() in public/filter-unset.js, so
+   the muted empty state is now the same on every bar (issue #983 AC2 — before
+   this, only Jobs and Audit muted it and the divergence was hidden behind the
+   white UA default the repaint removed).
+
+   The type-qualified selectors are (0,2,1), so they outrank the (0,1,1)
+   `.ops-table-filters select, .ops-table-filters input[type='date']` colour rule
+   above; the class-only pair is (0,2,0) against that rule's (0,1,0) sibling. */
 .ops-filter-select.is-unset,
-.ops-filter-date.is-unset {
+.ops-filter-date.is-unset,
+.ops-table-filters select.is-unset,
+.ops-table-filters input[type='date'].is-unset {
   color: var(--text-muted);
 }
 
 /* The date field's yyyy-mm-dd format hint is drawn by the UA in its own shadow
    subtree, which does not always inherit the host's color. */
-.ops-filter-date.is-unset::-webkit-datetime-edit {
+.ops-filter-date.is-unset::-webkit-datetime-edit,
+.ops-table-filters input[type='date'].is-unset::-webkit-datetime-edit {
   color: var(--text-muted);
 }
 
 /* The open option list stays legible regardless of the closed control's state:
-   only the placeholder entry ("All statuses", value='') is muted there. */
-.ops-filter-select option {
+   only the placeholder entry ("All statuses", value='') is muted there. Without
+   the bare-`select` pair the Assets list would inherit the muted `color` from its
+   own `.is-unset` host and open entirely greyed — i.e. muting the closed control
+   above is only safe together with this. */
+.ops-filter-select option,
+.ops-table-filters select option {
   color: var(--text);
 }
 
-.ops-filter-select option[value=''] {
+.ops-filter-select option[value=''],
+.ops-table-filters select option[value=''] {
   color: var(--text-muted);
 }
 
+/* One focus treatment for the whole bar. The generic `:focus` set near the top of
+   this file (`input[type="text"], input[type="url"], input[type="password"],
+   select, textarea`) does not cover `input[type=date]` or `input[type=search]`,
+   so the Assets and Logs date/search controls had no author focus style at all
+   while the Jobs ones (the `.ops-filter-*` classes) got the accent ring. Same
+   selector set as the colour rule above so the two cannot drift apart. */
 .ops-filter-select:focus-visible,
 .ops-filter-date:focus-visible,
-.ops-filter-search:focus-visible {
+.ops-filter-search:focus-visible,
+.ops-table-filters select:focus-visible,
+.ops-table-filters input[type='date']:focus-visible,
+.ops-table-filters input[type='search']:focus-visible {
   outline: 2px solid var(--accent, #6366f1);
   outline-offset: 1px;
+}
+
+/* The bar's date/search inputs also take the accent border on focus that the
+   generic `select:focus` / `input[type="text"]:focus` rule gives every other
+   field in the app, so the whole bar reacts identically. */
+.ops-table-filters input[type='date']:focus,
+.ops-table-filters input[type='search']:focus {
+  border-color: var(--accent);
 }
 
 /* Assets table filter controls (issue #369). Each control is a <label> that
@@ -2934,13 +3019,74 @@ body.detail-standalone .assets-side {
   color: var(--text-muted);
 }
 
-.ops-table-filters label > span {
-  font-weight: 500;
+/* One casing and one weight for every filter caption in the bar (issue #983 AC3).
+   Jobs and Audit caption with `<label class="ops-filter-label">`
+   (public/jobs-table.js:255-257, public/audit-table.js:268); Assets and Logs
+   caption with a `<span class="ops-filter-caption">` inside the control's own
+   `<label>` (public/assets-table.js `statusFilterControl`,
+   `searchFilterControl`, `structuredTextFilterControl` and `dateFilterControl`;
+   public/logs-table.js `labelledControl`, which every Logs control routes
+   through). Function names rather than line numbers: these refs drifted once
+   already.
+   Those two sets had drifted — uppercase/letter-spaced at 11px and inherited
+   weight on one side, sentence-case 12px at weight 500 on the other.
+
+   The Jobs/Audit treatment is the target, so Assets and Logs move onto it rather
+   than the other way round: #983 names the Jobs bar as the one that already looks
+   right. One Jobs/Audit caption value does change, deliberately: the old
+   unqualified `.ops-filter-label { font-size: 11px }` was (0,1,0) and therefore
+   LOST to `.ops-table-filters label { font-size: 12px }` above, so Jobs captions
+   were rendering uppercase at 12px while the rule next to them said 11px.
+   Qualifying the selector makes 11px actually take effect, which is the size the
+   Jobs bar was authored for (issue #370) and the size all three bars now share.
+   Casing, letter-spacing and colour on Jobs are untouched.
+
+   There is still no `font-weight` declaration here — `.ops-filter-label` never
+   carried one, and both caption sets sit in a `<label>`, so both inherit the same
+   400. Declaring 500 would have silently bolded the reference bar to fix the
+   other two.
+
+   Qualified with `.ops-table-filters` so it reaches (0,2,0) and outranks
+   `.ops-table-filters label { font-size: 12px }` above ((0,1,1) — a class beats an
+   element). Keyed off a NAMED caption hook rather than a structural
+   `.ops-filter-slot > label > span`: the Assets tag/metadata controls put their
+   help text in a `<span class="form-hint ops-filter-hint">` that is also a direct
+   child of the control's `<label>` (public/assets-table.js structuredTextFilterControl),
+   so the structural selector uppercased whole help sentences ("COMMA-SEPARATED.
+   AN ASSET MUST CARRY EVERY TAG LISTED."). The caption spans now carry
+   `ops-filter-caption` (public/assets-table.js, public/logs-table.js), which also
+   keeps the column chooser's own rows
+   (`label.ops-columns-item > span.ops-columns-item-label`) out of reach by
+   construction instead of by nesting depth. */
+.ops-table-filters .ops-filter-label,
+.ops-table-filters .ops-filter-caption {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
 }
 
+/* One text size for every control in the bar (issue #983 AC2). `font: inherit`
+   alone does not get there: the Jobs and Audit controls sit in a
+   `.ops-filter-slot-inner` div and inherit the bar's 14px (`body`, line 30),
+   while the Assets and Logs controls sit INSIDE their caption `<label>` and so
+   inherited its 12px — two tabs' worth of visibly smaller selects and date boxes.
+   13px is the size the Jobs controls were authored at (issue #370's
+   `.ops-filter-select/-date/-search { font-size: 13px }`, folded in here) and the
+   size the rest of the app's inputs use (`input[type="text"], …` at the top of
+   this file), so all three bars land on it.
+
+   The declaration belongs in THIS rule and not in the colour rule above: at
+   (0,1,1) it still loses to the (0,2,0) `.ops-table-filters .ops-search-input` /
+   `.ops-search-input-plain` padding that issue #946 uses to reserve room for the
+   magnifier and the clear control (search: 5px 26px; tags/metadata: 5px 26px 5px
+   8px), and it keeps the colour rule colour-only. Source order carries the tie
+   with `input[type="text"], …` at the top of the sheet, which is also (0,1,1) —
+   this block is later, so the bar's 5px 8px padding and 13px win there too. */
 .ops-table-filters select,
 .ops-table-filters input {
   font: inherit;
+  font-size: 13px;
   padding: 5px 8px;
 }
 
@@ -3137,12 +3283,15 @@ body.detail-standalone .assets-side {
   background: var(--border);
 }
 
-/* Selector-qualified to outrank `.ops-table-filters input { padding: 5px 8px }`
-   above, which is written for text/date inputs and would otherwise inflate every
-   checkbox in this list. */
+/* Selector-qualified to outrank `.ops-table-filters input { padding: 5px 8px;
+   font-size: 13px }` above, which is written for text/date/select controls and
+   would otherwise inflate every checkbox in this list. `font-size: inherit` pins
+   each box to its own row's size: the filter-control size does not belong to a
+   tick box, and some engines size a checkbox from its font. */
 .ops-table-filters .ops-columns-item input {
   margin: 0;
   padding: 0;
+  font-size: inherit;
   cursor: pointer;
 }
 
@@ -3157,8 +3306,13 @@ body.detail-standalone .assets-side {
   cursor: not-allowed;
 }
 
-/* Outranks `.ops-table-filters label > span { font-weight: 500 }`: those are
-   filter captions, these are pickable column names and read as body text. */
+/* Pinned rather than inherited: these are pickable column names and read as body
+   text, not filter captions. The `label > span { font-weight: 500 }` rule this
+   used to outrank is gone (issue #983 folded the caption typography into
+   `.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-caption`
+   above, which no longer declares a weight), so 400 is now what
+   these rows would inherit anyway — keeping it declared means a future weight on
+   a filter caption cannot reach the chooser by accident. */
 .ops-table-filters .ops-columns-item-label {
   font-weight: 400;
 }

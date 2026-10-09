@@ -221,6 +221,10 @@ import { REVIEW_STATES, reviewStateLabel } from './review-state.js';
 // live in one module so the list, the detail panel (#895) and the protected-
 // delete flow (#896) ship one pattern — see docs/ux/asset-lock-state-spec.md §2.
 import { isAssetLocked, lockBadgeHtml, ROW_LOCKED_CLASS } from './lock-state.js';
+// Muted empty state for placeholder-less filter controls (issues #984, #983 AC2).
+// The class name is a CSS contract, so it is imported rather than restated — see
+// public/filter-unset.js.
+import { wireUnset } from './filter-unset.js';
 
 // ─── Contract constants (verified above) ─────────────────────────────────────
 
@@ -560,12 +564,22 @@ function stateSignature(snap) {
 // wires its native events to the supplied `onChange(value)` (the primitive maps
 // that to state.setFilter(name, value), which resets paging). Initial values come
 // from the decoded URL state so a shared link reconstructs the controls.
+//
+// Every control captions itself with a `<span class="ops-filter-caption">` as the
+// first child of its `<label>`. The class is the hook the bar's caption typography
+// is keyed off (`.ops-table-filters .ops-filter-caption` in public/style.css,
+// issue #983); it replaced a structural `.ops-filter-slot > label > span`
+// selector that also matched the hint spans below, which rendered the tag and
+// metadata help sentences in uppercase. A caption span added here without the
+// class gets the plain label treatment, not the bar's; the DOM seam is asserted in
+// test/assets-tag-metadata-filters.test.ts.
 
 function statusFilterControl(initial) {
   return function () {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-status';
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = 'Status';
     const sel = document.createElement('select');
     sel.setAttribute('aria-label', 'Filter by status');
@@ -580,6 +594,12 @@ function statusFilterControl(initial) {
       sel.appendChild(o);
     });
     if (initial) sel.value = initial;
+    // "All statuses" is a real <option>, not a placeholder, so an unfiltered
+    // select would paint at full var(--text) while the Jobs equivalent is muted —
+    // the one remaining visible difference between the bars after #983's repaint.
+    // wireUnset() adds its own change/input listeners rather than relying on the
+    // descriptor below, whose `event` wiring belongs to the primitive (asSlot()).
+    wireUnset(sel);
     wrap.appendChild(span);
     wrap.appendChild(sel);
     return { el: wrap, input: sel, event: 'change', read: () => sel.value };
@@ -605,6 +625,7 @@ function searchFilterControl(initial) {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-q';
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = 'Search';
 
     const field = document.createElement('div');
@@ -738,6 +759,7 @@ function structuredTextFilterControl(opts) {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-' + opts.name;
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = opts.label;
 
     const field = document.createElement('div');
@@ -809,11 +831,15 @@ function dateFilterControl(name, labelText, initial) {
     const wrap = document.createElement('label');
     wrap.className = 'ops-filter-' + name;
     const span = document.createElement('span');
+    span.className = 'ops-filter-caption';
     span.textContent = labelText;
     const input = document.createElement('input');
     input.type = 'date';
     input.setAttribute('aria-label', labelText);
     if (initial) input.value = initial.length >= 10 ? initial.slice(0, 10) : initial;
+    // Same muted empty state as the Jobs date boxes (issue #983 AC2): the UA's
+    // yyyy-mm-dd hint is not a placeholder, so `.is-unset` is what mutes it.
+    wireUnset(input);
     wrap.appendChild(span);
     wrap.appendChild(input);
     return { el: wrap, input, event: 'change', read: () => input.value };
