@@ -49,7 +49,7 @@ export function startMock({ token = 'tok', commit = 'abc1234', sourceDigest = 's
         return json(res, 200, a);
       }
       if (req.method === 'PATCH' && sub === '') { Object.assign(a, { tags: body.tags ?? a.tags }); return json(res, 200, a); }
-      if (req.method === 'DELETE' && sub === '') { assets.delete(a.id); return json(res, 204); }
+      if (req.method === 'DELETE' && sub === '') { if (faults.hardDelete) assets.delete(a.id); else a.status = 'archived'; return json(res, 204); }
       if (req.method === 'POST' && sub === '/extract-metadata') { a.technicalMetadata = { codec: 'h264', width: 1280, height: 720, durationSeconds: 5, bitrateBps: 1e6, containerFormat: 'mp4', audioTracks: [], extractedAt: 'now' }; return json(res, 202, {}); }
       if (sub === '/thumbnails') {
         if (req.method === 'GET') return json(res, 200, { assetId: a.id, thumbnails: a.thumbnails ?? [] });

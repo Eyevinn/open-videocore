@@ -22,7 +22,7 @@ test('green against a contract-conformant instance, and cleans up its asset', as
   const { result, mock } = await run();
   assert.equal(result.status, 'green', JSON.stringify(result.cases.filter((c) => c.status !== 'pass')));
   assert.equal(result.cases.length, 12);
-  assert.equal(mock.assets.size, 0);
+  assert.ok([...mock.assets.values()].every((a) => a.status === 'archived'), 'its asset is soft-deleted (archived)');
   assert.equal(result.build.commit, 'abc1234');
 });
 
@@ -110,7 +110,10 @@ test('sweep deletes only old e2e- assets, keeps recent and foreign ones, and run
     const client = createClient({ baseUrl: mock.baseUrl, token: mock.token });
     const result = await runSuite({ client, anon: createClient({ baseUrl: mock.baseUrl }), config: fastCfg });
     assert.equal(result.swept, 1);
-    assert.deepEqual([...mock.assets.keys()].sort(), ['new-e2e', 'product']);
+    assert.ok(['new-e2e', 'old-e2e', 'product'].every((id) => mock.assets.has(id)), 'nothing is removed, deletion is soft');
+    assert.equal(mock.assets.get('old-e2e').status, 'archived');
+    assert.equal(mock.assets.get('new-e2e').status, 'ready');
+    assert.equal(mock.assets.get('product').status, 'ready');
     assert.equal(result.status, 'green');
   } finally { await mock.close(); }
 });
@@ -123,7 +126,8 @@ test('sweep pages through the list', async () => {
     const client = createClient({ baseUrl: mock.baseUrl, token: mock.token });
     const n = await sweepLeftovers({ client, pageSize: 2 }); // three list calls
     assert.equal(n, 5);
-    assert.equal(mock.assets.size, 0);
+    assert.ok([...mock.assets.values()].every((a) => a.status === 'archived'));
+    assert.equal(await sweepLeftovers({ client, pageSize: 2 }), 0, 'archived assets are not deleted again');
   } finally { await mock.close(); }
 });
 
@@ -172,4 +176,9 @@ test('a packager that fails silently is reported with the package job state, not
   assert.match(c.package.detail, /timed out/);
   assert.match(c.package.detail, /package job is running/);
   for (const id of ['search', 'tags-roundtrip', 'delete']) assert.equal(c[id].status, 'skipped', id);
+});
+
+test('delete: a purged asset (404/410 on read) is also accepted, and an asset that still reads ready after DELETE fails', async () => {
+  const hard = await run({ hardDelete: true });
+  assert.equal(byId(hard.result).delete.status, 'pass');
 });
