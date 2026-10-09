@@ -224,7 +224,13 @@ export const cases = [
     async run(ctx) {
       expectStatus(await ctx.client.request('DELETE', `/api/v1/assets/${ctx.state.assetId}`, { query: { force: 'true' } }), 204);
       ctx.state.deleted = true;
-      expectStatus(await ctx.client.request('GET', `/api/v1/assets/${ctx.state.assetId}`), 404, 410);
+      // DELETE is a SOFT delete (src/routes/assets.ts header: status -> archived; `force` only bypasses the delete lock).
+      // The asset stays readable as `archived` until the purge sweep tombstones it, after which a read returns 410 (404
+      // for a slug); a purged or never-existing asset reads 404/410.
+      const r = await ctx.client.request('GET', `/api/v1/assets/${ctx.state.assetId}`);
+      if (r.status === 200) {
+        if (r.body?.status !== 'archived') fail(`asset still reads as ${r.body?.status} after DELETE, expected archived`);
+      } else expectStatus(r, 404, 410);
     },
   },
 ];

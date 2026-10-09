@@ -8,7 +8,8 @@ export async function sweepLeftovers({ client, now = Date.now, maxAgeMs = 60 * 6
     const r = await client.request('GET', '/api/v1/assets/', { query: { limit: pageSize, offset } });
     if (r.status !== 200 || !Array.isArray(r.body?.items)) break;
     for (const a of r.body.items) {
-      if (typeof a.name === 'string' && a.name.startsWith('e2e-') && now() - Date.parse(a.createdAt) > maxAgeMs) stale.push(a.id);
+      // Already-archived assets were deleted (soft delete) by an earlier run and wait for the product's purge sweep.
+      if (a.status !== 'archived' && typeof a.name === 'string' && a.name.startsWith('e2e-') && now() - Date.parse(a.createdAt) > maxAgeMs) stale.push(a.id);
     }
     if (offset + pageSize >= (r.body.total ?? 0)) break;
   }
