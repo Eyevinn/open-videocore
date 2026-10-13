@@ -1,11 +1,11 @@
-// Slack alert for a failing e2e verdict. Posts with chat.postMessage using a bot token (E2E_SLACK_BOT_TOKEN) to a channel
+// Slack message for an e2e verdict (green, red, or a first infra-error). Posts with chat.postMessage using a bot token (E2E_SLACK_BOT_TOKEN) to a channel
 // (E2E_SLACK_CHANNEL, default #internal-dev-mediaconvert); with no token configured it does nothing. A failed post is reported to the caller, never thrown: the verdict is already stored
 // and the cycle must still exit 0 (see runner/cli.mjs).
 import { redact } from './redact.mjs';
 
-const ALERT_ON = new Set(['red', 'infra-error']);
+const ALERT_ON = new Set(['green', 'red', 'infra-error']);
 
-/** Which records deserve a message. red is final per commit, so it alerts once. infra-error is retried every cycle,
+/** Which records deserve a message. green and red are final per commit, so each posts once. infra-error is retried every cycle,
  *  so only the first one for a commit alerts; stale is routine (a merge landed mid-run) and stays silent. */
 export function shouldAlert(record, prior) {
   if (!ALERT_ON.has(record.status)) return false;
@@ -15,6 +15,10 @@ export function shouldAlert(record, prior) {
 
 export function formatAlert(record) {
   const short = String(record.commit).slice(0, 7);
+  if (record.status === 'green') {
+    const n = (record.cases ?? []).length;
+    return `:white_check_mark: open-videocore e2e *green* for commit \`${short}\` (${n}/${n} cases)`;
+  }
   const lines = [`:rotating_light: open-videocore e2e *${record.status}* for commit \`${short}\``];
   const failed = (record.cases ?? []).filter((c) => c.status && c.status !== 'pass' && c.status !== 'skipped');
   for (const c of failed) lines.push(`• \`${c.id ?? c.name}\` ${c.status}${c.detail ? `: ${String(c.detail).slice(0, 200)}` : ''}`);

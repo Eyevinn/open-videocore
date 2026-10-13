@@ -69,7 +69,7 @@ Variables: `GHCR_USER`, `GHCR_TOKEN` (read:packages), `OSC_ACCESS_TOKEN`, `E2E_I
 `E2E_SOURCE_URL=https://raw.githubusercontent.com/Eyevinn/open-videocore/main/e2e/fixtures/clip.mp4`
 (optional `GITHUB_TOKEN`, `E2E_INSTANCE_NAME`, default `ovce2e`, `E2E_SLACK_BOT_TOKEN`, `E2E_SLACK_CHANNEL`).
 
-**Slack alert.** With `E2E_SLACK_BOT_TOKEN` set (a bot token with `chat:write`, kept in the parameter store; the bot must be a member of the channel), to `E2E_SLACK_CHANNEL` (default `#internal-dev-mediaconvert`), the runner posts when a verdict is `red`, or the first time a commit ends `infra-error`. `stale` and `green` are silent, and a skipped cycle never posts. A failed post is logged in the cycle output (`notifyError`) and does not change the exit code.
+**Slack alert.** With `E2E_SLACK_BOT_TOKEN` set (a bot token with `chat:write`, kept in the parameter store; the bot must be a member of the channel), to `E2E_SLACK_CHANNEL` (default `#internal-dev-mediaconvert`), the runner posts when a verdict is `green` or `red` (each is final, so once per commit), or the first time a commit ends `infra-error`. `stale` is silent, and a skipped cycle never posts. A failed post is logged in the cycle output (`notifyError`) and does not change the exit code.
 
 ## Not built / not verified yet
 
