@@ -67,7 +67,9 @@ Variables: `GHCR_USER`, `GHCR_TOKEN` (read:packages), `OSC_ACCESS_TOKEN`, `E2E_I
 `E2E_PARAMETER_STORE`, `E2E_PARAMETER_STORE_API_KEY`, `E2E_MINIO_ROOT_PASSWORD`, `E2E_COUCHDB_ADMIN_PASSWORD`,
 `E2E_S3_ENDPOINT`, `E2E_S3_BUCKET`, `E2E_S3_ACCESS_KEY`, `E2E_S3_SECRET_KEY`, and
 `E2E_SOURCE_URL=https://raw.githubusercontent.com/Eyevinn/open-videocore/main/e2e/fixtures/clip.mp4`
-(optional `GITHUB_TOKEN`, `E2E_INSTANCE_NAME`, default `ovce2e`).
+(optional `GITHUB_TOKEN`, `E2E_INSTANCE_NAME`, default `ovce2e`, `E2E_SLACK_BOT_TOKEN`, `E2E_SLACK_CHANNEL`).
+
+**Slack alert.** With `E2E_SLACK_BOT_TOKEN` set (a bot token with `chat:write`, kept in the parameter store; the bot must be a member of the channel), to `E2E_SLACK_CHANNEL` (default `#internal-dev-mediaconvert`), the runner posts when a verdict is `red`, or the first time a commit ends `infra-error`. `stale` and `green` are silent, and a skipped cycle never posts. A failed post is logged in the cycle output (`notifyError`) and does not change the exit code.
 
 ## Not built / not verified yet
 

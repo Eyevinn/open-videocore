@@ -19,6 +19,7 @@ const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @property {(inst: { baseUrl: string, token: string }) => Promise<{ commit?: string, sourceDigest?: string, version?: string } | undefined>} health   GET /health build info, undefined if not up
  * @property {{ get(commit: string): Promise<any>, put(commit: string, record: any): Promise<void> }} store
  * @property {(inst: { baseUrl: string, token: string }) => Promise<any>} [prepare]   make the instance ready for the suite (provision its stack); a failure is infra-error
+ * @property {(record: any, prior: any) => Promise<void>} [notify]   alert on a failing verdict; its failure never fails the cycle
  * @property {string[]} [secrets]    exact values to mask in anything stored or printed
  * @property {{ waitMs?: number, pollMs?: number, retries?: number, backoffMs?: number }} [opts]
  * @property {(ms: number) => Promise<void>} [sleep]
@@ -50,7 +51,9 @@ export async function runCycle(d) {
   const finish = async (record) => {
     const full = { commit: head, startedAt, finishedAt: clock(), ...record };
     await store.put(head, full);
-    return { action: 'recorded', ...full };
+    let notifyError;
+    if (d.notify) { try { await d.notify(full, prior); } catch (e) { notifyError = clean(`alert failed: ${e?.message ?? e}`); } }
+    return { action: 'recorded', ...full, ...(notifyError && { notifyError }) };
   };
 
   // Create or restart, up to `retries` extra attempts. A third failure is infra-error, not red.

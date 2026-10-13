@@ -154,3 +154,18 @@ test('a prepare failure is infra-error (not red), is not final, and the suite is
   assert.ok(!log.includes('suite'));
   assert.equal(store.get(C1).status, 'infra-error'); // not green/red, so the next cycle retries this commit
 });
+
+test('notify: red alerts once with the record; green and skip stay silent', async () => {
+  const sent = [];
+  const { d } = deps({ notify: async (r, prior) => { sent.push([r.status, prior]); }, runSuite: async () => ({ suiteVersion: 'v1', status: 'red', build: {}, cases: [] }) });
+  await runCycle(d);
+  assert.deepEqual(sent, [['red', undefined]]);
+});
+
+test('notify: a failing notifier does not fail the cycle', async () => {
+  const { d, store } = deps({ notify: async () => { throw new Error('webhook down'); } });
+  const r = await runCycle(d);
+  assert.equal(r.status, 'green');
+  assert.match(r.notifyError, /webhook down/);
+  assert.equal(store.get(C1).status, 'green');
+});
