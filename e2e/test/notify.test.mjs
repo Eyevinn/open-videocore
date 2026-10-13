@@ -4,13 +4,19 @@ import { shouldAlert, formatAlert, slackNotifier } from '../lib/notify.mjs';
 
 const rec = (status, extra = {}) => ({ commit: 'abcdef0123456789', status, cases: [], ...extra });
 
-test('shouldAlert: red and a first infra-error alert; green, stale and a repeated infra-error do not', () => {
+test('shouldAlert: green, red and a first infra-error post; stale and a repeated infra-error do not', () => {
   assert.equal(shouldAlert(rec('red')), true);
   assert.equal(shouldAlert(rec('infra-error')), true);
   assert.equal(shouldAlert(rec('infra-error'), { status: 'infra-error' }), false);
   assert.equal(shouldAlert(rec('infra-error'), { status: 'stale' }), true);
-  assert.equal(shouldAlert(rec('green')), false);
+  assert.equal(shouldAlert(rec('green')), true);
   assert.equal(shouldAlert(rec('stale')), false);
+});
+
+test('formatAlert: green is a one-line pass with the case count', () => {
+  const text = formatAlert(rec('green', { cases: [{ id: 'a', status: 'pass' }, { id: 'b', status: 'pass' }] }));
+  assert.match(text, /green.*abcdef0.*2\/2/);
+  assert.doesNotMatch(text, /rotating_light/);
 });
 
 test('formatAlert names the commit and the failed cases, not the skipped ones', () => {
