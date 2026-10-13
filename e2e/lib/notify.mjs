@@ -1,5 +1,5 @@
-// Slack alert for a failing e2e verdict. Posts through an incoming webhook (E2E_SLACK_WEBHOOK_URL); with no webhook
-// configured it does nothing. A failed post is reported to the caller, never thrown: the verdict is already stored
+// Slack alert for a failing e2e verdict. Posts with chat.postMessage using a bot token (E2E_SLACK_BOT_TOKEN) to a channel
+// (E2E_SLACK_CHANNEL, default #internal-dev-mediaconvert); with no token configured it does nothing. A failed post is reported to the caller, never thrown: the verdict is already stored
 // and the cycle must still exit 0 (see runner/cli.mjs).
 import { redact } from './redact.mjs';
 
@@ -23,15 +23,18 @@ export function formatAlert(record) {
   return lines.join('\n');
 }
 
+export const DEFAULT_CHANNEL = 'C0C4GLN8GAC'; // #internal-dev-mediaconvert
+
 /** @returns {(record: any, prior: any) => Promise<void>} */
-export function slackNotifier({ webhookUrl, secrets = [], fetchImpl = fetch }) {
+export function slackNotifier({ token, channel = DEFAULT_CHANNEL, secrets = [], fetchImpl = fetch }) {
   return async (record, prior) => {
-    if (!webhookUrl || !shouldAlert(record, prior)) return;
-    const res = await fetchImpl(webhookUrl, {
+    if (!token || !shouldAlert(record, prior)) return;
+    const res = await fetchImpl('https://slack.com/api/chat.postMessage', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: redact(formatAlert(record), secrets) }),
+      headers: { 'content-type': 'application/json; charset=utf-8', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ channel, text: redact(formatAlert(record), secrets) }),
     });
-    if (!res.ok) throw new Error(`Slack webhook answered HTTP ${res.status}`);
+    const body = res.ok ? await res.json().catch(() => ({})) : {};
+    if (!res.ok || !body.ok) throw new Error(`Slack chat.postMessage failed: ${res.ok ? body.error ?? 'unknown' : `HTTP ${res.status}`}`);
   };
 }
