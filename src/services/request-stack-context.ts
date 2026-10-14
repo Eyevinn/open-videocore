@@ -193,6 +193,18 @@ export function requestStackNameFromHeaders(
 ): string | undefined {
   const raw = headers['x-stack-name'];
   if (typeof raw !== 'string') return undefined;
+  return normaliseStackName(raw);
+}
+
+// Normalise and syntax-check a client-supplied stack name, returning undefined
+// when the value cannot name a provisioned stack. The SINGLE spelling of that
+// check (issue #1164): the header read above and the stack-scoped profile index
+// routes (`/api/v1/profiles/stacks/:stack/...`, src/routes/profiles.ts) both go
+// through it, so a name accepted on one boundary is accepted on the other and a
+// URL this app generates for Encore can be validated with the same rule that
+// validated the header that created the profile.
+export function normaliseStackName(raw: string | undefined): string | undefined {
+  if (typeof raw !== 'string') return undefined;
   const normalised = raw.trim().toLowerCase();
   return STACK_NAME_PATTERN.test(normalised) ? normalised : undefined;
 }

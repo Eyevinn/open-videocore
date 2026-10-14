@@ -37,6 +37,10 @@ import {
   stripCredentials
 } from '../services/param-store.js';
 import { STACK_CONFIG_NAMESPACE } from '../services/workspace-stack.js';
+// Re-enter the just-provisioned stack when seeding its profile store (issue
+// #1164): the seed resolves the ambient stack, and a provision request names the
+// new stack in its body rather than in X-Stack-Name.
+import { runWithRequestStack } from '../services/request-stack-context.js';
 import {
   AUTO_SUBTITLES_SERVICE_ID,
   OBJECT_STORE_SERVICE_ID,
@@ -1561,9 +1565,22 @@ export const provisionRouter: FastifyPluginAsync<ProvisionRouterOptions> = async
           // stack is live and an operator can retry via
           // POST /api/v1/profiles/bootstrap), mirroring the startup bootstrap's
           // non-blocking semantics.
+          //
+          // Seeded INSIDE this stack's own context (issue #1164). The seed goes
+          // through the PerWorkspaceProfileRepository, which resolves the stack
+          // of the in-flight request and falls back to the FIRST listed stack
+          // when none is named (src/data/per-workspace-repos.ts:362-366 ->
+          // src/services/workspace-stack.ts `resolve()`, no-stackName branch).
+          // A provision request names the new stack in its BODY, not in
+          // `X-Stack-Name`, so on an install that already has a stack this seed
+          // re-seeded stack 1 (idempotently: a no-op) and left the stack it had
+          // just provisioned with an EMPTY profile store. `name` is the stack
+          // this route has just persisted a config for — a provisioned identity,
+          // not a raw client routing hint — so the trusted
+          // `runWithRequestStack` is the correct entry point.
           if (seedProfiles) {
             try {
-              await seedProfiles();
+              await runWithRequestStack(name, () => seedProfiles());
             } catch (err) {
               request.log.warn(
                 { err, name },
