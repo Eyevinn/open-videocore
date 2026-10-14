@@ -390,17 +390,23 @@ export const DEFAULT_SPAWN_READY_POLL_INTERVAL_MS =
 // deadline path is remapped — a getServiceAccessToken failure before the loop
 // still propagates as itself, which the cleanup path correctly treats as "not a
 // readiness timeout".
+// `signal` (#1170) cancels the wait when the SIBLING readiness wait this one
+// runs concurrently with has already failed — see spawnPooledInstance. Passing
+// it keeps the "no health probe after the spawn has rejected" property (#778
+// review round 2) intact now that two waits overlap.
 async function waitForSpawnedInstanceReady(
   serviceId: string,
   instanceId: string,
-  config: EncoreScalerConfig
+  config: EncoreScalerConfig,
+  signal?: AbortSignal
 ): Promise<void> {
   await waitForInstanceReadyBounded(config.oscContext, serviceId, instanceId, {
     timeoutMs: config.spawnReadyTimeoutMs ?? DEFAULT_SPAWN_READY_TIMEOUT_MS,
     pollIntervalMs:
       config.spawnReadyPollIntervalMs ?? DEFAULT_SPAWN_READY_POLL_INTERVAL_MS,
     makeTimeoutError: (message) =>
-      new SpawnReadyTimeoutError(serviceId, instanceId, message)
+      new SpawnReadyTimeoutError(serviceId, instanceId, message),
+    ...(signal ? { signal } : {})
   });
 }
 
@@ -710,7 +716,40 @@ async function spawnPooledInstance(
   // sit outside, so an instance that never became `running` was left live on OSC
   // with no pool record and no cleanup.
   try {
-    await waitForSpawnedInstanceReady(ENCORE_SERVICE_ID, instanceId, config);
+    // #1170: START the Encore half's readiness wait, do NOT await it yet.
+    //
+    // A pooled instance only becomes eligible for queued work once the pool
+    // record below is written, and that record is written only after BOTH
+    // halves report `running`. These two waits used to be SERIAL — the paired
+    // callback listener was not even created until the Encore half was up — so
+    // a workspace that needed a second instance paid for two full provisioning
+    // waits end to end. That is the delay reported in #1170: the Encore half
+    // (muxs3tn6) was ready at 07:21:59 with jobs queued, but its listener had
+    // only just been created and the instance did not take a job until 07:26,
+    // while the already-warm instance drained the whole queue in sequence. The
+    // tick itself is blocked for that whole time too (EncoreScalerLoop.start
+    // guards against overlapping ticks, scaler-loop.ts), so nothing else in the
+    // control loop runs either.
+    //
+    // The listener's create only needs `encoreUrl`, which `createInstance`
+    // already returned above — it does NOT need the Encore instance to be
+    // `running`. So the create is issued immediately and the two readiness
+    // waits overlap in the Promise.all below. Nothing downstream is weakened:
+    // the record is still written only when both halves report `running`, and
+    // the first job is still gated on the callback-trust probe
+    // (ensureCallbackTrust, scaler-loop.ts) exactly as before.
+    //
+    // The no-op catch keeps a rejection that lands while the listener create is
+    // still running from surfacing as an unhandled rejection; it attaches a
+    // second handler and does not consume the rejection for the await below.
+    const readinessAbort = new AbortController();
+    const encoreReady = waitForSpawnedInstanceReady(
+      ENCORE_SERVICE_ID,
+      instanceId,
+      config,
+      readinessAbort.signal
+    );
+    encoreReady.catch(() => undefined);
     // Pair this Encore instance with a dedicated callback listener (same name)
     // configured with this exact Encore URL, so completion callbacks are routed
     // to the scaler-managed instance rather than a static one. RedisQueue is set
@@ -752,11 +791,31 @@ async function spawnPooledInstance(
     if (!callback) throw lastCallbackErr;
     listenerCreated = true;
     listenerUrl = instanceUrl(callback);
-    await waitForSpawnedInstanceReady(
+    // #1170: both halves are now provisioning; wait for them CONCURRENTLY
+    // rather than one after the other. Each wait keeps its own deadline and
+    // cadence (waitForSpawnedInstanceReady), and Promise.all rejects with the
+    // first failure — which the cleanup path below classifies exactly as
+    // before: a SpawnReadyTimeoutError keeps the instance and records it as a
+    // PENDING pool entry for resolvePendingSpawns to finish. That pending
+    // record now carries `callbackListenerUrl` even when it is the ENCORE half
+    // that timed out, because the listener already exists by this point — the
+    // "a timed-out spawn never got to the listener" case resolvePendingSpawns
+    // documents is one less thing a resumed spawn has to redo.
+    const listenerReady = waitForSpawnedInstanceReady(
       ENCORE_CALLBACK_LISTENER_SERVICE_ID,
       instanceId,
-      config
+      config,
+      readinessAbort.signal
     );
+    listenerReady.catch(() => undefined);
+    try {
+      await Promise.all([encoreReady, listenerReady]);
+    } finally {
+      // Whichever way this ends, the other wait has nothing left to wait for.
+      // Cancelling it keeps the #778 property that no health probe is issued
+      // after the spawn has already settled.
+      readinessAbort.abort();
+    }
 
     const readyAt = Date.now();
     const record: EncoreInstanceRecord = {
