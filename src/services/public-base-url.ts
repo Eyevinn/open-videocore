@@ -26,6 +26,8 @@
 // existing unset-fallbacks unchanged (CallbackUrl omitted; Encore falls back to
 // the remote default profiles index).
 
+import { normaliseStackName } from './request-stack-context.js';
+
 /**
  * Resolve this deployment's publicly-reachable base URL.
  *
@@ -53,6 +55,71 @@ export function resolvePublicBaseUrl(): string | undefined {
 // fetches its transcode profiles from here (see module comment, item 2). Kept
 // as a shared constant so main.ts and this resolver cannot drift.
 export const LOCAL_PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml';
+
+// Path of the STACK-SCOPED form of the same index (issue #1164), served by
+// `GET /stacks/:stack/index.yml` on the profiles router
+// (src/routes/profiles.ts). Built here so the URL handed to Encore and the route
+// that serves it cannot drift.
+export function localProfilesIndexPathForStack(stackName: string): string {
+  return `/api/v1/profiles/stacks/${stackName}/index.yml`;
+}
+
+/**
+ * Rewrite a resolved profiles-index URL to the STACK-SCOPED form for `stackKey`
+ * (issue #1164), when — and only when — that URL is THIS app's own index.
+ *
+ * Why this exists: `profilesUrl` is handed to every scaler-spawned Encore
+ * instance (src/encore-scaler/instance-pool.ts:604-608) as a plain, header-less,
+ * tokenless GET, so the stack cannot travel in `X-Stack-Name`. Without the stack
+ * in the URL, every stack's Encore reads the FIRST listed stack's profile store
+ * (src/data/per-workspace-repos.ts:362-366 ->
+ * src/services/workspace-stack.ts `resolve()`, no-stackName branch) and a
+ * profile created against a non-first stack is invisible to that stack's own
+ * transcodes.
+ *
+ * Narrow by construction:
+ *   - Only a URL whose path ends with {@link LOCAL_PROFILES_INDEX_PATH} is
+ *     rewritten. That covers the derived `${PUBLIC_BASE_URL}` tier and an
+ *     `ENCORE_PROFILES_URL_OVERRIDE`/parameter-store value that points back at
+ *     this app's own index (including behind an ingress path prefix). An
+ *     EXTERNAL index (a bucket, the remote default seed index) is returned
+ *     unchanged: it is not served by this router and has no per-stack form.
+ *   - Only a syntactically valid stack name is scoped
+ *     ({@link normaliseStackName}). The scaler's loop key is the effective stack
+ *     identity a request resolved to, which on a single-stack env-override
+ *     deployment is a fixed deployment context rather than a stack name; such a
+ *     key leaves the URL unscoped, so that deployment's behaviour is unchanged.
+ *
+ * @param profilesIndexUrl the resolved index URL (from {@link resolveEncoreProfilesUrl}).
+ * @param stackKey the stack the spawned Encore instance belongs to.
+ * @returns the stack-scoped URL, or `profilesIndexUrl` unchanged.
+ */
+export function stackScopedProfilesIndexUrl(
+  profilesIndexUrl: string,
+  stackKey: string | undefined
+): string {
+  const stackName = normaliseStackName(stackKey);
+  if (!stackName) return profilesIndexUrl;
+  // Compare on the PATH only, so a query string or fragment can never decide
+  // this (same rule as isProfilesIndexUrl, src/encore-scaler/retry-policy.ts).
+  let pathname: string;
+  try {
+    pathname = new URL(profilesIndexUrl).pathname;
+  } catch {
+    pathname = profilesIndexUrl.split(/[?#]/)[0] ?? '';
+  }
+  if (!pathname.toLowerCase().endsWith(LOCAL_PROFILES_INDEX_PATH)) {
+    return profilesIndexUrl;
+  }
+  // Replace the final occurrence of the unscoped path with the scoped one,
+  // preserving any host and ingress path prefix ahead of it. Query/fragment on a
+  // profiles-index URL carries no meaning for Encore's fetch and is dropped with
+  // the replaced tail.
+  const cut = profilesIndexUrl.toLowerCase().lastIndexOf(LOCAL_PROFILES_INDEX_PATH);
+  return (
+    profilesIndexUrl.slice(0, cut) + localProfilesIndexPathForStack(stackName)
+  );
+}
 
 /**
  * Resolve the profiles-index URL handed to every scaler-spawned Encore instance

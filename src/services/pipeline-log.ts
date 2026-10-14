@@ -44,10 +44,12 @@
 import type { AppendLogInput, LogLevel } from './log-store.js';
 
 // The single write capability a pipeline call site needs. Structurally satisfied
-// by `LogStore` (its `append(input: AppendLogInput): LogRecord`), narrowed to the
-// write path so instrumentation cannot reach the listing primitives. Optional at
-// every call site: when no sink is wired (e.g. a unit test that does not assert
-// logging) emission is a no-op.
+// by the in-memory `LogStore` (`append(input: AppendLogInput): LogRecord`) AND
+// by the durable `CouchLogStore` / `PerWorkspaceLogStore`
+// (`append(input): Promise<LogRecord>`, issue #996) — which is why the return
+// type here is `unknown`. Narrowed to the write path so instrumentation cannot
+// reach the listing primitives. Optional at every call site: when no sink is
+// wired (e.g. a unit test that does not assert logging) emission is a no-op.
 export interface PipelineLogSink {
   append(input: AppendLogInput): unknown;
 }
@@ -79,10 +81,17 @@ export type PipelineLogEvent = {
 };
 
 // Append exactly ONE operational log record for a pipeline step event. Never
-// throws and never returns a rejected promise: `append()` is synchronous
-// (src/services/log-store.ts:112) so any failure is caught here and reported via
-// `log`, leaving the primary pipeline operation exactly as failable as it was
-// before instrumentation. A no-op when `sink` is undefined.
+// throws, never returns a rejected promise, and never makes the caller wait: the
+// primary pipeline operation stays exactly as failable as it was before
+// instrumentation. A no-op when `sink` is undefined.
+//
+// The sink's `append()` may be synchronous (in-memory LogStore,
+// src/services/log-store.ts) or asynchronous (the durable CouchLogStore,
+// src/data/couch-log-repo.ts, and PerWorkspaceLogStore — issue #996). Both are
+// handled: a synchronous throw is caught below, and a returned promise is
+// detached with its own `.catch`, the same fire-and-forget shape `emitAudit`
+// gives the audit write (src/data/audit-emit.ts:59-75). Without that catch, a
+// CouchDB write failure would surface as an unhandled rejection.
 export function logPipelineEvent(
   sink: PipelineLogSink | undefined,
   event: PipelineLogEvent,
@@ -91,18 +100,32 @@ export function logPipelineEvent(
   if (!sink) {
     return;
   }
+  const report = (err: unknown): void => {
+    log?.error(
+      { err, stage: event.stage, level: event.level },
+      'pipeline log append failed (non-fatal)'
+    );
+  };
   try {
-    sink.append({
+    const result = sink.append({
       // Stage-prefixed so the server-side `q` substring filter (which searches
       // `message` only) can select a whole stage, e.g. `q=transcode:`.
       message: `${event.stage}: ${event.message}`,
       level: event.level,
       category: event.stage
     });
+    if (isPromiseLike(result)) {
+      void Promise.resolve(result).catch(report);
+    }
   } catch (err: unknown) {
-    log?.error(
-      { err, stage: event.stage, level: event.level },
-      'pipeline log append failed (non-fatal)'
-    );
+    report(err);
   }
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
 }

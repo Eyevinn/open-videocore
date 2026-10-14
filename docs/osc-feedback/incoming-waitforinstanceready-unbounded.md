@@ -122,6 +122,31 @@ which is the only field of the contract that survives a round trip.
 
 ---
 
+## Update — 2026-10-01 (issue #1038): the same helper, a second incident
+
+Friction 1 above notes in passing that the SDK propagates an exception from
+`getInstanceHealth` while our replacement loop treats it as "not ready yet".
+That difference turned out to be the whole story of a second production failure:
+on 2026-09-30 a `POST /api/v1/provision/` aborted with a bare `fetch failed`
+because ONE poll out of several hundred dropped during a readiness wait, on an
+instance that came up moments later. `lib/core.js:343-353` does not wrap the
+probe in a `try`, so the helper has no tolerance for a transient poll failure and
+the rejection carries no service attribution.
+
+#1038 lifted the scaler's bounded loop into a shared helper
+(`src/services/instance-readiness.ts`, `waitForInstanceReadyBounded`) and moved
+the five provisioning readiness waits in `src/routes/provision.ts` (object
+storage, document store, queue, subtitle generation, scene detection) onto it,
+so none of them calls the unbounded SDK helper any more. Two unbounded
+`waitForInstanceReady` call sites remain elsewhere —
+`src/services/packager-provisioning.ts` and `src/services/param-store.ts` (the
+Valkey wait) — and are tracked as the follow-up in issue #1055; the SDK facet is
+the same, so retiring the workaround there is a mechanical move onto the same
+helper once that lands.
+The full write-up of that second facet (and the specific SDK changes that would
+retire the workaround) is in the engagement repo:
+`eng-open-videocore-agents/docs/osc-feedback/incoming-waitforinstanceready-single-dropped-poll.md`.
+
 ## Impact if unaddressed
 
 Every consumer that spawns OSC instances programmatically has to re-invent both

@@ -18,6 +18,16 @@
 // Idempotency: the callback listener may deliver more than once. completeTranscode
 // no-ops if the job is already terminal, so duplicate callbacks never record
 // duplicate renditions.
+//
+// Profile selection (issue #1022): a transcode selects its encoding ladder by
+// NAME only. The upstream job document has no inline-profile/outputs field
+// (`EncoreJob`: profile: String, profileParams, outputFolder, baseName, inputs —
+// github.com/svt/encore, encore-common/.../model/EncoreJob.kt:52-180, fetched
+// 2026-10-05) and the name is resolved server-side against the profile index
+// (`ProfileService.getProfile`, .../service/profile/ProfileService.kt). So the
+// submitted profile is a single string, resolved once as `submittedProfile`
+// below and used for BOTH the job record and the submit — they can no longer
+// disagree.
 
 import { ulid } from 'ulid';
 import { isValidTransition, type AssetRepository, type Rendition } from '../data/asset-repo.js';
@@ -25,13 +35,19 @@ import {
   encodeEncoreJobId,
   type JobRepository
 } from '../data/job-repo.js';
-import type { EncoreProfile } from './encode-presets.js';
 import type { EncoreClient } from './encore-client.js';
 import { BURN_IN_PROFILE_PARAM_KEY } from './burn-in.js';
 import { emitAudit, originActor, type AuditEmitter, type AuditErrorLog } from '../data/audit-emit.js';
 import { logPipelineEvent, type PipelineLogSink } from '../services/pipeline-log.js';
 
 export const PACKAGED_OUTPUT_PREFIX = 'transcode';
+
+// Profile submitted when a caller names none. 'program' is the conventional
+// entry of the default Encore profile index this API bootstraps from
+// (src/services/profile-bootstrap.ts), so it is the only name likely to resolve
+// on a freshly-seeded deployment. Exported so the routes record/validate the
+// same default the submit path uses (issue #1022).
+export const DEFAULT_PROFILE_NAME = 'program';
 
 export type SubmitTranscodeParams = {
   // Context token embedded in the encoreJobId so the unauthenticated Encore
@@ -41,8 +57,10 @@ export type SubmitTranscodeParams = {
   sourceAssetId: string;
   sourceObjectKey: string;
   // Profile name forwarded verbatim to Encore (server-side named profile).
+  // When omitted, DEFAULT_PROFILE_NAME is submitted. Whatever this resolves to
+  // is BOTH what is sent to Encore and what is recorded on the job document
+  // (`Job.profile`) — see `submittedProfile` below (issue #1022).
   preset?: string;
-  customProfile?: EncoreProfile;
   // Flat string map forwarded verbatim into the Encore job document's
   // `profileParams` object (issue #287). Encore evaluates these as SpEL
   // expression properties within the named profile (e.g. crf, preset, height,
@@ -86,20 +104,24 @@ export async function submitTranscode(
     auditLog?: AuditErrorLog;
     // Best-effort operational log emission (issue #995). Optional, exactly like
     // `audit` above: when absent no log record is appended and behaviour is
-    // unchanged. Wired to the in-memory LogStore that backs GET /api/v1/logs
+    // unchanged. Wired to the log store that backs GET /api/v1/logs
     // (src/main.ts, `logStore`).
     pipelineLog?: PipelineLogSink;
   }
 ): Promise<SubmitTranscodeResult> {
-  // Profile name forwarded verbatim to Encore. Falls back to 'program' —
-  // the only profile guaranteed to exist in the default Encore test-profiles set.
-  const profileName = params.preset ?? 'program';
+  // THE profile this submission uses. Resolved exactly ONCE, here, and then
+  // reused verbatim for the job record, the audit entry, the operational log and
+  // the Encore submit below — so the recorded profile can never disagree with
+  // the submitted one (issue #1022: `job.profile` used to be written from this
+  // default while a `customProfile.name` was what actually reached Encore, so a
+  // job document reported a profile that was never submitted).
+  const submittedProfile = params.preset ?? DEFAULT_PROFILE_NAME;
 
   // Create the job first so we have a local id to embed in the Encore job id.
   const job = await deps.jobs.create({
     type: 'transcode',
     assetId: params.sourceAssetId,
-    profile: profileName
+    profile: submittedProfile
   });
 
   // Audit: transcode job submitted (issue #564). One entry, targetId = the new
@@ -114,7 +136,7 @@ export async function submitTranscode(
       action: 'job.submitted',
       targetType: 'job',
       targetId: job.id,
-      detail: { jobType: 'transcode', assetId: params.sourceAssetId, profile: profileName }
+      detail: { jobType: 'transcode', assetId: params.sourceAssetId, profile: submittedProfile }
     },
     deps.auditLog
   );
@@ -128,7 +150,7 @@ export async function submitTranscode(
     {
       stage: 'transcode',
       level: 'info',
-      message: `submitted job ${job.id} for asset ${params.sourceAssetId} with profile ${profileName}`
+      message: `submitted job ${job.id} for asset ${params.sourceAssetId} with profile ${submittedProfile}`
     },
     deps.auditLog
   );
@@ -154,7 +176,6 @@ export async function submitTranscode(
     // progressCallbackUri is injected by the scaler at dispatch time, pointing
     // at the callback listener paired with the chosen Encore instance (ADR-006),
     // so it is not set here.
-    const encoreProfile = params.customProfile ? params.customProfile.name : profileName;
     // Burn-in opt-in (issue #388, ADR-014 D3): merge the resolved subtitles
     // filter into profileParams under the `subtitlesFilter` SpEL key so the
     // selected profile's VideoEncode filters can pick it up. This is additive —
@@ -163,7 +184,11 @@ export async function submitTranscode(
     const profileParams = params.burnInSubtitlesFilter
       ? { ...(params.profileParams ?? {}), [BURN_IN_PROFILE_PARAM_KEY]: params.burnInSubtitlesFilter }
       : params.profileParams;
-    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: encoreProfile, profileParams, progressCallbackUri: undefined });
+    // `submittedProfile` is the SAME value recorded on the job document above
+    // (issue #1022), so `Job.profile` always names the profile Encore was asked
+    // for. EncoreSubmitInput.profile is a name string resolved server-side
+    // (src/pipeline/encore-client.ts:29-30).
+    const result = await deps.encore.submit({ externalId: encoreJobId, inputUri, outputUri, profile: submittedProfile, profileParams, progressCallbackUri: undefined });
     encoreInternalJobId = result.encoreInternalId || undefined;
     if (encoreInternalJobId) {
       await deps.jobs.update(job.id, { encoreInternalJobId });

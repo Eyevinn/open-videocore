@@ -17,8 +17,8 @@
 //     spawnInstance/destroyInstance/listInstances/updateInstance + ENCORE_SERVICE_ID
 //     (src/encore-scaler/instance-pool.ts), keys/JOBS_PER_INSTANCE (types.ts).
 //   - encodeEncoreJobId (src/data/job-repo.ts:143).
-//   - EncoreSubmitInput / EncoreProfile shapes (src/pipeline/encore-client.ts,
-//     src/pipeline/encode-presets.ts).
+//   - EncoreSubmitInput shape (src/pipeline/encore-client.ts:17-40) — `profile`
+//     is a server-side profile NAME string (issue #1022).
 
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Redis as IORedis, type Redis } from 'ioredis';
@@ -36,28 +36,17 @@ import {
 } from '../src/encore-scaler/instance-pool.js';
 import { encodeEncoreJobId } from '../src/data/job-repo.js';
 import type { EncoreSubmitInput } from '../src/pipeline/encore-client.js';
-import type { EncoreProfile } from '../src/pipeline/encode-presets.js';
 
 // Encore instances can take 60-120s to become ready on OSC.
 const E2E_TIMEOUT_MS = 180_000;
 
 const SKIP = !process.env['OSC_ACCESS_TOKEN'] || !process.env['TEST_REDIS_URL'];
 
-// Minimal profile consistent with EncoreProfile (encode-presets.ts). "program"
-// is the only profile confirmed present in the OSC Encore instance.
-const PROFILE: EncoreProfile = {
-  name: 'program',
-  outputs: [
-    {
-      label: '1080p',
-      width: 1920,
-      height: 1080,
-      videoBitrateBps: 4_000_000,
-      audioBitrateBps: 128_000,
-      format: 'mp4'
-    }
-  ]
-};
+// The profile NAME submitted by this e2e run. EncoreSubmitInput.profile is a
+// name string resolved server-side against the profile index
+// (src/pipeline/encore-client.ts:29-30); "program" is the only profile confirmed
+// present in the Encore instance.
+const PROFILE = 'program';
 
 function makeSubmitInput(workspaceId: string, jobLocalId: string): EncoreSubmitInput {
   return {

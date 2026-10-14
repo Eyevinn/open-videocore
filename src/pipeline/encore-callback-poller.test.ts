@@ -35,7 +35,11 @@ import { InMemoryPipelineRepository } from '../data/pipeline-repo.js';
 // #976: the deterministic packaging correlation id + output prefix a `package`
 // job carries (the counterparts of a transcode job's encoreJobId).
 import { outputPrefix, packagingId } from './packaging.js';
-import { keys, type EncoreInstanceRecord } from '../encore-scaler/types.js';
+import { keys, type EncoreInstanceRecord, type QueuedJob } from '../encore-scaler/types.js';
+// #1101: the retry gate the FAILED-callback branch consults, plus the bound and
+// backoff table it honours.
+import { recordDispatch } from '../encore-scaler/retry-store.js';
+import { MAX_ENCODE_ATTEMPTS, BACKOFF_MS } from '../encore-scaler/retry-policy.js';
 import { InMemoryWebhookRepository } from '../data/inmemory-webhook-repo.js';
 import { WEBHOOK_EVENT_TYPES } from '../data/webhook-repo.js';
 import { WebhookDispatcher } from '../services/webhook-dispatcher.js';
@@ -43,6 +47,7 @@ import {
   ENCODE_COMPLETION_EVENT_TYPE,
   encodeCompletionEventSchema
 } from './encode-completion-event.js';
+import { currentRequestStackName } from '../services/request-stack-context.js';
 
 // Parse a ZRANGEBYSCORE score bound the way Valkey does: '-inf'/'+inf' and the
 // exclusive '(' prefix (e.g. '(1700000000000'). Kept alongside FakeRedis so its
@@ -63,7 +68,13 @@ class FakeRedis {
   private hashes = new Map<string, Map<string, string>>();
   private zsets = new Map<string, Map<string, number>>();
   private sets = new Map<string, Set<string>>();
+  private lists = new Map<string, string[]>();
 
+  private list(key: string): string[] {
+    let l = this.lists.get(key);
+    if (!l) { l = []; this.lists.set(key, l); }
+    return l;
+  }
   private hash(key: string): Map<string, string> {
     let h = this.hashes.get(key);
     if (!h) { h = new Map(); this.hashes.set(key, h); }
@@ -110,8 +121,24 @@ class FakeRedis {
       if (this.strings.delete(key)) removed++;
       if (this.hashes.delete(key)) removed++;
       if (this.zsets.delete(key)) removed++;
+      if (this.lists.delete(key)) removed++;
     }
     return removed;
+  }
+  // #1101: the failure branch's retry gate (decideRetry) re-queues onto
+  // keys.queue — a Valkey LIST — and scans keys.queue/keys.inflight with LRANGE
+  // for the #743 idempotence guard. Added so the poller's retry path can be
+  // exercised end to end against this fake rather than mocked out.
+  // ioredis LPUSH pushes onto the head (index 0 here); LRANGE 0 -1 reads all.
+  async lpush(key: string, value: string): Promise<number> {
+    const l = this.list(key);
+    l.unshift(value);
+    return l.length;
+  }
+  async lrange(key: string, start: number, stop: number): Promise<string[]> {
+    const l = this.list(key);
+    const end = stop === -1 ? l.length - 1 : stop;
+    return l.slice(start, end + 1);
   }
   async keys(pattern: string): Promise<string[]> {
     // Only '*'-suffix globs are used by the sweep (e.g. 'encore:pool:*').
@@ -131,6 +158,14 @@ class FakeRedis {
   // #707: the success path hdel's keys.jobInstance so a later reconcile tick's
   // drop diff can't re-observe a completed job. ioredis hdel accepts one or more
   // fields and returns the count actually removed.
+  // Bounded message retry: the poller counts consecutive failures of one
+  // message in a hash (HINCRBY) and clears the field on success/dead-letter.
+  async hincrby(key: string, field: string, by: number): Promise<number> {
+    const h = this.hash(key);
+    const next = Number(h.get(field) ?? '0') + by;
+    h.set(field, String(next));
+    return next;
+  }
   async hdel(key: string, ...fields: string[]): Promise<number> {
     const h = this.hash(key);
     let removed = 0;
@@ -243,7 +278,12 @@ async function seedScenario(
   jobs: InMemoryJobRepository,
   assets: InMemoryAssetRepository,
   pipelines: InMemoryPipelineRepository,
-  opts: { encoreUuid: string; jobStatus?: 'queued' | 'failed' | 'done'; withPackageStep?: boolean }
+  opts: {
+    encoreUuid: string;
+    jobStatus?: 'queued' | 'failed' | 'done';
+    withPackageStep?: boolean;
+    stackName?: string;
+  }
 ): Promise<{ externalId: string; assetId: string; pipelineId: string }> {
   const record: EncoreInstanceRecord = {
     instanceId: INSTANCE_ID,
@@ -258,7 +298,7 @@ async function seedScenario(
   await assets.update(asset.id, { status: 'processing' });
 
   // Local transcode job; encoreJobId embeds the workspace so decodeEncoreJobId works.
-  const job = await jobs.create({ type: 'transcode', assetId: asset.id });
+  const job = await jobs.create({ type: 'transcode', assetId: asset.id, stackName: opts.stackName });
   const externalId = encodeEncoreJobId(WORKSPACE, job.id);
   await jobs.update(job.id, { encoreJobId: externalId, status: 'queued' });
   if (opts.jobStatus === 'failed') {
@@ -702,10 +742,11 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
 
   // Seed a transcode+package pipeline in the running-transcode state, then enqueue
   // the completion message the callback listener would have written.
-  async function seedAndEnqueue(encoreUuid: string) {
+  async function seedAndEnqueue(encoreUuid: string, stackName?: string) {
     const seeded = await seedScenario(redis, jobs, assets, pipelines, {
       encoreUuid,
-      withPackageStep: true
+      withPackageStep: true,
+      stackName
     });
     // completeTranscode only settles a running job to done (mirrors the #464 test).
     await jobs.update(findLocalJobId(seeded.externalId), { status: 'running' });
@@ -786,6 +827,186 @@ describe('encore-callback-poller — transcode->package handoff provisioning (#4
     expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(1);
     const execution = await pipelines.get(pipelineId);
     expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // Multi-stack: each stack has its own Valkey, where its scaler loop
+  // dispatches, its callback listeners write completions, and its packager
+  // consumes. A poller started on a second stack's Valkey (beside the one on
+  // the first stack's) must apply the completion found there and hand
+  // packaging off on that SAME Valkey, onto that stack's queue key — nothing
+  // may land on the first stack's Valkey.
+  it('drains a second stack’s Valkey and hands packaging off on that same Valkey', async () => {
+    const encoreUuid = 'uuid-handoff-stack-valkey';
+    const stackRedis = new FakeRedis();
+    const seeded = await seedScenario(stackRedis, jobs, assets, pipelines, {
+      encoreUuid,
+      withPackageStep: true,
+      stackName: 'stack2'
+    });
+    await jobs.update(findLocalJobId(seeded.externalId), { status: 'running' });
+    await stackRedis.zadd(
+      QUEUE_KEY,
+      Date.now(),
+      JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` })
+    );
+    const d = {
+      ...baseDeps(successFetch(seeded.externalId, encoreUuid), undefined),
+      redis: stackRedis as unknown as import('ioredis').Redis,
+      resolvePackagingQueueKey: async (defaultKey: string) =>
+        `${defaultKey}:${currentRequestStackName()}`
+    };
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => stackRedis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    expect(redis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`)).toHaveLength(0);
+    expect(stackRedis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    const execution = await pipelines.get(seeded.pipelineId);
+    expect(execution?.steps.find((s) => s.name === 'transcode')?.status).toBe('done');
+    expect(execution?.steps.find((s) => s.name === 'package')?.status).toBe('running');
+  });
+
+  // A completion for a job still `queued` (its onDispatched hook missed it —
+  // the hook ran outside the job's stack, or the process restarted between
+  // dispatch and the hook) must not be rejected as `queued -> done` forever:
+  // the completion proves the dispatch, so the poller advances the job first.
+  it('advances a job never marked running before settling its completion', async () => {
+    const encoreUuid = 'uuid-queued-completion';
+    const seeded = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid,
+      withPackageStep: false
+    });
+    const localJobId = findLocalJobId(seeded.externalId);
+    expect((await jobs.get(localJobId))?.status).toBe('queued');
+    await redis.zadd(
+      QUEUE_KEY,
+      Date.now(),
+      JSON.stringify({ jobId: encoreUuid, url: `${BASE_URL}/encoreJobs/${encoreUuid}` })
+    );
+    const d = baseDeps(successFetch(seeded.externalId, encoreUuid), undefined);
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await jobs.get(localJobId))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    expect((await assets.get(seeded.assetId))?.status).toBe('ready');
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(0);
+    expect(redis.zmembers(`${QUEUE_KEY}:dead`)).toHaveLength(0);
+  });
+
+  // A message whose handling keeps throwing used to be put back with its
+  // original score and popped straight back — once a second, forever — so it
+  // blocked every later completion on that Valkey. It must be retried a bounded
+  // number of times BEHIND the rest of the queue and then dead-lettered, and a
+  // healthy completion queued after it must still be applied.
+  it('dead-letters a message that keeps failing without blocking later completions', async () => {
+    const poisonUuid = 'uuid-poison';
+    const healthyUuid = 'uuid-healthy';
+    const poison = await seedAndEnqueue(poisonUuid);
+    const healthy = await seedAndEnqueue(healthyUuid);
+    const poisonMessage = JSON.stringify({ jobId: poisonUuid, url: `${BASE_URL}/encoreJobs/${poisonUuid}` });
+    const healthyMessage = JSON.stringify({ jobId: healthyUuid, url: `${BASE_URL}/encoreJobs/${healthyUuid}` });
+    // The poison message is at the head of the queue.
+    await redis.zadd(QUEUE_KEY, 1, poisonMessage);
+    await redis.zadd(QUEUE_KEY, 2, healthyMessage);
+    // Its terminal write fails every time (a CouchDB write the repository
+    // rejects, say); the healthy job's writes go through.
+    const poisonLocalId = findLocalJobId(poison.externalId);
+    const originalUpdate = jobs.update.bind(jobs);
+    jobs.update = async (id, patch) => {
+      if (id === poisonLocalId && patch.status === 'done') throw new Error('write rejected');
+      return originalUpdate(id, patch);
+    };
+    const fetchFn = makeFetch({
+      successfulUuids: [poisonUuid, healthyUuid],
+      jobDocs: {
+        [poisonUuid]: { externalId: poison.externalId, status: 'SUCCESSFUL', output: [] },
+        [healthyUuid]: { externalId: healthy.externalId, status: 'SUCCESSFUL', output: [] }
+      }
+    });
+    const d = {
+      ...baseDeps(fetchFn, undefined),
+      maxMessageAttempts: 3,
+      messageRetryBackoffMs: () => 5
+    };
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(`${QUEUE_KEY}:dead`).length === 1);
+      await waitFor(async () => (await jobs.get(findLocalJobId(healthy.externalId)))?.status === 'done');
+    } finally {
+      stop();
+    }
+
+    expect(redis.zmembers(`${QUEUE_KEY}:dead`)).toEqual([poisonMessage]);
+    expect(redis.zmembers(QUEUE_KEY)).toHaveLength(0);
+    expect(redis.zmembers(`${QUEUE_KEY}:processing`)).toHaveLength(0);
+    expect(await redis.hgetall(`${QUEUE_KEY}:attempts`)).toEqual({});
+    expect((await jobs.get(poisonLocalId))?.status).toBe('running');
+  });
+
+  // Multi-stack: a transcode on a non-first stack must provision and enqueue for
+  // ITS stack's packager. Both hooks run inside the job's persisted stack, and
+  // the job lands on the key resolvePackagingQueueKey returns for that stack —
+  // not the shared default key another stack's packager also drains.
+  it('provisions and enqueues for the job’s persisted stack', async () => {
+    const encoreUuid = 'uuid-handoff-stack2';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid, 'stack2');
+
+    const ensuredFor: (string | undefined)[] = [];
+    const ensurePackaging = vi.fn(async () => {
+      ensuredFor.push(currentRequestStackName());
+    });
+    const resolvePackagingQueueKey = vi.fn(async (defaultKey: string) =>
+      currentRequestStackName() === 'stack2' ? `${defaultKey}:stack2` : defaultKey
+    );
+    const d = {
+      ...baseDeps(successFetch(externalId, encoreUuid), ensurePackaging),
+      resolvePackagingQueueKey
+    };
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(() => redis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`).length === 1);
+    } finally {
+      stop();
+    }
+
+    expect(ensuredFor).toEqual(['stack2']);
+    expect(resolvePackagingQueueKey).toHaveBeenCalledWith(PACKAGING_QUEUE_KEY);
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    const enqueued = JSON.parse(redis.zmembers(`${PACKAGING_QUEUE_KEY}:stack2`)[0]!);
+    expect(enqueued.jobId).toBe((await pipelines.get(pipelineId))!.assetId);
+  });
+
+  it('fails the package job without enqueueing when the per-stack queue key cannot be resolved', async () => {
+    const encoreUuid = 'uuid-handoff-key-throw';
+    const { externalId, pipelineId } = await seedAndEnqueue(encoreUuid);
+    const d = {
+      ...baseDeps(successFetch(externalId, encoreUuid), undefined),
+      resolvePackagingQueueKey: vi.fn(async () => {
+        throw new Error('parameter store unavailable');
+      })
+    };
+    const assetId = (await pipelines.get(pipelineId))!.assetId;
+
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(async () => (await assets.get(assetId))?.packagingError !== undefined);
+    } finally {
+      stop();
+    }
+
+    expect(redis.zmembers(PACKAGING_QUEUE_KEY)).toHaveLength(0);
+    expect((await assets.get(assetId))?.packagingError).toContain('parameter store unavailable');
   });
 
   // #976: the transcode->package handoff is the OSC-native enqueue path (it
@@ -1382,5 +1603,221 @@ describe('encore-callback-poller — webhook dispatch on the poller completion p
     }
 
     expect((await assets.get(assetId))?.status).toBe('ready');
+  });
+});
+
+// #1101: a 401/403 on the UNAUTHENTICATED profiles index must be RETRIED by the
+// FAILED-callback branch, not settled deterministic.
+//
+// This is the second of the two paths that share classifyEncoreFailure (the
+// reconcile drop path is covered in
+// src/encore-scaler/profiles-index-auth-retry.test.ts). It is driven through the
+// REAL poller — startEncoreCallbackPoller -> handleMessage -> decideRetry — so
+// what is asserted is the wiring as deployed, not a reimplementation of it.
+//
+// Contracts verified (CLAUDE.md rule 7):
+//   - The failure branch builds `job.message ?? 'encore status: ${status}'` and
+//     passes it to decideRetry (encore-callback-poller.ts:549-564); on
+//     action:'retry' it finalizes the failed attempt with decision.failureClass,
+//     frees the slot, and returns WITHOUT settling (:571-598).
+//   - decideRetry needs keys.jobPayload + keys.jobAttempts, written by
+//     recordDispatch (retry-store.ts:151-159).
+//   - MAX_ENCODE_ATTEMPTS = 3, BACKOFF_MS = [15s, 60s] (retry-policy.ts).
+//   - The 401 failure string is the JDK HttpURLConnection format recorded
+//     verbatim on #1091 / #110.
+describe('encore-callback-poller — profiles-index 401/403 is retried, not settled (#1101)', () => {
+  let redis: FakeRedis;
+  let jobs: InMemoryJobRepository;
+  let assets: InMemoryAssetRepository;
+  let pipelines: InMemoryPipelineRepository;
+
+  const PROFILES_INDEX_URL = 'https://videocore.example.osaas.io/api/v1/profiles/index.yml';
+  const PAYLOAD = { profile: 'vod-compat', inputs: [{ uri: 's3://b/k' }] };
+
+  const javaHttpFailure = (status: number, url: string) =>
+    `java.io.IOException: Server returned HTTP response code: ${status} for URL: ${url}`;
+
+  beforeEach(() => {
+    redis = new FakeRedis();
+    jobs = new InMemoryJobRepository();
+    assets = new InMemoryAssetRepository();
+    pipelines = new InMemoryPipelineRepository();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function deps(fetchFn: ReturnType<typeof vi.fn>) {
+    vi.stubGlobal('fetch', fetchFn);
+    return {
+      redis: redis as unknown as import('ioredis').Redis,
+      jobRepository: jobs,
+      assetRepository: assets,
+      pipelineRepository: pipelines,
+      oscContext: OSC_CONTEXT_STUB,
+      queueKey: QUEUE_KEY,
+      logger: NOOP_LOGGER
+    };
+  }
+
+  function findLocalJobId(externalId: string): string {
+    const sep = externalId.indexOf('__');
+    return externalId.slice(sep + 2);
+  }
+
+  // Drive one FAILED callback for `encoreUuid` carrying `message` through the
+  // real poller, and wait for `settled` to observe its effect.
+  async function runFailedCallback(
+    encoreUuid: string,
+    externalId: string,
+    message: string,
+    settled: () => boolean | Promise<boolean>
+  ): Promise<void> {
+    const fetchFn = makeFetch({
+      failedUuids: [encoreUuid],
+      jobDocs: { [encoreUuid]: { externalId, status: 'FAILED', message } }
+    });
+    const d = deps(fetchFn);
+    const queued = JSON.stringify({
+      jobId: encoreUuid,
+      url: `${BASE_URL}/encoreJobs/${encoreUuid}`
+    });
+    await redis.zadd(QUEUE_KEY, Date.now(), queued);
+    const stop = startEncoreCallbackPoller(d);
+    try {
+      await waitFor(settled);
+    } finally {
+      stop();
+    }
+  }
+
+  for (const status of [401, 403] as const) {
+    it(`retries a ${status} on the profiles index with backoff instead of settling the job failed`, async () => {
+      const encoreUuid = `uuid-profiles-${status}`;
+      const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, {
+        encoreUuid
+      });
+      const localId = findLocalJobId(externalId);
+      await jobs.update(localId, { status: 'running' });
+      await jobs.appendEncodeAttempt(localId, { index: 1 });
+      // Attempt 1 already dispatched; the gate needs the payload to re-POST.
+      await recordDispatch(redis as unknown as import('ioredis').Redis, externalId, PAYLOAD, 1);
+
+      await runFailedCallback(
+        encoreUuid,
+        externalId,
+        javaHttpFailure(status, PROFILES_INDEX_URL),
+        // Wait on the re-queue AND the #381 attempt finalisation (the branch's
+        // last durable write before it returns, :586-593) so the assertions
+        // below cannot race the handler mid-branch.
+        async () =>
+          (await redis.lrange(keys.queue(WORKSPACE), 0, -1)).length === 1 &&
+          (await jobs.get(localId))?.encodeAttemptLog?.[0]?.classification !== undefined
+      );
+
+      // The caller-facing job is NOT settled — this is the #1091 regression. The
+      // asset stays `processing` so the retry can still complete it.
+      const job = await jobs.get(localId);
+      expect(job?.status).toBe('running');
+      expect(job?.error).toBeUndefined();
+      expect((await assets.get(assetId))?.status).toBe('processing');
+
+      // The retry is queued with the documented first backoff, carrying the
+      // original payload, and the scaler-facing status is pinned back to RUNNING.
+      const entries = await redis.lrange(keys.queue(WORKSPACE), 0, -1);
+      expect(entries).toHaveLength(1);
+      const requeued = JSON.parse(entries[0]!) as QueuedJob;
+      expect(requeued.jobId).toBe(externalId);
+      expect(requeued.payload).toEqual(PAYLOAD);
+      expect(requeued.notBefore).toBeGreaterThan(Date.now());
+      expect(requeued.notBefore! - Date.now()).toBeLessThanOrEqual(BACKOFF_MS[0]!);
+      expect(await redis.hget(keys.jobStatus(WORKSPACE), externalId)).toBe('RUNNING');
+
+      // The attempt that just failed is closed out with the retry class (#381)
+      // so the retry appends a fresh, distinct attempt rather than extending it.
+      const attempt = (await jobs.get(localId))!.encodeAttemptLog![0]!;
+      expect(attempt.endedAt).toBeDefined();
+      expect(attempt.classification).toBe('transport');
+    });
+  }
+
+  it('settles terminal once the profiles-index 401 has exhausted MAX_ENCODE_ATTEMPTS', async () => {
+    const encoreUuid = 'uuid-profiles-401-exhausted';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid
+    });
+    const localId = findLocalJobId(externalId);
+    await jobs.update(localId, { status: 'running' });
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+    // The full bound is already spent, so this observation must fail clearly
+    // rather than retry forever.
+    await recordDispatch(
+      redis as unknown as import('ioredis').Redis,
+      externalId,
+      PAYLOAD,
+      MAX_ENCODE_ATTEMPTS
+    );
+
+    await runFailedCallback(
+      encoreUuid,
+      externalId,
+      javaHttpFailure(401, PROFILES_INDEX_URL),
+      async () => (await jobs.get(localId))?.status === 'failed'
+    );
+
+    expect((await assets.get(assetId))?.status).toBe('failed');
+    // Not retried past the bound.
+    expect(await redis.lrange(keys.queue(WORKSPACE), 0, -1)).toHaveLength(0);
+    // Encore's own cause is surfaced to the caller.
+    expect((await jobs.get(localId))?.error).toContain('401');
+  });
+
+  it('still settles a 401 from any OTHER url terminal on the first observation', async () => {
+    const encoreUuid = 'uuid-401-other-url';
+    const { externalId, assetId } = await seedScenario(redis, jobs, assets, pipelines, {
+      encoreUuid
+    });
+    const localId = findLocalJobId(externalId);
+    await jobs.update(localId, { status: 'running' });
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+    // A payload and two spare attempts ARE available — the message alone must
+    // keep this out of the retry path.
+    await recordDispatch(redis as unknown as import('ioredis').Redis, externalId, PAYLOAD, 1);
+
+    await runFailedCallback(
+      encoreUuid,
+      externalId,
+      javaHttpFailure(401, 'https://minio.example.osaas.io/ovc-media/src/clip.mov'),
+      async () => (await jobs.get(localId))?.status === 'failed'
+    );
+
+    expect((await assets.get(assetId))?.status).toBe('failed');
+    expect(await redis.lrange(keys.queue(WORKSPACE), 0, -1)).toHaveLength(0);
+    const attempt = (await jobs.get(localId))!.encodeAttemptLog![0]!;
+    expect(attempt.classification).toBe('deterministic');
+  });
+
+  it('still settles a 404 deterministic (the object genuinely is not there)', async () => {
+    const encoreUuid = 'uuid-404-source';
+    const { externalId } = await seedScenario(redis, jobs, assets, pipelines, { encoreUuid });
+    const localId = findLocalJobId(externalId);
+    await jobs.update(localId, { status: 'running' });
+    await jobs.appendEncodeAttempt(localId, { index: 1 });
+    await recordDispatch(redis as unknown as import('ioredis').Redis, externalId, PAYLOAD, 1);
+
+    await runFailedCallback(
+      encoreUuid,
+      externalId,
+      // Both the JDK 404 form on the profiles index and #1058's ffprobe wording
+      // classify the same way; the JDK form is the sharper guard because it is
+      // the one the new parser inspects.
+      javaHttpFailure(404, PROFILES_INDEX_URL),
+      async () => (await jobs.get(localId))?.status === 'failed'
+    );
+
+    expect(await redis.lrange(keys.queue(WORKSPACE), 0, -1)).toHaveLength(0);
+    const attempt = (await jobs.get(localId))!.encodeAttemptLog![0]!;
+    expect(attempt.classification).toBe('deterministic');
   });
 });

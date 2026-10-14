@@ -56,6 +56,12 @@ export type ArchivedAssetPurgeLoopOptions = {
   // /api/v1/retention/config takes effect without a restart, and so the sweep is
   // skipped entirely when retention is unset (0/disabled).
   retentionMs(): number;
+  // Run one tick's sweep once per provisioned stack (issue #1098). Bound in
+  // main.ts to perStackSweepRunner (src/services/for-each-stack.ts), which
+  // re-reads listStackNames() every tick and runs the sweep inside each stack's
+  // request-stack context with per-stack failure isolation. Left unset (tests,
+  // direct use) the sweep runs exactly once, as before.
+  forEachStack?(run: () => Promise<void>): Promise<void>;
   logger?: Logger;
 };
 
@@ -95,22 +101,31 @@ export class ArchivedAssetPurgeLoop {
   }
 
   // One tick: read the live retention window and run the sweep unless retention
-  // is unset (0/disabled), in which case the sweep is skipped entirely.
+  // is unset (0/disabled), in which case the sweep is skipped entirely. The
+  // window is instance-global, so it is read ONCE per tick and the same value
+  // applies to every stack swept below.
   async tick(): Promise<void> {
     const retentionMs = this.options.retentionMs();
     if (!Number.isFinite(retentionMs) || retentionMs <= 0) {
       return; // retention unset — never purge (skip the sweep entirely)
     }
-    const result = await purgeExpiredArchivedAssets({
-      ...this.options.sweepDeps,
-      retentionMs
-    });
-    if (result.purged > 0) {
-      this.options.logger?.info?.(
-        '[archived-asset-purge] tick complete: scanned=%d purged=%d',
-        result.scanned,
-        result.purged
-      );
-    }
+    const runSweep = async (): Promise<void> => {
+      const result = await purgeExpiredArchivedAssets({
+        ...this.options.sweepDeps,
+        retentionMs
+      });
+      if (result.purged > 0) {
+        this.options.logger?.info?.(
+          '[archived-asset-purge] tick complete: scanned=%d purged=%d',
+          result.scanned,
+          result.purged
+        );
+      }
+    };
+    // Once per provisioned stack when wired (issue #1098); otherwise exactly
+    // once, unchanged.
+    const perStack = this.options.forEachStack?.bind(this.options);
+    if (perStack) await perStack(runSweep);
+    else await runSweep();
   }
 }
