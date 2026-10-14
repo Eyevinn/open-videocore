@@ -22,6 +22,8 @@
 //     send an empty `q` (the schema is `.min(1)`, i.e. a 400).
 //   - Container/MIME (`mimeType`) is explicitly OUT OF SCOPE for #914 (issue #822).
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createAssetsTable } from '../public/assets-table.js';
 import { decodeTableState, encodeTableStateToQuery } from '../public/table-url-state.js';
@@ -338,5 +340,226 @@ describe('shared URL-state schema additions', () => {
     const back = decodeTableState('?' + q, 'assets');
     expect(back.tags).toEqual(['news', 'sports']);
     expect(back.meta).toEqual(['genre=documentary']);
+  });
+});
+
+// ─── The hint is help text, not a filter caption (issue #983) ────────────────
+//
+// CONTRACT GROUNDING for the markers asserted here — all internal, all read off
+// their source rather than assumed:
+//   - the caption hook: `span.className = 'ops-filter-caption'` in
+//     public/assets-table.js (statusFilterControl / searchFilterControl /
+//     structuredTextFilterControl / dateFilterControl) and in
+//     public/logs-table.js labelledControl().
+//   - the hint marker: `hint.className = 'form-hint ops-filter-hint'` in
+//     structuredTextFilterControl(), public/assets-table.js — a DIRECT CHILD of
+//     the control's <label>, exactly like the caption span.
+//   - the rules keyed off those markers, in public/style.css:
+//     `.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-caption
+//      { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em }`,
+//     `.ops-table-filters .ops-filter-hint { font-size: 11px; font-weight: 400 }`,
+//     `.ops-table-filters select, .ops-table-filters input { font-size: 13px;
+//      padding: 5px 8px }`, and the issue #946 padding
+//     `.ops-table-filters .ops-search-input { padding: 5px 26px }` /
+//     `.ops-search-input-plain { padding-left: 8px }`.
+//
+// The defect this guards: the caption rule used to be keyed structurally
+// (`.ops-filter-slot > label > span`), which also matched the hint span, so the
+// help sentences rendered as "COMMA-SEPARATED. AN ASSET MUST CARRY EVERY TAG
+// LISTED." The assertions resolve against the REAL sheet injected into the real
+// mount point, so any future rule that reaches the hint fails here.
+describe('filter captions and hints resolve against the real stylesheet', () => {
+  const STYLESHEET = readFileSync(resolve(process.cwd(), 'public/style.css'), 'utf8');
+
+  function withStylesheet(): () => void {
+    const style = document.createElement('style');
+    style.textContent = STYLESHEET;
+    document.head.appendChild(style);
+    return () => style.remove();
+  }
+
+  async function mountStyled() {
+    const drop = withStylesheet();
+    const { t } = await mount();
+    return { t, drop };
+  }
+
+  it('marks the caption span and the hint span as different things in the DOM', async () => {
+    const { t, drop } = await mountStyled();
+    try {
+      for (const name of ['tags', 'meta']) {
+        const label = t.el.querySelector<HTMLElement>('.ops-filter-' + name)!;
+        expect(label.tagName).toBe('LABEL');
+
+        const caption = label.querySelector<HTMLElement>('.ops-filter-caption')!;
+        const hint = label.querySelector<HTMLElement>('.ops-filter-hint')!;
+        expect(caption).toBeTruthy();
+        expect(hint).toBeTruthy();
+
+        // Both are direct children of the same <label>, which is why a structural
+        // selector could not tell them apart.
+        expect(caption.parentElement).toBe(label);
+        expect(hint.parentElement).toBe(label);
+
+        // The hint is NOT a caption: no caption class, and it is the help text
+        // referenced by aria-describedby rather than the control's name.
+        expect(hint.classList.contains('ops-filter-caption')).toBe(false);
+        expect(caption.classList.contains('ops-filter-hint')).toBe(false);
+        const input = label.querySelector<HTMLInputElement>('input')!;
+        expect(input.getAttribute('aria-describedby')).toBe(hint.id);
+      }
+      t.destroy();
+    } finally {
+      drop();
+    }
+  });
+
+  it('uppercases the caption but leaves the help sentence in sentence case', async () => {
+    const { t, drop } = await mountStyled();
+    try {
+      for (const name of ['tags', 'meta']) {
+        const label = t.el.querySelector<HTMLElement>('.ops-filter-' + name)!;
+        const caption = label.querySelector<HTMLElement>('.ops-filter-caption')!;
+        const hint = label.querySelector<HTMLElement>('.ops-filter-hint')!;
+
+        expect(getComputedStyle(caption).textTransform).toBe('uppercase');
+        expect(getComputedStyle(caption).fontSize).toBe('11px');
+
+        // The regression: this resolved to 'uppercase' and shouted the sentence.
+        // happy-dom reports an unset inherited property as '' rather than the
+        // initial keyword, so accept either spelling of "not transformed".
+        const hintTransform = getComputedStyle(hint).textTransform;
+        expect(hintTransform).not.toBe('uppercase');
+        expect(['', 'none']).toContain(hintTransform);
+        expect(getComputedStyle(hint).fontSize).toBe('11px');
+      }
+      t.destroy();
+    } finally {
+      drop();
+    }
+  });
+
+  it('gives every control in the bar the same 13px text (AC2)', async () => {
+    const { t, drop } = await mountStyled();
+    try {
+      const controls = [
+        t.el.querySelector<HTMLElement>('.ops-filter-status select')!,
+        t.el.querySelector<HTMLElement>('.ops-filter-q input')!,
+        t.el.querySelector<HTMLElement>('.ops-filter-tags input')!,
+        t.el.querySelector<HTMLElement>('.ops-filter-meta input')!,
+        t.el.querySelector<HTMLElement>('.ops-filter-from input')!,
+        t.el.querySelector<HTMLElement>('.ops-filter-to input')!,
+      ];
+      for (const c of controls) {
+        expect(c).toBeTruthy();
+        // Not the 12px inherited from the caption <label>, which is what made the
+        // Assets and Logs bars look smaller than the Jobs one.
+        expect(getComputedStyle(c).fontSize).toBe('13px');
+      }
+      t.destroy();
+    } finally {
+      drop();
+    }
+  });
+
+  it('keeps the issue #946 affordance padding on the three search boxes', async () => {
+    const { t, drop } = await mountStyled();
+    try {
+      const q = getComputedStyle(t.el.querySelector<HTMLElement>('.ops-filter-q input')!);
+      expect(q.paddingLeft).toBe('26px'); // magnifier
+      expect(q.paddingRight).toBe('26px'); // clear control
+
+      for (const name of ['tags', 'meta']) {
+        const box = getComputedStyle(t.el.querySelector<HTMLElement>('.ops-filter-' + name + ' input')!);
+        expect(box.paddingLeft).toBe('8px'); // no magnifier on these two
+        expect(box.paddingRight).toBe('26px'); // clear control still needs its room
+      }
+      t.destroy();
+    } finally {
+      drop();
+    }
+  });
+});
+
+// ─── Unset Assets controls read as unset, exactly like the Jobs ones (#983) ────
+//
+// The Jobs-side seam is asserted at test/jobs-table.test.ts:398-400; these are
+// the Assets equivalents for the two NEW wireUnset() call sites on this surface.
+//
+// CONTRACT GROUNDING — read off the source, not assumed:
+//   - `wireUnset(sel)` at public/assets-table.js:602 (statusFilterControl) and
+//     `wireUnset(input)` at public/assets-table.js:842 (dateFilterControl, used
+//     for BOTH the 'from' and 'to' boxes — see the filter slot list at
+//     public/assets-table.js:1478-1481).
+//   - the shared toggle: wireUnset()/markUnset() in public/filter-unset.js,
+//     imported at public/assets-table.js:227 — adds `.is-unset` while the
+//     control's value is empty, on first render and on every change/input.
+//   - the paint keyed off the marker, public/style.css:
+//     `.ops-filter-select.is-unset, .ops-filter-date.is-unset { color: var(--text-muted) }`
+//     plus the `.ops-table-filters select.is-unset` /
+//     `input[type='date'].is-unset` pair that reaches these class-less controls.
+//   - the DOM hooks the queries below use: `wrap.className = 'ops-filter-status'`
+//     (statusFilterControl) and `'ops-filter-' + name` (dateFilterControl).
+//
+// Why the marker and not a colour: "All statuses" is a real <option> and a date
+// box's yyyy-mm-dd is UA chrome, so neither has a placeholder to mute — and
+// happy-dom resolves neither. The marker IS the seam. (The free-text box needs
+// no marker: it has a native placeholder, asserted muted on the Logs side.)
+describe('unset Assets filter controls are marked muted', () => {
+  function controls(el: HTMLElement) {
+    return {
+      status: el.querySelector<HTMLSelectElement>('.ops-filter-status select')!,
+      from: el.querySelector<HTMLInputElement>('.ops-filter-from input')!,
+      to: el.querySelector<HTMLInputElement>('.ops-filter-to input')!,
+    };
+  }
+
+  it('marks the status select and both date boxes unset on first render', async () => {
+    const { t } = await mount();
+    const c = controls(t.el);
+    expect(c.status.value).toBe('');
+    expect(c.status.classList.contains('is-unset')).toBe(true);
+    expect(c.from.type).toBe('date');
+    expect(c.from.value).toBe('');
+    expect(c.from.classList.contains('is-unset')).toBe(true);
+    expect(c.to.value).toBe('');
+    expect(c.to.classList.contains('is-unset')).toBe(true);
+    t.destroy();
+  });
+
+  it('does NOT mark them unset when the URL state already carries values', async () => {
+    const { t } = await mount(stubWin('?assets.status=ready&assets.from=2026-01-02&assets.to=2026-01-04'));
+    const c = controls(t.el);
+    expect(c.status.value).toBe('ready');
+    expect(c.status.classList.contains('is-unset')).toBe(false);
+    expect(c.from.value).toBe('2026-01-02');
+    expect(c.from.classList.contains('is-unset')).toBe(false);
+    expect(c.to.value).toBe('2026-01-04');
+    expect(c.to.classList.contains('is-unset')).toBe(false);
+    t.destroy();
+  });
+
+  it('drops the marker when a value is chosen, and restores it when cleared', async () => {
+    const { t } = await mount();
+    const c = controls(t.el);
+
+    c.status.value = 'ready';
+    c.status.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(c.status.classList.contains('is-unset')).toBe(false);
+    // Back to the "All statuses" entry — an unfiltered select must read unset
+    // again, which is the whole point of the marker.
+    c.status.value = '';
+    c.status.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(c.status.classList.contains('is-unset')).toBe(true);
+
+    for (const box of [c.from, c.to]) {
+      box.value = '2026-01-03';
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+      expect(box.classList.contains('is-unset')).toBe(false);
+      box.value = '';
+      box.dispatchEvent(new Event('change', { bubbles: true }));
+      expect(box.classList.contains('is-unset')).toBe(true);
+    }
+    t.destroy();
   });
 });

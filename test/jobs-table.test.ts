@@ -479,3 +479,95 @@ describe('unset filter controls are marked muted', () => {
     expect(opts.slice(1).every((o) => o.value !== '')).toBe(true);
   });
 });
+
+// ─── The Jobs bar is typeset by the SAME rules as the other bars (issue #983) ──
+//
+// The Assets side of this already resolves against the real sheet
+// (test/assets-tag-metadata-filters.test.ts:369-381, withStylesheet()); the Jobs
+// bar had no equivalent, so the re-typeset that issue #983 performs on it was
+// unpinned. These assertions reuse that harness here.
+//
+// CONTRACT GROUNDING — every marker below was read off its source, not assumed:
+//   - the caption hook: `label.className = 'ops-filter-label'` in labelled(),
+//     public/jobs-table.js:252. Jobs captions are bare <label>s (no caption
+//     <span>), which is exactly why the shared rule has to name BOTH hooks.
+//   - the control hooks: `sel.className = 'ops-filter-select'`
+//     (statusFilterControl), `input.className = 'ops-filter-date'`
+//     (dateInput, public/jobs-table.js:308), `input.className =
+//     'ops-filter-search'` (searchControl) — and the bar they sit in,
+//     `filterBar.className = 'ops-table-filters'` (public/ops-ui-table.js:414),
+//     which every selector below is scoped to.
+//   - the rules, public/style.css:3050-3053 and :3075-3078:
+//     `.ops-table-filters .ops-filter-label, .ops-table-filters .ops-filter-caption
+//      { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em }`
+//     `.ops-table-filters select, .ops-table-filters input
+//      { font: inherit; font-size: 13px; padding: 5px 8px }`
+//
+// The defect this guards: the Jobs controls sit in a `.ops-filter-slot-inner`
+// div and so inherited the bar's 14px, while the Assets/Logs controls sit inside
+// their 12px caption <label> — two tabs' worth of visibly different control text.
+// `font: inherit` alone does not converge them; the explicit 13px does. Anything
+// that drops that declaration, or re-keys the caption rule off a structure the
+// Jobs bar does not have, fails here.
+describe('the Jobs filter bar resolves against the real stylesheet', () => {
+  const STYLESHEET = readFileSync(resolve(process.cwd(), 'public/style.css'), 'utf8');
+
+  function withStylesheet(): () => void {
+    const style = document.createElement('style');
+    style.textContent = STYLESHEET;
+    document.head.appendChild(style);
+    return () => style.remove();
+  }
+
+  function mountStyled() {
+    const drop = withStylesheet();
+    const table = createJobsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    return { table, drop };
+  }
+
+  it('typesets the Jobs captions at the bar caption size, uppercased', () => {
+    const { table, drop } = mountStyled();
+    try {
+      const captions = table.el.querySelectorAll<HTMLElement>('.ops-table-filters .ops-filter-label');
+      // Status + From + To + Search — a caption per control, none of them a span.
+      expect(captions.length).toBeGreaterThanOrEqual(3);
+      for (const caption of captions) {
+        expect(caption.tagName).toBe('LABEL');
+        const s = getComputedStyle(caption);
+        expect(s.fontSize).toBe('11px');
+        expect(s.textTransform).toBe('uppercase');
+      }
+    } finally {
+      drop();
+    }
+  });
+
+  it('typesets every Jobs select/date/search control at one 13px size', () => {
+    const { table, drop } = mountStyled();
+    try {
+      const select = table.el.querySelector<HTMLElement>('.ops-filter-select')!;
+      const from = table.el.querySelector<HTMLElement>('#jobs-filter-from')!;
+      const to = table.el.querySelector<HTMLElement>('#jobs-filter-to')!;
+      const search = table.el.querySelector<HTMLElement>('.ops-filter-search')!;
+      for (const control of [select, from, to, search]) {
+        expect(control).toBeTruthy();
+        // Each control must really be inside the filter bar, or the scoped rule
+        // above would not apply to it and the size below would be a coincidence.
+        expect(control.closest('.ops-table-filters')).toBeTruthy();
+        expect(getComputedStyle(control).fontSize).toBe('13px');
+      }
+    } finally {
+      drop();
+    }
+  });
+});
+
+// Appended with the describe block above: ESM imports are hoisted, so this sits
+// next to the test that needs it rather than disturbing the import block at the
+// top of this file.
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';

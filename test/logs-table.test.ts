@@ -351,3 +351,190 @@ describe('isUnfilteredFirstPage', () => {
     expect(isUnfilteredFirstPage({})).toBe(true);
   });
 });
+
+// ─── The Logs bar is typeset by the SAME rules as the other bars (issue #983) ──
+//
+// CONTRACT GROUNDING — markers read off their source, not assumed:
+//   - the caption hook: `span.className = 'ops-filter-caption'` in
+//     labelledControl(), public/logs-table.js:267. Logs captions are <span>s
+//     inside the control's <label>; the Jobs bar uses a bare
+//     `.ops-filter-label` instead, which is why the shared rule names both.
+//   - the bar: `filterBar.className = 'ops-table-filters'`
+//     (public/ops-ui-table.js:414) — every selector below is scoped to it.
+//   - the controls: `input.type = 'date'` in dateFilterControl() and
+//     `input.type = 'search'` in searchFilterControl() (public/logs-table.js).
+//     Neither carries a class, so they are reached by the type-qualified
+//     selectors — the exact reason those selectors exist in the sheet.
+//   - the rules, public/style.css:3050-3053, :3075-3078 and :2929-2932:
+//     caption 11px/uppercase; `.ops-table-filters select, .ops-table-filters
+//     input { font-size: 13px }`; `.ops-filter-search::placeholder,
+//     .ops-table-filters input[type='search']::placeholder
+//      { color: var(--text-muted); opacity: 1 }`
+//   - the muted token: `--text-muted: #94a3b8`, public/style.css:6.
+describe('the Logs filter bar resolves against the real stylesheet', () => {
+  const STYLESHEET = readFileSync(resolve(process.cwd(), 'public/style.css'), 'utf8');
+
+  function withStylesheet(): { drop: () => void; sheet: CSSStyleSheet } {
+    const style = document.createElement('style');
+    style.textContent = STYLESHEET;
+    document.head.appendChild(style);
+    return { drop: () => style.remove(), sheet: style.sheet as CSSStyleSheet };
+  }
+
+  function mountStyled() {
+    const styled = withStylesheet();
+    const table = createLogsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    return { table, ...styled };
+  }
+
+  it('typesets the Logs captions at the bar caption size, uppercased', () => {
+    const { table, drop } = mountStyled();
+    try {
+      const captions = table.el.querySelectorAll<HTMLElement>(
+        '.ops-table-filters .ops-filter-caption',
+      );
+      // From + To + Message.
+      expect(captions.length).toBeGreaterThanOrEqual(3);
+      for (const caption of captions) {
+        expect(caption.tagName).toBe('SPAN');
+        const s = getComputedStyle(caption);
+        expect(s.fontSize).toBe('11px');
+        expect(s.textTransform).toBe('uppercase');
+      }
+    } finally {
+      drop();
+    }
+  });
+
+  it('typesets every Logs date/search control at the same 13px as the other bars', () => {
+    const { table, drop } = mountStyled();
+    try {
+      const from = table.el.querySelector<HTMLElement>('.ops-filter-from input')!;
+      const to = table.el.querySelector<HTMLElement>('.ops-filter-to input')!;
+      const search = table.el.querySelector<HTMLElement>('.ops-filter-q input')!;
+      for (const control of [from, to, search]) {
+        expect(control).toBeTruthy();
+        expect(control.closest('.ops-table-filters')).toBeTruthy();
+        // The regression: these inherited their caption <label>'s 12px, so the
+        // Logs controls rendered visibly smaller than the Jobs ones.
+        expect(getComputedStyle(control).fontSize).toBe('13px');
+      }
+    } finally {
+      drop();
+    }
+  });
+
+  it('mutes the Logs search placeholder, which matched no ::placeholder rule before', () => {
+    const { table, drop, sheet } = mountStyled();
+    try {
+      const search = table.el.querySelector<HTMLInputElement>('.ops-filter-q input')!;
+      expect(search.type).toBe('search');
+      expect(search.placeholder.length).toBeGreaterThan(0);
+      expect(search.className).toBe(''); // reached by type, not by class
+
+      // happy-dom does not resolve ::placeholder — getComputedStyle(el,
+      // '::placeholder') reports the INPUT's own colour — so the assertion is
+      // made against the real sheet's CSSOM instead: find every authored
+      // ::placeholder rule, and require that one of them both matches this input
+      // and paints it with the muted token.
+      const placeholderRules = Array.from(sheet.cssRules)
+        .filter((r): r is CSSStyleRule => 'selectorText' in r)
+        .filter((r) => r.selectorText.includes('::placeholder'));
+      expect(placeholderRules.length).toBeGreaterThan(0);
+
+      const muted = getComputedStyle(document.documentElement)
+        .getPropertyValue('--text-muted')
+        .trim();
+      expect(muted).toBe('#94a3b8');
+
+      const hit = placeholderRules.find((r) =>
+        r.selectorText
+          .split(',')
+          .map((s) => s.trim().replace(/::placeholder$/, ''))
+          .some((base) => base.length > 0 && search.matches(base)),
+      );
+      expect(hit).toBeTruthy();
+      expect(hit!.style.color).toBe('var(--text-muted)');
+      // Firefox dims placeholders by default; the rule pins it back.
+      expect(hit!.style.opacity).toBe('1');
+    } finally {
+      drop();
+    }
+  });
+});
+
+// ─── Unset Logs date boxes read as unset, exactly like the Jobs ones (#983) ────
+//
+// The Jobs-side seam is asserted at test/jobs-table.test.ts:398-400; these are
+// the Logs equivalents for the wireUnset() call site at public/logs-table.js:290.
+// CONTRACT GROUNDING: `wireUnset(input)` (public/filter-unset.js, imported at
+// public/logs-table.js:107) toggles `.is-unset` on an empty control, and
+// `.ops-table-filters input[type='date'].is-unset` in public/style.css mutes the
+// UA's yyyy-mm-dd hint. Logs has no <select> in its bar, so the two date boxes
+// are its only placeholder-less controls. No stylesheet needed: happy-dom does
+// not resolve the UA date hint, so the DOM marker IS the testable seam.
+describe('unset Logs date boxes are marked muted', () => {
+  function dates(el: HTMLElement) {
+    return {
+      from: el.querySelector<HTMLInputElement>('.ops-filter-from input')!,
+      to: el.querySelector<HTMLInputElement>('.ops-filter-to input')!,
+    };
+  }
+
+  it('marks both date inputs unset on first render', () => {
+    const table = createLogsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const d = dates(table.el);
+    expect(d.from.type).toBe('date');
+    expect(d.from.value).toBe('');
+    expect(d.from.classList.contains('is-unset')).toBe(true);
+    expect(d.to.value).toBe('');
+    expect(d.to.classList.contains('is-unset')).toBe(true);
+  });
+
+  it('does NOT mark the date boxes unset when the URL state already carries a range', () => {
+    const win = {
+      location: { search: '?logs.from=2026-01-02&logs.to=2026-01-04', pathname: '/', hash: '' },
+      history: { replaceState: vi.fn(), pushState: vi.fn(), state: null },
+    } as unknown as Window;
+    const table = createLogsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+      win,
+    });
+    document.body.appendChild(table.el);
+    const d = dates(table.el);
+    expect(d.from.value).toBe('2026-01-02');
+    expect(d.from.classList.contains('is-unset')).toBe(false);
+    expect(d.to.value).toBe('2026-01-04');
+    expect(d.to.classList.contains('is-unset')).toBe(false);
+  });
+
+  it('drops the marker as soon as a date is picked, and restores it when cleared', () => {
+    const table = createLogsTable({
+      apiFetch: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+      win: null,
+    });
+    document.body.appendChild(table.el);
+    const { from } = dates(table.el);
+    expect(from.classList.contains('is-unset')).toBe(true);
+    from.value = '2026-01-03';
+    from.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(from.classList.contains('is-unset')).toBe(false);
+    from.value = '';
+    from.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(from.classList.contains('is-unset')).toBe(true);
+  });
+});
+
+// Appended with the describe blocks above: ESM imports are hoisted, so this sits
+// next to the tests that need it rather than disturbing the import block at the
+// top of this file.
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
