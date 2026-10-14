@@ -55,7 +55,11 @@ const errorSchema = z.object({ error: z.string(), message: z.string().optional()
 const transitionSchema = z.object({
   at: z.string(),
   from: z.string().nullable(),
-  to: z.string()
+  to: z.string(),
+  // Why a background settle moved the asset (issue #1085). Mirrors the same
+  // optional member on the assets router's transition schema
+  // (src/routes/assets.ts) so a hit's history reads identically here.
+  reason: z.string().optional()
 });
 
 const audioTrackSchema = z.object({

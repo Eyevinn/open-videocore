@@ -451,7 +451,16 @@ export class CouchAssetRepository implements AssetRepository {
       next.versionGroupId = patch.versionGroupId;
     }
     if (patch.status !== undefined) {
-      const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
+      // `patch.statusReason` (issue #1085) annotates the appended history entry
+      // so a background settle says WHY — see UpdateAssetInput.statusReason,
+      // src/data/asset-repo.ts.
+      const applied = applyStatus(
+        existing.status,
+        patch.status,
+        existing.statusHistory,
+        now,
+        patch.statusReason
+      );
       next.status = applied.status;
       next.statusHistory = applied.statusHistory;
     }

@@ -2886,8 +2886,10 @@ abandonedUploadSweepLoop.start(abandonedUploadIntervalMsFromEnv());
 // this process's start time: a `running` ingest-url job stamped before it cannot
 // belong to a live worker here, while anything stamped at or after it may be a
 // pull streaming bytes right now and is left strictly alone. Settles the JOB
-// record only — moving the asset out of `uploading` is #1085 and partial-byte
-// cleanup is #1086 — and does NOT re-queue the pull. Idempotent, so a crash
+// record and, in the same pass, the asset it was pulling into (#1085: moved
+// `uploading -> failed` with a reason naming the interrupted pull, distinct from
+// the abandoned-upload sweep's) — partial-byte cleanup is still #1086 — and does
+// NOT re-queue the pull. Idempotent, so a crash
 // between boots cannot double-settle. Detached + swallowed: a reconcile failure
 // must never block the API from serving.
 //
@@ -2914,6 +2916,13 @@ function printfToPino(
 
 void reconcileInterruptedIngests({
   jobs: jobRepository,
+  // Issue #1085: settle the pull's ASSET in the same pass. Without this the
+  // asset keeps claiming `uploading` — with nothing left alive to finish the
+  // upload — until the 24h abandoned-upload sweep above settles it under the
+  // WRONG reason ('upload abandoned', which blames the client for a server-side
+  // interruption). Only an asset still in `uploading` is touched. Resolved
+  // per-stack like the job repository, via the same runInStack below.
+  assets: assetRepository,
   audit: auditEmitter,
   auditLog: app.log,
   stacks: {
