@@ -233,3 +233,292 @@ describe('makePerStackQuotaSum — every provisioned stack, one deployment-wide 
     expect((await store.read()).consumedBytes).toBe(150);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #1141 review finding 1 — the walk enumerates READY stacks only.
+//
+// `listStackNames()` applies no status filter, so the `status: 'provisioning'`
+// record the provision route writes before creating services and the
+// `status: 'failed'` record it writes on a failure path are both listed, and
+// both persist on purpose so deprovision can still clean them up
+// (src/services/param-store.ts:121-128, isReadyStack). `resolve()` refuses to
+// connect them and yields the same no-storage shape as a degraded resolution,
+// so before this fix one un-deprovisioned failed provision put the sweep
+// permanently in the `stack-without-object-storage` branch and FROZE the
+// deployment-wide counter. These cases pin both halves: with the readiness
+// listing the sweep writes, without it the same inputs freeze.
+//
+// Contract sources verified before writing (per CLAUDE.md rule 7):
+//   - PerStackQuotaSumDeps.listReadyStackNames?(): Promise<string[]>, consumed
+//     in place of resolver.listStackNames() by the sweep's internal
+//     StackSweepResolver: src/data/storage-quota-stack-sum.ts:134, :233-237
+//   - WorkspaceStackResolver.listReadyStackNames(), wired at src/main.ts:3082
+//   - forEachStack() reads the stack list through
+//     StackSweepResolver.listStackNames(): src/services/for-each-stack.ts:98-99
+describe('makePerStackQuotaSum — only READY stacks are enumerated (#1141 finding 1)', () => {
+  // `listStackNames()` returns the unfiltered listing (a ready stack plus a
+  // failed provision record); `listReadyStackNames()` returns only the stack
+  // the resolver would actually connect.
+  function listings() {
+    const listedCalls: string[] = [];
+    const readyCalls: string[] = [];
+    const resolver: StackSweepResolver = {
+      listStackNames: async () => {
+        listedCalls.push('listStackNames');
+        return ['stack-a', 'stack-b-failed'];
+      },
+      resolve: async () => ({})
+    };
+    const listReadyStackNames = async () => {
+      readyCalls.push('listReadyStackNames');
+      return ['stack-a'];
+    };
+    return { resolver, listReadyStackNames, listedCalls, readyCalls };
+  }
+
+  // The failed provision record resolves to no object storage, exactly as the
+  // resolver's non-ready fallback does.
+  const plan = {
+    'stack-a': { sizes: [100, 200] },
+    'stack-b-failed': { sizes: [], noStorage: true }
+  };
+
+  it('(5) skips a non-ready stack and still WRITES the ready stacks total', async () => {
+    const summed: string[] = [];
+    const store = new InMemoryStorageQuotaStore({ consumedBytes: 999 });
+    const { resolver, listReadyStackNames, listedCalls, readyCalls } = listings();
+
+    const total = await reconcileStorageQuota({
+      store,
+      buckets: [
+        makePerStackQuotaSum({
+          resolver,
+          listReadyStackNames,
+          bucketsForStack: bucketsFor(plan, summed)
+        })
+      ]
+    });
+
+    // stack-a's two buckets only; the failed record contributed nothing and
+    // did NOT make the pass partial.
+    expect(total).toBe(300);
+    expect((await store.read()).consumedBytes).toBe(300);
+    expect(summed).toEqual(['stack-a:0', 'stack-a:1']);
+    // The readiness listing replaced the unfiltered one for the enumeration.
+    expect(readyCalls).toEqual(['listReadyStackNames']);
+    expect(listedCalls).toEqual([]);
+  });
+
+  it('(5b) the SAME inputs enumerated unfiltered freeze the counter — what finding 1 fixed', async () => {
+    const summed: string[] = [];
+    const store = new InMemoryStorageQuotaStore({ consumedBytes: 999 });
+    const { resolver } = listings();
+
+    // No listReadyStackNames: the walk falls back to the unfiltered listing,
+    // so the failed provision record looks like a ready stack that resolved
+    // without object storage.
+    const sum = makePerStackQuotaSum({
+      resolver,
+      bucketsForStack: bucketsFor(plan, summed)
+    });
+
+    await expect(reconcileStorageQuota({ store, buckets: [sum] })).rejects.toMatchObject({
+      name: 'PerStackQuotaSumIncomplete',
+      reason: 'stack-without-object-storage'
+    });
+    expect((await store.read()).consumedBytes).toBe(999);
+  });
+
+  it('(5c) a readiness read failure fails the sweep instead of reporting "no ready stacks"', async () => {
+    const store = new InMemoryStorageQuotaStore({ consumedBytes: 4242 });
+    const { resolver } = listings();
+    const sum = makePerStackQuotaSum({
+      resolver,
+      listReadyStackNames: async () => {
+        throw new Error('parameter store unreachable');
+      },
+      bucketsForStack: bucketsFor(plan, [])
+    });
+
+    // "We don't know which stacks are live" must never be written as a total.
+    await expect(reconcileStorageQuota({ store, buckets: [sum] })).rejects.toThrow(
+      'parameter store unreachable'
+    );
+    expect((await store.read()).consumedBytes).toBe(4242);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1141 review finding 2 — the resolution guards, exercised against resolver
+// stubs that return real connection SHAPES (the shared `makeResolver` above
+// returns `{}`, under which none of these guards can fire).
+//
+// Contract sources verified before writing (per CLAUDE.md rule 7):
+//   - the three guards: alias check on `conns.stackName`
+//     (src/data/storage-quota-stack-sum.ts:257-265), object-store identity
+//     dedup on `endpoint|sourceBucket|packagedBucket` (:199-205, :267-278) and
+//     the ready-stack-without-buckets check (:285-288, :323-329)
+//   - WorkspaceConnections.stackName — "the stack identity these connections
+//     were built from ... Undefined on the env-override and in-memory fallback
+//     paths": src/services/workspace-stack.ts:190-198
+//   - WorkspaceConnections.s3Config.endpoint / .sourceBucket / .packagedBucket:
+//     src/services/workspace-stack.ts:362-375 (per-stack), :537-539 (MINIO_URL
+//     env override), `s3Config: undefined` on the no-storage in-memory
+//     fallback: :585-587
+describe('makePerStackQuotaSum — resolution guards on real connection shapes (#1141 finding 2)', () => {
+  // The subset of WorkspaceConnections the walk inspects (ResolvedConnectionsLike,
+  // src/data/storage-quota-stack-sum.ts:171-176).
+  type FakeConnections = {
+    stackName?: string;
+    sourceBucket?: string;
+    packagedBucket?: string;
+    s3Config?: { endpoint?: string };
+  };
+
+  // Every stack of a deployment carries the SAME literal bucket names
+  // (workspace-stack.ts:291-295), which is why the endpoint is part of the
+  // identity rather than the bucket names alone.
+  const SOURCE = 'openvideocore-source';
+  const PACKAGED = 'openvideocore-packaged';
+
+  function connsFor(stackName: string): FakeConnections {
+    return {
+      stackName,
+      sourceBucket: SOURCE,
+      packagedBucket: PACKAGED,
+      s3Config: { endpoint: `https://${stackName}-objectstore.example.test` }
+    };
+  }
+
+  // A resolver stub that hands back a connection shape per name, so the guards
+  // see what the real resolver would give them.
+  function makeConnectionResolver(
+    names: string[],
+    byName: (stackName: string | undefined) => FakeConnections
+  ): StackSweepResolver {
+    return {
+      listStackNames: async () => [...names],
+      resolve: async (stackName) => byName(stackName)
+    };
+  }
+
+  it('(a) two names resolving to ONE object store (env override) are summed once', async () => {
+    const summed: string[] = [];
+    const store = new InMemoryStorageQuotaStore({ consumedBytes: 1 });
+    // MINIO_URL-style override: identical connections for every name, and NO
+    // stackName — so the alias guard cannot fire and the identity dedup is the
+    // only thing standing between the sweep and N x the real bytes.
+    const override: FakeConnections = {
+      sourceBucket: SOURCE,
+      packagedBucket: PACKAGED,
+      s3Config: { endpoint: 'https://shared-objectstore.example.test' }
+    };
+    const resolver = makeConnectionResolver(['stack-a', 'stack-b'], () => override);
+
+    const total = await reconcileStorageQuota({
+      store,
+      buckets: [
+        makePerStackQuotaSum({
+          resolver,
+          listReadyStackNames: async () => ['stack-a', 'stack-b'],
+          bucketsForStack: bucketsFor(
+            { 'stack-a': { sizes: [100, 200] }, 'stack-b': { sizes: [100, 200] } },
+            summed
+          )
+        })
+      ]
+    });
+
+    // 300, not 600: one set of buckets counted once.
+    expect(total).toBe(300);
+    expect((await store.read()).consumedBytes).toBe(300);
+    expect(summed).toEqual(['stack-a:0', 'stack-a:1']);
+  });
+
+  it('(b) a resolution naming ANOTHER stack declines the write and keeps the previous total', async () => {
+    const summed: string[] = [];
+    const warn = vi.fn();
+    const store = new InMemoryStorageQuotaStore({ consumedBytes: 5000 });
+    // stack-b has no stored config, so the resolver aliases it to the first
+    // listed stack (workspace-stack.ts:1054-1066) and returns stack-a's
+    // connections under stack-b's name.
+    const resolver = makeConnectionResolver(['stack-a', 'stack-b'], () => connsFor('stack-a'));
+
+    const sum = makePerStackQuotaSum({
+      resolver,
+      listReadyStackNames: async () => ['stack-a', 'stack-b'],
+      logger: { warn },
+      bucketsForStack: bucketsFor(
+        { 'stack-a': { sizes: [100] }, 'stack-b': { sizes: [7] } },
+        summed
+      )
+    });
+
+    await expect(reconcileStorageQuota({ store, buckets: [sum] })).rejects.toMatchObject({
+      name: 'PerStackQuotaSumIncomplete',
+      reason: 'stack-failures'
+    });
+
+    // stack-a was summed, stack-b was refused — and because the pass was
+    // partial the counter is untouched at its previous value.
+    expect(summed).toEqual(['stack-a:0']);
+    expect((await store.read()).consumedBytes).toBe(5000);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ stackName: 'stack-b', resolvedStackName: 'stack-a' }),
+      expect.stringContaining('another stack')
+    );
+  });
+
+  it('(c) a READY stack resolving without object storage rejects and keeps the previous total', async () => {
+    const summed: string[] = [];
+    const store = new InMemoryStorageQuotaStore({ consumedBytes: 8080 });
+    // stack-b degraded to the in-memory no-storage fallback: correct stackName,
+    // no s3Config, no buckets — and it is READY, so it cannot be skipped.
+    const resolver = makeConnectionResolver(['stack-a', 'stack-b'], (stackName) =>
+      stackName === 'stack-b' ? { stackName: 'stack-b' } : connsFor('stack-a')
+    );
+
+    const sum = makePerStackQuotaSum({
+      resolver,
+      listReadyStackNames: async () => ['stack-a', 'stack-b'],
+      bucketsForStack: bucketsFor(
+        { 'stack-a': { sizes: [100, 200] }, 'stack-b': { sizes: [], noStorage: true } },
+        summed
+      )
+    });
+
+    await expect(reconcileStorageQuota({ store, buckets: [sum] })).rejects.toMatchObject({
+      name: 'PerStackQuotaSumIncomplete',
+      reason: 'stack-without-object-storage'
+    });
+
+    expect(summed).toEqual(['stack-a:0', 'stack-a:1']);
+    expect((await store.read()).consumedBytes).toBe(8080);
+  });
+
+  it('(c2) distinct endpoints are NOT deduplicated: both stacks are summed', async () => {
+    const summed: string[] = [];
+    const store = new InMemoryStorageQuotaStore();
+    const resolver = makeConnectionResolver(['stack-a', 'stack-b'], (stackName) =>
+      connsFor(stackName ?? 'stack-a')
+    );
+
+    const total = await reconcileStorageQuota({
+      store,
+      buckets: [
+        makePerStackQuotaSum({
+          resolver,
+          listReadyStackNames: async () => ['stack-a', 'stack-b'],
+          bucketsForStack: bucketsFor(
+            { 'stack-a': { sizes: [100, 200] }, 'stack-b': { sizes: [30, 4] } },
+            summed
+          )
+        })
+      ]
+    });
+
+    expect(total).toBe(334);
+    expect((await store.read()).consumedBytes).toBe(334);
+    expect(summed).toEqual(['stack-a:0', 'stack-a:1', 'stack-b:0', 'stack-b:1']);
+  });
+});
