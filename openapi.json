@@ -2267,6 +2267,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -2839,6 +2842,9 @@
                                     "failed",
                                     "archived"
                                   ]
+                                },
+                                "reason": {
+                                  "type": "string"
                                 }
                               },
                               "required": [
@@ -3554,6 +3560,9 @@
                                     "failed",
                                     "archived"
                                   ]
+                                },
+                                "reason": {
+                                  "type": "string"
                                 }
                               },
                               "required": [
@@ -4092,6 +4101,9 @@
                                     "failed",
                                     "archived"
                                   ]
+                                },
+                                "reason": {
+                                  "type": "string"
                                 }
                               },
                               "required": [
@@ -4705,6 +4717,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -5294,6 +5309,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -6059,6 +6077,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -6665,6 +6686,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -7370,6 +7394,9 @@
                                     "failed",
                                     "archived"
                                   ]
+                                },
+                                "reason": {
+                                  "type": "string"
                                 }
                               },
                               "required": [
@@ -10311,6 +10338,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -11231,6 +11261,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -12022,6 +12055,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -13111,6 +13147,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -13656,6 +13695,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -14293,6 +14335,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -14873,6 +14918,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -15407,6 +15455,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -15943,6 +15994,9 @@
                               "failed",
                               "archived"
                             ]
+                          },
+                          "reason": {
+                            "type": "string"
                           }
                         },
                         "required": [
@@ -21805,6 +21859,9 @@
                                   "nullable": true
                                 },
                                 "to": {
+                                  "type": "string"
+                                },
+                                "reason": {
                                   "type": "string"
                                 }
                               },
