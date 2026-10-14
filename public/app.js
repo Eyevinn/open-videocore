@@ -245,6 +245,30 @@ function canChangeDeleteLock() {
   return r === 'editor' || r === 'admin';
 }
 
+/**
+ * Copy for the unified Editorial panel — review state + tags + comments as one
+ * surface on asset detail (issue #937). Verbatim from the copy deck in
+ * docs/design/editorial-panel-layout.md §9, where the intro sentence is §4.2.
+ *
+ * The intro names the lifecycle field (`status`) and where it is rendered (the
+ * summary grid) instead of saying "above": the two axes are INDEPENDENT
+ * (src/data/asset-repo.ts:55-61 — "a `ready` asset can be `draft`,
+ * `in-review`, `approved`, or `rejected`, and moving one never moves the
+ * other"), and a positional claim silently becomes false the moment the panel
+ * is re-ordered or the pane is narrowed.
+ *
+ * Exported so a test asserts the rendered string against the deck rather than
+ * against a copy of it.
+ */
+export const EDITORIAL_COPY = Object.freeze({
+  heading: 'Editorial',
+  intro:
+    'Editorial state — set by people, not by the pipeline. Review state, tags ' +
+    'and comments are all edited here. Review state is a separate axis from ' +
+    "the asset's lifecycle status in the summary grid: moving one never moves " +
+    'the other.',
+});
+
 // Whether the current client role may apply an editorial review transition
 // (issue #901). Same matrix, checked before this was written: `MATRIX`
 // (src/auth/authorize.ts:54-58) gives `write` to `editor` and `admin` only, and
@@ -2997,39 +3021,11 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // Bind the ULID copy affordance (issue #851).
     wireCopyIdButtons(kvDiv);
 
-    // ── Tags: add / remove (issue #934, broken out of #792) ──
-    //
-    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
-    // cited in full — with the verified constraints — in public/asset-tags.js:
-    //   READ: there is NO GET /assets/{id}/tags. `openapi.json
-    //        .paths["/api/v1/assets/{id}/tags"]` declares `post` only; the list
-    //        is the optional `tags` array on the asset body already awaited
-    //        above (`assetSchema`, src/routes/assets.ts:919), so the panel adds
-    //        no round-trip. Absent and `[]` both mean "no tags" and both occur.
-    //   POST /api/v1/assets/{id}/tags — body REQUIRED
-    //        { tags: string[] }, each 1..128 chars, 1..128 items,
-    //        additionalProperties: false; 200 = the FULL asset, 404 { error }.
-    //        APPENDS and deduplicates (src/routes/assets.ts:5568-5590, merge at
-    //        :5583 via normalizeTags, src/data/asset-repo.ts:1297).
-    //   DELETE /api/v1/assets/{id}/tags/{tag} — no body; 200 = the FULL asset,
-    //        404 { error }. Removing an absent tag is a 200 no-op
-    //        (src/routes/assets.ts:5595-5618, filter at :5609).
-    // Mounted directly under the key/value grid, where the read-only "Tags" row
-    // used to be, so the tags stay where operators already look for them — and
-    // so there is exactly ONE rendering of the list. Both mutations return the
-    // full asset and the panel re-renders from THAT (never from a local edit),
-    // which is what keeps the list in step with the server after every change.
-    //
-    // The sub-resource takes the ULID (`asset.id`): unlike GET /:id neither
-    // handler resolves a slug (verified — POST to /assets/<slug>/tags 404s), and
-    // this pane holds the ULID even when it was opened by slug.
-    mountAssetTags({
-      asset: asset,
-      host: body,
-      canChange: canChangeTags(),
-      apiFetch: apiFetch,
-      showMsg: showMsg,
-    });
+    // Tags used to be a read-only key/value row here, then (issue #934) an
+    // editable block mounted directly under this grid. Since issue #937 they
+    // are a sub-section of the single "Editorial" panel further down, next to
+    // review state and comments — see the mount below. There is still exactly
+    // ONE rendering of the tag list anywhere on this pane.
 
     // ── Status history (issue #889) ──
     // The audited lifecycle trail. Rendered here so a status transition an
@@ -3591,6 +3587,70 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       showMsg(host, text, kind);
     };
 
+    // ── The Editorial panel: review state + tags + comments (issue #937) ──
+    //
+    // One named container for the three things a HUMAN decides about an asset,
+    // per docs/design/editorial-panel-layout.md §1-§4 (the layout defined in
+    // #898 / PR #1035). It replaces three separately-wedged blocks; the three
+    // sub-sections themselves are untouched modules (public/review-state.js,
+    // public/asset-tags.js, public/comments-panel.js) and still mount, render
+    // and re-render independently — the panel only supplies their host element,
+    // so any one of them can ship, change or be removed on its own.
+    //
+    // Fixed order, identical on every asset (§2): Review → Tags → Comments.
+    // Review first because it is the only sub-section with a state machine and
+    // the only one an operator is blocked by; comments last because the thread
+    // is unbounded and unpaginated, so nothing may sit below it.
+    //
+    // The panel is inserted before the action row — exactly the slot the review
+    // block occupied before — so no block moves out of the review/comments slot
+    // and nothing above it shifts. The blocks the panel ABSORBS do move relative
+    // to each other, by design: comments and tags now render inside the panel,
+    // so `#asset-comments` sits above `#asset-external-ids` and the export action
+    // instead of below them (both still anchor on the action row, which the panel
+    // now precedes), and tags come up from under the summary grid. §2's "nothing
+    // is placed below comments" therefore holds within the panel, not pane-wide.
+    // The pane still reads: what the asset is (grid, technical) → what happened
+    // to it (status history, pipeline) → what humans decide and say about it
+    // (this panel) → what you can do to it (the action row).
+    //
+    // The panel NEVER collapses (§3): hiding the review axis behind a click is
+    // the exact failure #134 asks this layout to prevent.
+    const editorialPanel = document.createElement('div');
+    editorialPanel.id = 'editorial-panel';
+    editorialPanel.className = 'mt20 editorial-panel';
+    const editorialTitle = document.createElement('div');
+    editorialTitle.className = 'section-title';
+    editorialTitle.textContent = EDITORIAL_COPY.heading;
+    editorialPanel.appendChild(editorialTitle);
+    // The axis sentence, promoted from the review block so it covers all three
+    // sub-sections (§4.2, copy deck §9). It names the lifecycle `status` field
+    // and where it lives rather than pointing "above" at it, so the claim stays
+    // true if this panel is ever re-ordered or the pane is narrowed.
+    const editorialIntro = document.createElement('div');
+    editorialIntro.className = 'text-muted editorial-intro';
+    editorialIntro.textContent = EDITORIAL_COPY.intro;
+    editorialPanel.appendChild(editorialIntro);
+    actionsDiv.parentNode.insertBefore(editorialPanel, actionsDiv);
+    /**
+     * One sub-section wrapper inside the panel. The wrapper — not the module —
+     * carries the group id and class, which is what lets the three modules stay
+     * independent: they keep their own ids (`#review-state`, `#asset-tags`,
+     * `#asset-comments`), their own `aria-live` hosts and their own in-place
+     * re-render, and the panel supplies nothing but a parent element.
+     *
+     * @param {string} id  the group id (`editorial-review` | `editorial-tags` |
+     *                     `editorial-comments`)
+     * @returns {HTMLElement}
+     */
+    const editorialGroup = function (id) {
+      const group = document.createElement('div');
+      group.id = id;
+      group.className = 'editorial-group';
+      editorialPanel.appendChild(group);
+      return group;
+    };
+
     // ── Editorial review state + legal transitions (issue #901) ──
     //
     // Contract, fetched before this call was written (CLAUDE.md rule 7) and
@@ -3604,21 +3664,65 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //        404 { error }, 422 { error: 'invalid_review_transition', message }.
     //        (…].post; src/routes/assets.ts:5470-5484, 422 mapping :2663-2664)
     //
-    // The block is mounted ABOVE "Delete protection" and renders its own badge
-    // class, because the review axis is INDEPENDENT of the lifecycle `status`
-    // shown in the KV grid above (src/data/asset-repo.ts:55-61) — the two must
-    // not read as one control (#134). The transition buttons are built only from
+    // The block is the FIRST sub-section of the editorial panel and renders its
+    // own badge class, because the review axis is INDEPENDENT of the lifecycle
+    // `status` shown in the KV grid (src/data/asset-repo.ts:55-61) — the two
+    // must not read as one control (#134). Keeping review state inside the
+    // accented editorial boundary and the lifecycle badge outside it in the
+    // summary grid is the first of the separations in
+    // docs/design/editorial-panel-layout.md §4; the differing badge SHAPE
+    // (.review-badge is square, .badge is a pill), the non-overlapping
+    // vocabularies, the literal "Review state" label and the panel intro
+    // sentence carry the rest. The transition buttons are built only from
     // the server's `allowedTransitions`, so an illegal move has no control to
     // originate from; the asset's own `reviewState` field is deliberately NOT
     // used to gate anything, since it carries the state but not the graph.
     //
     // Sub-resource paths take the ULID (`asset.id`), which this pane holds even
     // when it was opened by slug.
+    // `host` with no `anchorEl`: the module's own place() appends to `host` in
+    // that case ("The block is inserted before `anchorEl` when given, else
+    // appended to `host`", public/review-state.js), so re-parenting it into the
+    // panel needs no signature change.
     await mountReviewState({
       assetId: asset.id,
-      anchorEl: actionsDiv,
-      host: body,
+      host: editorialGroup('editorial-review'),
       canChange: canChangeReviewState(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
+
+    // ── Tags: add / remove (issue #934, broken out of #792) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full — with the verified constraints — in public/asset-tags.js:
+    //   READ: there is NO GET /assets/{id}/tags. `openapi.json
+    //        .paths["/api/v1/assets/{id}/tags"]` declares `post` only; the list
+    //        is the optional `tags` array on the asset body already awaited
+    //        above (`assetSchema`, src/routes/assets.ts:919), so the panel adds
+    //        no round-trip. Absent and `[]` both mean "no tags" and both occur.
+    //   POST /api/v1/assets/{id}/tags — body REQUIRED
+    //        { tags: string[] }, each 1..128 chars, 1..128 items,
+    //        additionalProperties: false; 200 = the FULL asset, 404 { error }.
+    //        APPENDS and deduplicates (src/routes/assets.ts:5568-5590, merge at
+    //        :5583 via normalizeTags, src/data/asset-repo.ts:1297).
+    //   DELETE /api/v1/assets/{id}/tags/{tag} — no body; 200 = the FULL asset,
+    //        404 { error }. Removing an absent tag is a 200 no-op
+    //        (src/routes/assets.ts:5595-5618, filter at :5609).
+    //
+    // Second sub-section of the editorial panel (issue #937): classification is
+    // what the review decision above it is made ABOUT, and the pill list has a
+    // fixed, scannable height. Both mutations return the full asset and the
+    // block re-renders from THAT (never from a local edit) — it re-renders only
+    // itself, never the whole pane, so the comment draft below survives.
+    //
+    // The sub-resource takes the ULID (`asset.id`): unlike GET /:id neither
+    // handler resolves a slug (verified — POST to /assets/<slug>/tags 404s), and
+    // this pane holds the ULID even when it was opened by slug.
+    mountAssetTags({
+      asset: asset,
+      host: editorialGroup('editorial-tags'),
+      canChange: canChangeTags(),
       apiFetch: apiFetch,
       showMsg: showMsg,
     });
@@ -3690,9 +3794,11 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //        schema. (…].post; src/routes/assets.ts:4776-4793,
     //        commentBodySchema :1174-1176)
     //
-    // Mounted directly below "Editorial review" and above the action row, with
-    // the other editorial blocks: a comment is editorial commentary on the
-    // asset, not a lifecycle operation.
+    // Last sub-section of the editorial panel (issue #937), below Review and
+    // Tags and above the action row: a comment is editorial commentary on the
+    // asset, not a lifecycle operation. It is last because the thread is
+    // unbounded and the API offers no pagination, so anything placed below it
+    // would be pushed off-screen as the thread grows.
     //
     // ADD + READ ONLY, and not as a scope decision to revisit: the path carries
     // only `post` and `get`, there is no `…/comments/{commentId}` path, and
@@ -3712,8 +3818,7 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     // (src/routes/assets.ts:4786, :4807).
     await mountAssetComments({
       assetId: asset.id,
-      anchorEl: actionsDiv,
-      host: body,
+      host: editorialGroup('editorial-comments'),
       canAdd: canAddComment(),
       apiFetch: apiFetch,
       showMsg: showMsg,
