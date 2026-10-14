@@ -164,6 +164,52 @@ export function isIdlePastTimeout(
   return now - idleSince > idleTimeoutMs;
 }
 
+// #1171 review finding A: how long before a service access token's own `exp`
+// this loop stops using its cached copy. The probe is a single HEAD with a 5s
+// bound, so anything comfortably longer than one request is enough; 60s also
+// absorbs modest clock skew between this process and the token issuer.
+export const SAT_EXPIRY_MARGIN_MS = 60_000;
+
+// Fallback cache lifetime for a token whose expiry we cannot read (not a JWT,
+// or no usable `exp` claim). Deliberately far shorter than the ~1h a real SAT
+// lasts: minting is one HTTPS POST on a path that only runs while an instance
+// is still being gated, so re-minting too often costs nothing, whereas holding
+// an expired token is what #1171's review flagged.
+export const SAT_UNKNOWN_EXPIRY_TTL_MS = 5 * 60_000;
+
+// Epoch ms at which a service access token expires, read from the `exp` claim of
+// its (unverified) JWT payload, or undefined when that is not readable.
+//
+// Contract (CLAUDE.md rule 7): RFC 7519 §4.1.4 — `exp` is a NumericDate, i.e.
+// SECONDS since the epoch, in the second of the three dot-separated base64url
+// segments of a JWS (RFC 7515 §3.1). Verified against a live token minted
+// 2026-10-14 from `POST https://token.svc.prod.osaas.io/servicetoken` for
+// `eyevinn-encore-callback-listener`: three segments, payload
+// `{"...","iat":1760...,"exp":1760...}` with `exp - iat === 3601`.
+//
+// NOTE: the signature is deliberately NOT verified — this is a local cache-TTL
+// hint for a token WE minted and only send outbound, never a trust decision. A
+// token whose payload does not parse simply falls back to
+// SAT_UNKNOWN_EXPIRY_TTL_MS.
+export function jwtExpiryEpochMs(token: string): number | undefined {
+  const parts = token.split('.');
+  if (parts.length !== 3) return undefined;
+  const payload = parts[1];
+  if (payload === undefined || payload.length === 0) return undefined;
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(payload, 'base64url').toString('utf8')
+    ) as { exp?: unknown };
+    const exp = decoded.exp;
+    if (typeof exp === 'number' && Number.isFinite(exp) && exp > 0) {
+      return exp * 1000;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class EncoreScalerLoop {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
@@ -181,12 +227,18 @@ export class EncoreScalerLoop {
   // loop — one loop per workspace, created once (workspace-registry.ts) — so the
   // state lives exactly as long as the loop whose appends it is limiting.
   private readonly logThrottle = new ScalerLogThrottle();
-  // #1171: callback-listener service access token, cached for the lifetime of
-  // the loop. Only used to disambiguate a 401/403 on the callback-trust probe
-  // (see ensureCallbackTrust), so it is fetched lazily — a pool that never
-  // probes never mints one. Never logged; `spawnFailureSecrets` redaction
-  // already covers SAT-shaped strings in log paths.
-  private callbackListenerSat: string | undefined;
+  // #1171: callback-listener service access token with the epoch ms at which
+  // this loop stops trusting it. Only used to disambiguate a 401/403 on the
+  // callback-trust probe (see ensureCallbackTrust), so it is fetched lazily — a
+  // pool that never probes never mints one. Caching it for the loop's lifetime
+  // was the #1171 review's finding A: a minted SAT expires (~1h) and the client
+  // renews nothing, so an indefinite cache turns every later re-probe into an
+  // expired-JWT 401. `expiresAtMs` comes from the token's own `exp` claim where
+  // readable (see getCallbackListenerSat). Never logged; `spawnFailureSecrets`
+  // redaction already covers SAT-shaped strings in log paths.
+  private callbackListenerSat:
+    | { token: string; expiresAtMs: number }
+    | undefined;
 
   constructor(private config: EncoreScalerConfig) {}
 
@@ -1699,9 +1751,11 @@ export class EncoreScalerLoop {
   //     fires during the ~14s window after a fresh listener's ingress starts
   //     answering, in which the origin returns 200 while `/encoreCallback` is
   //     still auth-walled (measured live; see callback-trust-probe.ts header).
-  //     That window is the #811/#812 failure, and it resolves on its own well
-  //     inside the bounded wait — the instance is simply held ineligible until
-  //     it does. Past the bounded wait it resolves to the degraded
+  //     That window is the #811/#812 failure. It lifted inside the bounded wait
+  //     on the instances measured for #814 (~14s) but NOT on the four in #1171
+  //     (401 for ~62s), so "it resolves on its own in time" is an expectation,
+  //     not a guarantee: the instance is held ineligible while it might, and
+  //     past the bounded wait it resolves to the degraded
   //     `callbackPathUnusableAt` state — persisted, logged, and dispatched to
   //     anyway so completion falls back to the terminal-job sweep instead of
   //     halting the pool. `callbackTrustReady` is never set for it, so
@@ -1719,19 +1773,51 @@ export class EncoreScalerLoop {
   // (never throws) if the token cannot be minted: the probe then behaves exactly
   // as it did before, grading an unauthenticated 401/403 as 'callback-unusable'.
   //
-  // Contract (CLAUDE.md rule 7): `@osaas/client-core@0.24.0`
-  // `lib/context.d.ts:25` — `getServiceAccessToken(serviceId: string):
-  // Promise<string>`, called with `ENCORE_CALLBACK_LISTENER_SERVICE_ID`
-  // (`src/encore-scaler/instance-pool.ts:68`), the same service id and the same
-  // accessor instance-pool.ts:722 already uses for the paired listener.
-  private async getCallbackListenerSat(): Promise<string | undefined> {
-    if (this.callbackListenerSat) return this.callbackListenerSat;
+  // EXPIRY-AWARE (#1171 review finding A). The first cut cached the token for
+  // the process lifetime, which silently un-fixed #1171 after about an hour:
+  // every re-probe then sent an EXPIRED JWT, the ingress answered 401 just as it
+  // does for a missing one, and every instance graded back to
+  // 'callback-unusable'. The cache therefore carries the token's own expiry and
+  // re-mints `SAT_EXPIRY_MARGIN_MS` before it, and `forceRefresh` lets the probe
+  // discard a token the ingress just rejected.
+  //
+  // Contracts (CLAUDE.md rule 7):
+  //   - `getServiceAccessToken(serviceId: string): Promise<string>` —
+  //     `@osaas/client-core@0.24.0` `lib/context.d.ts:25`, called with
+  //     `ENCORE_CALLBACK_LISTENER_SERVICE_ID`
+  //     (`src/encore-scaler/instance-pool.ts:68`), the same service id and the
+  //     same accessor instance-pool.ts:722 already uses for the paired listener.
+  //   - No renewal exists in the client to lean on: `lib/context.js:22-45`
+  //     POSTs `https://token.svc.<env>.osaas.io/servicetoken` per call and
+  //     returns `serviceAccessToken.token` ONLY — the `expiry` field of the
+  //     `ServiceAccessToken` type (`lib/context.d.ts:5-9`:
+  //     `{ serviceId; token; expiry }`) is discarded before we can see it — and
+  //     `refreshServiceAccessToken` (`lib/context.js:58-60`) is a plain
+  //     re-mint. Hence reading `exp` off the JWT here (jwtExpiryEpochMs).
+  private async getCallbackListenerSat(
+    opts: { forceRefresh?: boolean } = {}
+  ): Promise<string | undefined> {
+    const now = Date.now();
+    const cached = this.callbackListenerSat;
+    if (!opts.forceRefresh && cached !== undefined && cached.expiresAtMs > now) {
+      return cached.token;
+    }
+    // Drop the rejected/stale entry before the mint so a failed mint cannot
+    // leave an unusable token in the cache for the next probe to replay.
+    this.callbackListenerSat = undefined;
     try {
       const sat = await this.config.oscContext.getServiceAccessToken(
         ENCORE_CALLBACK_LISTENER_SERVICE_ID
       );
       if (typeof sat === 'string' && sat.length > 0) {
-        this.callbackListenerSat = sat;
+        const exp = jwtExpiryEpochMs(sat);
+        this.callbackListenerSat = {
+          token: sat,
+          expiresAtMs:
+            exp !== undefined
+              ? exp - SAT_EXPIRY_MARGIN_MS
+              : Date.now() + SAT_UNKNOWN_EXPIRY_TTL_MS
+        };
         return sat;
       }
       return undefined;
@@ -1777,8 +1863,12 @@ export class EncoreScalerLoop {
 
     // #1171: hand the probe (a) a SHORT per-request bound so one hung request
     // cannot occupy a tick for the whole 60s bounded wait and stall readiness /
-    // job assignment, and (b) the callback-listener SAT so an ingress auth-wall
-    // 401 is told apart from a genuinely closed callback path.
+    // job assignment, (b) the callback-listener SAT so an ingress auth-wall
+    // 401 is told apart from a genuinely closed callback path, and (c) a way to
+    // re-mint that SAT. (c) is review finding A: if the ingress rejects the
+    // authenticated attempt too, an expired cached token looks identical to a
+    // closed callback path, so the probe gets ONE re-mint-and-retry before it
+    // may grade the instance 'callback-unusable'.
     const result = await probeCallbackTrust(
       inst.callbackListenerUrl,
       timeoutMs,
@@ -1787,7 +1877,9 @@ export class EncoreScalerLoop {
         requestTimeoutMs:
           this.config.callbackProbeRequestTimeoutMs ??
           DEFAULT_PROBE_REQUEST_TIMEOUT_MS,
-        authToken: await this.getCallbackListenerSat()
+        authToken: await this.getCallbackListenerSat(),
+        refreshAuthToken: () =>
+          this.getCallbackListenerSat({ forceRefresh: true })
       }
     );
 

@@ -113,10 +113,18 @@
 //                                are live and the rejection comes from the OSC
 //                                ingress's inbound auth wall still covering the
 //                                callback path, not from a standing policy or a
-//                                broken listener. Retryable: the wall lifts on
-//                                its own (measured ~14s, #812/#814), so the
-//                                caller holds the instance ineligible and
-//                                re-probes rather than latching a verdict.
+//                                broken listener. Treated as retryable, which
+//                                is an INFERENCE, not a measurement: the only
+//                                thing measured is that the wall lifted after
+//                                ~14s on the two throwaway listeners in
+//                                #812/#814, while #1171 saw the unauthenticated
+//                                401 persist for ~62s on 4 of 4 instances. So
+//                                the caller re-probes for the whole bounded
+//                                wait instead of latching a verdict, and if the
+//                                wall outlasts the wait it dispatches anyway
+//                                (sweep-only completion) rather than
+//                                sidelining an instance that answered an
+//                                authenticated request.
 export type CallbackTrustProbeResult =
   | { ok: true; state: 'trusted'; status: number }
   | { ok: false; state: 'callback-unusable'; status: number; detail: string }
@@ -204,9 +212,22 @@ export const DEFAULT_PROBE_REQUEST_TIMEOUT_MS = 5_000;
 //                        unauthenticated 401/403, never on the first attempt:
 //                        the first attempt must stay credential-free because
 //                        that is exactly what Encore sends (#814).
+//   - refreshAuthToken — mints a FRESH SAT, bypassing (and clearing) whatever
+//                        cache the caller keeps. Called at most once per probe,
+//                        and only when the authenticated attempt was itself
+//                        rejected 401/403 — which is exactly what an EXPIRED
+//                        cached SAT looks like from here (#1171 review finding
+//                        A). A SAT minted by
+//                        `Context.getServiceAccessToken` is a JWT with a ~1h
+//                        `exp` and @osaas/client-core@0.24.0 does no renewal of
+//                        its own (`lib/context.js:58-60`:
+//                        `refreshServiceAccessToken` just mints a new one), so
+//                        a long-lived process MUST be able to re-mint or the
+//                        disambiguation silently stops working after an hour.
 //   - requestTimeoutMs — per-request AbortSignal window (#1171).
 export type CallbackProbeOptions = {
   authToken?: string;
+  refreshAuthToken?: () => Promise<string | undefined>;
   requestTimeoutMs?: number;
 };
 
@@ -238,6 +259,22 @@ export function buildCallbackUri(callbackListenerUrl: string): string {
   // resolves to the same URI the scaler injects.
   new URL(callbackListenerUrl);
   return `${callbackListenerUrl.replace(/\/$/, '')}${CALLBACK_PATH}`;
+}
+
+// Whether a bearer credential may be attached to a request to `target`
+// (#1171 review finding E). The SAT is a real bearer token for this tenant's
+// callback-listener subscription: sending it over anything but TLS would put it
+// on the wire in clear text, so a non-https target loses the disambiguating
+// attempt rather than leaking the credential. Every production listener URL is
+// https (OSC publishes per-instance ingresses on https only); plain-http values
+// show up in local/dev wiring, which is exactly where an accidental leak would
+// go unnoticed.
+function mayAttachBearerToken(target: string): boolean {
+  try {
+    return new URL(target).protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 // Second, disambiguating attempt at the same URL carrying the callback-listener
@@ -287,7 +324,14 @@ export async function probeCallbackTrust(
   }
 
   // Per-request bound, independent of the caller's cross-tick bounded wait
-  // (#1171). Never longer than the caller's own deadline.
+  // (#1171). It bounds EACH HTTP request this function makes, not the call as a
+  // whole: on the 401/403 path the probe makes up to two more requests (the
+  // authenticated attempt, and one retry after a token re-mint), so one call can
+  // take up to 3 × this bound — 15s with the 5s default (#1171 review finding
+  // D). That is still well inside the 60s cross-tick wait the caller owns, and
+  // the caller's value is a WAIT deadline it re-checks between ticks
+  // (scaler-loop.ts ensureCallbackTrust), not a hard per-tick cap. `Math.min`
+  // keeps a SINGLE request from ever outlasting that deadline.
   const requestTimeoutMs = Math.min(
     timeoutMs,
     options.requestTimeoutMs ?? DEFAULT_PROBE_REQUEST_TIMEOUT_MS
@@ -319,13 +363,44 @@ export async function probeCallbackTrust(
       //                       simply still covering the callback path. That is
       //                       the transient #812 window, which lifts on its own
       //                       — report it as retryable, not as a verdict.
-      if (options.authToken) {
-        const authenticated = await probeWithIngressToken(
+      //
+      // "Still 401/403" has a third cause the first cut of this change missed:
+      // the SAT we just sent is EXPIRED (#1171 review finding A). The ingress
+      // answers an expired JWT exactly like a missing one, so before keeping the
+      // pessimistic verdict, re-mint once through `refreshAuthToken` (which
+      // clears the caller's cache) and retry. Bounded to a single retry, and
+      // only when the fresh token actually differs — otherwise the same
+      // credential would be replayed against the same wall.
+      if (options.authToken && mayAttachBearerToken(target)) {
+        let authenticated = await probeWithIngressToken(
           target,
           requestTimeoutMs,
           fetchImpl,
           options.authToken
         );
+        if (
+          authenticated !== undefined &&
+          CALLBACK_REJECTED_STATUSES.has(authenticated) &&
+          options.refreshAuthToken
+        ) {
+          // try/catch, not `.catch(...)`: a provider that throws SYNCHRONOUSLY
+          // would otherwise escape into the outer handler and be misreported as
+          // a connection failure. This function never throws.
+          let refreshed: string | undefined;
+          try {
+            refreshed = await options.refreshAuthToken();
+          } catch {
+            refreshed = undefined;
+          }
+          if (refreshed && refreshed !== options.authToken) {
+            authenticated = await probeWithIngressToken(
+              target,
+              requestTimeoutMs,
+              fetchImpl,
+              refreshed
+            );
+          }
+        }
         if (
           authenticated !== undefined &&
           !CALLBACK_REJECTED_STATUSES.has(authenticated)
@@ -363,7 +438,14 @@ export async function probeCallbackTrust(
         ok: false,
         state: 'probe-failed',
         errorClass: 'timeout',
-        detail: `probe timed out after ${timeoutMs}ms`
+        // The abort came from the PER-REQUEST bound, so that is the number to
+        // report (#1171 review finding B): interpolating the caller's
+        // cross-tick wait here claimed a 60s hang for a request that was cut
+        // off after 5s, which is the opposite of what an operator needs to see.
+        // The caller deadline is named separately so both are visible.
+        detail:
+          `probe request timed out after ${requestTimeoutMs}ms ` +
+          `(caller bounded wait ${timeoutMs}ms)`
       };
     }
     const lower = detail.toLowerCase();

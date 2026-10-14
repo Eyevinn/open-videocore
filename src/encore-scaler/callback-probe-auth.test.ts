@@ -181,3 +181,154 @@ describe('probeCallbackTrust per-request bound (#1171)', () => {
     expect(r.errorClass).toBe('timeout');
   });
 });
+
+// ---------------------------------------------------------------------------
+// #1171 review findings. Each block below pins one of the three blocking
+// findings (and the two cheap non-blocking ones) so the fix cannot regress.
+// ---------------------------------------------------------------------------
+
+describe('probeCallbackTrust timeout detail (#1171 review finding B)', () => {
+  const abortingFetch = () =>
+    vi.fn(
+      (_input: string, init?: { signal?: AbortSignal }) =>
+        new Promise<{ status: number }>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted');
+            err.name = 'TimeoutError';
+            reject(err);
+          });
+        })
+    );
+
+  it('names the per-request bound that actually aborted, not the caller deadline', async () => {
+    // The abort comes from the per-request AbortSignal, so reporting the 60s
+    // cross-tick wait described a hang that never happened.
+    const r = await probeCallbackTrust(LISTENER_URL, 60_000, abortingFetch(), {
+      requestTimeoutMs: 40
+    });
+    expect(r.ok).toBe(false);
+    if (r.state !== 'probe-failed') throw new Error('unreachable');
+    expect(r.errorClass).toBe('timeout');
+    expect(r.detail).toContain('40ms');
+    expect(r.detail).not.toMatch(/timed out after 60000ms/);
+  });
+
+  it('mentions the caller bounded wait alongside the request bound', async () => {
+    const r = await probeCallbackTrust(LISTENER_URL, 60_000, abortingFetch(), {
+      requestTimeoutMs: 40
+    });
+    if (r.state !== 'probe-failed') throw new Error('unreachable');
+    expect(r.detail).toContain('60000ms');
+  });
+
+  it('reports the clamped bound when the caller deadline is the shorter one', async () => {
+    // requestTimeoutMs is Math.min'd with the caller deadline, so the detail has
+    // to name the clamped value (25ms) rather than the 5s default.
+    const r = await probeCallbackTrust(LISTENER_URL, 25, abortingFetch());
+    if (r.state !== 'probe-failed') throw new Error('unreachable');
+    expect(r.detail).toContain('timed out after 25ms');
+  });
+});
+
+describe('probeCallbackTrust SAT re-mint (#1171 review finding A)', () => {
+  it('re-mints once and retries when the authenticated attempt is also rejected', async () => {
+    // What an EXPIRED cached SAT looks like from here: the ingress answers it
+    // exactly like a missing one. Without the re-mint this graded the instance
+    // callback-unusable and silently reverted the #1171 fix after ~1h uptime.
+    const FRESH = 'fresh-callback-listener-sat';
+    const fetchImpl = vi.fn(
+      async (_input: string, init?: { headers?: Record<string, string> }) => {
+        const jwt = init?.headers?.['x-jwt'];
+        if (jwt === `Bearer ${FRESH}`) return { status: 404 };
+        return { status: 401 };
+      }
+    );
+    const refreshAuthToken = vi.fn(async () => FRESH);
+    const r = await probeCallbackTrust(LISTENER_URL, 60_000, fetchImpl, {
+      authToken: SAT,
+      refreshAuthToken
+    });
+    expect(r.state).toBe('ingress-auth-window');
+    if (r.state !== 'ingress-auth-window') throw new Error('unreachable');
+    expect(r.authenticatedStatus).toBe(404);
+    expect(refreshAuthToken).toHaveBeenCalledTimes(1);
+    // unauthenticated, stale-SAT, fresh-SAT — and no more than that.
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl).toHaveBeenLastCalledWith(
+      CALLBACK_URL,
+      expect.objectContaining({ headers: { 'x-jwt': `Bearer ${FRESH}` } })
+    );
+  });
+
+  it('keeps callback-unusable when even the freshly minted token is rejected', async () => {
+    const fetchImpl = vi.fn(async () => ({ status: 401 }));
+    const refreshAuthToken = vi.fn(async () => 'another-sat');
+    const r = await probeCallbackTrust(LISTENER_URL, 60_000, fetchImpl, {
+      authToken: SAT,
+      refreshAuthToken
+    });
+    expect(r.state).toBe('callback-unusable');
+    expect(refreshAuthToken).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not replay the same credential when the re-mint returns an identical token', async () => {
+    const fetchImpl = vi.fn(async () => ({ status: 401 }));
+    const refreshAuthToken = vi.fn(async () => SAT);
+    const r = await probeCallbackTrust(LISTENER_URL, 60_000, fetchImpl, {
+      authToken: SAT,
+      refreshAuthToken
+    });
+    expect(r.state).toBe('callback-unusable');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('survives a re-mint that fails, keeping the pre-review verdict', async () => {
+    const fetchImpl = vi.fn(async () => ({ status: 403 }));
+    const refreshAuthToken = vi.fn(async () => {
+      throw new Error('servicetoken 503');
+    });
+    const r = await probeCallbackTrust(LISTENER_URL, 60_000, fetchImpl, {
+      authToken: SAT,
+      refreshAuthToken
+    });
+    expect(r.state).toBe('callback-unusable');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('never asks for a re-mint when the first authenticated attempt gets through', async () => {
+    const fetchImpl = vi.fn(
+      async (_input: string, init?: { headers?: Record<string, string> }) =>
+        init?.headers?.['x-jwt'] ? { status: 404 } : { status: 401 }
+    );
+    const refreshAuthToken = vi.fn(async () => 'unused');
+    const r = await probeCallbackTrust(LISTENER_URL, 60_000, fetchImpl, {
+      authToken: SAT,
+      refreshAuthToken
+    });
+    expect(r.state).toBe('ingress-auth-window');
+    expect(refreshAuthToken).not.toHaveBeenCalled();
+  });
+});
+
+describe('probeCallbackTrust credential handling (#1171 review finding E)', () => {
+  it('refuses to put the bearer token on a non-https target', async () => {
+    const fetchImpl = vi.fn(async () => ({ status: 401 }));
+    const refreshAuthToken = vi.fn(async () => 'unused');
+    const r = await probeCallbackTrust(
+      'http://listener-1171.internal:8080',
+      60_000,
+      fetchImpl,
+      { authToken: SAT, refreshAuthToken }
+    );
+    // Loses the disambiguation rather than sending a tenant credential in the
+    // clear; the pre-#1171 verdict stands.
+    expect(r.state).toBe('callback-unusable');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenLastCalledWith(
+      'http://listener-1171.internal:8080/encoreCallback',
+      expect.objectContaining({ method: 'HEAD' })
+    );
+    expect(refreshAuthToken).not.toHaveBeenCalled();
+  });
+});

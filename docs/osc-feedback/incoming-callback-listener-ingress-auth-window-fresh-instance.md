@@ -232,3 +232,45 @@ Additionally verified live 2026-09-26 while implementing `#814`:
   `CALLBACK_REJECTED_STATUSES`; `src/encore-scaler/instance-pool.ts:440-442`
   (listener created with exactly `RedisUrl` / `EncoreUrl` / `RedisQueue`, matching
   the catalog options).
+
+## Update 2026-10-14 (`#1171`): the window is not always ~14 s — 401 for ~62 s on 4 of 4 instances
+
+The `#814` mitigation assumed the auth wall lifts well inside the scaler's 60 s
+bounded wait, because that is what the two timed reproductions above showed
+(~13–18 s). Production says otherwise. On `#1171` **every** instance in the pool
+— 4 of 4 — was graded `callback path NOT usable … status: 401 … elapsedMs:
+62464`, i.e. the unauthenticated `HEAD /encoreCallback` was answered 401 for the
+**whole** bounded wait (~62 s) rather than for ~14 s. Every instance therefore
+fell back to sweep-only completion and no progress callback was ever delivered.
+
+Measured live the same day (tenant `oscaidev`, service
+`eyevinn-encore-callback-listener`):
+
+- `HEAD /encoreCallback` unauthenticated on a **warm** instance → 404
+  (Fastify's own "route not found"), as before — so the steady state is healthy.
+- `GET /healthcheck` on the same hostname → **401** (nginx HTML)
+  unauthenticated, **200** `{"status":"up"}` with `x-jwt: Bearer <SAT>`, where
+  the SAT came from `POST https://token.svc.prod.osaas.io/servicetoken`. The
+  inbound wall accepts exactly the header `@osaas/client-core@0.24.0`
+  (`lib/core.js:86`) already sends.
+- A TLS handshake plus a `HEAD` against a live per-instance ingress completes in
+  0.05–0.08 s, so a 60 s probe spent 60 s waiting on a verdict that was
+  available immediately.
+
+Two things this makes concrete for OSC:
+
+1. **The duration of the inbound-auth window on a fresh per-instance ingress is
+   unbounded from a tenant's point of view.** There is no API that reports
+   whether the wall is still up, so the only way to tell "wall still up" from
+   "callback path closed" is to send a credential the callback producer (Encore)
+   cannot be given. The ask in *Requested capability* above stands, and this
+   measurement is the reason it is not a cosmetic one: at ~62 s it stops being a
+   startup race and becomes a steady failure mode.
+2. **Service access tokens carry no renewal in the client.**
+   `Context.getServiceAccessToken` (`lib/context.d.ts:25`) returns only
+   `ServiceAccessToken.token` and drops the `expiry` field of its own type
+   (`lib/context.d.ts:5-9`), and `refreshServiceAccessToken`
+   (`lib/context.js:58-60`) is a plain re-mint. A token minted for this probe
+   expires in ~3601 s, so any long-lived process has to decode `exp` out of the
+   JWT itself to know when to re-mint. Exposing `expiry` through the accessor (or
+   caching + renewing inside the client) would remove that.
