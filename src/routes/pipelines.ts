@@ -13,6 +13,10 @@ import type { PipelineRepository, StepExecution } from '../data/pipeline-repo.js
 import type { JobRepository } from '../data/job-repo.js';
 import type { AssetRepository } from '../data/asset-repo.js';
 import type { EncoreClient } from '../pipeline/encore-client.js';
+// Structured step failure detail (issue #1060). ONE shared schema so this
+// router's copy of stepExecutionSchema and the assets router's copy
+// (src/routes/assets.ts) cannot drift on it.
+import { stepErrorDetailSchema } from '../pipeline/step-error-detail.js';
 
 const stepExecutionSchema = z.object({
   name: z.enum(['extract-metadata', 'thumbnail', 'subtitles', 'scene-detect', 'transcode', 'package']),
@@ -23,6 +27,20 @@ const stepExecutionSchema = z.object({
   jobId: z.string().optional(),
   encoreJobId: z.string().optional(),
   error: z.string().optional(),
+  // Machine-readable companion to `error` (issue #1060). Present only for the
+  // failure classes we can recognise — today `source_read_failed`, a transcode
+  // whose SOURCE object could not be read — and carrying the code, the redacted
+  // source location (url/bucket/key), the HTTP status and the transcoder job +
+  // asset ids. ADDITIVE and OPTIONAL: `error` still carries the same free text,
+  // so existing consumers are unaffected. See StepErrorDetail in
+  // ../pipeline/step-error-detail.ts.
+  errorDetail: stepErrorDetailSchema
+    .optional()
+    .describe(
+      'Structured, machine-readable failure detail. Present only for ' +
+        'recognised failure classes; branch on `errorDetail.code` rather than ' +
+        'parsing `error`.'
+    ),
   skipReason: z.string().optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),

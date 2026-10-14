@@ -32,6 +32,13 @@
 //
 // Resilience: a bad/unparseable object key (e.g. one with no workspace prefix)
 // is logged and skipped — the service never crashes on a single bad object.
+//
+// Stack identity (issue #1099): one instance watches ONE bucket on ONE client,
+// so on a multi-stack installation there is one instance PER provisioned stack
+// (wired by services/watch-folder-wiring.ts). Each instance is handed a
+// `runInStackContext` wrapper that runs its ingest inside that stack's identity,
+// so the assets it creates are written to the stack whose bucket received the
+// file rather than to the first listed stack.
 
 import type { Client as MinioClient } from 'minio';
 import type { AssetRepository } from '../data/asset-repo.js';
@@ -163,6 +170,17 @@ export type WatchFolderOptions = {
   // API ingests (and the reconciliation sweep is the ground-truth backstop).
   // Absent => no accounting, behaviour unchanged (opt-in).
   quota?: StorageQuotaGuard;
+  // Run every ingest side-effect inside the stack identity this watcher belongs
+  // to (issue #1099). One instance is wired PER provisioned stack
+  // (services/watch-folder-wiring.ts), and `repository` is the stack-delegating
+  // PerWorkspaceAssetRepository, which keys on the ambient request stack
+  // (services/request-stack-context.ts `currentRequestStackName`). main.ts
+  // supplies `runWithRequestStack(stackName, fn)` here so the asset + job
+  // documents a drop produces are written to the SAME stack whose source bucket
+  // the file was dropped into, instead of the first listed stack. Absent =>
+  // `fn()` is called directly, which is the pre-#1099 default-stack behaviour
+  // (the single-stack and env-override paths).
+  runInStackContext?: <T>(fn: () => Promise<T>) => Promise<T>;
   // Polling cadence; defaults to the env-derived value.
   pollIntervalMs?: number;
   // Injectable timers for fast, deterministic tests.
@@ -182,6 +200,7 @@ export class WatchFolderService {
     stackName?: string
   ) => void;
   private readonly quota?: StorageQuotaGuard;
+  private readonly runInStackContext: <T>(fn: () => Promise<T>) => Promise<T>;
   private readonly pollIntervalMs: number;
   private readonly setIntervalFn: (handler: () => void, ms: number) => ReturnType<typeof setInterval>;
   private readonly clearIntervalFn: (handle: ReturnType<typeof setInterval>) => void;
@@ -201,6 +220,7 @@ export class WatchFolderService {
     this.log = opts.log;
     this.onObjectStored = opts.onObjectStored;
     this.quota = opts.quota;
+    this.runInStackContext = opts.runInStackContext ?? ((fn) => fn());
     this.pollIntervalMs = opts.pollIntervalMs ?? pollIntervalSeconds() * 1000;
     this.setIntervalFn = opts.setIntervalFn ?? ((h, ms) => setInterval(h, ms));
     this.clearIntervalFn = opts.clearIntervalFn ?? ((handle) => clearInterval(handle));
@@ -365,34 +385,51 @@ export class WatchFolderService {
     this.processed.add(fullKey);
 
     try {
-      const name = parsed.localKey.split('/').pop() || parsed.localKey;
-      const asset = await this.repo.create({
-        name,
-        objectKey: parsed.localKey
-      });
-      // Account the direct-drop bytes against the running total (issue #579).
-      // Best-effort: a stat failure must not abort ingest (the reconciliation
-      // sweep is the backstop), so it is caught and logged.
-      if (this.quota) {
-        try {
-          const stat = await this.client.statObject(this.bucket, fullKey);
-          await this.quota.recordDelta(stat.size ?? 0);
-        } catch (err) {
-          this.log.warn({ err, key: fullKey }, 'watch-folder: quota accounting failed');
+      // EVERY side-effect below runs inside this watcher's stack identity
+      // (issue #1099): the repository writes, the quota accounting, and the
+      // fire-and-forget onObjectStored continuation — which itself resolves this
+      // stack's object storage synchronously from the ambient stack name
+      // (main.ts `storageFor` -> makeRequestScopedStorageFactory). Wrapping the
+      // whole block, rather than each call, keeps the document writes and the
+      // byte reads on one stack even for work detached with `void` inside
+      // onObjectStored (AsyncLocalStorage propagates along the async chain).
+      await this.runInStackContext(async () => {
+        const name = parsed.localKey.split('/').pop() || parsed.localKey;
+        const asset = await this.repo.create({
+          name,
+          objectKey: parsed.localKey
+        });
+        // Account the direct-drop bytes against the running total (issue #579).
+        // Best-effort: a stat failure must not abort ingest (the reconciliation
+        // sweep is the backstop), so it is caught and logged.
+        if (this.quota) {
+          try {
+            const stat = await this.client.statObject(this.bucket, fullKey);
+            await this.quota.recordDelta(stat.size ?? 0);
+          } catch (err) {
+            this.log.warn({ err, key: fullKey }, 'watch-folder: quota accounting failed');
+          }
         }
-      }
-      // Advance to processing and fire metadata extraction, mirroring the
-      // upload route's post-upload behaviour.
-      await this.repo.update(asset.id, { status: 'processing' });
-      // The asset's own persisted stack (issue #1097), not the ambient context.
-      // `storage` stays undefined: the watch-folder has no per-request storage
-      // handle, and the callback falls back to its own `storageFor()` resolved
-      // INSIDE the stack this argument re-enters.
-      this.onObjectStored?.(asset.id, parsed.localKey, undefined, asset.stackName);
-      this.log.info(
-        { assetId: asset.id, objectKey: parsed.localKey },
-        'watch-folder: ingested direct-drop object'
-      );
+        // Advance to processing and fire metadata extraction, mirroring the
+        // upload route's post-upload behaviour.
+        await this.repo.update(asset.id, { status: 'processing' });
+        // The asset's own persisted stack (issue #1097), not the ambient
+        // context. Under the per-stack wiring (issue #1099) the two now agree
+        // by construction: `create` above ran inside this watcher's
+        // `runInStackContext`, so asset-repo.ts stamped `stackName` from
+        // `currentDocumentStackName()` — i.e. the stack whose source bucket
+        // received the drop. Passing the PERSISTED value keeps the detached
+        // continuation correct even for the env-override/no-context path, where
+        // `runInStackContext` is the identity wrapper.
+        // `storage` stays undefined: the watch-folder has no per-request storage
+        // handle, and the callback falls back to its own `storageFor()` resolved
+        // INSIDE the stack this argument re-enters.
+        this.onObjectStored?.(asset.id, parsed.localKey, undefined, asset.stackName);
+        this.log.info(
+          { assetId: asset.id, objectKey: parsed.localKey },
+          'watch-folder: ingested direct-drop object'
+        );
+      });
     } catch (err) {
       // Un-reserve so a later poll can retry a transient failure.
       this.processed.delete(fullKey);

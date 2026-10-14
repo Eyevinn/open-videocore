@@ -225,6 +225,17 @@ export function parseHttpFailureDetail(
 // instances the scaler spawns fetch it with a tokenless GET.
 export const PROFILES_INDEX_PATH = '/api/v1/profiles/index.yml';
 
+// The STACK-SCOPED form of the same index (issue #1164):
+// `/api/v1/profiles/stacks/<stack>/index.yml`, which is what a scaler-spawned
+// Encore instance is actually pointed at on a deployment that serves its own
+// index (src/services/public-base-url.ts `stackScopedProfilesIndexUrl`, served
+// by `GET /stacks/:stack/index.yml` in src/routes/profiles.ts). It must classify
+// exactly like the unscoped path: the reason a 401/403 here is an infrastructure
+// verdict rather than a credentials one — the endpoint is unauthenticated by
+// design and only the platform edge can reject it — is a property of the
+// profiles router, not of which of its two index routes was fetched.
+const PROFILES_STACK_INDEX_PATH_RE = /\/api\/v1\/profiles\/stacks\/[^/]+\/index\.yml$/;
+
 // Is `url` the profiles index? Compared on the PATH only: the host is whatever
 // PUBLIC_BASE_URL resolved to for that deployment (resolveEncoreProfilesUrl,
 // src/main.ts:957) and a query string or fragment must never decide this.
@@ -243,7 +254,10 @@ export function isProfilesIndexUrl(url: string): boolean {
     // and fragment and compare what remains.
     pathname = url.split(/[?#]/)[0] ?? '';
   }
-  return pathname.toLowerCase().endsWith(PROFILES_INDEX_PATH);
+  const lower = pathname.toLowerCase();
+  return (
+    lower.endsWith(PROFILES_INDEX_PATH) || PROFILES_STACK_INDEX_PATH_RE.test(lower)
+  );
 }
 
 // The ONLY statuses that make a profiles-index fetch retryable (#1101).

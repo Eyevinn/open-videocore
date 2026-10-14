@@ -26,6 +26,7 @@ import { destroyInstance, listInstances, reconcilePoolFromOsc } from './instance
 import { keys } from './types.js';
 import { valkeyConnectionId } from './valkey-connection-id.js';
 import type { DroppedJob, EncoreScalerConfig } from './types.js';
+import type { ScalerLogSink } from './scaler-log.js';
 
 export type WorkspaceEncoreScalerConfig = {
   redis: Redis;
@@ -103,6 +104,17 @@ export type WorkspaceEncoreScalerConfig = {
   // Forwarded to every spawned Encore instance as its `profilesUrl` so it loads
   // operator-managed profiles from this API's public index (issue #84).
   profilesUrl?: string;
+  // Optional per-stack rewrite of `profilesUrl` (issue #1164). When supplied,
+  // called with the loop key (the EFFECTIVE stack identity the transcode request
+  // resolved to) and preferred over the process-global `profilesUrl` above.
+  // Mirrors resolveS3Config / resolveRedisUrl: a spawned Encore instance fetches
+  // its profile index with a header-less, tokenless GET
+  // (instance-pool.ts:604-608), so the only way it can read the profiles of the
+  // stack it belongs to — rather than the first-listed stack's — is for the
+  // stack to be in the URL. Returns undefined when there is no per-stack form of
+  // the configured URL (an external index, or a loop key that is not a stack
+  // name), and the loop then uses `profilesUrl` unchanged.
+  resolveProfilesUrl?: (stackKey: string) => string | undefined;
   // Forwarded to every per-workspace scaler loop: invoked after a queued job is
   // dispatched to an Encore instance so the Job record can advance queued->running.
   onDispatched?: (encoreJobId: string) => Promise<void>;
@@ -128,6 +140,13 @@ export type WorkspaceEncoreScalerConfig = {
   // annotates the caller-facing Job with the recoverable interruption reason
   // (without changing its status).
   onJobInterrupted?: (encoreJobId: string, reason: 'interrupted_by_scaledown') => Promise<void>;
+  // Forwarded to every per-workspace scaler loop: the operational log store the
+  // loop appends its spawn/dispatch/reap/tick FAILURES to (issue #998), so they
+  // are visible through GET /api/v1/logs and the Logs tab instead of only in the
+  // container's stdout. main.ts passes the same store the pipeline-step producer
+  // (#995) writes to and the logs router reads. Unset => the loops log to
+  // `console.error` only, exactly as before.
+  logSink?: ScalerLogSink;
 };
 
 // How long a stack enumeration (listStackKeys) is reused before it is fetched
@@ -199,6 +218,18 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
   // no resolver/factory is wired, or the stack has no stored redisUrl, it falls
   // back to the injected process-global `redis`/`redisUrl` — the unchanged
   // single-Valkey behaviour used by env-override deployments and tests.
+  // The profile-index URL the instances spawned for `stackKey` must fetch
+  // (issue #1164). Delegates to the injected `resolveProfilesUrl` hook — the
+  // registry owns no URL conventions — and falls back to the process-global
+  // `profilesUrl` when the hook is absent or reports no per-stack form (an
+  // external index, or a loop key that is not a stack name). Never returns
+  // another stack's URL: the only two outcomes are "this stack's index" and
+  // "the configured index, unchanged".
+  private resolveLoopProfilesUrl(stackKey: string): string | undefined {
+    if (!this.config.resolveProfilesUrl) return this.config.profilesUrl;
+    return this.config.resolveProfilesUrl(stackKey) ?? this.config.profilesUrl;
+  }
+
   async resolveStackRedis(
     stackKey: string
   ): Promise<{ redis: Redis; redisUrl: string }> {
@@ -358,6 +389,12 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
     // Valkey belonging to this stack, not the first-provisioned one.
     const { redis, redisUrl } = await this.resolveStackRedis(workspaceId);
 
+    // Point the instances this loop spawns at THIS stack's profile index (issue
+    // #1164), so a profile created on this stack is loadable by it regardless of
+    // the stack's position in the listing. Falls back to the process-global URL
+    // when there is no per-stack form.
+    const profilesUrl = this.resolveLoopProfilesUrl(workspaceId);
+
     const scalerConfig: EncoreScalerConfig = {
       workspaceId,
       maxInstances: this.config.maxInstances,
@@ -382,12 +419,17 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
       redisUrl,
       getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
       s3Config,
-      profilesUrl: this.config.profilesUrl,
+      profilesUrl,
       onDispatched: this.config.onDispatched,
       onEncodeDispatched: this.config.onEncodeDispatched,
       reconcileFailedTranscodes: this.config.reconcileFailedTranscodes,
       onJobsDropped: this.config.onJobsDropped,
-      onJobInterrupted: this.config.onJobInterrupted
+      onJobInterrupted: this.config.onJobInterrupted,
+      // #998: the loop's own failures go to the operational log store as well as
+      // stdout. Passed to EVERY loop (there is one per stack), and each entry
+      // names its workspace, so a multi-stack deployment stays separable in one
+      // tail.
+      logSink: this.config.logSink
     };
 
     const loop = new EncoreScalerLoop(scalerConfig);
@@ -525,7 +567,10 @@ export class WorkspaceEncoreScalerRegistry implements EncoreClient {
             redisUrl,
             getToken: () => this.config.oscContext.getServiceAccessToken('encore'),
             s3Config,
-            profilesUrl: this.config.profilesUrl,
+            // This stack's own profile index (issue #1164), same resolution as
+            // getOrCreate, so a re-discovered pool and a freshly created one
+            // never disagree about which stack's profiles its instances load.
+            profilesUrl: this.resolveLoopProfilesUrl(workspaceId),
             onDispatched: this.config.onDispatched
           };
           await reconcilePoolFromOsc(scalerConfig).catch(() => {

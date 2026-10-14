@@ -269,12 +269,25 @@ tbody td {
 }
 
 /* Click-to-copy button beside an identifier (issue #851). Always visible — the
-   id must be copyable without hovering for a tooltip. */
+   id must be copyable without hovering for a tooltip.
+
+   Icon button since issue #990: a square 24x24 box holding the CSS-drawn glyph
+   below, with the words kept in a `.visually-hidden` span (the live region the
+   outcome is announced through — see public/copy-id.js). The painted box is
+   24x24, the SC 2.5.8 Target Size (Minimum) floor, which the old 11px pill
+   missed on the vertical axis at ~20px tall; `::after` below then extends the
+   clickable region past the paint so the target does not shrink in area either.
+   Colour comes from `currentColor`, so the glyph follows the muted/hover/outcome
+   rules rather than hardcoding a hue. */
 .copy-id-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
   margin-left: 6px;
-  padding: 1px 6px;
-  font-size: 11px;
-  line-height: 16px;
+  padding: 0;
   vertical-align: middle;
   color: var(--text-muted);
   background: transparent;
@@ -283,9 +296,116 @@ tbody td {
   cursor: pointer;
 }
 
+/* Hit area, not decoration: the clickable region reaches 4px beyond the painted
+   box on every side (32x32 = 1024px², against the old pill's ~40x20 = 800px²),
+   so going from a worded pill to a square icon enlarges the target instead of
+   shrinking it. 4px fits inside the 6px gap to the id text, so neighbouring
+   controls are not overlapped. */
+.copy-id-btn::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+}
+
+.copy-id-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .copy-id-btn:hover {
   color: var(--text);
   border-color: var(--accent, var(--border));
+}
+
+/* Outcome states (issue #990). Order matters: these follow `:hover` at equal
+   specificity so a pointer resting on the button cannot repaint away the result
+   it just produced. Each state changes the glyph's SHAPE as well as its colour,
+   so success and failure are not told apart by hue alone (WCAG 1.4.1). */
+.copy-id-btn.is-copied {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.copy-id-btn.is-copy-failed {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* The glyph. Drawn from the two pseudo-elements of an empty, aria-hidden span —
+   `public/` has no icon set, no icon font and no inline SVG, and the magnifier at
+   `.ops-search-icon` below is built the same way. Everything is `currentColor`,
+   inherited from the rules above. */
+.copy-id-btn-icon {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+
+/* Resting: two offset sheets. The back sheet is drawn as its top and right edges
+   only, which keeps it clear of the front sheet entirely — no occluding fill, so
+   the icon sits on a row background of any colour. */
+.copy-id-btn-icon::before {
+  content: '';
+  position: absolute;
+  left: 3.5px;
+  top: 0;
+  width: 10.5px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-bottom: 0;
+  border-left: 0;
+  border-radius: 0 2px 0 0;
+}
+
+.copy-id-btn-icon::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 3.5px;
+  width: 9.5px;
+  height: 10.5px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+
+/* Copied: a tick — a left+bottom border corner rotated 45°. Offsets put the
+   unrotated box's centre at (7px, 6.25px) so the rotated glyph lands centred in
+   the 14px icon box rather than riding up against its top edge. */
+.copy-id-btn.is-copied .copy-id-btn-icon::before {
+  left: 2px;
+  top: 3.5px;
+  width: 10px;
+  height: 5.5px;
+  border: 1.5px solid currentColor;
+  border-top: 0;
+  border-right: 0;
+  border-radius: 0 0 1px 1px;
+  transform: rotate(-45deg);
+}
+
+.copy-id-btn.is-copied .copy-id-btn-icon::after {
+  content: none;
+}
+
+/* Not copied: a cross. Different shape, not just a different colour. */
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::before,
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::after {
+  left: 1px;
+  top: 6.25px;
+  width: 12px;
+  height: 1.5px;
+  background: currentColor;
+  border: 0;
+  border-radius: 1px;
+}
+
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::before {
+  transform: rotate(45deg);
+}
+
+.copy-id-btn.is-copy-failed .copy-id-btn-icon::after {
+  transform: rotate(-45deg);
 }
 
 /* Jobs table Asset cell (issue #988): the asset's human-readable name leads,
@@ -499,6 +619,155 @@ tr.row-locked td:first-child {
 
 .review-actions {
   flex-wrap: wrap;
+}
+
+/* ── Export action (issue #945) ─────────────────────────────────────────────
+   Pinned by docs/design/export-action-states.md. The block gets its own left
+   rule — a different hue from the review block's — so the two action blocks in
+   the detail pane read as separate things; shape and the always-present
+   "Export" heading carry the distinction, so it survives monochrome rendering
+   (WCAG 1.4.1). */
+.export-block {
+  border-left: 3px solid var(--export-accent, #818cf8);
+  padding-left: 10px;
+}
+
+.export-intro,
+.export-role-note {
+  max-width: 60ch;
+}
+
+.export-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 420px;
+}
+
+.export-field-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.export-field-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* The global input rule signals focus with a border colour change only. For the
+   controls added here, add a real offset outline too, so the focus indicator
+   does not depend on distinguishing two similar border hues
+   (WCAG 2.4.7 Focus Visible / 1.4.11 Non-text Contrast). */
+.export-block select:focus-visible,
+.export-block input:focus-visible,
+.export-block button:focus-visible,
+.export-block a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.export-actions {
+  flex-wrap: wrap;
+}
+
+/* The selected destination's non-secret coordinates (under the picker), and the
+   verified coordinates of a completed export (in the success message). Same
+   label/value pair treatment in both places, so "where it would go" and "where
+   it went" read as the same kind of fact. */
+.export-destination-detail,
+.export-result-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.export-fact {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.export-fact-label {
+  color: var(--text-muted);
+  min-width: 92px;
+}
+
+.export-fact-value {
+  /* An object key or bucket name can be long and must stay readable rather than
+     stretch the detail pane. */
+  overflow-wrap: anywhere;
+}
+
+.export-result-line {
+  font-weight: 600;
+}
+
+.export-retry {
+  margin-top: 8px;
+}
+
+/* An export whose outcome is UNKNOWN (504 delivery_timeout) — the copy may still
+   complete at the destination. Deliberately neither .msg-success nor .msg-error:
+   amber, because the honest statement is "we do not know", and dressing it as
+   either a success or a settled failure is exactly the false report this feature
+   exists to avoid. */
+.msg-warn {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+/* The three standing states of the export block (design spec §5 and the two
+   variants it deferred until a destination-carrying endpoint existed):
+   data-outcome="not-configured" (501 — no destination storage on this
+   deployment), "no-destinations" (configured, but nothing registered) and
+   "destinations-unreadable" (the list could not be read, so nothing can be
+   claimed either way).
+   Deliberately NOT .msg-error: in this UI red means "that failed, try again",
+   and the first two are the deployment's standing configuration state, which no
+   retry changes. Also NOT .msg-unrecoverable, whose copy and
+   data-outcome="unrecoverable" semantics belong to the 410 tombstone. Same
+   shape as that component — heavy left rule, uppercase label row — in its own
+   palette, with its own data-outcome on the element so all of them are
+   distinguishable without matching on prose. */
+.msg-not-configured {
+  background: rgba(148, 163, 184, 0.08);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warning);
+}
+
+.msg-not-configured .not-configured-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.msg-not-configured .not-configured-title {
+  display: block;
+  font-weight: 600;
+}
+
+.msg-not-configured .not-configured-body {
+  display: block;
+  margin-top: 4px;
+}
+
+.msg-not-configured .not-configured-detail {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 /* Read-only tracks panel (issue #902). Sub-group headings sit a step below
@@ -968,6 +1237,75 @@ td.cell-actions {
   margin: 1px 2px;
 }
 
+/* ── Tags panel on the asset detail view (issue #934) ───────────────────────
+   Reuses the .tag pill above, so a tag reads the same here as it does in the
+   assets table and in search results; the panel only adds the chip layout, the
+   remove affordance and the add row. The chips are a real <ul>/<li> list (the
+   list semantics are what give the group a length and a label in the
+   accessibility tree), so the list markers and padding are cleared. */
+.tags-block .tags-intro,
+.tags-block .tags-field-help {
+  font-size: 12px;
+}
+
+.tag-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* A tag is up to 128 characters of arbitrary text, so a chip wraps rather than
+   stretching the panel; the remove control stays on the same line as its tag. */
+.tag-chip .tag-chip-label {
+  margin: 0;
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+
+button.tag-remove {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 20px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  /* 20px of hit area in a 11px-text row: a destructive control should not be a
+     pixel-hunt (WCAG 2.5.8). */
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0 4px;
+}
+
+button.tag-remove:hover,
+button.tag-remove:focus-visible {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: var(--danger);
+}
+
+.tags-add-row {
+  align-items: flex-end;
+}
+
+.tags-add-field {
+  flex: 1 1 220px;
+  max-width: 420px;
+}
+
+.tags-block .tags-add-error {
+  margin-top: 6px;
+}
+
 /* Forms */
 .form-row {
   display: flex;
@@ -1337,6 +1675,16 @@ button:disabled {
 .tc-health.health-stuck {
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+/* Pool at its maxInstances ceiling with work still queued (#981). Amber, like
+   .badge-attention and .tc-health.health-overdue: something an operator may want
+   to act on. Deliberately NOT --danger — a ceiling being honoured is the system
+   working as configured, not a failure — and the clause spells the state out in
+   words, so the colour is reinforcement rather than the only signal. */
+.tc-at-ceiling {
+  color: var(--warning);
+  font-weight: 600;
 }
 
 /* Code block */
@@ -2096,6 +2444,17 @@ tbody tr.coll-row.row-selected {
   gap: 8px;
   justify-content: flex-end;
   margin-top: 16px;
+}
+
+/* Search tab intro copy (issue #948) — sits between the panel title and the
+   first section, and says what this tab does that the Assets tab filter does
+   not. The gap above is .panel-title's own bottom margin; this rule only sets
+   its own gap below, so it does not depend on that value. */
+.search-tab-intro {
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 70ch;
+  margin: 0 0 16px;
 }
 
 /* Clip-asset dialog (issue #793). Same furniture again — .form-row/.form-field
@@ -2969,5 +3328,94 @@ td[data-empty='logs-never-written'] .ops-table-empty-detail {
 .audit-detail {
   font-size: 12px;
   color: var(--text-muted);
+  word-break: break-word;
+}
+
+/* ─── Detail-panel raw disclosure (issue #963) ─────────────────────────────── */
+/* The full server record is kept on every detail panel but demoted behind a
+   native <details>, collapsed by default (public/detail-sections.js), so the
+   curated fields lead and the JSON is there when a field this UI does not
+   render yet matters. Native disclosure => keyboard operable and state-exposed
+   with no ARIA of our own (WCAG 2.1 SC 2.1.1, 4.1.2). */
+.raw-disclosure > summary {
+  cursor: pointer;
+  display: list-item;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 4px 2px;
+  width: fit-content;
+}
+
+.raw-disclosure > summary:hover {
+  color: var(--text);
+}
+
+/* A visible, non-colour focus indicator: the summary is a focus stop and the
+   UA default outline is easy to lose against this surface (SC 2.4.7). */
+.raw-disclosure > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Keep the raw JSON scrollable rather than letting it stretch the panel. */
+.raw-disclosure-body {
+  max-height: 420px;
+  overflow: auto;
+}
+
+/* ─── Encode-attempt history (issue #963) ─────────────────────────────────── */
+/* One line answering "was this retried, and did it recover?", above a row-per
+   -attempt table. Shown only for a job with more than one Encore dispatch, so
+   a first-time success gains no empty section. */
+.attempt-summary {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+/* Attempt rows are not clickable — undo the global clickable-row cursor so the
+   timeline does not advertise an interaction it does not have. */
+.attempt-timeline tbody tr:hover {
+  cursor: default;
+}
+
+.attempt-timeline tbody th.attempt-index {
+  padding: 8px 10px;
+  text-align: left;
+  font-family: 'Courier New', monospace;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* The outcome is carried by the WORD ("Failed" / "Succeeded" / "In flight");
+   the colour only reinforces it, so the state survives being read in
+   monochrome (SC 1.4.1). */
+.attempt-outcome {
+  font-weight: 600;
+}
+
+.attempt-outcome-failed {
+  /* The lighter red the job Error row already uses, for contrast above 4.5:1
+     against this surface rather than the saturated --danger. */
+  color: #f87171;
+}
+
+.attempt-outcome-succeeded {
+  color: var(--success);
+}
+
+.attempt-outcome-open {
+  color: var(--warning);
+}
+
+.attempt-outcome-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
   word-break: break-word;
 }

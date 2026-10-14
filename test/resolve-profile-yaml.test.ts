@@ -133,14 +133,19 @@ async function makeSource(assets: InMemoryAssetRepository): Promise<string> {
 }
 
 describe('POST /:id/transcode store-unreachable vs not-found permissiveness (issue #392)', () => {
-  it('accepts the request when the profile is resolvable-but-absent (not-found)', async () => {
+  it('accepts the request when the DEFAULT profile is resolvable-but-absent (not-found)', async () => {
     const { app, assets, submitted } = await buildApp(new InMemoryProfileRepository());
     const id = await makeSource(assets);
     const res = await app.inject({
       method: 'POST',
       url: `/api/v1/assets/${id}/transcode`,
       headers: { authorization: 'Bearer token-a' },
-      payload: { profile: 'not-in-store', profileParams: { anything: 'goes' } }
+      // No `profile` named -> the submit default ('program'), absent from this
+      // empty store. That keeps exercising the #392 resolver's not-found branch.
+      // A caller-NAMED profile absent from a reachable store is a 400
+      // `unknown_profile` since issue #1022 (test/transcode.test.ts), because it
+      // could only fail on the transcoding side after dispatch.
+      payload: { profileParams: { anything: 'goes' } }
     });
     // Store reachable, profile absent -> permissive: still submitted.
     expect(res.statusCode).toBe(202);

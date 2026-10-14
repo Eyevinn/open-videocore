@@ -50,7 +50,12 @@ import {
 // in-memory LogStore on the no-Couch paths — the same Couch/in-memory pairing
 // `audit` uses above.
 import { CouchLogStore } from '../data/couch-log-repo.js';
-import { LogStore, type LogReader, type LogSink } from './log-store.js';
+import {
+  LogStore,
+  type LogReader,
+  type LogRetentionStore,
+  type LogSink
+} from './log-store.js';
 import type { ProfileRepository } from '../data/profile-repo.js';
 import { resolveObjectStoreCredential } from './object-store-credentials.js';
 import type { StorageFactory } from '../routes/asset-upload.js';
@@ -131,10 +136,14 @@ export type WorkspaceConnections = {
   // on every Couch-backed path, so records written by the pipeline producer
   // survive a restart and are still returned by GET /api/v1/logs; the in-memory
   // LogStore backs the no-Couch dev/test paths. ALWAYS present, like `audit`.
-  // Carries both the `append()` write primitive the pipeline producer uses
-  // (src/services/pipeline-log.ts) and the `list()` read the logs router uses
-  // (src/routes/logs.ts), so one field serves both consumers.
-  logs: LogSink & LogReader;
+  // Carries the `append()` write primitive the pipeline producer uses
+  // (src/services/pipeline-log.ts), the `list()` read the logs router uses
+  // (src/routes/logs.ts), AND the retention surface (issue #1067,
+  // listOldestPage/purgeEntry) the log-retention purge sweep drives per tick —
+  // the same three-way intersection `audit` above carries. Typed as the
+  // intersection so the single field serves all three consumers; both concrete
+  // stores satisfy it.
+  logs: LogSink & LogReader & LogRetentionStore;
   profiles: ProfileRepository;
   pipelines: PipelineRepository;
   // Asset comments for this stack (issue #135, made durable by issue #1046).
@@ -442,7 +451,7 @@ function buildEnvConnections(
   // Operational log store (issue #996): durable on the Couch env path so
   // GET /api/v1/logs survives a restart there too, in-memory when no COUCHDB_URL
   // is configured.
-  let logs: LogSink & LogReader;
+  let logs: LogSink & LogReader & LogRetentionStore;
   let profiles: ProfileRepository;
   let pipelines: PipelineRepository;
   // Asset comments: always present, Couch-backed on the couch env path and

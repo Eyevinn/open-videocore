@@ -26,6 +26,7 @@ import {
   ensureParameterStore,
   paramStoreFromEnv,
   configKvStoreFromEnv,
+  makeScalerConfigStore,
   type StackConfig
 } from './services/param-store.js';
 import { saveSecret } from '@osaas/client-core';
@@ -71,6 +72,7 @@ import {
   currentDocumentStackName,
   PERSISTED_STACK_FALLBACK_MESSAGE
 } from './services/request-stack-context.js';
+import { reconcileWatchFolders } from './services/watch-folder-wiring.js';
 import { makePostUploadThumbnailTrigger } from './services/post-upload-thumbnail.js';
 import { ResolverHealthSignal } from './services/resolver-health.js';
 import {
@@ -128,7 +130,8 @@ import { usageRouter } from './routes/usage.js';
 import {
   retentionRouter,
   archiveRetentionMsFromEnv,
-  auditRetentionMsFromEnv
+  auditRetentionMsFromEnv,
+  logRetentionMsFromEnv
 } from './routes/retention.js';
 import { logsRouter } from './routes/logs.js';
 import type { LogReader, LogSink } from './services/log-store.js';
@@ -141,6 +144,10 @@ import {
   AuditRetentionPurgeLoop,
   auditPurgeIntervalMsFromEnv
 } from './pipeline/audit-retention-purge-loop.js';
+import {
+  LogRetentionPurgeLoop,
+  logPurgeIntervalMsFromEnv
+} from './pipeline/log-retention-purge-loop.js';
 import {
   AbandonedUploadSweepLoop,
   abandonedUploadIntervalMsFromEnv,
@@ -172,7 +179,8 @@ import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,
   resolveEncoreProfilesUrl,
-  resolveEncoreProfilesUrlFromParamStore
+  resolveEncoreProfilesUrlFromParamStore,
+  stackScopedProfilesIndexUrl
 } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
@@ -1005,6 +1013,14 @@ let archiveRetentionMs = archiveRetentionMsFromEnv();
 // as archiveRetentionMs is.
 let auditRetentionMs = auditRetentionMsFromEnv();
 
+// Instance-global OPERATIONAL-LOG retention window in ms (issue #1067),
+// parallel to `auditRetentionMs` above. Read from LOG_RETENTION_MS at boot;
+// unset/0 = indefinite retention (never purge), preserving #996's persist-only
+// behaviour for every deployment that does not opt in. Held as a live mutable
+// var so PATCH /api/v1/retention/config hot-swaps it with no restart, exactly as
+// the other two windows are.
+let logRetentionMs = logRetentionMsFromEnv();
+
 // The default Encore profile index used to seed the profile store on first
 // startup / on bootstrap. Same URL + default as before (issue #84).
 const encoreProfilesUrl =
@@ -1314,6 +1330,18 @@ function activateScaler(redisUrl: string): void {
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
+    // …and point it at THAT STACK's profile index (issue #1164). The scaler's
+    // loop key is the EFFECTIVE stack identity the transcode request resolved to
+    // (issue #615), and a spawned instance fetches its profilesUrl with a
+    // header-less, tokenless GET — so unless the stack is in the URL, every
+    // stack's Encore reads the FIRST listed stack's profile store and a profile
+    // created against a non-first stack cannot be used by the stack it was
+    // created on. Rewrites ONLY this app's own index URL and ONLY for a
+    // syntactically valid stack name (see stackScopedProfilesIndexUrl), so an
+    // external index and the single-stack/env-override deployments keep the
+    // process-global URL unchanged.
+    resolveProfilesUrl: (stackKey: string) =>
+      stackScopedProfilesIndexUrl(encoreScalerProfilesUrl, stackKey),
     // Local-dev fallback only: ENCORE_S3_ENDPOINT is used verbatim for all
     // workspaces when set. On OSC this is unset and resolveS3Config below
     // resolves the MinIO endpoint per workspace from the parameter store.
@@ -1494,6 +1522,9 @@ function activateScaler(redisUrl: string): void {
     // the job here by its encoreJobId (externalId), exactly as onDispatched does.
     // Best-effort: the scaler swallows a thrown hook so a repo hiccup never
     // blocks the re-enqueue that already succeeded.
+    // #1058: the repositories resolve the AMBIENT request stack, and a scaler
+    // hook fires outside any request — so run the lookup/update inside the stack
+    // decoded from the encore job id, exactly as onDispatched/onJobsDropped do.
     onJobInterrupted: (encoreJobId: string, reason: 'interrupted_by_scaledown') =>
       inEncoreJobStack(encoreJobId, async () => {
         const found = await jobRepository.findByEncoreJobId(encoreJobId);
@@ -1503,6 +1534,38 @@ function activateScaler(redisUrl: string): void {
           interruptionReason: reason
         });
       }),
+    // Second operational-log producer (issue #998, parent #985): every scaler
+    // control-loop spawn/dispatch/reap/tick FAILURE is appended here as well as
+    // written to the container's stdout. The SAME store GET /api/v1/logs reads
+    // (`logStore` above, durable since #996) and the pipeline-step producer
+    // (#995) writes to — scaler entries carry `category: 'encore-scaler'` and an
+    // `encore-scaler/<phase>: ` message prefix, so they are filterable with the
+    // existing `q` parameter and never confusable with pipeline-step entries.
+    //
+    // Additive, not a substitute for the pipeline-step producer (architect's
+    // note on #998): the scaler is opt-in per deployment, so it does not fire on
+    // every ingest run and cannot alone populate the tab.
+    //
+    // WRAPPED IN THE EMITTING WORKSPACE'S STACK (#998 review finding 2).
+    // `logStore` is a PerWorkspaceLogStore: every call resolves the AMBIENT
+    // request stack (src/data/per-workspace-repos.ts) and the scaler runs on a
+    // `setInterval`, outside any request — so a bare `logSink: logStore` wrote
+    // EVERY workspace's failures to the default stack, where
+    // GET /api/v1/logs for any other workspace could never see them. The sink
+    // therefore enters the stack the loop names before delegating, which is the
+    // same fix #1058 applied to the sibling repo-bridge hooks above
+    // (onDispatched / onJobInterrupted / onJobsDropped, all via
+    // inEncoreJobStack). `logScalerEvent` is fire-and-forget and swallows the
+    // rejection, so returning the promise cannot break the loop.
+    logSink: {
+      // `async` because LogSink.append is declared `LogRecord |
+      // Promise<LogRecord>` (src/services/log-store.ts LogSink.append) while
+      // inScalerStack takes a promise-returning callback. The append is still
+      // INVOKED synchronously inside the stack context, which is what the
+      // AsyncLocalStorage read in PerWorkspaceLogStore.store() needs.
+      append: (input, context) =>
+        inScalerStack(context?.workspaceId, async () => logStore.append(input))
+    },
     onJobsDropped: async (drops) => {
       for (const { encoreJobId, reason } of drops) {
         await inEncoreJobStack(encoreJobId, async () => {
@@ -2076,7 +2139,16 @@ async function deactivateScaler(): Promise<void> {
 // single-stack env-override deployment) is not a stack name and keeps the
 // default resolution.
 function inEncoreJobStack<T>(encoreJobId: string, fn: () => Promise<T>): Promise<T> {
-  const stackKey = decodeEncoreJobId(encoreJobId)?.workspaceId;
+  return inScalerStack(decodeEncoreJobId(encoreJobId)?.workspaceId, fn);
+}
+
+// Run a scaler-originated callback inside the stack it belongs to, given the
+// stack key directly. The shared core of inEncoreJobStack above: the loop's own
+// `workspaceId` IS that stack key, so a callback that already knows its
+// workspace (the #998 log sink) needs no job id to decode. DEPLOYMENT_CONTEXT —
+// a single-stack env-override deployment — is not a stack name and keeps the
+// default resolution, exactly as before.
+function inScalerStack<T>(stackKey: string | undefined, fn: () => Promise<T>): Promise<T> {
   return runWithRequestStack(
     stackKey && stackKey !== DEPLOYMENT_CONTEXT ? stackKey : undefined,
     fn
@@ -2249,6 +2321,12 @@ const assetRouterOptions: Parameters<typeof assetsRouter>[1] & { prefix: string 
   collectionRepository,
   // Best-effort audit emission for asset mutations (issue #564).
   audit: auditEmitter,
+  // Per-asset retention window on the read contract (issue #1034). Bound to the
+  // SAME live instance global the purge loop ticks on (`archiveRetentionMs`,
+  // hot-swapped by PATCH /api/v1/retention/config), read per request — so the
+  // window a read reports and the window the sweep enforces are one value, and a
+  // config change is reflected on the next read with no restart.
+  retentionMs: () => archiveRetentionMs,
   // Operational log records for the pipeline steps this router drives (issue
   // #995): the `ingest` stage (URL-pull worker + the synchronous
   // extract-metadata / thumbnail / subtitles / scene-detect steps) and the
@@ -2448,6 +2526,13 @@ await app.register(assetUploadRouter, {
 //      onStackChange the moment one is provisioned, mirroring activateScaler.
 //      This closes the gap in issue #643/#636 where the watch-folder was only
 //      ever built from MINIO_URL and therefore silently did nothing on OSC.
+//      ONE INSTANCE PER PROVISIONED STACK since issue #1099: the parameter-store
+//      path enumerates stacks with stackResolver.listStackNames() and resolves
+//      each BY NAME, because a watcher watches exactly one bucket on one client
+//      and the previous no-name resolve() only ever reached the FIRST listed
+//      stack — so drops into stack B's bucket were never ingested at all. See
+//      services/watch-folder-wiring.ts for the reconciliation + the
+//      global-config / per-stack-source-location decision.
 //
 // Fail-loud config validation (issue #642): we CLASSIFY the config first and,
 // when the feature is requested (WATCH_FOLDER_ENABLED=true) but its storage
@@ -2486,48 +2571,60 @@ let watchFolder: WatchFolderService | undefined =
 // workspace-stack.ts:buildEnvConnections).
 const watchFolderFromEnv = watchFolder !== undefined;
 
-// (Re)build the watch-folder from the resolved stack's parameter-store-backed
-// storage connection (issue #643). No-op unless WATCH_FOLDER_ENABLED=true and
-// we are NOT already wired from the env override. Idempotent: if a running
-// watch-folder is already pointed at the resolved bucket on the same endpoint we
-// leave it running; otherwise we (re)create it against the current storage
-// client + source bucket and start it. Never throws — a resolve failure leaves
-// the watch-folder as-is and is logged.
+// Live watch-folder instances on the parameter-store path, keyed by stack name
+// (issue #1099; `''` is the default/unnamed resolution — see
+// services/watch-folder-wiring.ts stackRegistryKey). Reconciled in place so
+// boot and every onStackChange converge on "one watcher per provisioned stack".
+// Empty on the env-override path, which owns `watchFolder` exclusively.
+const watchFoldersByStack = new Map<string, WatchFolderService>();
+
+// (Re)build the watch-folder from each provisioned stack's parameter-store-backed
+// storage connection (issue #643, per-stack since #1099). No-op unless
+// WATCH_FOLDER_ENABLED=true and we are NOT already wired from the env override.
+// Idempotent: a watcher already pointed at its stack's resolved bucket and
+// running is left alone; otherwise it is (re)created against that stack's
+// storage client + source bucket and started. Never throws — a per-stack resolve
+// failure leaves that stack's watcher as-is, is logged, and does not stop the
+// other stacks from being wired.
 async function wireWatchFolderFromStack(): Promise<void> {
   if (!watchFolderEnabled() || watchFolderFromEnv) return;
-  try {
-    const conns = await stackResolver.resolve();
-    const client = conns.storageClient;
-    if (!client) {
-      // No object storage on the resolved stack yet (no stack provisioned, or a
-      // partial/invalid one). Nothing to watch; leave any prior instance be.
-      return;
-    }
-    const bucket = conns.sourceBucket;
-    // Already wired against this bucket and running: nothing to do. (The stack's
-    // storage endpoint is stack-invariant for a given deployment, so an
-    // unchanged bucket + a live service means the wiring still holds.)
-    if (watchFolder && watchFolder.currentBucket() === bucket && watchFolder.isRunning()) {
-      return;
-    }
-    // Rebuild against the freshly resolved client/bucket. Stop any stale prior
-    // instance first so its notification listener + poll timer are detached.
-    watchFolder?.stop();
-    watchFolder = new WatchFolderService({
-      client,
-      bucket,
-      repository: assetRepository,
-      log: app.log,
-      onObjectStored
-    });
-    watchFolder.start();
-    app.log.info(
-      { bucket, source: 'parameter-store' },
-      'watch-folder ingest wired from provisioned stack storage'
-    );
-  } catch (err) {
-    app.log.warn({ err }, 'watch-folder: failed to wire from provisioned stack storage');
-  }
+  const { defaultWatchFolder } = await reconcileWatchFolders({
+    listStackNames: () => stackResolver.listStackNames(),
+    resolveStack: (stackName) => stackResolver.resolve(stackName),
+    registry: watchFoldersByStack,
+    log: app.log,
+    createWatchFolder: ({ stackName, client, bucket }) =>
+      new WatchFolderService({
+        client,
+        bucket,
+        repository: assetRepository,
+        log: app.log,
+        onObjectStored,
+        // Pin this watcher's ingest to the stack it was built from (issue
+        // #1099). `assetRepository` is the stack-delegating
+        // PerWorkspaceAssetRepository and `onObjectStored` reads the
+        // request-scoped storage factory, both of which key on the stack name
+        // (services/request-stack-context.ts), so without this every drop —
+        // whichever stack's bucket it landed in — would be written to the first
+        // listed stack. The resolve() re-warms this stack's resolver cache entry
+        // first, because the synchronous resolveCached() reads inside
+        // onObjectStored would otherwise miss once the entry ages past the
+        // resolver TTL between reconciles.
+        runInStackContext: (fn) =>
+          runWithRequestStack(stackName, async () => {
+            await stackResolver.resolve(stackName);
+            return fn();
+          })
+      })
+  });
+  // Keep the single `watchFolder` binding the admin + storage routers read
+  // pointed at the DEFAULT stack's watcher — the stack a request with no
+  // X-Stack-Name resolves to — so single-stack behaviour is byte-for-byte
+  // unchanged. Those two routers still expose one instance (their response
+  // shapes are part of the published contract); on a multi-stack installation
+  // they therefore report and toggle the default stack's watcher, while ingest
+  // itself now runs on every stack.
+  if (defaultWatchFolder) watchFolder = defaultWatchFolder;
 }
 
 // Operational status (issue #16). Unauthenticated; reports background service
@@ -2559,6 +2656,14 @@ const scalerRouterOptions: Parameters<typeof scalerRouter>[1] & { prefix: string
   maxInstances: encoreMaxInstances,
   minInstances: 0,
   idleTimeoutMs: encoreIdleTimeoutMs,
+  // Durable scaler runtime config (#1077). Reuses the SAME generic
+  // eyevinn-app-config-svc key/value store the storage-backend registry writes
+  // through (`backendKvStore`, built with configKvStoreFromEnv above) — one
+  // dedicated instance-global key, `openvideocore/scalerconfig`. Undefined when
+  // the parameter store is unconfigured, in which case PATCH /scaler/config
+  // responds 501 instead of accepting a change that cannot survive a restart.
+  // The boot-time read of this key is issue #1078.
+  ...(backendKvStore ? { configStore: makeScalerConfigStore(backendKvStore) } : {}),
   onConfigChange: (cfg) => {
     if (scalerRegistry) {
       scalerRegistry.setMaxInstances(cfg.maxInstances);
@@ -2600,9 +2705,14 @@ const retentionRouterOptions: Parameters<typeof retentionRouter>[1] & { prefix: 
   // Boot-time audit-log retention window (issue #566). Exposed on GET
   // /api/v1/retention/config so an operator can see the effective policy.
   auditRetentionMs: auditRetentionMsFromEnv(),
+  // Boot-time operational-log retention window (issue #1067). Exposed on the
+  // same GET /api/v1/retention/config surface so an operator sees one policy
+  // view across archived assets, the audit partition and the log partition.
+  logRetentionMs: logRetentionMsFromEnv(),
   onConfigChange: (cfg) => {
     archiveRetentionMs = cfg.retentionMs;
     auditRetentionMs = cfg.auditRetentionMs;
+    logRetentionMs = cfg.logRetentionMs;
   }
 };
 await app.register(retentionRouter, retentionRouterOptions);
@@ -2701,6 +2811,49 @@ const auditRetentionPurgeLoop = new AuditRetentionPurgeLoop({
 });
 auditRetentionPurgeLoop.start(auditPurgeIntervalMsFromEnv());
 
+// Operational-log retention purge sweep (issue #1067), parallel to the
+// audit-retention sweep above and built on the same shape (unref'd,
+// overlap-guarded interval; NOT a new mechanism). It expires WHOLE log records
+// aged past the log-retention window from the persisted log partition
+// (CouchLogStore, src/data/couch-log-repo.ts, issue #996), which until now had
+// no age-based retention at all — its only removal path bounds the record COUNT
+// (the retained-window eviction), not record AGE.
+//
+// It reads the LIVE `logRetentionMs` each tick, so it honours PATCH
+// /api/v1/retention/config and is skipped entirely while the log window is unset
+// (0 = indefinite retention). The log store is ALWAYS present on the resolved
+// connection (issue #996: CouchLogStore on Couch-backed stacks, the
+// process-local LogStore on the no-Couch dev/test paths) and both concrete
+// stores implement the retention surface (listOldestPage / purgeEntry,
+// src/services/log-store.ts `LogRetentionStore`), so each tick resolves the
+// active stack's log store and drives the sweep directly — the same per-tick
+// resolution the audit loop uses, rather than going through the request-scoped
+// PerWorkspaceLogStore.
+const logRetentionPurgeLoop = new LogRetentionPurgeLoop({
+  retentionMs: () => logRetentionMs,
+  logger: {
+    info: (...a: unknown[]) => app.log.info(a),
+    warn: (...a: unknown[]) => app.log.warn(a),
+    error: (...a: unknown[]) => app.log.error(a)
+  },
+  sweepDeps: {
+    // Resolve the active stack's log store per tick. The sweep drives it via
+    // listOldestPage (enumerate the aged tail) + purgeEntry (whole-record
+    // expiry). `conns.logs` is always present (issue #996), so no null-guard.
+    logs: {
+      listOldestPage: async (opts: { limit: number; offset?: number }) => {
+        const conns = await stackResolver.resolve();
+        return conns.logs.listOldestPage(opts);
+      },
+      purgeEntry: async (id: string) => {
+        const conns = await stackResolver.resolve();
+        return conns.logs.purgeEntry(id);
+      }
+    }
+  }
+});
+logRetentionPurgeLoop.start(logPurgeIntervalMsFromEnv());
+
 // Abandoned-upload settle sweep (issue #726). An INDEPENDENT unref'd, overlap-
 // guarded interval (mirrors ArchivedAssetPurgeLoop, NOT a parallel mechanism)
 // that settles assets wedged in `uploading` past the liveness threshold to
@@ -2779,7 +2932,16 @@ void reconcileInterruptedIngests({
 }).catch((err) => app.log.warn({ err }, 'interrupted-ingest reconciliation on boot failed'));
 
 // Full-text + metadata search (issue #10). Workspace-scoped; behind `authenticate`.
-await app.register(searchRouter, { prefix: '/api/v1/search', repository: searchRepository });
+await app.register(searchRouter, {
+  prefix: '/api/v1/search',
+  repository: searchRepository,
+  // Per-asset retention window on archived hits (issue #1034). Bound to the
+  // SAME live instance global the assets router and the purge loop read
+  // (`archiveRetentionMs`, hot-swapped by PATCH /api/v1/retention/config), so
+  // the canonical search endpoint reports the identical window its deprecated
+  // alias `GET /api/v1/assets/search` does.
+  retentionMs: () => archiveRetentionMs
+});
 
 // Webhook registrations (issue #13). Workspace-scoped; behind `authenticate`.
 await app.register(webhooksRouter, { prefix: '/api/v1/webhooks', repository: webhookRepository });
@@ -2931,11 +3093,12 @@ if (storageCapBytesFromEnv() !== undefined && storageAvailable) {
   }
 }
 
-// Parameter-store path (Open Source Cloud, issue #643): if a stack was already
+// Parameter-store path (Open Source Cloud, issue #643): if any stack was already
 // provisioned in a previous run (self-discovered from the parameter store),
-// wire + start the watch-folder against its object storage now. On a fresh OSC
-// deployment no stack exists yet, so this is a no-op and the watch-folder comes
-// online later from onStackChange the moment the first stack is provisioned.
+// wire + start one watch-folder per stack against that stack's own object
+// storage now (issue #1099). On a fresh OSC deployment no stack exists yet, so
+// this is a no-op and the watch-folders come online later from onStackChange the
+// moment a stack is provisioned.
 // Skipped entirely when the env-override path already owns the watch-folder.
 if (!watchFolderFromEnv) {
   await wireWatchFolderFromStack();

@@ -230,10 +230,14 @@ export const encoreCompatRouter: FastifyPluginAsync<EncoreCompatRouterOptions> =
       });
 
       // Resolve the profile by name if the caller supplied one. Only our known
-      // presets are honoured; an unknown name falls through to submitTranscode's
-      // default (resolveProfile handles undefined). Inline custom Encore
-      // profiles are not translated here — a named preset covers the migration
-      // path; custom-profile forwarding is a follow-up.
+      // preset names are honoured; any other name falls through to
+      // submitTranscode's own default (DEFAULT_PROFILE_NAME). An inline profile
+      // object carrying an encodes/outputs ladder is NOT translated: the job
+      // document selects a profile by name only (EncoreJob.profile: String —
+      // github.com/svt/encore, encore-common/.../model/EncoreJob.kt:52), so a
+      // ladder has to be registered as a profile (POST /api/v1/profiles) and
+      // named. See issue #1022, which removed the equivalent field from the
+      // native route rather than keep validating a ladder it then discarded.
       const profileName = body.profile?.name;
       const preset = PRESET_NAMES.includes(profileName as PresetName)
         ? (profileName as PresetName)

@@ -294,6 +294,41 @@ export interface LogReader {
   list(opts?: ListLogsOptions): ListLogsResult | Promise<ListLogsResult>;
 }
 
+// The retention capability the log-retention purge sweep needs (issue #1067).
+// Kept SEPARATE from `LogReader` so the read route and the frontend table are
+// not handed a removal path: only the retention sweep consumes this.
+//
+// Mirrors `AuditRetentionRepository` (src/data/audit-repo.ts) one-for-one — the
+// audit partition this store is modelled on carries exactly this pair — with the
+// one difference that the return types are unions of the sync and promised form,
+// as `LogReader.list` / `LogSink.append` already are, because the in-memory
+// LogStore answers synchronously and the durable CouchLogStore
+// (src/data/couch-log-repo.ts) answers with a promise. Both concrete stores
+// implement it, so the sweep drives whichever store the resolved stack surfaces.
+export interface LogRetentionStore {
+  // Oldest-first page of log records (ascending `id`, i.e. append order).
+  listOldestPage(opts: { limit: number; offset?: number }): LogRecord[] | Promise<LogRecord[]>;
+  // Whole-record expiry (never an in-place edit). True on a live removal.
+  purgeEntry(id: string): boolean | Promise<boolean>;
+}
+
+// Pure oldest-first paging over already-materialised records, shared by the
+// in-memory LogStore and the durable CouchLogStore so their `listOldestPage`
+// semantics cannot drift — the same device `applyLogQuery` provides for the
+// listing contract. Sorts a COPY: the caller's array is never reordered.
+//
+// Ascending `id` is append order: `id` is a process-wide monotonic ULID
+// (mintLogRecordId above), which is exactly the basis
+// CouchAuditRepository.listOldestPage relies on (src/data/audit-repo.ts).
+export function applyOldestPage(
+  records: readonly LogRecord[],
+  opts: { limit: number; offset?: number }
+): LogRecord[] {
+  const oldestFirst = [...records].sort((a, b) => compareIds(a.id, b.id));
+  const offset = opts.offset ?? 0;
+  return oldestFirst.slice(offset, offset + opts.limit).map((r) => ({ ...r }));
+}
+
 // The write capability the pipeline producer needs. Satisfied synchronously by
 // the in-memory LogStore and asynchronously by the durable CouchLogStore
 // (src/data/couch-log-repo.ts). `PipelineLogSink`
@@ -309,7 +344,7 @@ export interface LogSink {
 // InMemoryAuditRepository is retained alongside CouchAuditRepository
 // (src/data/audit-repo.ts:312). Process-local: records do NOT survive a restart
 // — that is what CouchLogStore (src/data/couch-log-repo.ts, issue #996) is for.
-export class LogStore {
+export class LogStore implements LogReader, LogSink, LogRetentionStore {
   // Append order == id order, so the array is intrinsically ordered by `id`
   // ascending. We never reorder entries, and the only removal is oldest-first
   // eviction at the cap (see maxRecords) — so the held window is always a
@@ -369,5 +404,30 @@ export class LogStore {
   // never reordered or mutated by the query).
   list(opts: ListLogsOptions = {}): ListLogsResult {
     return applyLogQuery(this.records, opts);
+  }
+
+  // Oldest-first page (ascending `id` / append order) for the log-retention
+  // purge sweep (issue #1067). Mirrors CouchLogStore.listOldestPage so the
+  // no-Couch dev/test path drives the SAME sweep as production, exactly as
+  // InMemoryAuditRepository.listOldestPage mirrors the Couch audit store
+  // (src/data/audit-repo.ts). NOT the newest-first `list()` above — kept
+  // separate so the read contract is untouched.
+  listOldestPage(opts: { limit: number; offset?: number }): LogRecord[] {
+    return applyOldestPage(this.records, opts);
+  }
+
+  // Whole-record expiry for the retention sweep (issue #1067): removes the
+  // single matching record outright, never an in-place edit, so a record is
+  // either present verbatim or gone. Returns true when a live record was
+  // removed, false when nothing matched — the contract
+  // CouchAuditRepository.purgeEntry defines (src/data/audit-repo.ts) and the
+  // sweep counts purges on.
+  purgeEntry(id: string): boolean {
+    const idx = this.records.findIndex((r) => r.id === id);
+    if (idx < 0) {
+      return false;
+    }
+    this.records.splice(idx, 1);
+    return true;
   }
 }

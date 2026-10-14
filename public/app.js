@@ -36,6 +36,22 @@ import { applyThumbnail } from './thumbnail-url.js';
 // button; slugs are shown under their own "Slug" header. Contract grounding for
 // which value each endpoint accepts lives in public/copy-id.js.
 import { copyableIdCellHtml, slugCellHtml, wireCopyIdButtons } from './copy-id.js';
+// Shared detail-panel primitives (issue #963): the collapsed "Raw" disclosure
+// that holds the full server record, and the copyable field value built on the
+// copy-id.js control. Factored out because the pipeline-execution detail view
+// (issue #964) needs the same two affordances; contract grounding for the
+// values passed in stays with each caller.
+import {
+  createRawDisclosure,
+  rawDisclosureOpen,
+  copyableFieldHtml,
+  wireCopyableFields,
+} from './detail-sections.js';
+// Encode-attempt history (issue #963): the derivation + rendering of
+// `encodeAttemptLog` / `encodeAttempts`, so a job rescued by a classified retry
+// reads differently from a plain slow success. Full contract grounding for
+// every field it touches is in that module's header.
+import { renderAttemptHistory } from './job-attempts.js';
 // Delete-lock detail surface (issue #895): the "Delete protection" block and the
 // lock / unlock / edit-note actions on the asset detail view, implementing
 // docs/ux/asset-lock-state-spec.md §4. State derivation and copy live in
@@ -131,6 +147,27 @@ import { mountVersionChain } from './version-chain.js';
 // reactively — is in that module's header.
 import { mountAssetExternalIds } from './external-ids.js';
 
+// Tags panel (issue #934, broken out of #792): the asset's tag list plus an add
+// control and a per-tag remove control. Tags have been readable AND writable
+// over the API since #11 (POST /assets/{id}/tags, DELETE /assets/{id}/tags/{tag})
+// but nothing in this UI could write one. UI only — no route or schema changes.
+// The panel mirrors the API's own validation bounds client-side and re-renders
+// only from server answers; full contract grounding, including the verified
+// "any characters allowed" rule and the list-cap asymmetry on the append route,
+// is in that module's header.
+import { mountAssetTags } from './asset-tags.js';
+
+// Export action (issue #945, broken out of #796): pick one of the export
+// destinations this deployment has registered (read live from
+// GET /api/v1/export-destinations), trigger POST /assets/{id}/deliver, and read
+// the outcome truthfully. Copy and visual treatment for the in-progress /
+// exported / failed / not-available states come from
+// docs/design/export-action-states.md (issue #911), plus the two states that
+// spec deferred until a destination-carrying endpoint existed ("nothing
+// registered" and "the list could not be read"). The module header carries the
+// full contract grounding for both calls.
+import { mountExportAction } from './export-action.js';
+
 // ─── Escape helper (XSS prevention) ─────────────────────────────────────────
 
 function escHtml(str) {
@@ -223,6 +260,19 @@ function canChangeReviewState() {
   return r === 'editor' || r === 'admin';
 }
 
+// Whether the current client role may export an asset (issue #945). Same matrix,
+// checked before this was written: `MATRIX` (src/auth/authorize.ts:54-58) gives
+// `write` to `editor` and `admin` only, and `methodToAction` (:79-92) maps
+// POST -> write, so POST /assets/{id}/deliver is refused to a `viewer` with 403
+// by `resourceAuthorizationPreHandler('asset')` (:126, registered
+// src/routes/assets.ts:1773). Client-side mirror only: the 403 is still handled
+// if it arrives. A `viewer` may still READ the destinations list, which needs
+// only `read`.
+function canExportAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
 // Whether the current client role may add or remove an asset's subtitle tracks
 // (issue #940). Same matrix, read before this was written: `MATRIX`
 // (src/auth/authorize.ts:54-58) gives `write` and `delete` to `editor` and
@@ -247,6 +297,20 @@ function canChangeSubtitleTracks() {
 // src/routes/assets.ts:1718). Client-side mirror only: the 403 is still handled
 // if it arrives.
 function canRenameAsset() {
+  const r = getClientRole();
+  return r === 'editor' || r === 'admin';
+}
+
+// Whether the current client role may add or remove an asset's tags (issue
+// #934). Same matrix, checked before this was written: `MATRIX`
+// (src/auth/authorize.ts:54-58) gives `write` AND `delete` to `editor` and
+// `admin` and neither to `viewer`; `methodToAction` (:79-93) maps POST -> write
+// and DELETE -> delete, and `resourceAuthorizationPreHandler('asset')` (:126,
+// registered src/routes/assets.ts:1773) applies both to the tag sub-resource —
+// verified against the real router: a viewer gets 403 on POST /tags AND on
+// DELETE /tags/{tag}. A viewer still READS the tags, which arrive on the asset
+// body itself. Client-side mirror only: the 403 is still handled if it arrives.
+function canChangeTags() {
   const r = getClientRole();
   return r === 'editor' || r === 'admin';
 }
@@ -2755,6 +2819,75 @@ async function renderAssetFiles(assetId, container) {
   }
 }
 
+// Remaining-retention-window text for an archived asset's restore action
+// (issue #891, scoped by the companion contract note for #888).
+//
+// Reads the `retention` object the server now attaches to the single-asset
+// reads (`AssetRetentionWindowSchema`, src/data/asset-retention.ts, attached by
+// `withRetentionWindow()` in src/routes/assets.ts, issue #1034) — the
+// additive `{ archivedAt, purgeAfter, retentionMs }` shape
+// docs/findings/asset-restore-contract-888.md §4 recommends. It is present on
+// `GET /api/v1/assets/{id}` only while the asset is `archived`; the `200` of
+// `POST /api/v1/assets/{id}/restore` carries none, because the asset has just
+// left `archived` (test/asset-retention-window.test.ts).
+//
+// Still null-safe in every direction rather than assuming the field: it is
+// attached only while the asset is `archived` and only where the deployment
+// wires the live retention window, and an older server sends no `retention`
+// at all. In those cases this
+// returns null and the detail view simply shows no countdown instead of
+// guessing a deadline.
+function formatRetentionRemaining(retention) {
+  if (!retention || typeof retention !== 'object') return null;
+  var purgeAfter = retention.purgeAfter;
+  if (purgeAfter === null) {
+    // `purgeAfter: null` is documented as meaning exactly one thing: retention
+    // is disabled, i.e. `retentionMs === 0` ("never purge" —
+    // RETENTION_DISABLED_MS, src/routes/retention.ts:36; convention per
+    // asset-restore-contract-888.md §4). A null deadline alongside a NON-zero
+    // window is not a case the contract defines, so say nothing rather than
+    // promise an asset will never expire when a live window may still purge it.
+    if (retention.retentionMs === 0) {
+      return 'No retention limit is configured for this deployment — this asset will not expire automatically.';
+    }
+    return null;
+  }
+  if (typeof purgeAfter !== 'string') return null;
+  var purgeMs = Date.parse(purgeAfter);
+  if (isNaN(purgeMs)) return null;
+  var diffMs = purgeMs - Date.now();
+  if (diffMs <= 0) {
+    return 'The retention window has elapsed. The next purge sweep may remove this asset.';
+  }
+  var min = Math.floor(diffMs / 60000);
+  var hr = Math.floor(min / 60);
+  var day = Math.floor(hr / 24);
+  // Pick the coarsest unit, and CLAMP ONCE into `count` so the number, its unit
+  // suffix and the verb all agree. (The clamp matters for a sub-minute window:
+  // `min` floors to 0, which would otherwise print "0 minutes" — or, worse,
+  // print a clamped "1" with a plural "minutes" suffix derived from the
+  // un-clamped 0.)
+  var count;
+  var unit;
+  if (day >= 1) {
+    count = day;
+    unit = 'day';
+  } else if (hr >= 1) {
+    count = hr;
+    unit = 'hour';
+  } else {
+    count = Math.max(min, 1);
+    unit = 'minute';
+  }
+  var remaining = count + ' ' + unit + (count === 1 ? '' : 's');
+  var verb = count === 1 ? 'remains' : 'remain';
+  // Approximate on purpose: the purge sweep runs on its own cadence
+  // (ARCHIVE_PURGE_INTERVAL_MS, default 1h — archived-asset-purge-loop.ts:31
+  // per the finding), so this is an earliest-possible deadline, not a
+  // guarantee of exactly-on-time purge.
+  return 'About ' + remaining + ' ' + verb + ' before the retention sweep may purge this asset.';
+}
+
 // Populate an asset detail view into `bodyEl` from a freshly-fetched asset.
 // Reusable in both the embedded side panel and the standalone detached window.
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
@@ -2823,7 +2956,11 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       ['Title', escHtml(asset.title || asset.name || '—')],
       ['Status', statusCell],
       ['MIME type', escHtml(asset.mimeType || '—')],
-      ['Tags', renderTags(asset.tags)],
+      // Tags are NOT a key/value row any more (issue #934): they live in the
+      // editable "Tags" block mounted just below this grid. Two renderings of
+      // one list is exactly how a stale UI happens — the block re-renders from
+      // the asset each mutation returns, and this grid is built once per detail
+      // read, so a row here would keep showing the pre-mutation list.
       ['Created', escHtml(fmtDate(asset.createdAt))],
       ['Updated', escHtml(fmtDate(asset.updatedAt))]
     );
@@ -2859,6 +2996,40 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     body.appendChild(kvDiv);
     // Bind the ULID copy affordance (issue #851).
     wireCopyIdButtons(kvDiv);
+
+    // ── Tags: add / remove (issue #934, broken out of #792) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full — with the verified constraints — in public/asset-tags.js:
+    //   READ: there is NO GET /assets/{id}/tags. `openapi.json
+    //        .paths["/api/v1/assets/{id}/tags"]` declares `post` only; the list
+    //        is the optional `tags` array on the asset body already awaited
+    //        above (`assetSchema`, src/routes/assets.ts:919), so the panel adds
+    //        no round-trip. Absent and `[]` both mean "no tags" and both occur.
+    //   POST /api/v1/assets/{id}/tags — body REQUIRED
+    //        { tags: string[] }, each 1..128 chars, 1..128 items,
+    //        additionalProperties: false; 200 = the FULL asset, 404 { error }.
+    //        APPENDS and deduplicates (src/routes/assets.ts:5568-5590, merge at
+    //        :5583 via normalizeTags, src/data/asset-repo.ts:1297).
+    //   DELETE /api/v1/assets/{id}/tags/{tag} — no body; 200 = the FULL asset,
+    //        404 { error }. Removing an absent tag is a 200 no-op
+    //        (src/routes/assets.ts:5595-5618, filter at :5609).
+    // Mounted directly under the key/value grid, where the read-only "Tags" row
+    // used to be, so the tags stay where operators already look for them — and
+    // so there is exactly ONE rendering of the list. Both mutations return the
+    // full asset and the panel re-renders from THAT (never from a local edit),
+    // which is what keeps the list in step with the server after every change.
+    //
+    // The sub-resource takes the ULID (`asset.id`): unlike GET /:id neither
+    // handler resolves a slug (verified — POST to /assets/<slug>/tags 404s), and
+    // this pane holds the ULID even when it was opened by slug.
+    mountAssetTags({
+      asset: asset,
+      host: body,
+      canChange: canChangeTags(),
+      apiFetch: apiFetch,
+      showMsg: showMsg,
+    });
 
     // ── Status history (issue #889) ──
     // The audited lifecycle trail. Rendered here so a status transition an
@@ -3282,10 +3453,9 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
     //     otherwise `failed` (restoreTargetStatus, src/data/asset-repo.ts:1006-1014)
     //   - restore moves the LIFECYCLE axis only; `storageTiering` is untouched
     //     (src/routes/assets.ts:5640-5644), so bytes on a cold tier stay cold.
-    // Deliberately NOT claimed: any remaining-retention countdown. No such field
-    // exists on the asset or the restore response
-    // (docs/findings/asset-restore-contract-888.md §4), so the UI does not
-    // invent one.
+    // The remaining-retention deadline is NOT asserted here — it is rendered
+    // separately below, and only from the server-sent `asset.retention` object,
+    // so this static note stays true on a deployment that reports no window.
     if (isArchived) {
       const restoreNote = document.createElement('div');
       restoreNote.id = 'restore-note';
@@ -3298,6 +3468,21 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
         'stored bytes are not moved between storage tiers. Once the retention ' +
         'sweep has purged the asset, restore is no longer possible.';
       body.appendChild(restoreNote);
+
+      // Remaining retention window (issue #891) — rendered ONLY when the
+      // server actually sends `asset.retention` (`AssetRetentionWindowSchema`,
+      // src/data/asset-retention.ts; attached to GET /:id for an archived asset
+      // whenever the deployment wires the live window). No countdown is
+      // fabricated when the field is absent — see formatRetentionRemaining.
+      const retentionText = formatRetentionRemaining(asset.retention);
+      if (retentionText) {
+        const retentionNote = document.createElement('div');
+        retentionNote.id = 'retention-window';
+        retentionNote.className = 'mt4 text-muted';
+        retentionNote.style.fontSize = '12px';
+        retentionNote.textContent = retentionText;
+        body.appendChild(retentionNote);
+      }
     }
 
     var runBtn = runDiv.querySelector('#btn-run-pipeline');
@@ -3533,6 +3718,60 @@ async function renderAssetDetailBody(id, bodyEl, opts) {
       apiFetch: apiFetch,
       showMsg: showMsg,
       fmtDate: fmtDate,
+    });
+
+    // ── Export to a registered destination (issue #945) ──
+    //
+    // Contract, fetched before these calls were written (CLAUDE.md rule 7) and
+    // cited in full in public/export-action.js:
+    //   GET  /api/v1/export-destinations — no parameters; responses are exactly
+    //        200 { destinations: [ { id, name, role, backend, bucket,
+    //        accessKeyId, endpointUrl?, region?, publicBaseUrl?, pathTemplate?,
+    //        hasSessionToken, deletable, createdAt, credentials } ] }
+    //        (`destinationListSchema` / `destinationViewSchema`,
+    //        src/routes/export-destinations.ts:125-127 / :95-123, handler :279-288)
+    //        and 501 { error: 'not_configured' } (:236-239). The implicit
+    //        OSC-managed default (id 'default') is ALWAYS in the 200 list
+    //        (StorageBackendRegistry.list prepends defaultBackendView(),
+    //        src/services/storage-backend-registry.ts:686-693), so "nothing is
+    //        registered" is a list holding only that entry — which the module
+    //        filters out, because the export call refuses it by name.
+    //   POST /api/v1/assets/{id}/deliver — body REQUIRED, exactly
+    //        { destination: string(1..256) }, additionalProperties: false
+    //        (`deliverBodySchema`). Responses are exactly
+    //        200 { assetId, status: 'delivered', destination: { id, name, role },
+    //        bucket, objectKey, bytes, etag, deliveredAt }, 400 bad_request,
+    //        404 not_found, 409 no_object | source_missing,
+    //        422 backend_role | destination_unreachable | destination_unresolved
+    //        | source_too_large, 501 not_configured, 502 delivery_failed,
+    //        504 delivery_timeout. Re-verified after PR #1158 (issue #1131)
+    //        merged, against openapi.json
+    //        .paths["/api/v1/assets/{id}/deliver"].post as it now stands on main.
+    //
+    // The destination picker is built from the live 200 list and from nothing
+    // else, so the submitted value is always an id the API just said it has.
+    // When the list holds no usable destination, the block explains that plainly
+    // instead of offering an empty picker and a submit button that could only
+    // 400 (issue #945's third acceptance criterion).
+    //
+    // The success state may name the bucket and key because a 200 is
+    // falsifiable: `status: 'delivered'` is sent only after the object was
+    // re-read at the destination with the source's byte count. A 504 is reported
+    // as an UNKNOWN outcome rather than as a failure, because the copy may still
+    // complete store-side — the honesty rule this ticket's prerequisite
+    // investigation (docs/findings/export-truthful-status-944.md) established
+    // for the other export endpoint, applied here.
+    //
+    // The path takes the ULID (`asset.id`), which this pane holds even when it
+    // was opened by slug.
+    mountExportAction({
+      assetId: asset.id,
+      sourceName: asset.name,
+      anchorEl: actionsDiv,
+      host: body,
+      canExport: canExportAsset(),
+      apiFetch: apiFetch,
+      wireCopyIds: wireCopyIdButtons,
     });
 
     // ── Delete protection: lock / unlock (issue #895) ──
@@ -4096,9 +4335,25 @@ async function showJobDetail(id, detailPanel) {
 // `opts.afterCancel()` runs after a successful in-panel cancel (embedded only).
 // Clears `bodyEl` first so it is safe to call repeatedly (self-poll). Returns
 // the fetched job (or throws if the fetch fails / 404s).
+//
+// CONTRACT: GET /api/v1/jobs/{id} — `jobSchema`, src/routes/jobs.ts:50-145
+// (openapi.json:15658, path key "/api/v1/jobs/{id}", method `get`; the spec
+// assigns this operation no operationId). Per-field grounding is inline at each
+// row below; the encode-attempt fields (`encodeAttempts`, `encodeAttemptLog`)
+// are grounded in public/job-attempts.js's header.
+//
+// Issue #963 shape: the panel LEADS with curated fields, then the encode-attempt
+// history (only when the job was actually retried), and ends with the full
+// record behind a collapsed "Raw" disclosure — it no longer dumps
+// JSON.stringify(job) as the primary surface.
 async function renderJobDetailBody(id, bodyEl, opts) {
   opts = opts || {};
   const body = bodyEl;
+  // Read the raw-disclosure state BEFORE the container is cleared. The detached
+  // window re-renders this body every DETAIL_POLL_INTERVAL_MS (public/detail.js
+  // tick()), so without carrying the operator's own expansion across the
+  // re-render the raw record would slam shut under them every 5 seconds.
+  const rawWasOpen = rawDisclosureOpen(body);
   body.innerHTML = '';
   const loader = loadingEl();
   body.appendChild(loader);
@@ -4132,10 +4387,39 @@ async function renderJobDetailBody(id, bodyEl, opts) {
     }
     if (job.profile) kvRows.push(['Profile', escHtml(job.profile)]);
     if (job.progress != null) kvRows.push(['Progress', escHtml(job.progress + '%')]);
+    // Bytes pulled, for a URL-pull ingest job (issue #963). `bytesTransferred`
+    // is a REQUIRED number on the job (src/routes/jobs.ts:72; present in the
+    // GET 200 `required` list, openapi.json:15802-15813) and `totalBytes` is
+    // OPTIONAL (src/routes/jobs.ts:73) — absent when the source served no
+    // content-length, which is why the "of N" half is conditional. Shown only
+    // for the job type that transfers bytes: `type` is
+    // 'ingest-url' | 'transcode' | 'package' (src/routes/jobs.ts:52 ->
+    // JOB_TYPES, src/data/job-repo.ts:84).
+    if (job.type === 'ingest-url' && job.bytesTransferred != null) {
+      kvRows.push(['Transferred',
+        escHtml(fmtBytes(job.bytesTransferred)) +
+          (job.totalBytes != null
+            ? ' <span class="text-muted">of ' + escHtml(fmtBytes(job.totalBytes)) + '</span>'
+            : '')]);
+    }
     kvRows.push(['Created', escHtml(fmtDate(job.createdAt))]);
     kvRows.push(['Updated', escHtml(fmtDate(job.updatedAt))]);
     if (job.error) {
       kvRows.push(['Error', '<span style="color:var(--error,#f87171)">' + escHtml(job.error) + '</span>']);
+    }
+    // Encore job id (issue #963). This is the handle the transcode job's
+    // completion signal is correlated by — it is what an operator greps for in
+    // the Encore instance's own logs — so it must be on screen and copyable,
+    // not buried in the raw record. OPTIONAL on the wire and present only for
+    // transcode jobs (src/routes/jobs.ts:80-81; openapi.json:15725, absent from
+    // the GET 200 `required` list at openapi.json:15802-15813), so the row is
+    // conditional. Rendered through the shared click-to-copy control
+    // (public/copy-id.js via copyableFieldHtml) rather than a hover tooltip:
+    // the value IS the visible text, and the button carries the aria-live
+    // feedback.
+    if (job.encoreJobId) {
+      kvRows.push(['Encore Job ID',
+        copyableFieldHtml(job.encoreJobId, 'Copy Encore job id')]);
     }
     if (job.encoreInstanceId) {
       // Placeholder value; resolved to a link (or plain text) after render once
@@ -4150,6 +4434,17 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       return '<span class="kv-key">' + r[0] + '</span><span class="kv-val">' + r[1] + '</span>';
     }).join('');
     body.appendChild(kvDiv);
+    // Bind the click-to-copy control(s) in the field list (currently the Encore
+    // job id). Idempotent, so a re-render on the poll tick re-binds safely.
+    wireCopyableFields(kvDiv);
+
+    // Encode-attempt history (issue #963). Renders NOTHING when the job was
+    // dispatched once: a single-attempt job has no history to compare and must
+    // not get an empty section. When it was retried, the timeline is how a
+    // rescued run (classified failure + backoff + a later success) is told apart
+    // from a plain slow success without reading JSON.
+    const attemptHistory = renderAttemptHistory(job, { fmtDate: fmtDate });
+    if (attemptHistory) body.appendChild(attemptHistory);
 
     // Resolve the Encore instance to a clickable link via the scaler status.
     if (job.encoreInstanceId) {
@@ -4249,10 +4544,17 @@ async function renderJobDetailBody(id, bodyEl, opts) {
       body.appendChild(actions);
     }
 
-    const pre = document.createElement('pre');
-    pre.className = 'code-block mt12';
-    pre.textContent = JSON.stringify(job, null, 2);
-    body.appendChild(pre);
+    // The full server record, kept but demoted (issue #963). It is the only
+    // view guaranteed complete when the API grows a field this panel does not
+    // render yet, so it stays — behind a disclosure, COLLAPSED by default, so
+    // the curated fields above are what the panel leads with. `rawWasOpen`
+    // carries an operator's own expansion across the detached window's poll
+    // re-render.
+    body.appendChild(createRawDisclosure(job, {
+      label: 'Raw job JSON',
+      open: rawWasOpen,
+      className: 'mt12',
+    }));
     return job;
   } catch (err) {
     body.innerHTML = '';
@@ -5598,20 +5900,64 @@ const SEARCH_FORMAT_PLACEHOLDER = 'video/mp4';
 const SEARCH_FORMAT_HINT =
   'Matches the extracted container format — "video/mp4", "mp4" and "mov" all match an MP4.';
 
+// Scope copy for the Search tab (issue #913). This tab is the only one whose
+// results include collections as well as assets — GET /api/v1/search/ returns
+// `{ assets, collections, ... }` and stamps each hit with a `type`
+// discriminator (verified: src/routes/search.ts collectionHitSchema
+// `type: z.literal('collection')`; openapi.json "/api/v1/search/").
+// Nothing in the UI said so, so the heading, the section title and the query
+// hint now name both kinds. Copy only: the request this tab sends is unchanged.
+const SEARCH_TAB_TITLE = 'Search everything';
+const SEARCH_SECTION_TITLE = 'Search assets and collections';
+const SEARCH_SCOPE_HINT =
+  'Full-text search across the whole workspace: assets and collections both match on ' +
+  'name, description and tags. Container format matches assets only.';
+
+// Why this tab exists alongside the Assets tab's filter box (issue #948). The
+// two surfaces look alike now that both take structured filters, so the copy
+// has to carry the distinction. #913 above named the scope; this intro says why
+// you would come here rather than to the Assets tab:
+//   - GET /api/v1/search returns BOTH kinds of hit — `assets` (type: 'asset')
+//     and `collections` (type: 'collection', issue #561); see the verified
+//     contract note above normaliseSearchResults and src/routes/search.ts
+//     (collectionHitSchema / searchResultSchema).
+//   - The Assets tab's free-text box hits the same endpoint but reads only
+//     `res.assets` and drops the collection hits (public/assets-table.js),
+//     so it can never surface a collection.
+//   - The Collections tab lists every collection via GET /api/v1/collections/
+//     with no query parameters at all (verified: openapi.json
+//     "/api/v1/collections/" get.parameters === []), so it cannot narrow.
+// So this tab is the only place a search can return a collection, and the copy
+// below says exactly that. It leads with that differentiator rather than
+// restating the scope: SEARCH_TAB_TITLE, SEARCH_SECTION_TITLE and
+// SEARCH_SCOPE_HINT already say this tab covers assets and collections, so
+// repeating it here would be the fourth statement of scope in one viewport.
+const SEARCH_TAB_INTRO =
+  'The only search that returns collections — the filter box on the Assets tab ' +
+  'narrows the asset list only, and the Collections tab just lists every ' +
+  'collection without searching.';
+
 async function renderSearchTab(container) {
   const title = document.createElement('h2');
   title.className = 'panel-title';
-  title.textContent = 'Search';
+  title.textContent = SEARCH_TAB_TITLE;
   container.appendChild(title);
+
+  const intro = document.createElement('p');
+  intro.className = 'text-muted search-tab-intro';
+  intro.textContent = SEARCH_TAB_INTRO;
+  container.appendChild(intro);
 
   const section = document.createElement('div');
   section.className = 'section';
   section.innerHTML = [
-    '<div class="section-title">Search assets</div>',
+    '<div class="section-title">' + escHtml(SEARCH_SECTION_TITLE) + '</div>',
     '<div class="form-row">',
     '  <div class="form-field grow">',
     '    <label for="search-q">Query</label>',
-    '    <input type="text" id="search-q" placeholder="Full-text search…" />',
+    '    <input type="text" id="search-q" placeholder="Full-text search…"',
+    '      aria-describedby="search-scope-hint" />',
+    '    <div class="form-hint" id="search-scope-hint">' + escHtml(SEARCH_SCOPE_HINT) + '</div>',
     '  </div>',
     '  <div class="form-field">',
     '    <label for="search-tags">Tags (comma-separated)</label>',
@@ -8357,6 +8703,10 @@ async function renderTranscodersTab(container) {
       loader.remove();
       showMsg(wrap, 'Failed to load scaler status: ' + err.message, 'error');
       summaryEl.textContent = 'Encore scaler pool';
+      // Drop the queue tooltip a previous successful load may have set, so a
+      // failed refresh cannot leave a hover explaining depths that are no longer
+      // on screen (#981).
+      summaryEl.title = '';
       return;
     }
     loader.remove();
@@ -8374,9 +8724,82 @@ async function renderTranscodersTab(container) {
       });
     });
 
-    // Pool-capacity context using maxInstances from the response.
-    summaryEl.textContent = flatInstances.length + ' of ' + maxInstances +
+    // Waiting work across all workspaces (issue #981). The pool's instance count
+    // alone cannot tell a saturated pool from an idle one: "3 of 3 active" reads
+    // the same whether 0 or 12 jobs are backed up behind it.
+    //
+    // `queueDepth` is work accepted but not yet dispatched to an instance — a
+    // per-workspace required number (workspaceSchema.queueDepth, GET
+    // /api/v1/scaler/status in src/routes/scaler.ts:144, mirrored in
+    // openapi.json) populated from `LLEN encore:queue:{workspaceId}`
+    // (src/routes/scaler.ts:267). Summed across the returned workspaces, with the
+    // same `Number(x) || 0` coercion the cards use so a junk value reads as 0
+    // rather than NaN-ing the whole summary.
+    //
+    // `inflightDepth` is on the wire next to it and is DELIBERATELY not surfaced
+    // here (#981 offers that as the alternative to surfacing it). It is the LLEN
+    // of `encore:inflight:{workspaceId}`, which holds a job only for the duration
+    // of a single dispatch attempt: scaler-loop.ts:468 claims one with
+    // `RPOPLPUSH queue -> inflight` and :497 removes it immediately after the
+    // POST ("the job is no longer 'inflight' under this attempt"), with :479 and
+    // :489 closing the window sooner still. So it is a sub-second
+    // dispatch-in-progress counter, not dispatched-but-not-started work, and it
+    // does not mean "running" — running work is `instances[].activeJobs`, which
+    // the cards already show. Reporting it on the summary would flicker between
+    // refreshes of an unchanged pool and would read as 0 while twelve jobs
+    // encoded.
+    let totalQueued = 0;
+    workspaces.forEach(function(ws) {
+      totalQueued += Number(ws && ws.queueDepth) || 0;
+    });
+
+    // Pool-capacity context using maxInstances from the response, plus the queued
+    // count when there is any, so an idle pool still reads cleanly as "N of M
+    // instances active" (#981 criterion c: unchanged at queueDepth === 0) and a
+    // backlog is impossible to miss next to it (criterion a).
+    let summaryText = flatInstances.length + ' of ' + maxInstances +
       ' instance' + (maxInstances === 1 ? '' : 's') + ' active';
+    if (totalQueued > 0) {
+      summaryText += ', ' + totalQueued + ' job' +
+        (totalQueued === 1 ? '' : 's') + ' queued';
+    }
+
+    // The one actionable state (#981 criterion b): work is queued AND the pool
+    // cannot grow to meet it. The scaler only spawns while
+    // `instances.length < maxInstances` (scaler-loop.ts), so below the ceiling a
+    // queue drains itself on the next 10s tick (scaler-loop.ts:174) and needs no
+    // operator; at the ceiling the only lever is maxInstances, which is what the
+    // message names. Requires maxInstances > 0 because a response missing the
+    // field falls back to 0 above, and `length >= 0` would otherwise flag an
+    // empty pool as saturated.
+    const atCeiling = totalQueued > 0 && maxInstances > 0 &&
+      flatInstances.length >= maxInstances;
+
+    // Assigning textContent also clears any element appended by a previous load().
+    summaryEl.textContent = summaryText + (atCeiling ? ' — ' : '');
+    if (atCeiling) {
+      // Its own element, not more text in the line above, so this clause alone
+      // can carry attention styling. Deliberately NOT .msg-error / --danger: a
+      // ceiling being honoured is the system working as configured, so it is
+      // amber information, not a failure (#981: "neither message is styled as an
+      // error"). The state is also named in words, so colour is never the only
+      // channel carrying it (WCAG 1.4.1).
+      const lever = document.createElement('span');
+      lever.className = 'tc-at-ceiling';
+      lever.textContent = 'at maximum capacity. Raise max instances to add throughput.';
+      summaryEl.appendChild(lever);
+    }
+
+    // The line is terse by design; the lifecycle detail lives in a tooltip, which
+    // is supplementary — nothing an operator must act on is tooltip-only.
+    summaryEl.title = totalQueued > 0
+      ? (atCeiling
+        ? 'Queued = accepted but not yet dispatched to an instance. The pool is at ' +
+          'its maxInstances ceiling, so the scaler will not add capacity: the queue ' +
+          'drains only as running jobs finish.'
+        : 'Queued = accepted but not yet dispatched to an instance. The pool is below ' +
+          'maxInstances, so the scaler adds an instance on its next tick (10s).')
+      : '';
 
     if (!scalerActive || flatInstances.length === 0) {
       const empty = document.createElement('div');
@@ -8697,6 +9120,18 @@ export {
   renderSearchTab,
   SEARCH_FORMAT_LABEL,
   SEARCH_FORMAT_PLACEHOLDER,
+  // Search-tab scope copy (issue #913). Exported so a DOM/unit test can assert
+  // the tab says it covers collections as well as assets.
+  SEARCH_TAB_TITLE,
+  SEARCH_SECTION_TITLE,
+  SEARCH_SCOPE_HINT,
+  // NOTE (issue #948): SEARCH_TAB_INTRO is deliberately NOT exported. The
+  // "states it returns collections" acceptance criterion is already pinned by
+  // the #913 assertions on SEARCH_SECTION_TITLE / SEARCH_SCOPE_HINT above; the
+  // intro adds the Assets-filter-vs-Collections-tab contrast on top of that.
+  // Exporting it without a test that imports it would ship a dead export and a
+  // comment that claims coverage nothing provides, so the constant stays
+  // module-local until a test actually asserts it.
   // Per-instance capacity is read from the wire, not inferred (issue #979).
   // Exported so a DOM/unit test can assert the card reports the server's
   // `jobsPerInstance`.
@@ -8728,6 +9163,14 @@ export {
   setupTabs,
   auditTabWiring,
   reportTabWiring,
+  // Remaining-retention-window text for the restore action (issue #891).
+  // Exported so a DOM/unit test can exercise the pure formatter directly on a
+  // hand-built `retention` object, without standing up a server. The formatter
+  // stays null-safe for the bodies that legitimately carry no `retention`
+  // (non-archived assets, the list endpoint, a deployment with no live
+  // retention window wired) — see formatRetentionRemaining's own comment for
+  // the exact contract citations.
+  formatRetentionRemaining,
 };
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
