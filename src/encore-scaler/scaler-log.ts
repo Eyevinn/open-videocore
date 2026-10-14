@@ -115,7 +115,17 @@ export const SCALER_LOG_CATEGORY = 'encore-scaler';
 //               interruption re-enqueue at the drain/teardown boundary.
 //   - tick:     the tick as a whole, plus the per-tick repo-bridge hooks
 //               (reconcileFailedTranscodes, onJobsDropped).
-export const SCALER_LOG_PHASES = ['spawn', 'dispatch', 'reap', 'tick'] as const;
+//
+// Plus ONE non-failure phase (issue #1172):
+//   - assign:   the per-tick readiness/job-assignment trail — queue depth, the
+//               instances considered, each one's probe outcome, and the jobs it
+//               was given (src/encore-scaler/assignment-log.ts). `info` level,
+//               not `error`; it is the only phase that reports a NORMAL outcome.
+//               It is a separate phase precisely so it cannot dilute the failure
+//               phases' filters: `q=encore-scaler/dispatch` still selects only
+//               the dispatch FAILURES it selected before #1172, while
+//               `q=encore-scaler/assign` selects the trail.
+export const SCALER_LOG_PHASES = ['spawn', 'dispatch', 'reap', 'tick', 'assign'] as const;
 export type ScalerLogPhase = (typeof SCALER_LOG_PHASES)[number];
 
 export type ScalerLogEvent = {
