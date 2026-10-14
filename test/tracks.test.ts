@@ -101,6 +101,8 @@ describe('multi-language tracks (issue #18)', () => {
       const id = await createAsset(app);
       const res = await app.inject({ method: 'GET', url: `/api/v1/assets/${id}/tracks`, headers: A });
       expect(res.statusCode).toBe(200);
+      // `videoTracks` (issue #1066) is empty too: a fresh asset has not been
+      // probed, so there is no technical metadata to lift a video track from.
       expect(res.json()).toEqual({ videoTracks: [], audioTracks: [], subtitleTracks: [] });
     });
 

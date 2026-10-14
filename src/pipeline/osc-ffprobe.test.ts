@@ -4,7 +4,13 @@
 // place, and that a default (presigned-URL) source is unchanged.
 
 import { describe, it, expect, vi } from 'vitest';
-import { makeOscProbeRunner, ffprobeCmdLine, ffprobeExternalCmdLine } from './osc-ffprobe.js';
+import {
+  makeOscProbeRunner,
+  ffprobeCmdLine,
+  ffprobeExternalCmdLine,
+  parseFfmpegLogToProbeResult
+} from './osc-ffprobe.js';
+import { parseFfprobe } from './metadata-extractor.js';
 import type { ExternalProbeSource } from './metadata-extractor.js';
 
 const PROBE_LOG =
@@ -32,6 +38,56 @@ describe('ffprobe command lines', () => {
   });
   it('external source probes s3://bucket/key in place', () => {
     expect(ffprobeExternalCmdLine('ext-bkt', 'path/to/a.mp4')).toBe('-i "s3://ext-bkt/path/to/a.mp4" -f null -');
+  });
+});
+
+// Frame rate + start timecode off the ffmpeg log (issue #1066). The service runs
+// ffmpeg, not ffprobe, so the rate is the decimal on the stream line rather than a
+// rational — these cases pin the scrape AND the value the extractor ends up with.
+describe('parseFfmpegLogToProbeResult — frame rate and start timecode (issue #1066)', () => {
+  it('reads an integer frame rate off the video stream line', () => {
+    const result = parseFfmpegLogToProbeResult(PROBE_LOG);
+    expect(result.streams?.[0]?.r_frame_rate).toBe('25');
+    expect(parseFfprobe(result, 'now').frameRate).toBe(25);
+  });
+
+  it('reads a 29.97 fps source and its start timecode', () => {
+    const log =
+      "Input #0, mov,mp4, from 'ntsc.mov':\n" +
+      '  Metadata:\n' +
+      '    timecode        : 01:00:00:00\n' +
+      '  Duration: 00:00:10.01, start: 0.000000, bitrate: 5131 kb/s\n' +
+      '    Stream #0:0(und): Video: h264, yuv420p, 1920x1080, 4814 kb/s, 29.97 fps, 29.97 tbr\n' +
+      '    Stream #0:1(und): Audio: aac, 48000 Hz, stereo, 317 kb/s\n';
+    const md = parseFfprobe(parseFfmpegLogToProbeResult(log), 'now');
+    expect(md.frameRate).toBeCloseTo(29.97, 2);
+    expect(md.startTimecode).toBe('01:00:00:00');
+  });
+
+  it('falls back to tbr when ffmpeg prints no fps, and omits both when it prints neither', () => {
+    const tbrOnly =
+      "Input #0, matroska, from 'x.mkv':\n" +
+      '  Duration: 00:00:10.00, start: 0.000000, bitrate: 1000 kb/s\n' +
+      '    Stream #0:0: Video: vp9, yuv420p, 1280x720, 50 tbr\n';
+    expect(parseFfprobe(parseFfmpegLogToProbeResult(tbrOnly), 'now').frameRate).toBe(50);
+
+    const neither =
+      "Input #0, matroska, from 'x.mkv':\n" +
+      '  Duration: 00:00:10.00, start: 0.000000, bitrate: 1000 kb/s\n' +
+      '    Stream #0:0: Video: vp9, yuv420p, 1280x720\n';
+    const md = parseFfprobe(parseFfmpegLogToProbeResult(neither), 'now');
+    expect(md.frameRate).toBeUndefined();
+    expect(md.startTimecode).toBeUndefined();
+  });
+
+  it('an audio-only source yields no frame rate and still parses', () => {
+    const log =
+      "Input #0, mov,mp4, from 'a.m4a':\n" +
+      '  Duration: 00:00:30.00, start: 0.000000, bitrate: 128 kb/s\n' +
+      '    Stream #0:0(und): Audio: aac, 48000 Hz, stereo, 128 kb/s\n';
+    const md = parseFfprobe(parseFfmpegLogToProbeResult(log), 'now');
+    expect(md.frameRate).toBeUndefined();
+    expect(md.audioTracks).toHaveLength(1);
   });
 });
 
