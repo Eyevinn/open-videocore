@@ -545,6 +545,48 @@ tr.row-locked td:first-child {
   font-size: 11px;
 }
 
+/* ── The Editorial panel (issue #937) ───────────────────────────────────────
+   One container on asset detail holding the three things a HUMAN decides about
+   an asset: its approval state, its classification and the notes left on it
+   (docs/design/editorial-panel-layout.md §1). The left rail is the boundary
+   between the two independent axes — everything inside it is editorial, the
+   lifecycle `status` badge in the summary grid is outside it (§4, separation 5).
+   The panel itself never collapses: hiding the review axis behind a click is
+   the failure #134 asks this layout to prevent. */
+.editorial-panel {
+  border-left: 3px solid var(--review-accent, #2dd4bf);
+  padding-left: 10px;
+}
+
+/* The axis sentence (§4.2). Sits directly under the panel heading and covers
+   all three sub-sections, so neither the review block nor the tags block has to
+   repeat it. */
+.editorial-intro {
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+
+/* A sub-section wrapper. The panel supplies it; the three modules keep their
+   own ids and render into it untouched, so each can still ship on its own. */
+.editorial-group + .editorial-group {
+  margin-top: 4px;
+}
+
+/* Visual hierarchy inside the panel (§8): the panel owns the one loud heading,
+   and the three sub-section headings drop a step below it — the same step
+   `.tracks-group-title` already encodes for sub-groups of the Audio section.
+   Without this the panel would read as four peer sections rather than one
+   surface with three parts. Scoped to `.editorial-group` so the modules' own
+   `.section-title` markup needs no change, and so the same block mounted
+   standalone anywhere else keeps the house heading. */
+.editorial-group .section-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+  margin-bottom: 6px;
+}
+
 /* ── Editorial review state (issue #901) ────────────────────────────────────
    The review axis is INDEPENDENT of the lifecycle `status`
    (src/data/asset-repo.ts) and must never read as the same control. So the
@@ -552,8 +594,13 @@ tr.row-locked td:first-child {
    a pill, its own teal accent, and it is always preceded by the words "Review
    state". Shape + wording carry the distinction, so it survives monochrome and
    colour-blind rendering (WCAG 1.4.1). */
+/* The teal rail moved from this block to `.editorial-panel` with issue #937:
+   the review block is now nested INSIDE that panel, and a rail on both would
+   draw a rail inside a rail — two nesting levels where there is one, diluting
+   the very signal that made the rail worth having. The rail now means exactly
+   one thing: everything inside this boundary is the human/editorial axis, and
+   the lifecycle axis is outside it. */
 .review-block {
-  border-left: 3px solid var(--review-accent, #2dd4bf);
   padding-left: 10px;
 }
 

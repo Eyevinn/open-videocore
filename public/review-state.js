@@ -127,9 +127,13 @@ export const REVIEW_COPY = Object.freeze({
    *  position alone (WCAG 1.4.1). */
   stateKey: 'Review state',
   /** Says outright what #134 asks the layout to make obvious. */
+  // No positional reference ("…the lifecycle status above"): since issue #937
+  // this block is a sub-section of the Editorial panel, whose intro carries the
+  // full sentence naming the summary grid, so a second positional claim here
+  // would be both redundant and liable to go stale if the panel moves.
   axisNote:
-    'Editorial approval. This is a separate axis from the lifecycle status ' +
-    'above — moving one never moves the other.',
+    'Editorial approval. A separate axis from the lifecycle status — moving ' +
+    'one never moves the other.',
   /** Shown when the state has outgoing moves; the moves themselves are buttons. */
   movesIntro: 'Moves allowed from here:',
   /** `allowedTransitions: []` — the contract says an empty array means terminal. */
