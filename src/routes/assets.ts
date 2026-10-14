@@ -877,7 +877,12 @@ const clipBodySchema = z
 const transitionSchema = z.object({
   at: z.string(),
   from: statusSchema.nullable(),
-  to: statusSchema
+  to: statusSchema,
+  // Why a background settle moved the asset (issue #1085): the abandoned-upload
+  // sweep and the interrupted-pull reconciler both write `uploading -> failed`,
+  // and this is the only thing in the response that tells a caller which one it
+  // was. Optional — user-driven transitions carry none.
+  reason: z.string().optional()
 });
 
 const audioTrackSchema = z.object({

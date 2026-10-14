@@ -20,10 +20,36 @@
 // right now, so it is left strictly alone — that boundary is what keeps a live
 // pull from being mistaken for a dead one.
 //
-// SCOPE (issue #1084): the JOB RECORD ONLY — settled to `failed` with a reason
-// naming the interruption, plus the matching terminal audit entry (below). It is
-// deliberately NOT re-queued and the asset is NOT moved out of `uploading`
-// (issue #1085).
+// SCOPE (issue #1084): the JOB RECORD — settled to `failed` with a reason naming
+// the interruption, plus the matching terminal audit entry (below). The pull is
+// deliberately NOT re-queued.
+//
+// SCOPE (issue #1085): and the JOB'S ASSET, which the #1084 version left behind.
+// A pull's asset is created in `uploading` before any bytes arrive
+// (src/data/asset-repo.ts initialHistory), so settling only the job left the
+// asset claiming an upload was in progress while the only thing that could ever
+// complete it was already dead. The abandoned-upload sweep would eventually
+// reach it, but not for 24h (src/pipeline/abandoned-upload-loop.ts) — a full day
+// of a state we can already prove is wrong at boot. So the asset is moved
+// `uploading -> failed` here, in the same pass, carrying a `statusReason` that
+// names the interrupted pull (INTERRUPTED_PULL_ASSET_REASON) rather than the
+// sweep's `upload abandoned` — from/to alone cannot tell a dead pull worker from
+// a client that closed its tab.
+//
+// NOT ONE TRANSACTION, by necessity: the job and the asset are separate
+// documents in a store with no cross-document transaction (CouchDB —
+// src/data/couch-asset-repo.ts / couch-job-repo.ts write one `_id` at a time),
+// so the two writes are sequential and either can fail alone. The ORDER makes
+// each half safe on its own: the job is settled FIRST (its terminal state is
+// what #1084 guarantees and what GET /api/v1/jobs/:id reports), then the asset.
+// If the asset write fails, the asset simply keeps today's behaviour — stuck
+// `uploading` until the 24h sweep settles it as an abandoned upload — and the
+// failure is logged, never thrown. The reverse half-write cannot strand anything
+// either: an asset settled whose job write then fails is re-examined on the next
+// boot, where the still-`running` job is settled again and the asset, no longer
+// `uploading`, is left untouched by the status guard below.
+//
+// Partial bytes are still NOT cleaned up here (issue #1086, unchanged).
 //
 // Partially-written bytes are also NOT cleaned up here (issue #1086). That gap
 // does not need new machinery: the in-process terminal-failure path already
@@ -76,7 +102,24 @@
 //     runWithRequestStack(stackName, fn) (src/services/request-stack-context.ts:46-48),
 //     the pair the sibling boot/tick sweeps already use for this exact defect
 //     (src/main.ts:1346-1352, issue #1058/#1062)
+//
+// Contract sources verified for the #1085 asset settle:
+//   - AssetStatus incl. 'uploading'/'failed' and `uploading -> failed` allowed
+//     (ALLOWED_TRANSITIONS.uploading): src/data/asset-repo.ts:28-38
+//   - AssetRepository.get(id) / update(id, patch) -> Asset | undefined:
+//     src/data/asset-repo.ts:1009 (interface), InMemoryAssetRepository.update
+//   - UpdateAssetInput.status + UpdateAssetInput.statusReason (the #1085 field
+//     that annotates the appended history entry): src/data/asset-repo.ts
+//     UpdateAssetInput
+//   - StatusTransition { at, from, to, reason? } and applyStatus() appending it:
+//     src/data/asset-repo.ts StatusTransition / applyStatus
+//   - The sibling settle whose reason this one must NOT collide with:
+//     ABANDONED_UPLOAD_REASON, src/pipeline/abandoned-upload-sweep.ts
+//   - An asset is created in `uploading` with a `null -> uploading` entry before
+//     bytes arrive (why a dead pull leaves it there): src/data/asset-repo.ts
+//     initialHistory()
 
+import type { AssetRepository } from '../data/asset-repo.js';
 import type { Job, JobRepository } from '../data/job-repo.js';
 import {
   emitAudit,
@@ -88,6 +131,16 @@ import {
 // The reason written to Job.error for a pull whose owning process died. Exported
 // so callers and tests assert on the same string rather than duplicating it.
 export const INTERRUPTED_PULL_ERROR = 'pull interrupted by process restart';
+
+// The reason recorded on the ASSET's `uploading -> failed` statusHistory entry
+// (issue #1085). Deliberately DIFFERENT from the abandoned-upload sweep's
+// ABANDONED_UPLOAD_REASON ('upload abandoned',
+// src/pipeline/abandoned-upload-sweep.ts): the two settles write the identical
+// from/to pair, so this string is the only thing that tells an operator reading
+// the asset whether a client stopped uploading or a server-side pull worker
+// died. Kept shorter than the job's INTERRUPTED_PULL_ERROR above because the
+// asset entry is a status annotation, not the job's terminal error message.
+export const INTERRUPTED_PULL_ASSET_REASON = 'pull interrupted';
 
 // How many jobs to enumerate per list call. JobRepository.list() has no status or
 // type filter (src/data/job-repo.ts:276), so the walk pages over the job list and
@@ -124,6 +177,13 @@ export type ReconcileInterruptedIngestsDeps = {
   // transition it to `failed` via update(). All three are on the shared
   // JobRepository interface, so no concrete-repo callback is needed.
   jobs: JobRepository;
+  // The settled job's asset (issue #1085). Supplied, the reconciler moves each
+  // settled pull's asset `uploading -> failed` with `statusReason` =
+  // `assetReason` below, instead of leaving it to claim an upload is in progress
+  // until the 24h abandoned-upload sweep notices. OPTIONAL so a test (or a
+  // caller) that only cares about the job record keeps the exact #1084
+  // behaviour: omitted, no asset is read or written.
+  assets?: AssetRepository;
   // The liveness boundary in epoch ms. A `running` ingest-url job whose
   // `updatedAt` is strictly EARLIER than this is declared interrupted; one
   // stamped AT OR AFTER it is left untouched (it may be a live pull). Injectable
@@ -132,6 +192,11 @@ export type ReconcileInterruptedIngestsDeps = {
   processStartedAtMs?: number;
   // The reason recorded on Job.error. Defaults to INTERRUPTED_PULL_ERROR.
   reason?: string;
+  // The reason recorded on the ASSET's statusHistory entry (issue #1085).
+  // Defaults to INTERRUPTED_PULL_ASSET_REASON. Separate from `reason` above
+  // because the two annotate different records: a job's terminal error message
+  // vs an asset's status transition.
+  assetReason?: string;
   // Best-effort terminal audit emission (issues #1000/#1032). This reconciler is
   // a SETTLE SITE for the ingest-url job's terminal transition, so it owes the
   // same `job.failed` entry the in-process worker emits when IT settles the job
@@ -165,6 +230,12 @@ export type ReconcileInterruptedIngestsDeps = {
   logger?: Logger;
 };
 
+// Deliberately UNCHANGED by issue #1085 — still `{ scanned, settled }`, both
+// counting JOBS. The asset settle is a consequence of a settled job, not a
+// separate unit of work, and no caller consumes the result (main.ts voids it),
+// so adding a third counter would churn every existing assertion on this shape
+// for no reader. Asset outcomes are observable where they matter: the asset's
+// own `status`/`statusHistory`, plus the per-asset info/warn log lines.
 export type ReconcileInterruptedIngestsResult = {
   scanned: number;
   settled: number;
@@ -220,6 +291,7 @@ async function settleInterruptedIngestsInCurrentStack(
 ): Promise<ReconcileInterruptedIngestsResult> {
   const processStartedAtMs = deps.processStartedAtMs ?? processStartTimeMs();
   const reason = deps.reason ?? INTERRUPTED_PULL_ERROR;
+  const assetReason = deps.assetReason ?? INTERRUPTED_PULL_ASSET_REASON;
 
   const candidates = await listInterruptedCandidates(deps, processStartedAtMs);
 
@@ -242,10 +314,11 @@ async function settleInterruptedIngestsInCurrentStack(
         continue; // touched since the snapshot — it is a live pull after all
       }
 
-      // Settle the JOB ONLY (issue #1084 scope). `running -> failed` is a valid
+      // Settle the JOB first (issue #1084). `running -> failed` is a valid
       // transition (src/data/job-repo.ts:248) and `error` is the caller-facing
-      // terminal reason surfaced by GET /api/v1/jobs/:id. The asset is left to
-      // issue #1085 and partial bytes to #1086; the pull is NOT re-queued.
+      // terminal reason surfaced by GET /api/v1/jobs/:id. The asset follows
+      // below (#1085); partial bytes are still #1086 and the pull is NOT
+      // re-queued.
       const result = await deps.jobs.update(job.id, { status: 'failed', error: reason });
       if (result === undefined) {
         deps.logger?.warn?.(
@@ -283,6 +356,28 @@ async function settleInterruptedIngestsInCurrentStack(
         job.assetId,
         reason
       );
+
+      // Issue #1085: move the pull's asset out of `uploading` in the same pass,
+      // so it stops advertising an upload that nothing is driving. Runs ONLY on
+      // the branch that actually settled the job, and inside the same per-stack
+      // context, so the asset repository resolves the same stack the job did
+      // (#1062). Isolated in its own try so an asset-side failure leaves the
+      // job's settle (already durable) intact.
+      if (deps.assets) {
+        try {
+          await settleAssetForInterruptedPull(deps, job, assetReason);
+        } catch (err) {
+          // Best-effort, exactly like the per-job guard: the asset keeps today's
+          // behaviour (stuck `uploading` until the 24h abandoned-upload sweep)
+          // and nothing else in the run is affected.
+          deps.logger?.warn?.(
+            '[interrupted-ingest-reconciler] settled job %s but failed to settle asset %s: %o',
+            job.id,
+            job.assetId,
+            err
+          );
+        }
+      }
     } catch (err) {
       // Best-effort: one job's failure never aborts the run.
       deps.logger?.warn?.(
@@ -294,6 +389,72 @@ async function settleInterruptedIngestsInCurrentStack(
   }
 
   return { scanned, settled };
+}
+
+// Move an interrupted pull's asset `uploading -> failed` (issue #1085),
+// annotated with `assetReason`. Returns true only when it actually wrote.
+//
+// ONLY an asset still in `uploading` is touched — the acceptance criterion
+// "never overwrite an asset that has already moved on". That guard matters for
+// real cases, not just races: a retried pull may have already carried the asset
+// to `processing` or `ready`, and an operator may have archived it. The check is
+// made against a FRESH read taken here (not the job's page snapshot), for the
+// same reason the job settle re-reads — it is the only state that can be acted
+// on. `uploading -> failed` is the only move this makes, and it is an allowed
+// transition (src/data/asset-repo.ts:28-38), so update() cannot reject it with
+// InvalidStateTransitionError; any other current status is skipped BEFORE the
+// write rather than being attempted and caught.
+async function settleAssetForInterruptedPull(
+  deps: ReconcileInterruptedIngestsDeps,
+  job: Job,
+  assetReason: string
+): Promise<boolean> {
+  const assets = deps.assets;
+  if (!assets) {
+    return false;
+  }
+
+  const asset = await assets.get(job.assetId);
+  if (!asset) {
+    // The asset was deleted/purged while its job hung. The job is settled; there
+    // is nothing else to do.
+    deps.logger?.warn?.(
+      '[interrupted-ingest-reconciler] job %s has no asset %s to settle',
+      job.id,
+      job.assetId
+    );
+    return false;
+  }
+  if (asset.status !== 'uploading') {
+    // Already moved on (processing/ready/failed/archived) — leave it exactly as
+    // it is, and never append a second history entry on top of someone else's
+    // state.
+    return false;
+  }
+
+  // `statusReason` rides on the SAME update() that changes `status`, so the
+  // appended `uploading -> failed` entry carries the reason atomically with the
+  // transition — there is no window in which the asset is `failed` with an
+  // unexplained entry (src/data/asset-repo.ts applyStatus).
+  const updated = await assets.update(job.assetId, {
+    status: 'failed',
+    statusReason: assetReason
+  });
+  if (!updated) {
+    deps.logger?.warn?.(
+      '[interrupted-ingest-reconciler] asset %s vanished before settle',
+      job.assetId
+    );
+    return false;
+  }
+
+  deps.logger?.info?.(
+    '[interrupted-ingest-reconciler] settled asset %s (job %s) to failed: %s',
+    job.assetId,
+    job.id,
+    assetReason
+  );
+  return true;
 }
 
 // True when the job's `updatedAt` is strictly earlier than the boundary. An

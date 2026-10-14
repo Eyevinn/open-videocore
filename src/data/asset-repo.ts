@@ -120,6 +120,15 @@ export type StatusTransition = {
   at: string; // ISO timestamp
   from: AssetStatus | null; // null for the initial creation entry
   to: AssetStatus;
+  // Why this transition happened, when the writer is a BACKGROUND settle rather
+  // than a user action (issue #1085). Two different failures both land an asset
+  // on `uploading -> failed` — a client upload abandoned past the 24h threshold
+  // (abandoned-upload-sweep.ts) and a URL pull whose worker process died
+  // (interrupted-ingest-reconciler.ts) — and the from/to pair alone cannot tell
+  // them apart, so an operator reading the history cannot tell whether to chase
+  // the client or the server. Optional and additive: user-driven transitions and
+  // every entry written before #1085 simply omit it.
+  reason?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -713,6 +722,14 @@ export type UpdateAssetInput = {
   // size, so the stored length always describes the stored key.
   sourceSizeBytes?: number;
   status?: AssetStatus;
+  // Why this status change happened (issue #1085), recorded on the appended
+  // `statusHistory` entry. Written by BACKGROUND settles that need to be told
+  // apart in the history — the abandoned-upload sweep vs the interrupted-pull
+  // reconciler, which both write `uploading -> failed`. Ignored unless `status`
+  // is also present (there is no entry to annotate otherwise), and ignored on a
+  // same-status no-op move, which appends no entry. NOT exposed on the PATCH
+  // route: it names a system settle, not a user action.
+  statusReason?: string;
   // Version-chain linkage backfill (issue #118). Set only when a clip/export/
   // rewrap run with `asVersion` seeds a lineage on a source asset that had no
   // group yet, so the source joins its own chain. Not exposed on the PATCH
@@ -1220,21 +1237,31 @@ export function provenanceForPatch(patch: UpdateAssetInput, now: string): Proven
 // Apply a status change, validating the transition and appending to history.
 // Mutates and returns the passed-in arrays/values via a new object the caller
 // can persist. Throws InvalidStateTransitionError on an illegal move.
+// `reason` (issue #1085) is recorded on the appended entry when supplied and
+// omitted entirely when not, so a transition written without one is byte-
+// identical to pre-#1085 history.
 export function applyStatus(
   current: AssetStatus,
   next: AssetStatus,
   history: StatusTransition[],
-  now: string
+  now: string,
+  reason?: string
 ): { status: AssetStatus; statusHistory: StatusTransition[] } {
   if (!isValidTransition(current, next)) {
     throw new InvalidStateTransitionError(current, next);
   }
   if (current === next) {
+    // An idempotent no-op move appends nothing, so there is no entry to carry a
+    // reason either.
     return { status: current, statusHistory: history };
+  }
+  const entry: StatusTransition = { at: now, from: current, to: next };
+  if (reason !== undefined && reason !== '') {
+    entry.reason = reason;
   }
   return {
     status: next,
-    statusHistory: [...history, { at: now, from: current, to: next }]
+    statusHistory: [...history, entry]
   };
 }
 
@@ -1777,7 +1804,13 @@ export class InMemoryAssetRepository implements AssetRepository {
       next.versionGroupId = patch.versionGroupId;
     }
     if (patch.status !== undefined) {
-      const applied = applyStatus(existing.status, patch.status, existing.statusHistory, now);
+      const applied = applyStatus(
+        existing.status,
+        patch.status,
+        existing.statusHistory,
+        now,
+        patch.statusReason
+      );
       next.status = applied.status;
       next.statusHistory = applied.statusHistory;
     }

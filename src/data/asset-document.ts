@@ -140,7 +140,13 @@ const SceneDetectionSchema = z.object({
 const StatusTransitionSchema = z.object({
   at: z.string(),
   from: z.string().nullable(),
-  to: z.string()
+  to: z.string(),
+  // Why a BACKGROUND settle moved the asset (issue #1085) — e.g. an abandoned
+  // client upload vs an interrupted URL pull, which share the same
+  // `uploading -> failed` pair. Optional/additive: every document written before
+  // #1085 simply lacks it and stays a valid v1 document, so no schemaVersion
+  // bump is required (the reviewState / packagedOutput precedent).
+  reason: z.string().optional()
 });
 
 // Explicit delete-lock (ADR-020 decision 3, issue #568). An operator-set flag
@@ -707,7 +713,10 @@ export function fromAssetDocument(doc: AssetDocument): Asset {
     statusHistory: (doc.administrative.statusHistory ?? []).map((t) => ({
       at: t.at,
       from: t.from as AssetStatus | null,
-      to: t.to as AssetStatus
+      to: t.to as AssetStatus,
+      // Carried through only when the stored entry has one (issue #1085), so a
+      // pre-#1085 entry round-trips without an added `reason: undefined` key.
+      ...(t.reason !== undefined ? { reason: t.reason } : {})
     })),
     technicalMetadata: technical.technicalMetadata,
     technicalMetadataError: technical.technicalMetadataError,
