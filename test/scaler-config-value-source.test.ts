@@ -25,7 +25,12 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { serializerCompiler, validatorCompiler } from 'fastify-type-provider-zod';
+import swagger from '@fastify/swagger';
+import {
+  jsonSchemaTransform,
+  serializerCompiler,
+  validatorCompiler
+} from 'fastify-type-provider-zod';
 
 import { scalerRouter } from '../src/routes/scaler.js';
 
@@ -231,5 +236,66 @@ describe('scaler config value provenance (issue #1079)', () => {
     // the server calls it runtime.
     expect(body.sources.maxInstances.source).toBe('runtime');
     expect(body.sources.maxInstances.updatedAt).toEqual(expect.any(String));
+  });
+});
+
+// The two review findings on the #1079 PR were both in the SHIPPED CONTRACT TEXT
+// rather than in behaviour, so they need contract-text coverage or they regress
+// silently on the next doc edit.
+//
+// Contract source read before writing (CLAUDE.md rule 7): the generated spec is
+// served by @fastify/swagger from the same route schemas the handlers use, so
+// registering it over `scalerRouter` here reads the exact descriptions
+// `openapi.json` and `public/docs/` are generated from — not a copy of them.
+//   - GET /api-docs/json route + { openapi, info } options: src/main.ts's
+//     @fastify/swagger registration.
+//   - jsonSchemaTransform from fastify-type-provider-zod is what turns the zod
+//     `.describe()` calls into the `description` fields asserted below.
+describe('scaler config provenance is described honestly on the wire (issue #1079)', () => {
+  let spec: any;
+
+  beforeEach(async () => {
+    const app = Fastify();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    await app.register(swagger, {
+      openapi: { info: { title: 'test', version: '0' } },
+      transform: jsonSchemaTransform
+    });
+    await app.register(scalerRouter, {
+      prefix: '/scaler',
+      maxInstances: ENV_MAX_INSTANCES,
+      minInstances: ENV_MIN_INSTANCES,
+      idleTimeoutMs: ENV_IDLE_TIMEOUT_MS,
+      configStore: { save: async () => undefined, load: async () => undefined }
+    });
+    await app.ready();
+    spec = app.swagger();
+    await app.close();
+  });
+
+  const configOp = (method: 'get' | 'patch') => spec.paths['/scaler/config'][method];
+
+  it('does not tell PATCH clients that provenance is unavailable', () => {
+    // The `sources` field exists precisely to falsify this sentence, which the
+    // PATCH description carried after the GET description had dropped it.
+    const description: string = configOp('patch').description;
+    expect(description).not.toContain('but not whether it came from a PATCH');
+    expect(description).toContain('sources');
+  });
+
+  it('describes sources.minInstances as the built-in 0, never ENCORE_MIN_INSTANCES', () => {
+    // main.ts hands this router a hardcoded minInstances: 0 and never forwards
+    // ENCORE_MIN_INSTANCES, so a generic "the environment variable" wording
+    // would assert a provenance the deployment does not have.
+    for (const method of ['get', 'patch'] as const) {
+      const sources =
+        configOp(method).responses['200'].content['application/json'].schema.properties.sources;
+      expect(sources.properties.minInstances.description).toContain('ENCORE_MIN_INSTANCES');
+      // And the field-specific text must not be the generic shared one.
+      expect(sources.properties.minInstances.description).not.toEqual(
+        sources.properties.maxInstances.description
+      );
+    }
   });
 });

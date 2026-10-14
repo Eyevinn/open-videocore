@@ -605,8 +605,15 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
   // Per-field provenance (#1079). A field is absent from this map until a PATCH
   // sets it, so "never patched on this process" and "env-sourced" are the same
   // state — which is exactly right: the values above are seeded from the router
-  // options, which main.ts resolves from the environment (ENCORE_MAX_INSTANCES,
-  // ENCORE_MIN_INSTANCES, ENCORE_IDLE_TIMEOUT_MS, or their defaults).
+  // options, which main.ts resolves from the environment — ENCORE_MAX_INSTANCES
+  // and ENCORE_IDLE_TIMEOUT_MS, or their defaults (main.ts scalerRouterOptions).
+  //
+  // minInstances is the exception, and `sources.minInstances` says so on the
+  // wire: main.ts hands this router a hardcoded `minInstances: 0` and never
+  // forwards ENCORE_MIN_INSTANCES, which only ever reaches the scaler registry
+  // (main.ts, the scaler-loop options). So "env" for minInstances means the
+  // built-in 0 — the deployment's own ENCORE_MIN_INSTANCES is a separate value
+  // this endpoint does not see and does not report.
   //
   // The map holds the PATCH timestamp because that is a timestamp the process
   // genuinely has. There is no equivalent for an env-sourced value: nothing
@@ -675,7 +682,24 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
       sources: z
         .object({
           maxInstances: configValueSourceSchema,
-          minInstances: configValueSourceSchema,
+          // Field-specific, because the generic `source` wording is not true of
+          // this field: "env" here is the built-in 0 this endpoint is seeded
+          // with, NEVER the deployment's ENCORE_MIN_INSTANCES, which is read
+          // elsewhere and never reaches this endpoint (see the comment on
+          // runtimeSetAt).
+          minInstances: configValueSourceSchema.describe(
+            'Provenance of `minInstances`, with one caveat specific to this ' +
+              'field: `source: "env"` means the built-in default 0 this process ' +
+              'started with, NOT the value of ENCORE_MIN_INSTANCES. That ' +
+              'variable is read only by the scaler loops and never reaches this ' +
+              'endpoint, so a deployment running with ENCORE_MIN_INSTANCES=2 ' +
+              'still reports `minInstances: 0` with `source: "env"` here until ' +
+              'a PATCH sets it. `source: "runtime"` has its usual meaning — set ' +
+              'by PATCH /config on this process — but note that even then the ' +
+              'value is only recorded and echoed, not applied to the running ' +
+              'scaler loops (see the `minInstances` field description). ' +
+              'Read-only and server-asserted.'
+          ),
           idleTimeoutMs: configValueSourceSchema
         })
         .describe('Where each config value in this response came from (#1079).')
@@ -843,8 +867,12 @@ export const scalerRouter: FastifyPluginAsync<ScalerRouterOptions> = async (fast
           'sentinel value. PATCH the environment values back explicitly, which ' +
           'overwrites the stored snapshot; restarting reverts the live values but ' +
           'leaves the stored record in place. `GET /api/v1/scaler/config` shows ' +
-          'what is in force, but not whether it came from a PATCH or from the ' +
-          'environment.\n\n' +
+          'what is in force, and `sources` says per field whether the value came ' +
+          'from a PATCH on this process or from the environment (#1079) — note ' +
+          'that PATCHing an environment value back still reports ' +
+          '`source: "runtime"`, because `sources` reports who set the value, not ' +
+          'whether the number changed; only a restart puts a field back to ' +
+          '`source: "env"`.\n\n' +
           '**Caveats.** `minInstances` is recorded, persisted and echoed back but ' +
           'is not applied to the running scaler loops (see the field description). ' +
           'A PATCH sent while `GET /api/v1/scaler/status` reports ' +
