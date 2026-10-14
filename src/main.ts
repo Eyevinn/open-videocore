@@ -179,7 +179,8 @@ import { makeOscPackagerQueue } from './pipeline/osc-packager-queue.js';
 import {
   resolvePublicBaseUrl,
   resolveEncoreProfilesUrl,
-  resolveEncoreProfilesUrlFromParamStore
+  resolveEncoreProfilesUrlFromParamStore,
+  stackScopedProfilesIndexUrl
 } from './services/public-base-url.js';
 import type { EncoreClient } from './pipeline/encore-client.js';
 import { Redis as IORedis } from 'ioredis';
@@ -1329,6 +1330,18 @@ function activateScaler(redisUrl: string): void {
     // Point each spawned Encore instance at our own public profile index so it
     // loads the operator-managed profiles from CouchDB (issue #84).
     profilesUrl: encoreScalerProfilesUrl,
+    // …and point it at THAT STACK's profile index (issue #1164). The scaler's
+    // loop key is the EFFECTIVE stack identity the transcode request resolved to
+    // (issue #615), and a spawned instance fetches its profilesUrl with a
+    // header-less, tokenless GET — so unless the stack is in the URL, every
+    // stack's Encore reads the FIRST listed stack's profile store and a profile
+    // created against a non-first stack cannot be used by the stack it was
+    // created on. Rewrites ONLY this app's own index URL and ONLY for a
+    // syntactically valid stack name (see stackScopedProfilesIndexUrl), so an
+    // external index and the single-stack/env-override deployments keep the
+    // process-global URL unchanged.
+    resolveProfilesUrl: (stackKey: string) =>
+      stackScopedProfilesIndexUrl(encoreScalerProfilesUrl, stackKey),
     // Local-dev fallback only: ENCORE_S3_ENDPOINT is used verbatim for all
     // workspaces when set. On OSC this is unset and resolveS3Config below
     // resolves the MinIO endpoint per workspace from the parameter store.

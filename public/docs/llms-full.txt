@@ -401,6 +401,29 @@ Response 200 (application/json)
 Response 200 (application/json)
 "string"
 
+  GET /api/v1/profiles/stacks/{stack}/index.yml
+
+  Public Encore-format profile index for ONE stack (name -> :name/yaml), served without auth. Identical body/status/x-profile-count contract to GET /api/v1/profiles/index.yml, but resolved against the named stack's profile store so an Encore instance belonging to that stack reads the profiles created on it, whatever its position in the stack listing (issue #1164). Index entries are relative, so each per-profile fetch stays on this stack-scoped prefix.
+
+  Parameters
+Name | In | Type | Required
+stack | path | string | required
+  Response
+Response 200 (application/json)
+"string"
+
+  GET /api/v1/profiles/stacks/{stack}/{name}/yaml
+
+  One profile's raw YAML from the named stack's profile store, served without auth. Target of the relative entries in GET /api/v1/profiles/stacks/{stack}/index.yml (issue #1164).
+
+  Parameters
+Name | In | Type | Required
+stack | path | string | required
+name | path | string | required
+  Response
+Response 200 (application/json)
+"string"
+
   GET /api/v1/profiles/{name}
 
   Get a single profile.
@@ -3685,7 +3708,7 @@ URL: https://videocore.pages.osaas.io/api-reference.html
 
 API reference
 
-Every endpoint, grouped by resource, generated straight from the committed openapi.json (119 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
+Every endpoint, grouped by resource, generated straight from the committed openapi.json (121 endpoints across 18 groups). If you're looking for how to accomplish something rather than a single endpoint's exact shape, start with the guides instead — each one links back to the relevant endpoints here.
 
 Health2
 Liveness probes.
@@ -3693,7 +3716,7 @@ Provisioning7
 Provision and tear down a workspace's full OSC media stack (object storage, metadata store, queue).
 Optional services4
 Discover and provision add-on OSC services for a workspace.
-Profiles8
+Profiles10
 Transcoding profiles served to the transcoder via the public, unauthenticated index.yml endpoint.
 Assets52
 Asset lifecycle, ingest, upload, transcode, package, thumbnails, tracks, tags, delivery.
@@ -4531,7 +4554,7 @@ Example prompts for driving open-videocore from an AI agent — send a large fil
 
 Reference
 
-Looking for one endpoint's exact parameters or response shape? The API reference covers all 119 endpoints, generated from the committed openapi.json.
+Looking for one endpoint's exact parameters or response shape? The API reference covers all 121 endpoints, generated from the committed openapi.json.
 
   Introduction
 What open-videocore is and how it's put together.
